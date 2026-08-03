@@ -1,14 +1,17 @@
 [project]
 name = "kaggriculture"
 version = "0.1.0"
-description = "Tools for the kaggriculture project."
+description = "Agent for the Kaggriculture simulation competition on Kaggle."
 readme = "README.md"
 authors = [{ name = "Will Rice", email = "wrice20@gmail.com" }]
-requires-python = ">=3.12"
+# Kaggle runs agents on gcr.io/kaggle-images/python; pin low so anything that
+# runs locally also runs on the competition image.
+requires-python = ">=3.11"
 dependencies = [
+  "kaggle-environments>=1.32.3",
+  "kaggle>=1.7.4",
   "pre-commit>=4.1.0",
   "pydantic>=2.12.2",
-  "pydocstyle>=6.3.0",
   "pytest>=8.3.4",
   "python-dotenv>=1.1.1",
   "ruff>=0.9.7",
@@ -38,3 +41,5 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 [project.scripts]
 run = "kaggriculture.scripts.run:main"
+package = "kaggriculture.scripts.package:main"
+submit = "kaggriculture.scripts.submit:main"
