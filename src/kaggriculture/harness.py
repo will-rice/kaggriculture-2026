@@ -1,9 +1,9 @@
 """Main harness module."""
 
-from agent_harness.agent import Agent
-from agent_harness.config import HarnessConfig
-from agent_harness.result import Result
-from agent_harness.task import Task
+from kaggriculture.agent import Agent
+from kaggriculture.config import HarnessConfig
+from kaggriculture.result import Result
+from kaggriculture.task import Task
 
 
 class Harness:
