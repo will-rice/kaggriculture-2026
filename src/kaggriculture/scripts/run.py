@@ -1,7 +1,7 @@
 """Main run script for the agent harness."""
 
-from agent_harness.config import HarnessConfig
-from agent_harness.harness import Harness
+from kaggriculture.config import HarnessConfig
+from kaggriculture.harness import Harness
 
 
 def main() -> None:

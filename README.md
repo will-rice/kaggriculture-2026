@@ -1,6 +1,6 @@
-# Agent Harness Template
+# kaggriculture-2026
 
-A batteries-included template for building AI agent evaluation harnesses using modern Python tooling.
+The kaggriculture project package and supporting tooling.
 
 ## Features
 
@@ -14,7 +14,7 @@ A batteries-included template for building AI agent evaluation harnesses using m
 
 ```
 .
-├── src/agent_harness/
+├── src/kaggriculture/
 │   ├── agent.py               # Agent protocol
 │   ├── config.py              # Pydantic configuration
 │   ├── harness.py             # Main Harness class
@@ -36,28 +36,13 @@ A batteries-included template for building AI agent evaluation harnesses using m
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 2. Use this template for a new project
-
-When creating a new project from this template:
-
-1. Clone or fork this repository
-2. Rename the `src/agent_harness` directory to your project name:
-   ```bash
-   mv src/agent_harness src/your_project_name
-   ```
-3. Update `pyproject.toml`:
-   - Change `name = "agent_harness"` to your project name
-   - Update `module-name = ["agent_harness"]` to your project name
-   - Update the `run` script path in `[project.scripts]`
-4. Update import statements in Python files to use your new project name
-
-### 3. Install dependencies
+### 2. Install dependencies
 
 ```bash
 uv sync
 ```
 
-### 4. Set up environment variables
+### 3. Set up environment variables
 
 Copy the example environment file and add your API keys:
 
@@ -66,7 +51,7 @@ cp .env.example .env
 # Edit .env and add your API keys
 ```
 
-### 5. Install pre-commit hooks
+### 4. Install pre-commit hooks
 
 ```bash
 uv run pre-commit install
@@ -87,7 +72,7 @@ uv run run
 Create a class that conforms to the `Agent` protocol:
 
 ```python
-from agent_harness.agent import Agent
+from kaggriculture.agent import Agent
 
 
 class MyAgent:
@@ -104,7 +89,7 @@ class MyAgent:
 Create a class that conforms to the `Task` protocol:
 
 ```python
-from agent_harness.task import Task
+from kaggriculture.task import Task
 
 
 class MyTask:
@@ -123,8 +108,8 @@ class MyTask:
 ### Running an Evaluation
 
 ```python
-from agent_harness.config import HarnessConfig
-from agent_harness.harness import Harness
+from kaggriculture.config import HarnessConfig
+from kaggriculture.harness import Harness
 
 config = HarnessConfig(max_workers=4, timeout=30.0)
 harness = Harness(config=config)
@@ -168,7 +153,7 @@ uv run pre-commit run --all-files
 
 ## Configuration
 
-Edit `src/agent_harness/config.py` to customize harness settings:
+Edit `src/kaggriculture/config.py` to customize harness settings:
 
 ```python
 from pydantic import BaseModel

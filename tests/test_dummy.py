@@ -1,6 +1,11 @@
-"""Dummy test."""
+"""Smoke tests for package metadata."""
 
 
-def test_dummy() -> None:
-    """Dummy test."""
-    assert True
+from kaggriculture.config import HarnessConfig
+
+
+def test_package_imports() -> None:
+    """The renamed package remains importable."""
+    config = HarnessConfig()
+
+    assert config.seed == 42
