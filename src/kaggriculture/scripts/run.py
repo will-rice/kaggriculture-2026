@@ -1,7 +1,8 @@
 """Main run script for the agent harness.
 
-Plays the submission entrypoint against the environment's built-in agents and
-reports a win rate per opponent.
+Plays the submission entrypoint against the recorded league — a frozen replay
+tape, an earlier heuristic agent, and the environment's built-in ``starter`` —
+and reports a win rate per opponent.
 """
 
 import argparse
@@ -11,6 +12,7 @@ from pathlib import Path
 from kaggriculture.agent import EpisodeAgent
 from kaggriculture.config import HarnessConfig
 from kaggriculture.harness import Harness
+from kaggriculture.policy import STRATEGY
 from kaggriculture.report import format_standing, standings
 from kaggriculture.result import Result
 from kaggriculture.scripts.package import ENTRYPOINT
@@ -33,6 +35,9 @@ def main() -> None:
     parser.add_argument(
         "--replays", type=Path, default=None, help="directory for replay JSON"
     )
+    parser.add_argument(
+        "--track", action="store_true", help="log this evaluation to wandb"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -47,6 +52,10 @@ def main() -> None:
     agent = EpisodeAgent(spec=args.agent, replay_dir=args.replays)
     results = harness.run(agent, harness.matches())
     report(results)
+    if args.track:
+        from kaggriculture.scripts.tracking import log_evaluation
+
+        log_evaluation(standings(results), config, STRATEGY, args.agent)
 
 
 def report(results: list[Result]) -> None:

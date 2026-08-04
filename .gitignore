@@ -230,6 +230,7 @@ __marimo__/
 # Kaggriculture
 submission.tar.gz
 replays/
+wandb/
 
 # Node — only the prettier plugin the pre-commit format hook resolves from here
 node_modules/
