@@ -37,10 +37,10 @@ def test_run_config_carries_every_strategy_knob() -> None:
 
 def test_metric_keys_survive_opponents_named_by_path() -> None:
     """League members are file paths; slashes would nest them into separate charts."""
-    metrics = run_metrics([standing("baselines/meta_build.py", 0.4)])
+    metrics = run_metrics([standing("baselines/heuristic_v2.py", 0.4)])
 
-    assert metrics["win_rate/meta_build"] == 0.4
-    assert metrics["bank/meta_build"] == 50000.0
+    assert metrics["win_rate/heuristic_v2"] == 0.4
+    assert metrics["bank/heuristic_v2"] == 50000.0
     assert not any("/" in key.split("/", 1)[1] for key in metrics)
 
 

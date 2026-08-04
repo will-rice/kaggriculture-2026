@@ -79,6 +79,24 @@ against it.
 
 ## Where we stand
 
+> **Superseded 2026-08-04 — we no longer submit our own heuristic.**
+>
+> `pilkwang/kaggriculture-structured-economic-policy`, a public notebook with 74 votes, turned out to be a
+> genuinely reactive agent rather than another copy of the tape: 44 functions, stdlib only, pricing from
+> the live market curve and from the opponent's visible supply. Measured over 20 seeded games it beat our
+> tuned heuristic **20-0 at 148k to 51k**, and it costs 0.9 ms a turn at the median against a 1000 ms
+> budget, so the strength is not bought with compute. It is vendored at
+> `src/kaggriculture/economic_policy.py` with attribution, linted and typed to this project's standards,
+> and guarded by a 2,157-turn decision-level characterization test plus 117 unit tests that check its
+> internal price model against the engine's — they agree exactly across every product and inventory level.
+>
+> This answers the open question at the end of this document about which public kernel the field is
+> copying: it is neither of the two guessed at, and the kernel has been renamed since that was written.
+>
+> Our heuristic is frozen at `baselines/heuristic_v2.py` and remains a league opponent. The narrative below
+> describes how it got there and is kept because the reasoning still holds — it is simply no longer the
+> thing we ship. The heuristic track's remaining items now apply to the vendored policy instead.
+
 `melon loop v1` (submission 55222583) is on the ladder at **478**, below its 600 seed, with a 1W–4L
 recent record. It wins every game against the built-in agents and banks ~48k doing it, then banks 7.7k
 to 47k against real opponents.
@@ -207,32 +225,46 @@ Nothing downstream is measurable without this, and the existing `Harness` is mos
   prices and inventory deltas. We already have this as scratch code; it needs to become a real module
   because every later phase reads it.
 
-**Gate:** `heuristic-v1` vs `meta-build` over 100 seeded games returns a win rate with a CI narrower than
+**Gate:** `heuristic-v1` vs the strongest league opponent over 100 seeded games returns a win rate with a CI narrower than
 ±0.1, in under 10 minutes wall-clock on 64 cores.
 
-#### Result — gate passed 2026-08-04 (will-rice/kaggriculture-2026 runs fsrlzxgh, l73v8htf)
+#### Result — gate passed 2026-08-04 (will-rice/kaggriculture-2026 runs `s8mmlfea`, `urrclpeq`)
 
 `meta-build` was ruled out of the league during infrastructure work as byte-for-byte the shipped agent, so
 the matchup would have been self-play; the recorded tape took its place as the strongest opponent actually
-in the league. `heuristic-v1` vs the recorded tape over 100 seeded games (wandb run `fsrlzxgh`): win rate
+in the league. `heuristic-v1` vs the recorded tape over 100 seeded games (run `s8mmlfea`): win rate
 0.000 [0.000, 0.037], half-width 0.0185 — half of the stated interval, since the lower bound is 0 — in 15s
-on 64 cores. Both criteria clear with room to spare — the interval is under a fifth of the ±0.1 budget, and
-the run finished in seconds rather than minutes because 100 episodes parallelise cleanly across 64 workers.
-`heuristic-v1` lost all 100 games; the tape plays the recorded 75th-percentile ladder build open-loop, and
-nothing in the current agent beats it yet.
+on 64 cores. Both criteria clear, though not by as much as the interval suggests: the width depends on the
+observed rate, and at 100 games the worst case (a rate of 0.5) gives a half-width of 0.0962. **One hundred
+games is the minimum that satisfies this gate, not a comfortable margin** — size future sweeps from the
+worst case, not from this run.
 
-Reference league standing for the current submission (`main.py`), 300 seeded games per opponent, seed 1000
-(wandb run `l73v8htf`):
+`heuristic-v1` lost all 100 games. The tape plays the recorded 75th-percentile ladder build open-loop, and
+nothing we had written beat it.
 
-| opponent     | win rate | 95% interval   |
-| ------------ | -------- | -------------- |
-| meta-tape    | 0.000    | [0.000, 0.013] |
-| heuristic-v1 | 1.000    | [0.987, 1.000] |
-| starter      | 1.000    | [0.987, 1.000] |
+Reference league standing for the current submission, 300 seeded games per opponent, seed 1000 (run
+`urrclpeq`). The submission is now the vendored economic policy, not our own heuristic — see the adoption
+note below:
 
-The submission beats both frozen baselines cleanly and loses every game against the recorded tape — the
-honest current state of the project. It is ahead of everything in the league except the one opponent built
-from the ladder's dominant, copied strategy, and closing that gap is what the phases from here on are for.
+| opponent     | win rate | 95% interval   | our bank | theirs  |
+| ------------ | -------- | -------------- | -------- | ------- |
+| meta-tape    | 0.000    | [0.000, 0.013] | 118,672  | 140,585 |
+| heuristic-v2 | 1.000    | [0.987, 1.000] | 148,931  | 50,972  |
+| heuristic-v1 | 1.000    | [0.987, 1.000] | 151,012  | 16,056  |
+| starter      | 1.000    | [0.987, 1.000] | 161,120  | 3,496   |
+
+It beats all three frozen baselines cleanly and still loses every game against the recorded tape — the
+honest current state. What adoption bought is visible in the banks rather than the win column: our own
+tuned heuristic banked 54,569 against the tape while the tape reached 171,353; the served agent banks
+118,672 and holds the tape to 140,585. The gap narrowed from 3.1x to 1.2x without a single win.
+
+**Two earlier runs carry a wrong configuration.** Runs `fsrlzxgh` and `l73v8htf`, cited here before
+2026-08-04, recorded correct win rates against a config describing the wrong agent: the runner logged the
+package's default `Strategy` regardless of which agent `--agent` selected, so the gate's config claimed the
+tuned crop mix and a herd of fourteen while `heuristic-v1` actually played melon monoculture with no
+livestock. The measurements were sound and reproduce exactly; only the metadata lied. Fixed at commit
+`82a4130` by deriving the strategy from the agent module, and the two runs above replace them. The wrong
+runs are named rather than deleted, because an audit trail that quietly drops its own errors is not one.
 
 **From here, a change ships only if it beats the current submission on win
 rate against this league, with non-overlapping intervals.** Mean bank against a
@@ -322,12 +354,14 @@ interpreter trains the agent on the wrong game.
 ### Phase 4 — Scale and league (2 weeks)
 
 - Train a larger model with the Phase 3 model as KL teacher.
-- League: past checkpoints, `meta-build`, `heuristic-v1`, sampled with preference for opponents that beat
+- League: past checkpoints, the recorded tape, `heuristic-v1`, `heuristic-v2`, sampled with preference for opponents that beat
   us — prioritised fictitious self-play, which exists precisely because self-play alone cycles among
   non-transitive strategies.
 - Fine-tune against the strongest ladder opponents we can reconstruct from replays.
 
-**Gate:** beats the Phase 3 model at >60% and `meta-build` at >65%.
+**Gate:** beats the Phase 3 model at >60% and the recorded tape at >65%. The tape replaces `meta-build`
+here for the reason given under Phase 1: a baseline built on our own policy is our own code with
+different constants, and the one we built turned out byte-for-byte identical to the shipped agent.
 
 ### Phase 5 — Ship and iterate (ongoing from week 4)
 
