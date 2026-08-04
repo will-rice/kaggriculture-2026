@@ -30,7 +30,7 @@ entry. We keep the heuristic track funded for exactly that reason.
 ## The opponent is a tape
 
 The most-voted public kernel (`romantamrazov/kaggriculture-hamburger`, 82 votes) is not a strategy. Its
-embedded agent's docstring reads *"Fixed public Tran H Hoang policy from episode 89674601, seat 0"*, and
+embedded agent's docstring reads _"Fixed public Tran H Hoang policy from episode 89674601, seat 0"_, and
 the notebook asserts `len(anchor_trace) == 720`. It replays **one recorded game's action sequence,
 open-loop**, with thin overlays for terminal liquidation, weed repair, and mirror detection.
 
@@ -43,11 +43,11 @@ median — the median is depressed because tape-versus-tape games crash each oth
 
 Because it is open-loop, its entire market footprint is known in advance:
 
-| | units over the season |
-|---|---|
+|       | units over the season                                                                                     |
+| ----- | --------------------------------------------------------------------------------------------------------- |
 | sells | wheat 1103, milk 413, **fertilizer 408**, strawberry 390, wool 251, melon 182, carrot 13, egg 8, tomato 4 |
-| buys | **wheat 967** |
-| other | 306 hires (~10/day), 2 land purchases, 8 cows, 6 sheep |
+| buys  | **wheat 967**                                                                                             |
+| other | 306 hires (~10/day), 2 land purchases, 8 cows, 6 sheep                                                    |
 
 And its dump schedule is known per day — strawberry is negligible before day 17 then floods days 18–29
 (38, 27, 42, 23, 30, 24, 49, 33, 20, 14, 49, 22); melon front-loads days 10–12 (39, 27, 12); wheat spikes
@@ -60,7 +60,7 @@ Five edges follow directly, all measured rather than inferred:
    `melon loop v1`.
 2. **Fertilizer is mispriced downward.** The tape sells 408 units of it — the engine permits fertilizer
    sales even though the documentation says otherwise — and it ends at $57 against a $100 base. It is
-   *buyable*, so cheap fertilizer is a yield multiplier nobody is using as one.
+   _buyable_, so cheap fertilizer is a yield multiplier nobody is using as one.
 3. **The field is a guaranteed wheat buyer**, 967 units of forced demand per tape, to feed 14 animals.
 4. **Strawberry, milk and wool hold high against a single tape** (264 / 303 / 248 at the end) because
    only one player is supplying them. The tape captures all of that. We supply none of it.
@@ -83,7 +83,7 @@ against it.
 recent record. It wins every game against the built-in agents and banks ~48k doing it, then banks 7.7k
 to 47k against real opponents.
 
-The diagnosis is in the research: it ranks crops at *base* price, which picks melon, and melon is the one
+The diagnosis is in the research: it ranks crops at _base_ price, which picks melon, and melon is the one
 crop with zero shop demand. Locally, playing bots that never touch the market, melon inventory drains
 and the price holds at $288. On the ladder it gluts to +100 and the price collapses to $94–154. The agent
 is not badly implemented; it is optimising a number that stops being true the moment a second melon
@@ -151,7 +151,7 @@ Nothing downstream is measurable without this, and the existing `Harness` is mos
 
 ### Phase 2 — Imitation dataset and architecture selection (1 week)
 
-Pick the architecture with cheap supervised signal *before* spending the expensive RL budget — FLG's
+Pick the architecture with cheap supervised signal _before_ spending the expensive RL budget — FLG's
 procedure, and the most reusable process lesson in the research.
 
 - Build the dataset from the daily replay dumps, **filtered to top-decile banks**. The pool is
@@ -227,7 +227,7 @@ Immediate work, reordered after measuring against the tape. The benchmark for ev
    (independent budgeting spent $3000 three ways on day zero and starved the farm to $56 for twelve
    days); buy an animal only when its feed is already in the shed and build its pasture only when it is
    waiting for one; and charge the herd's daily feed, care and harvest against the same crew the crops
-   draw on. A target herd of 8 cows and 6 sheep — the tape's mix — measured *worse* than 8 cows and 2
+   draw on. A target herd of 8 cows and 6 sheep — the tape's mix — measured _worse_ than 8 cows and 2
    sheep (32.8k vs 40.8k): past about ten animals this crew cannot walk the feed round, and the animals
    it misses escape. Splitting the feed run across several carriers measured worse than one loaded
    carrier at every split tried, because the pastures sit together beside the shed.
@@ -240,7 +240,8 @@ Immediate work, reordered after measuring against the tape. The benchmark for ev
    pricing overstates the absolute figures, since a large order walks its own price down; the ranking is
    what matters.) Cows and sheep need a pasture tile, daily wheat, and `CARE`; the wheat can simply be
    bought, which is what the tape's 967 wheat purchases are for.
-2. **Abandon melon** — but only after animals. Measured against the tape, melon is *still* our best
+
+2. **Abandon melon** — but only after animals. Measured against the tape, melon is _still_ our best
    single crop at 28.7k, versus wheat 9.4k, tomato 10.5k, carrot 4.1k and strawberry 1.5k. Crop choice is
    not the gap; the absence of livestock is. Changing crop first would have been a wasted cycle, which is
    exactly why this list is now ordered by measurement rather than by the earlier reasoning.
@@ -272,14 +273,14 @@ A change ships when it beats the current submission at >55% over ≥100 seeded g
 
 ## Timeline
 
-| weeks | RL track | heuristic track |
-|---|---|---|
-| 1 (Aug 4–10) | Phase 0 probe, Phase 1 infrastructure | live-price allocation, sell timing |
-| 2 (Aug 11–17) | Phase 2 dataset + architecture | animals, cash-flow fix |
-| 3–4 (Aug 18–31) | Phase 3 small-model RL | maintain as league opponent |
-| 5–6 (Sep 1–14) | Phase 4 scale + league | — |
-| 7 (Sep 15–21) | fine-tune vs ladder replays | — |
-| 8 (Sep 22–30) | stability, adversarial testing, final submissions | fallback ready |
+| weeks           | RL track                                          | heuristic track                    |
+| --------------- | ------------------------------------------------- | ---------------------------------- |
+| 1 (Aug 4–10)    | Phase 0 probe, Phase 1 infrastructure             | live-price allocation, sell timing |
+| 2 (Aug 11–17)   | Phase 2 dataset + architecture                    | animals, cash-flow fix             |
+| 3–4 (Aug 18–31) | Phase 3 small-model RL                            | maintain as league opponent        |
+| 5–6 (Sep 1–14)  | Phase 4 scale + league                            | —                                  |
+| 7 (Sep 15–21)   | fine-tune vs ladder replays                       | —                                  |
+| 8 (Sep 22–30)   | stability, adversarial testing, final submissions | fallback ready                     |
 
 ---
 
@@ -301,7 +302,7 @@ Stated in advance so they are not rationalised away later.
 
 1. Does torch run in the agent sandbox, and how fast? (Phase 0 answers this.)
 2. Is the 198,630-bank diversified build reproducible, or was it one lucky market?
-3. What does the ladder's top decile bank *today*, versus the 123,334 median measured on 2026-08-02?
+3. What does the ladder's top decile bank _today_, versus the 123,334 median measured on 2026-08-02?
 4. Which public kernel is the monoculture source — `romantamrazov/kaggriculture-hamburger` (82 votes) or
    `pilkwang/kaggriculture-observable-economic-control` (71)? Reading it tells us exactly what 75% of the
    field does.

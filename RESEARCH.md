@@ -75,7 +75,7 @@ citable to a third party, and they are the findings least likely to be wrong.
 Three assumptions carry enough materiality to state explicitly. First, the ladder meta observed on
 2026-08-02 is treated as informative but perishable; the top rating rose from 1152 to 2627 in four days
 [14], so any conclusion depending on opponent behaviour has a short half-life. Second, torch is assumed
-available in the competition sandbox because it ships in the Kaggle Python image, but this is *not*
+available in the competition sandbox because it ships in the Kaggle Python image, but this is _not_
 verified for the simulation sandbox specifically, and Section 7 treats it as the principal open risk.
 Third, the analysis assumes the competition's default configuration, which the replay confirms is what
 the ladder actually runs [14].
@@ -94,7 +94,7 @@ strongest RL entry placing fourth [2][3]. Lux AI Season 3 in 2025 returned to le
 agent first and imitation learning third and fourth [6][7].
 
 Sorted instead by the structure of a single decision, the pattern resolves. In Kore, a unit is issued a
-*flight plan* — a compressed multi-step route. In Lux S2, each unit carries an action queue of up to
+_flight plan_ — a compressed multi-step route. In Lux S2, each unit carries an action queue of up to
 twenty steps, and re-issuing that queue costs power, so an agent that re-plans every turn is
 mechanically penalised. FLG measured this directly and found that agents predicting fewer than four to
 six steps ahead were "crippled" [3]. These are combinatorial planning problems, and a forward simulator
@@ -109,8 +109,8 @@ reduces to pattern-recognition over a spatial state — precisely what a convolu
 The microRTS competition provides the cleanest natural experiment, because the same game was contested
 repeatedly. Scripted agents won the first five iterations before a deep RL agent finally took it [9].
 What changed was not the game but the technique stack: GridNet outputs with invalid-action masking, a
-downscaling backbone chosen to hit a 100 ms turn deadline, iterative fine-tuning against the *previous
-competition winners*, and a reward schedule moving from shaped to sparse [9]. The cost was 70 GPU-days,
+downscaling backbone chosen to hit a 100 ms turn deadline, iterative fine-tuning against the _previous
+competition winners_, and a reward schedule moving from shaped to sparse [9]. The cost was 70 GPU-days,
 later reduced to 23 by bootstrapping with behaviour cloning from opponent replays [9].
 
 The lesson is not that RL has become universally better. It is that RL became viable once the
@@ -302,7 +302,7 @@ existing heuristic — captures most of the benefit at low complexity.
 
 **Progressive scaling with the smaller model as teacher.** Toad Brigade trained an 8-block network,
 then a 16-block, then a 24-block, each using its predecessor as teacher [1]. FLG's stated plan was the
-same, and his architecture was selected by measuring imitation accuracy against CPU cost *before*
+same, and his architecture was selected by measuring imitation accuracy against CPU cost _before_
 committing to an RL run [3]. That ordering — pick the architecture using cheap supervised signal, then
 spend the expensive RL budget on it — is the most reusable process lesson in the corpus.
 
@@ -326,8 +326,8 @@ was a spatial contest, and the accumulated wisdom in those writeups is about spa
 collisions, unit micro. Kaggriculture's spatial layer is comparatively simple: a 10×10 grid, no combat,
 no collisions, units that may share tiles. The layer that decides games is economic, and the writeups say
 nothing about it because no previous game had one. The transferable material from the competition corpus
-is therefore mostly *machinery* — how to shape an action head, how to mask, how to schedule reward — while
-the *strategy* has to be discovered here. That asymmetry argues for learning over hand-coding more
+is therefore mostly _machinery_ — how to shape an action head, how to mask, how to schedule reward — while
+the _strategy_ has to be discovered here. That asymmetry argues for learning over hand-coding more
 strongly than any single citation does: we can borrow the machinery with confidence and cannot borrow the
 strategy at all.
 
@@ -336,7 +336,7 @@ running one build produces exactly the price structure that build cannot exploit
 schedule, wheat appreciating monotonically, tomato and eggs unsupplied [14]. But this holds only while
 the monoculture holds. The top rating moved from 1152 to 2627 in four days [14], and the final standing is
 decided by a Bradley-Terry tournament run two weeks after the September deadline [14], which is roughly
-two months of meta evolution away. Any solution whose edge *is* the current monoculture will decay; a
+two months of meta evolution away. Any solution whose edge _is_ the current monoculture will decay; a
 policy that prices from live market state adapts by construction. This is an argument for learning the
 allocation rather than tuning it, and it is independent of whether learning is currently ahead on raw
 strength.
@@ -345,7 +345,7 @@ strength.
 within reach — second place in the most recent competition used hardware inferior to what is already
 available here [8]. What actually destroyed a strong competitor's model was the inability to run it inside
 the Kaggle sandbox [3]. The correct sequencing therefore inverts the intuitive one: establish what can be
-deployed *before* deciding what to train. A probe submission costs one slot and one hour; discovering the
+deployed _before_ deciding what to train. A probe submission costs one slot and one hour; discovering the
 constraint after a week of training costs the week.
 
 ---
@@ -374,8 +374,8 @@ the price curves are structural properties of the environment source and will no
 monoculture, the price trajectories it produces, and the 123,334 median bank are properties of a
 five-day-old ladder and will.
 
-Finally, this report does not establish that RL will beat a well-executed heuristic *in this
-competition*. It establishes that the decision structure resembles the competitions RL won rather than
+Finally, this report does not establish that RL will beat a well-executed heuristic _in this
+competition_. It establishes that the decision structure resembles the competitions RL won rather than
 those it lost, that the compute is affordable, and that the market layer rewards adaptation. Lux S2 is
 the cautionary case: an excellent forward-simulation heuristic beat the strongest RL entry [2][3].
 
@@ -433,44 +433,43 @@ It costs nothing to retain and provides both a training opponent and a fallback 
 
 ## Bibliography
 
-[1] Toad Brigade (I. Pressman et al.). *Toad Brigade's Approach — Deep Reinforcement Learning.* Lux AI
+[1] Toad Brigade (I. Pressman et al.). _Toad Brigade's Approach — Deep Reinforcement Learning._ Lux AI
 Season 1, 1st place. https://www.kaggle.com/competitions/lux-ai-2021/writeups/toad-brigade-toad-brigade-s-approach-deep-reinforc
 
-[2] ry_andy_. *1st place solution.* Lux AI Season 2, 1st place. https://www.kaggle.com/competitions/lux-ai-season-2/writeups/ry-andy-1st-place-solution
+[2] ry*andy*. _1st place solution._ Lux AI Season 2, 1st place. https://www.kaggle.com/competitions/lux-ai-season-2/writeups/ry-andy-1st-place-solution
 
-[3] FLG. *FLG's Approach — Deep Reinforcement Learning with a Focus on Performance.* Lux AI Season 2, 4th
+[3] FLG. _FLG's Approach — Deep Reinforcement Learning with a Focus on Performance._ Lux AI Season 2, 4th
 place. https://www.kaggle.com/competitions/lux-ai-season-2/writeups/flg-flg-s-approach-deep-reinforcement-learning-wit
 
-[4] H. Buisman. *1st place solution.* Kore 2022, 1st place. https://www.kaggle.com/competitions/kore-2022/writeups/harm-buisman-1st-place-solution
+[4] H. Buisman. _1st place solution._ Kore 2022, 1st place. https://www.kaggle.com/competitions/kore-2022/writeups/harm-buisman-1st-place-solution
 
-[5] Nebula. *Writing a fast simulator.* Kore 2022. https://www.kaggle.com/competitions/kore-2022/writeups/nebula-writing-a-fast-simulator
+[5] Nebula. _Writing a fast simulator._ Kore 2022. https://www.kaggle.com/competitions/kore-2022/writeups/nebula-writing-a-fast-simulator
 
-[6] Flat Neurons. *1st place approach by Flat Neurons.* Lux AI Season 3, 1st place. https://www.kaggle.com/competitions/lux-ai-season-3/writeups/flat-neurons-1st-place-approach-by-flat-neurons
+[6] Flat Neurons. _1st place approach by Flat Neurons._ Lux AI Season 3, 1st place. https://www.kaggle.com/competitions/lux-ai-season-3/writeups/flat-neurons-1st-place-approach-by-flat-neurons
 
-[7] aDg4b. *Imitation Learning: 3rd Place Solution.* Lux AI Season 3, 3rd place. https://www.kaggle.com/competitions/lux-ai-season-3/writeups/adg4b-imitation-learning-3rd-place-solution
+[7] aDg4b. _Imitation Learning: 3rd Place Solution._ Lux AI Season 3, 3rd place. https://www.kaggle.com/competitions/lux-ai-season-3/writeups/adg4b-imitation-learning-3rd-place-solution
 
-[8] kurupical. *kaggle Lux AI Season 3 強化学習ソリューションまとめ＋振り返り* (Lux AI Season 3 RL solutions
+[8] kurupical. _kaggle Lux AI Season 3 強化学習ソリューションまとめ＋振り返り_ (Lux AI Season 3 RL solutions
 roundup and retrospective). https://zenn.dev/kurupical/articles/61dbeedf89a29d
 
-[9] S. Huang et al. *A Competition Winning Deep Reinforcement Learning Agent in microRTS.* 2024. https://arxiv.org/html/2402.08112v1
+[9] S. Huang et al. _A Competition Winning Deep Reinforcement Learning Agent in microRTS._ 2024. https://arxiv.org/html/2402.08112v1
 
-[10] *Superhuman AI for Generals.io Using Self-Play Reinforcement Learning.* 2026. https://www.alphaxiv.org/abs/2606.23348
+[10] _Superhuman AI for Generals.io Using Self-Play Reinforcement Learning._ 2026. https://www.alphaxiv.org/abs/2606.23348
 
-[11] S. Huang and S. Ontañón. *A Closer Look at Invalid Action Masking in Policy Gradient Algorithms.*
-2020. https://arxiv.org/abs/2006.14171
+[11] S. Huang and S. Ontañón. _A Closer Look at Invalid Action Masking in Policy Gradient Algorithms._ 2020. https://arxiv.org/abs/2006.14171
 
-[12] *Multi-Agent Reinforcement Learning for Dynamic Pricing in Supply Chains: Benchmarking Strategic
-Agent Behaviours under Realistically Simulated Market Conditions.* 2025. https://arxiv.org/abs/2507.02698
+[12] _Multi-Agent Reinforcement Learning for Dynamic Pricing in Supply Chains: Benchmarking Strategic
+Agent Behaviours under Realistically Simulated Market Conditions._ 2025. https://arxiv.org/abs/2507.02698
 
-[13] O. Vinyals et al. *Grandmaster level in StarCraft II using multi-agent reinforcement learning.*
+[13] O. Vinyals et al. _Grandmaster level in StarCraft II using multi-agent reinforcement learning._
 DeepMind, 2019. https://storage.googleapis.com/deepmind-media/research/alphastar/AlphaStar_unformatted.pdf
 
 [14] Kaggriculture competition and environment source, `kaggle_environments/envs/kaggriculture/`
 v1.32.3; primary measurements taken in this repository; 400 episodes mined from
 `kaggle/kaggriculture-episodes-2026-08-02`. https://www.kaggle.com/competitions/kaggriculture
 
-[15] SIDHAARTH SHREE. *Crucial Information for Starters and Organizers: Documentation vs. Engine
-Discrepancies.* https://www.kaggle.com/competitions/kaggriculture/discussion/732450
+[15] SIDHAARTH SHREE. _Crucial Information for Starters and Organizers: Documentation vs. Engine
+Discrepancies._ https://www.kaggle.com/competitions/kaggriculture/discussion/732450
 
 ---
 
@@ -512,12 +511,12 @@ offers no transferable strategy. Finding 3 was promoted accordingly, and the rec
 reordered to place market-specific architecture ahead of general training advice. No sections were
 removed; the original research question is unchanged.
 
-**Critique (Phase 6).** Three critic personas were applied. The *Skeptical Practitioner* objected that
+**Critique (Phase 6).** Three critic personas were applied. The _Skeptical Practitioner_ objected that
 writeup evidence is success-biased and that two claims rested on thin sourcing — both now recorded in
-Limitations. The *Adversarial Reviewer* challenged the central structural thesis, noting that Lux S2 is a
+Limitations. The _Adversarial Reviewer_ challenged the central structural thesis, noting that Lux S2 is a
 direct counterexample where a heuristic beat RL in a game with a small per-unit action space; this is
 acknowledged in Limitations and partly answered in Finding 1 by the action-queue mechanism, which is
-absent from Kaggriculture. The *Implementation Engineer* objected that the recommendations assumed a
+absent from Kaggriculture. The _Implementation Engineer_ objected that the recommendations assumed a
 deployable runtime, which prompted reordering the recommendation set to put the probe submission first,
 and flagged one implausible figure in [8] which has been excluded.
 
