@@ -33,10 +33,13 @@ identical build, which both creates exploitable price structure and makes imitat
 
 The recommendation is self-play reinforcement learning with a grid-shaped action head, invalid-action
 masking, sparse win-based reward, and a frozen teacher for stability — trained on the workstation
-already available, since the second-place Lux S3 team reached that position on an RTX 3090 and an RTX
-2070 Super [8]. The binding risk is not training but inference: one competitor had a trained model he
-could not deploy because no fast runtime could be installed in the Kaggle sandbox [3]. That risk is
-cheap to retire with a probe submission before committing to a long run.
+already available, since the second-place Lux S3 team reached that position with a 10M-parameter model on
+an RTX 3090 and an RTX 2070 Super [16]. The binding risk is not training but inference: one competitor
+had to abandon a model **mid-training** because no fast runtime could be installed in the Kaggle sandbox,
+and his error logs came back 404 [3]. That risk is cheap to retire with a probe submission before
+committing to a long run — and doing so on 2026-08-04 established that torch 2.6.0 is available, the
+sandbox has two cores and 6.8 GB, and a 20M-parameter convolutional forward pass costs 105 ms of the
+one-second turn.
 
 ---
 
@@ -110,8 +113,13 @@ The microRTS competition provides the cleanest natural experiment, because the s
 repeatedly. Scripted agents won the first five iterations before a deep RL agent finally took it [9].
 What changed was not the game but the technique stack: GridNet outputs with invalid-action masking, a
 downscaling backbone chosen to hit a 100 ms turn deadline, iterative fine-tuning against the _previous
-competition winners_, and a reward schedule moving from shaped to sparse [9]. The cost was 70 GPU-days,
-later reduced to 23 by bootstrapping with behaviour cloning from opponent replays [9].
+competition winners_, and a reward schedule moving from shaped to sparse [9]. The cost was 70 GPU-days.
+
+> **Correction, 2026-08-04.** This previously continued "later reduced to 23 by bootstrapping with
+> behaviour cloning from opponent replays", which [9] contradicts. The 23-GPU-day model (RAI-BC) is
+> behaviour-cloning only and materially weaker — 44% against Mayari, where the winner scored 90%+.
+> Behaviour cloning followed by PPO fine-tuning cost 23 + 49 = **72** GPU-days, more than the 70 of
+> plain RL. Imitation bought quality-per-compute nowhere in that paper.
 
 The lesson is not that RL has become universally better. It is that RL became viable once the
 engineering around it — masking, grid-shaped heads, teacher regularisation, fast simulators — matured
@@ -204,7 +212,9 @@ carrot tiles — a crop no mined agent touched [14]. The meta build is demonstra
 
 The trap is that this same corpus is the imitation-learning dataset. Behaviour cloning against a
 population that is three-quarters one copied kernel teaches the monoculture, including its badly-timed
-strawberry allocation. The technique that saved microRTS 47 GPU-days [9] would here be cloning the thing
+strawberry allocation. (The claim that this technique saved microRTS 47 GPU-days is withdrawn — see the
+correction in Finding 1 — so imitation is justified here as a cold-start escape, not as a compute
+saving.) Cloning would here mean copying the thing
 we intend to beat. Filtering to top-decile banks or to winners only is the minimum precaution, and
 imitation should be treated strictly as an initialisation to escape rather than a target to match. This
 is a genuine departure from the Lux S3 precedent, where third and fourth place were pure imitation
@@ -219,19 +229,31 @@ industrial tier.
 
 Toad Brigade's Lux S1 winner — a 24-block residual network of roughly 20 million parameters, trained with
 IMPALA plus UPGO and TD(λ) — was trained entirely on "my personal PC, an 8-core/16-thread dual-GPU
-system" [1]. In Lux S3, first place did use industrial scale, a 200-million-parameter IMPALA model on
-eight H100s for three to four days. But **second place, Frog Parade, trained a 10-million-parameter PPO
-model for roughly 300 million game steps over eight days on an RTX 3090 and an RTX 2070 Super** [16].
-Tenth place used a single RTX 4090 [8].
+system" [1]. In Lux S3, first place trained for ~1.5B environment steps over three to four days, and
+20B+ steps across the competition [6]; their writeup states no parameter count and names no GPU, saying
+only "We had substantial computing resources", so the "200-million-parameter model on eight H100s"
+this paragraph used to assert is **UNVERIFIED** and came from [8].
+
+**Second place, Frog Parade, trained a 10-million-parameter PPO model for roughly 300 million game steps
+over eight days on an RTX 3090 and an RTX 2070 Super** [16]. Tenth place ran a ~1.8M-parameter model
+(~3.2M with a separate critic) on a local RTX 4090 **plus two to four rented cloud RTX 4090s** over
+roughly ten days [17] — [8] reported this as "23 billion parameters on a single RTX 4090", where 23B is
+in fact its environment-step count.
 
 > **Correction, 2026-08-04.** This paragraph previously read "dual 300-million-parameter PPO models for
 > ten million steps", taken from the roundup [8]. The primary source — Frog Parade's own write-up and
 > code [16] — has the two numbers the other way round: a **10M-parameter** model, **300M game steps**
 > (600M per-player observations). The error mattered: it set Phase 2's model size two orders of
 > magnitude too high, and a 300M-parameter model neither fits Kaggriculture's turn budget nor, at 1.2 GB
-> of weights, any plausible submission size limit. Prefer [16] to [8] on this solution throughout; [8]
-> already had one figure excluded for implausibility (see Limitations), so its numbers are now treated
-> as leads rather than evidence.
+> of weights, the 100 MB submission limit [16].
+>
+> A verification pass on 2026-08-04 established that [8] commits this same units error at least twice —
+> the "23 billion parameters" excluded from this report as implausible is likewise an environment-step
+> count, and correct as such. **A units error was mislabelled as an outlier**, so the lesson did not
+> generalise to the figure above. Three further claims sourced to [8] alone did not survive contact with
+> the primaries. **[8] is therefore struck as an evidence source**; it is retained in the bibliography
+> only to record what was previously cited to it. Full ledger:
+> `/data/kaggriculture/research/corrections-run-20260804/CORRECTIONS.md`.
 
 The workstation available here has an RTX 3090 and an RTX 6000 Ada with 49 GB, plus 64 CPU cores —
 strictly better than the second-place Lux S3 configuration.
@@ -242,7 +264,8 @@ steps/second, or ~37M steps a day [16]. This is the same lever Nebula pulled in 
 environment from
 12.9 ms per step to 0.08 ms in Rust, a 160× speedup [5], and the same one the Generals.io authors
 identify as their central contribution, a JAX simulator running "tens of millions of frames per second on
-a single GPU, roughly a 10,000× speedup", concluding flatly that "a fast simulator removes the data
+a single GPU, more than four orders of magnitude over a 3,500 steps/s CPU baseline — about 14,500× on
+the paper's own figures — concluding flatly that "a fast simulator removes the data
 bottleneck" [10].
 
 Kaggriculture's starting position is better than any of theirs. At 1.68 ms per step it is already about
@@ -379,6 +402,18 @@ Neurons' use of IMPALA) agree [6]. The rest should be treated as approximately r
 One figure in that roundup, a 23-billion-parameter model on a single RTX 4090, is not physically
 plausible as stated and has been excluded.
 
+> **Resolved, 2026-08-04 — and the resolution is worse than the caveat.** This limitation was correctly
+> identified and then not acted on: the body of the report used the roundup's figures as though they were
+> firm, and STRATEGY.md sized a whole phase of work on one of them. Checked against the primaries, they
+> were not "approximately right" — they were wrong in kind. The 23B figure is an environment-step count,
+> not an implausible parameter count, and the same transposition corrupted second place's 300M. Neither
+> parameter count in [8] that has been checked survived. See
+> `/data/kaggriculture/research/corrections-run-20260804/CORRECTIONS.md`.
+>
+> The process lesson is not "retrieve harder". It is that a limitation recorded in Section 7 has to
+> propagate to the decisions in Section 8, or it is decoration. Any figure carrying a caveat this
+> explicit should be walked to a primary before it is allowed to size an engineering plan.
+
 The market measurements are a snapshot of one day's corpus. Melon's absent shop demand and the shape of
 the price curves are structural properties of the environment source and will not change [14]; the
 monoculture, the price trajectories it produces, and the 123,334 median bank are properties of a
@@ -460,9 +495,14 @@ place. https://www.kaggle.com/competitions/lux-ai-season-2/writeups/flg-flg-s-ap
 [7] aDg4b. _Imitation Learning: 3rd Place Solution._ Lux AI Season 3, 3rd place. https://www.kaggle.com/competitions/lux-ai-season-3/writeups/adg4b-imitation-learning-3rd-place-solution
 
 [8] kurupical. _kaggle Lux AI Season 3 強化学習ソリューションまとめ＋振り返り_ (Lux AI Season 3 RL solutions
-roundup and retrospective). https://zenn.dev/kurupical/articles/61dbeedf89a29d
+roundup and retrospective). https://zenn.dev/kurupical/articles/61dbeedf89a29d — **STRUCK 2026-08-04.**
+A secondary roundup that reports environment-step counts in the parameter column, twice. Every figure
+taken from it that has been checked was wrong. Not to be cited as evidence; use the competitors' own
+artifacts instead.
 
-[9] S. Huang et al. _A Competition Winning Deep Reinforcement Learning Agent in microRTS._ 2024. https://arxiv.org/html/2402.08112v1
+[9] S. Goodfriend. _A Competition Winning Deep Reinforcement Learning Agent in microRTS._ 2024.
+https://arxiv.org/abs/2402.08112 (previously misattributed here to S. Huang et al., who wrote the
+underlying Gym-microRTS/GridNet paper, arXiv:2105.13807)
 
 [10] _Superhuman AI for Generals.io Using Self-Play Reinforcement Learning._ 2026. https://www.alphaxiv.org/abs/2606.23348
 
@@ -483,6 +523,12 @@ Discrepancies._ https://www.kaggle.com/competitions/kaggriculture/discussion/732
 
 [16] I. Pressman et al. (Frog Parade). _kaggle-lux-2024_ — code and `write-up.md` for the Lux AI
 Season 3 second-place solution. https://github.com/IsaiahPressman/kaggle-lux-2024
+
+[17] Boey. _End-to-End JAX RL._ Lux AI Season 3, 10th place.
+https://www.kaggle.com/competitions/lux-ai-season-3/discussion/570196
+
+[18] T. Van de Wiele. _1st Place – Winning Solution._ Halite IV, 1st place.
+https://www.kaggle.com/competitions/halite/discussion/183543
 
 ---
 

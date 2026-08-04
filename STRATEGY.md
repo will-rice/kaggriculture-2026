@@ -215,6 +215,14 @@ Nothing downstream is measurable without this, and the existing `Harness` is mos
 Pick the architecture with cheap supervised signal _before_ spending the expensive RL budget — FLG's
 procedure, and the most reusable process lesson in the research.
 
+> **Premise weakened, 2026-08-04.** The compute-saving half of this argument rested on microRTS
+> "70 GPU-days, later reduced to 23 by behaviour cloning". The primary source contradicts it: the
+> 23-GPU-day model is behaviour-cloning only and materially weaker (44% against Mayari, where the winner
+> scored 90%+), and cloning followed by PPO fine-tuning cost **72** GPU-days — more than the 70 of plain
+> RL [9]. Imitation bought quality-per-compute nowhere in that paper. It is still worth doing here to
+> escape a cold start and to select an architecture cheaply, but **not** on the grounds that it saves
+> training budget, and the phase should be time-boxed accordingly.
+
 - Build the dataset from the daily replay dumps, **filtered to top-decile banks**. The pool is
   three-quarters one copied kernel, so unfiltered cloning teaches the monoculture including its
   badly-timed strawberry allocation. Treat imitation as an initialisation to escape, never a target.
@@ -235,10 +243,17 @@ procedure, and the most reusable process lesson in the research.
   | second actor head: 2-layer CNN → a 24×24 probability map shared across units, per-unit illegal masking | the market-order head, and any op that names a target tile           |
 
   Note the sizing this settles: **~10M parameters, not 300M** — the 300M is their step count, and the
-  numbers were transposed in [8]. Their model is smaller than Toad Brigade's 20M, by the same author, so
-  the trend among people who have actually shipped these is _down_. At 10M convolutional parameters on a
-  100-cell board this costs ~40–50 ms of a 1-second turn, and the 6 GMAC budget above leaves room to grow
-  it several times over if that ever pays.
+  numbers were transposed in [8]. At 10M convolutional parameters on a 100-cell board this costs ~40–50 ms
+  of a 1-second turn, and the 6 GMAC budget above leaves room to grow it several times over if that ever
+  pays.
+
+  **Every verified winner is small.** The 2026-08-04 verification pass established this across four
+  competitions: microRTS RAISocketAI **5.0M** [9], with Huang et al.'s best policies under **1M**; Lux S3
+  tenth place **1.8M**, 3.2M with a separate critic [17]; Lux S3 second place **10M** [16]; Lux S1 first
+  place **~20M** [1]. No primary source anywhere supports a winning model above 20M — both figures that
+  suggested otherwise, 300M and 23B, were step counts. **Start at ~10M and treat 20M as a ceiling to
+  justify rather than a floor to exceed.** Frog Parade's 10M model shipped at ~38 MB against a 100 MB
+  submission cap [16], so file size is not the binding constraint here; the turn budget is.
 
 - Candidate trunks: the above, against a downscaling U-shaped variant. Select on action-prediction
   accuracy **per millisecond of CPU inference measured at two threads**, which is what the sandbox has.
