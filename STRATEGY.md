@@ -27,6 +27,56 @@ entry. We keep the heuristic track funded for exactly that reason.
 
 ---
 
+## The opponent is a tape
+
+The most-voted public kernel (`romantamrazov/kaggriculture-hamburger`, 82 votes) is not a strategy. Its
+embedded agent's docstring reads *"Fixed public Tran H Hoang policy from episode 89674601, seat 0"*, and
+the notebook asserts `len(anchor_trace) == 720`. It replays **one recorded game's action sequence,
+open-loop**, with thin overlays for terminal liquidation, weed repair, and mirror detection.
+
+This explains the monoculture exactly: 298 of 400 mined agent-games had byte-identical builds because
+they are the same recording. It is decoded to `/data/kaggriculture/baselines/meta_tape.py` and runs as a
+local opponent.
+
+**It banks 174k–194k against our current agent's 28.7k.** That is the real bar, not the 123k mined
+median — the median is depressed because tape-versus-tape games crash each other's prices.
+
+Because it is open-loop, its entire market footprint is known in advance:
+
+| | units over the season |
+|---|---|
+| sells | wheat 1103, milk 413, **fertilizer 408**, strawberry 390, wool 251, melon 182, carrot 13, egg 8, tomato 4 |
+| buys | **wheat 967** |
+| other | 306 hires (~10/day), 2 land purchases, 8 cows, 6 sheep |
+
+And its dump schedule is known per day — strawberry is negligible before day 17 then floods days 18–29
+(38, 27, 42, 23, 30, 24, 49, 33, 20, 14, 49, 22); melon front-loads days 10–12 (39, 27, 12); wheat spikes
+on day 12 (204) and day 29 (148).
+
+Five edges follow directly, all measured rather than inferred:
+
+1. **Melon is dead.** Against the tape it finishes at **$1** in every game — its 182 units plus our ~170
+   floor it. Our entire current strategy is built on a crop the meta destroys. This alone invalidates
+   `melon loop v1`.
+2. **Fertilizer is mispriced downward.** The tape sells 408 units of it — the engine permits fertilizer
+   sales even though the documentation says otherwise — and it ends at $57 against a $100 base. It is
+   *buyable*, so cheap fertilizer is a yield multiplier nobody is using as one.
+3. **The field is a guaranteed wheat buyer**, 967 units of forced demand per tape, to feed 14 animals.
+4. **Strawberry, milk and wool hold high against a single tape** (264 / 303 / 248 at the end) because
+   only one player is supplying them. The tape captures all of that. We supply none of it.
+5. **Carrot, tomato and eggs remain unsupplied** — 13, 4 and 8 units respectively across a whole season.
+
+There is also an asymmetric weapon here. The ladder scores wins, not margins, and the tape cannot react.
+Selling into its known dump windows depresses the prices its own revenue depends on, and it will keep
+executing regardless. Costing it 40k while costing ourselves 10k is a winning trade.
+
+**Caveat on using it for training.** An open-loop opponent is a poor sole adversary — beating it can be
+achieved by exploiting its blindness rather than by playing well. It belongs in the league as one
+opponent among several, never as the only one, and the RL reward must stay the win rather than the margin
+against it.
+
+---
+
 ## Where we stand
 
 `melon loop v1` (submission 55222583) is on the ladder at **478**, below its 600 seed, with a 1W–4L
@@ -167,18 +217,24 @@ testing are the defence.
 RL takes weeks and the ladder is live now. The heuristic is also the honest hedge against the Lux S2
 outcome where a good heuristic beats a good policy.
 
-Immediate work, roughly a day each, in order:
+Immediate work, reordered after measuring against the tape. The benchmark for every step is bank against
+`meta_tape.py`, currently 28.7k versus its 180k.
 
-1. **Price from live inventory, never from the base table.** This alone should fix the melon collapse.
-2. **Marginal-value allocation.** Give each tile to whichever crop has the highest value for its *next*
-   unit, accounting for what we have already committed and for season-long town + shop absorption. Melon
-   wins the first tiles and the allocation diversifies on its own.
-3. **Sell timing.** Trickle rather than dump; sell into scarcity. Measured: trickling at 2 units/turn beat
-   dumping by ~15% bank locally.
-4. **Fix the cash-starvation window.** v1 sits at exactly zero money from day 4 to day 14 and cannot hire
+1. **Abandon melon.** It floors at $1 against the meta in every game. This is the largest single fix and
+   it is a constant change, not an algorithm change.
+2. **Animals first, not last.** The tape's 180k comes mostly from milk (413 units), wool (251) and
+   fertilizer (408) — products that hold $243–303 against a single supplier. We run zero animals. Cows
+   and sheep need pasture, daily wheat, and `CARE`; the wheat can be bought.
+3. **Price from live inventory, never from the base table.** The generalisation of fix 1, so the next
+   crop that gets flooded doesn't cost us another submission cycle.
+4. **Sell around the tape's known windows.** Strawberry before day 18, melon outside days 10–12. This is
+   free money against 75% of the field and needs no market model at all — only a calendar.
+5. **Buy fertilizer, don't sell it.** It ends at $57 with a $100 base because the field dumps it, and
+   fertilizer doubles the per-day yield bonus on a watered crop.
+6. **Marginal-value allocation** across crops and animals, accounting for committed volume and
+   season-long town plus shop absorption.
+7. **Fix the cash-starvation window.** v1 sits at exactly zero money from day 4 to day 14 and cannot hire
    through it.
-5. **Animals.** 14 animal tiles are standard at the top and we have none. Eggs especially: one agent in
-   800 keeps geese, egg demand is unopposed, and egg's `log` glut curve is the most forgiving in the game.
 
 Every one of these is also a better league opponent for the RL track.
 
@@ -186,7 +242,8 @@ Every one of these is also a better league opponent for the RL track.
 
 ## How we decide anything is better
 
-Local head-to-head win rate against a fixed opponent set, seeds paired, with a confidence interval.
+Local head-to-head win rate against a fixed opponent set — `meta_tape`, `heuristic-v1`, `starter` — seeds
+paired, with a confidence interval.
 Never bank (it is not what the ladder scores), never leaderboard position (too noisy, and the Kore winner
 documented the instability), never a single game.
 
