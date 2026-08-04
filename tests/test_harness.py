@@ -1,5 +1,7 @@
 """Tests for the evaluation harness, its config, and match scoring."""
 
+from pathlib import Path
+
 from kaggriculture.agent import Agent, EpisodeAgent
 from kaggriculture.config import HarnessConfig
 from kaggriculture.harness import Harness
@@ -35,6 +37,27 @@ def test_matches_cover_every_opponent_and_seed() -> None:
         "random:6",
         "random:7",
     ]
+
+
+def test_replays_of_a_path_named_opponent_land_in_the_replay_directory(
+    tmp_path: Path,
+) -> None:
+    """A baseline given by path must not send its replay to its own directory."""
+    opponent = tmp_path / "baselines" / "tape.py"
+    opponent.parent.mkdir()
+    opponent.write_text(
+        'def agent(obs):\n    return {"farmer": ["PASS"], "hands": [], "market": []}\n'
+    )
+    replays = tmp_path / "replays"
+
+    EpisodeAgent(spec="pass", replay_dir=replays).run(
+        MatchTask(opponent=str(opponent), seed=0, episode_steps=24)
+    )
+
+    assert [path.name for path in replays.iterdir()] == [
+        f"{str(opponent).replace('/', '_')}:0.json"
+    ]
+    assert list(opponent.parent.iterdir()) == [opponent]
 
 
 def test_harness_plays_short_episodes_in_parallel() -> None:

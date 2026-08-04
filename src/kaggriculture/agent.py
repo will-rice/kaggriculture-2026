@@ -42,5 +42,9 @@ class EpisodeAgent:
         env.run([self.spec, task.opponent])
         if self.replay_dir is not None:
             self.replay_dir.mkdir(parents=True, exist_ok=True)
-            (self.replay_dir / f"{task.id}.json").write_text(json.dumps(env.toJSON()))
+            # An opponent named by path puts separators in the task id, and
+            # joining that onto the replay directory writes the replay next to
+            # the opponent instead of into the directory asked for.
+            name = task.id.replace("/", "_")
+            (self.replay_dir / f"{name}.json").write_text(json.dumps(env.toJSON()))
         return [state.reward for state in env.steps[-1]]
