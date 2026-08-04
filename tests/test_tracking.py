@@ -1,5 +1,7 @@
 """Tests for the shape of what we send to Weights & Biases."""
 
+import pytest
+
 from kaggriculture.config import HarnessConfig
 from kaggriculture.policy import Strategy
 from kaggriculture.report import Standing
@@ -48,3 +50,12 @@ def test_league_win_rate_is_the_headline_number() -> None:
     metrics = run_metrics([standing("a.py", 0.4), standing("b.py", 0.6)])
 
     assert metrics["win_rate/league"] == 0.5
+
+
+def test_opponents_sharing_a_basename_raise_instead_of_colliding() -> None:
+    """A silent overwrite would drop a row from a record meant to be trustworthy."""
+    with pytest.raises(ValueError) as excinfo:
+        run_metrics([standing("dir1/foo.py", 0.4), standing("dir2/foo.py", 0.6)])
+
+    assert "dir1/foo.py" in str(excinfo.value)
+    assert "dir2/foo.py" in str(excinfo.value)

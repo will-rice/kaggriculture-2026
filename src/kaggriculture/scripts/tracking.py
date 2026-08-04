@@ -86,17 +86,36 @@ def run_metrics(standings: list[Standing]) -> dict[str, float]:
 
     Opponents are named by file path, so the stem is used: a slash in a metric
     key nests it into a separate chart group and the league stops being
-    comparable at a glance.
+    comparable at a glance. Two opponents in different directories can share a
+    basename, which would otherwise collide onto the same key and silently
+    drop a row from a record whose whole point is to be trustworthy — so that
+    raises instead of picking a winner.
+
+    ``win_rate/league`` weights each opponent equally, regardless of how many
+    games it played. That normally coincides with a games-weighted mean,
+    because ``Harness.matches()`` gives every opponent the same seed and game
+    count by construction; the two diverge only when opponents error at
+    different rates and end up scored over different game counts.
 
     Args:
         standings: Per-opponent records from this evaluation.
 
     Returns:
         A flat mapping of metric name to value, plus a league-wide win rate.
+
+    Raises:
+        ValueError: If two standings' opponents share a metric-key stem.
     """
     metrics: dict[str, float] = {}
+    stems: dict[str, str] = {}
     for standing in standings:
         name = Path(standing.opponent).stem
+        if name in stems and stems[name] != standing.opponent:
+            raise ValueError(
+                f"opponents {stems[name]!r} and {standing.opponent!r} both collide "
+                f"on metric key {name!r}"
+            )
+        stems[name] = standing.opponent
         metrics[f"win_rate/{name}"] = standing.win_rate
         metrics[f"low/{name}"] = standing.low
         metrics[f"high/{name}"] = standing.high
