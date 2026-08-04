@@ -41,6 +41,5 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 [project.scripts]
 run = "kaggriculture.scripts.run:main"
-fetch-episodes = "kaggriculture.scripts.fetch_episodes:main"
 package = "kaggriculture.scripts.package:main"
 submit = "kaggriculture.scripts.submit:main"

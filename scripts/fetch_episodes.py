@@ -1,10 +1,17 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kaggle>=1.7.4"]
+# ///
 """Download any daily Kaggriculture replay datasets we do not have yet.
 
-Kaggle publishes one dataset of top-rated episodes per day and an index dataset
+Kaggle publishes one dataset of top-rated episodes per day plus an index dataset
 listing them. This reads the index and fetches whatever is missing locally, so it
-is safe to run repeatedly and safe to miss a day. It runs unattended from cron,
-so it uses the Kaggle Python API rather than the CLI — cron's minimal PATH does
-not reach the virtualenv's scripts.
+is safe to run repeatedly and safe to miss a day.
+
+Run from cron. The shebang makes uv resolve the dependencies above into its own
+cached environment, so the job does not depend on the project's virtualenv being
+present or in sync, and needs nothing on PATH beyond uv itself.
 """
 
 import argparse
