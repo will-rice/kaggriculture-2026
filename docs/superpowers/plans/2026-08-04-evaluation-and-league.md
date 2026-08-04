@@ -488,7 +488,7 @@ from kaggriculture.replay import Season, load, summarise
 def test_summarise_reads_a_real_episode(tmp_path: Path) -> None:
     """The module has to read what the harness actually writes."""
     env = make(ENVIRONMENT, configuration={"episodeSteps": 96, "seed": 5})
-    env.run(["baselines/meta_build.py", "pass"])
+    env.run(["baselines/heuristic_v1.py", "pass"])
     path = tmp_path / "episode.json"
     path.write_text(json.dumps(env.toJSON()))
 
@@ -753,10 +753,10 @@ def test_run_config_carries_every_strategy_knob() -> None:
 
 def test_metric_keys_survive_opponents_named_by_path() -> None:
     """League members are file paths; slashes would nest them into separate charts."""
-    metrics = run_metrics([standing("baselines/meta_build.py", 0.4)])
+    metrics = run_metrics([standing("baselines/heuristic_v1.py", 0.4)])
 
-    assert metrics["win_rate/meta_build"] == 0.4
-    assert metrics["bank/meta_build"] == 50000.0
+    assert metrics["win_rate/heuristic_v1"] == 0.4
+    assert metrics["bank/heuristic_v1"] == 50000.0
     assert not any("/" in key.split("/", 1)[1] for key in metrics)
 
 
