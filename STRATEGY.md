@@ -220,13 +220,19 @@ outcome where a good heuristic beats a good policy.
 Immediate work, reordered after measuring against the tape. The benchmark for every step is bank against
 `meta_tape.py`, currently 28.7k versus its 180k.
 
-1. **Abandon melon.** It floors at $1 against the meta in every game. This is the largest single fix and
-   it is a constant change, not an algorithm change.
-2. **Animals first, not last.** The tape's 180k comes mostly from milk (413 units), wool (251) and
-   fertilizer (408) — products that hold $243–303 against a single supplier. We run zero animals. Cows
-   and sheep need pasture, daily wheat, and `CARE`; the wheat can be bought.
-3. **Price from live inventory, never from the base table.** The generalisation of fix 1, so the next
-   crop that gets flooded doesn't cost us another submission cycle.
+1. **Animals. Nothing else comes close.** Valuing the tape's known sales at the market prices recorded
+   during a real game against us decomposes its gross revenue as milk ~112k (413 units at ~$272),
+   strawberry ~99k, wool ~61k, wheat ~46k (1103 units but only ~$42 each), melon ~43k, fertilizer ~32k.
+   **Animal products are over half of gross revenue**, and we produce none of them. (Start-of-step
+   pricing overstates the absolute figures, since a large order walks its own price down; the ranking is
+   what matters.) Cows and sheep need a pasture tile, daily wheat, and `CARE`; the wheat can simply be
+   bought, which is what the tape's 967 wheat purchases are for.
+2. **Abandon melon** — but only after animals. Measured against the tape, melon is *still* our best
+   single crop at 28.7k, versus wheat 9.4k, tomato 10.5k, carrot 4.1k and strawberry 1.5k. Crop choice is
+   not the gap; the absence of livestock is. Changing crop first would have been a wasted cycle, which is
+   exactly why this list is now ordered by measurement rather than by the earlier reasoning.
+3. **Price from live inventory, never from the base table.** So the next crop that gets flooded doesn't
+   cost us another submission cycle.
 4. **Sell around the tape's known windows.** Strawberry before day 18, melon outside days 10–12. This is
    free money against 75% of the field and needs no market model at all — only a calendar.
 5. **Buy fertilizer, don't sell it.** It ends at $57 with a $100 base because the field dumps it, and
