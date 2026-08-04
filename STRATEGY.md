@@ -218,9 +218,22 @@ RL takes weeks and the ladder is live now. The heuristic is also the honest hedg
 outcome where a good heuristic beats a good policy.
 
 Immediate work, reordered after measuring against the tape. The benchmark for every step is bank against
-`meta_tape.py`, currently 28.7k versus its 180k.
+`meta_tape.py`, which v1 played at 28.5k versus its 182k over 16 seeds.
 
-1. **Animals. Nothing else comes close.** Valuing the tape's known sales at the market prices recorded
+1. ~~**Animals. Nothing else comes close.**~~ **Done — 28.5k → 40.1k** over the same 16 seeds, with the
+   tape's own bank pulled down from 182k to 164k. Still 0 wins: the herd closes a third of a gap that is
+   a factor of four wide, so items 2–7 all still stand. Three things had to be true at once and each was
+   worth measuring separately: budget every market order against the balance the previous orders left
+   (independent budgeting spent $3000 three ways on day zero and starved the farm to $56 for twelve
+   days); buy an animal only when its feed is already in the shed and build its pasture only when it is
+   waiting for one; and charge the herd's daily feed, care and harvest against the same crew the crops
+   draw on. A target herd of 8 cows and 6 sheep — the tape's mix — measured *worse* than 8 cows and 2
+   sheep (32.8k vs 40.8k): past about ten animals this crew cannot walk the feed round, and the animals
+   it misses escape. Splitting the feed run across several carriers measured worse than one loaded
+   carrier at every split tried, because the pastures sit together beside the shed.
+
+   The original reasoning below is kept because items 2–7 are ordered by it.
+   Valuing the tape's known sales at the market prices recorded
    during a real game against us decomposes its gross revenue as milk ~112k (413 units at ~$272),
    strawberry ~99k, wool ~61k, wheat ~46k (1103 units but only ~$42 each), melon ~43k, fertilizer ~32k.
    **Animal products are over half of gross revenue**, and we produce none of them. (Start-of-step
