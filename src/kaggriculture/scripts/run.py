@@ -7,11 +7,11 @@ reports a win rate per opponent.
 import argparse
 import logging
 from pathlib import Path
-from statistics import mean
 
 from kaggriculture.agent import EpisodeAgent
 from kaggriculture.config import HarnessConfig
 from kaggriculture.harness import Harness
+from kaggriculture.report import format_standing, standings
 from kaggriculture.result import Result
 from kaggriculture.scripts.package import ENTRYPOINT
 
@@ -46,24 +46,18 @@ def main() -> None:
     harness = Harness(config=config)
     agent = EpisodeAgent(spec=args.agent, replay_dir=args.replays)
     results = harness.run(agent, harness.matches())
-    report(results, config)
+    report(results)
 
 
-def report(results: list[Result], config: HarnessConfig) -> None:
-    """Log one line per opponent, plus any episode that failed to run."""
-    for opponent in config.opponents:
-        played = [result for result in results if result.opponent == opponent]
-        banks = [result.scores for result in played if result.scores]
-        LOGGER.info(
-            "vs %-10s win_rate %.2f  (%dW %dL %dT)  bank %8.0f vs %8.0f",
-            opponent,
-            mean(result.score for result in played),
-            sum(result.score == 1.0 for result in played),
-            sum(result.score == 0.0 and not result.error for result in played),
-            sum(result.score == 0.5 for result in played),
-            mean(bank[0] for bank in banks),
-            mean(bank[1] for bank in banks),
-        )
+def report(results: list[Result]) -> None:
+    """Log one line per opponent, plus any episode that failed to run.
+
+    Win rate rather than bank: the ladder scores wins, and a change that banks
+    more while winning less has not improved anything. The interval is what
+    decides whether a difference is real or is sixteen seeds of noise.
+    """
+    for standing in standings(results):
+        LOGGER.info("%s", format_standing(standing))
     for result in results:
         if result.error:
             LOGGER.error("%s failed: %s", result.task_id, result.error)
