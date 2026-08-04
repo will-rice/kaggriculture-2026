@@ -15,11 +15,12 @@ zero.
 import dataclasses
 import logging
 import subprocess
+from importlib.machinery import ModuleSpec, SourceFileLoader
+from importlib.util import module_from_spec
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import wandb
-
 from kaggriculture.config import HarnessConfig
 from kaggriculture.policy import Strategy
 from kaggriculture.report import Standing
@@ -33,7 +34,6 @@ ENTITY = "will-rice"
 def log_evaluation(
     standings: list[Standing],
     config: HarnessConfig,
-    strategy: Strategy,
     agent: str,
 ) -> None:
     """Send one evaluation run to Weights & Biases.
@@ -48,30 +48,37 @@ def log_evaluation(
         entity=ENTITY,
         project=PROJECT,
         job_type="evaluation",
-        config=run_config(config, strategy, agent),
+        config=run_config(config, agent),
     )
     run.log(run_metrics(standings))
     run.finish()
     LOGGER.info("logged to %s", run.url)
 
 
-def run_config(config: HarnessConfig, strategy: Strategy, agent: str) -> dict[str, Any]:
+def run_config(config: HarnessConfig, agent: str) -> dict[str, Any]:
     """Return the configuration that produced a run, flat enough to group by.
 
     Every ``Strategy`` field is included because any of them may turn out to be
     the one that mattered — the herd size and the crop both did, and neither was
     predictable in advance.
 
+    The strategy is read from the agent rather than passed alongside it. The two
+    getting out of step is not hypothetical: this function used to take a
+    ``Strategy`` argument and every caller handed it the package default, so a
+    run evaluating a frozen baseline recorded the knobs of a completely
+    different farm. A record that misdescribes what it measured is worse than no
+    record, because it is trusted.
+
     Args:
         config: Harness configuration the evaluation ran under.
-        strategy: Policy knobs the evaluated agent used.
         agent: Agent path or built-in name that was evaluated.
 
     Returns:
         A flat mapping suitable as a wandb run config.
     """
+    strategy = strategy_of(agent)
     return {
-        **dataclasses.asdict(strategy),
+        **(dataclasses.asdict(strategy) if strategy is not None else {}),
         "agent": agent,
         "games": config.games,
         "seed": config.seed,
@@ -79,6 +86,30 @@ def run_config(config: HarnessConfig, strategy: Strategy, agent: str) -> dict[st
         "episode_steps": config.episode_steps,
         "commit": commit(),
     }
+
+
+def strategy_of(agent: str) -> Optional[Strategy]:
+    """Return the ``Strategy`` the named agent plays under, if it has one.
+
+    Built-in opponents are named rather than pathed and carry no strategy, and
+    the vendored economic policy has none either — it is not parameterised that
+    way. A run of either honestly records no knobs rather than borrowing
+    somebody else's.
+
+    Args:
+        agent: Agent path or built-in name.
+
+    Returns:
+        The module's ``STRATEGY`` if it exposes one, otherwise ``None``.
+    """
+    path = Path(agent)
+    if not path.is_file():
+        return None
+    loader = SourceFileLoader(path.stem, str(path))
+    module = module_from_spec(ModuleSpec(loader.name, loader))
+    loader.exec_module(module)
+    strategy = getattr(module, "STRATEGY", None)
+    return strategy if isinstance(strategy, Strategy) else None
 
 
 def run_metrics(standings: list[Standing]) -> dict[str, float]:

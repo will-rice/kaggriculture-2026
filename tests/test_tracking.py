@@ -3,7 +3,6 @@
 import pytest
 
 from kaggriculture.config import HarnessConfig
-from kaggriculture.policy import Strategy
 from kaggriculture.report import Standing
 from kaggriculture.scripts.tracking import run_config, run_metrics
 
@@ -27,12 +26,12 @@ def standing(opponent: str, win_rate: float) -> Standing:
 
 def test_run_config_carries_every_strategy_knob() -> None:
     """A sweep is only comparable if the configuration that produced it is recorded."""
-    config = run_config(HarnessConfig(), Strategy(), agent="main.py")
+    config = run_config(HarnessConfig(), agent="baselines/heuristic_v2.py")
 
     assert config["crops"] == {"WHEAT": 11, "MELON": 11, "STRAWBERRY": 40}
     assert config["sell_rate"] == 2
     assert config["tiles_per_unit"] == 5
-    assert config["agent"] == "main.py"
+    assert config["agent"] == "baselines/heuristic_v2.py"
     assert "games" in config and "seed" in config
 
 
@@ -59,3 +58,38 @@ def test_opponents_sharing_a_basename_raise_instead_of_colliding() -> None:
 
     assert "dir1/foo.py" in str(excinfo.value)
     assert "dir2/foo.py" in str(excinfo.value)
+
+
+def test_config_describes_the_agent_that_ran_not_the_package_default() -> None:
+    """The runner used to log the package default whatever --agent selected.
+
+    That is the failure this module exists to prevent, and it happened: the
+    Phase 1 gate evaluated a frozen baseline and recorded the knobs of an
+    entirely different farm. The strategy is now read from the agent, so the two
+    cannot disagree.
+    """
+    from kaggriculture.policy import STRATEGY
+
+    logged = run_config(HarnessConfig(), agent="baselines/heuristic_v1.py")
+
+    assert logged["crops"] == {"MELON": 36}
+    assert logged["herd"] == {}
+    assert logged["max_hands"] == 8
+    assert logged["crops"] != dict(STRATEGY.crops)
+
+
+def test_an_agent_without_a_strategy_records_none_rather_than_borrowing_one() -> None:
+    """The served agent is not parameterised by Strategy; it must not claim to be."""
+    logged = run_config(HarnessConfig(), agent="main.py")
+
+    assert "crops" not in logged
+    assert "sell_rate" not in logged
+    assert logged["agent"] == "main.py"
+
+
+def test_a_builtin_opponent_has_no_strategy() -> None:
+    """Built-ins are named rather than pathed, so there is no module to read."""
+    logged = run_config(HarnessConfig(), agent="starter")
+
+    assert "crops" not in logged
+    assert logged["agent"] == "starter"

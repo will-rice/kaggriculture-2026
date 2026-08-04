@@ -933,7 +933,13 @@ the episode on turn zero."
 
 ### Task 6: Pass the Phase 1 gate
 
-STRATEGY.md's gate: `heuristic-v1` vs `meta-build` over 100 seeded games returns a win rate with a CI narrower than ±0.1, in under 10 minutes on 64 cores.
+STRATEGY.md's gate: `heuristic-v1` vs the strongest league opponent over 100 seeded games returns a win rate
+with a CI narrower than ±0.1, in under 10 minutes on 64 cores.
+
+> **Substitution.** The gate was written as `heuristic-v1` vs `meta-build`. `meta_build` was ruled out of
+> the league during Task 2 — it was byte-for-byte the shipped agent, so the matchup would have been
+> self-play. The recorded tape takes its place as the strongest available opponent. The gate tests
+> whether the infrastructure returns a tight interval quickly, and any real opponent serves that.
 
 **Files:**
 
@@ -944,7 +950,7 @@ STRATEGY.md's gate: `heuristic-v1` vs `meta-build` over 100 seeded games returns
 ```bash
 time uv run python -m kaggriculture.scripts.run \
   --agent baselines/heuristic_v1.py \
-  --opponents baselines/meta_build.py \
+  --opponents /data/kaggriculture/baselines/meta_tape.py \
   --games 100 --workers 64 --seed 1000 --track
 ```
 
@@ -965,7 +971,7 @@ Add under Phase 1 in `STRATEGY.md`, filling in the measured numbers:
 ```markdown
 #### Result — gate passed YYYY-MM-DD
 
-`heuristic-v1` vs `meta-build` over 100 seeded games: win rate X.XXX
+`heuristic-v1` vs the recorded tape over 100 seeded games: win rate X.XXX
 [low, high], half-width 0.0XX, in Xm Xs on 64 cores.
 
 Reference league standing for the current submission, 100 games each:

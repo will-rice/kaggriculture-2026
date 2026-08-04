@@ -12,7 +12,6 @@ from pathlib import Path
 from kaggriculture.agent import EpisodeAgent
 from kaggriculture.config import HarnessConfig
 from kaggriculture.harness import Harness
-from kaggriculture.policy import STRATEGY
 from kaggriculture.report import format_standing, standings
 from kaggriculture.result import Result
 from kaggriculture.scripts.package import ENTRYPOINT
@@ -55,7 +54,7 @@ def main() -> None:
     if args.track:
         from kaggriculture.scripts.tracking import log_evaluation
 
-        log_evaluation(standings(results), config, STRATEGY, args.agent)
+        log_evaluation(standings(results), config, args.agent)
 
 
 def report(results: list[Result]) -> None:
