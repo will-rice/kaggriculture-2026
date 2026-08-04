@@ -75,7 +75,7 @@ def test_season_ends_with_produce_sold(episode: list) -> None:
 
 def test_new_plants_are_watered_on_their_planting_day() -> None:
     """A plant starts one dry day down, so skipping day zero would kill it."""
-    crop = STRATEGY.crop
+    crop = next(iter(STRATEGY.crops))
     fresh = {
         "crop": crop,
         "planted_day": 3,
@@ -88,7 +88,7 @@ def test_new_plants_are_watered_on_their_planting_day() -> None:
 
 def test_watering_is_skipped_outside_the_bonus_window() -> None:
     """A plant watered yesterday and outside its window can safely wait a turn."""
-    crop = STRATEGY.crop
+    crop = next(iter(STRATEGY.crops))
     idle = {
         "crop": crop,
         "planted_day": 0,

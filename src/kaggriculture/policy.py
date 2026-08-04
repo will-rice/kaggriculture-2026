@@ -60,14 +60,19 @@ HAUL = 10
 class Strategy:
     """Tunable knobs for the baseline policy."""
 
-    crop: str = "STRAWBERRY"
-    herd: Mapping[str, int] = field(default_factory=lambda: {"COW": 8, "SHEEP": 2})
+    # Target tile counts, in planting priority. Matched to the meta build
+    # measured from a replay: wheat early for cash it returns on day two, melon
+    # through the middle, strawberry as the standing crop it ramps to 40 of.
+    crops: Mapping[str, int] = field(
+        default_factory=lambda: {"WHEAT": 11, "MELON": 11, "STRAWBERRY": 40}
+    )
+    herd: Mapping[str, int] = field(default_factory=lambda: {"COW": 8, "SHEEP": 6})
     max_hands: int = 12
-    tiles_per_unit: int = 4
+    tiles_per_unit: int = 5
     hire_before_hour: int = 4
     wage_share: float = 0.1
     cash_reserve: int = 300
-    land_reserve: int = 800
+    land_reserve: int = 400
     last_land_day: int = 20
     animals_per_turn: int = 2
     working_capital: int = 400
@@ -357,33 +362,56 @@ def crop_capacity(obs: Observation, strategy: Strategy) -> int:
     return crew - sum(owned_animals(obs).values())
 
 
-def plantable(obs: Observation, strategy: Strategy) -> int:
-    """Return how many more tiles are worth sowing right now.
+def planted(obs: Observation) -> collections.Counter[str]:
+    """Return how many tiles currently hold each crop."""
+    return collections.Counter(
+        tile["crop"] for row in obs.tiles for tile in row if is_plant(tile)
+    )
 
-    A crop that misses two days of water becomes a weed, so planting past what
-    the crew can walk to every day destroys tiles instead of earning from them.
-    The area is therefore capped by the crew a full day can field, not by the
-    land owned.
+
+def wanted_crops(obs: Observation, strategy: Strategy) -> collections.Counter[str]:
+    """Return how many more tiles of each crop to sow, in planting order.
+
+    A crop sown too late to reach its first yield is a wasted seed and a wasted
+    tile, so each is dropped from the mix once the season is shorter than its
+    ``first_yield_day``. That is what retires wheat and melon into strawberry as
+    the season runs on, and it is why the mix is expressed as target tile counts
+    rather than a schedule: the calendar falls out of the crop table.
+
+    The total is still capped by what the crew can water, since the mix names
+    what we would like and the crew decides what we can keep alive. It is
+    deliberately *not* also capped by ground currently free: seed has to be in
+    hand before a tile opens, and rationing it to today's empty tiles measured
+    5k worse because planting stalled every time a harvest freed ground.
     """
-    if obs.day + CROPS[strategy.crop]["first_yield_day"] > LAST_DAY:
-        return 0
-    return min(len(obs.open_tiles()), crop_capacity(obs, strategy) - obs.plant_count())
+    standing = planted(obs)
+    room = crop_capacity(obs, strategy) - sum(standing.values())
+    wanted: collections.Counter[str] = collections.Counter()
+    for crop, target in strategy.crops.items():
+        if obs.day + int(CROPS[crop]["first_yield_day"]) > LAST_DAY:
+            continue
+        take = min(max(target - standing[crop], 0), max(room, 0))
+        if take:
+            wanted[crop] = take
+            room -= take
+    return wanted
 
 
 def planting_jobs(obs: Observation, strategy: Strategy) -> list[Job]:
     """Return plant jobs for open tiles, capped by seeds on hand.
 
     The environment drops *every* ``PLANT`` op for a crop when a turn requests
-    more of a crop than there are seeds, so the seed cap is a correctness
-    requirement and not just an optimisation.
+    more of a crop than there are seeds, so the per-crop seed cap is a
+    correctness requirement and not just an optimisation.
     """
-    crop = strategy.crop
-    wanted = min(plantable(obs, strategy), obs.seeds.get(crop, 0))
-    if wanted <= 0:
-        return []
     reserved = set(pasture_sites(obs, strategy))
     free = [pos for pos in obs.open_tiles() if pos not in reserved]
-    return [Job(PLANT, pos, ["PLANT", crop]) for pos in free[:wanted]]
+    jobs: list[Job] = []
+    for crop, count in wanted_crops(obs, strategy).items():
+        take = min(count, obs.seeds.get(crop, 0), len(free))
+        jobs.extend(Job(PLANT, pos, ["PLANT", crop]) for pos in free[:take])
+        free = free[take:]
+    return jobs
 
 
 def haul_jobs(obs: Observation, strategy: Strategy) -> list[Job]:
@@ -434,14 +462,17 @@ def plan_market(obs: Observation, strategy: Strategy) -> list[Op]:
     money = obs.money
     orders = sell_orders(obs, strategy)
     # Feed first: an unfed animal is a bought asset walking off the farm. Then
-    # labour and seed, which are what the crops already in the ground need to
-    # pay for the herd, and only then the herd itself and more land.
+    # labour and seed, which the crops already in the ground need. Land comes
+    # before livestock because it is the multiplier — every later crop and
+    # pasture needs ground to stand on, and buying it last left the farm on its
+    # opening quadrant until day fourteen while the meta build owned all three
+    # by day twelve.
     for planner in (
         feed_orders,
         hire_orders,
         seed_orders,
-        animal_orders,
         land_orders,
+        animal_orders,
     ):
         planned, spent = planner(obs, strategy, money)
         orders.extend(planned)
@@ -563,9 +594,7 @@ def hire_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
     if obs.hour > strategy.hire_before_hour or obs.day >= LAST_DAY:
         return [], 0
     work = (
-        obs.plant_count()
-        + obs.seeds.get(strategy.crop, 0)
-        + sum(owned_animals(obs).values())
+        obs.plant_count() + sum(obs.seeds.values()) + sum(owned_animals(obs).values())
     )
     target = min(strategy.max_hands, -(-work // strategy.tiles_per_unit))
     budget = money * strategy.wage_share
@@ -581,11 +610,17 @@ def hire_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
 
 
 def land_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
-    """Return a land order once the crew has outgrown the land it already owns."""
+    """Return a land order once the farm has outgrown the land it already owns.
+
+    Sized to the crops the mix asks for plus a tile per animal, because pastures
+    occupy ground too. The meta build owns all three quadrants by day twelve and
+    works 52 crop tiles beside 14 animals, which does not fit in two.
+    """
     bought = len(obs.farm["unlocked_quadrants"]) - 1
     if bought >= len(LAND_PRICES) or obs.day > strategy.last_land_day:
         return [], 0
-    if obs.unlocked_tile_count() >= crop_capacity(obs, strategy):
+    needed = sum(strategy.crops.values()) + sum(strategy.herd.values())
+    if obs.unlocked_tile_count() >= needed:
         return [], 0
     if money < LAND_PRICES[bought] + strategy.land_reserve:
         return [], 0
@@ -593,11 +628,21 @@ def land_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
 
 
 def seed_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
-    """Return a seed order sized to the tiles the crew can still take on."""
-    crop = strategy.crop
-    price = int(CROPS[crop]["seed"])
-    wanted = plantable(obs, strategy) - obs.seeds.get(crop, 0)
-    quantity = min(wanted, int((money - strategy.cash_reserve) // price))
-    if quantity <= 0:
-        return [], 0
-    return [["BUY_SEED", crop, quantity]], quantity * price
+    """Return seed orders sized to the tiles the crew can still take on.
+
+    Crops are bought in the mix's own order, so the cheap fast ones are funded
+    first when money is short. Wheat yields on day two against a ten-coin seed,
+    which is what pays for the land and the livestock that the slow crops need.
+    """
+    orders: list[Op] = []
+    spent = 0
+    for crop, count in wanted_crops(obs, strategy).items():
+        price = int(CROPS[crop]["seed"])
+        wanted = count - obs.seeds.get(crop, 0)
+        affordable = int((money - spent - strategy.cash_reserve) // price)
+        quantity = min(wanted, affordable)
+        if quantity <= 0:
+            continue
+        orders.append(["BUY_SEED", crop, quantity])
+        spent += quantity * price
+    return orders, spent
