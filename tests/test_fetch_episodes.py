@@ -1,17 +1,17 @@
 """Tests for the daily replay fetcher, which runs unattended from cron."""
 
-import importlib.util
 import os
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import ModuleType
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "fetch_episodes.py"
 
 
-def load_script():  # noqa: ANN201 - module object from a path, not an importable package
+def load_script() -> ModuleType:
     """Import the cron script by path, since it lives outside the package."""
-    spec = importlib.util.spec_from_file_location("fetch_episodes", SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = ModuleType("fetch_episodes")
+    SourceFileLoader("fetch_episodes", str(SCRIPT)).exec_module(module)
     return module
 
 
