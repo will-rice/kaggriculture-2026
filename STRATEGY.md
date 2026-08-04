@@ -115,6 +115,30 @@ flush.
 
 ---
 
+## The public kernels are exhausted
+
+Surveyed the competition's top kernels on 2026-08-04, by votes, classifying each as a replay of a
+recorded episode or a reactive agent that reads the observation:
+
+| kernel                    | votes | what it is                              |
+| ------------------------- | ----- | --------------------------------------- |
+| romantamrazov (hamburger) | 105   | the recorded tape                       |
+| **pilkwang**              | 74    | **the only genuinely reactive agent**   |
+| prvsiyan (frontier lab)   | 55    | analysis and visualisation, no agent    |
+| degnonguidi               | 43    | replay variant, carries `TRACE_ACTIONS` |
+| lucifer19 (night harvest) | 37    | replay variant, carries `TRACE_ACTIONS` |
+| kaitofukami (closed loop) | 32    | analysis; never reads the observation   |
+
+So the field's public code is one recording, several re-wrappings of that recording, some analysis, and
+one real agent — which we adopted. **There is nothing left to borrow.** Every improvement from here has
+to be ours.
+
+That reframes the gap to the top of the board. The leader sits at 3070 and the recorded tape at ~1720,
+so the teams above us are running private agents substantially stronger than anything published. Copying
+has taken us as far as it goes; the remaining distance is work.
+
+---
+
 ## What actually decides games
 
 Three levers, in order of measured impact.
