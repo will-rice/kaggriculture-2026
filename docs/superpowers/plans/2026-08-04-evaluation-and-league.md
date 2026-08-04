@@ -6,7 +6,7 @@
 
 **Architecture:** Three additions to the existing harness. A `report` module turns `Result` lists into per-opponent win rates with Wilson score intervals. A `baselines/` directory holds frozen named opponents, each a thin module that runs the existing policy under a pinned `Strategy` — so a baseline is a configuration, not a copy of the code, and cannot rot. A `replay` module turns the ad-hoc replay inspection used during development into a real API, because every later phase reads it.
 
-**Tech Stack:** Python 3.11, `pydantic` models, `pytest` functional style, `kaggle-environments` for episodes, `ProcessPoolExecutor` for fan-out. No new dependencies.
+**Tech Stack:** Python 3.11, `pydantic` models, `pytest` functional style, `kaggle-environments` for episodes, `ProcessPoolExecutor` for fan-out, `wandb` for the run record.
 
 ## Global Constraints
 
@@ -22,18 +22,20 @@
 
 ## File Structure
 
-| File                               | Responsibility                                                                                                                                        |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/kaggriculture/report.py`      | **Create.** Wilson interval, per-opponent aggregation, one formatted line per opponent. Pure functions over `Result` lists — no I/O, no environment.  |
-| `src/kaggriculture/replay.py`      | **Create.** Load an episode JSON and answer questions about it: crop mix per day, bank trajectory, animals lost, realised prices, end-of-season shed. |
-| `baselines/heuristic_v1.py`        | **Create.** The melon monoculture that first went on the ladder, pinned as a `Strategy`.                                                              |
-| `baselines/meta_build.py`          | **Create.** The reconstructed meta build — a _reactive_ agent playing what 75% of the ladder plays, unlike the open-loop tape.                        |
-| `src/kaggriculture/constants.py`   | **Modify.** Add `LEAGUE` naming the frozen opponents.                                                                                                 |
-| `src/kaggriculture/config.py`      | **Modify.** Default `opponents` to `LEAGUE`.                                                                                                          |
-| `src/kaggriculture/scripts/run.py` | **Modify.** Report win rate with CI instead of mean bank.                                                                                             |
-| `tests/test_report.py`             | **Create.** Interval maths and aggregation.                                                                                                           |
-| `tests/test_replay.py`             | **Create.** Replay analysis against a real short episode.                                                                                             |
-| `tests/test_baselines.py`          | **Create.** Every league member plays a legal season.                                                                                                 |
+| File                                    | Responsibility                                                                                                                                        |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/kaggriculture/report.py`           | **Create.** Wilson interval, per-opponent aggregation, one formatted line per opponent. Pure functions over `Result` lists — no I/O, no environment.  |
+| `src/kaggriculture/replay.py`           | **Create.** Load an episode JSON and answer questions about it: crop mix per day, bank trajectory, animals lost, realised prices, end-of-season shed. |
+| `baselines/heuristic_v1.py`             | **Create.** The melon monoculture that first went on the ladder, pinned as a `Strategy`.                                                              |
+| `baselines/meta_build.py`               | **Create.** The reconstructed meta build — a _reactive_ agent playing what 75% of the ladder plays, unlike the open-loop tape.                        |
+| `src/kaggriculture/constants.py`        | **Modify.** Add `LEAGUE` naming the frozen opponents.                                                                                                 |
+| `src/kaggriculture/config.py`           | **Modify.** Default `opponents` to `LEAGUE`.                                                                                                          |
+| `src/kaggriculture/scripts/tracking.py` | **Create.** One wandb run per evaluation. Under `scripts/` so it can never reach the submission archive.                                              |
+| `src/kaggriculture/scripts/run.py`      | **Modify.** Report win rate with CI instead of mean bank; add `--track`.                                                                              |
+| `tests/test_report.py`                  | **Create.** Interval maths and aggregation.                                                                                                           |
+| `tests/test_replay.py`                  | **Create.** Replay analysis against a real short episode.                                                                                             |
+| `tests/test_tracking.py`                | **Create.** The shape of the wandb payload, without touching the network.                                                                             |
+| `tests/test_baselines.py`               | **Create.** Every league member plays a legal season.                                                                                                 |
 
 ---
 
@@ -51,7 +53,7 @@ The current runner reports mean bank, which is not what the ladder scores. It al
 - Consumes: `kaggriculture.result.Result` (fields `task_id`, `score`, `error`, `scores`; property `opponent`).
 - Produces:
   - `wilson_interval(wins: float, games: int, z: float = 1.96) -> tuple[float, float]`
-  - `class Standing(BaseModel)` with fields `opponent: str`, `games: int`, `wins: int`, `losses: int`, `ties: int`, `errors: int`, `win_rate: float`, `low: float`, `high: float`, and property `half_width: float`
+  - `class Standing(BaseModel)` with fields `opponent: str`, `games: int`, `wins: int`, `losses: int`, `ties: int`, `errors: int`, `win_rate: float`, `low: float`, `high: float`, `bank: float`, `opponent_bank: float`, and property `half_width: float`
   - `standings(results: list[Result]) -> list[Standing]`
   - `format_standing(standing: Standing) -> str`
 
@@ -105,6 +107,20 @@ def test_standings_separate_wins_losses_ties_and_errors() -> None:
     assert (standing.wins, standing.losses, standing.ties) == (1, 1, 1)
     assert standing.errors == 1
     assert standing.games == 3
+
+
+def test_standings_average_the_banks_of_scored_games() -> None:
+    """Bank is no longer the acceptance metric, but it is still the diagnostic."""
+    results = [
+        Result(task_id="tape:1", agent_id="a", score=0.0, scores=[40000.0, 170000.0]),
+        Result(task_id="tape:2", agent_id="a", score=0.0, scores=[60000.0, 150000.0]),
+        Result(task_id="tape:3", agent_id="a", score=0.0, error="boom"),
+    ]
+
+    (standing,) = standings(results)
+
+    assert standing.bank == 50000.0
+    assert standing.opponent_bank == 160000.0
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -126,6 +142,7 @@ on the page, and the difference decides whether a change ships.
 """
 
 import math
+from typing import Iterable
 
 from pydantic import BaseModel
 
@@ -169,6 +186,8 @@ class Standing(BaseModel):
     win_rate: float
     low: float
     high: float
+    bank: float
+    opponent_bank: float
 
     @property
     def half_width(self) -> float:
@@ -195,6 +214,7 @@ def standings(results: list[Result]) -> list[Standing]:
         losses = len(scored) - wins - ties
         points = wins + ties / 2
         low, high = wilson_interval(points, len(scored))
+        banked = [result.scores for result in scored if result.scores]
         table.append(
             Standing(
                 opponent=opponent,
@@ -206,9 +226,17 @@ def standings(results: list[Result]) -> list[Standing]:
                 win_rate=points / len(scored) if scored else 0.0,
                 low=low,
                 high=high,
+                bank=mean(pair[0] for pair in banked) if banked else 0.0,
+                opponent_bank=mean(pair[1] for pair in banked) if banked else 0.0,
             )
         )
     return table
+
+
+def mean(values: Iterable[float]) -> float:
+    """Return the arithmetic mean, or zero for an empty sequence."""
+    collected = list(values)
+    return sum(collected) / len(collected) if collected else 0.0
 
 
 def format_standing(standing: Standing) -> str:
@@ -218,6 +246,7 @@ def format_standing(standing: Standing) -> str:
         f"{standing.win_rate:.3f} [{standing.low:.3f}, {standing.high:.3f}]  "
         f"({standing.wins}W {standing.losses}L {standing.ties}T"
         f"{f' {standing.errors}E' if standing.errors else ''})"
+        f"  bank {standing.bank:8.0f} vs {standing.opponent_bank:8.0f}"
     )
 ```
 
@@ -645,7 +674,256 @@ the ladder only counts wins."
 
 ---
 
-### Task 5: Pass the Phase 1 gate
+### Task 5: Log every evaluation run to Weights & Biases
+
+Roughly a dozen sweeps were run in one day — herd size, crop, sell rate, tiles per unit, land reserve — and every result exists only in terminal scrollback and prose in commit messages. That is not a record anyone can query, and it is why re-checking whether an old constant still holds means re-running it. One wandb run per evaluation, with the whole `Strategy` as config, makes the sweep table the thing it should always have been: a queryable record of which configuration beat which opponent, comparable across days.
+
+**Critical:** this module lives under `src/kaggriculture/scripts/`, which `package.py` excludes from the submission archive (`EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts")`). `wandb` must never reach the competition sandbox — there is no network there and no API key, and an import error on turn zero forfeits the game.
+
+**Files:**
+
+- Create: `src/kaggriculture/scripts/tracking.py`
+- Modify: `src/kaggriculture/scripts/run.py` (add `--track` flag, call the logger)
+- Modify: `pyproject.toml` (via `uv add`)
+- Test: `tests/test_tracking.py`
+
+**Interfaces:**
+
+- Consumes: `kaggriculture.report.Standing`, `kaggriculture.config.HarnessConfig`, `kaggriculture.policy.Strategy`.
+- Produces:
+  - `run_config(config: HarnessConfig, strategy: Strategy, agent: str) -> dict[str, Any]`
+  - `run_metrics(standings: list[Standing]) -> dict[str, float]`
+  - `log_evaluation(standings: list[Standing], config: HarnessConfig, strategy: Strategy, agent: str) -> None`
+  - Module constants `PROJECT = "kaggriculture-2026"`, `ENTITY = "will-rice"`
+
+- [ ] **Step 1: Add the dependency**
+
+```bash
+uv add wandb
+```
+
+- [ ] **Step 2: Write the failing test**
+
+Create `tests/test_tracking.py`. The two payload builders are pure functions, so they are tested directly and no network is touched:
+
+```python
+"""Tests for the shape of what we send to Weights & Biases."""
+
+from kaggriculture.config import HarnessConfig
+from kaggriculture.policy import Strategy
+from kaggriculture.report import Standing
+from kaggriculture.scripts.tracking import run_config, run_metrics
+
+
+def standing(opponent: str, win_rate: float) -> Standing:
+    """Return a standing with the fields the metric builder reads."""
+    return Standing(
+        opponent=opponent,
+        games=100,
+        wins=int(win_rate * 100),
+        losses=100 - int(win_rate * 100),
+        ties=0,
+        errors=0,
+        win_rate=win_rate,
+        low=win_rate - 0.05,
+        high=win_rate + 0.05,
+        bank=50000.0,
+        opponent_bank=170000.0,
+    )
+
+
+def test_run_config_carries_every_strategy_knob() -> None:
+    """A sweep is only comparable if the configuration that produced it is recorded."""
+    config = run_config(HarnessConfig(), Strategy(), agent="main.py")
+
+    assert config["crops"] == {"WHEAT": 11, "MELON": 11, "STRAWBERRY": 40}
+    assert config["sell_rate"] == 2
+    assert config["tiles_per_unit"] == 5
+    assert config["agent"] == "main.py"
+    assert "games" in config and "seed" in config
+
+
+def test_metric_keys_survive_opponents_named_by_path() -> None:
+    """League members are file paths; slashes would nest them into separate charts."""
+    metrics = run_metrics([standing("baselines/meta_build.py", 0.4)])
+
+    assert metrics["win_rate/meta_build"] == 0.4
+    assert metrics["bank/meta_build"] == 50000.0
+    assert not any("/" in key.split("/", 1)[1] for key in metrics)
+
+
+def test_league_win_rate_is_the_headline_number() -> None:
+    """One number decides whether a change ships, and it spans the whole league."""
+    metrics = run_metrics([standing("a.py", 0.4), standing("b.py", 0.6)])
+
+    assert metrics["win_rate/league"] == 0.5
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `uv run pytest tests/test_tracking.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.scripts.tracking'`
+
+- [ ] **Step 4: Write the implementation**
+
+Create `src/kaggriculture/scripts/tracking.py`:
+
+```python
+"""Recording evaluation runs to Weights & Biases.
+
+A dozen sweeps in a day left their results in terminal scrollback and in prose,
+which means the only way to recheck an old constant is to run it again. One run
+per evaluation, carrying the whole ``Strategy`` as config, turns the sweep into
+something queryable: which configuration, against which opponent, at what win
+rate, at which commit.
+
+This module deliberately lives under ``scripts``, which ``package.py`` excludes
+from the submission archive. The competition sandbox has no network and no API
+key, so an import of ``wandb`` reaching it would forfeit the episode on turn
+zero.
+"""
+
+import dataclasses
+import logging
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import wandb
+
+from kaggriculture.config import HarnessConfig
+from kaggriculture.policy import Strategy
+from kaggriculture.report import Standing
+
+LOGGER = logging.getLogger(__name__)
+
+PROJECT = "kaggriculture-2026"
+ENTITY = "will-rice"
+
+
+def log_evaluation(
+    standings: list[Standing],
+    config: HarnessConfig,
+    strategy: Strategy,
+    agent: str,
+) -> None:
+    """Send one evaluation run to Weights & Biases."""
+    run = wandb.init(
+        entity=ENTITY,
+        project=PROJECT,
+        job_type="evaluation",
+        config=run_config(config, strategy, agent),
+    )
+    run.log(run_metrics(standings))
+    run.finish()
+    LOGGER.info("logged to %s", run.url)
+
+
+def run_config(
+    config: HarnessConfig, strategy: Strategy, agent: str
+) -> dict[str, Any]:
+    """Return the configuration that produced a run, flat enough to group by.
+
+    Every ``Strategy`` field is included because any of them may turn out to be
+    the one that mattered — the herd size and the crop both did, and neither was
+    predictable in advance.
+    """
+    return {
+        **dataclasses.asdict(strategy),
+        "agent": agent,
+        "games": config.games,
+        "seed": config.seed,
+        "opponents": list(config.opponents),
+        "episode_steps": config.episode_steps,
+        "commit": commit(),
+    }
+
+
+def run_metrics(standings: list[Standing]) -> dict[str, float]:
+    """Return the metrics for one evaluation, keyed by opponent.
+
+    Opponents are named by file path, so the stem is used: a slash in a metric
+    key nests it into a separate chart group and the league stops being
+    comparable at a glance.
+    """
+    metrics: dict[str, float] = {}
+    for standing in standings:
+        name = Path(standing.opponent).stem
+        metrics[f"win_rate/{name}"] = standing.win_rate
+        metrics[f"low/{name}"] = standing.low
+        metrics[f"high/{name}"] = standing.high
+        metrics[f"bank/{name}"] = standing.bank
+        metrics[f"opponent_bank/{name}"] = standing.opponent_bank
+    if standings:
+        metrics["win_rate/league"] = sum(s.win_rate for s in standings) / len(standings)
+    return metrics
+
+
+def commit() -> str:
+    """Return the short commit the evaluation ran at, or ``unknown``."""
+    finished = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return finished.stdout.strip() or "unknown"
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `uv run pytest tests/test_tracking.py -v`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 6: Wire it into the runner**
+
+In `src/kaggriculture/scripts/run.py`, add the flag inside `main`'s parser:
+
+```python
+    parser.add_argument(
+        "--track", action="store_true", help="log this evaluation to wandb"
+    )
+```
+
+and after `report(results, config)`:
+
+```python
+    if args.track:
+        from kaggriculture.scripts.tracking import log_evaluation
+
+        log_evaluation(standings(results), config, STRATEGY, args.agent)
+```
+
+Add `from kaggriculture.policy import STRATEGY` to the imports. The `tracking` import stays inside the branch so an evaluation without `--track` never imports `wandb`, which keeps the common path fast and keeps a missing API key from breaking a local sweep.
+
+- [ ] **Step 7: Verify against the real service**
+
+```bash
+uv run python -m kaggriculture.scripts.run --games 4 --workers 4 --opponents pass --track
+```
+
+Expected: the usual standings line, then a `logged to https://wandb.ai/will-rice/kaggriculture-2026/runs/...` line. Open it and confirm the config panel shows all sixteen `Strategy` fields and the commit.
+
+- [ ] **Step 8: Commit**
+
+```bash
+uv run pre-commit run -a
+git add src/kaggriculture/scripts/tracking.py tests/test_tracking.py src/kaggriculture/scripts/run.py pyproject.toml uv.lock
+git commit -m "feat: log evaluations to wandb
+
+A dozen sweeps in one day left their results in terminal scrollback and in
+commit prose, so rechecking an old constant means running it again. One run
+per evaluation carrying the whole Strategy as config makes the sweep
+queryable instead.
+
+Kept under scripts/, which the submission archive excludes: the sandbox has
+no network and no API key, and an import of wandb reaching it would forfeit
+the episode on turn zero."
+```
+
+---
+
+### Task 6: Pass the Phase 1 gate
 
 STRATEGY.md's gate: `heuristic-v1` vs `meta-build` over 100 seeded games returns a win rate with a CI narrower than ±0.1, in under 10 minutes on 64 cores.
 
@@ -659,7 +937,7 @@ STRATEGY.md's gate: `heuristic-v1` vs `meta-build` over 100 seeded games returns
 time uv run python -m kaggriculture.scripts.run \
   --agent baselines/heuristic_v1.py \
   --opponents baselines/meta_build.py \
-  --games 100 --workers 64 --seed 1000
+  --games 100 --workers 64 --seed 1000 --track
 ```
 
 Expected: a `vs baselines/meta_build.py` line whose interval half-width is below 0.1, and a wall-clock under 10 minutes. At 100 games an even split gives a half-width of about 0.098, so the gate is satisfied by any result at this sample size; a lopsided result gives a narrower one.
@@ -667,7 +945,7 @@ Expected: a `vs baselines/meta_build.py` line whose interval half-width is below
 - [ ] **Step 2: Run the full league for a reference standing**
 
 ```bash
-uv run python -m kaggriculture.scripts.run --games 100 --workers 64 --seed 1000
+uv run python -m kaggriculture.scripts.run --games 100 --workers 64 --seed 1000 --track
 ```
 
 Record the four resulting lines. This is the baseline every later change is compared against.
@@ -715,10 +993,12 @@ sample, and the strategy document said so before we did it anyway."
 
 **Spec coverage.** STRATEGY.md Phase 1 asks for three things. Frozen named opponents including a reconstructed meta build — Task 2, with the tape retained alongside the reconstruction because they fail differently. Head-to-head evaluation with paired seeds reporting win rate with a confidence interval — Task 1 and Task 4; seeds are already paired across matchups by `Harness.matches`, which iterates opponents over one shared `range`. A replay-analysis module reporting crop mix, bank trajectory, prices and inventory — Task 3, which also reports animals lost, since that is a live defect. The gate is Task 5.
 
+Run tracking is Task 5, which is not in STRATEGY.md's Phase 1 list but belongs to the same subsystem: the plan retires bank-against-one-opponent as the acceptance metric, and a queryable record of what was measured is what stops the replacement decaying the same way.
+
 **Deliberately out of scope**, each needing its own plan: forward search over market decisions (the 99.9% of the turn budget currently unused); automated constant optimisation over the 16 `Strategy` knobs; the RL track's Phases 2–4. All three depend on this plan's win-rate metric to be measurable, which is why this one comes first.
 
 **Placeholders.** None. The one templated block is the results table in Task 5, whose numbers cannot exist before the run that produces them.
 
-**Type consistency.** `Standing` and `Season` are pydantic models as the codebase uses for `Result` and `HarnessConfig`. `standings` and `format_standing` are the only names Task 4 imports and both are defined in Task 1. `LEAGUE` is defined in Task 2 and consumed by `config.py` in the same task. `load` and `summarise` are used only inside Task 3's tests.
+**Type consistency.** `run_config` and `run_metrics` read only `Standing` fields defined in Task 1, including `bank` and `opponent_bank` which Task 1 adds for this purpose. `Standing` and `Season` are pydantic models as the codebase uses for `Result` and `HarnessConfig`. `standings` and `format_standing` are the only names Task 4 imports and both are defined in Task 1. `LEAGUE` is defined in Task 2 and consumed by `config.py` in the same task. `load` and `summarise` are used only inside Task 3's tests.
 
 **One risk worth stating.** Task 2 assumes `Strategy(herd={})` runs cleanly, which the current code appears to support but has never been exercised. Step 5 of that task names the symptom and says to fix the policy rather than the baseline if it does not.
