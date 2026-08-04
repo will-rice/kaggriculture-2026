@@ -47,6 +47,13 @@ def main() -> None:
         games=args.games,
         **({"opponents": tuple(args.opponents)} if args.opponents else {}),
     )
+    if args.track:
+        # Fail now rather than after the episodes: a sweep can take minutes, and
+        # discovering at the end that it cannot be recorded wastes all of them.
+        from kaggriculture.scripts.tracking import commit
+
+        commit()
+
     harness = Harness(config=config)
     agent = EpisodeAgent(spec=args.agent, replay_dir=args.replays)
     results = harness.run(agent, harness.matches())

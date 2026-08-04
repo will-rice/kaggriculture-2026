@@ -44,12 +44,13 @@ def log_evaluation(
         strategy: Policy knobs the evaluated agent used.
         agent: Agent path or built-in name that was evaluated.
     """
-    settings = run_config(config, agent)
+    revision = commit()
+    settings = run_config(config, agent, revision)
     run = wandb.init(
         entity=ENTITY,
         project=PROJECT,
         job_type=job_type(config),
-        name=run_name(config, agent, str(settings["commit"])),
+        name=run_name(config, agent, revision),
         config=settings,
     )
     run.log(run_metrics(standings))
@@ -57,7 +58,7 @@ def log_evaluation(
     LOGGER.info("logged to %s", run.url)
 
 
-def run_config(config: HarnessConfig, agent: str) -> dict[str, Any]:
+def run_config(config: HarnessConfig, agent: str, revision: str) -> dict[str, Any]:
     """Return the configuration that produced a run, flat enough to group by.
 
     Every ``Strategy`` field is included because any of them may turn out to be
@@ -71,9 +72,15 @@ def run_config(config: HarnessConfig, agent: str) -> dict[str, Any]:
     different farm. A record that misdescribes what it measured is worse than no
     record, because it is trusted.
 
+    The revision is passed in rather than looked up here, so that building a
+    config is a pure function of its arguments. Resolving it inside would make
+    every caller — including the tests — depend on the state of the working
+    tree, which is exactly the coupling the dirty-tree check exists to police.
+
     Args:
         config: Harness configuration the evaluation ran under.
         agent: Agent path or built-in name that was evaluated.
+        revision: Short commit to attribute the run to.
 
     Returns:
         A flat mapping suitable as a wandb run config.
@@ -86,7 +93,7 @@ def run_config(config: HarnessConfig, agent: str) -> dict[str, Any]:
         "seed": config.seed,
         "opponents": list(config.opponents),
         "episode_steps": config.episode_steps,
-        "commit": commit(),
+        "commit": revision,
     }
 
 
@@ -198,15 +205,63 @@ def run_metrics(standings: list[Standing]) -> dict[str, float]:
 
 
 def commit() -> str:
-    """Return the short commit the evaluation ran at, or ``unknown``.
+    """Return the short commit the evaluation ran at, refusing a dirty tree.
 
     Returns:
-        The short commit hash, or ``"unknown"`` if it could not be determined.
+        The short commit hash, or ``"unknown"`` outside a git checkout.
+
+    Raises:
+        RuntimeError: If the working tree has uncommitted changes.
     """
-    finished = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
+    revision = (
+        subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        or "unknown"
+    )
+    return ensure_reproducible(working_tree_status(), revision)
+
+
+def working_tree_status() -> str:
+    """Return git's porcelain status for the working tree, empty when clean."""
+    return subprocess.run(
+        ["git", "status", "--porcelain"],
         capture_output=True,
         text=True,
         check=False,
+    ).stdout.strip()
+
+
+def ensure_reproducible(status: str, revision: str) -> str:
+    """Return the revision, or refuse if the tree that produced it was dirty.
+
+    A tracked run asserts that these numbers came from this revision. With
+    uncommitted changes in the tree that assertion is false, and the run is a
+    measurement of code that exists nowhere and can never be reproduced —
+    indistinguishable in the record from one that can. Every later comparison
+    against it inherits the doubt.
+
+    Refusing is deliberate rather than warning or tagging: a record whose
+    trustworthiness varies row by row is one nobody can rely on without checking
+    each entry, which is the same as having no record.
+
+    Args:
+        status: Porcelain status output; empty means clean.
+        revision: Short commit the run would be recorded against.
+
+    Returns:
+        ``revision`` unchanged when the tree is clean.
+
+    Raises:
+        RuntimeError: If the tree is dirty, naming what is uncommitted.
+    """
+    if not status:
+        return revision
+    raise RuntimeError(
+        "refusing to track a run from a dirty working tree — the numbers would "
+        f"be attributed to {revision}, which is not the code that produced "
+        f"them. Commit or stash first:\n{status}"
     )
-    return finished.stdout.strip() or "unknown"

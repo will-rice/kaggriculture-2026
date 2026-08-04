@@ -4,7 +4,13 @@ import pytest
 
 from kaggriculture.config import HarnessConfig
 from kaggriculture.report import Standing
-from kaggriculture.scripts.tracking import job_type, run_config, run_metrics, run_name
+from kaggriculture.scripts.tracking import (
+    ensure_reproducible,
+    job_type,
+    run_config,
+    run_metrics,
+    run_name,
+)
 
 
 def standing(opponent: str, win_rate: float) -> Standing:
@@ -26,7 +32,7 @@ def standing(opponent: str, win_rate: float) -> Standing:
 
 def test_run_config_carries_every_strategy_knob() -> None:
     """A sweep is only comparable if the configuration that produced it is recorded."""
-    config = run_config(HarnessConfig(), agent="baselines/heuristic_v2.py")
+    config = run_config(HarnessConfig(), "baselines/heuristic_v2.py", "abc1234")
 
     assert config["crops"] == {"WHEAT": 11, "MELON": 11, "STRAWBERRY": 40}
     assert config["sell_rate"] == 2
@@ -70,7 +76,7 @@ def test_config_describes_the_agent_that_ran_not_the_package_default() -> None:
     """
     from kaggriculture.policy import STRATEGY
 
-    logged = run_config(HarnessConfig(), agent="baselines/heuristic_v1.py")
+    logged = run_config(HarnessConfig(), "baselines/heuristic_v1.py", "abc1234")
 
     assert logged["crops"] == {"MELON": 36}
     assert logged["herd"] == {}
@@ -80,7 +86,7 @@ def test_config_describes_the_agent_that_ran_not_the_package_default() -> None:
 
 def test_an_agent_without_a_strategy_records_none_rather_than_borrowing_one() -> None:
     """The served agent is not parameterised by Strategy; it must not claim to be."""
-    logged = run_config(HarnessConfig(), agent="main.py")
+    logged = run_config(HarnessConfig(), "main.py", "abc1234")
 
     assert "crops" not in logged
     assert "sell_rate" not in logged
@@ -89,7 +95,7 @@ def test_an_agent_without_a_strategy_records_none_rather_than_borrowing_one() ->
 
 def test_a_builtin_opponent_has_no_strategy() -> None:
     """Built-ins are named rather than pathed, so there is no module to read."""
-    logged = run_config(HarnessConfig(), agent="starter")
+    logged = run_config(HarnessConfig(), "starter", "abc1234")
 
     assert "crops" not in logged
     assert logged["agent"] == "starter"
@@ -125,3 +131,28 @@ def test_job_type_separates_league_runs_from_ad_hoc_matchups() -> None:
     """League runs are the acceptance record; ad-hoc sweeps are exploration."""
     assert job_type(HarnessConfig()) == "league"
     assert job_type(HarnessConfig(opponents=("starter",))) == "head-to-head"
+
+
+def test_a_clean_tree_records_its_revision() -> None:
+    """The ordinary case: nothing uncommitted, so the commit describes the code."""
+    assert ensure_reproducible("", "bc7b4ce") == "bc7b4ce"
+
+
+def test_a_dirty_tree_refuses_to_be_recorded() -> None:
+    """Numbers from uncommitted code are attributable to no revision at all."""
+    status = " M src/kaggriculture/policy.py\n?? experiment.py"
+
+    with pytest.raises(RuntimeError) as raised:
+        ensure_reproducible(status, "bc7b4ce")
+
+    assert "dirty working tree" in str(raised.value)
+    assert "policy.py" in str(raised.value)
+
+
+def test_the_refusal_names_what_is_uncommitted() -> None:
+    """A refusal the user cannot act on is just an obstacle."""
+    with pytest.raises(RuntimeError) as raised:
+        ensure_reproducible(" M tests/test_policy.py", "abc1234")
+
+    assert "tests/test_policy.py" in str(raised.value)
+    assert "abc1234" in str(raised.value)
