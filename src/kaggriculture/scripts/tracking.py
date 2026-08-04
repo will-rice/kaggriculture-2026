@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import wandb
-from kaggriculture.config import HarnessConfig
+from kaggriculture.config import LEAGUE, HarnessConfig
 from kaggriculture.policy import Strategy
 from kaggriculture.report import Standing
 
@@ -44,11 +44,13 @@ def log_evaluation(
         strategy: Policy knobs the evaluated agent used.
         agent: Agent path or built-in name that was evaluated.
     """
+    settings = run_config(config, agent)
     run = wandb.init(
         entity=ENTITY,
         project=PROJECT,
-        job_type="evaluation",
-        config=run_config(config, agent),
+        job_type=job_type(config),
+        name=run_name(config, agent, str(settings["commit"])),
+        config=settings,
     )
     run.log(run_metrics(standings))
     run.finish()
@@ -86,6 +88,44 @@ def run_config(config: HarnessConfig, agent: str) -> dict[str, Any]:
         "episode_steps": config.episode_steps,
         "commit": commit(),
     }
+
+
+def short(spec: str) -> str:
+    """Return a readable stem for an agent or opponent spec.
+
+    Built-in opponents are bare names; everything else is a path, and the
+    directory is noise once the file names are distinct.
+    """
+    return Path(spec).stem if Path(spec).suffix else spec
+
+
+def job_type(config: HarnessConfig) -> str:
+    """Return the kind of evaluation this is, for grouping runs."""
+    return "league" if tuple(config.opponents) == LEAGUE else "head-to-head"
+
+
+def run_name(config: HarnessConfig, agent: str, commit: str) -> str:
+    """Return a run name that says what was measured and at which commit.
+
+    Weights & Biases names runs `icy-pond-3` by default, which is memorable and
+    tells a reader nothing. A record whose whole purpose is to be queried months
+    later should say, in the name, which agent played what at which revision —
+    `main-vs-league-bc7b4ce` rather than `splendid-firefly-4`.
+
+    Args:
+        config: Harness configuration the evaluation ran under.
+        agent: Agent path or built-in name that was evaluated.
+        commit: Short revision the evaluation ran at.
+
+    Returns:
+        A name of the form ``<agent>-vs-<opponents>-<commit>``.
+    """
+    against = (
+        "league"
+        if tuple(config.opponents) == LEAGUE
+        else "+".join(sorted(short(opponent) for opponent in config.opponents))
+    )
+    return f"{short(agent)}-vs-{against}-{commit}"
 
 
 def strategy_of(agent: str) -> Optional[Strategy]:

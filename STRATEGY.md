@@ -228,7 +228,10 @@ Nothing downstream is measurable without this, and the existing `Harness` is mos
 **Gate:** `heuristic-v1` vs the strongest league opponent over 100 seeded games returns a win rate with a CI narrower than
 ±0.1, in under 10 minutes wall-clock on 64 cores.
 
-#### Result — gate passed 2026-08-04 (will-rice/kaggriculture-2026 runs `s8mmlfea`, `urrclpeq`)
+#### Result — gate passed 2026-08-04
+
+Runs are in `will-rice/kaggriculture-2026`, named `<agent>-vs-<opponents>-<commit>`:
+`heuristic_v1-vs-meta_tape-82a4130` (`s8mmlfea`) and `main-vs-league-82a4130` (`urrclpeq`).
 
 `meta-build` was ruled out of the league during infrastructure work as byte-for-byte the shipped agent, so
 the matchup would have been self-play; the recorded tape took its place as the strongest opponent actually

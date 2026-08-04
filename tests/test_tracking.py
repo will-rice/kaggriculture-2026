@@ -4,7 +4,7 @@ import pytest
 
 from kaggriculture.config import HarnessConfig
 from kaggriculture.report import Standing
-from kaggriculture.scripts.tracking import run_config, run_metrics
+from kaggriculture.scripts.tracking import job_type, run_config, run_metrics, run_name
 
 
 def standing(opponent: str, win_rate: float) -> Standing:
@@ -93,3 +93,35 @@ def test_a_builtin_opponent_has_no_strategy() -> None:
 
     assert "crops" not in logged
     assert logged["agent"] == "starter"
+
+
+def test_a_league_run_is_named_for_the_agent_and_the_commit() -> None:
+    """`icy-pond-3` tells a reader nothing later; this tells them everything."""
+    name = run_name(HarnessConfig(), agent="main.py", commit="bc7b4ce")
+
+    assert name == "main-vs-league-bc7b4ce"
+
+
+def test_a_head_to_head_run_names_its_opponents() -> None:
+    """A gate run is a specific matchup and its name should say which."""
+    config = HarnessConfig(opponents=("/data/kaggriculture/baselines/meta_tape.py",))
+
+    name = run_name(config, agent="baselines/heuristic_v1.py", commit="82a4130")
+
+    assert name == "heuristic_v1-vs-meta_tape-82a4130"
+
+
+def test_opponent_order_does_not_change_the_name() -> None:
+    """The same matchup written two ways must group as one thing, not two."""
+    forward = HarnessConfig(opponents=("starter", "pass"))
+    reverse = HarnessConfig(opponents=("pass", "starter"))
+
+    assert run_name(forward, "main.py", "abc1234") == run_name(
+        reverse, "main.py", "abc1234"
+    )
+
+
+def test_job_type_separates_league_runs_from_ad_hoc_matchups() -> None:
+    """League runs are the acceptance record; ad-hoc sweeps are exploration."""
+    assert job_type(HarnessConfig()) == "league"
+    assert job_type(HarnessConfig(opponents=("starter",))) == "head-to-head"
