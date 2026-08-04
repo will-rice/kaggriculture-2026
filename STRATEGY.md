@@ -178,10 +178,13 @@ here. Everything else the probe found is a constraint:
   extrapolates to ~190 ms and fits. The constraint rules out a _shape_, not a size — which is
   convenient, because the market branch that decides this game is ~26 numbers and belongs in exactly the
   cheap kind of layer. Toad Brigade's ~20M conv trunk fits with ten times headroom.
-- **Open question before sizing against Lux S3.** The research records only "dual 300M-parameter PPO
-  models" [8], with no layer composition. Their 24×24 map makes board-wide convolutions ~6× costlier per
-  parameter than ours, which is reason to think their parameters were mostly not there. Read [8] before
-  copying the shape.
+- **The 300M question is moot: their model was 10M.** Reading the primary source [16] rather than the
+  roundup [8] settles it. Frog Parade's submitted model is an **8-block 3×3 residual CNN with
+  squeeze-excitation at d_model 256, about 10M parameters**; the 300M is their _training steps_
+  (600M per-player observations). The two numbers were transposed in [8] and copied into RESEARCH.md.
+  Nothing about their solution is out of reach — it is _smaller_ than Toad Brigade's 20M, and the same
+  author wrote both, having gone down in size rather than up. A model that shape costs roughly 40–50 ms
+  in our sandbox, since our board has 100 cells to their 576.
 - **Two cores, not sixty-four.** Every inference number above is a two-thread number, so local timings
   taken on the workstation will flatter the sandbox by an order of magnitude. Measure Phase 2's
   candidates under `OMP_NUM_THREADS=2` or the architecture selection is measuring the wrong machine.
@@ -219,21 +222,34 @@ procedure, and the most reusable process lesson in the research.
   `watered_today`, `consecutive_unwatered`, `yield_units`, `fertilized_until_day`, age), unit-count
   planes, and **separate learned embeddings for `hour` (0–23) and `day` (0–29)** — the analogous phase
   features are credited with producing distinct opening/midgame/endgame play in Lux S1.
-- The market gets its **own MLP branch** concatenated at the trunk bottleneck, not broadcast planes. It is
-  ~26 numbers that decide the game.
-- Candidate trunks: a residual ResNet with squeeze-excitation (no normalisation layers), and a
-  downscaling U-shaped variant. Select on action-prediction accuracy **per millisecond of CPU inference
-  measured at two threads**, which is what the sandbox has.
-- **Budget the convolutions at ~6 GMACs a turn — about 60M conv parameters — and put the rest in dense
-  layers.** Sizing against the Lux S3 second place (dual ~300M-parameter PPO models, ten million steps
-  over eight days on an RTX 3090 and an RTX 2070 Super [8]) is fine as a training target: that
-  workstation is one we beat. It is only the _placement_ Phase 0 rules out. 300M as a conv trunk runs
-  1131 ms against a 1-second turn; the same count in dense layers extrapolates to ~190 ms. Toad
-  Brigade's ~20M conv trunk costs 105 ms, so the board tower should stay near that and the parameter
-  budget should be spent on the market and bottleneck branches, where it is ~60× cheaper.
-- Also note what bought that team their scale: a Rust rewrite of the environment lifting collection from
-  one to ten million steps a day. We are deferring that (see Phase 3), which caps how much of their
-  recipe is reachable in eight weeks.
+- **Start from Frog Parade's shape rather than inventing one** [16]. Their Lux S3 second place is open
+  source, was trained on hardware we beat, and its structure maps onto this game almost line for line:
+
+  | their component                                                                                        | ours                                                                 |
+  | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+  | 8-block 3×3 residual CNN, squeeze-excitation, `d_model` 256, ~10M parameters                           | same, on 10×10                                                       |
+  | temporal + nontemporal spatial features → 2-layer CNN projection                                       | tile planes, plus a frame stack                                      |
+  | global features (80 of them) → 2-layer MLP, broadcast and **added** to the spatial tensor              | the market's ~26 numbers, which is the branch we had already planned |
+  | value head: 2-layer 1×1 CNN → mean-pool → scalar                                                       | same                                                                 |
+  | actor head: index the alive units, append normalised energy, 2-layer MLP → per-unit logits             | index unit-bearing cells, append carried inventory, → 22 op logits   |
+  | second actor head: 2-layer CNN → a 24×24 probability map shared across units, per-unit illegal masking | the market-order head, and any op that names a target tile           |
+
+  Note the sizing this settles: **~10M parameters, not 300M** — the 300M is their step count, and the
+  numbers were transposed in [8]. Their model is smaller than Toad Brigade's 20M, by the same author, so
+  the trend among people who have actually shipped these is _down_. At 10M convolutional parameters on a
+  100-cell board this costs ~40–50 ms of a 1-second turn, and the 6 GMAC budget above leaves room to grow
+  it several times over if that ever pays.
+
+- Candidate trunks: the above, against a downscaling U-shaped variant. Select on action-prediction
+  accuracy **per millisecond of CPU inference measured at two threads**, which is what the sandbox has.
+- Steal three cheap things from [16] while we are here: **test-time augmentation** (they average the
+  policy over both diagonal reflections and a 180° rotation before sampling — our board is square and
+  symmetric, so this applies directly), **illegal-action masking** in the loss and not just at sampling,
+  and a **teacher-KL term** alongside entropy, which Phase 3 already plans.
+- What bought that team their scale was a Rust rewrite of the environment, worth ~3.2× data collection
+  and a final 430 steps/second [8][16]. We are deferring that (see Phase 3), which caps how much of their
+  recipe is reachable in eight weeks — though note their 300M steps at 430/s is eight days, and our
+  Python interpreter already does ~38k steps/s across 64 cores.
 
 **Gate:** a chosen architecture with a measured forward pass comfortably inside the Phase 0 budget, and a
 behaviour-cloned agent that beats `random` and ideally `heuristic-v1`.

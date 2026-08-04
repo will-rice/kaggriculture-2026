@@ -220,16 +220,26 @@ industrial tier.
 Toad Brigade's Lux S1 winner — a 24-block residual network of roughly 20 million parameters, trained with
 IMPALA plus UPGO and TD(λ) — was trained entirely on "my personal PC, an 8-core/16-thread dual-GPU
 system" [1]. In Lux S3, first place did use industrial scale, a 200-million-parameter IMPALA model on
-eight H100s for three to four days. But **second place trained dual 300-million-parameter PPO models for
-ten million steps over eight days on an RTX 3090 and an RTX 2070 Super** [8]. Tenth place used a single
-RTX 4090 [8].
+eight H100s for three to four days. But **second place, Frog Parade, trained a 10-million-parameter PPO
+model for roughly 300 million game steps over eight days on an RTX 3090 and an RTX 2070 Super** [16].
+Tenth place used a single RTX 4090 [8].
+
+> **Correction, 2026-08-04.** This paragraph previously read "dual 300-million-parameter PPO models for
+> ten million steps", taken from the roundup [8]. The primary source — Frog Parade's own write-up and
+> code [16] — has the two numbers the other way round: a **10M-parameter** model, **300M game steps**
+> (600M per-player observations). The error mattered: it set Phase 2's model size two orders of
+> magnitude too high, and a 300M-parameter model neither fits Kaggriculture's turn budget nor, at 1.2 GB
+> of weights, any plausible submission size limit. Prefer [16] to [8] on this solution throughout; [8]
+> already had one figure excluded for implausibility (see Limitations), so its numbers are now treated
+> as leads rather than evidence.
 
 The workstation available here has an RTX 3090 and an RTX 6000 Ada with 49 GB, plus 64 CPU cores —
 strictly better than the second-place Lux S3 configuration.
 
 What separated second place from the field was not hardware but throughput: they rewrote the environment
-in Rust, roughly 10,800 lines, lifting data collection from a one-million-step-per-day ceiling to ten
-million per day [8]. This is the same lever Nebula pulled in Kore, taking the Python environment from
+in Rust, buying "approximately 3.2x faster data collection" [8] and a final training rate of 430
+steps/second, or ~37M steps a day [16]. This is the same lever Nebula pulled in Kore, taking the Python
+environment from
 12.9 ms per step to 0.08 ms in Rust, a 160× speedup [5], and the same one the Generals.io authors
 identify as their central contribution, a JAX simulator running "tens of millions of frames per second on
 a single GPU, roughly a 10,000× speedup", concluding flatly that "a fast simulator removes the data
@@ -470,6 +480,9 @@ v1.32.3; primary measurements taken in this repository; 400 episodes mined from
 
 [15] SIDHAARTH SHREE. _Crucial Information for Starters and Organizers: Documentation vs. Engine
 Discrepancies._ https://www.kaggle.com/competitions/kaggriculture/discussion/732450
+
+[16] I. Pressman et al. (Frog Parade). _kaggle-lux-2024_ — code and `write-up.md` for the Lux AI
+Season 3 second-place solution. https://github.com/IsaiahPressman/kaggle-lux-2024
 
 ---
 
