@@ -6,13 +6,13 @@ from pathlib import Path
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
-from kaggriculture.policy import agent
+from kaggriculture.economic_policy import agent
 from kaggriculture.scripts.package import ENTRYPOINT, build
 from kaggriculture.task import MatchTask
 
 
 def test_entrypoint_exposes_the_agent_last() -> None:
-    """Kaggle takes the last callable in main.py, so it must be our policy."""
+    """Kaggle takes the last callable in main.py, so it must be the served agent."""
     loaded = get_last_callable(ENTRYPOINT.read_text(), path=str(ENTRYPOINT))
 
     assert loaded is agent
@@ -37,5 +37,6 @@ def test_archive_holds_the_entrypoint_beside_the_package(tmp_path: Path) -> None
     assert len(names) == len(set(names))
     assert "main.py" in names
     assert "kaggriculture/policy.py" in names
+    assert "kaggriculture/economic_policy.py" in names
     assert not any(name.startswith("kaggriculture/scripts") for name in names)
     assert not any("__pycache__" in name for name in names)

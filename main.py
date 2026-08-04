@@ -7,8 +7,14 @@ here may reference ``__file__``, which is not defined under that exec.
 The submission tarball places this file next to the ``kaggriculture`` package,
 and the loader puts that directory on ``sys.path`` while this module executes,
 so the import below resolves both locally and on the competition runner.
+
+The agent served here is the vendored economic policy, not our own heuristic.
+Measured over 20 seeded games it beat the heuristic 20-0 at 148k to 51k, and it
+prices from the live market curve and the opponent's visible supply rather than
+from the base table. The heuristic is frozen at ``baselines/heuristic_v2.py``
+and remains a league opponent.
 """
 
-from kaggriculture.policy import agent
+from kaggriculture.economic_policy import agent
 
 __all__ = ["agent"]

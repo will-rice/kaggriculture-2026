@@ -13,6 +13,7 @@ from kaggriculture.constants import EPISODE_STEPS
 # machines that have fetched the replay corpus to that path.
 LEAGUE = (
     "/data/kaggriculture/baselines/meta_tape.py",
+    "baselines/heuristic_v2.py",
     "baselines/heuristic_v1.py",
     "starter",
 )
