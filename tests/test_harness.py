@@ -39,7 +39,9 @@ def test_matches_cover_every_opponent_and_seed() -> None:
 
 def test_harness_plays_short_episodes_in_parallel() -> None:
     """A sweep returns one scored result per task."""
-    config = HarnessConfig(games=2, seed=0, opponents=("pass",), episode_steps=48, max_workers=2)
+    config = HarnessConfig(
+        games=2, seed=0, opponents=("pass",), episode_steps=48, max_workers=2
+    )
     harness = Harness(config=config)
 
     results = harness.run(EpisodeAgent(spec="starter"), harness.matches())

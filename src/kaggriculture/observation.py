@@ -6,7 +6,7 @@ copying the tile grid (a 720-turn episode re-reads it every step).
 """
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Sequence
 
 from kaggriculture.constants import CROPS
 

@@ -25,10 +25,14 @@ def test_movement_offsets_match_environment() -> None:
 
 def test_shed_access_and_quadrants_match_environment() -> None:
     """Shed adjacency and quadrant naming match the interpreter's private helpers."""
-    assert constants.shed_access_tiles() == env_module._shed_access_tiles(constants.BOARD_SIZE)
+    assert constants.shed_access_tiles() == env_module._shed_access_tiles(
+        constants.BOARD_SIZE
+    )
     for x in range(constants.BOARD_SIZE):
         for y in range(constants.BOARD_SIZE):
-            assert constants.quadrant_of(x, y) == env_module._quadrant_of(x, y, constants.BOARD_SIZE)
+            assert constants.quadrant_of(x, y) == env_module._quadrant_of(
+                x, y, constants.BOARD_SIZE
+            )
 
 
 def test_hire_cost_matches_environment() -> None:

@@ -3,14 +3,21 @@
 import pytest
 from kaggle_environments import make
 
+from kaggriculture.constants import (
+    CROPS,
+    EPISODE_STEPS,
+    MAX_MARKET_ORDERS_PER_TURN,
+    STARTING_MONEY,
+)
 from kaggriculture.policy import STRATEGY, agent, needs_water
-from kaggriculture.constants import CROPS, EPISODE_STEPS, MAX_MARKET_ORDERS_PER_TURN, STARTING_MONEY
 
 
 @pytest.fixture(scope="module")
 def episode() -> list:
     """Return the recorded steps of one full season against the starter agent."""
-    env = make("kaggriculture", configuration={"episodeSteps": EPISODE_STEPS, "seed": 7})
+    env = make(
+        "kaggriculture", configuration={"episodeSteps": EPISODE_STEPS, "seed": 7}
+    )
     env.run([agent, "starter"])
     return env.steps
 
@@ -23,7 +30,7 @@ def turns(episode: list) -> list[tuple]:
     """
     return [
         (observed[0].observation, acted[0].action)
-        for observed, acted in zip(episode, episode[1:])
+        for observed, acted in zip(episode, episode[1:], strict=False)
     ]
 
 
@@ -51,7 +58,9 @@ def test_actions_stay_within_the_market_order_cap(episode: list) -> None:
 def test_plant_requests_never_exceed_seeds(episode: list) -> None:
     """Over-requesting a crop voids every plant that turn, so it must never happen."""
     for observed, acted in turns(episode):
-        planted = [op[1] for op in [acted["farmer"], *acted["hands"]] if op[0] == "PLANT"]
+        planted = [
+            op[1] for op in [acted["farmer"], *acted["hands"]] if op[0] == "PLANT"
+        ]
         seeds = observed.private["seeds"]
         for crop in set(planted):
             assert planted.count(crop) <= seeds.get(crop, 0)

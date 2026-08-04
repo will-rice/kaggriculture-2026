@@ -119,7 +119,9 @@ def collect_jobs(obs: Observation, strategy: Strategy) -> list[Job]:
             if is_plant(tile):
                 if needs_water(tile, obs.day):
                     jobs.append(Job(WATER, pos, ["WATER"]))
-                elif is_harvestable(tile, obs.day) or (final_day and tile["yield_units"] > 0):
+                elif is_harvestable(tile, obs.day) or (
+                    final_day and tile["yield_units"] > 0
+                ):
                     jobs.append(Job(HARVEST, pos, ["HARVEST"]))
             elif is_weed(tile):
                 jobs.append(Job(DIG, pos, ["DIG"]))
@@ -189,7 +191,9 @@ def haul_jobs(obs: Observation, strategy: Strategy) -> list[Job]:
     for unit, pos in enumerate(obs.units):
         if sum(obs.inventory(unit).values()) < threshold:
             continue
-        jobs.append(Job(priority, min(drops, key=lambda drop: distance(pos, drop)), ["DROP"]))
+        jobs.append(
+            Job(priority, min(drops, key=lambda drop: distance(pos, drop)), ["DROP"])
+        )
     return jobs
 
 
@@ -217,7 +221,10 @@ def sell_orders(obs: Observation, strategy: Strategy) -> list[Op]:
             continue
         if final_day:
             orders.append(["SELL", item, quantity])
-        elif obs.prices[item] >= int(MARKET_PARAMS[item]["base"]) * strategy.min_price_ratio:
+        elif (
+            obs.prices[item]
+            >= int(MARKET_PARAMS[item]["base"]) * strategy.min_price_ratio
+        ):
             orders.append(["SELL", item, min(quantity, strategy.max_sell_per_turn)])
     return orders
 
