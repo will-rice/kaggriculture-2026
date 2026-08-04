@@ -210,17 +210,19 @@ Nothing downstream is measurable without this, and the existing `Harness` is mos
 **Gate:** `heuristic-v1` vs `meta-build` over 100 seeded games returns a win rate with a CI narrower than
 ±0.1, in under 10 minutes wall-clock on 64 cores.
 
-#### Result — gate passed 2026-08-04
+#### Result — gate passed 2026-08-04 (will-rice/kaggriculture-2026 runs fsrlzxgh, l73v8htf)
 
 `meta-build` was ruled out of the league during infrastructure work as byte-for-byte the shipped agent, so
 the matchup would have been self-play; the recorded tape took its place as the strongest opponent actually
-in the league. `heuristic-v1` vs the recorded tape over 100 seeded games: win rate 0.000 [0.000, 0.037],
-half-width 0.018, in 15s on 64 cores. Both criteria clear with room to spare — the interval is under a
-fifth of the ±0.1 budget, and the run finished in seconds rather than minutes because 100 episodes
-parallelise cleanly across 64 workers. `heuristic-v1` lost all 100 games; the tape plays the recorded
-75th-percentile ladder build open-loop, and nothing in the current agent beats it yet.
+in the league. `heuristic-v1` vs the recorded tape over 100 seeded games (wandb run `fsrlzxgh`): win rate
+0.000 [0.000, 0.037], half-width 0.0185 — half of the stated interval, since the lower bound is 0 — in 15s
+on 64 cores. Both criteria clear with room to spare — the interval is under a fifth of the ±0.1 budget, and
+the run finished in seconds rather than minutes because 100 episodes parallelise cleanly across 64 workers.
+`heuristic-v1` lost all 100 games; the tape plays the recorded 75th-percentile ladder build open-loop, and
+nothing in the current agent beats it yet.
 
-Reference league standing for the current submission (`main.py`), 300 seeded games per opponent, seed 1000:
+Reference league standing for the current submission (`main.py`), 300 seeded games per opponent, seed 1000
+(wandb run `l73v8htf`):
 
 | opponent     | win rate | 95% interval   |
 | ------------ | -------- | -------------- |
