@@ -60,3 +60,64 @@ def test_animals_lost_counts_every_disappearance() -> None:
     season = summarise(steps, player=0)
 
     assert season.animals_lost == 1
+
+
+def test_animals_lost_counts_a_loss_masked_by_a_same_turn_placement() -> None:
+    """A starvation and a same-turn purchase elsewhere must not cancel out.
+
+    Unit actions, including placing a newly bought animal, apply before the
+    end-of-day starvation check within the same recorded turn. A player who
+    places one animal the same turn another starves shows no net change in
+    herd size, so a net-count implementation would miss the loss entirely.
+    """
+    steps = [
+        [
+            {
+                "observation": {
+                    "day": 0,
+                    "farms": [
+                        {
+                            "tiles": [
+                                [
+                                    {"kind": "PASTURE", "animal": "COW"},
+                                    {"kind": "PASTURE"},
+                                    {"kind": "PASTURE", "animal": "COW"},
+                                ]
+                            ],
+                            "money": 3000,
+                        }
+                    ],
+                    "private": {"shed": {}},
+                    "market": {"prices": {}},
+                },
+                "reward": 3000,
+            }
+        ],
+        [
+            {
+                "observation": {
+                    "day": 1,
+                    "farms": [
+                        {
+                            "tiles": [
+                                [
+                                    {"kind": "PASTURE"},
+                                    {"kind": "PASTURE", "animal": "COW"},
+                                    {"kind": "PASTURE", "animal": "COW"},
+                                ]
+                            ],
+                            "money": 3000,
+                        }
+                    ],
+                    "private": {"shed": {}},
+                    "market": {"prices": {}},
+                },
+                "reward": 3000,
+            }
+        ],
+    ]
+
+    season = summarise(steps, player=0)
+
+    assert season.animals == [2, 2]
+    assert season.animals_lost == 1

@@ -17,7 +17,21 @@ Step = list[dict[str, Any]]
 
 
 class Season(BaseModel):
-    """One player's season, reduced to the signals worth looking at."""
+    """One player's season, reduced to the signals worth looking at.
+
+    Attributes:
+        player: Seat this season was summarised for.
+        bank: Money at each recorded turn.
+        crops: Crop mix keyed by day. Each day's value is the mix as of the
+            *last* turn recorded for that day (a near-end-of-day snapshot),
+            not a start-of-day reading or a day-long aggregate.
+        animals: Herd size at each recorded turn.
+        animals_lost: Total animals that vanished from the board over the
+            season, counted positionally so a same-turn loss and gain
+            elsewhere cannot cancel out.
+        final_shed: Shed contents at the final recorded turn.
+        final_prices: Market prices at the final recorded turn.
+    """
 
     player: int
     bank: list[float]
@@ -41,28 +55,26 @@ def summarise(steps: list[Step], player: int) -> Season:
         player: Seat to report on.
 
     Returns:
-        A ``Season`` holding the bank trajectory, the crop mix on each day, the
-        herd size per turn, how many animals vanished, and the closing shed and
-        prices.
+        A ``Season`` holding the bank trajectory, the crop mix on each day
+        (the mix as of the last turn recorded for that day, not a
+        start-of-day or aggregate value), the herd size per turn, how many
+        animals vanished, and the closing shed and prices.
     """
     bank: list[float] = []
     crops: dict[int, dict[str, int]] = {}
     animals: list[int] = []
     lost = 0
+    previous_positions: set[tuple[int, int]] | None = None
     for step in steps:
         observation = step[0]["observation"]
         farm = observation["farms"][player]
         bank.append(farm["money"])
         crops[observation["day"]] = crop_mix(farm)
-        herd = sum(
-            1
-            for row in farm["tiles"]
-            for tile in row
-            if isinstance(tile, dict) and tile.get("animal")
-        )
-        if animals and herd < animals[-1]:
-            lost += animals[-1] - herd
-        animals.append(herd)
+        positions = animal_positions(farm)
+        if previous_positions is not None:
+            lost += len(previous_positions - positions)
+        animals.append(len(positions))
+        previous_positions = positions
 
     closing = steps[-1][player]["observation"]
     return Season(
@@ -71,9 +83,33 @@ def summarise(steps: list[Step], player: int) -> Season:
         crops=crops,
         animals=animals,
         animals_lost=lost,
-        final_shed=dict(closing.get("private", {}).get("shed", {})),
+        final_shed=dict(closing["private"]["shed"]),
         final_prices=dict(steps[-1][0]["observation"]["market"]["prices"]),
     )
+
+
+def animal_positions(farm: dict[str, Any]) -> set[tuple[int, int]]:
+    """Return the board positions currently holding an animal.
+
+    Tracking positions rather than a headcount is what makes a loss
+    detectable even when it is masked, in the same turn, by a placement
+    elsewhere on the board: on starvation the engine replaces the tile with a
+    bare structure of the same kind, so a position dropping out of this set
+    is the exact signal of an animal vanishing, independent of the net herd
+    count.
+
+    Args:
+        farm: One player's farm observation for a single turn.
+
+    Returns:
+        The ``(row, column)`` positions whose tile currently holds an animal.
+    """
+    return {
+        (y, x)
+        for y, row in enumerate(farm["tiles"])
+        for x, tile in enumerate(row)
+        if isinstance(tile, dict) and tile.get("animal")
+    }
 
 
 def crop_mix(farm: dict[str, Any]) -> dict[str, int]:
