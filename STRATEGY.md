@@ -128,8 +128,25 @@ model because no fast inference runtime could be installed in the Kaggle sandbox
 back 404.
 
 Submit a probe agent that plays the current heuristic but additionally logs, on turn 0: the Python
-version, whether `torch` and `numpy` import, their versions, available core count, and a timed forward
-pass of a representative small conv net. Read it back with `kaggle competitions logs <episode> <index>`.
+version, whether `torch` and `numpy` import, their versions, available core count, and timed forward
+passes. Read it back with `kaggle competitions logs <episode> <index>`.
+
+The networks timed are the two we would actually ship, not a token small one — a benchmark of a net we
+have no intention of training answers a question nobody asked:
+
+- **~20M parameters**, the 24-block residual trunk Toad Brigade won Lux S1 with on a personal PC [1].
+- **~300M parameters**, the scale Lux S3's second place trained on an RTX 3090 and an RTX 2070 Super [8],
+  which is the configuration this workstation strictly beats and therefore the one worth sizing for.
+
+Training scale and inference budget are separate constraints and this measures only the second. On two
+threads of the local workstation the 300M trunk runs a batch-1 forward in **311 ms** and the 20M trunk in
+**29 ms**, so neither is obviously excluded by the 1-second turn — but the sandbox CPU is the number that
+counts, which is the whole point of submitting.
+
+The probe measures the small trunk first and extrapolates the large one's cost from it, building the
+large one only if the prediction fits the remaining budget. A single 300M forward pass on a slow sandbox
+CPU could outlast the entire 60-second overage pool, and an agent that overruns forfeits; a prediction
+that says it does not fit is the Phase 0 answer without betting the episode on it.
 
 **Gate:** we know the inference budget in milliseconds for a concrete network, and whether torch is
 usable. Costs one of five daily slots.
@@ -163,8 +180,14 @@ procedure, and the most reusable process lesson in the research.
   features are credited with producing distinct opening/midgame/endgame play in Lux S1.
 - The market gets its **own MLP branch** concatenated at the trunk bottleneck, not broadcast planes. It is
   ~26 numbers that decide the game.
-- Candidate trunks: small ResNet with squeeze-excitation (no normalisation layers), and a downscaling
-  U-shaped variant. Select on action-prediction accuracy **per millisecond of measured CPU inference**.
+- Candidate trunks: a residual ResNet with squeeze-excitation (no normalisation layers), and a
+  downscaling U-shaped variant. Select on action-prediction accuracy **per millisecond of measured CPU
+  inference**. Size against the Lux S3 second-place configuration — dual ~300M-parameter PPO models,
+  ten million steps over eight days on an RTX 3090 and an RTX 2070 Super [8] — because that is the
+  largest solution known to have been trained on hardware we have, and Phase 0 measures whether it fits
+  the turn. Note what actually bought them that scale: a Rust rewrite of the environment lifting
+  collection from one to ten million steps a day. We are deferring that (see Phase 3), which caps how
+  much of their recipe is reachable in eight weeks.
 
 **Gate:** a chosen architecture with a measured forward pass comfortably inside the Phase 0 budget, and a
 behaviour-cloned agent that beats `random` and ideally `heuristic-v1`.
