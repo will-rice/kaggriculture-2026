@@ -264,10 +264,27 @@ Immediate work, reordered after measuring against the tape. The benchmark for ev
    what matters.) Cows and sheep need a pasture tile, daily wheat, and `CARE`; the wheat can simply be
    bought, which is what the tape's 967 wheat purchases are for.
 
-2. **Abandon melon** — but only after animals. Measured against the tape, melon is _still_ our best
-   single crop at 28.7k, versus wheat 9.4k, tomato 10.5k, carrot 4.1k and strawberry 1.5k. Crop choice is
-   not the gap; the absence of livestock is. Changing crop first would have been a wasted cycle, which is
-   exactly why this list is now ordered by measurement rather than by the earlier reasoning.
+2. ~~**Abandon melon** — but only after animals.~~ **Done — melon 40.8k → strawberry 49.1k**, confirmed
+   on holdout seeds (40.1k → 47.3k). Sweeping all five crops with the herd in place puts strawberry
+   first, wheat second (40.4k), then tomato 37.6k and carrot 33.2k.
+
+   The ordering completely inverted. Pre-livestock, melon was the best crop at 28.7k and strawberry the
+   **worst at 1.5k**; a farm at $56 could not carry a 100-coin seed to a day-10 first yield, so the crop
+   that needs working capital measured as the crop that does not work. Fixing the budget changed which
+   crop is best — which is the same lesson as the melon trap, one level up: we were ranking crops under a
+   constraint we then removed.
+
+   Two mechanics explain the winner, both worth remembering. Strawberry is _ongoing_, and the engine
+   accrues an ongoing crop's yield on schedule whether or not it was watered that day — watering only
+   prevents death and enables the fertilizer bonus. So a strawberry tile costs roughly half the
+   unit-turns of a melon tile, which is exactly the constraint the herd competes for. And melon's price
+   collapses to $31 against the tape's 182 units while strawberry holds near $269 because only one player
+   supplies it.
+
+   Note it still measures _worse_ against the built-in agents (65k versus melon's 87k), because bots
+   never touch the market and melon's price holds at $288 there. That is the trap in `melon loop v1`
+   verbatim, and the reason the tape is the benchmark and the built-ins are not.
+
 3. **Price from live inventory, never from the base table.** So the next crop that gets flooded doesn't
    cost us another submission cycle.
 4. **Sell around the tape's known windows.** Strawberry before day 18, melon outside days 10–12. This is

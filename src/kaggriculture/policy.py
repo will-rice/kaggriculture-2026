@@ -60,7 +60,7 @@ HAUL = 10
 class Strategy:
     """Tunable knobs for the baseline policy."""
 
-    crop: str = "MELON"
+    crop: str = "STRAWBERRY"
     herd: Mapping[str, int] = field(default_factory=lambda: {"COW": 8, "SHEEP": 2})
     max_hands: int = 12
     tiles_per_unit: int = 4
