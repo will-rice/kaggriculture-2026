@@ -28,8 +28,7 @@
 | `src/kaggriculture/replay.py`           | **Create.** Load an episode JSON and answer questions about it: crop mix per day, bank trajectory, animals lost, realised prices, end-of-season shed. |
 | `baselines/heuristic_v1.py`             | **Create.** The melon monoculture that first went on the ladder, pinned as a `Strategy`.                                                              |
 | `baselines/meta_build.py`               | **Create.** The reconstructed meta build — a _reactive_ agent playing what 75% of the ladder plays, unlike the open-loop tape.                        |
-| `src/kaggriculture/constants.py`        | **Modify.** Add `LEAGUE` naming the frozen opponents.                                                                                                 |
-| `src/kaggriculture/config.py`           | **Modify.** Default `opponents` to `LEAGUE`.                                                                                                          |
+| `src/kaggriculture/config.py`           | **Modify.** Add `LEAGUE` naming the frozen opponents, and default `opponents` to it.                                                                  |
 | `src/kaggriculture/scripts/tracking.py` | **Create.** One wandb run per evaluation. Under `scripts/` so it can never reach the submission archive.                                              |
 | `src/kaggriculture/scripts/run.py`      | **Modify.** Report win rate with CI instead of mean bank; add `--track`.                                                                              |
 | `tests/test_report.py`                  | **Create.** Interval maths and aggregation.                                                                                                           |
@@ -278,8 +277,7 @@ The heuristic is currently measured against one open-loop replay. Beating a reco
 
 - Create: `baselines/heuristic_v1.py`
 - Create: `baselines/meta_build.py`
-- Modify: `src/kaggriculture/constants.py` (add `LEAGUE`, extend `__all__`)
-- Modify: `src/kaggriculture/config.py:12` (default `opponents` to `LEAGUE`)
+- Modify: `src/kaggriculture/config.py` (add `LEAGUE`, default `opponents` to it)
 - Test: `tests/test_baselines.py`
 
 **Interfaces:**
@@ -288,7 +286,7 @@ The heuristic is currently measured against one open-loop replay. Beating a reco
 - Produces:
   - `baselines/heuristic_v1.py::agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]`
   - `baselines/meta_build.py::agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]`
-  - `kaggriculture.constants.LEAGUE: tuple[str, ...]`
+  - `kaggriculture.config.LEAGUE: tuple[str, ...]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -300,7 +298,8 @@ Create `tests/test_baselines.py`:
 import pytest
 from kaggle_environments import make
 
-from kaggriculture.constants import ENVIRONMENT, LEAGUE
+from kaggriculture.config import LEAGUE
+from kaggriculture.constants import ENVIRONMENT
 
 
 @pytest.mark.parametrize("baseline", LEAGUE)
@@ -399,12 +398,18 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
 
 - [ ] **Step 4: Register the league**
 
-In `src/kaggriculture/constants.py`, add `"LEAGUE"` to `__all__` and add below `BASELINE_AGENTS`:
+`LEAGUE` goes in `src/kaggriculture/config.py`, **not** `constants.py`. `constants.py` is imported by
+`policy.py` and therefore ships inside the submission archive, where an absolute path to a local
+directory is machine-specific dead weight. `config.py` is imported only by the harness and the runner,
+neither of which ships.
+
+Add to `src/kaggriculture/config.py`, above the `HarnessConfig` class:
 
 ```python
 # Frozen named opponents, strongest first. Paths rather than names because the
-# environment loads them as files; the recorded tape is included alongside the
-# reactive reconstruction because the two fail differently.
+# environment loads them as files; the recorded tape is kept alongside the
+# reactive reconstruction because the two fail differently — a recording can be
+# beaten by exploiting its blindness, and a reactive opponent cannot.
 LEAGUE = (
     "baselines/meta_build.py",
     "/data/kaggriculture/baselines/meta_tape.py",
@@ -413,11 +418,14 @@ LEAGUE = (
 )
 ```
 
-In `src/kaggriculture/config.py`, change the import to `from kaggriculture.constants import EPISODE_STEPS, LEAGUE` and the field to:
+and change the field to:
 
 ```python
     opponents: tuple[str, ...] = LEAGUE
 ```
+
+`BASELINE_AGENTS` stays in `constants.py` untouched — it names built-in environment agents, which are
+not paths.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -430,7 +438,7 @@ If `test_league_member_plays_a_legal_season` fails for `heuristic_v1` with a `Ke
 
 ```bash
 uv run pre-commit run -a
-git add baselines tests/test_baselines.py src/kaggriculture/constants.py src/kaggriculture/config.py
+git add baselines tests/test_baselines.py src/kaggriculture/config.py
 git commit -m "feat: freeze a league of named opponents
 
 Tuning against one open-loop recording rewards exploiting its blindness,
@@ -627,20 +635,20 @@ same signals, so they belong somewhere tested."
 
 **Files:**
 
-- Modify: `src/kaggriculture/scripts/run.py:52-70` (replace `report`)
+- Modify: `src/kaggriculture/scripts/run.py:52-70` (replace `report`, drop its unused parameter)
 - Test: covered by Task 1's unit tests plus a manual gate run in Task 5.
 
 **Interfaces:**
 
 - Consumes: `kaggriculture.report.standings`, `kaggriculture.report.format_standing`.
-- Produces: no new API; `report(results, config)` keeps its signature.
+- Produces: `report(results: list[Result]) -> None`. The old signature took a `HarnessConfig` that the new body never reads, and unused parameters are an unused code path.
 
 - [ ] **Step 1: Replace the reporting function**
 
 In `src/kaggriculture/scripts/run.py`, replace the `report` function and drop the now-unused `from statistics import mean` import:
 
 ```python
-def report(results: list[Result], config: HarnessConfig) -> None:
+def report(results: list[Result]) -> None:
     """Log one line per opponent, plus any episode that failed to run.
 
     Win rate rather than bank: the ladder scores wins, and a change that banks
@@ -654,7 +662,7 @@ def report(results: list[Result], config: HarnessConfig) -> None:
             LOGGER.error("%s failed: %s", result.task_id, result.error)
 ```
 
-Add the import `from kaggriculture.report import format_standing, standings` and remove `from statistics import mean`. The `config` parameter stays in the signature — it is part of the call contract — and is now unused inside the body, so rename it to `_config` if `ruff` objects.
+Add the import `from kaggriculture.report import format_standing, standings` and remove `from statistics import mean`. Update the call site in `main` from `report(results, config)` to `report(results)`. Drop the now-unused `HarnessConfig` import from the module only if nothing else in the file uses it — `main` constructs one, so it stays.
 
 - [ ] **Step 2: Verify the runner still works end to end**
 
