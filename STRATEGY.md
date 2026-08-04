@@ -166,13 +166,22 @@ usable. Costs one of five daily slots.
 **Torch is usable, so the RL track is not dead on arrival** — the Lux S2 failure mode does not apply
 here. Everything else the probe found is a constraint:
 
-- **The 300M scale we chose to size against does not fit.** At 1131 ms a single forward exceeds the
-  1-second turn, so a 300M model would draw on the 60-second overage pool every turn and forfeit inside
-  a minute of game time. We can _train_ at the Lux S3 second place's scale on this workstation; we
-  cannot _serve_ it. Either target Toad Brigade's ~20M — which fits with roughly ten times headroom —
-  or train large and distil down to something that does.
-- **The practical ceiling is around 80M parameters**, taking 300 ms as a sustainable turn and leaving
-  room for the policy code around the network. Scaling from the two measurements, 300 ms buys ~80M.
+- **The budget is arithmetic, not parameters.** Both measurements agree on roughly **20–26 GMAC/s** at
+  two threads, so a 300 ms turn buys about **6 GMACs**. What that converts to in parameters depends
+  entirely on where they sit: a convolution weight does one multiply-add _per cell_, a hundred of them on
+  a 10×10 board, while a dense weight at a bottleneck does exactly one. Measured at two threads locally,
+  300M in convolutions costs 307 ms and 152M in dense layers costs 26 ms — about **60× cheaper per
+  parameter**.
+- **So 300M in convolutions is excluded, and 300M is not.** Six GMACs is ~60M convolution parameters, or
+  effectively unlimited dense ones. At 1131 ms the conv version of the Lux S3 scale would draw on the
+  60-second overage pool every turn and forfeit within a minute of game time; a dense-heavy 300M model
+  extrapolates to ~190 ms and fits. The constraint rules out a _shape_, not a size — which is
+  convenient, because the market branch that decides this game is ~26 numbers and belongs in exactly the
+  cheap kind of layer. Toad Brigade's ~20M conv trunk fits with ten times headroom.
+- **Open question before sizing against Lux S3.** The research records only "dual 300M-parameter PPO
+  models" [8], with no layer composition. Their 24×24 map makes board-wide convolutions ~6× costlier per
+  parameter than ours, which is reason to think their parameters were mostly not there. Read [8] before
+  copying the shape.
 - **Two cores, not sixty-four.** Every inference number above is a two-thread number, so local timings
   taken on the workstation will flatter the sandbox by an order of magnitude. Measure Phase 2's
   candidates under `OMP_NUM_THREADS=2` or the architecture selection is measuring the wrong machine.
@@ -215,11 +224,13 @@ procedure, and the most reusable process lesson in the research.
 - Candidate trunks: a residual ResNet with squeeze-excitation (no normalisation layers), and a
   downscaling U-shaped variant. Select on action-prediction accuracy **per millisecond of CPU inference
   measured at two threads**, which is what the sandbox has.
-- **Size at ~20M parameters, not 300M.** Sizing against the Lux S3 second place — dual ~300M-parameter
-  PPO models, ten million steps over eight days on an RTX 3090 and an RTX 2070 Super [8] — was the plan
-  until Phase 0 measured that scale at 1131 ms a turn against a 1-second budget. Their configuration is
-  reachable for _training_ on this workstation and unshippable for _inference_. Toad Brigade's ~20M Lux
-  S1 winner runs in 105 ms and is the model we can actually field; ~80M is the hard ceiling.
+- **Budget the convolutions at ~6 GMACs a turn — about 60M conv parameters — and put the rest in dense
+  layers.** Sizing against the Lux S3 second place (dual ~300M-parameter PPO models, ten million steps
+  over eight days on an RTX 3090 and an RTX 2070 Super [8]) is fine as a training target: that
+  workstation is one we beat. It is only the _placement_ Phase 0 rules out. 300M as a conv trunk runs
+  1131 ms against a 1-second turn; the same count in dense layers extrapolates to ~190 ms. Toad
+  Brigade's ~20M conv trunk costs 105 ms, so the board tower should stay near that and the parameter
+  budget should be spent on the market and bottleneck branches, where it is ~60× cheaper.
 - Also note what bought that team their scale: a Rust rewrite of the environment lifting collection from
   one to ten million steps a day. We are deferring that (see Phase 3), which caps how much of their
   recipe is reachable in eight weeks.
