@@ -151,6 +151,38 @@ that says it does not fit is the Phase 0 answer without betting the episode on i
 **Gate:** we know the inference budget in milliseconds for a concrete network, and whether torch is
 usable. Costs one of five daily slots.
 
+#### Result — gate passed, and it caps the model (submission 55242090, episode 89948290)
+
+|                       | sandbox                                             |
+| --------------------- | --------------------------------------------------- |
+| python                | 3.11.13, glibc 2.35                                 |
+| cpus                  | **2**                                               |
+| memory                | **6.8 GB**                                          |
+| numpy                 | 2.4.6                                               |
+| torch                 | **2.6.0+cu124, available**; import costs **10.7 s** |
+| ~20M-parameter trunk  | **105 ms** per batch-1 forward                      |
+| ~300M-parameter trunk | **1131 ms** per batch-1 forward                     |
+
+**Torch is usable, so the RL track is not dead on arrival** — the Lux S2 failure mode does not apply
+here. Everything else the probe found is a constraint:
+
+- **The 300M scale we chose to size against does not fit.** At 1131 ms a single forward exceeds the
+  1-second turn, so a 300M model would draw on the 60-second overage pool every turn and forfeit inside
+  a minute of game time. We can _train_ at the Lux S3 second place's scale on this workstation; we
+  cannot _serve_ it. Either target Toad Brigade's ~20M — which fits with roughly ten times headroom —
+  or train large and distil down to something that does.
+- **The practical ceiling is around 80M parameters**, taking 300 ms as a sustainable turn and leaving
+  room for the policy code around the network. Scaling from the two measurements, 300 ms buys ~80M.
+- **Two cores, not sixty-four.** Every inference number above is a two-thread number, so local timings
+  taken on the workstation will flatter the sandbox by an order of magnitude. Measure Phase 2's
+  candidates under `OMP_NUM_THREADS=2` or the architecture selection is measuring the wrong machine.
+- **The 10.7-second torch import lands on turn 0** and comes out of the overage pool, leaving ~49 s of
+  cushion for the rest of the episode. A model load has to go there too. The probe episode spent 31 s on
+  turn 0 and 0.8 ms on average across the other 719 turns, and completed — so the pool absorbs a
+  one-off startup comfortably, but nothing recurring.
+
+The probe has answered these and is removed; it is in git history if a later question needs it.
+
 ### Phase 1 — Evaluation and league infrastructure (3–4 days)
 
 Nothing downstream is measurable without this, and the existing `Harness` is most of the way there.
@@ -181,13 +213,16 @@ procedure, and the most reusable process lesson in the research.
 - The market gets its **own MLP branch** concatenated at the trunk bottleneck, not broadcast planes. It is
   ~26 numbers that decide the game.
 - Candidate trunks: a residual ResNet with squeeze-excitation (no normalisation layers), and a
-  downscaling U-shaped variant. Select on action-prediction accuracy **per millisecond of measured CPU
-  inference**. Size against the Lux S3 second-place configuration — dual ~300M-parameter PPO models,
-  ten million steps over eight days on an RTX 3090 and an RTX 2070 Super [8] — because that is the
-  largest solution known to have been trained on hardware we have, and Phase 0 measures whether it fits
-  the turn. Note what actually bought them that scale: a Rust rewrite of the environment lifting
-  collection from one to ten million steps a day. We are deferring that (see Phase 3), which caps how
-  much of their recipe is reachable in eight weeks.
+  downscaling U-shaped variant. Select on action-prediction accuracy **per millisecond of CPU inference
+  measured at two threads**, which is what the sandbox has.
+- **Size at ~20M parameters, not 300M.** Sizing against the Lux S3 second place — dual ~300M-parameter
+  PPO models, ten million steps over eight days on an RTX 3090 and an RTX 2070 Super [8] — was the plan
+  until Phase 0 measured that scale at 1131 ms a turn against a 1-second budget. Their configuration is
+  reachable for _training_ on this workstation and unshippable for _inference_. Toad Brigade's ~20M Lux
+  S1 winner runs in 105 ms and is the model we can actually field; ~80M is the hard ceiling.
+- Also note what bought that team their scale: a Rust rewrite of the environment lifting collection from
+  one to ten million steps a day. We are deferring that (see Phase 3), which caps how much of their
+  recipe is reachable in eight weeks.
 
 **Gate:** a chosen architecture with a measured forward pass comfortably inside the Phase 0 budget, and a
 behaviour-cloned agent that beats `random` and ideally `heuristic-v1`.

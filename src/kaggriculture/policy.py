@@ -12,7 +12,6 @@ scales hands and land with the tile count rather than hoarding cash.
 """
 
 import collections
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -97,26 +96,7 @@ class Job:
 
 def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     """Return this turn's action dict for the environment."""
-    obs = Observation.parse(raw_obs)
-    if obs.step == 0:
-        probe_sandbox()
-    return plan(obs, STRATEGY).to_action()
-
-
-def probe_sandbox() -> None:
-    """Log what the competition sandbox offers, once, on the first turn.
-
-    Imported here rather than at module scope so the probe's own imports stay
-    off the path every other turn takes, and wrapped because it rides on a live
-    ladder submission: an episode must not be forfeited by the measurement it is
-    carrying. Delete this and ``probe.py`` once Phase 0's questions are answered.
-    """
-    try:
-        from kaggriculture import probe
-
-        probe.report()
-    except Exception as error:  # noqa: BLE001 - a probe must not cost the game
-        logging.getLogger(__name__).info("PROBE failed %s", error)
+    return plan(Observation.parse(raw_obs), STRATEGY).to_action()
 
 
 def plan(obs: Observation, strategy: Strategy) -> Turn:
