@@ -95,7 +95,7 @@ def animal_positions(farm: dict[str, Any]) -> set[tuple[int, int]]:
     detectable even when it is masked, in the same turn, by a placement
     elsewhere on the board: on starvation the engine replaces the tile with a
     bare structure of the same kind, so a position dropping out of this set
-    is the exact signal of an animal vanishing, independent of the net herd
+    is the signal of an animal leaving a tile, independent of the net herd
     count.
 
     Args:

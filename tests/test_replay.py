@@ -121,3 +121,26 @@ def test_animals_lost_counts_a_loss_masked_by_a_same_turn_placement() -> None:
 
     assert season.animals == [2, 2]
     assert season.animals_lost == 1
+
+
+def test_summarise_reads_the_right_seat_s_private_state(tmp_path: Path) -> None:
+    """Public state comes from index 0, private state from the player's own index.
+
+    At `player=0` those two indices coincide, so every other test in this file
+    passes whether or not the distinction is honoured. Seat 1 is the only place
+    the module's one non-obvious decision is actually exercised: reading a
+    player's shed from index 0 would silently return seat 0's produce for
+    everybody, and nothing would raise.
+    """
+    env = make(ENVIRONMENT, configuration={"episodeSteps": 240, "seed": 9})
+    env.run(["baselines/heuristic_v1.py", "baselines/heuristic_v2.py"])
+    path = tmp_path / "episode.json"
+    path.write_text(json.dumps(env.toJSON()))
+    steps = load(path)
+
+    first, second = summarise(steps, player=0), summarise(steps, player=1)
+
+    assert first.bank != second.bank
+    assert first.crops != second.crops
+    raw = steps[-1][1]["observation"]["private"]["shed"]
+    assert second.final_shed == dict(raw)

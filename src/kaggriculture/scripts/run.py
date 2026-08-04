@@ -12,7 +12,7 @@ from pathlib import Path
 from kaggriculture.agent import EpisodeAgent
 from kaggriculture.config import HarnessConfig
 from kaggriculture.harness import Harness
-from kaggriculture.report import format_standing, standings
+from kaggriculture.report import format_league, format_standing, standings
 from kaggriculture.result import Result
 from kaggriculture.scripts.package import ENTRYPOINT
 
@@ -71,8 +71,10 @@ def report(results: list[Result]) -> None:
     more while winning less has not improved anything. The interval is what
     decides whether a difference is real or is sixteen seeds of noise.
     """
-    for standing in standings(results):
+    table = standings(results)
+    for standing in table:
         LOGGER.info("%s", format_standing(standing))
+    LOGGER.info("%s", format_league(table))
     for result in results:
         if result.error:
             LOGGER.error("%s failed: %s", result.task_id, result.error)

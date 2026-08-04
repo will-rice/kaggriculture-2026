@@ -1,6 +1,15 @@
 """Tests for win-rate reporting and its confidence intervals."""
 
-from kaggriculture.report import Standing, standings, wilson_interval
+import pytest
+
+from kaggriculture.report import (
+    Standing,
+    format_league,
+    format_standing,
+    league_win_rate,
+    standings,
+    wilson_interval,
+)
 from kaggriculture.result import Result
 
 
@@ -57,3 +66,66 @@ def test_standings_average_the_banks_of_scored_games() -> None:
 
     assert standing.bank == 50000.0
     assert standing.opponent_bank == 160000.0
+
+
+def standing(opponent: str = "tape", win_rate: float = 0.4) -> Standing:
+    """Return a standing with every field populated, for formatting tests."""
+    return Standing(
+        opponent=opponent,
+        games=100,
+        wins=40,
+        losses=60,
+        ties=0,
+        errors=0,
+        win_rate=win_rate,
+        low=0.31,
+        high=0.50,
+        bank=118672.0,
+        opponent_bank=140585.0,
+    )
+
+
+def test_half_width_is_half_the_interval() -> None:
+    """The Phase 1 gate is stated in terms of this quantity and nothing tested it."""
+    assert standing().half_width == pytest.approx((0.50 - 0.31) / 2)
+
+
+def test_a_formatted_standing_carries_every_number_a_reader_needs() -> None:
+    """This line is the entire output of an evaluation; it had no coverage at all."""
+    line = format_standing(standing())
+
+    assert "tape" in line
+    assert "0.400" in line
+    assert "[0.310, 0.500]" in line
+    assert "40W 60L 0T" in line
+    assert "118672" in line and "140585" in line
+
+
+def test_errors_appear_in_the_formatted_line_only_when_they_happen() -> None:
+    """A silent error count would hide a broken agent behind a plausible win rate."""
+    clean = format_standing(standing())
+    broken = format_standing(standing().model_copy(update={"errors": 3}))
+
+    assert "E)" not in clean
+    assert "3E" in broken
+
+
+def test_league_win_rate_weights_each_opponent_equally() -> None:
+    """The acceptance rule is stated against this number, so it must be computable."""
+    table = [standing("a", 0.0), standing("b", 1.0), standing("c", 1.0)]
+
+    assert league_win_rate(table) == pytest.approx(2 / 3)
+
+
+def test_league_win_rate_of_nothing_is_zero_rather_than_an_error() -> None:
+    """An evaluation whose episodes all errored still has to report something."""
+    assert league_win_rate([]) == 0.0
+
+
+def test_the_league_line_reports_how_much_evidence_it_rests_on() -> None:
+    """A rate without a game count invites the mistake this whole module prevents."""
+    line = format_league([standing("a", 0.0), standing("b", 1.0)])
+
+    assert "0.500" in line
+    assert "2 opponents" in line
+    assert "200 games" in line

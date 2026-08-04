@@ -7,7 +7,7 @@ on the page, and the difference decides whether a change ships.
 """
 
 import math
-from typing import Iterable
+import statistics
 
 from pydantic import BaseModel
 
@@ -91,17 +91,13 @@ def standings(results: list[Result]) -> list[Standing]:
                 win_rate=points / len(scored) if scored else 0.0,
                 low=low,
                 high=high,
-                bank=mean(pair[0] for pair in banked) if banked else 0.0,
-                opponent_bank=mean(pair[1] for pair in banked) if banked else 0.0,
+                bank=statistics.fmean(pair[0] for pair in banked) if banked else 0.0,
+                opponent_bank=(
+                    statistics.fmean(pair[1] for pair in banked) if banked else 0.0
+                ),
             )
         )
     return table
-
-
-def mean(values: Iterable[float]) -> float:
-    """Return the arithmetic mean, or zero for an empty sequence."""
-    collected = list(values)
-    return sum(collected) / len(collected) if collected else 0.0
 
 
 def format_standing(standing: Standing) -> str:
@@ -112,4 +108,35 @@ def format_standing(standing: Standing) -> str:
         f"({standing.wins}W {standing.losses}L {standing.ties}T"
         f"{f' {standing.errors}E' if standing.errors else ''})"
         f"  bank {standing.bank:8.0f} vs {standing.opponent_bank:8.0f}"
+    )
+
+
+def league_win_rate(standings: list[Standing]) -> float:
+    """Return the win rate across every opponent, weighting each equally.
+
+    The acceptance rule in STRATEGY.md is stated against this number, so it has
+    to exist somewhere a person running the evaluation can see. It previously
+    lived only in the wandb payload, which meant the rule could not be checked
+    without ``--track`` and an internet connection.
+
+    Each opponent counts once regardless of how many games it played. That
+    normally coincides with a games-weighted mean, because the harness gives
+    every opponent the same seeds; the two diverge only when opponents error at
+    different rates.
+
+    Args:
+        standings: Per-opponent records from one evaluation.
+
+    Returns:
+        The mean of the per-opponent win rates, or zero if there are none.
+    """
+    return statistics.fmean(s.win_rate for s in standings) if standings else 0.0
+
+
+def format_league(standings: list[Standing]) -> str:
+    """Return the one line the acceptance rule is actually read from."""
+    played = sum(standing.games for standing in standings)
+    return (
+        f"   league {league_win_rate(standings):.3f} "
+        f"over {len(standings)} opponents, {played} games"
     )
