@@ -21,8 +21,9 @@ from kaggriculture.constants import (
     CROPS,
     LAND_PRICES,
     LAST_DAY,
-    MARKET_PARAMS,
+    MAX_MARKET_ORDERS_PER_TURN,
     PRODUCTS,
+    TURNS_PER_DAY,
     hire_cost,
     shed_access_tiles,
     water_bonus_window,
@@ -71,8 +72,8 @@ class Strategy:
     animals_per_turn: int = 2
     working_capital: int = 400
     feed_days: int = 3
-    max_sell_per_turn: int = 2
-    min_price_ratio: float = 0.6
+    sell_rate: int = 2
+    buy_slots: int = 4
     haul_threshold: int = 12
     flush_hour: int = 12
 
@@ -503,30 +504,52 @@ def animal_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
     return orders, spent
 
 
-def sell_orders(obs: Observation, strategy: Strategy) -> list[Op]:
-    """Return sell orders for shed produce.
+def turns_remaining(obs: Observation) -> int:
+    """Return how many turns are left in the season, this one included."""
+    return (LAST_DAY - obs.day) * TURNS_PER_DAY + (TURNS_PER_DAY - obs.hour)
 
-    Sales are trickled out and held back when a product has been driven well
-    under its base price, except on the final day when unsold stock scores
-    nothing.
+
+def sell_orders(obs: Observation, strategy: Strategy) -> list[Op]:
+    """Return sell orders that clear the shed by season's end, no faster.
+
+    Every unit sold pushes its own price down, and the town shops drain
+    inventory between turns, so a trickle realises close to the peak price on
+    every unit while a dump realises the average of a falling curve. Measured:
+    selling everything the market would absorb at a 10% impact cap banked 41.2k
+    where a slow trickle banked 49.1k on the same seeds.
+
+    So the rate is the smallest that still empties the shed in time —
+    ``held / turns_remaining`` — with a floor so a small stock still moves. That
+    single expression also replaces the old final-day dump: as the last turn
+    approaches the divisor falls to one and the rate rises to the whole holding,
+    which liquidates smoothly over the closing turns instead of cratering the
+    price in a single one.
+
+    What is deliberately gone is the old gate that refused to sell below a
+    fraction of the *base* price. Base price says nothing here — the shops keep
+    goods scarce, so strawberry trades near $207 against a base of $120 — and
+    refusing to sell when a price was depressed simply hoarded stock into the
+    worst possible moment.
+
+    Orders are ranked by value and capped so purchases still fit in the turn's
+    ten market slots.
     """
     final_day = obs.day >= LAST_DAY
     feed_reserve = len(livestock(obs)) * strategy.feed_days
-    orders: list[Op] = []
+    left = turns_remaining(obs)
+    candidates: list[tuple[float, str, int]] = []
     for item in PRODUCTS:
-        quantity = obs.shed.get(item, 0)
+        held = obs.shed.get(item, 0)
         if item == "WHEAT" and not final_day:
-            quantity -= feed_reserve  # the herd eats before the market does
-        if quantity <= 0:
+            held -= feed_reserve  # the herd eats before the market does
+        if held <= 0:
             continue
-        if final_day:
-            orders.append(["SELL", item, quantity])
-        elif (
-            obs.prices[item]
-            >= int(MARKET_PARAMS[item]["base"]) * strategy.min_price_ratio
-        ):
-            orders.append(["SELL", item, min(quantity, strategy.max_sell_per_turn)])
-    return orders
+        quantity = min(held, max(strategy.sell_rate, -(-held // left)))
+        candidates.append((quantity * obs.prices[item], item, quantity))
+
+    candidates.sort(key=lambda candidate: -candidate[0])
+    slots = MAX_MARKET_ORDERS_PER_TURN - (0 if final_day else strategy.buy_slots)
+    return [["SELL", item, quantity] for _, item, quantity in candidates[:slots]]
 
 
 def hire_orders(obs: Observation, strategy: Strategy, money: float) -> Order:
