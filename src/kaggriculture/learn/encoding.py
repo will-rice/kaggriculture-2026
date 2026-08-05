@@ -20,9 +20,12 @@ calls for but never that *this* hand is the one standing next to the weeds.
 Both farms get them, since the opponent's units are public too.
 """
 
+import inspect
+import re
 from typing import Any, Mapping
 
 import torch
+from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
 from kaggriculture.constants import (
     ANIMALS,
@@ -467,11 +470,26 @@ def _op(label: int) -> list[Any]:
 # not things the market will sell back to it. Building this slot from
 # `sorted(PRODUCTS)` instead, as the wider catalogue tempts, would add seven
 # slots the engine silently no-ops on every turn the model fills them, each
-# one crowding a real order out of a ten-order turn. This project's own
-# heuristic policy (kaggriculture.policy, kaggriculture.economic_policy) only
-# ever emits `BUY_PRODUCT WHEAT`, which is consistent with -- but narrower
-# than -- the engine's actual gate, so FERTILIZER is kept too.
-_BUY_PRODUCT_ITEMS = ("FERTILIZER", "WHEAT")
+# one crowding a real order out of a ten-order turn.
+#
+# That gate exists only as an inline literal inside `_process_market`, not as
+# a named constant, so it is pulled out of the engine's own source rather than
+# typed by hand -- the same reason `UNIT_OPS` reads `_apply_unit_action`'s
+# source for DROP instead of trusting the published op list. A hand-typed
+# tuple here would silently stop tracking the engine the day this gate
+# changes; this one cannot.
+_BUY_PRODUCT_SOURCE = inspect.getsource(engine._process_market)
+_BUY_PRODUCT_GATE = re.search(
+    r'op == "BUY_PRODUCT" and item in \(([^)]+)\)', _BUY_PRODUCT_SOURCE
+)
+if _BUY_PRODUCT_GATE is None:
+    raise RuntimeError(
+        "could not find BUY_PRODUCT's item gate in _process_market; "
+        "the engine's source changed shape and this regex needs updating"
+    )
+_BUY_PRODUCT_ITEMS = tuple(
+    sorted(re.findall(r'"([A-Z_]+)"', _BUY_PRODUCT_GATE.group(1)))
+)
 
 MARKET_SLOTS: tuple[tuple[str, str], ...] = (
     tuple(("SELL", item) for item in PRODUCT_NAMES)

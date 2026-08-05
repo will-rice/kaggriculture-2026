@@ -344,6 +344,40 @@ def test_the_vocabulary_covers_every_op_the_engine_implements() -> None:
     assert implemented <= {op.split(":")[0] for op in UNIT_OPS}
 
 
+def test_buy_product_s_item_gate_matches_the_engine_exactly() -> None:
+    """BUY_PRODUCT's gate is a closed literal, not an open-ended op list.
+
+    ``test_the_vocabulary_covers_every_op_the_engine_implements`` checks
+    ``<=`` because the unit op list only ever grows. ``_process_market``'s
+    BUY_PRODUCT gate is different in kind: it is a literal
+    ``item in ("WHEAT", "FERTILIZER")``, a fixed set rather than a floor. An
+    item the engine accepts that MARKET_SLOTS omits silently drops an order
+    the teacher could have played; an item MARKET_SLOTS claims that the
+    engine rejects is a dead slot that no-ops every turn the model fills it,
+    wasting a slot out of the ten-order cap. Both are defects, so this checks
+    equality, not containment.
+    """
+    import inspect
+    import re
+
+    from kaggle_environments.envs.kaggriculture import kaggriculture as engine
+
+    source = inspect.getsource(engine._process_market)
+    match = re.search(r'op == "BUY_PRODUCT" and item in \(([^)]+)\)', source)
+    assert match, "engine's BUY_PRODUCT gate pattern not found in _process_market"
+    gated = set(re.findall(r'"([A-Z_]+)"', match.group(1)))
+
+    ours = {item for verb, item in MARKET_SLOTS if verb == "BUY_PRODUCT"}
+
+    engine_only = gated - ours
+    ours_only = ours - gated
+    assert not engine_only and not ours_only, (
+        "BUY_PRODUCT drifted from the engine's gate: "
+        f"the engine now also accepts {engine_only or '{}'}, "
+        f"MARKET_SLOTS claims {ours_only or '{}'} that the engine rejects"
+    )
+
+
 def test_unit_labels_are_padded_and_masked() -> None:
     """Hands are hired through the day, so the acting unit count varies by turn."""
     action = {"farmer": ["WATER"], "hands": [["NORTH"]], "market": []}
