@@ -1053,7 +1053,7 @@ decisions, and the crop is what collapsed our own agent's price."
 
 **Interfaces:**
 
-- Consumes: `Sample`, `encode_board`, `encode_scalars`, `encode_units`, `TILE_PLANES`, `SCALARS`, `MAX_UNITS`.
+- Consumes: `CORPUS`, `Sample` (fields `archive`, `name`, `seat`, `rating`), `select`, `split`, `encode_board`, `encode_scalars`, `encode_units`, `TILE_PLANES`, `SCALARS`, `MAX_UNITS`.
 - Produces:
   - `build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> int` returning rows written
   - `class Shards(torch.utils.data.Dataset)` yielding `(board, scalars, labels)` tensors
@@ -1261,7 +1261,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from kaggriculture.learn.corpus import index_corpus, select, split
+from kaggriculture.learn.corpus import CORPUS, select, split
 from kaggriculture.learn.dataset import build_shard
 
 LOGGER = logging.getLogger(__name__)
@@ -1274,14 +1274,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=SHARDS, help="shard directory")
     parser.add_argument("--stride", type=int, default=4, help="keep one turn in N")
-    parser.add_argument("--quantile", type=float, default=0.9, help="bank quantile")
-    parser.add_argument("--per-team", type=int, default=40, help="cap per team")
+    parser.add_argument("--min-rating", type=float, default=2500.0, help="rating floor")
+    parser.add_argument("--per-archive", type=int, default=200, help="cap per archive")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    chosen = select(index_corpus(), quantile=args.quantile, per_team=args.per_team)
+    chosen = select(
+        sorted(CORPUS.glob("*.zip")),
+        min_rating=args.min_rating,
+        per_archive=args.per_archive,
+    )
     train, held = split(chosen)
     LOGGER.info("selected %d seats: %d train, %d holdout", len(chosen), len(train), len(held))
 
@@ -1703,7 +1707,7 @@ Add under Phase 2 in `STRATEGY.md`, filling in measured values:
 ```markdown
 #### Result — behaviour cloning, YYYY-MM-DD (run `bc-…`)
 
-Dataset: N seats selected from M episodes at quantile Q with a per-team cap of C,
+Dataset: N seats selected from M episodes at a rating floor of R with a per-archive cap of C,
 S rows at stride T. Holdout accuracy A over acting units.
 
 | opponent     | win rate | 95% interval |
