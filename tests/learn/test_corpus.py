@@ -8,9 +8,12 @@ from kaggriculture.learn.corpus import CORPUS, EpisodeRecord, index_archive
 
 ARCHIVE = CORPUS / "kaggriculture-episodes-2026-08-03.zip"
 
-pytestmark = pytest.mark.skipif(
-    not ARCHIVE.exists(), reason="replay corpus not present on this machine"
-)
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(
+        not ARCHIVE.exists(), reason="replay corpus not present on this machine"
+    ),
+]
 
 
 def test_index_reads_every_episode_in_an_archive() -> None:

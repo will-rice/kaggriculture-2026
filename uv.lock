@@ -1510,6 +1510,7 @@ dependencies = [
     { name = "pytest" },
     { name = "python-dotenv" },
     { name = "ruff" },
+    { name = "tqdm" },
     { name = "ty" },
     { name = "wandb" },
 ]
@@ -1523,6 +1524,7 @@ requires-dist = [
     { name = "pytest", specifier = ">=8.3.4" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "ruff", specifier = ">=0.9.7" },
+    { name = "tqdm", specifier = ">=4.70.0" },
     { name = "ty", specifier = ">=0.0.18" },
     { name = "wandb", specifier = ">=0.28.1" },
 ]

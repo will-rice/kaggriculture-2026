@@ -69,14 +69,14 @@ def index_archive(archive: Path) -> list[EpisodeRecord]:
         for name in tqdm(names, desc=archive.name, unit="ep"):
             with bundle.open(name) as member:
                 episode = json.load(member)
-            info = episode.get("info", {})
+            info = episode["info"]
             records.append(
                 EpisodeRecord(
                     archive=archive.name,
                     name=name,
-                    episode_id=int(info.get("EpisodeId", 0)),
+                    episode_id=int(info["EpisodeId"]),
                     rewards=[float(value) for value in episode["rewards"]],
-                    teams=[str(team) for team in info.get("TeamNames", [])],
+                    teams=[str(team) for team in info["TeamNames"]],
                 )
             )
     return records
