@@ -31,6 +31,7 @@ from kaggriculture.constants import (
     EPISODE_STEPS,
     LAND_ORDER,
     MARKET_PARAMS,
+    MAX_MARKET_ORDERS_PER_TURN,
     PRODUCTS,
     SEASON_DAYS,
     SHOPS,
@@ -452,3 +453,171 @@ def _op(label: int) -> list[Any]:
     if name.startswith("PLANT:"):
         return ["PLANT", name.split(":", 1)[1]]
     return [name]
+
+
+# Every (verb, item) pair the engine's `_process_market` will actually act on.
+# SELL covers the whole PRODUCTS catalogue: `_commit_unit` gates a sale only on
+# whether the shed holds the item, never on which item it is. BUY_SEED and
+# BUY_ANIMAL are gated by `item in CROPS` / `item in ANIMALS`, the whole
+# catalogue in each case.
+#
+# BUY_PRODUCT is narrower. `_process_market` gates it with a literal
+# `item in ("WHEAT", "FERTILIZER")` that has nothing to do with the rest of
+# PRODUCTS -- CARROT, MELON and the animal products are things a farm grows,
+# not things the market will sell back to it. Building this slot from
+# `sorted(PRODUCTS)` instead, as the wider catalogue tempts, would add seven
+# slots the engine silently no-ops on every turn the model fills them, each
+# one crowding a real order out of a ten-order turn. This project's own
+# heuristic policy (kaggriculture.policy, kaggriculture.economic_policy) only
+# ever emits `BUY_PRODUCT WHEAT`, which is consistent with -- but narrower
+# than -- the engine's actual gate, so FERTILIZER is kept too.
+_BUY_PRODUCT_ITEMS = ("FERTILIZER", "WHEAT")
+
+MARKET_SLOTS: tuple[tuple[str, str], ...] = (
+    tuple(("SELL", item) for item in PRODUCT_NAMES)
+    + tuple(("BUY_SEED", item) for item in CROP_NAMES)
+    + tuple(("BUY_PRODUCT", item) for item in _BUY_PRODUCT_ITEMS)
+    + tuple(("BUY_ANIMAL", item) for item in ANIMAL_NAMES)
+)
+
+# HIRE and BUY_LAND are atomic engine ops (`_parse_order` returns them with no
+# item or quantity), so they get their own slots after the (verb, item) pairs
+# rather than a row each in MARKET_SLOTS.
+HIRE_SLOT = len(MARKET_SLOTS)
+LAND_SLOT = len(MARKET_SLOTS) + 1
+
+# The engine truncates a turn's market orders to `maxMarketOrdersPerTurn`
+# before processing them (`_process_market`: `queues.append(q[:max_orders])`),
+# reading it from the environment configuration with a default of 10. The
+# corpus never configures it away from that default, and hits the cap 903
+# times -- more often than it emits exactly 9 orders -- so it is a real,
+# frequently-binding limit on how many orders a turn can carry, not a
+# theoretical one.
+MAX_ORDERS = MAX_MARKET_ORDERS_PER_TURN
+
+# The first thirteen buckets are exact counts: 93.5% of orders in the corpus
+# are 12 or fewer, and lumping that dense range into ranges would blur most of
+# the distribution the model has to predict. The remaining four buckets
+# summarize the long tail -- 13-20, 21-32, 33-52, 53+ -- each labelled by one
+# representative quantity, so a big order is still distinguishable from no
+# order without one class per order size seen only a handful of times.
+QUANTITIES: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 24, 40, 64)
+
+# The inclusive upper bound of each of the three bounded tail buckets (index
+# 13, 14, 15); the fourth tail bucket (index 16, representative 64) is
+# unbounded above. These are not derivable from QUANTITIES itself -- the
+# representative quantities step by a roughly-1.5x progression (12, 16, 24,
+# 40, 64) while the ranges they stand for widen faster (8, 12, 20, then
+# open-ended), so "the next representative minus one" is not this scheme;
+# the ranges are their own design choice and are written out accordingly.
+_TAIL_BUCKET_MAX = (20, 32, 52)
+
+
+def bucket_of(n: int) -> int:
+    """Return the bucket index that quantity ``n`` falls into.
+
+    The first thirteen buckets are exact: bucket ``k`` is quantity ``k``
+    itself, for ``k`` up to 12. Past that, a quantity falls into whichever of
+    the three bounded tail ranges (13-20, 21-32, 33-52) contains it, or the
+    open-ended 53+ bucket if it exceeds all of them.
+
+    Args:
+        n: A non-negative quantity, possibly already summed across repeated
+            orders for the same (verb, item) pair.
+
+    Returns:
+        An index into ``QUANTITIES``.
+    """
+    if n <= 12:
+        return n
+    for offset, upper in enumerate(_TAIL_BUCKET_MAX):
+        if n <= upper:
+            return 13 + offset
+    return len(QUANTITIES) - 1
+
+
+def quantity_of(bucket: int) -> int:
+    """Return the quantity one bucket index represents.
+
+    Args:
+        bucket: An index into ``QUANTITIES``, typically an argmaxed logit.
+
+    Returns:
+        ``QUANTITIES[bucket]``.
+    """
+    return QUANTITIES[bucket]
+
+
+def encode_market(action: Mapping[str, Any]) -> torch.Tensor:
+    """Return one bucketed label per market slot.
+
+    Unlike ``encode_units``, no market slot is ever ``IGNORE``. A unit slot is
+    padding when the farm has no hand standing there yet; a market slot has no
+    such state; every slot -- sell this product, buy that seed, hire, buy land
+    -- is a genuine decision on every turn, and "trade nothing" is itself the
+    meaningful class 0 rather than something to mask out: the corpus trades
+    nothing on roughly half of all turns. The market loss therefore masks
+    nothing, where the unit loss masks every unhired hand's padding.
+
+    Repeated orders for the same (verb, item) pair are summed before
+    bucketing -- 22% of order-bearing turns repeat a pair, and keeping only
+    the last one would discard a real sale or purchase the teacher made.
+    ``HIRE`` carries no item and is counted rather than summed, since one
+    ``HIRE`` order hires exactly one hand. ``BUY_LAND`` collapses to a flag,
+    since the engine performs it at most once per turn regardless of how many
+    ``BUY_LAND`` orders are queued (``_do_buy_land`` is called once per
+    occurrence, but a second call the same turn is a no-op once the quadrant
+    is already unlocked).
+
+    Args:
+        action: One recorded turn's action dict.
+
+    Returns:
+        A ``(1, len(MARKET_SLOTS) + 2)`` int64 tensor of bucket indices.
+    """
+    totals = [0] * len(MARKET_SLOTS)
+    hires = 0
+    land = 0
+    for order in action["market"]:
+        verb = order[0]
+        if verb == "HIRE":
+            hires += 1
+        elif verb == "BUY_LAND":
+            land = 1
+        else:
+            totals[MARKET_SLOTS.index((verb, order[1]))] += int(order[2])
+    labels = [bucket_of(total) for total in totals] + [bucket_of(hires), land]
+    return torch.tensor(labels, dtype=torch.int64).reshape(1, len(MARKET_SLOTS) + 2)
+
+
+def decode_market(logits: torch.Tensor) -> list[list[Any]]:
+    """Return the market orders implied by per-slot logits.
+
+    Orders are emitted in ``MARKET_SLOTS`` order, so every ``SELL`` precedes
+    every ``BUY_*`` since the ``SELL`` block is built first. The engine
+    processes one turn's orders in list order, one unit of quantity at a time
+    per order before moving to the next, so a sale queued ahead of a purchase
+    can fund it; queued the other way, the purchase would be evaluated against
+    money the sale had not yet raised. ``HIRE`` orders follow, repeated by
+    count, then ``BUY_LAND``.
+
+    The result is truncated to ``MAX_ORDERS``: the engine silently drops
+    anything past ``maxMarketOrdersPerTurn``, so emitting more here would
+    never reach the game.
+
+    Args:
+        logits: A ``(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` tensor.
+
+    Returns:
+        A list of order lists, e.g. ``["SELL", "WHEAT", 4]`` or ``["HIRE"]``.
+    """
+    buckets = logits[0].argmax(dim=-1)
+    orders: list[list[Any]] = []
+    for slot, (verb, item) in enumerate(MARKET_SLOTS):
+        bucket = int(buckets[slot].item())
+        if bucket != 0:
+            orders.append([verb, item, quantity_of(bucket)])
+    orders.extend([["HIRE"]] * quantity_of(int(buckets[HIRE_SLOT].item())))
+    if int(buckets[LAND_SLOT].item()) != 0:
+        orders.append(["BUY_LAND"])
+    return orders[:MAX_ORDERS]

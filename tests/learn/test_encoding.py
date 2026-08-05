@@ -12,18 +12,27 @@ import zipfile
 import pytest
 import torch
 
-from kaggriculture.constants import CROPS, PRODUCTS
+from kaggriculture.constants import ANIMALS, CROPS, PRODUCTS
 from kaggriculture.learn.corpus import CORPUS
 from kaggriculture.learn.encoding import (
     BOARD,
+    HIRE_SLOT,
     IGNORE,
+    LAND_SLOT,
+    MARKET_SLOTS,
+    MAX_ORDERS,
     MAX_UNITS,
+    QUANTITIES,
     SCALARS,
     TILE_PLANES,
+    bucket_of,
+    decode_market,
     encode_board,
+    encode_market,
     encode_positions,
     encode_scalars,
     encode_units,
+    quantity_of,
     unit_count,
 )
 
@@ -411,3 +420,89 @@ def test_a_unit_count_beyond_max_units_raises() -> None:
 
     with pytest.raises(ValueError):
         encode_units(action, units=MAX_UNITS + 1)
+
+
+def test_every_verb_item_pair_the_corpus_uses_has_a_slot() -> None:
+    """A missing slot silently drops an order the teacher actually played.
+
+    BUY_PRODUCT is checked against ``{"WHEAT", "FERTILIZER"}``, not
+    ``set(PRODUCTS)``: the engine's own ``_process_market`` gates BUY_PRODUCT
+    with a literal ``item in ("WHEAT", "FERTILIZER")``, narrower than the
+    catalogue SELL, BUY_SEED and BUY_ANIMAL each cover in full. Asserting the
+    wider set here would pass while MARKET_SLOTS carried seven dead slots the
+    engine silently no-ops.
+    """
+    verbs = {verb for verb, _ in MARKET_SLOTS}
+
+    assert verbs == {"SELL", "BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL"}
+    assert {item for verb, item in MARKET_SLOTS if verb == "SELL"} == set(PRODUCTS)
+    assert {item for verb, item in MARKET_SLOTS if verb == "BUY_SEED"} == set(CROPS)
+    assert {item for verb, item in MARKET_SLOTS if verb == "BUY_ANIMAL"} == set(ANIMALS)
+    assert {item for verb, item in MARKET_SLOTS if verb == "BUY_PRODUCT"} == {
+        "WHEAT",
+        "FERTILIZER",
+    }
+
+
+def test_buckets_are_exact_where_the_corpus_is_dense() -> None:
+    """93.5% of orders are 12 or fewer, so those must not be lumped into ranges."""
+    assert QUANTITIES[:13] == tuple(range(13))
+    assert bucket_of(0) == 0
+    assert bucket_of(7) == 7
+    assert bucket_of(12) == 12
+    assert bucket_of(13) == bucket_of(16) > 12
+    assert bucket_of(85) == len(QUANTITIES) - 1
+
+
+def test_a_bucket_round_trips_to_a_quantity_that_lands_in_it() -> None:
+    """Decoding must not emit a count outside the bucket it came from."""
+    for n in (0, 1, 5, 12, 14, 20, 30, 85):
+        assert bucket_of(quantity_of(bucket_of(n))) == bucket_of(n)
+
+
+def test_hire_is_a_count_and_buy_land_is_a_flag() -> None:
+    """HIRE is atomic, so hiring three hands is three orders, not a quantity."""
+    action = {"market": [["HIRE"], ["HIRE"], ["HIRE"], ["BUY_LAND"]]}
+
+    labels = encode_market(action)
+
+    assert labels[0, HIRE_SLOT].item() == bucket_of(3)
+    assert labels[0, LAND_SLOT].item() == 1
+
+
+def test_repeated_orders_for_one_item_sum() -> None:
+    """22% of order-bearing turns repeat a pair; dropping one loses a real sale."""
+    action = {"market": [["SELL", "WHEAT", 3], ["SELL", "WHEAT", 4]]}
+
+    labels = encode_market(action)
+
+    assert labels[0, MARKET_SLOTS.index(("SELL", "WHEAT"))].item() == bucket_of(7)
+
+
+def test_decoding_never_exceeds_the_engine_s_order_cap() -> None:
+    """The engine truncates past MAX_ORDERS, so anything beyond it is discarded."""
+    logits = torch.zeros(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))
+    logits[0, :, 1] = 10.0
+
+    orders = decode_market(logits)
+
+    assert len(orders) <= MAX_ORDERS
+
+
+def test_decoding_puts_sells_before_buys() -> None:
+    """Orders fill in sequence, so a sale must fund the purchase it precedes."""
+    logits = torch.zeros(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))
+    logits[0, MARKET_SLOTS.index(("SELL", "WHEAT")), 2] = 10.0
+    logits[0, MARKET_SLOTS.index(("BUY_SEED", "MELON")), 2] = 10.0
+
+    orders = decode_market(logits)
+
+    assert [order[0] for order in orders] == ["SELL", "BUY_SEED"]
+
+
+def test_an_empty_market_decodes_to_no_orders() -> None:
+    """Half of all turns trade nothing; emitting a zero order would be rejected."""
+    logits = torch.zeros(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))
+    logits[0, :, 0] = 10.0
+
+    assert decode_market(logits) == []
