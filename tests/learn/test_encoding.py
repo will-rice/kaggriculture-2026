@@ -323,6 +323,34 @@ def test_the_phase_of_the_season_is_encoded() -> None:
     assert not torch.equal(encode_scalars(early, 0), encode_scalars(late, 0))
 
 
+@pytest.mark.slow
+@pytest.mark.skipif(not CORPUS.is_dir(), reason="needs the replay corpus")
+def test_every_order_in_the_corpus_encodes() -> None:
+    """A verb or item with no slot is dropped silently, not loudly.
+
+    Checked across every archive rather than one, because the ladder's agent
+    mix changes daily -- the verb mix inverts between 07-30 and 08-04, and two
+    committed claims in this repo have already come from generalising a single
+    archive.
+    """
+    seen = set()
+    for archive in sorted(CORPUS.glob("*.zip")):
+        with zipfile.ZipFile(archive) as bundle:
+            name = next(n for n in bundle.namelist() if n.endswith(".json"))
+            with bundle.open(name) as member:
+                steps = json.load(member)["steps"]
+        for step in steps:
+            for seat in (0, 1):
+                action = step[seat].get("action") or {}
+                for order in action.get("market", []) or []:
+                    seen.add(order[0] if len(order) < 3 else (order[0], order[1]))
+                encode_market(action)
+
+    unknown = {s for s in seen if isinstance(s, tuple) and s not in MARKET_SLOTS}
+    assert not unknown, f"corpus plays {unknown}, which no slot can express"
+    assert {s for s in seen if isinstance(s, str)} <= {"HIRE", "BUY_LAND"}
+
+
 def test_the_vocabulary_covers_every_op_the_engine_implements() -> None:
     """Derived from the engine's code, not its docs.
 
