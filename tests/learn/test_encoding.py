@@ -131,31 +131,25 @@ def test_the_phase_of_the_season_is_encoded() -> None:
     assert not torch.equal(encode_scalars(early, 0), encode_scalars(late, 0))
 
 
-def test_every_recorded_op_has_a_label() -> None:
-    """An op absent from the vocabulary would silently become a different action."""
+def test_the_vocabulary_covers_every_op_the_engine_implements() -> None:
+    """Derived from the engine's code, not its docs.
+
+    The published spec lists seventeen unit ops and omits DROP, which the engine
+    implements and this project's own agents emit routinely. A hand-written list
+    checked against another hand-written list passes while both are wrong.
+    """
+    import inspect
+    import re
+
+    from kaggle_environments.envs.kaggriculture import kaggriculture as engine
+
     from kaggriculture.learn.encoding import UNIT_OPS
 
-    engine_ops = {
-        "NORTH",
-        "SOUTH",
-        "EAST",
-        "WEST",
-        "PASS",
-        "PICKUP",
-        "PLANT",
-        "WATER",
-        "HARVEST",
-        "FERTILIZE",
-        "BUILD_COOP",
-        "BUILD_PASTURE",
-        "DIG",
-        "PLACE",
-        "FEED",
-        "COLLECT_FERTILIZER",
-        "CARE",
-    }
+    source = inspect.getsource(engine._apply_unit_action)
+    implemented = set(re.findall(r'op == "([A-Z_]+)"', source))
 
-    assert engine_ops <= {op.split(":")[0] for op in UNIT_OPS}
+    assert implemented
+    assert implemented <= {op.split(":")[0] for op in UNIT_OPS}
 
 
 def test_unit_labels_are_padded_and_masked() -> None:

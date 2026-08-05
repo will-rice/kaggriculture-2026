@@ -215,6 +215,11 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
 # One label per distinct decision. PLANT carries its crop because planting melon
 # and planting wheat are different choices, not one op with a detail attached --
 # the crop is the decision that collapsed our own agent's price this morning.
+#
+# DROP is here even though the engine's own JSON action spec never mentions it:
+# the spec text lists seventeen ops, but `_apply_unit_action` in the engine's
+# source implements an eighteenth, DROP, and this project's own policies emit
+# it routinely. The docs are not authoritative; the engine's code is.
 UNIT_OPS: tuple[str, ...] = (
     "PASS",
     "NORTH",
@@ -232,6 +237,7 @@ UNIT_OPS: tuple[str, ...] = (
     "BUILD_PASTURE",
     "PICKUP",
     "PLACE",
+    "DROP",
 ) + tuple(f"PLANT:{crop}" for crop in CROP_NAMES)
 
 # The main farmer plus enough hands for a full day's hiring. There is no
