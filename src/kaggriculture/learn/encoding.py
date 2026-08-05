@@ -265,6 +265,17 @@ MAX_UNITS = 20
 IGNORE = -100
 
 
+class TooManyUnitsError(ValueError):
+    """Raised when a turn has more acting units than ``MAX_UNITS`` covers.
+
+    Kept distinct from the plain ``ValueError`` that ``_label`` raises for an
+    op outside ``UNIT_OPS`` (``tuple.index(x): x not in tuple``), so a caller
+    that wants to tolerate an oversized turn -- an empirical, not proven,
+    bound -- can catch exactly this and let an unknown-op bug propagate
+    instead of being silently counted as the same kind of failure.
+    """
+
+
 def encode_units(action: Mapping[str, Any]) -> torch.Tensor:
     """Return one label per unit, padded to ``MAX_UNITS``.
 
@@ -279,11 +290,13 @@ def encode_units(action: Mapping[str, Any]) -> torch.Tensor:
         A ``(1, MAX_UNITS)`` int64 tensor of labels.
 
     Raises:
-        ValueError: If more units acted this turn than ``MAX_UNITS`` covers.
+        TooManyUnitsError: If more units acted this turn than ``MAX_UNITS`` covers.
     """
     ops = [action["farmer"], *action["hands"]]
     if len(ops) > MAX_UNITS:
-        raise ValueError(f"{len(ops)} acting units exceeds MAX_UNITS={MAX_UNITS}")
+        raise TooManyUnitsError(
+            f"{len(ops)} acting units exceeds MAX_UNITS={MAX_UNITS}"
+        )
     labels = torch.full((1, MAX_UNITS), IGNORE, dtype=torch.int64)
     for index, op in enumerate(ops):
         labels[0, index] = _label(op)
@@ -316,10 +329,10 @@ def decode_units(logits: torch.Tensor, units: int) -> dict[str, Any]:
         (market orders are decoded elsewhere).
 
     Raises:
-        ValueError: If ``units`` exceeds ``MAX_UNITS``.
+        TooManyUnitsError: If ``units`` exceeds ``MAX_UNITS``.
     """
     if units > MAX_UNITS:
-        raise ValueError(f"{units} units exceeds MAX_UNITS={MAX_UNITS}")
+        raise TooManyUnitsError(f"{units} units exceeds MAX_UNITS={MAX_UNITS}")
     chosen = logits[0, :units].argmax(dim=-1)
     ops = [_op(int(index.item())) for index in chosen]
     return {"farmer": ops[0], "hands": ops[1:], "market": []}
