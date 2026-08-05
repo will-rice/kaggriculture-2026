@@ -310,10 +310,15 @@ def unit_count(observation: Mapping[str, Any], seat: int) -> int:
     cannot disagree about it. The observation, not the action, is authoritative:
     the engine walks ``[farmer, *farm["hands"]]`` and its ``_farmer_position``
     returns ``None`` past the end of ``hands``, making any further op in the
-    action a silent no-op. About 5% of corpus turns emit a hand-op list that
-    does not match the farm -- usually one or two too many, sometimes two too
-    few -- so the two counts genuinely differ and only one of them decides
-    anything.
+    action a silent no-op.
+
+    On correctly paired data the two counts never actually diverge -- measured
+    at 0 of 11,504 turns across eight episodes. They diverge on 7.3% of turns
+    only when an observation is paired with its own action rather than the next
+    one, because a HIRE shows up in the observation the action produced. So this
+    function is not here to reconcile a discrepancy in the corpus; it is here so
+    that ``encode_positions`` and ``encode_units`` cannot drift apart, a failure
+    that would train every unit on another unit's surroundings without raising.
 
     Args:
         observation: One turn's observation.
