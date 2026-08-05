@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
   "kaggle-environments>=1.32.3",
   "kaggle>=1.7.4",
+  "lightning>=2.6.5",
   "pre-commit>=4.1.0",
   "pydantic>=2.12.2",
   "pytest>=8.3.4",
