@@ -554,7 +554,7 @@ def test_the_agent_emits_both_unit_and_market_orders() -> None:
     assert isinstance(action["market"], list)
 
 
-def test_the_submission_carries_the_weights() -> None:
+def test_the_submission_carries_the_weights(tmp_path: Path) -> None:
     """A packaged agent that cannot load its checkpoint plays untrained."""
     archive = build_archive(tmp_path)
 
@@ -562,7 +562,7 @@ def test_the_submission_carries_the_weights() -> None:
     assert any(name.endswith(".pt") for name in names)
 
 
-def test_the_submission_ships_no_scripts() -> None:
+def test_the_submission_ships_no_scripts(tmp_path: Path) -> None:
     """The sandbox has no network; a wandb import forfeits the episode on turn 0."""
     archive = build_archive(tmp_path)
 
