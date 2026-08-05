@@ -41,17 +41,32 @@ Items: 9 products (`CARROT`, `EGG`, `FERTILIZER`, `MELON`, `MILK`, `STRAWBERRY`,
 
 ## What the corpus actually does
 
-Sampled across the two most recent archives:
+Measured across **all six** archives, 10 episodes each, 86,400 seat-turns. An
+earlier draft of this spec sampled two archives and drew two conclusions that the
+full corpus contradicts — the exact mistake this repo has now made twice.
 
-- Verb mix: `SELL` 6,158, `HIRE` 4,849, `BUY_PRODUCT` 4,836, `BUY_SEED` 840,
-  `BUY_ANIMAL` 224, `BUY_LAND` 32.
-- Orders per turn: 0 on 3,842 turns, 1 on 3,790, 2 on 1,581, tailing to 7. Never
-  close to the cap of 10.
-- Quantities: 39 distinct values, heavily skewed small — 1 is the mode (2,598),
-  then 2 (1,397), 3 (1,028) — with a long thin tail to 56.
+- Orders per turn: 0 on 42,333 turns, 1 on 22,981, 2 on 8,861, then a decreasing
+  tail — **except at exactly 10, which occurs 903 times, more often than 9
+  (202)**. That spike is the `maxMarketOrdersPerTurn` cap clipping agents who
+  wanted more. The head must be able to emit a full ten orders; the two-archive
+  draft claimed the cap was never approached.
+- Verb mix shifts hard across the month. On 07-30 `BUY_SEED` (1,118) outnumbered
+  `SELL` (837); by 08-04 `SELL` (8,084) dominates and `BUY_SEED` is 1,080. Any
+  statistic here must be reported per archive.
+- Quantities: 62 distinct values to a max of 85. **34.5% are exactly 1**, 51.8%
+  are ≤2, 72.6% are ≤4, and **93.5% are ≤12**.
+- Item sets per verb are narrower than the engine allows: `BUY_SEED` uses all 5
+  crops, `SELL` all 9 products (`WHEAT` 12,148 leading), `BUY_ANIMAL` all 3, but
+  `BUY_PRODUCT` is `WHEAT` 27,635 against `FERTILIZER` twice — effectively a
+  single-item verb, because wheat is the feed for every animal.
 
-So the head does not need to express ten orders, and it does not need a
-fine-grained quantity range. It needs to be good at "sell a few of one thing".
+**Aggregation is very nearly lossless.** 22.3% of order-bearing turns repeat a
+`(verb, item)` pair, but that is overwhelmingly `HIRE` — atomic at one hand per
+order, so repetition is the only way to hire several, and the design already
+models it as a count. Non-`HIRE` repeats are ~1.8%, almost all a doubled `SELL`.
+Merging those two sells into one changes their interleaving against the
+opponent's queue under lockstep quoting; that is the fidelity this design trades
+away, and it is small enough to accept.
 
 ## Design
 
@@ -67,8 +82,10 @@ directly:
 - `HIRE` → one count distribution (how many hires this turn).
 - `BUY_LAND` → one binary.
 
-Quantities are **bucketed, not regressed**: `0, 1, 2, 3, 4, 5, 6-8, 9-12, 13-20,
-21+`, chosen from the measured distribution above. Regression on a long-tailed
+Quantities are **bucketed, not regressed**. The measured distribution puts 93.5%
+of orders at 12 or below, so the buckets are exact there and coarse above:
+`0, 1, 2, …, 12, 13-16, 17-24, 25-40, 41+` — 17 classes, of which the first
+thirteen are exact values rather than ranges. Regression on a long-tailed
 count trains toward the mean and emits 2.7 of a melon; classification over
 buckets matches how the corpus behaves and keeps the loss comparable to the unit
 head's cross-entropy.
