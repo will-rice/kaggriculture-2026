@@ -123,6 +123,28 @@ def test_scalars_carry_both_price_and_opponent_supply() -> None:
     assert not torch.equal(encode_scalars(cheap, 0), encode_scalars(rich, 0))
 
 
+def test_scalars_do_not_depend_on_the_step_key() -> None:
+    """kaggle_environments only ever writes ``step`` onto agent 0's observation.
+
+    Its own ``core.py`` sets ``new_state[0].observation.step = ...`` and never
+    mirrors it to any other agent, so a real seat-1 (or later) observation has
+    no ``step`` key at all. ``encode_scalars`` must derive the global step from
+    ``day``/``hour``, which the game's interpreter does mirror to every agent,
+    rather than reading a key that is only ever present for seat 0.
+    """
+    from kaggriculture.constants import EPISODE_STEPS, TURNS_PER_DAY
+
+    observation = empty_observation()
+    observation["day"], observation["hour"] = 3, 7
+    del observation["step"]
+
+    scalars = encode_scalars(observation, seat=0)
+
+    step_index = SCALARS - 6
+    expected = (3 * TURNS_PER_DAY + 7) / EPISODE_STEPS
+    assert scalars[0, step_index].item() == pytest.approx(expected)
+
+
 def test_the_phase_of_the_season_is_encoded() -> None:
     """Shops unlock every three days and demand steps at days 10 and 20."""
     early, late = empty_observation(), empty_observation()

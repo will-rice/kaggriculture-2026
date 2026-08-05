@@ -176,6 +176,15 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
     shops and hired hands are included for both seats, since the opponent's
     farm is public.
 
+    The global step is derived from ``day`` and ``hour`` rather than read from
+    ``observation["step"]``: kaggle_environments' own core loop only ever
+    writes ``step`` onto agent 0's observation (``new_state[0].observation.step
+    = ...`` in its ``core.py``), so any other seat's real observation has no
+    ``step`` key at all. ``day`` and ``hour`` are mirrored onto every agent by
+    the game's interpreter, and reconstruct ``step`` exactly, since the
+    interpreter itself derives them as ``next_step // turns_per_day`` and
+    ``next_step % turns_per_day``.
+
     Args:
         observation: One turn's observation.
         seat: Which player to encode for.
@@ -202,7 +211,7 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
         theirs["money"] / 10_000.0,
         observation["day"] / SEASON_DAYS,
         observation["hour"] / TURNS_PER_DAY,
-        observation["step"] / EPISODE_STEPS,
+        (observation["day"] * TURNS_PER_DAY + observation["hour"]) / EPISODE_STEPS,
         len(observation["town"]["unlocked_shops"]) / len(SHOPS),
         len(ours["unlocked_quadrants"]) / _MAX_QUADRANTS,
         len(theirs["unlocked_quadrants"]) / _MAX_QUADRANTS,
