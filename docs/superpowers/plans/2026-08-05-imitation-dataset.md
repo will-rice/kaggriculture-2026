@@ -550,7 +550,7 @@ This is the task where a silent error costs the most. A wrong plane does not rai
 **Interfaces:**
 
 - Produces:
-  - Constants `BOARD = 10`, `TILE_PLANES = 24`, `SCALARS = 32`
+  - Constants `BOARD = 10`, `TILE_PLANES` and `SCALARS`, all **derived from the engine's rules tables**, never hardcoded. As implemented they compute to 34 and 28; the plan's earlier stated values of 24 and 32 were the author's arithmetic, not a requirement. Later tasks import these names and must never restate their values.
   - `encode_board(observation: Mapping[str, Any], seat: int) -> torch.Tensor` returning `(1, TILE_PLANES, BOARD, BOARD)` float32
   - `encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor` returning `(1, SCALARS)` float32
 
