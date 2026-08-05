@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_ROOT = REPO_ROOT / "src" / "kaggriculture"
 ENTRYPOINT = REPO_ROOT / "main.py"
 SUBMISSION = REPO_ROOT / "submission.tar.gz"
-EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts")
+EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "learn")
 
 
 def main() -> None:

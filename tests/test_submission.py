@@ -39,4 +39,5 @@ def test_archive_holds_the_entrypoint_beside_the_package(tmp_path: Path) -> None
     assert "kaggriculture/policy.py" in names
     assert "kaggriculture/economic_policy.py" in names
     assert not any(name.startswith("kaggriculture/scripts") for name in names)
+    assert not any(name.startswith("kaggriculture/learn") for name in names)
     assert not any("__pycache__" in name for name in names)
