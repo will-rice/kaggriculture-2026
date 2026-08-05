@@ -9,12 +9,17 @@ be step counts.
 Our board is 10x10 against their 24x24, so the same shape costs roughly a sixth
 as much: the Phase 0 probe measured a 10M-parameter conv trunk at ~45ms of the
 1000ms turn.
+
+The readout follows them too: rather than pool the trunk and emit every unit's
+op from one wide ``Linear``, each unit's logits are read from the trunk column
+at the tile that unit is standing on, through one ``Linear`` shared by every
+slot. Almost all of the parameters are in the trunk either way; what changes is
+that the head can see position at all.
 """
 
 import torch
 
 from kaggriculture.learn.encoding import (
-    MAX_UNITS,
     SCALARS,
     TILE_PLANES,
     UNIT_OPS,
@@ -60,22 +65,30 @@ class Policy(torch.nn.Module):
             torch.nn.Linear(channels, channels),
         )
         self.blocks = torch.nn.ModuleList(Residual(channels) for _ in range(blocks))
-        self.head = torch.nn.Sequential(
-            torch.nn.Linear(channels, channels),
-            torch.nn.ReLU(),
-            torch.nn.Linear(channels, MAX_UNITS * len(UNIT_OPS)),
-        )
+        self.head = torch.nn.Linear(channels, len(UNIT_OPS))
 
-    def forward(self, board: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         """Return per-unit op logits.
 
         The market is projected and added to the spatial tensor rather than
         broadcast as constant planes: it is 28 numbers that decide the game and
         deserve their own capacity.
 
+        Each unit reads the trunk at its own tile rather than at a global
+        average. Pooling the trunk and emitting every slot from one ``Linear``
+        gives slot *k* nothing but a board summary and its own index, so it can
+        express what the day calls for but never what the unit is standing next
+        to; measured, perturbing one board cell moved all ``MAX_UNITS`` slots.
+        Gathering per position also makes the readout weights shared across
+        slots, so which unit a slot holds stops mattering.
+
         Args:
             board: ``(batch, TILE_PLANES, BOARD, BOARD)`` planes.
             scalars: ``(batch, SCALARS)`` market and phase features.
+            positions: ``(batch, MAX_UNITS)`` int64 flattened tile indices, in
+                the order ``encode_units`` labels the units.
 
         Returns:
             ``(batch, MAX_UNITS, len(UNIT_OPS))`` logits.
@@ -83,5 +96,6 @@ class Policy(torch.nn.Module):
         features = self.stem(board) + self.market(scalars)[:, :, None, None]
         for block in self.blocks:
             features = block(features)
-        pooled = features.mean(dim=(2, 3))
-        return self.head(pooled).reshape(-1, MAX_UNITS, len(UNIT_OPS))
+        columns = features.flatten(2)
+        wanted = positions[:, None, :].tile(1, columns.shape[1], 1)
+        return self.head(columns.gather(2, wanted).transpose(1, 2))

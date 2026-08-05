@@ -15,6 +15,12 @@ is ``steps[i - 1]["observation"]``. Every row here therefore pairs
 ``observation[i]`` with ``action[i + 1]`` -- the decision made *from* that
 state -- and ``action[0]`` is dropped as a reset filler with nothing preceding
 it to predict from.
+
+Unit positions are part of the row's *input*, so they come from
+``observation[i]`` along with the board and the scalars, never from the later
+step. A hand that walks north between the two has already left the tile it
+decided from, and reading positions one step late would train every moving unit
+on the surroundings it arrived at rather than the ones it chose from.
 """
 
 import json
@@ -32,19 +38,21 @@ from kaggriculture.learn.corpus import CORPUS, Sample
 from kaggriculture.learn.encoding import (
     TooManyUnitsError,
     encode_board,
+    encode_positions,
     encode_scalars,
     encode_units,
+    unit_count,
 )
 
 LOGGER = logging.getLogger(__name__)
 
-# One row is ~13.6 KB of board planes plus a few hundred bytes of scalars and
-# labels. At this cap a shard is ~270 MB of raw float32 tensors before
-# compression -- small enough that peak memory during a build is one shard,
-# not the ~5.5 GiB the full corpus would concatenate to at stride=4.
+# One row is ~15.2 KB of board planes plus a few hundred bytes of scalars,
+# positions and labels. At this cap a shard is ~305 MB of raw float32 tensors
+# before compression -- small enough that peak memory during a build is one
+# shard, not the ~6.1 GiB the full corpus would concatenate to at stride=4.
 ROWS_PER_SHARD = 20_000
 
-_Row = tuple[np.ndarray, np.ndarray, np.ndarray]
+_Row = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
 def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> int:
@@ -58,9 +66,10 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
     file it asked for.
 
     ``MAX_UNITS`` is an empirical bound from sampling part of the corpus, not a
-    proven one. A turn whose acting-unit count exceeds it is skipped rather than
-    aborting the whole build; the skip is counted and logged so an unexpectedly
-    non-zero count surfaces as a finding about the bound, not a silent loss. Any
+    proven one. A turn whose acting-unit count -- taken from the observation,
+    which is what the engine walks -- exceeds it is skipped rather than aborting
+    the whole build; the skip is counted and logged so an unexpectedly non-zero
+    count surfaces as a finding about the bound, not a silent loss. Any
     other encoding failure -- an op outside ``UNIT_OPS``, say -- is not this
     kind of known, bounded risk and propagates instead of being swallowed.
 
@@ -74,6 +83,7 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
     """
     boards: list[np.ndarray] = []
     scalars: list[np.ndarray] = []
+    positions: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     shard_index = 0
     written = 0
@@ -89,6 +99,7 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
             path,
             boards=np.concatenate(boards),
             scalars=np.concatenate(scalars),
+            positions=np.concatenate(positions),
             labels=np.concatenate(labels),
         )
         LOGGER.info("%s: %d rows", path.name, len(boards))
@@ -96,6 +107,7 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
         shard_index += 1
         boards.clear()
         scalars.clear()
+        positions.clear()
         labels.clear()
 
     by_archive: dict[str, list[Sample]] = {}
@@ -112,9 +124,10 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
                     if row is None:
                         skipped += 1
                         continue
-                    board, scalar, label = row
+                    board, scalar, position, label = row
                     boards.append(board)
                     scalars.append(scalar)
+                    positions.append(position)
                     labels.append(label)
                     if len(boards) >= ROWS_PER_SHARD:
                         flush()
@@ -149,19 +162,22 @@ def _encode_episode(
     decision made *from* that state -- see the module docstring for why the
     same-index pairing is wrong. ``action[0]`` is never read as a label, and the
     final observation is never read at all, since neither has a following
-    action.
+    action. Everything the row feeds the model, positions included, is read from
+    ``observation[index]``; only the label comes from the later step.
 
     Yields:
-        A row's ``(board, scalars, labels)`` arrays, or ``None`` for a turn
-        skipped because it exceeded ``MAX_UNITS``.
+        A row's ``(board, scalars, positions, labels)`` arrays, or ``None`` for
+        a turn skipped because it exceeded ``MAX_UNITS``.
     """
     steps = episode["steps"]
     for index in range(0, len(steps) - 1, stride):
         action = steps[index + 1][sample.seat].get("action")
         if not action:
             continue
+        observation = steps[index][sample.seat]["observation"]
         try:
-            label = encode_units(action)
+            position = encode_positions(observation, sample.seat)
+            label = encode_units(action, unit_count(observation, sample.seat))
         except TooManyUnitsError as error:
             LOGGER.warning(
                 "skipping turn %d of %s (seat %d): %s",
@@ -172,10 +188,9 @@ def _encode_episode(
             )
             yield None
             continue
-        observation = steps[index][sample.seat]["observation"]
         board = encode_board(observation, sample.seat).numpy(force=True)
         scalar = encode_scalars(observation, sample.seat).numpy(force=True)
-        yield board, scalar, label.numpy(force=True)
+        yield board, scalar, position.numpy(force=True), label.numpy(force=True)
 
 
 class Shards(Dataset):
@@ -183,14 +198,16 @@ class Shards(Dataset):
 
     def __init__(self, paths: list[Path]) -> None:
         """Load every shard named by ``paths``."""
-        boards, scalars, labels = [], [], []
+        boards, scalars, positions, labels = [], [], [], []
         for path in paths:
             with np.load(path) as data:
                 boards.append(data["boards"])
                 scalars.append(data["scalars"])
+                positions.append(data["positions"])
                 labels.append(data["labels"])
         self.boards = torch.from_numpy(np.concatenate(boards))
         self.scalars = torch.from_numpy(np.concatenate(scalars))
+        self.positions = torch.from_numpy(np.concatenate(positions))
         self.labels = torch.from_numpy(np.concatenate(labels))
 
     def __len__(self) -> int:
@@ -199,6 +216,11 @@ class Shards(Dataset):
 
     def __getitem__(
         self, index: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return one row's board, scalars and labels, without batch dimensions."""
-        return self.boards[index], self.scalars[index], self.labels[index]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return one row's board, scalars, positions and labels, unbatched."""
+        return (
+            self.boards[index],
+            self.scalars[index],
+            self.positions[index],
+            self.labels[index],
+        )

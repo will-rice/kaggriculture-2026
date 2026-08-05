@@ -18,6 +18,7 @@ from kaggriculture.learn.encoding import (
     SCALARS,
     TILE_PLANES,
     encode_units,
+    unit_count,
 )
 
 ARCHIVE = CORPUS / "kaggriculture-episodes-2026-08-03.zip"
@@ -34,23 +35,29 @@ def one_sample() -> Sample:
     return Sample(archive=ARCHIVE.name, name=name, seat=0, rating=2600.0)
 
 
-def _empty_farm() -> dict:
+def _empty_farm(farmer: tuple[int, int] = (0, 0), hands: int = 0) -> dict:
     """Return a fresh, independent farm dict for a synthetic observation."""
     return {
         "tiles": [[None] * BOARD for _ in range(BOARD)],
         "money": 3000.0,
-        "hands": [],
+        "farmer": list(farmer),
+        "hands": [[1, 1] for _ in range(hands)],
         "unlocked_quadrants": ["NW"],
     }
 
 
-def _observation() -> dict:
-    """Return a minimal well-formed observation for a synthetic episode."""
+def _observation(farmer: tuple[int, int] = (0, 0), hands: int = 0) -> dict:
+    """Return a minimal well-formed observation for a synthetic episode.
+
+    ``farmer`` places seat 0's farmer and ``hands`` staffs it, so an episode can
+    be built in which a unit stands somewhere different on each step, or in
+    which one turn has more units on the board than ``MAX_UNITS`` covers.
+    """
     return {
         "day": 0,
         "hour": 0,
         "step": 0,
-        "farms": [_empty_farm(), _empty_farm()],
+        "farms": [_empty_farm(farmer, hands), _empty_farm()],
         "market": {
             "prices": dict.fromkeys(PRODUCTS, 100),
             "inventory": dict.fromkeys(PRODUCTS, 10000),
@@ -76,11 +83,14 @@ def test_a_shard_round_trips_into_tensors_of_the_declared_shape(tmp_path: Path) 
     rows = build_shard([one_sample()], destination, stride=64)
 
     assert rows > 0
-    board, scalars, labels = Shards([destination])[0]
+    board, scalars, positions, labels = Shards([destination])[0]
     assert board.shape == (TILE_PLANES, BOARD, BOARD)
     assert scalars.shape == (SCALARS,)
+    assert positions.shape == (MAX_UNITS,)
     assert labels.shape == (MAX_UNITS,)
     assert board.dtype == torch.float32
+    assert positions.dtype == torch.int64
+    assert positions.ge(0).all() and positions.lt(BOARD * BOARD).all()
 
 
 @pytest.mark.slow
@@ -119,21 +129,60 @@ def test_labels_are_the_action_taken_from_the_state_not_the_one_that_made_it(
     with zipfile.ZipFile(ARCHIVE) as bundle, bundle.open(sample.name) as member:
         steps = json.load(member)["steps"]
 
+    def encoded(state: int, action: int) -> torch.Tensor:
+        """Label the action at ``action`` against the units standing at ``state``."""
+        observation = steps[state][sample.seat]["observation"]
+        units = unit_count(observation, sample.seat)
+        return encode_units(steps[action][sample.seat]["action"], units)[0]
+
     turn = next(
         i
         for i in range(1, len(steps) - 1)
-        if not torch.equal(
-            encode_units(steps[i][sample.seat]["action"] or {})[0],
-            encode_units(steps[i + 1][sample.seat]["action"] or {})[0],
-        )
+        if not torch.equal(encoded(i, i), encoded(i, i + 1))
     )
     destination = tmp_path / "aligned.npz"
     build_shard([sample], destination, stride=1)
 
-    _, _, labels = Shards([destination])[turn]
+    _, _, _, labels = Shards([destination])[turn]
 
-    assert torch.equal(labels, encode_units(steps[turn + 1][sample.seat]["action"])[0])
-    assert not torch.equal(labels, encode_units(steps[turn][sample.seat]["action"])[0])
+    assert torch.equal(labels, encoded(turn, turn + 1))
+    assert not torch.equal(labels, encoded(turn, turn))
+
+
+def test_positions_come_from_the_state_the_decision_was_made_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positions are input, so they are read one step earlier than the label.
+
+    A row pairs ``observation[i]`` with ``action[i + 1]``, and it is tempting to
+    read positions alongside the label. That would place every unit where it
+    ended up rather than where it decided from -- a hand that walked north has
+    already left the tile whose surroundings made it choose NORTH -- and the
+    model would be trained to justify moves after the fact.
+
+    The synthetic episode walks seat 0's farmer to a different tile on every
+    step, so the right and wrong sources cannot agree by accident.
+    """
+    action = {"farmer": ["NORTH"], "hands": [], "market": []}
+    episode = {
+        "steps": [
+            [{"action": action, "observation": _observation(farmer=(1, 1))}, {}],
+            [{"action": action, "observation": _observation(farmer=(7, 3))}, {}],
+            [{"action": action, "observation": _observation(farmer=(9, 9))}, {}],
+        ]
+    }
+
+    archive = _write_synthetic_archive(tmp_path, "synthetic.zip", episode)
+    monkeypatch.setattr(dataset_module, "CORPUS", tmp_path)
+
+    sample = Sample(archive=archive.name, name="42.json", seat=0, rating=2600.0)
+    destination = tmp_path / "shard.npz"
+    rows = build_shard([sample], destination, stride=1)
+    shards = Shards([destination])
+
+    assert rows == 2
+    assert shards[0][2][0].item() == 1 * BOARD + 1
+    assert shards[1][2][0].item() == 7 * BOARD + 3
 
 
 def test_a_turn_over_max_units_is_skipped_not_fatal(
@@ -144,24 +193,23 @@ def test_a_turn_over_max_units_is_skipped_not_fatal(
     Built against a synthetic archive so it runs on every machine, not only one
     with the corpus, and stays fast enough for the default test run. Four steps
     give three ``(observation[i], action[i + 1])`` rows: the first and third
-    actions are ordinary, the middle one exceeds ``MAX_UNITS`` and must be
-    skipped, counted and named in a warning rather than aborting the other two.
+    observations are ordinary, the middle one puts more units on the board than
+    ``MAX_UNITS`` covers, and its row must be skipped, counted and named in a
+    warning rather than aborting the other two.
+
+    The oversized count is in the *observation*, not the action, because the
+    observation is what the engine walks -- an action listing ops for hands the
+    farm does not have is ordinary in the corpus and no-ops in the engine.
     """
-    reset_action = {"farmer": ["PASS"], "hands": [], "market": []}
-    fine_action = {"farmer": ["PASS"], "hands": [], "market": []}
-    over_action = {
-        "farmer": ["PASS"],
-        "hands": [["PASS"] for _ in range(MAX_UNITS)],
-        "market": [],
-    }
+    action = {"farmer": ["PASS"], "hands": [], "market": []}
     # steps[i][seat] is the shape json.load gives a real episode; seat 1 is
     # never read by this test, so its entry is left empty.
     episode = {
         "steps": [
-            [{"action": reset_action, "observation": _observation()}, {}],
-            [{"action": fine_action, "observation": _observation()}, {}],
-            [{"action": over_action, "observation": _observation()}, {}],
-            [{"action": fine_action, "observation": _observation()}, {}],
+            [{"action": action, "observation": _observation()}, {}],
+            [{"action": action, "observation": _observation(hands=MAX_UNITS)}, {}],
+            [{"action": action, "observation": _observation()}, {}],
+            [{"action": action, "observation": _observation()}, {}],
         ]
     }
 

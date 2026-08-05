@@ -13,6 +13,11 @@ a price signal and an inventory signal per product, because value in this
 game is a property of a product given what the opponent is selling: an
 earlier change that replaced an opponent-aware animal valuation with a
 static per-animal one measured 10,000 coins worse over 20 games.
+
+Each farm block also carries where its units stand. Without those planes the
+trunk sees a board with nobody on it, so the network can learn what the day
+calls for but never that *this* hand is the one standing next to the weeds.
+Both farms get them, since the opponent's units are public too.
 """
 
 from typing import Any, Mapping
@@ -39,17 +44,38 @@ CROP_NAMES = sorted(CROPS)
 ANIMAL_NAMES = sorted(ANIMALS)
 PRODUCT_NAMES = sorted(PRODUCTS)
 
+# The main farmer plus enough hands for a full day's hiring. There is no
+# engine-enforced cap on hand count: hires_today resets every day and each
+# hire only costs mult * fib(hires_today), so a rich-enough farm can keep
+# hiring. 13 (farmer + 12 hands, this project's own heuristic policy's
+# hiring target) is not a bound on what other agents actually do: sampling
+# 240 episodes across the six replay archives on disk turned up a farm with
+# 14 hands (15 acting units) in a single day. MAX_UNITS is set with headroom
+# above that observed value, and encode_units/encode_positions/decode_units
+# raise rather than silently drop a real unit if it is ever exceeded, so a
+# wider hand count can never become a misaligned label.
+MAX_UNITS = 20
+
 # Per farm, in order: one plane per crop, one per animal, four mutually
-# exclusive tile states, then five continuous per-tile features. A crop or
-# animal lights its own plane inside a PLANT / occupied-structure tile; the
-# state planes cover everything else, including a bare (unoccupied) structure.
+# exclusive tile states, five continuous per-tile features, then two
+# occupancy planes. A crop or animal lights its own plane inside a PLANT /
+# occupied-structure tile; the state planes cover everything else, including
+# a bare (unoccupied) structure.
+#
+# Occupancy is two planes rather than one because the farmer and a hand are
+# different pieces, and rather than a flag per unit because several hands may
+# stand on one tile -- [[4, 3], [4, 3]] occurs in the corpus. The hands plane
+# is therefore a count, scaled by MAX_UNITS so it shares the range of the
+# other continuous features.
 _TILE_STATES = ("WEED", "LOCKED", "EMPTY", "STRUCTURE")
 _TILE_FEATURES = ("ACTIVE_TODAY", "DISTRESS", "YIELD_FRACTION", "BONUS_READY", "AGE")
+_UNIT_PLANES = ("FARMER", "HANDS")
 
 _ANIMAL_BASE = len(CROP_NAMES)
 _STATE_BASE = _ANIMAL_BASE + len(ANIMAL_NAMES)
 _FEATURE_BASE = _STATE_BASE + len(_TILE_STATES)
-_PER_FARM_PLANES = _FEATURE_BASE + len(_TILE_FEATURES)
+_UNIT_BASE = _FEATURE_BASE + len(_TILE_FEATURES)
+_PER_FARM_PLANES = _UNIT_BASE + len(_UNIT_PLANES)
 
 TILE_PLANES = 2 * _PER_FARM_PLANES
 
@@ -86,6 +112,7 @@ def encode_board(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
         for y, row in enumerate(farm["tiles"]):
             for x, tile in enumerate(row):
                 _write_tile(planes, base, tile, y, x, day)
+        _write_units(planes, base, farm)
     return planes
 
 
@@ -164,6 +191,18 @@ def _write_features(
     planes[0, offset + 2, y, x] = yield_units / yield_capacity
     planes[0, offset + 3, y, x] = float(bonus_ready)
     planes[0, offset + 4, y, x] = age / SEASON_DAYS
+
+
+def _write_units(planes: torch.Tensor, base: int, farm: Mapping[str, Any]) -> None:
+    """Write one farm's unit occupancy into its block of planes, in place.
+
+    The hands plane accumulates rather than sets: several hands may stand on
+    one tile, and a flag would report a crowd of five the same as a lone hand.
+    """
+    farmer_y, farmer_x = farm["farmer"]
+    planes[0, base + _UNIT_BASE, farmer_y, farmer_x] = 1.0
+    for y, x in farm["hands"]:
+        planes[0, base + _UNIT_BASE + 1, y, x] += 1.0 / MAX_UNITS
 
 
 def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
@@ -249,18 +288,6 @@ UNIT_OPS: tuple[str, ...] = (
     "DROP",
 ) + tuple(f"PLANT:{crop}" for crop in CROP_NAMES)
 
-# The main farmer plus enough hands for a full day's hiring. There is no
-# engine-enforced cap on hand count: hires_today resets every day and each
-# hire only costs mult * fib(hires_today), so a rich-enough farm can keep
-# hiring. 13 (farmer + 12 hands, this project's own heuristic policy's
-# hiring target) is not a bound on what other agents actually do: sampling
-# 240 episodes across the six replay archives on disk turned up a farm with
-# 14 hands (15 acting units) in a single day. MAX_UNITS is set with headroom
-# above that observed value, and encode_units/decode_units raise rather than
-# silently truncate if it is ever exceeded, so a wider hand count can never
-# turn into a silently dropped or misaligned label.
-MAX_UNITS = 20
-
 # torch's cross entropy ignores this index, so padded units contribute no loss.
 IGNORE = -100
 
@@ -276,27 +303,92 @@ class TooManyUnitsError(ValueError):
     """
 
 
-def encode_units(action: Mapping[str, Any]) -> torch.Tensor:
+def unit_count(observation: Mapping[str, Any], seat: int) -> int:
+    """Return how many units act for ``seat`` from this observation.
+
+    The single definition of how many slots are real, so positions and labels
+    cannot disagree about it. The observation, not the action, is authoritative:
+    the engine walks ``[farmer, *farm["hands"]]`` and its ``_farmer_position``
+    returns ``None`` past the end of ``hands``, making any further op in the
+    action a silent no-op. About 5% of corpus turns emit a hand-op list that
+    does not match the farm -- usually one or two too many, sometimes two too
+    few -- so the two counts genuinely differ and only one of them decides
+    anything.
+
+    Args:
+        observation: One turn's observation.
+        seat: Which player's units to count.
+
+    Returns:
+        The farmer plus the hands standing on ``seat``'s farm.
+    """
+    return 1 + len(observation["farms"][seat]["hands"])
+
+
+def encode_positions(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
+    """Return the tile each acting unit occupies, padded to ``MAX_UNITS``.
+
+    Slots are ordered exactly as ``encode_units`` labels them -- slot 0 the
+    farmer, slot *k* the *k*-th hand -- because the head reads slot *k*'s trunk
+    column at slot *k*'s position and scores it against slot *k*'s label. If
+    the two orders diverged, every unit would be trained on another unit's
+    surroundings and nothing would raise.
+
+    Padded slots take tile index 0. That is deliberate, not a fallback: the
+    head gathers at these indices unconditionally, so every slot needs a valid
+    one, and a padded slot's label is ``IGNORE``, so its logits never reach the
+    loss and the tile it nominally read is never learned from.
+
+    Args:
+        observation: One turn's observation -- the state the decision was made
+            from, so it must be the same observation the row's board encodes.
+        seat: Which player's units to locate.
+
+    Returns:
+        A ``(1, MAX_UNITS)`` int64 tensor of flattened ``y * BOARD + x`` tile
+        indices.
+
+    Raises:
+        TooManyUnitsError: If more units are on the board than ``MAX_UNITS``
+            covers.
+    """
+    units = unit_count(observation, seat)
+    if units > MAX_UNITS:
+        raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
+    farm = observation["farms"][seat]
+    positions = torch.zeros(1, MAX_UNITS, dtype=torch.int64)
+    for index, (y, x) in enumerate([farm["farmer"], *farm["hands"]]):
+        positions[0, index] = y * BOARD + x
+    return positions
+
+
+def encode_units(action: Mapping[str, Any], units: int) -> torch.Tensor:
     """Return one label per unit, padded to ``MAX_UNITS``.
 
     Units that did not act -- hands not yet hired -- are marked with the
     ignore index rather than a ``PASS`` label. Teaching the model that an
     absent hand chose to pass would train it to pass.
 
+    ``units`` comes from ``unit_count`` on the observation the action was taken
+    from, and ops past it are dropped rather than labelled. About 5% of corpus
+    turns emit ops for hands the farm does not have; the engine no-ops them, so
+    labelling them would attach a real op to a slot holding no unit -- and, now
+    that the head reads each slot at its unit's tile, would train the readout on
+    a padded tile nobody is standing on.
+
     Args:
         action: One recorded turn's action dict.
+        units: How many units are actually on the board this turn.
 
     Returns:
         A ``(1, MAX_UNITS)`` int64 tensor of labels.
 
     Raises:
-        TooManyUnitsError: If more units acted this turn than ``MAX_UNITS`` covers.
+        TooManyUnitsError: If ``units`` exceeds ``MAX_UNITS``.
     """
-    ops = [action["farmer"], *action["hands"]]
-    if len(ops) > MAX_UNITS:
-        raise TooManyUnitsError(
-            f"{len(ops)} acting units exceeds MAX_UNITS={MAX_UNITS}"
-        )
+    if units > MAX_UNITS:
+        raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
+    ops = [action["farmer"], *action["hands"]][:units]
     labels = torch.full((1, MAX_UNITS), IGNORE, dtype=torch.int64)
     for index, op in enumerate(ops):
         labels[0, index] = _label(op)

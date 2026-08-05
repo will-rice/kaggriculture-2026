@@ -15,15 +15,72 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.model import Policy
 
 
+def _positions(batch: int) -> torch.Tensor:
+    """Return one distinct tile per unit slot, batched.
+
+    Distinct positions matter: with every slot on one tile a head that ignores
+    position entirely would still produce plausible-looking output.
+    """
+    return torch.arange(MAX_UNITS, dtype=torch.int64)[None, :].tile(batch, 1)
+
+
 def test_forward_returns_one_distribution_per_unit() -> None:
     """Each unit picks its own op, so the head is per-unit, not per-board."""
     model = Policy()
     board = torch.zeros(2, TILE_PLANES, BOARD, BOARD)
     scalars = torch.zeros(2, SCALARS)
 
-    logits = model(board, scalars)
+    logits = model(board, scalars, _positions(2))
 
     assert logits.shape == (2, MAX_UNITS, len(UNIT_OPS))
+
+
+def test_a_unit_reads_the_trunk_at_its_own_tile() -> None:
+    """Moving one unit must move that unit's logits and nothing else.
+
+    This is the property the pooled head could not have had: it summarised the
+    whole board into one vector and emitted every slot from it, so perturbing a
+    single cell was measured to move all ``MAX_UNITS`` slots, and moving a unit
+    moved nothing at all because position was not an input. Both halves are
+    asserted -- the moved slot changes, the others stay bit-identical -- because
+    either alone passes for a head reading a global summary.
+    """
+    torch.manual_seed(0)
+    model = Policy().eval()
+    board = torch.randn(1, TILE_PLANES, BOARD, BOARD)
+    scalars = torch.randn(1, SCALARS)
+    here = _positions(1)
+    there = here.clone()
+    there[0, 0] = BOARD * BOARD - 1
+
+    with torch.no_grad():
+        before = model(board, scalars, here)
+        after = model(board, scalars, there)
+
+    assert not torch.equal(before[0, 0], after[0, 0])
+    assert torch.equal(before[0, 1:], after[0, 1:])
+
+
+def test_two_units_on_one_tile_receive_identical_logits() -> None:
+    """One readout is shared by every slot, so a slot's index carries no meaning.
+
+    Two hands standing on the same tile see the same game, so they must be
+    scored the same way. A per-slot block of weights -- what a single wide
+    ``Linear`` over a pooled vector amounts to -- would give them different
+    logits for no reason available to the game.
+    """
+    torch.manual_seed(0)
+    model = Policy().eval()
+    board = torch.randn(1, TILE_PLANES, BOARD, BOARD)
+    scalars = torch.randn(1, SCALARS)
+    positions = _positions(1)
+    positions[0, 3] = positions[0, 7] = BOARD * BOARD // 2
+
+    with torch.no_grad():
+        logits = model(board, scalars, positions)
+
+    assert torch.equal(logits[0, 3], logits[0, 7])
+    assert not torch.equal(logits[0, 3], logits[0, 0])
 
 
 def test_the_model_fits_the_size_every_winner_used() -> None:
@@ -44,12 +101,13 @@ def test_a_turn_fits_the_sandbox_budget_at_two_threads() -> None:
     model = Policy().eval()
     board = torch.zeros(1, TILE_PLANES, BOARD, BOARD)
     scalars = torch.zeros(1, SCALARS)
+    positions = _positions(1)
 
     with torch.no_grad():
-        model(board, scalars)
+        model(board, scalars, positions)
         start = time.perf_counter()
         for _ in range(10):
-            model(board, scalars)
+            model(board, scalars, positions)
         elapsed = (time.perf_counter() - start) / 10
 
     assert elapsed < 0.25, f"{elapsed * 1000:.0f}ms per turn leaves no margin"
@@ -59,10 +117,11 @@ def test_the_market_reaches_the_trunk() -> None:
     """Prices decide this game; a scalar branch that is ignored is a silent bug."""
     model = Policy().eval()
     board = torch.zeros(1, TILE_PLANES, BOARD, BOARD)
+    positions = _positions(1)
 
     with torch.no_grad():
-        cheap = model(board, torch.zeros(1, SCALARS))
-        rich = model(board, torch.ones(1, SCALARS))
+        cheap = model(board, torch.zeros(1, SCALARS), positions)
+        rich = model(board, torch.ones(1, SCALARS), positions)
 
     assert not torch.allclose(cheap, rich)
 
@@ -82,7 +141,7 @@ def test_ignored_label_slots_do_not_affect_the_loss() -> None:
     scalars = torch.randn(2, SCALARS)
 
     with torch.no_grad():
-        logits = model(board, scalars)
+        logits = model(board, scalars, _positions(2))
 
     labels = torch.full((2, MAX_UNITS), IGNORE, dtype=torch.int64)
     labels[:, :3] = 0

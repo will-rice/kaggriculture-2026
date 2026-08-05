@@ -1802,4 +1802,17 @@ under the old encoding is invalid and is rebuilt.
 - The head gathers each unit's trunk column at its own tile and applies one
   shared `Linear(CHANNELS, len(UNIT_OPS))` across slots.
 
+**What the positions/labels invariant turned up.** The brief assumed
+`len(farm["hands"])` always equals `len(action["hands"])`. It does not: across
+40 episodes of one archive, ~5% of turns disagree — usually one or two hand ops
+too many, sometimes two too few — and 33 of the 40 episodes contain at least
+one. The engine's `_farmer_position` returns `None` past the end of
+`farm["hands"]`, so surplus ops are silent no-ops, which makes the _observation_
+the authority on how many units act. `unit_count(observation, seat)` is now that
+single authority, and `encode_units(action, units)` drops ops past it rather
+than labelling them. Before this, `encode_units` attached real ops to slots
+holding no unit — harmless-looking under the old pooled head, but under the
+spatial head those slots gather the padded tile and push a real gradient
+through a tile nobody stands on.
+
 Full brief: `.superpowers/sdd/2026-08-05-imitation-dataset/task-6b-brief.md`.

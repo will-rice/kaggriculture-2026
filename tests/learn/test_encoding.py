@@ -6,16 +6,31 @@ So these check the encoding against the engine's own rules tables and against a
 board built by hand.
 """
 
+import json
+import zipfile
+
 import pytest
 import torch
 
 from kaggriculture.constants import CROPS, PRODUCTS
+from kaggriculture.learn.corpus import CORPUS
 from kaggriculture.learn.encoding import (
     BOARD,
+    IGNORE,
+    MAX_UNITS,
     SCALARS,
     TILE_PLANES,
     encode_board,
+    encode_positions,
     encode_scalars,
+    encode_units,
+    unit_count,
+)
+
+ARCHIVE = CORPUS / "kaggriculture-episodes-2026-08-03.zip"
+
+_needs_corpus = pytest.mark.skipif(
+    not ARCHIVE.exists(), reason="replay corpus not present on this machine"
 )
 
 
@@ -101,6 +116,149 @@ def test_the_opponent_s_board_occupies_its_own_planes() -> None:
     assert not torch.equal(ours, theirs)
 
 
+def _changed_plane(before: torch.Tensor, after: torch.Tensor) -> int:
+    """Return the index of the one plane that differs between two encoded boards.
+
+    Finding the plane rather than naming it keeps these tests off the plane
+    layout: the occupancy planes' indices are derived from the engine's rules
+    tables and would shift under any upstream crop or animal.
+    """
+    changed = (before != after).flatten(2).any(dim=2)[0].nonzero().flatten()
+    assert changed.numel() == 1, f"expected one plane to move, got {changed.tolist()}"
+    return int(changed.item())
+
+
+def test_the_board_says_where_the_farmer_stands() -> None:
+    """Without this the trunk sees a board with nobody on it.
+
+    The whole point of the spatial head is that a unit reads the trunk at its
+    own tile; if no plane marks where anyone is standing, that column carries
+    the tile's crops and nothing about the unit deciding from it.
+    """
+    here, there = empty_observation(), empty_observation()
+    there["farms"][0]["farmer"] = [7, 1]
+
+    before, after = encode_board(here, seat=0), encode_board(there, seat=0)
+    plane = _changed_plane(before, after)
+
+    assert before[0, plane, 4, 4].item() == 1.0
+    assert after[0, plane, 7, 1].item() == 1.0
+    assert after[0, plane, 4, 4].item() == 0.0
+
+
+def test_the_hands_plane_counts_rather_than_flags() -> None:
+    """Two hands may stand on one tile -- ``[[4, 3], [4, 3]]`` occurs in the corpus.
+
+    A flag would report a crowd the same as a lone hand, so the plane carries a
+    count. It is scaled by ``MAX_UNITS`` to share the range of the other
+    continuous features, which this checks by ratio rather than by value.
+    """
+    one, two = empty_observation(), empty_observation()
+    one["farms"][0]["hands"] = [[4, 3]]
+    two["farms"][0]["hands"] = [[4, 3], [4, 3]]
+
+    single, doubled = encode_board(one, seat=0), encode_board(two, seat=0)
+    plane = _changed_plane(single, doubled)
+
+    assert single[0, plane, 4, 3].item() == pytest.approx(1.0 / MAX_UNITS)
+    assert doubled[0, plane, 4, 3].item() == pytest.approx(2.0 / MAX_UNITS)
+
+
+def test_the_opponent_s_units_occupy_their_own_planes() -> None:
+    """Their farmer and hands are public, and where they stand decides prices."""
+    empty, staffed = empty_observation(), empty_observation()
+    staffed["farms"][1]["hands"] = [[8, 8]]
+
+    plane = _changed_plane(encode_board(empty, seat=0), encode_board(staffed, seat=0))
+
+    assert plane >= TILE_PLANES // 2
+
+
+def test_positions_are_ordered_exactly_as_labels_are() -> None:
+    """Slot ``k``'s position and slot ``k``'s label must describe one unit.
+
+    The head reads slot ``k``'s trunk column at slot ``k``'s position and scores
+    it against slot ``k``'s label, so a divergence in order silently issues
+    every unit another unit's orders.
+    """
+    observation = empty_observation()
+    observation["farms"][0]["farmer"] = [2, 3]
+    observation["farms"][0]["hands"] = [[7, 1], [0, 9]]
+
+    positions = encode_positions(observation, seat=0)
+
+    assert positions.shape == (1, MAX_UNITS)
+    assert positions.dtype == torch.int64
+    assert positions[0, 0].item() == 2 * BOARD + 3
+    assert positions[0, 1].item() == 7 * BOARD + 1
+    assert positions[0, 2].item() == 0 * BOARD + 9
+    assert positions[0, 3:].eq(0).all()
+
+
+def test_positions_are_read_for_the_seat_asked_for() -> None:
+    """``seat`` selects whose units to locate, as it does everywhere else here."""
+    observation = empty_observation()
+    observation["farms"][1]["farmer"] = [9, 9]
+
+    assert encode_positions(observation, seat=0)[0, 0].item() == 4 * BOARD + 4
+    assert encode_positions(observation, seat=1)[0, 0].item() == 9 * BOARD + 9
+
+
+def test_a_position_count_beyond_max_units_raises() -> None:
+    """Truncating here would hand a real unit another unit's tile."""
+    observation = empty_observation()
+    observation["farms"][0]["hands"] = [[0, 0] for _ in range(MAX_UNITS)]
+
+    with pytest.raises(ValueError):
+        encode_positions(observation, seat=0)
+
+
+@pytest.mark.slow
+@_needs_corpus
+def test_positions_and_labels_agree_on_a_real_episode() -> None:
+    """The two functions are only correct relative to one another.
+
+    Slot ``k``'s logits are read at slot ``k``'s position and scored against
+    slot ``k``'s label, so a labelled slot with no unit on it, or a unit whose
+    slot carries the padded tile, is a silent training error rather than a
+    crash. This is the invariant that catches them drifting apart.
+
+    It is checked against a real episode because a hand-built observation
+    agrees with whatever the encoders do. The corpus does not: roughly 5% of
+    turns carry an action whose hand-op list is one or two longer -- or two
+    shorter -- than the farm's hand list, which is exactly the disagreement
+    that made ``unit_count`` the single authority.
+    """
+    with zipfile.ZipFile(ARCHIVE) as bundle:
+        name = next(n for n in bundle.namelist() if n.endswith(".json"))
+        with bundle.open(name) as member:
+            steps = json.load(member)["steps"]
+
+    most = 0
+    disagreements = 0
+    for seat in (0, 1):
+        for index in range(len(steps) - 1):
+            action = steps[index + 1][seat].get("action")
+            if not action:
+                continue
+            observation = steps[index][seat]["observation"]
+            farm = observation["farms"][seat]
+            tiles = [farm["farmer"], *farm["hands"]]
+            units = unit_count(observation, seat)
+            labels = encode_units(action, units)
+            positions = encode_positions(observation, seat)
+
+            assert units == len(tiles)
+            assert labels[0, units:].eq(IGNORE).all()
+            assert positions[0, :units].tolist() == [y * BOARD + x for y, x in tiles]
+            assert positions[0, units:].eq(0).all()
+            most = max(most, units)
+            disagreements += 1 + len(action["hands"]) != units
+
+    assert most > 1, "no turn had a hired hand, so this proved nothing"
+    assert disagreements, "this episode never disagreed, so this proved little"
+
+
 def test_scalars_have_the_declared_width() -> None:
     """The market branch is fixed-width; a ragged vector would break the model."""
     scalars = encode_scalars(empty_observation(), seat=0)
@@ -176,36 +334,60 @@ def test_the_vocabulary_covers_every_op_the_engine_implements() -> None:
 
 def test_unit_labels_are_padded_and_masked() -> None:
     """Hands are hired through the day, so the acting unit count varies by turn."""
-    from kaggriculture.learn.encoding import MAX_UNITS, encode_units
+    action = {"farmer": ["WATER"], "hands": [["NORTH"]], "market": []}
 
-    labels = encode_units({"farmer": ["WATER"], "hands": [["NORTH"]], "market": []})
+    labels = encode_units(action, units=2)
 
     assert labels.shape == (1, MAX_UNITS)
-    assert labels[0, 2].item() == -100
-    assert labels[0, 0].item() != -100
+    assert labels[0, 2].item() == IGNORE
+    assert labels[0, 0].item() != IGNORE
+
+
+def test_ops_for_units_that_are_not_on_the_board_are_not_labelled() -> None:
+    """About 5% of corpus turns order more hands than the farm has.
+
+    The engine's ``_farmer_position`` returns ``None`` past the end of
+    ``farm["hands"]``, so those ops move nothing. Labelling them would teach the
+    model an op for a unit that does not exist, and the head would read that
+    slot at the padded tile -- pushing a real gradient through a tile nobody is
+    standing on.
+    """
+    action = {"farmer": ["WATER"], "hands": [["NORTH"], ["DIG"]], "market": []}
+
+    labels = encode_units(action, units=2)
+
+    assert labels[0, 1].item() != IGNORE
+    assert labels[0, 2].item() == IGNORE
+
+
+def test_a_hand_the_action_never_ordered_is_left_unlabelled() -> None:
+    """The other direction: a shorter hand-op list than the farm has hands.
+
+    Such a hand is left where it stands by the engine. It gets no label rather
+    than a ``PASS`` one, for the same reason an unhired hand does not.
+    """
+    action = {"farmer": ["WATER"], "hands": [], "market": []}
+
+    labels = encode_units(action, units=3)
+
+    assert labels[0, 0].item() != IGNORE
+    assert labels[0, 1:].eq(IGNORE).all()
 
 
 def test_planting_a_crop_is_a_distinct_label_per_crop() -> None:
     """PLANT MELON and PLANT WHEAT are different decisions, not one op."""
-    from kaggriculture.learn.encoding import encode_units
-
-    melon = encode_units({"farmer": ["PLANT", "MELON"], "hands": [], "market": []})
-    wheat = encode_units({"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []})
+    melon = encode_units({"farmer": ["PLANT", "MELON"], "hands": [], "market": []}, 1)
+    wheat = encode_units({"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}, 1)
 
     assert melon[0, 0].item() != wheat[0, 0].item()
 
 
 def test_labels_round_trip_back_to_a_legal_action() -> None:
     """Training on labels the play path cannot invert would be silently useless."""
-    from kaggriculture.learn.encoding import (
-        MAX_UNITS,
-        UNIT_OPS,
-        decode_units,
-        encode_units,
-    )
+    from kaggriculture.learn.encoding import UNIT_OPS, decode_units
 
     action = {"farmer": ["PLANT", "MELON"], "hands": [["WATER"], ["DIG"]], "market": []}
-    labels = encode_units(action)
+    labels = encode_units(action, units=3)
     logits = torch.full((1, MAX_UNITS, len(UNIT_OPS)), -10.0)
     for unit in range(3):
         logits[0, unit, int(labels[0, unit].item())] = 10.0
@@ -218,8 +400,6 @@ def test_labels_round_trip_back_to_a_legal_action() -> None:
 
 def test_a_unit_count_beyond_max_units_raises() -> None:
     """Silently truncating a real hand's action would mislabel every unit after it."""
-    from kaggriculture.learn.encoding import MAX_UNITS, encode_units
-
     action = {
         "farmer": ["PASS"],
         "hands": [["PASS"] for _ in range(MAX_UNITS)],
@@ -227,4 +407,4 @@ def test_a_unit_count_beyond_max_units_raises() -> None:
     }
 
     with pytest.raises(ValueError):
-        encode_units(action)
+        encode_units(action, units=MAX_UNITS + 1)
