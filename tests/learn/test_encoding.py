@@ -343,7 +343,16 @@ def test_every_order_in_the_corpus_encodes() -> None:
             for seat in (0, 1):
                 action = step[seat].get("action") or {}
                 for order in action.get("market", []) or []:
-                    seen.add(order[0] if len(order) < 3 else (order[0], order[1]))
+                    played = order[0] if len(order) < 3 else (order[0], order[1])
+                    seen.add(played)
+                    # Checked here rather than only after the sweep because
+                    # `encode_market` raises on an order it cannot express, and
+                    # it would abort the loop before the aggregate assertions
+                    # below ever ran -- leaving a bare ValueError in place of a
+                    # message naming what the corpus actually played.
+                    assert played in MARKET_SLOTS or played in ("HIRE", "BUY_LAND"), (
+                        f"{archive.name} plays {played}, which no slot can express"
+                    )
                 encode_market(action)
 
     unknown = {s for s in seen if isinstance(s, tuple) and s not in MARKET_SLOTS}
