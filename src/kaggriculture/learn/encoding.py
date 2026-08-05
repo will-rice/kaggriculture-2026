@@ -210,3 +210,109 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
         len(theirs["hands"]) / 8.0,
     ]
     return torch.tensor(values, dtype=torch.float32).reshape(1, SCALARS)
+
+
+# One label per distinct decision. PLANT carries its crop because planting melon
+# and planting wheat are different choices, not one op with a detail attached --
+# the crop is the decision that collapsed our own agent's price this morning.
+UNIT_OPS: tuple[str, ...] = (
+    "PASS",
+    "NORTH",
+    "SOUTH",
+    "EAST",
+    "WEST",
+    "WATER",
+    "HARVEST",
+    "DIG",
+    "FEED",
+    "CARE",
+    "COLLECT_FERTILIZER",
+    "FERTILIZE",
+    "BUILD_COOP",
+    "BUILD_PASTURE",
+    "PICKUP",
+    "PLACE",
+) + tuple(f"PLANT:{crop}" for crop in CROP_NAMES)
+
+# The main farmer plus enough hands for a full day's hiring. There is no
+# engine-enforced cap on hand count: hires_today resets every day and each
+# hire only costs mult * fib(hires_today), so a rich-enough farm can keep
+# hiring. 13 (farmer + 12 hands, this project's own heuristic policy's
+# hiring target) is not a bound on what other agents actually do: sampling
+# 240 episodes across the six replay archives on disk turned up a farm with
+# 14 hands (15 acting units) in a single day. MAX_UNITS is set with headroom
+# above that observed value, and encode_units/decode_units raise rather than
+# silently truncate if it is ever exceeded, so a wider hand count can never
+# turn into a silently dropped or misaligned label.
+MAX_UNITS = 20
+
+# torch's cross entropy ignores this index, so padded units contribute no loss.
+IGNORE = -100
+
+
+def encode_units(action: Mapping[str, Any]) -> torch.Tensor:
+    """Return one label per unit, padded to ``MAX_UNITS``.
+
+    Units that did not act -- hands not yet hired -- are marked with the
+    ignore index rather than a ``PASS`` label. Teaching the model that an
+    absent hand chose to pass would train it to pass.
+
+    Args:
+        action: One recorded turn's action dict.
+
+    Returns:
+        A ``(1, MAX_UNITS)`` int64 tensor of labels.
+
+    Raises:
+        ValueError: If more units acted this turn than ``MAX_UNITS`` covers.
+    """
+    ops = [action["farmer"], *action["hands"]]
+    if len(ops) > MAX_UNITS:
+        raise ValueError(f"{len(ops)} acting units exceeds MAX_UNITS={MAX_UNITS}")
+    labels = torch.full((1, MAX_UNITS), IGNORE, dtype=torch.int64)
+    for index, op in enumerate(ops):
+        labels[0, index] = _label(op)
+    return labels
+
+
+def _label(op: list[Any]) -> int:
+    """Return the vocabulary index for one unit's recorded op.
+
+    Args:
+        op: One unit's op, e.g. ``["WATER"]`` or ``["PLANT", "MELON"]``.
+
+    Returns:
+        The op's index into ``UNIT_OPS``.
+    """
+    verb = str(op[0])
+    name = f"PLANT:{op[1]}" if verb == "PLANT" else verb
+    return UNIT_OPS.index(name)
+
+
+def decode_units(logits: torch.Tensor, units: int) -> dict[str, Any]:
+    """Return the action dict implied by per-unit logits.
+
+    Args:
+        logits: A ``(1, MAX_UNITS, len(UNIT_OPS))`` tensor.
+        units: How many units are actually on the board this turn.
+
+    Returns:
+        An action dict with ``farmer``, ``hands`` and an empty ``market``
+        (market orders are decoded elsewhere).
+
+    Raises:
+        ValueError: If ``units`` exceeds ``MAX_UNITS``.
+    """
+    if units > MAX_UNITS:
+        raise ValueError(f"{units} units exceeds MAX_UNITS={MAX_UNITS}")
+    chosen = logits[0, :units].argmax(dim=-1)
+    ops = [_op(int(index.item())) for index in chosen]
+    return {"farmer": ops[0], "hands": ops[1:], "market": []}
+
+
+def _op(label: int) -> list[Any]:
+    """Return the op list for one vocabulary index."""
+    name = UNIT_OPS[label]
+    if name.startswith("PLANT:"):
+        return ["PLANT", name.split(":", 1)[1]]
+    return [name]

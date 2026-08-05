@@ -6,6 +6,7 @@ So these check the encoding against the engine's own rules tables and against a
 board built by hand.
 """
 
+import pytest
 import torch
 
 from kaggriculture.constants import CROPS, PRODUCTS
@@ -128,3 +129,86 @@ def test_the_phase_of_the_season_is_encoded() -> None:
     late["day"], late["hour"], late["step"] = 25, 13, 25 * 24 + 13
 
     assert not torch.equal(encode_scalars(early, 0), encode_scalars(late, 0))
+
+
+def test_every_recorded_op_has_a_label() -> None:
+    """An op absent from the vocabulary would silently become a different action."""
+    from kaggriculture.learn.encoding import UNIT_OPS
+
+    engine_ops = {
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "PASS",
+        "PICKUP",
+        "PLANT",
+        "WATER",
+        "HARVEST",
+        "FERTILIZE",
+        "BUILD_COOP",
+        "BUILD_PASTURE",
+        "DIG",
+        "PLACE",
+        "FEED",
+        "COLLECT_FERTILIZER",
+        "CARE",
+    }
+
+    assert engine_ops <= {op.split(":")[0] for op in UNIT_OPS}
+
+
+def test_unit_labels_are_padded_and_masked() -> None:
+    """Hands are hired through the day, so the acting unit count varies by turn."""
+    from kaggriculture.learn.encoding import MAX_UNITS, encode_units
+
+    labels = encode_units({"farmer": ["WATER"], "hands": [["NORTH"]], "market": []})
+
+    assert labels.shape == (1, MAX_UNITS)
+    assert labels[0, 2].item() == -100
+    assert labels[0, 0].item() != -100
+
+
+def test_planting_a_crop_is_a_distinct_label_per_crop() -> None:
+    """PLANT MELON and PLANT WHEAT are different decisions, not one op."""
+    from kaggriculture.learn.encoding import encode_units
+
+    melon = encode_units({"farmer": ["PLANT", "MELON"], "hands": [], "market": []})
+    wheat = encode_units({"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []})
+
+    assert melon[0, 0].item() != wheat[0, 0].item()
+
+
+def test_labels_round_trip_back_to_a_legal_action() -> None:
+    """Training on labels the play path cannot invert would be silently useless."""
+    from kaggriculture.learn.encoding import (
+        MAX_UNITS,
+        UNIT_OPS,
+        decode_units,
+        encode_units,
+    )
+
+    action = {"farmer": ["PLANT", "MELON"], "hands": [["WATER"], ["DIG"]], "market": []}
+    labels = encode_units(action)
+    logits = torch.full((1, MAX_UNITS, len(UNIT_OPS)), -10.0)
+    for unit in range(3):
+        logits[0, unit, int(labels[0, unit].item())] = 10.0
+
+    decoded = decode_units(logits, units=3)
+
+    assert decoded["farmer"] == ["PLANT", "MELON"]
+    assert decoded["hands"] == [["WATER"], ["DIG"]]
+
+
+def test_a_unit_count_beyond_max_units_raises() -> None:
+    """Silently truncating a real hand's action would mislabel every unit after it."""
+    from kaggriculture.learn.encoding import MAX_UNITS, encode_units
+
+    action = {
+        "farmer": ["PASS"],
+        "hands": [["PASS"] for _ in range(MAX_UNITS)],
+        "market": [],
+    }
+
+    with pytest.raises(ValueError):
+        encode_units(action)
