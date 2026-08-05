@@ -1112,29 +1112,52 @@ def test_stride_controls_how_many_turns_are_kept(tmp_path: Path) -> None:
     assert dense > sparse
 
 
-def test_labels_align_with_the_turn_they_were_recorded_on(tmp_path: Path) -> None:
-    """An off-by-one between observation and action trains on the wrong pairing.
+def test_labels_are_the_action_taken_from_the_state_not_the_one_that_made_it(
+    tmp_path: Path,
+) -> None:
+    """The label must be the decision that follows an observation, not precedes it.
 
-    A replay step holds the state *before* its action was interpreted, so the
-    action belonging to an observation is recorded on that same index — not the
-    next one. Getting this backwards is invisible: the model still trains, it
-    just learns to predict the previous turn's decision.
+    ``kaggle_environments``' interpreter mutates the state object carried
+    alongside the action it is applying, so a recorded ``steps[i][seat]``
+    holds the state *after* ``action[i]`` ran — not before. Pairing them by
+    index therefore asks the model to predict an action from the world that
+    action already created, which is label leakage during training and a
+    distribution it never sees at inference. The correct pair is
+    ``(observation[i], action[i + 1])``; ``action[0]`` is a reset filler with
+    nothing to predict and is dropped.
+
+    The obvious version of this test cannot fail. Sampled sparsely, most
+    consecutive actions are both all-``PASS`` and encode identically, so the
+    right and wrong pairings agree and the assertion passes either way. This
+    one seeks out an index where the two genuinely differ and pins down both
+    directions.
     """
     import json
     import zipfile
 
-    sample = one_sample()
-    destination = tmp_path / "aligned.npz"
-    build_shard([sample], destination, stride=719)
-
-    with zipfile.ZipFile(ARCHIVE) as bundle, bundle.open(sample.name) as member:
-        episode = json.load(member)
     from kaggriculture.learn.encoding import encode_units
 
-    expected = encode_units(episode["steps"][0][0]["action"] or {})
-    _, _, labels = Shards([destination])[0]
+    sample = one_sample()
+    with zipfile.ZipFile(ARCHIVE) as bundle, bundle.open(sample.name) as member:
+        steps = json.load(member)["steps"]
 
-    assert torch.equal(labels, expected[0])
+    turn = next(
+        i
+        for i in range(1, len(steps) - 1)
+        if not torch.equal(
+            encode_units(steps[i][sample.seat]["action"] or {})[0],
+            encode_units(steps[i + 1][sample.seat]["action"] or {})[0],
+        )
+    )
+    destination = tmp_path / "aligned.npz"
+    build_shard([sample], destination, stride=1)
+
+    _, _, labels = Shards([destination])[turn]
+
+    assert torch.equal(labels, encode_units(steps[turn + 1][sample.seat]["action"])[0])
+    assert not torch.equal(
+        labels, encode_units(steps[turn][sample.seat]["action"])[0]
+    )
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
