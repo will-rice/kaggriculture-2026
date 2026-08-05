@@ -50,6 +50,40 @@ confirmed against the interpreter source):
 - `SELL` draws from the **shed**, never from a unit's carried inventory.
 - Strawberry is capped at 4 productions, not an indefinite producer.
 
+## How this repo gets things wrong
+
+Six defects in the imitation phase, and the same two shapes recur. Both are
+cheap to guard against once named.
+
+**A hand-built fixture agrees with whatever the code does.** Four tests passed
+while the behaviour they named was wrong. The `UNIT_OPS` completeness test
+checked against a hand-written list that was itself missing `DROP` — which the
+engine implements at `kaggriculture.py:326` and never mentions in its published
+JSON spec. A scalar test used a fixture carrying `observation["step"]`, a key
+`kaggle_environments` writes onto agent 0 only, so every seat-1 turn would have
+raised on real data. A label-alignment test sampled index 0, the one turn where
+the right and wrong pairings both encode to all-`PASS`. A padding-mask test
+asserted `cross_entropy`'s default rather than our code, because `IGNORE` is -100
+and so is the default.
+
+Guard: for anything load-bearing, break the behaviour, watch the test go red,
+restore it. A test only asserted to work is trusted without evidence, which is
+worse than an absent one. And prefer a real episode to a constructed dict —
+every one of these survived contact with a fixture and died on contact with the
+corpus.
+
+**One archive is not the corpus.** The action's hand-op list disagrees with the
+farm's hand count on 2.4% of turns overall — but on 0% across 2026-07-30 to
+08-01 and 8.1% on 08-03. Sampling `sorted(glob)[0]` and generalising produced a
+confident, committed, wrong claim that the disagreement did not exist. The
+ladder's agent mix changes daily, so any corpus statistic must be measured
+across archives or reported per archive.
+
+Related: **the engine's own recorded state is not what it looks like.** A replay
+step holds the world _after_ its own action ran, because the interpreter mutates
+the state object it is handed. Pairing `observation[i]` with `action[i]` trains
+a model to predict an action from the state that action produced.
+
 ## Economics the policy leans on
 
 - **Labour is cheap.** The n-th hire of a day costs `fib(n)` coins (1, 1, 2, 3,
