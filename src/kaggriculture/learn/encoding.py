@@ -20,12 +20,9 @@ calls for but never that *this* hand is the one standing next to the weeds.
 Both farms get them, since the opponent's units are public too.
 """
 
-import inspect
-import re
 from typing import Any, Mapping
 
 import torch
-from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
 from kaggriculture.constants import (
     ANIMALS,
@@ -473,23 +470,19 @@ def _op(label: int) -> list[Any]:
 # one crowding a real order out of a ten-order turn.
 #
 # That gate exists only as an inline literal inside `_process_market`, not as
-# a named constant, so it is pulled out of the engine's own source rather than
-# typed by hand -- the same reason `UNIT_OPS` reads `_apply_unit_action`'s
-# source for DROP instead of trusting the published op list. A hand-typed
-# tuple here would silently stop tracking the engine the day this gate
-# changes; this one cannot.
-_BUY_PRODUCT_SOURCE = inspect.getsource(engine._process_market)
-_BUY_PRODUCT_GATE = re.search(
-    r'op == "BUY_PRODUCT" and item in \(([^)]+)\)', _BUY_PRODUCT_SOURCE
-)
-if _BUY_PRODUCT_GATE is None:
-    raise RuntimeError(
-        "could not find BUY_PRODUCT's item gate in _process_market; "
-        "the engine's source changed shape and this regex needs updating"
-    )
-_BUY_PRODUCT_ITEMS = tuple(
-    sorted(re.findall(r'"([A-Z_]+)"', _BUY_PRODUCT_GATE.group(1)))
-)
+# a named constant, so it cannot be imported. It is typed by hand here rather
+# than parsed out of the engine's source at import time: this module is
+# imported by the submitted agent (`kaggriculture.learn.scripts.play`), which
+# runs inside the competition sandbox against a `kaggle_environments` build
+# this project does not control, and `len(MARKET_SLOTS)` sets the market
+# head's output shape. A source-parse that raises or silently changes shape
+# on a different engine build forfeits the episode with no logs to explain
+# why; a hand-typed tuple that has drifted still plays. What keeps this tuple
+# honest instead is
+# `test_buy_product_s_item_gate_matches_the_engine_exactly`, which parses the
+# engine's source at test time, in CI, where a mismatch fails loudly and
+# someone can fix it.
+_BUY_PRODUCT_ITEMS = ("FERTILIZER", "WHEAT")
 
 MARKET_SLOTS: tuple[tuple[str, str], ...] = (
     tuple(("SELL", item) for item in PRODUCT_NAMES)

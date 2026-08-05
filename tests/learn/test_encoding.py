@@ -356,6 +356,17 @@ def test_buy_product_s_item_gate_matches_the_engine_exactly() -> None:
     engine rejects is a dead slot that no-ops every turn the model fills it,
     wasting a slot out of the ten-order cap. Both are defects, so this checks
     equality, not containment.
+
+    This regex belongs here, in a test, and not in ``_BUY_PRODUCT_ITEMS``
+    itself. ``encoding`` is imported by the submitted agent
+    (``kaggriculture.learn.scripts.play``), which runs inside the competition
+    sandbox against a ``kaggle_environments`` build this project does not
+    control, and ``len(MARKET_SLOTS)`` sets the market head's output shape.
+    Parsing the engine's source at import time turns an upstream refactor
+    into an import that raises, or a head shape that silently no longer
+    matches a trained checkpoint -- both forfeit the episode on turn zero
+    with no logs to explain why. Here, in CI, the same mismatch fails loudly
+    where someone can fix it, and never runs where the agent actually plays.
     """
     import inspect
     import re
