@@ -6,10 +6,12 @@ and the checkpoint this writes is measured against the league at a commit --
 so the commit has to say what produced it.
 
 The shards are named explicitly. The build writes ``train.npz``,
-``train-001.npz`` ... alongside ``holdout.npz`` in one directory, so the obvious
-``glob("*.npz")`` would train on the holdout and leave a validation number that
-means nothing while looking excellent. ``train_shards`` names what it takes and
-refuses a directory holding an ``.npz`` it cannot account for.
+``train-001.npz`` ... alongside ``holdout.npz`` and its own numbered tail in one
+directory, so the obvious ``glob("*.npz")`` would train on the holdout and leave
+a validation number that means nothing while looking excellent. ``built_shards``
+names what it takes for each and refuses a directory holding an ``.npz`` it
+cannot account for -- which is also what catches a leftover shard from an older,
+larger build.
 """
 
 import logging
@@ -24,7 +26,7 @@ import wandb
 from kaggriculture.learn.dataset import Shards
 from kaggriculture.learn.encoding import IGNORE, UNIT_OPS
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.scripts.build import SHARDS
+from kaggriculture.learn.scripts.build import HOLDOUT, SHARDS, TRAIN
 from kaggriculture.learn.scripts.play import CHECKPOINT
 from kaggriculture.scripts.tracking import ENTITY, PROJECT, commit
 
@@ -36,10 +38,6 @@ LEARNING_RATE = 3e-4
 SEED = 0
 WORKERS = 8
 
-TRAIN = "train.npz"
-NUMBERED = "train-[0-9][0-9][0-9].npz"
-HOLDOUT = "holdout.npz"
-
 
 def main() -> None:
     """Train the policy on the built shards and save the checkpoint."""
@@ -47,9 +45,9 @@ def main() -> None:
     seed_everything(SEED, workers=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    shards = train_shards(SHARDS)
+    shards, holdout_shards = built_shards(SHARDS)
     training = Shards(shards)
-    held = Shards([SHARDS / HOLDOUT])
+    held = Shards(holdout_shards)
     LOGGER.info(
         "%d rows over %d shards, %d holdout rows, on %s",
         len(training),
@@ -129,37 +127,57 @@ def main() -> None:
     run.finish()
 
 
-def train_shards(directory: Path) -> list[Path]:
-    """Return the training shards in ``directory``, never the holdout.
+def shards_named(directory: Path, stem: str) -> list[Path]:
+    """Return one build's shards under ``stem``, first shard first.
 
-    The first shard is ``train.npz`` with no index and the rest are numbered,
-    so no single glob describes the set without also describing ``holdout.npz``.
-    Selecting by name and then refusing any ``.npz`` the selection cannot
-    account for makes both failures loud: a holdout swept into training, and a
-    shard silently left out of it.
+    A build writes ``<stem>.npz`` and then ``<stem>-001.npz`` onwards once it
+    passes the row cap, so no single glob describes one set without also
+    describing the other's. Both training and holdout are written this way: the
+    holdout is smaller and currently fits one file, but it is the same builder
+    and it will split as the nightly corpus grows.
+
+    Args:
+        directory: Where ``build.py`` wrote its shards.
+        stem: The shard family to collect, ``TRAIN`` or ``HOLDOUT``.
+
+    Returns:
+        The shards under ``stem``, first shard first.
+
+    Raises:
+        FileNotFoundError: If the first shard is missing.
+    """
+    first = directory / f"{stem}.npz"
+    if not first.is_file():
+        raise FileNotFoundError(f"no {stem}.npz in {directory}")
+    return [first, *sorted(directory.glob(f"{stem}-[0-9][0-9][0-9].npz"))]
+
+
+def built_shards(directory: Path) -> tuple[list[Path], list[Path]]:
+    """Return the training and holdout shards, refusing anything unaccounted for.
+
+    Selecting by name and then rejecting any ``.npz`` the selection cannot
+    explain makes both failures loud: a holdout swept into training, and a shard
+    silently left out of it. A leftover file from an older, larger build has the
+    same shapes as a real shard and would otherwise concatenate in silence.
 
     Args:
         directory: Where ``build.py`` wrote its shards.
 
     Returns:
-        The training shards, first shard first.
+        The training shards and the holdout shards.
 
     Raises:
-        FileNotFoundError: If the first shard is missing.
-        ValueError: If the directory holds an ``.npz`` that is neither a
-            training shard nor the holdout.
+        ValueError: If the directory holds an ``.npz`` belonging to neither.
     """
-    first = directory / TRAIN
-    if not first.is_file():
-        raise FileNotFoundError(f"no {TRAIN} in {directory}")
-    shards = [first, *sorted(directory.glob(NUMBERED))]
-    unaccounted = set(directory.glob("*.npz")) - set(shards) - {directory / HOLDOUT}
+    training = shards_named(directory, TRAIN)
+    held = shards_named(directory, HOLDOUT)
+    unaccounted = set(directory.glob("*.npz")) - set(training) - set(held)
     if unaccounted:
         raise ValueError(
-            f"{directory} holds {sorted(path.name for path in unaccounted)}, which is "
-            f"neither {TRAIN}, a numbered shard, nor {HOLDOUT}"
+            f"{directory} holds {sorted(path.name for path in unaccounted)}, which "
+            f"belongs to neither the {TRAIN} nor the {HOLDOUT} shards"
         )
-    return shards
+    return training, held
 
 
 def unit_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

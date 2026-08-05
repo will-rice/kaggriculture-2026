@@ -6,7 +6,6 @@ import torch
 
 from kaggriculture.learn.encoding import (
     BOARD,
-    IGNORE,
     MAX_UNITS,
     SCALARS,
     TILE_PLANES,
@@ -126,34 +125,8 @@ def test_the_market_reaches_the_trunk() -> None:
     assert not torch.allclose(cheap, rich)
 
 
-def test_ignored_label_slots_do_not_affect_the_loss() -> None:
-    """Most unit slots are padding; cross_entropy must not learn from them.
-
-    A batch pairs the model's logits with labels where every slot past the
-    first three is ``IGNORE`` (unhired hands this turn). Perturbing the
-    logits only at those padded positions must leave the cross-entropy loss
-    bit-identical -- if it moved, the model would be trained to predict
-    padding rather than real unit choices.
-    """
-    torch.manual_seed(0)
-    model = Policy().eval()
-    board = torch.randn(2, TILE_PLANES, BOARD, BOARD)
-    scalars = torch.randn(2, SCALARS)
-
-    with torch.no_grad():
-        logits = model(board, scalars, _positions(2))
-
-    labels = torch.full((2, MAX_UNITS), IGNORE, dtype=torch.int64)
-    labels[:, :3] = 0
-
-    perturbed = logits.clone()
-    perturbed[:, 3:, :] = torch.randn(2, MAX_UNITS - 3, len(UNIT_OPS))
-
-    loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, len(UNIT_OPS)), labels.reshape(-1), ignore_index=IGNORE
-    )
-    perturbed_loss = torch.nn.functional.cross_entropy(
-        perturbed.reshape(-1, len(UNIT_OPS)), labels.reshape(-1), ignore_index=IGNORE
-    )
-
-    assert torch.equal(loss, perturbed_loss)
+# The padding-mask guard lives in tests/learn/test_train.py, against this
+# project's `unit_loss`. The version that stood here called `cross_entropy`
+# directly and passed with its `ignore_index` argument deleted, because IGNORE
+# is -100 and that is torch's own default -- so it asserted a library default
+# rather than anything we wrote.

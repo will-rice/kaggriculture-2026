@@ -224,10 +224,13 @@ def test_positions_and_labels_agree_on_a_real_episode() -> None:
     crash. This is the invariant that catches them drifting apart.
 
     It is checked against a real episode because a hand-built observation
-    agrees with whatever the encoders do. The corpus does not: roughly 5% of
-    turns carry an action whose hand-op list is one or two longer -- or two
-    shorter -- than the farm's hand list, which is exactly the disagreement
-    that made ``unit_count`` the single authority.
+    agrees with whatever the encoders do. The corpus does not: 2.4% of turns
+    carry an action whose hand-op list disagrees with the farm's hand list,
+    which is the disagreement that made ``unit_count`` the single authority.
+
+    The rate is archive-dependent -- 0% before 2026-08-02, up to 8.1% after --
+    so ``ARCHIVE`` must stay on a day that actually disagrees or the final
+    assertion here silently stops testing anything.
     """
     with zipfile.ZipFile(ARCHIVE) as bundle:
         name = next(n for n in bundle.namelist() if n.endswith(".json"))

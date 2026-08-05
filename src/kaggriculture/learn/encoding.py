@@ -312,13 +312,24 @@ def unit_count(observation: Mapping[str, Any], seat: int) -> int:
     returns ``None`` past the end of ``hands``, making any further op in the
     action a silent no-op.
 
-    On correctly paired data the two counts never actually diverge -- measured
-    at 0 of 11,504 turns across eight episodes. They diverge on 7.3% of turns
-    only when an observation is paired with its own action rather than the next
-    one, because a HIRE shows up in the observation the action produced. So this
-    function is not here to reconcile a discrepancy in the corpus; it is here so
-    that ``encode_positions`` and ``encode_units`` cannot drift apart, a failure
-    that would train every unit on another unit's surroundings without raising.
+    The counts do diverge, on 2.4% of correctly paired turns overall, and the
+    rate depends entirely on which day's archive you look at: 0% across
+    2026-07-30 through 08-01, then 1.7%, 8.1% and 4.4% on 08-02 through 08-04.
+    Measuring one archive and generalising is how this docstring previously came
+    to claim the disagreement did not exist at all. Usually the action carries
+    one to five hand ops more than the farm has hands; occasionally, on 08-04,
+    one fewer.
+
+    Truncating to ``units`` is safe in both directions. The engine applies unit
+    ops before ``_process_market``, where HIRE lands, so a hand hired this turn
+    cannot act this turn; surplus ops address units that do not exist yet and
+    the engine no-ops them identically. A short action simply leaves the trailing
+    slots at ``IGNORE``, training nothing rather than training something wrong.
+
+    That is the secondary reason for this function. The primary one is that
+    ``encode_positions`` and ``encode_units`` must agree about how many slots are
+    real -- if they drift apart, every unit is trained on another unit's
+    surroundings and nothing raises.
 
     Args:
         observation: One turn's observation.

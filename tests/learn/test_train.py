@@ -16,7 +16,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts import train as train_module
-from kaggriculture.learn.scripts.train import evaluate, train_shards, unit_loss
+from kaggriculture.learn.scripts.train import built_shards, evaluate, unit_loss
 
 ACTING = 3
 
@@ -29,7 +29,7 @@ def _shards(directory: Path) -> None:
         (directory / name).touch()
 
 
-def test_train_shards_takes_every_shard_and_never_the_holdout(tmp_path: Path) -> None:
+def test_built_shards_takes_every_shard_and_never_the_holdout(tmp_path: Path) -> None:
     """The holdout sits in the same directory under a name no glob excludes for free.
 
     ``train.npz`` carries no index and the rest do, so the pattern that
@@ -39,27 +39,45 @@ def test_train_shards_takes_every_shard_and_never_the_holdout(tmp_path: Path) ->
     """
     _shards(tmp_path)
 
-    selected = train_shards(tmp_path)
+    training, held = built_shards(tmp_path)
 
-    assert selected == [tmp_path / "train.npz"] + [
+    assert training == [tmp_path / "train.npz"] + [
         tmp_path / f"train-{index:03d}.npz" for index in range(1, 8)
     ]
-    assert tmp_path / "holdout.npz" not in selected
+    assert held == [tmp_path / "holdout.npz"]
 
 
-def test_train_shards_refuses_a_shard_it_cannot_account_for(tmp_path: Path) -> None:
+def test_built_shards_reads_a_holdout_that_has_split(tmp_path: Path) -> None:
+    """The holdout is one file today only because it fits under the row cap.
+
+    It is written by the same builder as the training shards, so the nightly
+    corpus will eventually push it past ``ROWS_PER_SHARD`` and it will grow a
+    numbered tail. Rejecting that tail would stop training with a confusing
+    error; silently dropping it would shrink the validation set without saying
+    so.
+    """
+    _shards(tmp_path)
+    (tmp_path / "holdout-001.npz").touch()
+
+    training, held = built_shards(tmp_path)
+
+    assert held == [tmp_path / "holdout.npz", tmp_path / "holdout-001.npz"]
+    assert tmp_path / "holdout-001.npz" not in training
+
+
+def test_built_shards_refuses_a_shard_it_cannot_account_for(tmp_path: Path) -> None:
     """A shard left out of training is as silent as a holdout swept into it."""
     _shards(tmp_path)
     (tmp_path / "train-extra.npz").touch()
 
     with pytest.raises(ValueError, match="train-extra.npz"):
-        train_shards(tmp_path)
+        built_shards(tmp_path)
 
 
-def test_train_shards_refuses_a_directory_with_no_first_shard(tmp_path: Path) -> None:
+def test_built_shards_refuses_a_directory_with_no_first_shard(tmp_path: Path) -> None:
     """An empty directory must say so, not train on nothing."""
     with pytest.raises(FileNotFoundError, match="train.npz"):
-        train_shards(tmp_path)
+        built_shards(tmp_path)
 
 
 def test_the_loss_masks_the_slots_ignore_names_rather_than_torch_s_default(

@@ -77,7 +77,7 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     Returns:
         The action dict the environment consumes.
     """
-    seat = int(raw_obs.get("player", 0))
+    seat = int(raw_obs["player"])
     with torch.no_grad():
         logits = model()(
             encode_board(raw_obs, seat),
