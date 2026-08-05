@@ -1774,3 +1774,32 @@ ships."
 **Type consistency.** `Sample` is produced in Task 2 and consumed in Task 5. `TILE_PLANES`, `SCALARS`, `MAX_UNITS`, `UNIT_OPS`, `BOARD` and `IGNORE` are defined in Tasks 3 and 4 and consumed in Tasks 5, 6 and 7. `encode_board`/`encode_scalars` return batched tensors that Task 5 unbatches by `np.concatenate` and Task 7 passes through directly. `Policy.forward` returns `(batch, MAX_UNITS, len(UNIT_OPS))`, which `decode_units` indexes as `logits[0, :units]`.
 
 **Two risks worth stating.** The action space omits market orders entirely — the cloned agent will farm but never trade, which caps it well below the league's better opponents and is why the gate asks only for `starter`. Trading is a separate head and belongs in the RL plan, where the market branch already feeds the trunk. Second, `MAX_UNITS = 13` assumes the 12-hand cap our own strategy used; a demonstration from a team hiring more would silently truncate, which Task 4's padding test does not catch.
+
+---
+
+### Task 6b: give the policy its units' positions
+
+**Amendment.** Tasks 3 and 6 as originally written could not express positional
+play: `encode_board` wrote no unit-occupancy planes, and the head pooled the
+trunk to `(B, CHANNELS)` and emitted every unit slot from one `Linear`. Measured,
+perturbing a single board cell moved all 20 slots. The model could learn
+"day 40, wheat ripe → mostly HARVEST" but never "_this_ hand is beside weeds →
+DIG", and behaviour cloning would have read the resulting ceiling as an
+optimisation problem rather than a representation one.
+
+The fix spans three modules and changes the tensor shapes, so the dataset built
+under the old encoding is invalid and is rebuilt.
+
+- `encode_board` gains two planes per farm block — the farmer's tile, and a hand
+  count per tile, since two hands may share one. `TILE_PLANES` 34 → 38.
+- `encode_positions(observation, seat) -> (1, MAX_UNITS)` returns each acting
+  unit's flattened tile index in the same order `encode_units` labels them: slot
+  0 the farmer, slot _k_ the _k_-th hand. Padded slots take index 0, which the
+  head gathers unconditionally and the loss ignores.
+- Dataset rows become `(board, scalars, positions, labels)`, with positions read
+  from `observation[i]` — the state the decision was made from — while labels
+  remain `action[i + 1]`.
+- The head gathers each unit's trunk column at its own tile and applies one
+  shared `Linear(CHANNELS, len(UNIT_OPS))` across slots.
+
+Full brief: `.superpowers/sdd/2026-08-05-imitation-dataset/task-6b-brief.md`.
