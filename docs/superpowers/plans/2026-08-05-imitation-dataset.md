@@ -273,9 +273,20 @@ second overage pool."
 
 ---
 
-### Task 2: Select episodes worth cloning
+### Task 2: Select episodes worth cloning, by rating
 
-Three-quarters of the field replays one recorded episode. Cloning the corpus unfiltered teaches that recording — including its badly-timed strawberry allocation and the melon monoculture that collapses its own price. Selection is what makes imitation an initialisation to escape rather than a target to reach.
+Every archive ships a `manifest.csv` alongside its episodes carrying `avg_score`, `min_score` and
+`sum_score` per episode — the players' **ladder ratings**, not their banks. That is a strictly better
+selection signal than the final bank, and it costs nothing to read.
+
+Bank is noisy: it depends on the opponent and the seed, and a large bank against a weak opponent is not a
+demonstration of strong play. Rating measures the player. `min_score` is the weaker of the two seats, so
+filtering on it selects episodes where **both** players were strong — which is what imitation needs,
+because a stomp teaches behaviour that only works against someone who cannot respond.
+
+It also solves the copied-kernel problem more directly than a per-team cap could. The recorded tape rates
+about 1720 against a leaderboard top of 3070, so any rating floor above ~2500 excludes it and its
+re-wrappings automatically, without needing to identify them by name.
 
 **Files:**
 
@@ -284,142 +295,172 @@ Three-quarters of the field replays one recorded episode. Cloning the corpus unf
 
 **Interfaces:**
 
-- Consumes: `EpisodeRecord`, `index_corpus`.
+- Consumes: `CORPUS`.
 - Produces:
-  - `class Sample(BaseModel)` with `archive: str`, `name: str`, `seat: int`, `bank: float`, `team: str`
-  - `select(records: list[EpisodeRecord], quantile: float = 0.9, per_team: int = 40) -> list[Sample]`
+  - `class ManifestRow(BaseModel)` with `episode_id: int`, `avg_score: float`, `min_score: float`, `agent_count: int`
+  - `read_manifest(archive: Path) -> list[ManifestRow]`
+  - `class Sample(BaseModel)` with `archive: str`, `name: str`, `seat: int`, `rating: float`
+  - `select(archives: list[Path], min_rating: float = 2500.0, per_archive: int = 200) -> list[Sample]`
   - `split(samples: list[Sample], holdout: float = 0.1) -> tuple[list[Sample], list[Sample]]`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `tests/learn/test_corpus.py`:
+Append to `tests/learn/test_corpus.py`. Note these do NOT decode episodes, so they must not carry the
+`slow` marker — put them in a class or use `@pytest.mark.filterwarnings` free functions below the existing
+module-level `pytestmark`, and override it per-test with `@pytest.mark.slow` removed. The simplest correct
+form is to move the module-level `pytestmark` onto the three existing corpus-decoding tests individually
+and leave these new ones unmarked:
 
 ```python
-def record(bank: float, team: str, other: float = 1000.0) -> EpisodeRecord:
-    """Return a record whose seat 0 banked ``bank`` and was played by ``team``."""
-    return EpisodeRecord(
-        archive="a.zip",
-        name=f"{team}-{bank}.json",
-        episode_id=int(bank),
-        rewards=[bank, other],
-        teams=[team, "other"],
-    )
+def test_the_manifest_carries_a_rating_for_every_episode() -> None:
+    """Ratings are what make selection possible without decoding 21GB."""
+    from kaggriculture.learn.corpus import read_manifest
+
+    rows = read_manifest(ARCHIVE)
+
+    assert len(rows) == 787
+    assert all(row.episode_id > 0 for row in rows)
+    assert all(row.min_score <= row.avg_score for row in rows)
+    assert max(row.avg_score for row in rows) > 2000
 
 
-def test_selection_keeps_only_the_top_quantile() -> None:
-    """A clone of the median teaches median play; the point is the top decile."""
+def test_selection_excludes_the_recorded_tape_by_rating() -> None:
+    """The tape rates about 1720; a floor above that removes it and its clones.
+
+    This is what replaces a per-team cap. Three-quarters of the field replays
+    one recording, and every copy of it rates where the original does.
+    """
     from kaggriculture.learn.corpus import select
 
-    records = [record(float(bank), f"team{bank}") for bank in range(100, 200)]
+    chosen = select([ARCHIVE], min_rating=2500.0, per_archive=1000)
 
-    chosen = select(records, quantile=0.9, per_team=100)
+    assert chosen
+    assert all(sample.rating >= 2500.0 for sample in chosen)
 
-    assert all(sample.bank >= 190 for sample in chosen)
 
-
-def test_selection_caps_any_one_team_s_share() -> None:
-    """Three quarters of the field is one copied kernel, which would dominate."""
+def test_both_seats_of_a_strong_episode_are_taken() -> None:
+    """min_score gates on the weaker seat, so passing it means both played well."""
     from kaggriculture.learn.corpus import select
 
-    records = [record(float(500 + i), "monoculture") for i in range(200)]
-    records += [record(float(600 + i), f"rare{i}") for i in range(5)]
+    chosen = select([ARCHIVE], min_rating=2500.0, per_archive=1000)
+    seats = {(sample.name, sample.seat) for sample in chosen}
+    names = {name for name, _ in seats}
 
-    chosen = select(records, quantile=0.0, per_team=10)
-
-    counts: dict[str, int] = {}
-    for sample in chosen:
-        counts[sample.team] = counts.get(sample.team, 0) + 1
-    assert counts["monoculture"] == 10
+    assert len(seats) == 2 * len(names)
 
 
-def test_both_seats_of_a_good_episode_are_separate_samples() -> None:
-    """Each seat is its own demonstration; only the winner's may be worth keeping."""
+def test_the_per_archive_cap_bounds_the_dataset() -> None:
+    """Five archives of unbounded episodes would not fit in memory as tensors."""
     from kaggriculture.learn.corpus import select
 
-    chosen = select([record(900.0, "winner", other=100.0)], quantile=0.0, per_team=10)
+    chosen = select([ARCHIVE], min_rating=0.0, per_archive=10)
 
-    assert [sample.seat for sample in chosen] == [0]
+    assert len(chosen) == 20
 
 
 def test_the_holdout_split_shares_no_episode_with_training() -> None:
-    """An episode in both halves makes the validation accuracy a memorisation score."""
+    """An episode in both halves makes validation accuracy a memorisation score."""
     from kaggriculture.learn.corpus import select, split
 
-    records = [record(float(bank), f"team{bank}") for bank in range(100, 200)]
-    train, held = split(select(records, quantile=0.0, per_team=100), holdout=0.2)
+    train, held = split(select([ARCHIVE], min_rating=0.0, per_archive=50), holdout=0.2)
 
     assert {sample.name for sample in train} & {sample.name for sample in held} == set()
-    assert len(held) > 0
+    assert held
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run pytest tests/learn/test_corpus.py -k selection -v`
-Expected: FAIL with `ImportError: cannot import name 'select'`
+Run: `uv run pytest tests/learn/test_corpus.py -k "manifest or selection or seats or cap or holdout" -v`
+Expected: FAIL with `ImportError: cannot import name 'read_manifest'`
 
 - [ ] **Step 3: Write the implementation**
 
-Append to `src/kaggriculture/learn/corpus.py`:
+Add `import csv` and `import io` to the module's imports, then append to
+`src/kaggriculture/learn/corpus.py`:
 
 ```python
+class ManifestRow(BaseModel):
+    """One episode's entry in an archive's manifest."""
+
+    episode_id: int
+    avg_score: float
+    min_score: float
+    agent_count: int
+
+
+def read_manifest(archive: Path) -> list[ManifestRow]:
+    """Return the manifest rows for one archive.
+
+    Each archive ships a ``manifest.csv`` beside its episodes carrying the
+    players' ladder ratings. Reading it is instant, where establishing the same
+    thing from the episodes themselves means decoding 21 GB of JSON.
+
+    Args:
+        archive: Path to a daily ``.zip``.
+
+    Returns:
+        One row per episode, in the manifest's own order.
+    """
+    with zipfile.ZipFile(archive) as bundle:
+        text = bundle.read("manifest.csv").decode()
+    return [
+        ManifestRow(
+            episode_id=int(entry["episode_id"]),
+            avg_score=float(entry["avg_score"]),
+            min_score=float(entry["min_score"]),
+            agent_count=int(entry["agent_count"]),
+        )
+        for entry in csv.DictReader(io.StringIO(text))
+    ]
+
+
 class Sample(BaseModel):
     """One seat of one episode, as a demonstration to clone."""
 
     archive: str
     name: str
     seat: int
-    bank: float
-    team: str
+    rating: float
 
 
 def select(
-    records: list[EpisodeRecord], quantile: float = 0.9, per_team: int = 40
+    archives: list[Path],
+    min_rating: float = 2500.0,
+    per_archive: int = 200,
 ) -> list[Sample]:
-    """Return the seats worth cloning, filtered for quality and for diversity.
+    """Return the seats worth cloning, strongest episodes first.
 
-    Two filters, and the second matters as much as the first. Quality keeps only
-    banks above ``quantile`` of the corpus, because cloning the median teaches
-    median play. Diversity caps how many demonstrations any one team supplies,
-    because three-quarters of this field replays a single recorded episode and
-    an uncapped sample would be that recording, learned faithfully, including
-    the melon monoculture that collapses its own price.
+    Selection is on ``min_score`` — the weaker of the two players' ratings — so
+    a chosen episode had two strong players in it. A large bank against a weak
+    opponent is not a demonstration of strong play, and cloning one teaches
+    behaviour that only works against someone who cannot respond.
+
+    The rating floor also removes the recorded tape and its re-wrappings, which
+    make up three-quarters of the field and rate around 1720, without having to
+    identify them by name.
 
     Args:
-        records: Every episode indexed from the corpus.
-        quantile: Keep seats banking above this quantile of all seats.
-        per_team: Maximum demonstrations to take from any one team.
+        archives: Daily archives to select from.
+        min_rating: Keep episodes whose weaker player rated at least this.
+        per_archive: Cap on episodes taken from any one archive.
 
     Returns:
-        Selected seats, best bank first.
+        Both seats of each chosen episode, strongest first.
     """
-    seats = [
-        Sample(
-            archive=record.archive,
-            name=record.name,
-            seat=seat,
-            bank=record.rewards[seat],
-            team=record.teams[seat] if seat < len(record.teams) else "unknown",
-        )
-        for record in records
-        for seat in range(len(record.rewards))
-    ]
-    if not seats:
-        return []
-
-    banks = sorted(sample.bank for sample in seats)
-    floor = banks[min(int(len(banks) * quantile), len(banks) - 1)]
-    ranked = sorted(
-        (sample for sample in seats if sample.bank >= floor),
-        key=lambda sample: -sample.bank,
-    )
-
-    taken: dict[str, int] = {}
     chosen: list[Sample] = []
-    for sample in ranked:
-        if taken.get(sample.team, 0) >= per_team:
-            continue
-        taken[sample.team] = taken.get(sample.team, 0) + 1
-        chosen.append(sample)
+    for archive in archives:
+        rows = [row for row in read_manifest(archive) if row.min_score >= min_rating]
+        rows.sort(key=lambda row: -row.min_score)
+        for row in rows[:per_archive]:
+            for seat in range(row.agent_count):
+                chosen.append(
+                    Sample(
+                        archive=archive.name,
+                        name=f"{row.episode_id}.json",
+                        seat=seat,
+                        rating=row.min_score,
+                    )
+                )
     return chosen
 
 
@@ -451,24 +492,48 @@ def split(
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/learn/test_corpus.py -k "selection or holdout or seats" -v`
-Expected: PASS, 4 tests.
+Run: `uv run pytest tests/learn/test_corpus.py -k "manifest or selection or seats or cap or holdout" -v`
+Expected: PASS, 5 tests, in seconds — none of them decodes an episode. If they take minutes, they are
+inheriting the module's `slow` marker and the default deselection; fix the marker placement.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Report what the corpus actually offers**
+
+Run this and put the output in your report; the rating floor is a guess until it is measured:
+
+```bash
+uv run python -c "
+from kaggriculture.learn.corpus import CORPUS, read_manifest
+rows = [r for a in sorted(CORPUS.glob('*.zip')) for r in read_manifest(a)]
+rows.sort(key=lambda r: -r.min_score)
+print('episodes', len(rows))
+for floor in (2000, 2400, 2600, 2800):
+    print(f'min_score >= {floor}: {sum(1 for r in rows if r.min_score >= floor)}')
+print('best', rows[0].min_score, 'median', rows[len(rows)//2].min_score)
+"
+```
+
+If fewer than 200 episodes clear 2500, say so plainly rather than lowering the floor to fill a quota — a
+smaller dataset of strong play beats a larger one diluted with the tape.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 uv run pre-commit run -a
 git add src/kaggriculture/learn/corpus.py tests/learn/test_corpus.py
-git commit -m "feat: select demonstrations for quality and for diversity
+git commit -m "feat: select demonstrations by ladder rating, not by bank
 
-Cloning the corpus unfiltered would learn the one recorded episode that three
-quarters of the field replays, faithfully, including the monoculture that
-collapses its own price. Quality keeps the top decile; the per-team cap is what
-stops the copied kernel supplying most of the dataset.
+Every archive ships a manifest carrying each episode's avg_score and min_score
+— the players' ratings. Selecting on min_score picks episodes where both
+players were strong, where a bank filter would happily pick a large bank
+against a weak opponent and teach behaviour that only works against someone who
+cannot respond.
 
-The holdout splits by episode rather than by seat, because both seats of one
-episode share a board, its weeds and its market — splitting by seat would put
-near-identical states on both sides and make validation a memorisation score."
+It also removes the recorded tape and its re-wrappings, three-quarters of the
+field, without identifying them by name: they rate around 1720 and any floor
+above that excludes them. That replaces the per-team cap the plan called for.
+
+And it costs nothing. Establishing the same thing from the episodes means
+decoding 21GB of JSON per archive, which measured 17 minutes."
 ```
 
 ---
@@ -1022,7 +1087,7 @@ def one_sample() -> Sample:
 
     with zipfile.ZipFile(ARCHIVE) as bundle:
         name = next(n for n in bundle.namelist() if n.endswith(".json"))
-    return Sample(archive=ARCHIVE.name, name=name, seat=0, bank=1.0, team="t")
+    return Sample(archive=ARCHIVE.name, name=name, seat=0, rating=2600.0)
 
 
 def test_a_shard_round_trips_into_tensors_of_the_declared_shape(tmp_path: Path) -> None:
