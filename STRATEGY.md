@@ -357,6 +357,47 @@ procedure, and the most reusable process lesson in the research.
 **Gate:** a chosen architecture with a measured forward pass comfortably inside the Phase 0 budget, and a
 behaviour-cloned agent that beats `random` and ideally `heuristic-v1`.
 
+#### Result — behaviour cloning, 2026-08-05 (run `bc-10M-seed0-0cf4416`)
+
+Dataset: 868 seats selected from 434 episodes across 6 daily archives at a rating floor of 2500 (the
+weaker player's rating, so both players in a kept episode were strong) with a per-archive cap of 200.
+Split by episode: 780 train seats → 140,400 rows and 88 holdout seats → 15,840 rows, at stride 4.
+10,134,294 parameters, 8 epochs, batch 512, AdamW at 3e-4.
+
+**Holdout accuracy 0.857** over 149,481 acting units, against a majority-class baseline of 0.175
+(`NORTH`). The model is not a collapsed predictor: it emits 19 distinct ops and its per-op recall tracks
+the corpus — `WATER` 0.97, `PASS` 0.95, `PICKUP` 0.92, `PLANT:MELON` 1.00, down to `PLACE` 0.29. Train
+and holdout loss finish at 0.247 and 0.249, so it is not overfitting either. As a model of what a strong
+farmer's hands do next, cloning worked.
+
+| opponent     | win rate | 95% interval   | mean bank | opponent bank |
+| ------------ | -------- | -------------- | --------- | ------------- |
+| meta-tape    | 0.000    | [0.000, 0.037] | 3,000     | 189,245       |
+| heuristic-v2 | 0.000    | [0.000, 0.037] | 3,000     | 68,304        |
+| heuristic-v1 | 0.000    | [0.000, 0.037] | 3,000     | 41,376        |
+| starter      | 0.000    | [0.000, 0.037] | 3,000     | 3,501         |
+
+League 0.000 over 4 opponents, 400 games, 0 errors (run `play-vs-league-0cf4416`).
+
+**The gate is missed, and no amount of training clears it.** The agent banks exactly its starting 3,000
+in all 400 episodes because `UNIT_OPS` has no market verbs, and the engine increases a farm's money in
+exactly one place — `_commit_unit` crediting a `SELL` order. A policy restricted to unit ops therefore
+cannot gain a single coin, so its bank is pinned at 3,000 and its win rate against any opponent that nets
+anything at all is zero by construction, whatever its accuracy. `starter` finishes on 3,501: we lost by
+501 coins to an opponent we could not out-earn if the weights were perfect.
+
+This is the gap between predicting a recording and playing the game, and it is sharper than the phase
+text anticipated. Every economically decisive choice in Kaggriculture — buying seed, hiring, buying land
+and animals, and selling — is a market order, and the clone learned the 85.7% of the decision stream that
+moves hands around a farm it can never stock. The lesson for Phase 3 is that the market head is not an
+enhancement to schedule after the unit head works; it is the half of the action space that carries the
+score, and the encoder already feeds it (Task 3's market branch reaches the trunk). Deliberately not
+fixed here: adding a market head to a behaviour-cloning script would be Phase 3 work done in Phase 2's
+file, and the corpus's market orders deserve their own encoding decision rather than an afterthought.
+
+Kept as an initialisation, which is what the phase text says imitation is for: the trunk has learned to
+read a board, and Phase 3 starts from that rather than from noise.
+
 ### Phase 3 — RL, small model (2 weeks)
 
 - Board-shaped action head: `10×10×22`, read only at cells holding units, **illegal actions masked to
