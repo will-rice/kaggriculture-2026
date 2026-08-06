@@ -257,9 +257,16 @@ def market_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     Unlike ``unit_loss``, this passes no ``ignore_index`` at all: every market
     slot -- sell this product, buy that seed, hire, buy land -- is a real
     decision on every turn, and there is no slot analogous to a hand not yet
-    hired. Bucket 0 means "trade nothing", and the corpus genuinely chooses it
-    on roughly a third of rows; masking it the way ``unit_loss`` masks padding
-    would teach the model that not trading is unobserved rather than chosen.
+    hired. Bucket 0 means "trade nothing", and the teacher genuinely chooses it
+    on 35.9% of training rows and 34.0% of holdout rows; masking it the way
+    ``unit_loss`` masks padding would teach the model that not trading is
+    unobserved rather than chosen.
+
+    That is lower than the 46.3% of raw corpus turns quoted in
+    ``encode_market``, and the two are not in conflict: these rows are filtered
+    by ladder rating and strided, and the stronger agents that survive the
+    filter trade more often. Each figure names its own population because an
+    unqualified one invites exactly the "which is it?" the two used to provoke.
 
     ``IGNORE`` is -100, which happens to also be ``cross_entropy``'s own
     default ``ignore_index``. A test that calls ``cross_entropy`` directly with

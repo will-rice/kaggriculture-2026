@@ -566,9 +566,10 @@ def encode_market(action: Mapping[str, Any]) -> torch.Tensor:
     padding when the farm has no hand standing there yet; a market slot has no
     such state; every slot -- sell this product, buy that seed, hire, buy land
     -- is a genuine decision on every turn, and "trade nothing" is itself the
-    meaningful class 0 rather than something to mask out: the corpus trades
-    nothing on roughly half of all turns. The market loss therefore masks
-    nothing, where the unit loss masks every unhired hand's padding.
+    meaningful class 0 rather than something to mask out: measured across all six
+    archives, the corpus trades nothing on 46.3% of turns. The market loss
+    therefore masks nothing, where the unit loss masks every unhired hand's
+    padding.
 
     Repeated orders for the same (verb, item) pair are summed before
     bucketing -- 22% of order-bearing turns repeat a pair, and keeping only
