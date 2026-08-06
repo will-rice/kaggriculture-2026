@@ -47,19 +47,29 @@ def _farm(melons: int = 0, money: float = 3_000.0, hands: int = 0) -> dict[str, 
 
     Each call builds its own tile grid: two farms in one observation must
     never share one mutable list, or mutating one player's board silently
-    mutates the other's.
+    mutates the other's. The grid, the farmer's spawn and every hand's spawn
+    all come from the engine's own constructors, so tiles outside NW are
+    ``LOCKED`` exactly as they are in a real game -- which is the whole
+    subject of ``_shed_masked`` and cannot be tested on a board of ``None``.
+    ``melons`` fill NW, which is the only quadrant that starts unlocked.
     """
-    tiles: list[list[Any]] = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
+    tiles: list[list[Any]] = [
+        [engine._initial_tile(x, y, BOARD_SIZE) for x in range(BOARD_SIZE)]
+        for y in range(BOARD_SIZE)
+    ]
     for index in range(melons):
         tiles[index // 5][index % 5] = engine._new_plant("MELON", 0, TURNS_PER_DAY)
-    return {
+    farm = {
         "tiles": tiles,
         "money": money,
-        "farmer": [4, 4],
-        "hands": [[4, 4] for _ in range(hands)],
+        "farmer": list(engine._default_spawn(BOARD_SIZE)),
+        "hands": [],
         "unlocked_quadrants": ["NW"],
         "hires_today": hands,
     }
+    for _ in range(hands):
+        farm["hands"].append(engine._spawn_hand(farm, BOARD_SIZE))
+    return farm
 
 
 def _observation(
@@ -130,8 +140,13 @@ def _observation_backing(market: list[list[Any]]) -> dict[str, Any]:
 
 
 def _observation_marginally_closer_to(seed: int) -> dict[str, Any]:
-    """Return a board far from every prototype and one tile nearer to ``seed``'s."""
-    return _observation(melons=seed + _MARGINAL_GAP)
+    """Return a board far from every prototype and one tile nearer to ``seed``'s.
+
+    An hour later than the board the incumbent was chosen on, because that is
+    what a next turn is: two calls at turn zero would be two episodes, and
+    ``act`` clears its incumbent there on purpose.
+    """
+    return _observation(melons=seed + _MARGINAL_GAP, hour=1)
 
 
 def _observation_unlike(seed: int) -> dict[str, Any]:
@@ -254,6 +269,44 @@ def test_route_positions_are_replayed_from_the_actions_not_guessed() -> None:
     assert route_units(prototype, 0) == [(4, 4)]
     assert route_units(prototype, 1) == [(4, 3), (4, 4)]
     assert route_units(prototype, 2) == [(3, 3), (4, 5)]
+
+
+def test_a_transfer_the_engine_would_refuse_is_not_counted_against_the_shed() -> None:
+    """The shed model has to place goods where the engine would, not where asked.
+
+    The engine spawns a farm's first hand on ``(5, 4)``, a shed-access tile in
+    a quadrant nobody has bought yet, and ``_apply_unit_action`` refuses every
+    shed transfer from a ``LOCKED`` tile. A model without that guard predicts
+    the ``PICKUP`` emptying six sacks out of the shed, and clamps the sale of
+    ten that follows down to four -- revenue given away for goods we hold,
+    with nothing raised and nothing logged.
+    """
+    prototype = _prototype(market=[["SELL", "WHEAT", 10]])
+    for action in prototype.actions:
+        action["hands"] = [["PICKUP", "WHEAT", 6]]
+    hired = list(prototype.signatures[0])
+    hired[SIGNATURE_FIELDS.index("HANDS")] = 1.0 / HANDS_SCALE
+    prototype.signatures[:] = [tuple(hired)] * len(prototype.signatures)
+
+    observation = _observation(melons=1, hands=1, shed={"WHEAT": 10})
+
+    assert observation["farms"][0]["hands"] == [[5, 4]]
+    assert observation["farms"][0]["tiles"][4][5] == "LOCKED"
+    assert RouteAgent([prototype]).act(observation)["market"] == [["SELL", "WHEAT", 10]]
+
+
+def test_turn_zero_starts_a_new_episode_rather_than_continuing_the_last() -> None:
+    """One process plays many episodes in a league evaluation.
+
+    An agent that carried its incumbent route across a season boundary would
+    replay the wrong opening and report one fallback count for two games.
+    """
+    agent = RouteAgent([_prototype(seed=1)])
+    agent.act(_observation_unlike(seed=1))
+
+    agent.act(_observation_matching(seed=1))
+
+    assert agent.fallbacks == 0
 
 
 @pytest.mark.slow

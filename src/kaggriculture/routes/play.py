@@ -128,6 +128,24 @@ MATCH_THRESHOLD = 4.0
 # distinct routes and switched 17 times.
 HYSTERESIS_MARGIN = 0.25
 
+# Whether replayed orders are cut down to what our state backs before they
+# are sent. A sweep axis, not a settled question: paired single-variable
+# episodes put seed 99 12,674 better with the clamp and seed 42 10,239 worse,
+# a wash on the mean with a +/-12.7k spread, so Task 5 toggles this rather
+# than assuming it. `RouteAgent` takes it as an argument defaulting to this.
+CLAMP_ORDERS = True
+
+# How many turns an agent is actually asked to act on. The engine records
+# `EPISODE_STEPS` observations but fires DONE at `episodeSteps - 2`, so the
+# last turn anyone plays is 718 and the terminal observation at 719 is never
+# handed to an agent. A route's `actions` are the same length for the same
+# reason, which is why no turn falls back for want of a recorded action.
+ACTING_TURNS = EPISODE_STEPS - 1
+
+# The three unit ops that move goods between a unit and the shed, and so the
+# three the shed model has to place correctly. Read off `_apply_unit_action`.
+_SHED_TRANSFERS = frozenset({"DROP", "PICKUP", "PLACE"})
+
 _HANDS_INDEX = SIGNATURE_FIELDS.index("HANDS")
 
 # Where the engine puts a farmer at the start of every day: the first
@@ -146,13 +164,24 @@ class RouteAgent:
     route is currently being followed, so that hysteresis can prefer it, and
     how many turns have been played by the fallback instead.
 
-    One instance plays one episode. ``current`` is an index into
-    ``prototypes``, or ``None`` before the first match and after any turn that
-    fell back.
+    ``current`` is an index into ``prototypes``, or ``None`` before the first
+    match and after any turn that fell back. Both it and ``fallbacks`` are
+    cleared on turn zero rather than only at construction: one process plays
+    many episodes in a league evaluation, and an instance that carried an
+    incumbent route across a season boundary would replay the wrong opening
+    and report a fallback count for two games at once. Turn zero happens
+    exactly once per episode, so the reset is a property of the class instead
+    of something every caller has to remember.
+
+    ``clamp_orders`` chooses whether replayed market orders are cut to what
+    our state backs; see ``CLAMP_ORDERS``.
     """
 
-    def __init__(self, prototypes: list[Prototype]) -> None:
+    def __init__(
+        self, prototypes: list[Prototype], clamp_orders: bool = CLAMP_ORDERS
+    ) -> None:
         self.prototypes = prototypes
+        self.clamp_orders = clamp_orders
         self.current: int | None = None
         self.fallbacks = 0
 
@@ -178,12 +207,15 @@ class RouteAgent:
         seat = int(observation.get("player", 0) or 0)
         day = int(observation["day"])
         step = day * TURNS_PER_DAY + int(observation["hour"])
+        if step == 0:
+            self.current = None
+            self.fallbacks = 0
         chosen = self.choose(signature(observation, seat), step, day)
-        if step == EPISODE_STEPS - 1:
+        if step == ACTING_TURNS - 1:
             LOGGER.info(
                 "route memory fell back to the economic policy on %d of %d turns",
                 self.fallbacks + (1 if chosen is None else 0),
-                EPISODE_STEPS,
+                ACTING_TURNS,
             )
         if chosen is None:
             self.fallbacks += 1
@@ -197,6 +229,10 @@ class RouteAgent:
         ours = [_position(farm["farmer"])] + [_position(hand) for hand in farm["hands"]]
         plan = realign(recorded, route_units(self.prototypes[chosen], step), ours)
 
+        if not self.clamp_orders:
+            plan["market"] = [list(order) for order in recorded["market"]]
+            return plan
+
         # The shed as it will stand when the market runs: the engine applies
         # unit actions before market orders, so a DROP this turn is already in
         # the shed by the time a SELL is quoted, and clamping against the
@@ -204,9 +240,13 @@ class RouteAgent:
         # `_post_field_storage` reads `farmer` and `hands` and never
         # `liquidation`, which the vendored TypedDict requires and which is
         # inert here.
+        tiles = farm["tiles"]
         field: economic_policy.FieldPlan = {
-            "farmer": plan["farmer"],
-            "hands": plan["hands"],
+            "farmer": _shed_masked(plan["farmer"], ours[0], tiles),
+            "hands": [
+                _shed_masked(order, position, tiles)
+                for order, position in zip(plan["hands"], ours[1:], strict=True)
+            ],
             "liquidation": False,
         }
         capacity = SHED_CAPACITY if config is None else config["shedCapacity"]
@@ -342,8 +382,36 @@ def clamp(
     at the price quoted now, and purchases are costed at it too, where the
     engine will re-quote per unit as the inventory moves. That asymmetry is
     the safe one: an order we keep and the engine rejects costs nothing, while
-    an order we drop is gone. The shed is not estimated at all; it is our own
-    private state and is exact.
+    an order we drop is gone.
+
+    The shed is a *model*, not a reading, and the direction of its error is
+    what matters. It is our own private state plus this turn's field plan, so
+    nothing the opponent does can move it, but it is only as good as its model
+    of our own units -- and it over-emptied the shed until ``_shed_masked``
+    was added, because it applied transfers the engine refuses. What it
+    guarantees now, in each direction:
+
+    - It never counts a transfer the engine would refuse, because
+      ``_shed_masked`` mirrors the two guards in ``_apply_unit_action``. That
+      was the failure: a predicted ``PICKUP`` from a locked shed-access tile
+      emptied a shed the engine left full, and every ``SELL`` behind it was
+      clamped away for goods we were holding.
+    - It can still under-count what will be in the shed, because a
+      ``HARVEST`` this turn lands in a unit's inventory rather than the shed,
+      and ``_post_field_storage`` does not model one. That direction is safe:
+      it can only leave a sale for a later turn, never sell what is not there.
+
+    Measured rather than asserted. Over three seeds against ``starter``, on
+    every replayed turn where the emitted market was empty and the day did not
+    end -- 266, 241 and 292 turns, the ones where the engine's own market and
+    end-of-day transfers do not confound the comparison -- the predicted shed
+    equalled the engine's next observation exactly, with and without the
+    guard. The guard itself refuses 11 orders an episode, consistently across
+    six episodes and two opponents, and on those six none of the 11 would have
+    moved goods the model was tracking, so no clamped order and no bank moved.
+    The hazard is real and now closed; its measured cost on this sample was
+    zero. It is not proven exact everywhere and must never again be described
+    as if it were.
 
     Args:
         orders: The route's recorded market orders for this turn.
@@ -402,6 +470,38 @@ def clamp(
             budget -= quantity * unit
         kept.append([verb, item, quantity])
     return kept
+
+
+def _shed_masked(
+    order: list[Any], position: Position, tiles: economic_policy.TileGrid
+) -> list[Any]:
+    """Return ``order`` with a shed transfer the engine would refuse removed.
+
+    ``economic_policy._post_field_storage`` moves goods for every ``DROP``,
+    ``PICKUP`` and ``PLACE`` it is given, wherever the unit is standing. The
+    engine does not: ``_apply_unit_action`` returns early when the unit's own
+    tile is ``LOCKED``, and each of those three ops then checks
+    ``_is_shed_adjacent``. Both guards matter for a hand, because the engine
+    spawns hands on shed-access tiles that are still locked until that
+    quadrant is bought -- at day 0 the first hand spawns on ``(5, 4)``, in a
+    locked NE. Predicting a ``PICKUP`` there empties a shed the engine leaves
+    full, and every ``SELL`` after it gets clamped away for goods we actually
+    have.
+
+    Args:
+        order: One unit's order from the realigned plan.
+        position: Where that unit stands.
+        tiles: Our farm's tile grid, indexed ``[y][x]``.
+
+    Returns:
+        ``order`` unchanged, or ``["PASS"]`` where the engine would move
+        nothing.
+    """
+    if order[0] not in _SHED_TRANSFERS:
+        return order
+    if position in shed_access_tiles() and tiles[position[1]][position[0]] != "LOCKED":
+        return order
+    return ["PASS"]
 
 
 def _unit_cost(verb: str, item: str, prices: Mapping[str, float]) -> float:
@@ -516,15 +616,21 @@ def _position(raw: list[int]) -> Position:
 
 @functools.lru_cache(maxsize=1)
 def route_agent() -> RouteAgent:
-    """Return the episode's agent, loading the store once per process.
+    """Return the process's agent, loading the store once per process.
 
     The store is 3.6 MiB gzipped and takes about four seconds to decode, which
     is charged to the sandbox's overage pool exactly once rather than on every
     turn. Cached publicly rather than in a module global so a test can point
     ``STORE`` at its own file and drop what a previous test loaded.
 
+    One agent serves every episode this process plays -- a league evaluation
+    plays many -- which is safe only because ``RouteAgent.act`` clears its
+    incumbent route and its fallback count on turn zero. Caching a stateful
+    object is otherwise exactly how a season's hysteresis leaks into the next
+    game's opening.
+
     Returns:
-        A fresh ``RouteAgent`` over the shipped store.
+        The shared ``RouteAgent`` over the shipped store.
     """
     return RouteAgent(load(STORE))
 
