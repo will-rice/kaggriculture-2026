@@ -98,6 +98,34 @@ a model to predict an action from the state that action produced.
 - Wheat is the opposite: a `log` glut curve barely moves, and wheat is also the
   feed for every animal.
 
+## Where the ladder actually is
+
+Measured 2026-08-06 from the cached kernel index (`data/kernels.db`), best
+public-LB score across every version of each kernel:
+
+| kernel                             | best public LB |
+| ---------------------------------- | -------------- |
+| `kaitofukami` v21.1                | 2863.9         |
+| `kaitofukami` v20                  | 2753.4         |
+| `prvsiyan` Frontier                | 2736.1         |
+| `romantamrazov` Hamburger          | 2391.0         |
+| `pilkwang` — vendored as our agent | 1289.6         |
+
+Votes are not strength. `pilkwang` was adopted because it had the most votes and
+was the only readable reactive agent in a survey taken on 3 August; it peaks at
+1289.6 across 32 versions, which matches the ~1130-1218 we measured on the
+ladder.
+
+The 2863.9 agent is **96.7% memorised route tables** — 403 KB of Top-30 route
+prototypes and 11 KB of action tables against 14 KB of retrieval logic, packed
+base85 + zlib + tar and SHA-256 checked. Its own docstring: "a complete fit-only
+route provides the production plan... it never creates an ordinary-turn SELL."
+
+The corpus on disk tells the same story from the other side. Sampled across one
+archive, seat banks run 76,929 / 125,773 / 158,603 at min / median / max, with
+the top decile above 149,120 — our submitted agent banks ~118,000, below the
+median of data we already hold. Replaying good routes beats deciding afresh.
+
 ## Useful resources
 
 - [Daily top-episode replay dataset](https://www.kaggle.com/datasets/kaggle/kaggriculture-episodes-index)
