@@ -16,7 +16,12 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
 from kaggriculture.constants import BOARD_SIZE, PRODUCTS, TURNS_PER_DAY
 from kaggriculture.learn.corpus import CORPUS
-from kaggriculture.routes.signature import distance, field_contributions, signature
+from kaggriculture.routes.signature import (
+    SIGNATURE_FIELDS,
+    distance,
+    field_contributions,
+    signature,
+)
 
 ARCHIVE = CORPUS / "kaggriculture-episodes-2026-08-03.zip"
 
@@ -173,3 +178,56 @@ def test_no_single_field_dominates_a_real_distance() -> None:
 
     assert total > 0.0
     assert max(contributions) <= 0.5 * total
+
+
+@pytest.mark.slow
+@_needs_corpus
+def test_money_never_dominates_at_any_phase_of_the_season() -> None:
+    """The one-pair regression pins the bug where it was found, not where it lives.
+
+    Money was the field that broke this, and it behaves differently through a
+    season: it starts near zero for everyone, climbs to six figures, and is
+    log-compressed here precisely because of that spread. A single pair at day
+    16 cannot show whether the compression holds at day 1, when every farm is
+    still poor, or at day 29, when the spread is widest.
+
+    Asserted on money specifically rather than on whichever field happens to be
+    largest. Two boards that genuinely differ in one thing *should* have that
+    thing carry the distance -- a max-field threshold would flag correct
+    behaviour as a defect. Measured medians are 0.27 at day 1 falling to 0.07 by
+    day 29, so 0.5 leaves real headroom while still catching a regression to the
+    unscaled form, which put money at 0.9996.
+    """
+    import itertools
+    import statistics
+
+    # Drawn across archives, not from one. Five episodes from a single archive
+    # share a day-1 signature exactly -- the corpus is dominated by one public
+    # kernel playing one opening -- so a single-archive sample yields no
+    # comparable pairs at all early in the season and the assertion below would
+    # pass by having nothing to check.
+    episodes = []
+    for archive in sorted(CORPUS.glob("*.zip"))[:3]:
+        with zipfile.ZipFile(archive) as bundle:
+            names = [n for n in bundle.namelist() if n.endswith(".json")][:4]
+            episodes += [json.load(bundle.open(name))["steps"] for name in names]
+
+    for day in (1, 5, 16, 29):
+        index = day * TURNS_PER_DAY + 6
+        signatures = [
+            signature(steps[index][0]["observation"], 0)
+            for steps in episodes
+            if index < len(steps)
+        ]
+        shares = []
+        for one, other in itertools.combinations(signatures, 2):
+            contributions = field_contributions(one, other, day=day)
+            total = sum(contributions)
+            if total:
+                shares.append(contributions[SIGNATURE_FIELDS.index("MONEY")] / total)
+
+        assert shares, f"day {day} produced no comparable pairs"
+        assert statistics.median(shares) < 0.5, (
+            f"money carries {statistics.median(shares):.0%} of the median "
+            f"distance at day {day}; the scaling has regressed"
+        )
