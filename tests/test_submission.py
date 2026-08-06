@@ -59,15 +59,34 @@ def test_the_submission_carries_the_weights(tmp_path: Path) -> None:
     assert "kaggriculture/learn/encoding.py" in names
 
 
+def test_the_submission_carries_the_prototype_store(tmp_path: Path) -> None:
+    """A packaged route agent that cannot find its store raises on turn zero.
+
+    ``routes.play`` loads ``routes.STORE`` from beside the package, and until
+    the store was copied in there was nothing there: ``copytree`` walks the
+    source tree and the store is gitignored, so the archive shipped the code
+    that reads it and not the file. The failure lands in the sandbox on the
+    first turn, where the only symptom is a zero.
+    """
+    names = archive_names(tmp_path)
+
+    assert "kaggriculture/routes/prototypes.json.gz" in names
+    assert "kaggriculture/routes/play.py" in names
+    assert "kaggriculture/routes/store.py" in names
+    assert "kaggriculture/routes/signature.py" in names
+
+
 def test_the_submission_ships_no_training_code(tmp_path: Path) -> None:
     """The sandbox has no network; a wandb import forfeits the episode on turn 0.
 
     ``corpus.py`` and ``dataset.py`` reach for tqdm and a ``/data`` path that
-    exists on the workstation and nowhere else, and ``learn/scripts`` imports
-    wandb outright.
+    exists on the workstation and nowhere else, ``learn/scripts`` imports wandb
+    outright, and ``routes/scripts/harvest.py`` imports both ``corpus`` and
+    ``tqdm``.
     """
     names = archive_names(tmp_path)
 
     assert not any("/scripts/" in name for name in names)
     assert "kaggriculture/learn/corpus.py" not in names
     assert "kaggriculture/learn/dataset.py" not in names
+    assert "kaggriculture/routes/scripts/harvest.py" not in names

@@ -238,5 +238,11 @@ wandb/
 # source, and committing it would put a binary blob in every diff.
 *.pt
 
+# The prototype store, for the same reason. `routes.scripts.harvest` writes
+# src/kaggriculture/routes/prototypes.json.gz out of the 107 GB replay corpus
+# and `package.py` copies it into the archive; it is a 3.6 MiB build artifact,
+# rebuildable from the corpus, and gzip diffs are worthless anyway.
+prototypes.json.gz
+
 # Node — only the prettier plugin the pre-commit format hook resolves from here
 node_modules/

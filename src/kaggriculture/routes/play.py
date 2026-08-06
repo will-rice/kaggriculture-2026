@@ -54,7 +54,6 @@ name as an entrypoint directly.
 
 import functools
 import logging
-from pathlib import Path
 from typing import Any, Mapping
 
 from kaggriculture import economic_policy
@@ -71,6 +70,7 @@ from kaggriculture.constants import (
     quadrant_of,
     shed_access_tiles,
 )
+from kaggriculture.routes import STORE
 from kaggriculture.routes.signature import (
     HANDS_SCALE,
     SIGNATURE_FIELDS,
@@ -82,12 +82,6 @@ from kaggriculture.routes.store import Prototype, load
 LOGGER = logging.getLogger(__name__)
 
 Position = tuple[int, int]
-
-# Beside this file, so one path serves both the local league and the unpacked
-# submission archive -- the same reasoning `learn/__init__.py` gives for the
-# checkpoint. `routes/scripts/harvest.py` writes the store under `/data`, and
-# `package.py` is what copies it here.
-STORE = Path(__file__).parent / "prototypes.json.gz"
 
 # How far a route's recorded signature may sit from the live board before this
 # turn is played by `economic_policy` instead. Set from where the distances

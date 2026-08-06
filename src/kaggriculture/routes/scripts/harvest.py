@@ -32,12 +32,12 @@ from pathlib import Path
 from tqdm import tqdm
 
 from kaggriculture.learn.corpus import CORPUS, Sample, select
+from kaggriculture.routes import STORE
 from kaggriculture.routes.signature import signature
 from kaggriculture.routes.store import Prototype, dedupe, save
 
 LOGGER = logging.getLogger(__name__)
 
-STORE = Path("/data/kaggriculture/routes/prototypes.json.gz")
 FLOOR = 149_120.0
 TOLERANCE = 1e-3
 

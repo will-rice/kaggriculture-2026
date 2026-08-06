@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 from kaggriculture.learn import CHECKPOINT
+from kaggriculture.routes import STORE
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_ROOT = REPO_ROOT / "src" / "kaggriculture"
@@ -28,13 +29,22 @@ SUBMISSION = REPO_ROOT / "submission.tar.gz"
 # instead, one file at a time, because they are training-only and pull in tqdm
 # and a ``/data`` path the sandbox does not have.
 #
-# ``*.pt`` is excluded so that ``build`` is the single thing that decides the
-# checkpoint ships. Left to ``copytree``, the weights would be included exactly
-# when a training run happened to have left them in the source tree, and absent
-# without complaint when it had not.
+# ``*.pt`` and the prototype store are excluded so that ``build`` is the single
+# thing that decides they ship. Left to ``copytree``, each would be included
+# exactly when a training or harvest run happened to have left it in the source
+# tree, and absent without complaint when it had not.
 EXCLUDED = shutil.ignore_patterns(
-    "__pycache__", "scripts", "corpus.py", "dataset.py", "*.pt"
+    "__pycache__", "scripts", "corpus.py", "dataset.py", "*.pt", STORE.name
 )
+
+# The two build artifacts the archive cannot be assembled without, each mapped
+# to the module that produces it. Both are gitignored, so a fresh checkout has
+# neither, and both are loaded from beside the package at play time -- an
+# archive missing one is not a degraded agent but a broken one.
+REQUIRED = {
+    CHECKPOINT: "kaggriculture.learn.scripts.train",
+    STORE: "kaggriculture.routes.scripts.harvest",
+}
 
 
 def main() -> None:
@@ -56,11 +66,14 @@ def build(output: Path = SUBMISSION) -> Path:
     The packaging scripts themselves are left out: they import ``argparse`` and
     the Kaggle client, neither of which the agent needs at play time.
 
-    The checkpoint is copied in explicitly rather than left to ``copytree``,
-    which would pick it up only when it happened to be sitting in the source
-    tree. It is gitignored and written by a training run, so a fresh checkout
-    has no such file, and the archive would ship a policy of random weights
-    that plays a full episode and loses without ever raising.
+    ``REQUIRED`` is copied in explicitly rather than left to ``copytree``,
+    which would pick each file up only when it happened to be sitting in the
+    source tree. Both are gitignored build artifacts, so a fresh checkout has
+    neither, and the failure is silent in the direction that matters: without
+    the checkpoint the archive ships a policy of random weights that plays a
+    full episode and loses without ever raising, and without the store the
+    route agent raises ``FileNotFoundError`` on turn zero, in the sandbox,
+    where nobody sees it until the leaderboard reads zero.
 
     Args:
         output: Where to write the archive.
@@ -69,18 +82,20 @@ def build(output: Path = SUBMISSION) -> Path:
         ``output``, unchanged.
 
     Raises:
-        FileNotFoundError: If no checkpoint has been trained yet.
+        FileNotFoundError: If a required build artifact has not been produced.
     """
-    if not CHECKPOINT.is_file():
-        raise FileNotFoundError(
-            f"no checkpoint at {CHECKPOINT} — run "
-            "`uv run python -m kaggriculture.learn.scripts.train` first"
-        )
+    for artifact, producer in REQUIRED.items():
+        if not artifact.is_file():
+            raise FileNotFoundError(
+                f"no {artifact.name} at {artifact} — run "
+                f"`uv run python -m {producer}` first"
+            )
     with tempfile.TemporaryDirectory() as staging:
         root = Path(staging)
         package = root / PACKAGE_ROOT.name
         shutil.copytree(PACKAGE_ROOT, package, ignore=EXCLUDED)
-        shutil.copy(CHECKPOINT, package / CHECKPOINT.relative_to(PACKAGE_ROOT))
+        for artifact in REQUIRED:
+            shutil.copy(artifact, package / artifact.relative_to(PACKAGE_ROOT))
         shutil.copy(ENTRYPOINT, root / ENTRYPOINT.name)
         with tarfile.open(output, "w:gz") as archive:
             for path in sorted(root.iterdir()):
