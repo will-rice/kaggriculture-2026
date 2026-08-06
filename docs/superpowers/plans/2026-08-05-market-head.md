@@ -536,14 +536,48 @@ Tracking refuses a dirty tree, so commit first. Report both holdout accuracies, 
 
 **Files:**
 
-- Modify: `src/kaggriculture/learn/scripts/play.py`, `src/kaggriculture/package.py`
+- Move: `src/kaggriculture/learn/scripts/play.py` → `src/kaggriculture/learn/play.py`
+- Modify: `src/kaggriculture/scripts/package.py`, `main.py`, `.gitignore`
 - Test: `tests/learn/test_play.py`, `tests/test_submission.py`
 
 **Interfaces:**
 
-- Consumes: `decode_market` from Task 1, two-headed `forward` from Task 4, the checkpoint from Task 5.
+- Consumes: `decode_units`, `decode_market`, `unit_count` from `encoding`; the two-headed `Policy.forward`; the checkpoint from Task 5.
 
-- [ ] **Step 1: Write the failing tests**
+**What the plan got wrong, corrected here.** The packaging module is at
+`src/kaggriculture/scripts/package.py`, not `src/kaggriculture/package.py`. The
+archive is a **gzipped tar**, not a zip, so tests use `tarfile.open(...).getnames()`,
+never `zipfile`. And the agent cannot ship from where it currently lives:
+`EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "learn")` drops
+`play.py` twice over, since it sits in `learn/scripts/`.
+
+**The constraint that shapes this task.** `learn/__init__.py` records that
+importing torch in the competition sandbox costs **10.7 seconds of the
+60-second overage pool**, on two cores with 6.8 GB and no network. That is why
+`learn` was excluded wholesale. Shipping a torch policy spends a sixth of the
+pool before turn one, and the 1-second `actTimeout` cannot absorb it — the
+first turn necessarily overruns. This is survivable but must be **measured, not
+assumed**: a full 720-turn episode has to complete inside the pool.
+
+- [ ] **Step 1: Move the agent out of `scripts/`**
+
+`play.py` is inference code, not a script. Move it to
+`src/kaggriculture/learn/play.py`. Then `ignore_patterns("scripts")` — which
+copytree applies at every directory level, so it catches `learn/scripts` too —
+excludes the training scripts while leaving the agent shippable.
+
+Break its dependency on `kaggriculture.learn.scripts.build`. It imports `SHARDS`
+only to derive `CHECKPOINT = SHARDS / "policy.pt"`, and that one import drags in
+`learn.corpus` and `learn.dataset`, hence numpy, tqdm and a `/data` path that
+does not exist in the sandbox. Define the checkpoint as
+`Path(__file__).parent / "policy.pt"` instead: `__file__` is undefined only in
+`main.py`, which Kaggle `exec`s, and is available inside package modules. One
+path then works both for the local league and inside the archive, with no
+dual-location logic.
+
+Point `train.py` at that same path and add `*.pt` to `.gitignore`.
+
+- [ ] **Step 2: Write the failing tests**
 
 ```python
 def test_the_agent_emits_both_unit_and_market_orders() -> None:
@@ -556,59 +590,82 @@ def test_the_agent_emits_both_unit_and_market_orders() -> None:
 
 def test_the_submission_carries_the_weights(tmp_path: Path) -> None:
     """A packaged agent that cannot load its checkpoint plays untrained."""
-    archive = build_archive(tmp_path)
+    names = tarfile.open(build(tmp_path / "s.tar.gz")).getnames()
 
-    names = zipfile.ZipFile(archive).namelist()
-    assert any(name.endswith(".pt") for name in names)
+    assert any(name.endswith("policy.pt") for name in names)
 
 
-def test_the_submission_ships_no_scripts(tmp_path: Path) -> None:
+def test_the_submission_ships_no_training_scripts(tmp_path: Path) -> None:
     """The sandbox has no network; a wandb import forfeits the episode on turn 0."""
-    archive = build_archive(tmp_path)
+    names = tarfile.open(build(tmp_path / "s.tar.gz")).getnames()
 
-    names = zipfile.ZipFile(archive).namelist()
     assert not any("/scripts/" in name for name in names)
+    assert not any(name.endswith("corpus.py") or name.endswith("dataset.py")
+                   for name in names)
 ```
-
-- [ ] **Step 2: Run and watch them fail**
-
-Run: `uv run pytest tests/learn/test_play.py tests/test_submission.py -q`
-Expected: FAIL — the market list is empty and the archive has no `.pt`.
 
 - [ ] **Step 3: Implement**
 
-`play.py` calls both decodes and merges them into one dict. `decode_units` already returns `{"farmer": …, "hands": …, "market": []}`; fill that list from `decode_market`.
+`play.py` calls both decodes and merges them into one action dict.
+`decode_units` already returns `{"farmer": ..., "hands": ..., "market": []}`;
+fill that list from `decode_market`.
 
-`package.py` currently drops `learn/` wholesale through `EXCLUDED`, so it has no mechanism to ship weights at all. Add one: include the checkpoint and the modules `play.py` imports, while still excluding everything under `scripts/` that reaches the network. The submitted agent must import neither `wandb` nor `tracking`.
+In `package.py`, drop `"learn"` from `EXCLUDED` and keep `"scripts"`. Copy the
+checkpoint into the archive. Ship only what the agent imports — `learn/play.py`,
+`learn/model.py`, `learn/encoding.py` and the checkpoint — and exclude
+`corpus.py` and `dataset.py`, which are training-only and pull in tqdm.
+
+Update `learn/__init__.py`'s docstring: its claim that this package is never
+imported by the submitted agent stops being true here, and a stale comment
+asserting the opposite is worse than none.
 
 - [ ] **Step 4: Run**
 
 Run: `uv run pytest -q`
 Expected: PASS.
 
-- [ ] **Step 5: Gate against the league — this is the deliverable**
+- [ ] **Step 5: Measure the sandbox budget honestly**
+
+Play one full 720-turn episode from the **built archive**, not the repo, with
+`torch.set_num_threads(2)`. Report the import cost, the per-turn mean and max,
+and the total overage consumed. If a full episode cannot finish inside the
+60-second pool, say so plainly — that is a finding about whether a torch policy
+is submittable at all, and it outranks the league result.
+
+- [ ] **Step 6: Gate against the league — this is the deliverable**
 
 ```bash
 uv run python -m kaggriculture.scripts.evaluate <agent> --track
 ```
 
-Report, in this order and without tuning toward any of them:
+Report, in this order, without tuning toward any of them:
 
-1. Bank per episode, and whether it exceeds the opening 3,000 at all. That single number is what Phase 2 could not move.
+1. **Bank per episode, and whether it exceeds the opening 3,000 at all.** That
+   single number is what Phase 2 could not move.
 2. Win rate against `starter` with its Wilson interval.
 3. Win rate against `heuristic-v2` and against `economic_policy`.
 4. The league figure over all opponents.
 
-**Gate:** beats `starter`. Rungs beyond that — `heuristic-v2` at 54.6k, `economic_policy` at 118k — are reported, not required; the corpus is dominated by one kernel, so cloning it well means approaching it rather than beating it. State the rung reached and stop.
+**Gate:** beats `starter`. The rungs beyond — `heuristic-v2` at 54.6k,
+`economic_policy` at 118k — are reported, not required.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Switch `main.py` only if it earns it**
+
+`main.py` currently serves the vendored economic policy, which beat our
+heuristic 20-0 at 148k to 51k. **Repoint it at the trained agent only if the
+trained agent beats `economic_policy` in the gate.** Otherwise leave it and say
+so: shipping a worse agent to prove a phase worked is the one outcome worse than
+reporting that it did not.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
 git commit -m "feat: play and package the two-headed policy"
 ```
 
-Record the result in `STRATEGY.md` alongside Phase 2's, including the bank, so the two phases are comparable at a glance.
+Record the result in `STRATEGY.md` beside Phase 2's, including the bank, so the
+two are comparable at a glance.
 
 ---
 
