@@ -398,6 +398,62 @@ file, and the corpus's market orders deserve their own encoding decision rather 
 Kept as an initialisation, which is what the phase text says imitation is for: the trunk has learned to
 read a board, and Phase 3 starts from that rather than from noise.
 
+#### Result — market head, 2026-08-06 (run `bc-market-10M-seed0`, gate `play-vs-league-008c3b6`)
+
+The market head was added to close the gap above: the clone now predicts, per turn, a bucketed quantity
+for each of 21 market slots (sell per product, buy-seed per crop, buy-product, buy-animal, hire, buy
+land) alongside its per-unit ops, and `learn/play.py` decodes both heads into one action. Same trunk,
+same dataset, one extra loss term at `MARKET_WEIGHT = 1.0`.
+
+**Both heads clone well.** Units 0.857 over 149,481 acting units against a 0.175 majority-class
+baseline, unchanged. Market 0.989 over 332,640 slots — but the all-zero baseline is 0.943, because the
+teacher trades on only 5.7% of slots, so the honest figure is **0.818 restricted to the 19,006 slots
+where the teacher actually traded**. Verified through the play path, loading the shipped checkpoint the
+way the agent does, so the numbers describe the artefact and not just the training loop.
+
+**The agent trades, and goes bankrupt doing it.**
+
+| opponent          | win rate | 95% interval   | mean bank | opponent bank |
+| ----------------- | -------- | -------------- | --------- | ------------- |
+| meta-tape         | 0.000    | [0.000, 0.037] | 0         | 188,104       |
+| heuristic-v2      | 0.000    | [0.000, 0.037] | 0         | 68,884        |
+| heuristic-v1      | 0.000    | [0.000, 0.037] | 0         | 41,372        |
+| starter           | 0.000    | [0.000, 0.037] | 0         | 3,501         |
+| `economic_policy` | 0.000    | [0.000, 0.037] | 0         | 162,136       |
+
+League 0.000 over the four frozen opponents, 400 games, 0 errors (`play-vs-league-008c3b6`), plus 100
+games against the served agent (`play-vs-economic_policy-008c3b6`).
+
+**Phase 2's number to beat was 3,000. This banks 0.** The bank moved off its opening balance, which is
+what the market head was for, and it moved the wrong way: traced over one seeded episode against
+`starter`, the farm spends 3,000 down to zero by about turn 25 and never recovers, emitting 1,508 HIRE
+orders, 325 `BUY_PRODUCT WHEAT`, 47 `BUY_SEED MELON` and 34 `BUY_ANIMAL COW` across the season against
+311 `SELL FERTILIZER` and 247 `SELL WHEAT` that never fund them. Every hand it hires then plays PICKUP
+on an empty tile, turn after turn, because nothing was ever planted for them to work.
+
+**This is covariate shift, not a broken play path**, and the distinction is the finding. The same
+checkpoint, through the same encoders and the same decode, reproduces its holdout accuracies exactly on
+teacher states. It is only on states of its own making — a farm with nothing planted, a board no
+top-decile player ever stood on — that it degenerates. Two mechanisms compound: the model's own errors
+walk it off the data distribution within twenty turns, and the 21 market slots are argmaxed
+independently, so a turn's orders are a combination the teacher never played even when each slot is
+individually likely. Accuracy on a recording bounds nothing about a season played out.
+
+**The submission entrypoint is unchanged.** `main.py` still serves the vendored economic policy, which
+banks 162k where this banks 0. The gate to repoint it was beating that policy; it lost 100–0.
+
+**The sandbox budget is not the obstacle.** Measured out of the built 36.0 MiB archive at two threads: a
+0.911 s torch import inside turn 0, turn 0 at 1.028 s, and turns 1+ at 13.8 ms mean, 15.9 ms p99,
+123.5 ms max — one turn of 719 over the 1 s `actTimeout`, consuming 0.028 s of the 60 s overage pool.
+Scaling by the Phase 0 sandbox probe (10.7 s import, ~20–26 GMAC/s against this workstation's ~90) puts
+the sandbox at roughly 11 s of the pool on turn 0 and ~50 ms a turn thereafter — comfortably inside.
+**A torch policy is submittable; this one is just not worth submitting.** Re-measure with
+`uv run python -m kaggriculture.learn.scripts.budget`.
+
+What Phase 3 inherits: a trunk that reads a board, a market head that reads a market, and the measured
+fact that neither survives its own trajectory. That is an argument for the RL phase's frozen-teacher KL
+term rather than against the initialisation.
+
 ### Phase 3 — RL, small model (2 weeks)
 
 - Board-shaped action head: `10×10×22`, read only at cells holding units, **illegal actions masked to
