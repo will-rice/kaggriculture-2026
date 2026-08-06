@@ -240,3 +240,6 @@ wandb/
 
 # Node — only the prettier plugin the pre-commit format hook resolves from here
 node_modules/
+
+# Skill caches (discussion DB, scratch downloads)
+data/
