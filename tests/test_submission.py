@@ -45,18 +45,23 @@ def test_archive_holds_the_entrypoint_beside_the_package(tmp_path: Path) -> None
     assert not any("__pycache__" in name for name in names)
 
 
-def test_the_submission_carries_the_weights(tmp_path: Path) -> None:
-    """A packaged agent that cannot load its checkpoint plays untrained.
+def test_the_submission_ships_nothing_that_needs_torch(tmp_path: Path) -> None:
+    """The served agent replays routes; the learned policy is not in the archive.
 
-    Nothing raises in that case: ``Policy()`` initialises fine, the episode runs
-    all 720 turns, and the only symptom is a bad score.
+    Shipping ``learn`` cost 39 MB of checkpoint the archive never loaded --
+    measured, an archive carrying it was 41.7 MB and ``torch`` was still absent
+    from ``sys.modules`` after a full episode played from it. Excluding the
+    package also closes the path by which a later edit could pull torch into the
+    agent, where importing it spends 10.7 seconds of a 60 second overage pool.
+
+    Asserted on the whole package rather than on ``policy.pt`` alone: it is the
+    import reaching torch that costs the pool, not the weights sitting beside
+    it.
     """
     names = archive_names(tmp_path)
 
-    assert "kaggriculture/learn/policy.pt" in names
-    assert "kaggriculture/learn/play.py" in names
-    assert "kaggriculture/learn/model.py" in names
-    assert "kaggriculture/learn/encoding.py" in names
+    assert not [name for name in names if "/learn/" in name]
+    assert not [name for name in names if name.endswith(".pt")]
 
 
 def test_the_submission_carries_the_prototype_store(tmp_path: Path) -> None:

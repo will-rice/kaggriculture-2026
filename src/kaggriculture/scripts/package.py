@@ -12,7 +12,6 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from kaggriculture.learn import CHECKPOINT
 from kaggriculture.routes import STORE
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -29,22 +28,24 @@ SUBMISSION = REPO_ROOT / "submission.tar.gz"
 # instead, one file at a time, because they are training-only and pull in tqdm
 # and a ``/data`` path the sandbox does not have.
 #
+# ``learn`` goes entirely: ``main.py`` serves the route agent, which imports
+# none of it, and shipping it carried a 39 MB checkpoint the archive never
+# loaded -- measured, an archive built with it was 41.7 MB and `torch` was
+# absent from ``sys.modules`` after a full episode. Excluding the package also
+# removes any path by which a later edit could import torch into the agent and
+# spend 10.7 s of the 60 s overage pool.
+#
 # ``*.pt`` and the prototype store are excluded so that ``build`` is the single
 # thing that decides they ship. Left to ``copytree``, each would be included
-# exactly when a training or harvest run happened to have left it in the source
-# tree, and absent without complaint when it had not.
-EXCLUDED = shutil.ignore_patterns(
-    "__pycache__", "scripts", "corpus.py", "dataset.py", "*.pt", STORE.name
-)
+# exactly when a harvest run happened to have left it in the source tree, and
+# absent without complaint when it had not.
+EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "learn", "*.pt", STORE.name)
 
 # The two build artifacts the archive cannot be assembled without, each mapped
 # to the module that produces it. Both are gitignored, so a fresh checkout has
 # neither, and both are loaded from beside the package at play time -- an
 # archive missing one is not a degraded agent but a broken one.
-REQUIRED = {
-    CHECKPOINT: "kaggriculture.learn.scripts.train",
-    STORE: "kaggriculture.routes.scripts.harvest",
-}
+REQUIRED = {STORE: "kaggriculture.routes.scripts.harvest"}
 
 
 def main() -> None:
