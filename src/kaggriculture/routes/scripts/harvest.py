@@ -24,17 +24,89 @@ Run:
     uv run python -m kaggriculture.routes.scripts.harvest
 """
 
+import json
 import logging
+import zipfile
 from pathlib import Path
 
+from tqdm import tqdm
+
 from kaggriculture.learn.corpus import CORPUS, Sample, select
-from kaggriculture.routes.store import Prototype, dedupe, harvest, save
+from kaggriculture.routes.signature import signature
+from kaggriculture.routes.store import Prototype, dedupe, save
 
 LOGGER = logging.getLogger(__name__)
 
 STORE = Path("/data/kaggriculture/routes/prototypes.json.gz")
 FLOOR = 149_120.0
 TOLERANCE = 1e-3
+
+
+def harvest(samples: list[Sample], floor: float) -> list[Prototype]:
+    """Turn corpus samples into routes, keeping only the ones worth replaying.
+
+    Lives in this script rather than in ``routes/store.py`` because it is the
+    one part of the store that reads the corpus: it needs ``learn.corpus`` and
+    ``tqdm``, and ``package.py`` ships neither, while ``routes/store.py``
+    itself is imported by the agent at play time.
+
+    Streams each sample's episode straight out of its archive -- never
+    extracted, since an episode is ~27 MB and the corpus is ~107 GB
+    uncompressed. A route pairs ``signature(observation[i], seat)`` with the
+    action recorded at ``steps[i + 1][seat]["action"]``, the decision made
+    *from* that state; the final step is a terminal observation with no
+    following action and is read only for its bank.
+
+    Args:
+        samples: Seats to harvest, as returned by ``learn.corpus.select``.
+        floor: Minimum final bank a route must clear to be kept.
+
+    Returns:
+        One ``Prototype`` per sample whose seat's final bank cleared
+        ``floor``. Samples are grouped by archive before reading, so this
+        matches the input order exactly only when each sample's archive is
+        already contiguous in it -- true of ``learn.corpus.select``'s output,
+        not guaranteed for an arbitrary caller.
+    """
+    by_archive: dict[str, list[Sample]] = {}
+    for sample in samples:
+        by_archive.setdefault(sample.archive, []).append(sample)
+
+    prototypes: list[Prototype] = []
+    for archive, group in by_archive.items():
+        with zipfile.ZipFile(CORPUS / archive) as bundle:
+            for sample in tqdm(group, desc=archive, unit="ep"):
+                with bundle.open(sample.name) as member:
+                    steps = json.load(member)["steps"]
+                farms = steps[-1][sample.seat]["observation"]["farms"]
+                bank = float(farms[sample.seat]["money"])
+                if bank < floor:
+                    continue
+                opponent_bank = float(farms[1 - sample.seat]["money"])
+                prototypes.append(
+                    Prototype(
+                        bank=bank,
+                        opponent_bank=opponent_bank,
+                        rating=sample.rating,
+                        actions=[
+                            steps[index + 1][sample.seat]["action"]
+                            for index in range(len(steps) - 1)
+                        ],
+                        signatures=[
+                            signature(
+                                steps[index][sample.seat]["observation"], sample.seat
+                            )
+                            for index in range(len(steps) - 1)
+                        ],
+                    )
+                )
+    LOGGER.info(
+        "harvested %d of %d samples above a %.0f bank floor",
+        len(prototypes),
+        len(samples),
+        floor,
+    )
+    return prototypes
 
 
 def build_store(

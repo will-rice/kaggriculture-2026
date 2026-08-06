@@ -18,9 +18,10 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
 from kaggriculture.constants import BOARD_SIZE, PRODUCTS
 from kaggriculture.learn.corpus import CORPUS, Sample
-from kaggriculture.routes import store as store_module
+from kaggriculture.routes.scripts import harvest as harvest_module
+from kaggriculture.routes.scripts.harvest import harvest
 from kaggriculture.routes.signature import signature
-from kaggriculture.routes.store import Prototype, dedupe, harvest, load, save
+from kaggriculture.routes.store import Prototype, dedupe, load, save
 
 ARCHIVE = CORPUS / "kaggriculture-episodes-2026-08-03.zip"
 
@@ -37,7 +38,7 @@ _episode_ids = itertools.count()
 def _synthetic_corpus(
     request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Point ``store.CORPUS`` at a scratch directory for synthetic-fixture tests.
+    """Point the harvest script's ``CORPUS`` at a scratch directory.
 
     ``_sample`` writes its synthetic episodes here instead of ever touching the
     real corpus, so harvest tests run on every machine, not only one with
@@ -45,7 +46,7 @@ def _synthetic_corpus(
     real corpus directly and must keep the real ``CORPUS``, so they opt out.
     """
     if request.node.get_closest_marker("slow") is None:
-        monkeypatch.setattr(store_module, "CORPUS", tmp_path)
+        monkeypatch.setattr(harvest_module, "CORPUS", tmp_path)
 
 
 def _empty_farm(money: float = 3_000.0) -> dict:
@@ -88,7 +89,7 @@ def _sample(
     Only the final observation's money matters to ``harvest``'s floor check,
     so the episode is the shortest one that has a "before" and an "after":
     one starting step and one terminal step. Appended to a shared
-    ``synthetic.zip`` in ``store.CORPUS`` -- as real archives do, one zip
+    ``synthetic.zip`` in the harvest script's ``CORPUS`` -- as real archives do, one zip
     holds every episode a test needs -- under a fresh member name each call so
     two samples in one test never collide.
     """
@@ -98,7 +99,7 @@ def _sample(
         [{"action": dict(_ACTION), "observation": final}, {}],
     ]
     name = f"{next(_episode_ids)}.json"
-    with zipfile.ZipFile(store_module.CORPUS / "synthetic.zip", "a") as bundle:
+    with zipfile.ZipFile(harvest_module.CORPUS / "synthetic.zip", "a") as bundle:
         bundle.writestr(name, json.dumps({"steps": steps}))
     return Sample(archive="synthetic.zip", name=name, seat=0, rating=rating)
 

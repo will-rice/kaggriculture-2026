@@ -2,37 +2,39 @@
 
 A route is a season's worth of ``(signature, action)`` pairs recorded from one
 seat of one corpus episode -- the state-key the seat saw on a turn, paired with
-what the recorded player did next. ``harvest`` builds these from the corpus,
-keeping only routes whose seat banked above a floor set from the corpus's own
-distribution, not the median: the corpus median seat bank is 125,773 and the
-agent currently shipped banks about 118,000, so replaying a median route would
-teach nothing the agent does not already do -- the floor is the point of the
-exercise, not a detail. ``dedupe`` then collapses near-identical routes,
-because the corpus is dominated by a handful of public kernels playing the
-same handful of openings -- every sampled pair of episodes in one archive was
-found to share a byte-identical day-1 signature -- and without dedupe the
-store would be hundreds of copies of a few routes rather than coverage of many.
+what the recorded player did next. ``routes.scripts.harvest`` builds these from
+the corpus, keeping only routes whose seat banked above a floor set from the
+corpus's own distribution, not the median: the corpus median seat bank is
+125,773 and the agent currently shipped banks about 118,000, so replaying a
+median route would teach nothing the agent does not already do -- the floor is
+the point of the exercise, not a detail. ``dedupe`` then collapses
+near-identical routes, because the corpus is dominated by a handful of public
+kernels playing the same handful of openings -- every sampled pair of episodes
+in one archive was found to share a byte-identical day-1 signature -- and
+without dedupe the store would be hundreds of copies of a few routes rather
+than coverage of many. (At real scale it collapsed none of 190: routes that
+open identically still diverge.)
 
-This module must not import ``torch``. The agent path loads route memory
-before it loads the learned model, and ``routes.signature``'s module docstring
-measured importing torch alone at 10.7 seconds of the submission sandbox's
-60-second overage pool -- route memory has to be usable before that cost is
-ever paid.
+This module is on the agent path -- ``routes.play`` loads the store here -- so
+it imports neither ``torch`` nor anything the submission archive leaves out.
+``harvest`` used to live here and pulled in ``learn.corpus`` and ``tqdm`` with
+it; ``package.py`` drops ``corpus.py`` from the archive, so that import chain
+would have raised ``ModuleNotFoundError`` on turn zero rather than costing
+mere seconds. It now lives in ``routes/scripts/harvest.py``, beside the only
+caller that ever wanted it, and the whole ``scripts`` package is excluded from
+the archive as a directory.
 """
 
 import gzip
 import json
 import logging
-import zipfile
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
-from tqdm import tqdm
 
 from kaggriculture.constants import TURNS_PER_DAY
-from kaggriculture.learn.corpus import CORPUS, Sample
-from kaggriculture.routes.signature import distance, signature
+from kaggriculture.routes.signature import distance
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,68 +59,6 @@ class Prototype(BaseModel):
     rating: float
     actions: list[dict[str, Any]]
     signatures: list[tuple[float, ...]]
-
-
-def harvest(samples: list[Sample], floor: float) -> list[Prototype]:
-    """Turn corpus samples into routes, keeping only the ones worth replaying.
-
-    Streams each sample's episode straight out of its archive -- never
-    extracted, since an episode is ~27 MB and the corpus is ~107 GB
-    uncompressed. A route pairs ``signature(observation[i], seat)`` with the
-    action recorded at ``steps[i + 1][seat]["action"]``, the decision made
-    *from* that state; the final step is a terminal observation with no
-    following action and is read only for its bank.
-
-    Args:
-        samples: Seats to harvest, as returned by ``learn.corpus.select``.
-        floor: Minimum final bank a route must clear to be kept.
-
-    Returns:
-        One ``Prototype`` per sample whose seat's final bank cleared
-        ``floor``. Samples are grouped by archive before reading, so this
-        matches the input order exactly only when each sample's archive is
-        already contiguous in it -- true of ``learn.corpus.select``'s output,
-        not guaranteed for an arbitrary caller.
-    """
-    by_archive: dict[str, list[Sample]] = {}
-    for sample in samples:
-        by_archive.setdefault(sample.archive, []).append(sample)
-
-    prototypes: list[Prototype] = []
-    for archive, group in by_archive.items():
-        with zipfile.ZipFile(CORPUS / archive) as bundle:
-            for sample in tqdm(group, desc=archive, unit="ep"):
-                with bundle.open(sample.name) as member:
-                    steps = json.load(member)["steps"]
-                farms = steps[-1][sample.seat]["observation"]["farms"]
-                bank = float(farms[sample.seat]["money"])
-                if bank < floor:
-                    continue
-                opponent_bank = float(farms[1 - sample.seat]["money"])
-                prototypes.append(
-                    Prototype(
-                        bank=bank,
-                        opponent_bank=opponent_bank,
-                        rating=sample.rating,
-                        actions=[
-                            steps[index + 1][sample.seat]["action"]
-                            for index in range(len(steps) - 1)
-                        ],
-                        signatures=[
-                            signature(
-                                steps[index][sample.seat]["observation"], sample.seat
-                            )
-                            for index in range(len(steps) - 1)
-                        ],
-                    )
-                )
-    LOGGER.info(
-        "harvested %d of %d samples above a %.0f bank floor",
-        len(prototypes),
-        len(samples),
-        floor,
-    )
-    return prototypes
 
 
 def _trajectory_distance(a: Prototype, b: Prototype) -> float:
