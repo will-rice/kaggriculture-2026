@@ -15,11 +15,19 @@ op from one wide ``Linear``, each unit's logits are read from the trunk column
 at the tile that unit is standing on, through one ``Linear`` shared by every
 slot. Almost all of the parameters are in the trunk either way; what changes is
 that the head can see position at all.
+
+A second head reads the same trunk for what to trade. It is pooled, not
+gathered, because the two decisions are not the same shape: a unit's op
+depends on its own tile, but what the farm can afford to sell depends on the
+whole board and the whole market, not on any one cell. See ``Policy.forward``
+for the argument in full.
 """
 
 import torch
 
 from kaggriculture.learn.encoding import (
+    MARKET_SLOTS,
+    QUANTITIES,
     SCALARS,
     TILE_PLANES,
     UNIT_OPS,
@@ -53,7 +61,7 @@ class Residual(torch.nn.Module):
 
 
 class Policy(torch.nn.Module):
-    """Board trunk plus a market branch, reading out one op per unit."""
+    """Board trunk with two heads: one op per unit, and what the farm trades."""
 
     def __init__(self, blocks: int = BLOCKS, channels: int = CHANNELS) -> None:
         """Build the policy."""
@@ -66,11 +74,14 @@ class Policy(torch.nn.Module):
         )
         self.blocks = torch.nn.ModuleList(Residual(channels) for _ in range(blocks))
         self.head = torch.nn.Linear(channels, len(UNIT_OPS))
+        self.trade_head = torch.nn.Linear(
+            channels, (len(MARKET_SLOTS) + 2) * len(QUANTITIES)
+        )
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
-        """Return per-unit op logits.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-unit op logits and per-slot market logits.
 
         The market is projected and added to the spatial tensor rather than
         broadcast as constant planes: it is 28 numbers that decide the game and
@@ -84,6 +95,17 @@ class Policy(torch.nn.Module):
         Gathering per position also makes the readout weights shared across
         slots, so which unit a slot holds stops mattering.
 
+        The trade head is the opposite case, and pools on purpose. A unit's op
+        depends on what it is standing next to; what the farm can afford to
+        sell depends on the whole farm and the whole market, not on any one
+        tile. Reading a single gathered column -- even the farmer's -- would
+        make a trade decision hostage to where one unit happens to be standing,
+        which is not a fact about the market. So the trade head reads
+        ``features.mean(dim=(2, 3))``, the same whole-board summary the unit
+        head was measured to be wrong for, through one ``Linear`` shared by
+        every slot for the same reason the unit head shares one: which slot is
+        HIRE or SELL:WHEAT should not change how it is read out.
+
         Args:
             board: ``(batch, TILE_PLANES, BOARD, BOARD)`` planes.
             scalars: ``(batch, SCALARS)`` market and phase features.
@@ -91,11 +113,17 @@ class Policy(torch.nn.Module):
                 the order ``encode_units`` labels the units.
 
         Returns:
-            ``(batch, MAX_UNITS, len(UNIT_OPS))`` logits.
+            A tuple of ``(batch, MAX_UNITS, len(UNIT_OPS))`` unit logits and
+            ``(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` market logits.
         """
         features = self.stem(board) + self.market(scalars)[:, :, None, None]
         for block in self.blocks:
             features = block(features)
         columns = features.flatten(2)
         wanted = positions[:, None, :].tile(1, columns.shape[1], 1)
-        return self.head(columns.gather(2, wanted).transpose(1, 2))
+        units = self.head(columns.gather(2, wanted).transpose(1, 2))
+        pooled = features.mean(dim=(2, 3))
+        market = self.trade_head(pooled).reshape(
+            pooled.shape[0], len(MARKET_SLOTS) + 2, len(QUANTITIES)
+        )
+        return units, market

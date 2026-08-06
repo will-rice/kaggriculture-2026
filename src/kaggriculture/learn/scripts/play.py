@@ -67,9 +67,11 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     ``unit_count`` -- the observation, not the action, is what the engine walks
     -- so the decoded action names exactly the units standing on the farm.
 
-    The action carries no market orders: ``UNIT_OPS`` has none to decode. The
-    cloned agent farms and never trades, which is a property of the action
-    space rather than of the weights.
+    The action carries no market orders: the market head's logits are computed
+    but discarded here, not decoded. The cloned agent farms and never trades,
+    which for now is a property of this wrapper rather than of the weights --
+    the checkpoint has a market head, but nothing here calls ``decode_market``
+    on it yet.
 
     Args:
         raw_obs: One turn's observation, as the environment hands it over.
@@ -79,7 +81,7 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     """
     seat = int(raw_obs["player"])
     with torch.no_grad():
-        logits = model()(
+        logits, _market_logits = model()(
             encode_board(raw_obs, seat),
             encode_scalars(raw_obs, seat),
             encode_positions(raw_obs, seat),

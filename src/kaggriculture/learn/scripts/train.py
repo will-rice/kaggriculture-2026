@@ -91,7 +91,9 @@ def main() -> None:
             loader, desc=f"epoch {epoch}"
         ):
             labels = labels.to(device)
-            logits = model(board.to(device), scalars.to(device), positions.to(device))
+            logits, _market_logits = model(
+                board.to(device), scalars.to(device), positions.to(device)
+            )
             loss = unit_loss(logits, labels)
             optimiser.zero_grad()
             loss.backward()
@@ -216,8 +218,9 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> tuple[float, flo
     one. Padded slots are excluded from both numbers for the same reason they
     are excluded from the loss: predicting an absent hand's op is not a skill.
 
-    The market labels ride along in every batch but are not yet scored here;
-    no market head exists on the policy for this loss to read.
+    The market labels ride along in every batch but are not yet scored here:
+    the policy now has a market head, but no loss reads it yet, so its logits
+    are computed and discarded on every call.
 
     Args:
         model: The policy to score.
@@ -232,7 +235,9 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> tuple[float, flo
     with torch.no_grad():
         for board, scalars, positions, labels, _market in loader:
             labels = labels.to(device)
-            logits = model(board.to(device), scalars.to(device), positions.to(device))
+            logits, _market_logits = model(
+                board.to(device), scalars.to(device), positions.to(device)
+            )
             acting = int((labels != IGNORE).sum().item())
             total += unit_loss(logits, labels).item() * acting
             correct += float(

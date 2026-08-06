@@ -6,7 +6,9 @@ import torch
 
 from kaggriculture.learn.encoding import (
     BOARD,
+    MARKET_SLOTS,
     MAX_UNITS,
+    QUANTITIES,
     SCALARS,
     TILE_PLANES,
     UNIT_OPS,
@@ -29,7 +31,7 @@ def test_forward_returns_one_distribution_per_unit() -> None:
     board = torch.zeros(2, TILE_PLANES, BOARD, BOARD)
     scalars = torch.zeros(2, SCALARS)
 
-    logits = model(board, scalars, _positions(2))
+    logits, _market = model(board, scalars, _positions(2))
 
     assert logits.shape == (2, MAX_UNITS, len(UNIT_OPS))
 
@@ -53,8 +55,8 @@ def test_a_unit_reads_the_trunk_at_its_own_tile() -> None:
     there[0, 0] = BOARD * BOARD - 1
 
     with torch.no_grad():
-        before = model(board, scalars, here)
-        after = model(board, scalars, there)
+        before, _market = model(board, scalars, here)
+        after, _market = model(board, scalars, there)
 
     assert not torch.equal(before[0, 0], after[0, 0])
     assert torch.equal(before[0, 1:], after[0, 1:])
@@ -76,7 +78,7 @@ def test_two_units_on_one_tile_receive_identical_logits() -> None:
     positions[0, 3] = positions[0, 7] = BOARD * BOARD // 2
 
     with torch.no_grad():
-        logits = model(board, scalars, positions)
+        logits, _market = model(board, scalars, positions)
 
     assert torch.equal(logits[0, 3], logits[0, 7])
     assert not torch.equal(logits[0, 3], logits[0, 0])
@@ -119,10 +121,55 @@ def test_the_market_reaches_the_trunk() -> None:
     positions = _positions(1)
 
     with torch.no_grad():
-        cheap = model(board, torch.zeros(1, SCALARS), positions)
-        rich = model(board, torch.ones(1, SCALARS), positions)
+        cheap, _market = model(board, torch.zeros(1, SCALARS), positions)
+        rich, _market = model(board, torch.ones(1, SCALARS), positions)
 
     assert not torch.allclose(cheap, rich)
+
+
+def test_forward_returns_both_heads() -> None:
+    """One trunk, two decisions: what the units do and what the farm trades."""
+    model = Policy()
+    board = torch.zeros(2, TILE_PLANES, BOARD, BOARD)
+
+    units, market = model(board, torch.zeros(2, SCALARS), _positions(2))
+
+    assert units.shape == (2, MAX_UNITS, len(UNIT_OPS))
+    assert market.shape == (2, len(MARKET_SLOTS) + 2, len(QUANTITIES))
+
+
+def test_the_market_head_reads_the_whole_board() -> None:
+    """What to sell depends on the whole farm, not on any one tile.
+
+    The unit head deliberately reads only its own unit's tile. The market head
+    must not: a harvest anywhere changes what there is to sell.
+    """
+    torch.manual_seed(0)
+    model = Policy().eval()
+    board = torch.randn(1, TILE_PLANES, BOARD, BOARD)
+    elsewhere = board.clone()
+    elsewhere[0, :, 9, 9] += 5.0
+
+    with torch.no_grad():
+        _, before = model(board, torch.zeros(1, SCALARS), _positions(1))
+        _, after = model(elsewhere, torch.zeros(1, SCALARS), _positions(1))
+
+    assert not torch.equal(before, after)
+
+
+def test_unit_positions_do_not_move_the_market_head() -> None:
+    """Where a hand stands is not a reason to trade differently."""
+    torch.manual_seed(0)
+    model = Policy().eval()
+    board = torch.randn(1, TILE_PLANES, BOARD, BOARD)
+    moved = _positions(1)
+    moved[0, 0] = BOARD * BOARD - 1
+
+    with torch.no_grad():
+        _, here = model(board, torch.zeros(1, SCALARS), _positions(1))
+        _, there = model(board, torch.zeros(1, SCALARS), moved)
+
+    assert torch.equal(here, there)
 
 
 # The padding-mask guard lives in tests/learn/test_train.py, against this
