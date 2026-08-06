@@ -8,10 +8,21 @@ engine's own constructors where one exists -- so a test cannot quietly agree
 with code that reads a key the real game does not write.
 """
 
+import json
+import zipfile
+
+import pytest
 from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
 from kaggriculture.constants import BOARD_SIZE, PRODUCTS, TURNS_PER_DAY
-from kaggriculture.routes.signature import distance, signature
+from kaggriculture.learn.corpus import CORPUS
+from kaggriculture.routes.signature import distance, field_contributions, signature
+
+ARCHIVE = CORPUS / "kaggriculture-episodes-2026-08-03.zip"
+
+_needs_corpus = pytest.mark.skipif(
+    not ARCHIVE.exists(), reason="replay corpus not present on this machine"
+)
 
 
 def _empty_farm() -> dict:
@@ -106,3 +117,59 @@ def test_distance_to_itself_is_zero() -> None:
     one = signature(empty_observation(), 0)
 
     assert distance(one, one, day=10) == 0.0
+
+
+def test_the_signature_counts_bare_structures() -> None:
+    """A built coop or pasture is real board state even with nothing on it.
+
+    Built the same shape the engine's own ``BUILD_COOP``/``BUILD_PASTURE`` ops
+    write -- ``farm["tiles"][fy][fx] = {"kind": "COOP"}``, read straight out of
+    the engine's ``_apply_unit_action`` -- rather than guessed, so this test
+    cannot quietly agree with a signature that reads a key the engine never
+    writes. Before this field existed, a farm with three bare coops looked
+    identical to one with bare ground.
+    """
+    before = empty_observation()
+    after = empty_observation()
+    after["farms"][0]["tiles"][2][3] = {"kind": "COOP"}
+
+    assert signature(before, 0) != signature(after, 0)
+
+
+@pytest.mark.slow
+@_needs_corpus
+def test_no_single_field_dominates_a_real_distance() -> None:
+    """Money must not be the only field a real comparison responds to.
+
+    An earlier version of this module returned raw, unscaled fields and let
+    `distance` weight only by phase-vs-composition group. On this exact pair
+    of real episodes at day 16, that let `MONEY` alone account for 99.96% of
+    the total distance -- retrieval built on that key would pick the
+    prototype with the nearest bank balance and ignore everything else about
+    the board, which is close to the worst possible matching signal: bank is
+    an outcome of a route, not a description of the state a route should be
+    selected for. This pins the fix down: after scaling every field into a
+    comparable range, no single field may account for more than about half of
+    a real comparison.
+
+    The two episodes are the archive's first two entries in sorted name
+    order -- a fixed, deterministic, cheap read, not hand-picked to make the
+    assertion pass.
+    """
+    with zipfile.ZipFile(ARCHIVE) as bundle:
+        names = sorted(name for name in bundle.namelist() if name.endswith(".json"))
+        episode_a = json.load(bundle.open(names[0]))
+        episode_b = json.load(bundle.open(names[1]))
+
+    day = 16
+    index = day * TURNS_PER_DAY
+    observation_a = episode_a["steps"][index][0]["observation"]
+    observation_b = episode_b["steps"][index][0]["observation"]
+
+    contributions = field_contributions(
+        signature(observation_a, 0), signature(observation_b, 0), day
+    )
+    total = sum(contributions)
+
+    assert total > 0.0
+    assert max(contributions) <= 0.5 * total
