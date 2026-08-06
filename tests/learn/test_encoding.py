@@ -304,15 +304,26 @@ def test_scalars_do_not_depend_on_the_step_key() -> None:
     """
     from kaggriculture.constants import EPISODE_STEPS, TURNS_PER_DAY
 
-    observation = empty_observation()
-    observation["day"], observation["hour"] = 3, 7
-    del observation["step"]
+    absent = empty_observation()
+    absent["day"], absent["hour"] = 3, 7
+    del absent["step"]
+    misleading = empty_observation()
+    misleading["day"], misleading["hour"] = 3, 7
+    misleading["step"] = 999_999
 
-    scalars = encode_scalars(observation, seat=0)
+    # Asserted by equality rather than by indexing one scalar. An index into
+    # this vector is a positional fact about a layout that grows whenever a
+    # feature is added -- it broke the moment `hires_today` was appended -- and
+    # it tests where the value sits rather than that `step` is ignored, which is
+    # the property that matters.
+    assert torch.equal(
+        encode_scalars(absent, seat=0), encode_scalars(misleading, seat=0)
+    )
 
-    step_index = SCALARS - 6
     expected = (3 * TURNS_PER_DAY + 7) / EPISODE_STEPS
-    assert scalars[0, step_index].item() == pytest.approx(expected)
+    assert any(
+        value == pytest.approx(expected) for value in encode_scalars(absent, 0)[0]
+    )
 
 
 def test_the_phase_of_the_season_is_encoded() -> None:

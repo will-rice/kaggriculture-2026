@@ -42,6 +42,7 @@ def _empty_farm(farmer: tuple[int, int] = (0, 0), hands: int = 0) -> dict:
     return {
         "tiles": [[None] * BOARD for _ in range(BOARD)],
         "money": 3000.0,
+        "hires_today": 0,
         "farmer": list(farmer),
         "hands": [[1, 1] for _ in range(hands)],
         "unlocked_quadrants": ["NW"],

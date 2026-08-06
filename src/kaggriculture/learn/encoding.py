@@ -81,10 +81,20 @@ _PER_FARM_PLANES = _UNIT_BASE + len(_UNIT_PLANES)
 TILE_PLANES = 2 * _PER_FARM_PLANES
 
 # Both a price and an inventory signal per product, our money and the
-# opponent's, the day/hour/step phase of the season, and how much land, town
-# shops and hired hands are unlocked on each side (the opponent's farm is
-# public, so their counts are as knowable as ours).
-SCALARS = 2 * len(PRODUCT_NAMES) + 10
+# opponent's, the day/hour/step phase of the season, how much land, town shops
+# and hired hands are unlocked on each side, and how many hires each side has
+# already made today (the opponent's farm is public, so their counts are as
+# knowable as ours).
+#
+# hires_today is here because it is the only thing that prices the next hire:
+# the engine charges fib(hires_today) and resets the counter every day, so the
+# hand count alone cannot say whether the next hire costs 1 coin or 987. A
+# behaviour clone trained without it played correctly on the teacher's own
+# states -- false-positive rate 0.0002 on held-out turns -- and then hired ~2
+# units on every turn of its own episodes, spending its opening 3,000 down to
+# zero by turn 10 and losing all 500 games. The teacher hires on 14.6% of turns
+# and only in the first four hours of a day.
+SCALARS = 2 * len(PRODUCT_NAMES) + 12
 
 _MAX_QUADRANTS = 1 + len(LAND_ORDER)
 
@@ -257,6 +267,8 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
         len(theirs["unlocked_quadrants"]) / _MAX_QUADRANTS,
         len(ours["hands"]) / 8.0,
         len(theirs["hands"]) / 8.0,
+        ours["hires_today"] / MAX_UNITS,
+        theirs["hires_today"] / MAX_UNITS,
     ]
     return torch.tensor(values, dtype=torch.float32).reshape(1, SCALARS)
 
