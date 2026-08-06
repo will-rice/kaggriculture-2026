@@ -68,13 +68,17 @@ def _observation(
     day: int = 0,
     hour: int = 0,
     hands: int = 0,
+    shed: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return a minimal well-formed observation for one seat.
 
     ``private`` comes from the engine's own ``_new_private`` so the shed is
     dense -- every product keyed at zero -- and code that reaches for a
-    missing key fails here rather than only on real data.
+    missing key fails here rather than only on real data. Every price is 100,
+    so a clamp's arithmetic is something a test can state in one line.
     """
+    private = engine._new_private()
+    private["shed"].update(shed or {})
     return {
         "player": 0,
         "day": day,
@@ -85,7 +89,7 @@ def _observation(
             "inventory": dict.fromkeys(PRODUCTS, 10_000),
         },
         "town": {"unlocked_shops": []},
-        "private": engine._new_private(),
+        "private": private,
     }
 
 
@@ -94,8 +98,8 @@ def _prototype(seed: int = 1, market: list[list[Any]] | None = None) -> Prototyp
 
     Every turn carries the same signature and the same do-nothing field plan,
     so a test that moves the live board is moving the only thing under test.
-    ``market`` is the market half of the recorded action -- the half this
-    design throws away and recomputes.
+    ``market`` is the market half of the recorded action, which is replayed
+    with the rest of the turn and clamped to what our own state supports.
     """
     action: dict[str, Any] = {
         "farmer": ["PASS"],
@@ -116,15 +120,13 @@ def _observation_matching(seed: int) -> dict[str, Any]:
     return _observation(melons=seed)
 
 
-def _observation_with_empty_shed() -> dict[str, Any]:
-    """Return the board ``_prototype()`` recorded, with nothing in the shed.
+def _observation_backing(market: list[list[Any]]) -> dict[str, Any]:
+    """Return the board ``_prototype()`` recorded, stocked to back ``market``.
 
-    An empty shed and empty carried inventories are what make the market half
-    independent of the field half: no plan can place anything into the shed
-    this turn, so the only thing that can move the market orders is which
-    policy produced them.
+    A clamp that fires would hide whether the orders came from the route at
+    all, so the board this is played on can afford the recorded order outright.
     """
-    return _observation_matching(seed=1)
+    return _observation(melons=1, shed={"WHEAT": sum(order[2] for order in market)})
 
 
 def _observation_marginally_closer_to(seed: int) -> dict[str, Any]:
@@ -143,19 +145,40 @@ def economic_policy_market(observation: dict[str, Any]) -> list[list[Any]]:
     return economic_policy.agent(observation)["market"]
 
 
-def test_the_market_orders_come_from_the_live_policy_not_the_route() -> None:
-    """Prices depend on both players' cumulative sales.
+def test_the_market_orders_come_from_the_route_not_the_live_policy() -> None:
+    """A route's buys and its production are one plan, not two.
 
-    A replayed SELL quantity is priced for a market that no longer exists, so
-    the production plan is replayed and the market is recomputed. This is the
-    single most important division in this design.
+    The route buys the cow on the turn its units are walking to the pasture
+    that will hold it. Substituting an independent market policy buys
+    livestock the replayed units never place, so money leaves and nothing is
+    produced: measured over one episode, 10,312 banked against 181,321. This
+    is the single most important division in this design, and it took banking
+    the wrong side of it to learn which way round it went.
     """
-    prototype = _prototype(market=[["SELL", "WHEAT", 40]])
+    recorded = [["SELL", "WHEAT", 40]]
+    prototype = _prototype(market=recorded)
 
-    action = RouteAgent([prototype]).act(_observation_with_empty_shed())
+    action = RouteAgent([prototype]).act(_observation_backing(recorded))
 
-    assert action["market"] != [["SELL", "WHEAT", 40]]
-    assert action["market"] == economic_policy_market(_observation_with_empty_shed())
+    assert action["market"] == recorded
+    assert action["market"] != economic_policy_market(_observation_backing(recorded))
+
+
+def test_a_replayed_order_is_cut_down_to_what_our_own_state_backs() -> None:
+    """A recorded order is a claim about the farm that recorded it.
+
+    We reach the same turn with a different shed and a different bank, so the
+    quantities have to be cut to what we can actually back -- and cut in
+    order, since the engine credits a sale before it charges a later purchase.
+    Five sacks at 100 pays for exactly one 400-coin cow, not the two recorded.
+    """
+    prototype = _prototype(market=[["SELL", "WHEAT", 40], ["BUY_ANIMAL", "COW", 2]])
+
+    action = RouteAgent([prototype]).act(
+        _observation(melons=1, money=0.0, shed={"WHEAT": 5})
+    )
+
+    assert action["market"] == [["SELL", "WHEAT", 5], ["BUY_ANIMAL", "COW", 1]]
 
 
 def test_an_unmatched_board_falls_back_to_the_whole_policy() -> None:

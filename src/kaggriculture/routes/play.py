@@ -10,13 +10,19 @@ policy cannot represent.
 
 Three divisions make that replay survive contact with a live game.
 
-**The market is never replayed.** Prices in this game form from both players'
-cumulative sales, so a recorded ``SELL WHEAT 40`` was priced against an
-inventory that no longer exists, and a recorded ``BUY_ANIMAL`` was affordable
-in a bank balance we do not have. Only the production plan -- what the farmer
-and the hands do on the ground -- is replayed. Every market order comes from
-``economic_policy`` against the live board, computed *from the replayed field
-plan* so the two halves agree about what will land in the shed this turn.
+**The whole turn is replayed, market included, and then clamped.** This
+started out the other way round: the plan replayed production and recomputed
+every market order from ``economic_policy``, on the reasoning that a recorded
+``SELL WHEAT 40`` was priced against an inventory that no longer exists. That
+reasoning is wrong, and one episode says so -- 10,312 banked with the market
+recomputed against 181,321 with it replayed. A route's buys and its production
+are one plan: it buys the cow on the turn its units are walking to the pasture
+that will hold it. Substituting an independent market policy buys livestock
+the replayed units never place and seeds they never sow, so money leaves and
+nothing is produced; the recomputed episode ended with four cows and four
+sheep stranded in the shed. What a live board really invalidates is not the
+*intent* of a recorded order but its *size*, so orders are replayed and then
+cut down to what our own shed and bank support. See ``clamp``.
 
 **Orders are realigned onto the units we actually have.** A recorded action is
 an instruction to the unit standing on a particular tile. Our hand count comes
@@ -53,10 +59,15 @@ from typing import Any, Mapping
 
 from kaggriculture import economic_policy
 from kaggriculture.constants import (
+    ANIMALS,
     BOARD_SIZE,
+    CROPS,
     EPISODE_STEPS,
+    LAND_PRICES,
     MOVES,
+    SHED_CAPACITY,
     TURNS_PER_DAY,
+    hire_cost,
     quadrant_of,
     shed_access_tiles,
 )
@@ -79,27 +90,33 @@ Position = tuple[int, int]
 STORE = Path(__file__).parent / "prototypes.json.gz"
 
 # How far a route's recorded signature may sit from the live board before this
-# turn is played by `economic_policy` instead. Set from the distribution of
-# nearest-route distances over a full local episode against `starter`: days
-# 0-4 sit at p10 0.20, p50 0.65, p90 1.95, and from day 5 on the tenth
-# percentile is already 2.8. 1.5 is inside the band where a live board really
-# does resemble a recorded one and outside the band where it does not.
+# turn is played by `economic_policy` instead. Set from where the distances
+# actually fall in the two regimes, never from which bank came out largest.
 #
-# UNMEASURED against outcomes -- that is Task 5's sweep, and the value was
-# chosen from where the distances fall, never from which bank came out
-# largest. What the same episodes do say is that the choice matters
-# enormously: at this threshold 12% of turns replay and the seat banks
-# 148,871-169,976 across three seeds, while at an infinite threshold every
-# turn replays and the seat banks 2,788, less than it started with. Task 4's
-# report carries that measurement in full.
+# When a replay is tracking, the live board is nearly the recorded one: over a
+# full episode against `starter` with every turn replayed, the nearest route
+# sits at p50 0.02 and never exceeds 1.27, and against `economic_policy` on a
+# seed where the replay holds, never above 0.94. When a replay has derailed
+# the number is an order of magnitude larger -- p90 7.9 and a maximum of 57.4
+# on the seed where it does derail, and 25-47 routinely under the older,
+# broken market split. There is a clear gap between "tracking" and "lost", and
+# 4.0 sits in it: roughly three times the worst tracking error seen, and well
+# under the range that means the board has left the route behind.
+#
+# UNMEASURED against outcomes -- that is Task 5's sweep, and this needs to be
+# a value the sweep can move in both directions rather than an infinity that
+# can only come down. The earlier value of 1.5 was chosen when replay was
+# harmful and was really protecting us from a bug in the market split; with
+# that fixed it would leave almost no headroom above the observed maximum,
+# and a single spurious fallback compounds -- one turn off the route pushes
+# the board further from it, which makes the next turn likelier to fall back
+# too.
 #
 # Note that `distance` is not scale-stable across the season: its composition
 # weight climbs from 0.5 on day 0 to 40 on day 30, so one flat constant is a
-# far stricter test late than early, and in practice all replayed turns fall
-# in days 0-5. That is a known defect of pairing a flat threshold with a
-# phase-weighted distance, recorded here for the sweep rather than quietly
-# patched with a second guess.
-MATCH_THRESHOLD = 1.5
+# far stricter test late than early. Recorded here for the sweep rather than
+# quietly patched with a second guess.
+MATCH_THRESHOLD = 4.0
 
 # How much closer a challenger route must be before it displaces the route we
 # are already following. Each route is individually coherent -- it hires, buys
@@ -180,15 +197,27 @@ class RouteAgent:
         ours = [_position(farm["farmer"])] + [_position(hand) for hand in farm["hands"]]
         plan = realign(recorded, route_units(self.prototypes[chosen], step), ours)
 
-        roles = economic_policy._role_plan(observation, farm)
-        field = economic_policy._unit_actions(observation, config, farm, private, roles)
-        field["farmer"] = plan["farmer"]
-        field["hands"] = plan["hands"]
-        market = economic_policy._market_actions(
-            observation, config, farm, private, roles, field
-        )
-        plan["market"] = economic_policy._schedule_market_adjustment(
-            observation, config, farm, private, market
+        # The shed as it will stand when the market runs: the engine applies
+        # unit actions before market orders, so a DROP this turn is already in
+        # the shed by the time a SELL is quoted, and clamping against the
+        # observed shed would cut away sales the engine would have honoured.
+        # `_post_field_storage` reads `farmer` and `hands` and never
+        # `liquidation`, which the vendored TypedDict requires and which is
+        # inert here.
+        field: economic_policy.FieldPlan = {
+            "farmer": plan["farmer"],
+            "hands": plan["hands"],
+            "liquidation": False,
+        }
+        capacity = SHED_CAPACITY if config is None else config["shedCapacity"]
+        shed, _ = economic_policy._post_field_storage(private, field, capacity)
+        plan["market"] = clamp(
+            recorded["market"],
+            shed,
+            float(farm["money"]),
+            int(farm["hires_today"]),
+            len(farm["unlocked_quadrants"]),
+            observation["market"]["prices"],
         )
         return plan
 
@@ -280,6 +309,110 @@ def realign(
         "farmer": _translate(action["farmer"], prototype_units[0], our_units[0]),
         "hands": hands,
     }
+
+
+def clamp(
+    orders: list[list[Any]],
+    shed: Mapping[str, int],
+    money: float,
+    hires_today: int,
+    quadrants: int,
+    prices: Mapping[str, float],
+) -> list[list[Any]]:
+    """Cut a route's recorded orders down to what our own state supports.
+
+    A recorded order is a statement about the farm that recorded it. We reach
+    the same turn with a different shed and a different bank, so ``SELL WHEAT
+    40`` against five sacks of wheat, or ``BUY_ANIMAL COW 2`` against 400
+    coins, is a claim our board cannot back.
+
+    What the engine does with such an order, read from ``_process_market`` and
+    ``_commit_unit`` rather than assumed: orders are truncated to the first
+    ten, then committed one unit at a time, and the first unit that fails --
+    an empty shed, an unaffordable price -- abandons the rest of *that* order
+    and moves on to the next one. So an over-large order is not rejected
+    outright, it part-fills. Clamping is therefore behaviour-preserving at the
+    engine level, not a rescue: its value is that the action we emit is a true
+    statement of what will happen, which is what the fallback count, the
+    replays and any later audit are read against. (Measured: no route in the
+    store ever records more than ten orders, so dropping an order that clamps
+    to nothing never buys a slot back either.)
+
+    The money accounting deliberately errs high -- sale proceeds are credited
+    at the price quoted now, and purchases are costed at it too, where the
+    engine will re-quote per unit as the inventory moves. That asymmetry is
+    the safe one: an order we keep and the engine rejects costs nothing, while
+    an order we drop is gone. The shed is not estimated at all; it is our own
+    private state and is exact.
+
+    Args:
+        orders: The route's recorded market orders for this turn.
+        shed: Our shed as it will stand when the market runs -- after this
+            turn's field plan has dropped into it.
+        money: Our bank before any of these orders.
+        hires_today: Hands hired so far today, which sets the next hire's cost.
+        quadrants: How many quadrants we have unlocked, which sets the next
+            land price.
+        prices: This turn's quoted market prices.
+
+    Returns:
+        The orders we can actually back, in the recorded order, with
+        quantities reduced and impossible orders dropped.
+
+    Raises:
+        ValueError: If an order carries a verb the engine does not define.
+            Every one of the 136,610 actions in the store was checked against
+            this set; a new verb means the store or the engine has changed
+            under us, and playing on regardless would hide it.
+    """
+    remaining = dict(shed)
+    budget = money
+    hires = hires_today
+    land = quadrants - 1
+    kept: list[list[Any]] = []
+    for order in orders:
+        verb = order[0]
+        if verb == "HIRE":
+            cost = float(hire_cost(hires))
+            if budget < cost:
+                continue
+            budget -= cost
+            hires += 1
+            kept.append(["HIRE"])
+            continue
+        if verb == "BUY_LAND":
+            if land >= len(LAND_PRICES) or budget < LAND_PRICES[land]:
+                continue
+            budget -= LAND_PRICES[land]
+            land += 1
+            kept.append(["BUY_LAND"])
+            continue
+        item = order[1]
+        if verb == "SELL":
+            quantity = min(int(order[2]), int(remaining.get(item, 0)))
+            if quantity <= 0:
+                continue
+            remaining[item] -= quantity
+            budget += quantity * float(prices[item])
+        else:
+            unit = _unit_cost(verb, item, prices)
+            quantity = min(int(order[2]), int(budget // unit))
+            if quantity <= 0:
+                continue
+            budget -= quantity * unit
+        kept.append([verb, item, quantity])
+    return kept
+
+
+def _unit_cost(verb: str, item: str, prices: Mapping[str, float]) -> float:
+    """Return what one unit of a purchase costs, from the engine's own tables."""
+    if verb == "BUY_SEED":
+        return float(CROPS[item]["seed"])
+    if verb == "BUY_ANIMAL":
+        return float(ANIMALS[item]["cost"])
+    if verb == "BUY_PRODUCT":
+        return float(prices[item])
+    raise ValueError(f"unknown market verb {verb!r}")
 
 
 def route_units(prototype: Prototype, step: int) -> list[Position]:
