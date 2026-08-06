@@ -39,11 +39,19 @@ def checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path
 
 
 def observation(hands: list[list[int]]) -> Mapping[str, Any]:
-    """Return a real opening observation with ``hands`` hired onto seat 0."""
+    """Return a real opening observation with ``hands`` hired onto seat 0.
+
+    The private inventory list is extended alongside, because the engine's
+    ``_do_hire`` appends an inventory as it appends a hand and ``encode_board``
+    reads one per unit. Staffing a farm without that is a state the game cannot
+    produce, and a fixture in an impossible state is how a test comes to agree
+    with a bug.
+    """
     environment = make(ENVIRONMENT)
     environment.reset()
     state = environment.state[0].observation
     state["farms"][0]["hands"] = hands
+    state["private"]["inventories"] = [{} for _ in range(1 + len(hands))]
     return state
 
 

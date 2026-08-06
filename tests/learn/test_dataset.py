@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
 from kaggriculture.constants import PRODUCTS
 from kaggriculture.learn import dataset as dataset_module
@@ -55,7 +56,14 @@ def _observation(farmer: tuple[int, int] = (0, 0), hands: int = 0) -> dict:
     ``farmer`` places seat 0's farmer and ``hands`` staffs it, so an episode can
     be built in which a unit stands somewhere different on each step, or in
     which one turn has more units on the board than ``MAX_UNITS`` covers.
+
+    ``private`` comes from the engine's own ``_new_private`` so the shed and
+    seed counts are dense and the inventory list is indexed exactly as the
+    units are -- ``encode_board`` reads one inventory per unit and the engine
+    appends an inventory as it appends a hand.
     """
+    private = engine._new_private()
+    private["inventories"] = [{} for _ in range(1 + hands)]
     return {
         "day": 0,
         "hour": 0,
@@ -66,6 +74,7 @@ def _observation(farmer: tuple[int, int] = (0, 0), hands: int = 0) -> dict:
             "inventory": dict.fromkeys(PRODUCTS, 10000),
         },
         "town": {"unlocked_shops": []},
+        "private": private,
     }
 
 

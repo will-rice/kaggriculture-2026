@@ -84,8 +84,10 @@ class Policy(torch.nn.Module):
         """Return per-unit op logits and per-slot market logits.
 
         The market is projected and added to the spatial tensor rather than
-        broadcast as constant planes: it is 28 numbers that decide the game and
-        deserve their own capacity.
+        broadcast as constant planes: ``SCALARS`` numbers that decide the game
+        and deserve their own capacity. The count is read from the encoder, not
+        restated here -- it has already grown twice, and a stem sized from a
+        stale literal would load a checkpoint of a different shape.
 
         Each unit reads the trunk at its own tile rather than at a global
         average. Pooling the trunk and emitting every slot from one ``Linear``

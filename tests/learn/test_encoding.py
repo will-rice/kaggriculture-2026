@@ -11,20 +11,36 @@ import zipfile
 
 import pytest
 import torch
+from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
-from kaggriculture.constants import ANIMALS, CROPS, PRODUCTS
+from kaggriculture.constants import (
+    ANIMALS,
+    CROPS,
+    EPISODE_STEPS,
+    PRODUCTS,
+    SHED_CAPACITY,
+    SHOPS,
+    TURNS_PER_DAY,
+)
 from kaggriculture.learn.corpus import CORPUS
 from kaggriculture.learn.encoding import (
     BOARD,
+    CARE_BONUS_SCALE,
+    CARRIED_SCALE,
+    ENCODED_FIELDS,
     HIRE_SLOT,
     IGNORE,
     LAND_SLOT,
     MARKET_SLOTS,
     MAX_ORDERS,
     MAX_UNITS,
+    NO_DEATH_SCHEDULED,
+    NOT_ENCODED,
     QUANTITIES,
     SCALARS,
+    SEED_SCALE,
     TILE_PLANES,
+    UNIT_CARRIED_SCALE,
     bucket_of,
     decode_market,
     encode_board,
@@ -61,7 +77,14 @@ def _empty_farm() -> dict:
 
 
 def empty_observation(seat: int = 0) -> dict:
-    """Return a minimal well-formed observation with an empty unlocked board."""
+    """Return a minimal well-formed observation with an empty unlocked board.
+
+    ``private`` comes from the engine's own ``_new_private`` rather than being
+    typed out here. The shed and the seed counts are dense -- every product and
+    every crop keyed at zero -- and a hand-built ``{}`` would let an encoder
+    that reaches for a missing key pass here and raise on the first real
+    observation.
+    """
     return {
         "player": seat,
         "step": 0,
@@ -73,8 +96,37 @@ def empty_observation(seat: int = 0) -> dict:
             "inventory": dict.fromkeys(PRODUCTS, 10000),
         },
         "town": {"unlocked_shops": []},
-        "private": {"shed": {}, "seeds": {}, "inventories": [{}]},
+        "private": engine._new_private(),
     }
+
+
+def _plant(crop: str = "WHEAT", day: int = 0) -> dict:
+    """Return a freshly planted tile, built by the engine rather than by hand.
+
+    Every field a plant carries comes from ``_new_plant``, so a test cannot
+    quietly agree with an encoder that reads a key the real game does not
+    write, or miss one it does.
+    """
+    return engine._new_plant(crop, day, TURNS_PER_DAY)
+
+
+def _animal(animal: str = "GOOSE", day: int = 0) -> dict:
+    """Return a freshly placed animal tile, built by the engine."""
+    return engine._new_animal(animal, day)
+
+
+def _staff(observation: dict, hands: list[list[int]], seat: int = 0) -> dict:
+    """Put ``hands`` on ``seat``'s farm, with an inventory each, and return it.
+
+    The engine's ``_do_hire`` appends an inventory as it appends a hand, so a
+    farm staffed without one is a state the game cannot produce -- and
+    ``encode_board`` reads one inventory per unit. Hiring through this keeps
+    the fixture on the engine's invariant instead of quietly testing a board
+    that could never occur.
+    """
+    observation["farms"][seat]["hands"] = hands
+    observation["private"]["inventories"] = [{} for _ in range(1 + len(hands))]
+    return observation
 
 
 def test_board_has_the_declared_shape_and_batch_dimension() -> None:
@@ -88,15 +140,7 @@ def test_board_has_the_declared_shape_and_batch_dimension() -> None:
 def test_a_planted_tile_lights_exactly_its_own_crop_plane() -> None:
     """Crop identity is one-hot; two crops lit at once would be a silent mixture."""
     observation = empty_observation()
-    observation["farms"][0]["tiles"][2][3] = {
-        "kind": "PLANT",
-        "crop": "MELON",
-        "planted_day": 0,
-        "watered_today": False,
-        "consecutive_unwatered": 0,
-        "yield_units": 0,
-        "fertilized_until_day": -1,
-    }
+    observation["farms"][0]["tiles"][2][3] = _plant("MELON")
 
     board = encode_board(observation, seat=0)
     crops = sorted(CROPS)
@@ -109,15 +153,7 @@ def test_a_planted_tile_lights_exactly_its_own_crop_plane() -> None:
 def test_the_opponent_s_board_occupies_its_own_planes() -> None:
     """Opponent supply decides prices here; their board must be visible and distinct."""
     observation = empty_observation()
-    observation["farms"][1]["tiles"][5][5] = {
-        "kind": "PLANT",
-        "crop": "WHEAT",
-        "planted_day": 0,
-        "watered_today": False,
-        "consecutive_unwatered": 0,
-        "yield_units": 0,
-        "fertilized_until_day": -1,
-    }
+    observation["farms"][1]["tiles"][5][5] = _plant("WHEAT")
 
     ours = encode_board(observation, seat=0)
     theirs = encode_board(observation, seat=1)
@@ -125,16 +161,34 @@ def test_the_opponent_s_board_occupies_its_own_planes() -> None:
     assert not torch.equal(ours, theirs)
 
 
-def _changed_plane(before: torch.Tensor, after: torch.Tensor) -> int:
-    """Return the index of the one plane that differs between two encoded boards.
+def _changed_planes(before: torch.Tensor, after: torch.Tensor) -> list[int]:
+    """Return every plane index that differs between two encoded boards.
 
-    Finding the plane rather than naming it keeps these tests off the plane
-    layout: the occupancy planes' indices are derived from the engine's rules
-    tables and would shift under any upstream crop or animal.
+    Finding the planes rather than naming them keeps these tests off the plane
+    layout: the indices are derived from the engine's rules tables and would
+    shift under any upstream crop, animal or structure kind.
     """
-    changed = (before != after).flatten(2).any(dim=2)[0].nonzero().flatten()
-    assert changed.numel() == 1, f"expected one plane to move, got {changed.tolist()}"
-    return int(changed.item())
+    return (before != after).flatten(2).any(dim=2)[0].nonzero().flatten().tolist()
+
+
+def _changed_plane(before: torch.Tensor, after: torch.Tensor) -> int:
+    """Return the index of the one plane that differs between two encoded boards."""
+    changed = _changed_planes(before, after)
+    assert len(changed) == 1, f"expected one plane to move, got {changed}"
+    return changed[0]
+
+
+def _moved_scalars(before: torch.Tensor, after: torch.Tensor) -> dict[int, float]:
+    """Return ``{index: after-value}`` for every scalar that differs.
+
+    Located by comparing two observations that differ in one field, never by
+    indexing a fixed offset. An index into this vector is a positional fact
+    about a layout that grows every time a feature is appended -- one such
+    assertion broke the moment ``hires_today`` was added -- and it tests where
+    a value sits rather than what it means.
+    """
+    changed = (before != after)[0].nonzero().flatten().tolist()
+    return {index: float(after[0, index]) for index in changed}
 
 
 def test_the_board_says_where_the_farmer_stands() -> None:
@@ -162,9 +216,8 @@ def test_the_hands_plane_counts_rather_than_flags() -> None:
     count. It is scaled by ``MAX_UNITS`` to share the range of the other
     continuous features, which this checks by ratio rather than by value.
     """
-    one, two = empty_observation(), empty_observation()
-    one["farms"][0]["hands"] = [[4, 3]]
-    two["farms"][0]["hands"] = [[4, 3], [4, 3]]
+    one = _staff(empty_observation(), [[4, 3]])
+    two = _staff(empty_observation(), [[4, 3], [4, 3]])
 
     single, doubled = encode_board(one, seat=0), encode_board(two, seat=0)
     plane = _changed_plane(single, doubled)
@@ -176,7 +229,7 @@ def test_the_hands_plane_counts_rather_than_flags() -> None:
 def test_the_opponent_s_units_occupy_their_own_planes() -> None:
     """Their farmer and hands are public, and where they stand decides prices."""
     empty, staffed = empty_observation(), empty_observation()
-    staffed["farms"][1]["hands"] = [[8, 8]]
+    _staff(staffed, [[8, 8]], seat=1)
 
     plane = _changed_plane(encode_board(empty, seat=0), encode_board(staffed, seat=0))
 
@@ -190,9 +243,8 @@ def test_positions_are_ordered_exactly_as_labels_are() -> None:
     it against slot ``k``'s label, so a divergence in order silently issues
     every unit another unit's orders.
     """
-    observation = empty_observation()
+    observation = _staff(empty_observation(), [[7, 1], [0, 9]])
     observation["farms"][0]["farmer"] = [2, 3]
-    observation["farms"][0]["hands"] = [[7, 1], [0, 9]]
 
     positions = encode_positions(observation, seat=0)
 
@@ -215,8 +267,7 @@ def test_positions_are_read_for_the_seat_asked_for() -> None:
 
 def test_a_position_count_beyond_max_units_raises() -> None:
     """Truncating here would hand a real unit another unit's tile."""
-    observation = empty_observation()
-    observation["farms"][0]["hands"] = [[0, 0] for _ in range(MAX_UNITS)]
+    observation = _staff(empty_observation(), [[0, 0] for _ in range(MAX_UNITS)])
 
     with pytest.raises(ValueError):
         encode_positions(observation, seat=0)
@@ -334,6 +385,251 @@ def test_the_phase_of_the_season_is_encoded() -> None:
     assert not torch.equal(encode_scalars(early, 0), encode_scalars(late, 0))
 
 
+def test_the_shed_is_encoded_because_sell_draws_from_it() -> None:
+    """``SELL`` is the engine's only money-increasing op and it empties the shed.
+
+    A clone trained without this banked 0 coins across 500 episodes: it was
+    asked to choose what to sell with no way to know what it held. One product
+    moving in the shed must move exactly one scalar, by the documented ratio.
+    """
+    empty, stocked = empty_observation(), empty_observation()
+    stocked["private"]["shed"]["WHEAT"] = 20
+
+    moved = _moved_scalars(encode_scalars(empty, 0), encode_scalars(stocked, 0))
+
+    assert len(moved) == 1
+    assert next(iter(moved.values())) == pytest.approx(20 / SHED_CAPACITY)
+
+
+def test_each_product_in_the_shed_has_its_own_scalar() -> None:
+    """Twenty wheat and twenty melons are different hands to play.
+
+    One shared total would let the model learn that it has something to sell
+    without ever learning what, which is the same blindness one step along.
+    """
+    wheat, melon = empty_observation(), empty_observation()
+    wheat["private"]["shed"]["WHEAT"] = 20
+    melon["private"]["shed"]["MELON"] = 20
+
+    moved = _moved_scalars(encode_scalars(wheat, 0), encode_scalars(melon, 0))
+
+    assert len(moved) == 2
+
+
+def test_seeds_are_encoded_because_plant_requires_them() -> None:
+    """The engine drops every ``PLANT`` for a crop a turn overspends seeds on.
+
+    Seeds live outside the shed, in ``private["seeds"]``, so nothing else in
+    the vector implies them.
+    """
+    none, sown = empty_observation(), empty_observation()
+    sown["private"]["seeds"]["MELON"] = 4
+
+    moved = _moved_scalars(encode_scalars(none, 0), encode_scalars(sown, 0))
+
+    assert len(moved) == 1
+    assert next(iter(moved.values())) == pytest.approx(4 / SEED_SCALE)
+
+
+def test_carried_produce_is_totalled_across_our_units() -> None:
+    """What the crew is holding is produce on its way to the shed.
+
+    Totalled rather than per-unit here because a market decision is about the
+    farm's whole holding; the board carries the per-unit split. Both
+    observations staff one hand, so the hand-count scalar is identical and only
+    the total can move.
+    """
+    idle = _staff(empty_observation(), [[4, 3]])
+    laden = _staff(empty_observation(), [[4, 3]])
+    laden["private"]["inventories"] = [{"WHEAT": 2}, {"WHEAT": 3}]
+
+    moved = _moved_scalars(encode_scalars(idle, 0), encode_scalars(laden, 0))
+
+    assert len(moved) == 1
+    assert next(iter(moved.values())) == pytest.approx(5 / CARRIED_SCALE)
+
+
+def test_carried_produce_is_not_the_same_scalar_as_the_shed() -> None:
+    """Five wheat in hand cannot be sold; five in the shed can.
+
+    ``_commit_unit`` gates ``SELL`` on the shed alone, and the end-of-day drop
+    is what moves one to the other. Folding them into one number would tell the
+    model it can sell produce that is still out in the field.
+    """
+    in_shed, in_hand = empty_observation(), empty_observation()
+    in_shed["private"]["shed"]["WHEAT"] = 5
+    in_hand["private"]["inventories"] = [{"WHEAT": 5}]
+
+    base = encode_scalars(empty_observation(), 0)
+    shed_moved = _moved_scalars(base, encode_scalars(in_shed, 0))
+    hand_moved = _moved_scalars(base, encode_scalars(in_hand, 0))
+
+    assert len(shed_moved) == len(hand_moved) == 1
+    assert set(shed_moved) != set(hand_moved)
+
+
+def test_each_unlocked_shop_lights_its_own_flag() -> None:
+    """*Which* shops are open decides where the demand is, not how many.
+
+    Each shop consumes a fixed list of products every few turns, so two towns
+    with one shop open can be buying disjoint things. Both observations here
+    open exactly one shop, which holds the pre-existing count scalar fixed and
+    leaves only the per-shop flags free to move.
+    """
+    bakery, yarn = empty_observation(), empty_observation()
+    bakery["town"]["unlocked_shops"] = ["BAKERY"]
+    yarn["town"]["unlocked_shops"] = ["YARN_STORE"]
+
+    moved = _moved_scalars(encode_scalars(bakery, 0), encode_scalars(yarn, 0))
+
+    assert len(moved) == 2
+    assert sorted(moved.values()) == [0.0, 1.0]
+
+
+def test_a_bare_coop_and_a_bare_pasture_are_different_states() -> None:
+    """``BUILD_COOP`` and ``BUILD_PASTURE`` are distinct ops with distinct results.
+
+    ``PLACE`` accepts an animal only onto ``ANIMALS[item]["structure"]``, so a
+    tile already built as a coop can never take a cow. Collapsed into one
+    ``STRUCTURE`` state, as they were, the model could not tell which build a
+    tile was already committed to.
+    """
+    coop, pasture = empty_observation(), empty_observation()
+    coop["farms"][0]["tiles"][2][3] = {"kind": "COOP"}
+    pasture["farms"][0]["tiles"][2][3] = {"kind": "PASTURE"}
+
+    built, penned = encode_board(coop, seat=0), encode_board(pasture, seat=0)
+    changed = _changed_planes(built, penned)
+
+    assert len(changed) == 2
+    assert sorted(
+        (built[0, plane, 2, 3].item(), penned[0, plane, 2, 3].item())
+        for plane in changed
+    ) == [(0.0, 1.0), (1.0, 0.0)]
+
+
+def test_an_animal_already_cared_for_today_reads_differently() -> None:
+    """``CARE`` is a unit op the engine no-ops if the day's care already landed.
+
+    Without this the model cannot tell a productive ``CARE`` from a wasted turn.
+    """
+    unattended, attended = empty_observation(), empty_observation()
+    unattended["farms"][0]["tiles"][2][3] = _animal()
+    attended["farms"][0]["tiles"][2][3] = _animal() | {"cared_today": True}
+
+    before = encode_board(unattended, seat=0)
+    after = encode_board(attended, seat=0)
+    plane = _changed_plane(before, after)
+
+    assert before[0, plane, 2, 3].item() == 0.0
+    assert after[0, plane, 2, 3].item() == 1.0
+
+
+def test_the_care_bonus_an_animal_is_owed_is_encoded() -> None:
+    """The payoff ``CARE`` works toward, banked per cared-and-fed day.
+
+    ``_daily_refresh_animals`` spends it on the next production day, so it is
+    the difference between an animal that yields one unit and one that yields
+    four.
+    """
+    owed, unowed = empty_observation(), empty_observation()
+    unowed["farms"][0]["tiles"][2][3] = _animal()
+    owed["farms"][0]["tiles"][2][3] = _animal() | {"pending_care_bonus": 3}
+
+    after = encode_board(owed, seat=0)
+    plane = _changed_plane(encode_board(unowed, seat=0), after)
+
+    assert after[0, plane, 2, 3].item() == pytest.approx(3 / CARE_BONUS_SCALE)
+
+
+def test_a_plant_near_the_end_of_its_life_reads_differently_from_a_fresh_one() -> None:
+    """``_decay_plants`` starts taking a unit every other step past this step.
+
+    Both tiles are the same crop planted on the same day, so the crop and age
+    planes are identical and only the remaining lifespan can move.
+    """
+    fresh, doomed = empty_observation(), empty_observation()
+    fresh["farms"][0]["tiles"][2][3] = _plant("WHEAT")
+    doomed["farms"][0]["tiles"][2][3] = _plant("WHEAT") | {"max_lifespan_step": 10}
+
+    young, dying = encode_board(fresh, seat=0), encode_board(doomed, seat=0)
+    plane = _changed_plane(young, dying)
+
+    expected = _plant("WHEAT")["max_lifespan_step"] / EPISODE_STEPS
+    assert young[0, plane, 2, 3].item() == pytest.approx(expected)
+    assert dying[0, plane, 2, 3].item() == pytest.approx(10 / EPISODE_STEPS)
+
+
+def test_a_crop_with_no_death_scheduled_does_not_read_as_dying() -> None:
+    """An ongoing crop carries ``max_lifespan_step`` -1 until its last yield.
+
+    Encoded literally that is ``(-1 - step) / EPISODE_STEPS``, a small negative
+    that slides to -1 across the season -- exactly where a plant that is
+    already decaying sits. The sentinel gets its own value at the opposite end
+    instead. 53.6% of planted tiles in the corpus carry it, so getting this
+    wrong would mislabel most of the field.
+    """
+    ongoing, doomed = empty_observation(), empty_observation()
+    forever = _plant("TOMATO")
+    assert forever["max_lifespan_step"] == -1, "fixture no longer covers the sentinel"
+    ongoing["farms"][0]["tiles"][2][3] = forever
+    doomed["farms"][0]["tiles"][2][3] = forever | {"max_lifespan_step": 0}
+
+    alive, expiring = encode_board(ongoing, seat=0), encode_board(doomed, seat=0)
+    plane = _changed_plane(alive, expiring)
+
+    assert alive[0, plane, 2, 3].item() == pytest.approx(NO_DEATH_SCHEDULED)
+    assert expiring[0, plane, 2, 3].item() == pytest.approx(0.0)
+
+
+def test_the_board_says_what_each_unit_is_carrying() -> None:
+    """The unit head reads the trunk at the unit's own tile.
+
+    Whether *this* hand has anything on it is what decides ``DROP`` and
+    ``PLACE``, and a farm-wide total in the scalars cannot say which hand.
+    """
+    idle, laden = empty_observation(), empty_observation()
+    laden["private"]["inventories"] = [{"WHEAT": 4}]
+
+    before, after = encode_board(idle, seat=0), encode_board(laden, seat=0)
+    plane = _changed_plane(before, after)
+
+    assert plane < TILE_PLANES // 2
+    assert after[0, plane, 4, 4].item() == pytest.approx(4 / UNIT_CARRIED_SCALE)
+
+
+def test_the_opponent_s_carried_plane_stays_zero_because_it_is_hidden() -> None:
+    """Their ``private`` is not in our observation, so their plane means unknown.
+
+    Filling it from our own inventories -- the one mistake this plane invites --
+    would teach the trunk that the opponent is carrying whatever we are.
+    """
+    idle, laden = empty_observation(), empty_observation()
+    laden["private"]["inventories"] = [{"WHEAT": 4}]
+
+    after = encode_board(laden, seat=0)
+    plane = _changed_plane(encode_board(idle, seat=0), after)
+
+    assert after[0, plane + TILE_PLANES // 2].eq(0.0).all()
+
+
+def test_the_carried_plane_sums_units_sharing_a_tile() -> None:
+    """Units share a tile routinely, most of all the four shed-access corners.
+
+    One hand carrying nothing beside one carrying nine is not the same tile as
+    two empty-handed hands, so the plane accumulates like the hands count does.
+    """
+    lone = _staff(empty_observation(), [[4, 3], [4, 3]])
+    both = _staff(empty_observation(), [[4, 3], [4, 3]])
+    lone["private"]["inventories"] = [{}, {"WHEAT": 2}, {}]
+    both["private"]["inventories"] = [{}, {"WHEAT": 2}, {"WHEAT": 3}]
+
+    after = encode_board(both, seat=0)
+    plane = _changed_plane(encode_board(lone, seat=0), after)
+
+    assert after[0, plane, 4, 3].item() == pytest.approx(5 / UNIT_CARRIED_SCALE)
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not CORPUS.is_dir(), reason="needs the replay corpus")
 def test_every_order_in_the_corpus_encodes() -> None:
@@ -369,6 +665,160 @@ def test_every_order_in_the_corpus_encodes() -> None:
     unknown = {s for s in seen if isinstance(s, tuple) and s not in MARKET_SLOTS}
     assert not unknown, f"corpus plays {unknown}, which no slot can express"
     assert {s for s in seen if isinstance(s, str)} <= {"HIRE", "BUY_LAND"}
+
+
+# The widest any encoded scalar gets on real play, so a scalar that has lost
+# its divisor is loud. Measured across the sweep below: 14.76, both times a
+# money scalar (money / 10_000, and the richest farm sampled banked ~148k);
+# every other scalar stays under 7. 64 leaves four times that headroom and
+# still fails a raw, undivided market inventory (10,000), a raw money balance
+# or the seed tail (219). It does not fail a raw shed count, which tops out at
+# 96 -- the guard against that block being wrong is
+# ``test_a_real_observation_s_private_state_reaches_the_scalars``, not this
+# bound.
+SANE_BOUND = 64.0
+
+# One episode per archive, every seventh turn, both seats. Seven is coprime
+# with the 24-turn day on purpose: a stride that divides it reads every
+# inventory just after the end-of-day drop has emptied it, and would report
+# carried produce as zero on every row it looked at.
+_CORPUS_STRIDE = 7
+
+
+def _corpus_turns(episodes: int = 1, stride: int = _CORPUS_STRIDE) -> list[tuple]:
+    """Return ``(archive, observation, seat)`` from every archive on disk.
+
+    Every archive rather than one: the ladder's agent mix changes daily, and
+    two committed claims in this repo have already come from generalising a
+    single archive.
+    """
+    turns = []
+    for archive in sorted(CORPUS.glob("*.zip")):
+        with zipfile.ZipFile(archive) as bundle:
+            names = [n for n in bundle.namelist() if n.endswith(".json")][:episodes]
+            for name in names:
+                with bundle.open(name) as member:
+                    steps = json.load(member)["steps"]
+                for index in range(0, len(steps), stride):
+                    for seat in (0, 1):
+                        turns.append(
+                            (archive.name, steps[index][seat]["observation"], seat)
+                        )
+    return turns
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not CORPUS.is_dir(), reason="needs the replay corpus")
+def test_every_scalar_from_a_real_observation_is_finite_and_bounded() -> None:
+    """A hand-built observation agrees with the encoder; a real one does not.
+
+    This is the shape of test that would have caught the shed being absent. An
+    unencoded field never appears, never raises and never widens the vector --
+    the only thing that notices is code that reads a real observation end to
+    end. It also catches the opposite failure, a new field encoded at the wrong
+    scale, which arrives as a value nothing else in the vector is near.
+    """
+    turns = _corpus_turns()
+
+    assert turns, "no archives on disk, so this proved nothing"
+    for archive, observation, seat in turns:
+        scalars = encode_scalars(observation, seat)
+        board = encode_board(observation, seat)
+        assert scalars.shape == (1, SCALARS)
+        assert board.shape == (1, TILE_PLANES, BOARD, BOARD)
+        assert torch.isfinite(scalars).all(), (
+            f"{archive} seat {seat}: non-finite scalar"
+        )
+        assert torch.isfinite(board).all(), f"{archive} seat {seat}: non-finite plane"
+        assert scalars.abs().max().item() <= SANE_BOUND, (
+            f"{archive} seat {seat}: {scalars.abs().max().item()} exceeds {SANE_BOUND}"
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not CORPUS.is_dir(), reason="needs the replay corpus")
+def test_a_real_observation_s_private_state_reaches_the_scalars() -> None:
+    """Each private group must change the vector on real play, not just in a fixture.
+
+    Blanking one group of a real observation's private state and re-encoding is
+    the direct form of the question the audit asked: does this field reach the
+    model at all. It is asked on real turns because a hand-made observation can
+    only ever confirm what the encoder already does -- the shed was absent for
+    a whole training run while every fast test passed.
+
+    The town's shops are checked by swapping the open set for a different set
+    of the same size, which holds the pre-existing count scalar fixed so only
+    the per-shop identity flags can answer.
+    """
+    zeroed = engine._new_private()
+    reached = {"shed": 0, "seeds": 0, "inventories": 0, "shops": 0}
+
+    for _archive, observation, seat in _corpus_turns():
+        private = observation["private"]
+        baseline = encode_scalars(observation, seat)
+        blanked = {
+            "shed": {**private, "shed": zeroed["shed"]},
+            "seeds": {**private, "seeds": zeroed["seeds"]},
+            "inventories": {
+                **private,
+                "inventories": [{} for _ in private["inventories"]],
+            },
+        }
+        for group, replacement in blanked.items():
+            stripped = {**observation, "private": replacement}
+            reached[group] += not torch.equal(baseline, encode_scalars(stripped, seat))
+
+        open_shops = observation["town"]["unlocked_shops"]
+        others = sorted(SHOPS)[: len(open_shops)]
+        if sorted(open_shops) != others:
+            swapped = {**observation, "town": {"unlocked_shops": others}}
+            reached["shops"] += not torch.equal(baseline, encode_scalars(swapped, seat))
+
+    assert all(reached.values()), f"never reached the scalars: {reached}"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not CORPUS.is_dir(), reason="needs the replay corpus")
+def test_every_field_the_corpus_carries_is_either_encoded_or_argued_away() -> None:
+    """A field the engine emits must be named somewhere, encoded or refused.
+
+    This is the structural half of the fix. The shed, the seeds and the carried
+    inventories went unencoded for a whole training run because nothing in the
+    codebase ever had to mention them: an absent field has no width, no shape
+    and no test. Now every key the corpus carries has to appear in
+    ``ENCODED_FIELDS`` or in ``NOT_ENCODED`` with a reason, so an upstream
+    addition fails here rather than being silently dropped into a shard.
+
+    Checked in both directions. Forward, a key the corpus carries that neither
+    set names is an omission. Backward, a key claimed as encoded that the
+    corpus never carries is a stale claim -- which is how a table like this
+    rots into decoration.
+    """
+    seen: dict[str, set[str]] = {name: set() for name in ENCODED_FIELDS}
+
+    for _archive, observation, _seat in _corpus_turns(episodes=2, stride=4):
+        seen["observation"] |= set(observation)
+        seen["market"] |= set(observation["market"])
+        seen["town"] |= set(observation["town"])
+        seen["private"] |= set(observation["private"])
+        for farm in observation["farms"]:
+            seen["farm"] |= set(farm)
+            for row in farm["tiles"]:
+                for tile in row:
+                    if isinstance(tile, dict):
+                        seen["tile"] |= {str(key) for key in tile}
+
+    assert seen["observation"], "no archives on disk, so this proved nothing"
+    for name, keys in seen.items():
+        unaccounted = keys - ENCODED_FIELDS[name] - NOT_ENCODED
+        assert not unaccounted, (
+            f"{name} carries {sorted(unaccounted)}, which is neither encoded nor "
+            "listed in NOT_ENCODED with a reason"
+        )
+        stale = ENCODED_FIELDS[name] - keys
+        assert not stale, (
+            f"{name} claims {sorted(stale)}, which the corpus never carries"
+        )
 
 
 def test_the_vocabulary_covers_every_op_the_engine_implements() -> None:
