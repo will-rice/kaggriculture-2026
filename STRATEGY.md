@@ -448,7 +448,7 @@ banks 162k where this banks 0. The gate to repoint it was beating that policy; i
 Scaling by the Phase 0 sandbox probe (10.7 s import, ~20–26 GMAC/s against this workstation's ~90) puts
 the sandbox at roughly 11 s of the pool on turn 0 and ~50 ms a turn thereafter — comfortably inside.
 **A torch policy is submittable; this one is just not worth submitting.** Re-measure with
-`uv run python -m kaggriculture.learn.scripts.budget`.
+`uv run python -m kaggriculture.scripts.budget`.
 
 What Phase 3 inherits: a trunk that reads a board, a market head that reads a market, and the measured
 fact that neither survives its own trajectory. That is an argument for the RL phase's frozen-teacher KL

@@ -14,7 +14,7 @@ never ships is `learn/scripts/`, `corpus.py` and `dataset.py`: they import
 wandb, tqdm and a `/data` path, none of which exist in the sandbox.
 
 The 10.7 seconds are still spent, on the first turn, out of the overage pool.
-`learn/scripts/budget.py` measures whether a full 720-turn episode fits inside
+`scripts/budget.py` measures whether a full 720-turn episode fits inside
 what is left.
 
 ``CHECKPOINT`` lives here rather than in `play.py` or `train.py` so that the

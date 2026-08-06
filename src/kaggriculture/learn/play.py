@@ -2,7 +2,7 @@
 
 This is the one module under ``learn`` that ships. It imports torch, which the
 competition sandbox pays 10.7 seconds of its 60-second overage pool to load on
-the first turn, so ``learn/scripts/budget.py`` measures a full episode against
+the first turn, so ``scripts/budget.py`` measures a full episode against
 that pool rather than assuming it fits.
 
 It deliberately imports nothing from ``learn.scripts``, ``learn.corpus`` or
