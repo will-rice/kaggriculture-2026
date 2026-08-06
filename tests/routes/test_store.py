@@ -8,6 +8,7 @@ quietly agree with code that reads a key the real game does not write.
 
 import itertools
 import json
+import random
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,31 @@ def _prototype(
     )
 
 
+def _chain_prototype(step: int, bank: float = 150_000.0) -> Prototype:
+    """Return a one-turn Prototype with ``step`` bare coops on the board.
+
+    Built with the engine's own bare-structure shape (``{"kind": "COOP"}``,
+    the same shape ``test_signature.py``'s
+    ``test_the_signature_counts_bare_structures`` uses) so consecutive
+    ``step`` values differ by exactly one composition-field count. At day 0
+    that gives a fixed, known signature distance between neighbours -- the
+    shape needed to build a chain where each route is within tolerance of its
+    immediate neighbours only, which is what exposes order-dependent
+    clustering.
+    """
+    observation = _observation(3_000.0)
+    for index in range(step):
+        row, column = divmod(index, BOARD_SIZE)
+        observation["farms"][0]["tiles"][row][column] = {"kind": "COOP"}
+    return Prototype(
+        bank=bank,
+        opponent_bank=bank - 10_000.0,
+        rating=2600.0,
+        actions=[dict(_ACTION)],
+        signatures=[signature(observation, 0)],
+    )
+
+
 def test_a_prototype_keeps_the_action_for_every_acting_turn() -> None:
     """A route is the sequence; a gap in it is a turn the agent cannot replay."""
     prototype = _prototype(turns=719)
@@ -168,6 +194,29 @@ def test_dedupe_collapses_near_identical_routes_keeping_the_richest() -> None:
     kept = dedupe([twin_a, twin_b, other], tolerance=1e-6)
 
     assert sorted(p.bank for p in kept) == [151_000, 155_000]
+
+
+def test_dedupe_is_stable_under_reordering_a_tied_chain() -> None:
+    """A store whose size shifts on presentation order alone is not reproducible.
+
+    Twelve routes share one bank and form a chain: each is within tolerance
+    of its immediate neighbours only, so a naive single-linkage traversal's
+    survivor count depends on which order it visits them in. Sorting by
+    ``bank`` alone cannot break the tie here -- every bank is identical -- so
+    the canonical order also has to fall back to something that never depends
+    on how the caller presented the input, which is what lets Task 3 rebuild
+    the store nightly and get the same answer.
+    """
+    chain = [_chain_prototype(step) for step in range(12)]
+    tolerance = 0.007
+
+    canonical = {tuple(p.signatures[0]) for p in dedupe(chain, tolerance)}
+
+    shuffled = list(chain)
+    random.Random(0).shuffle(shuffled)
+    reordered = {tuple(p.signatures[0]) for p in dedupe(shuffled, tolerance)}
+
+    assert reordered == canonical
 
 
 def test_a_saved_store_round_trips(tmp_path: Path) -> None:

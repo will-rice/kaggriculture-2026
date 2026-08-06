@@ -74,8 +74,11 @@ def harvest(samples: list[Sample], floor: float) -> list[Prototype]:
         floor: Minimum final bank a route must clear to be kept.
 
     Returns:
-        One ``Prototype`` per sample whose seat's final bank cleared ``floor``,
-        in the order the samples were given.
+        One ``Prototype`` per sample whose seat's final bank cleared
+        ``floor``. Samples are grouped by archive before reading, so this
+        matches the input order exactly only when each sample's archive is
+        already contiguous in it -- true of ``learn.corpus.select``'s output,
+        not guaranteed for an arbitrary caller.
     """
     by_archive: dict[str, list[Sample]] = {}
     for sample in samples:
@@ -149,32 +152,42 @@ def dedupe(prototypes: list[Prototype], tolerance: float) -> list[Prototype]:
     """Collapse near-identical routes, keeping the richest of each group.
 
     Two routes whose mean per-turn distance is within ``tolerance`` are
-    treated as the same route recorded twice, and only the one with the
-    higher ``bank`` survives -- the store should trend toward the best
-    exemplar of each strategy, not the first one harvested.
+    treated as the same route recorded twice. Candidates are visited richest
+    first -- sorted by ``bank`` descending, ties broken by ``signatures`` so
+    the order is a pure function of the data and never of how the caller
+    happened to present it -- so "keep the richest" falls out of a
+    first-match traversal instead of needing a replace-if-better branch, and
+    the result is stable under shuffling the input. Single-linkage-to-first-
+    match clustering is an approximation, not true transitive clustering: a
+    chain of routes each within tolerance of its neighbour but not of routes
+    two or more steps away can still end up split across groups depending on
+    which end of the chain sorts first. It is deterministic given the same
+    inputs, which is what nightly reproducibility needs; it does not claim to
+    find the globally optimal clustering.
 
     Args:
-        prototypes: Routes to collapse, in harvest order.
+        prototypes: Routes to collapse.
         tolerance: Maximum mean per-turn distance for two routes to be
             treated as duplicates.
 
     Returns:
         One route per near-identical group.
     """
+    ordered = sorted(
+        prototypes, key=lambda prototype: (-prototype.bank, prototype.signatures)
+    )
     kept: list[Prototype] = []
-    for candidate in prototypes:
-        group = next(
-            (
-                index
-                for index, existing in enumerate(kept)
-                if _trajectory_distance(candidate, existing) <= tolerance
-            ),
-            None,
-        )
-        if group is None:
+    for candidate in ordered:
+        if not any(
+            _trajectory_distance(candidate, existing) <= tolerance for existing in kept
+        ):
             kept.append(candidate)
-        elif candidate.bank > kept[group].bank:
-            kept[group] = candidate
+    LOGGER.info(
+        "dedupe collapsed %d of %d routes at tolerance %s",
+        len(prototypes) - len(kept),
+        len(prototypes),
+        tolerance,
+    )
     return kept
 
 
