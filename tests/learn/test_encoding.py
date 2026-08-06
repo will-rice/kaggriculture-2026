@@ -39,6 +39,7 @@ from kaggriculture.learn.encoding import (
     QUANTITIES,
     SCALARS,
     SEED_SCALE,
+    SHED_NAMES,
     TILE_PLANES,
     UNIT_CARRIED_SCALE,
     bucket_of,
@@ -399,6 +400,34 @@ def test_the_shed_is_encoded_because_sell_draws_from_it() -> None:
 
     assert len(moved) == 1
     assert next(iter(moved.values())) == pytest.approx(20 / SHED_CAPACITY)
+
+
+def test_an_animal_bought_into_the_shed_is_visible_there() -> None:
+    """``BUY_ANIMAL`` puts a cow in the shed, not on the board.
+
+    It stays there until a unit ``PICKUP``s and ``PLACE``s it, so a shed encoded
+    over products alone leaves that middle step invisible: the policy can buy an
+    animal and then have no way to see that it owns one. The shed the engine
+    writes is keyed by every product *and* every animal.
+    """
+    empty, bought = empty_observation(), empty_observation()
+    bought["private"]["shed"]["COW"] = 2
+
+    moved = _moved_scalars(encode_scalars(empty, 0), encode_scalars(bought, 0))
+
+    assert len(moved) == 1
+    assert next(iter(moved.values())) == pytest.approx(2 / SHED_CAPACITY)
+
+
+def test_the_shed_block_covers_every_key_the_engine_puts_there() -> None:
+    """A key the shed carries and this vector omits is silently unspendable.
+
+    Asserted against the engine's own fresh private state rather than a list
+    written here, so an animal or product added upstream fails this test instead
+    of quietly falling out of the encoding -- which is how the whole shed came to
+    be missing in the first place.
+    """
+    assert set(SHED_NAMES) == set(engine._new_private()["shed"])
 
 
 def test_each_product_in_the_shed_has_its_own_scalar() -> None:

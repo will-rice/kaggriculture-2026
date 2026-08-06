@@ -70,6 +70,11 @@ from kaggriculture.observation import Tile
 BOARD = BOARD_SIZE
 
 CROP_NAMES = sorted(CROPS)
+# The shed holds bought animals as well as produce -- BUY_ANIMAL puts a COW
+# there and it stays until a unit PICKUPs and PLACEs it. Encoding only the
+# products left that middle step invisible, so the policy could buy an animal
+# and then have no way to see that it owned one.
+SHED_NAMES = sorted(set(PRODUCTS) | set(ANIMALS))
 ANIMAL_NAMES = sorted(ANIMALS)
 PRODUCT_NAMES = sorted(PRODUCTS)
 SHOP_NAMES = sorted(SHOPS)
@@ -178,7 +183,7 @@ TILE_PLANES = 2 * _PER_FARM_PLANES
 SCALARS = (
     2 * len(PRODUCT_NAMES)  # market price and inventory, per product
     + 12  # money, phase, land, shop count, hands and hires, both seats
-    + len(PRODUCT_NAMES)  # our shed, per product
+    + len(SHED_NAMES)  # our shed, per product and per animal awaiting placement
     + len(CROP_NAMES)  # our unplanted seeds, per crop
     + len(PRODUCT_NAMES)  # carried across our units, per product
     + len(SHOP_NAMES)  # which shops the town has opened
@@ -540,7 +545,7 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
         ours["hires_today"] / MAX_UNITS,
         theirs["hires_today"] / MAX_UNITS,
     ]
-    values += [private["shed"][item] / SHED_CAPACITY for item in PRODUCT_NAMES]
+    values += [private["shed"][item] / SHED_CAPACITY for item in SHED_NAMES]
     values += [private["seeds"][crop] / SEED_SCALE for crop in CROP_NAMES]
     values += [carried.get(item, 0) / CARRIED_SCALE for item in PRODUCT_NAMES]
     values += [float(shop in unlocked_shops) for shop in SHOP_NAMES]

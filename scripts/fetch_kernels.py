@@ -84,16 +84,22 @@ def catalogue(api: KaggleApi, pages: int) -> list[dict]:
         )
         if not batch:
             break
-        found += [
-            {
-                "ref": item.ref,
-                "title": item.title,
-                "author": item.author,
-                "votes": int(item.total_votes),
-                "last_run": str(item.last_run_time),
-            }
-            for item in batch
-        ]
+        for item in batch:
+            if item is None:
+                raise RuntimeError(
+                    f"Kaggle returned an empty entry on page {page}; a partial "
+                    "listing would cache a meta snapshot that silently omits "
+                    "kernels, which is worse than no snapshot"
+                )
+            found.append(
+                {
+                    "ref": item.ref,
+                    "title": item.title,
+                    "author": item.author,
+                    "votes": int(item.total_votes),
+                    "last_run": str(item.last_run_time),
+                }
+            )
     return found
 
 
