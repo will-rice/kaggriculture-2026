@@ -11,15 +11,38 @@ from kaggriculture.learn.encoding import (
     IGNORE,
     MARKET_SLOTS,
     MAX_UNITS,
+    QUANTITIES,
     SCALARS,
     TILE_PLANES,
     UNIT_OPS,
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts import train as train_module
-from kaggriculture.learn.scripts.train import built_shards, evaluate, unit_loss
+from kaggriculture.learn.scripts.train import (
+    MARKET_WEIGHT,
+    built_shards,
+    evaluate,
+    market_loss,
+    unit_loss,
+)
 
 ACTING = 3
+
+
+def _rows(rows: int) -> TensorDataset:
+    """Build ``rows`` of random-but-shaped five-tensor data for a loader.
+
+    Contents are unread by the tests that use this -- only shapes and dtypes
+    matter -- so values are random rather than drawn from a real observation.
+    """
+    torch.manual_seed(0)
+    board = torch.randn(rows, TILE_PLANES, BOARD, BOARD)
+    scalars = torch.randn(rows, SCALARS)
+    positions = torch.randint(0, BOARD * BOARD, (rows, MAX_UNITS))
+    labels = torch.full((rows, MAX_UNITS), IGNORE, dtype=torch.int64)
+    labels[:, :ACTING] = torch.randint(0, len(UNIT_OPS), (rows, ACTING))
+    market = torch.randint(0, len(QUANTITIES), (rows, len(MARKET_SLOTS) + 2))
+    return TensorDataset(board, scalars, positions, labels, market)
 
 
 def _shards(directory: Path) -> None:
@@ -138,6 +161,42 @@ def test_the_loss_averages_over_acting_units_and_not_over_slots() -> None:
     assert not torch.allclose(unit_loss(logits, labels), every_slot)
 
 
+def test_the_market_loss_scores_every_slot() -> None:
+    """Unlike unit slots, no market slot is padding -- "trade nothing" is a choice.
+
+    Masking a zero here would teach the model that not trading is unobserved
+    rather than chosen, and it chooses it on roughly a third of all turns.
+    """
+    logits = torch.zeros(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))
+    labels = torch.zeros(1, len(MARKET_SLOTS) + 2, dtype=torch.int64)
+
+    loss = market_loss(logits, labels)
+
+    assert loss > 0
+
+
+def test_the_market_loss_is_weighted_against_the_unit_loss() -> None:
+    """Roughly four acting units a turn against mostly-zero market slots.
+
+    Summed unweighted, the unit head dominates and the market head learns the
+    prior. The weight is a constant so a run's numbers can be reproduced from
+    the repository.
+    """
+    assert 0.0 < MARKET_WEIGHT <= 10.0
+
+
+def test_both_accuracies_are_reported_separately() -> None:
+    """A combined number hides which of the two heads is failing."""
+    model = Policy(blocks=1, channels=8).eval()
+    loader = DataLoader(_rows(6), batch_size=4)
+
+    metrics = evaluate(model, loader, "cpu")
+
+    assert {"loss/units", "accuracy/units", "loss/market", "accuracy/market"} <= set(
+        metrics
+    )
+
+
 def test_evaluate_scores_only_the_units_that_acted() -> None:
     """Accuracy over padded slots measures how well we predict nobody.
 
@@ -170,7 +229,9 @@ def test_evaluate_scores_only_the_units_that_acted() -> None:
     with torch.no_grad():
         logits, _market = model(board, scalars, positions)
 
-    loss, accuracy = evaluate(model, loader, "cpu")
+    metrics = evaluate(model, loader, "cpu")
 
-    assert accuracy == pytest.approx(0.5)
-    assert loss == pytest.approx(float(unit_loss(logits, labels)), rel=1e-5)
+    assert metrics["accuracy/units"] == pytest.approx(0.5)
+    assert metrics["loss/units"] == pytest.approx(
+        float(unit_loss(logits, labels)), rel=1e-5
+    )

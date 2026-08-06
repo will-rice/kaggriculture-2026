@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 import wandb
 from kaggriculture.learn.dataset import Shards
-from kaggriculture.learn.encoding import IGNORE, UNIT_OPS
+from kaggriculture.learn.encoding import IGNORE, MARKET_SLOTS, UNIT_OPS
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts.build import HOLDOUT, SHARDS, TRAIN
 from kaggriculture.learn.scripts.play import CHECKPOINT
@@ -37,6 +37,15 @@ BATCH = 512
 LEARNING_RATE = 3e-4
 SEED = 0
 WORKERS = 8
+
+# The unit head sees roughly four real per-row targets (one turn's acting
+# units) against the market head's len(MARKET_SLOTS) + 2 = 21 slots, most of
+# which sit at bucket 0. Summed unweighted, the wider, mostly-zero head would
+# dominate the gradient and the narrower one would starve. 1.0 is a starting
+# point measured against nothing yet -- it has not been tuned against a run --
+# and the first run's two accuracy curves, not this comment, are the evidence
+# for changing it.
+MARKET_WEIGHT = 1.0
 
 
 def main() -> None:
@@ -80,49 +89,81 @@ def main() -> None:
             "shards": [path.name for path in shards],
             "parameters": parameters,
             "ops": len(UNIT_OPS),
+            "market_slots": len(MARKET_SLOTS) + 2,
+            "market_weight": MARKET_WEIGHT,
             "commit": revision,
         },
     )
 
     for epoch in range(EPOCHS):
         model.train()
-        total = correct = counted = 0.0
-        for board, scalars, positions, labels, _market in tqdm(
+        unit_total = unit_correct = counted = 0.0
+        market_total = market_correct = slotted = 0.0
+        for board, scalars, positions, labels, market in tqdm(
             loader, desc=f"epoch {epoch}"
         ):
             labels = labels.to(device)
-            logits, _market_logits = model(
+            market = market.to(device)
+            logits, market_logits = model(
                 board.to(device), scalars.to(device), positions.to(device)
             )
-            loss = unit_loss(logits, labels)
+            units, trades = (
+                unit_loss(logits, labels),
+                market_loss(market_logits, market),
+            )
+            loss = units + MARKET_WEIGHT * trades
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
 
             acting = int((labels != IGNORE).sum().item())
-            total += loss.item() * acting
-            correct += float(
+            unit_total += units.item() * acting
+            unit_correct += float(
                 ((logits.argmax(dim=-1) == labels) & (labels != IGNORE)).sum().item()
             )
             counted += acting
-            run.log({"loss/step": loss.item()})
 
-        held_loss, held_accuracy = evaluate(model, holdout, device)
+            slots = market.numel()
+            market_total += trades.item() * slots
+            market_correct += float(
+                (market_logits.argmax(dim=-1) == market).sum().item()
+            )
+            slotted += slots
+
+            run.log(
+                {
+                    "loss/step": loss.item(),
+                    "loss/units/step": units.item(),
+                    "loss/market/step": trades.item(),
+                }
+            )
+
+        train_metrics = {
+            "loss/units": unit_total / counted,
+            "accuracy/units": unit_correct / counted,
+            "loss/market": market_total / slotted,
+            "accuracy/market": market_correct / slotted,
+        }
+        held_metrics = evaluate(model, holdout, device)
         LOGGER.info(
-            "epoch %d train loss %.4f accuracy %.4f | holdout loss %.4f accuracy %.4f",
+            "epoch %d train units loss %.4f accuracy %.4f market loss %.4f "
+            "accuracy %.4f | holdout units loss %.4f accuracy %.4f market loss "
+            "%.4f accuracy %.4f",
             epoch,
-            total / counted,
-            correct / counted,
-            held_loss,
-            held_accuracy,
+            train_metrics["loss/units"],
+            train_metrics["accuracy/units"],
+            train_metrics["loss/market"],
+            train_metrics["accuracy/market"],
+            held_metrics["loss/units"],
+            held_metrics["accuracy/units"],
+            held_metrics["loss/market"],
+            held_metrics["accuracy/market"],
         )
         run.log(
             {
                 "epoch": epoch,
-                "loss/train": total / counted,
-                "accuracy/train": correct / counted,
-                "loss/holdout": held_loss,
-                "accuracy/holdout": held_accuracy,
+                **{f"train/{key}": value for key, value in train_metrics.items()},
+                **{f"holdout/{key}": value for key, value in held_metrics.items()},
             }
         )
 
@@ -210,17 +251,45 @@ def unit_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 
-def evaluate(model: Policy, loader: DataLoader, device: str) -> tuple[float, float]:
-    """Return mean loss and top-1 accuracy over acting units.
+def market_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Return the mean cross entropy over every market slot.
 
-    Both are weighted by how many units actually acted in each batch, not by
-    batch count, so a short final batch does not count for as much as a full
-    one. Padded slots are excluded from both numbers for the same reason they
-    are excluded from the loss: predicting an absent hand's op is not a skill.
+    Unlike ``unit_loss``, this passes no ``ignore_index`` at all: every market
+    slot -- sell this product, buy that seed, hire, buy land -- is a real
+    decision on every turn, and there is no slot analogous to a hand not yet
+    hired. Bucket 0 means "trade nothing", and the corpus genuinely chooses it
+    on roughly a third of rows; masking it the way ``unit_loss`` masks padding
+    would teach the model that not trading is unobserved rather than chosen.
 
-    The market labels ride along in every batch but are not yet scored here:
-    the policy now has a market head, but no loss reads it yet, so its logits
-    are computed and discarded on every call.
+    ``IGNORE`` is -100, which happens to also be ``cross_entropy``'s own
+    default ``ignore_index``. A test that calls ``cross_entropy`` directly with
+    unlabelled ``ignore_index`` would therefore pass whether or not masking
+    ever happened -- it proves nothing about this function -- so the guard has
+    to call ``market_loss`` itself.
+
+    Args:
+        logits: ``(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` per-slot
+            scores.
+        labels: ``(batch, len(MARKET_SLOTS) + 2)`` bucket labels; every entry
+            is a genuine target, none of them padding.
+
+    Returns:
+        A scalar loss averaged over every slot of every row.
+    """
+    return torch.nn.functional.cross_entropy(logits.flatten(0, 1), labels.flatten())
+
+
+def evaluate(model: Policy, loader: DataLoader, device: str) -> dict[str, float]:
+    """Return mean loss and top-1 accuracy for each head, kept separate.
+
+    A single combined number would hide which of the two heads is failing, so
+    the two are never averaged together. Both are weighted by how many slots
+    actually contributed -- acting units for the unit head, every market slot
+    for the market head -- not by batch count, so a short final batch does not
+    count for as much as a full one. Padded unit slots are excluded from the
+    unit numbers for the same reason they are excluded from ``unit_loss``:
+    predicting an absent hand's op is not a skill. No market slot is excluded,
+    for the same reason ``market_loss`` masks nothing.
 
     Args:
         model: The policy to score.
@@ -228,23 +297,38 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> tuple[float, flo
         device: Where to run the forward pass.
 
     Returns:
-        Mean cross entropy and top-1 accuracy, both over acting units.
+        A dict with ``loss/units``, ``accuracy/units``, ``loss/market`` and
+        ``accuracy/market``.
     """
     model.eval()
-    total = correct = counted = 0.0
+    unit_total = unit_correct = counted = 0.0
+    market_total = market_correct = slotted = 0.0
     with torch.no_grad():
-        for board, scalars, positions, labels, _market in loader:
+        for board, scalars, positions, labels, market in loader:
             labels = labels.to(device)
-            logits, _market_logits = model(
+            market = market.to(device)
+            logits, market_logits = model(
                 board.to(device), scalars.to(device), positions.to(device)
             )
             acting = int((labels != IGNORE).sum().item())
-            total += unit_loss(logits, labels).item() * acting
-            correct += float(
+            unit_total += unit_loss(logits, labels).item() * acting
+            unit_correct += float(
                 ((logits.argmax(dim=-1) == labels) & (labels != IGNORE)).sum().item()
             )
             counted += acting
-    return total / counted, correct / counted
+
+            slots = market.numel()
+            market_total += market_loss(market_logits, market).item() * slots
+            market_correct += float(
+                (market_logits.argmax(dim=-1) == market).sum().item()
+            )
+            slotted += slots
+    return {
+        "loss/units": unit_total / counted,
+        "accuracy/units": unit_correct / counted,
+        "loss/market": market_total / slotted,
+        "accuracy/market": market_correct / slotted,
+    }
 
 
 if __name__ == "__main__":
