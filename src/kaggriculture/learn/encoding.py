@@ -472,7 +472,7 @@ def _op(label: int) -> list[Any]:
 # That gate exists only as an inline literal inside `_process_market`, not as
 # a named constant, so it cannot be imported. It is typed by hand here rather
 # than parsed out of the engine's source at import time: this module is
-# imported by the submitted agent (`kaggriculture.learn.scripts.play`), which
+# imported by the submitted agent (`kaggriculture.learn.play`), which
 # runs inside the competition sandbox against a `kaggle_environments` build
 # this project does not control, and `len(MARKET_SLOTS)` sets the market
 # head's output shape. A source-parse that raises or silently changes shape

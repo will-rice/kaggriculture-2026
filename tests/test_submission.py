@@ -27,17 +27,47 @@ def test_entrypoint_plays_a_full_episode() -> None:
     assert task.evaluate(scores) == 1.0
 
 
+def archive_names(tmp_path: Path) -> list[str]:
+    """Return the member names of a freshly built archive."""
+    with tarfile.open(build(tmp_path / "submission.tar.gz")) as tar:
+        return tar.getnames()
+
+
 def test_archive_holds_the_entrypoint_beside_the_package(tmp_path: Path) -> None:
     """Kaggle imports main.py from the archive root with the package alongside."""
-    archive = build(tmp_path / "submission.tar.gz")
-
-    with tarfile.open(archive) as tar:
-        names = tar.getnames()
+    names = archive_names(tmp_path)
 
     assert len(names) == len(set(names))
     assert "main.py" in names
     assert "kaggriculture/policy.py" in names
     assert "kaggriculture/economic_policy.py" in names
     assert not any(name.startswith("kaggriculture/scripts") for name in names)
-    assert not any(name.startswith("kaggriculture/learn") for name in names)
     assert not any("__pycache__" in name for name in names)
+
+
+def test_the_submission_carries_the_weights(tmp_path: Path) -> None:
+    """A packaged agent that cannot load its checkpoint plays untrained.
+
+    Nothing raises in that case: ``Policy()`` initialises fine, the episode runs
+    all 720 turns, and the only symptom is a bad score.
+    """
+    names = archive_names(tmp_path)
+
+    assert "kaggriculture/learn/policy.pt" in names
+    assert "kaggriculture/learn/play.py" in names
+    assert "kaggriculture/learn/model.py" in names
+    assert "kaggriculture/learn/encoding.py" in names
+
+
+def test_the_submission_ships_no_training_code(tmp_path: Path) -> None:
+    """The sandbox has no network; a wandb import forfeits the episode on turn 0.
+
+    ``corpus.py`` and ``dataset.py`` reach for tqdm and a ``/data`` path that
+    exists on the workstation and nowhere else, and ``learn/scripts`` imports
+    wandb outright.
+    """
+    names = archive_names(tmp_path)
+
+    assert not any("/scripts/" in name for name in names)
+    assert "kaggriculture/learn/corpus.py" not in names
+    assert "kaggriculture/learn/dataset.py" not in names

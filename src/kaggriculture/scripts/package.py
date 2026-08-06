@@ -12,11 +12,29 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from kaggriculture.learn import CHECKPOINT
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_ROOT = REPO_ROOT / "src" / "kaggriculture"
 ENTRYPOINT = REPO_ROOT / "main.py"
 SUBMISSION = REPO_ROOT / "submission.tar.gz"
-EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "learn")
+
+# ``copytree`` applies these at every directory level, so one "scripts" entry
+# drops both ``kaggriculture/scripts`` and ``kaggriculture/learn/scripts``.
+#
+# ``learn`` itself is no longer excluded: the trained policy is the agent now,
+# and ``learn/play.py`` imports ``learn/model.py``, ``learn/encoding.py`` and
+# the checkpoint beside them. ``corpus.py`` and ``dataset.py`` are named here
+# instead, one file at a time, because they are training-only and pull in tqdm
+# and a ``/data`` path the sandbox does not have.
+#
+# ``*.pt`` is excluded so that ``build`` is the single thing that decides the
+# checkpoint ships. Left to ``copytree``, the weights would be included exactly
+# when a training run happened to have left them in the source tree, and absent
+# without complaint when it had not.
+EXCLUDED = shutil.ignore_patterns(
+    "__pycache__", "scripts", "corpus.py", "dataset.py", "*.pt"
+)
 
 
 def main() -> None:
@@ -37,10 +55,32 @@ def build(output: Path = SUBMISSION) -> Path:
 
     The packaging scripts themselves are left out: they import ``argparse`` and
     the Kaggle client, neither of which the agent needs at play time.
+
+    The checkpoint is copied in explicitly rather than left to ``copytree``,
+    which would pick it up only when it happened to be sitting in the source
+    tree. It is gitignored and written by a training run, so a fresh checkout
+    has no such file, and the archive would ship a policy of random weights
+    that plays a full episode and loses without ever raising.
+
+    Args:
+        output: Where to write the archive.
+
+    Returns:
+        ``output``, unchanged.
+
+    Raises:
+        FileNotFoundError: If no checkpoint has been trained yet.
     """
+    if not CHECKPOINT.is_file():
+        raise FileNotFoundError(
+            f"no checkpoint at {CHECKPOINT} — run "
+            "`uv run python -m kaggriculture.learn.scripts.train` first"
+        )
     with tempfile.TemporaryDirectory() as staging:
         root = Path(staging)
-        shutil.copytree(PACKAGE_ROOT, root / PACKAGE_ROOT.name, ignore=EXCLUDED)
+        package = root / PACKAGE_ROOT.name
+        shutil.copytree(PACKAGE_ROOT, package, ignore=EXCLUDED)
+        shutil.copy(CHECKPOINT, package / CHECKPOINT.relative_to(PACKAGE_ROOT))
         shutil.copy(ENTRYPOINT, root / ENTRYPOINT.name)
         with tarfile.open(output, "w:gz") as archive:
             for path in sorted(root.iterdir()):

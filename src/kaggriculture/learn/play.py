@@ -1,15 +1,17 @@
-"""Wrap a trained checkpoint as an agent the harness can evaluate.
+"""Wrap a trained checkpoint as an agent, for the league and for the archive.
 
-Not a submission entrypoint. This imports torch, which the competition sandbox
-pays 10.7 seconds to load, and lives under ``learn`` which ``package.py`` never
-copies into the archive. It exists so a checkpoint can be measured against the
-same frozen league every other agent in this project is measured against.
+This is the one module under ``learn`` that ships. It imports torch, which the
+competition sandbox pays 10.7 seconds of its 60-second overage pool to load on
+the first turn, so ``learn/scripts/budget.py`` measures a full episode against
+that pool rather than assuming it fits.
 
-``CHECKPOINT`` is defined here rather than in the training script, and the
-training script imports it from this module, so there is exactly one statement
-of where the weights live. Two constants would let training write somewhere the
-agent does not read, and the failure would look like an untrained model rather
-than a missing file.
+It deliberately imports nothing from ``learn.scripts``, ``learn.corpus`` or
+``learn.dataset``: those reach for wandb, tqdm and a ``/data`` path, none of
+which exist in the sandbox, and an import that reaches the network forfeits the
+episode on turn zero. ``CHECKPOINT`` comes from ``kaggriculture.learn`` so that
+training, play and packaging share one statement of where the weights live;
+two constants would let training write somewhere the agent does not read, and
+the failure would look like an untrained model rather than a missing file.
 
 The whole file is arranged so ``agent`` is the last callable defined:
 ``kaggle_environments`` execs an agent path and takes the last callable in the
@@ -22,7 +24,9 @@ from typing import Any, Mapping
 
 import torch
 
+from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.encoding import (
+    decode_market,
     decode_units,
     encode_board,
     encode_positions,
@@ -30,9 +34,6 @@ from kaggriculture.learn.encoding import (
     unit_count,
 )
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.scripts.build import SHARDS
-
-CHECKPOINT = SHARDS / "policy.pt"
 
 # The sandbox has two cores. Timing at 64 flatters it by an order of magnitude,
 # and a league evaluation fans episodes out one per core, so a policy that
@@ -63,27 +64,31 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
 
     Every tensor handed to the model comes from the same observation, through
     the same encoders the dataset was built with, so play and training cannot
-    disagree about what a row means. The unit count comes from
-    ``unit_count`` -- the observation, not the action, is what the engine walks
-    -- so the decoded action names exactly the units standing on the farm.
+    disagree about what a row means. The unit count comes from ``unit_count``
+    -- the observation, not the action, is what the engine walks -- so the
+    decoded action names exactly the units standing on the farm.
 
-    The action carries no market orders: the market head's logits are computed
-    but discarded here, not decoded. The cloned agent farms and never trades,
-    which for now is a property of this wrapper rather than of the weights --
-    the checkpoint has a market head, but nothing here calls ``decode_market``
-    on it yet.
+    Both heads are decoded. Decoding only the first is not a smaller version of
+    this agent, it is a different one that cannot score: the engine increases a
+    farm's money in exactly one place, crediting a completed ``SELL``, so an
+    action with an empty market list banks the opening 3,000 and nothing more,
+    whatever the unit head predicts. That was measured over 400 episodes before
+    the market head existed.
 
     Args:
         raw_obs: One turn's observation, as the environment hands it over.
 
     Returns:
-        The action dict the environment consumes.
+        The action dict the environment consumes, carrying one op per unit and
+        this turn's market orders.
     """
     seat = int(raw_obs["player"])
     with torch.no_grad():
-        logits, _market_logits = model()(
+        unit_logits, market_logits = model()(
             encode_board(raw_obs, seat),
             encode_scalars(raw_obs, seat),
             encode_positions(raw_obs, seat),
         )
-    return decode_units(logits, unit_count(raw_obs, seat))
+    action = decode_units(unit_logits, unit_count(raw_obs, seat))
+    action["market"] = decode_market(market_logits)
+    return action

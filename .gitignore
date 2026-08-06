@@ -232,5 +232,11 @@ submission.tar.gz
 replays/
 wandb/
 
+# Trained weights. `train.py` writes src/kaggriculture/learn/policy.pt and
+# `package.py` copies it into the archive, so the file lives inside the package
+# tree — but it is a 40 MB build artifact of a run recorded in wandb, not
+# source, and committing it would put a binary blob in every diff.
+*.pt
+
 # Node — only the prettier plugin the pre-commit format hook resolves from here
 node_modules/

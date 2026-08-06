@@ -23,11 +23,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
+from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.dataset import Shards
 from kaggriculture.learn.encoding import IGNORE, MARKET_SLOTS, UNIT_OPS
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts.build import HOLDOUT, SHARDS, TRAIN
-from kaggriculture.learn.scripts.play import CHECKPOINT
 from kaggriculture.scripts.tracking import ENTITY, PROJECT, commit
 
 LOGGER = logging.getLogger(__name__)
