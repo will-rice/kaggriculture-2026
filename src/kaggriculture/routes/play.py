@@ -36,7 +36,12 @@ route is further away than ``MATCH_THRESHOLD`` this turn is played by
 already ship rather than zero. ``RouteAgent.fallbacks`` counts those turns and
 the count is logged at the end of the episode: a route memory that falls back
 on 90% of turns is ``economic_policy`` with extra steps, and no win rate would
-ever say so.
+ever say so. Measured at the settled constants over 400 episodes on 100 seeds
+and the whole league, it falls back on **0.1%** of turns, so what follows is
+replay and not the fallback wearing its name. It is not idle, either: on the
+one seed in that set where a replay derails it takes over for two turns and
+brings the season back, worth 20,000 coins against the same agent with the
+threshold set too tight to notice.
 
 This module is on the agent path, so it imports no torch, no wandb and nothing
 under a ``scripts`` package -- importing torch alone costs 10.7 seconds of the
@@ -87,47 +92,70 @@ Position = tuple[int, int]
 # turn is played by `economic_policy` instead. Set from where the distances
 # actually fall in the two regimes, never from which bank came out largest.
 #
-# When a replay is tracking, the live board is nearly the recorded one: over a
-# full episode against `starter` with every turn replayed, the nearest route
-# sits at p50 0.02 and never exceeds 1.27, and against `economic_policy` on a
-# seed where the replay holds, never above 0.94. When a replay has derailed
-# the number is an order of magnitude larger -- p90 7.9 and a maximum of 57.4
-# on the seed where it does derail, and 25-47 routinely under the older,
-# broken market split. There is a clear gap between "tracking" and "lost", and
-# 4.0 sits in it: roughly three times the worst tracking error seen, and well
-# under the range that means the board has left the route behind.
+# Measured, over twelve full episodes replayed with no threshold at all so
+# that every turn's nearest distance is observed rather than truncated: the
+# distribution is bimodal with an empty band between 4 and 25. Eleven episodes
+# tracked from turn 0 to turn 718 and never exceeded 3.96 -- p50 0.23, p90
+# 1.58. The twelfth derailed, and on it 290 turns sat above 25 with a maximum
+# of 362 and the bank ended at 60,659 against a league median of 167,000.
+# Nothing was ever observed between 3.96 and 25, on any opponent or seed. Any
+# threshold in that band partitions those turns identically; 16.0 is the middle
+# of it and the value the sweep actually played.
 #
-# UNMEASURED against outcomes -- that is Task 5's sweep, and this needs to be
-# a value the sweep can move in both directions rather than an infinity that
-# can only come down. The earlier value of 1.5 was chosen when replay was
-# harmful and was really protecting us from a bug in the market split; with
-# that fixed it would leave almost no headroom above the observed maximum,
-# and a single spurious fallback compounds -- one turn off the route pushes
-# the board further from it, which makes the next turn likelier to fall back
-# too.
+# Measured against outcomes too, over 400 episodes per setting on 100 seeds
+# and the whole league: 16.0 banks 162,747 against 4.0's 161,687 at the same
+# 0.935 league win rate, and falls back on 0.1% of turns against 2.7%. The
+# gain is the spurious fallbacks it stops making, and one of those compounds:
+# on the seed that derails against heuristic_v1, 4.0 fell back on 33.9% of
+# turns and banked 138,116 where 16.0 fell back on 0.3% and banked 158,130. A
+# threshold too tight does not merely fail to help -- it abandons leg two of a
+# round trip whose leg one has already spent the bank, since good routes run
+# money down to near zero mid-transaction and money is log-scaled in the
+# signature. 1.5, the first value tried, was protecting us from a bug in the
+# market split rather than from anything real.
 #
 # Note that `distance` is not scale-stable across the season: its composition
 # weight climbs from 0.5 on day 0 to 40 on day 30, so one flat constant is a
-# far stricter test late than early. Recorded here for the sweep rather than
-# quietly patched with a second guess.
-MATCH_THRESHOLD = 4.0
+# far stricter test late than early. That is why the empty band matters more
+# than the number: the partition is robust to the weighting in a way that a
+# tuned edge would not be.
+MATCH_THRESHOLD = 16.0
 
 # How much closer a challenger route must be before it displaces the route we
 # are already following. Each route is individually coherent -- it hires, buys
 # and plants in a sequence that pays off later -- and alternating between two
 # of them yields a sequence neither would ever play, so a challenger has to
-# win by a margin rather than by a hair. UNMEASURED, like the threshold above:
-# Task 5 sweeps it. Evidence that it is currently too loose rather than too
-# tight: over one local episode's 87 replayed turns this still followed 11
-# distinct routes and switched 17 times.
+# win by a margin rather than by a hair.
+#
+# Measured, and this is the constant that decides the only match that is close.
+# Against the three weak league opponents every margin wins every game. Against
+# the recorded meta tape, 0.25 wins 74% of 100 seeds while 1.0 and an infinite
+# margin -- lock on to the first route and never leave it -- win 0%, despite
+# banking *more* than 0.25 does on every other opponent. Locking on maximises
+# coins and loses the game: the tape banks about 130,000 open-loop, and only an
+# agent free to change its mind mid-season clears that. A margin of 0 is worse
+# still, at 0.750 league and a 24% fallback rate, because thrashing between
+# routes plays a sequence no route contains. 0.25 is a genuine interior optimum
+# rather than an end of the swept range.
 HYSTERESIS_MARGIN = 0.25
 
-# Whether replayed orders are cut down to what our state backs before they
-# are sent. A sweep axis, not a settled question: paired single-variable
-# episodes put seed 99 12,674 better with the clamp and seed 42 10,239 worse,
-# a wash on the mean with a +/-12.7k spread, so Task 5 toggles this rather
-# than assuming it. `RouteAgent` takes it as an argument defaulting to this.
-CLAMP_ORDERS = True
+# Whether replayed orders are cut down to what our state backs before they are
+# sent. Measured off, over the same 400 episodes: clamping banks 161,111 and
+# wins 0.910 of the league against 161,687 and 0.935 with it off, and the whole
+# difference is against the tape -- 0.640 clamped against 0.740 unclamped.
+#
+# `clamp`'s docstring argued it was behaviour-preserving at the engine level,
+# because the engine part-fills an over-large order rather than rejecting it.
+# The measurement says otherwise, and the mechanism is in that same docstring:
+# the engine re-quotes per unit as inventory moves, while `clamp` cuts the
+# whole quantity against a single current quote and against a shed it models
+# rather than observes. Both errors point the same way, so it drops fills the
+# engine would have made. The order we emit is a less true statement of what
+# will happen, not a more true one.
+#
+# Kept as an argument rather than deleted because it is the axis a change of
+# store vintage is most likely to move: `RouteAgent` takes it, defaulting here.
+CLAMP_ORDERS = False
 
 # How many turns an agent is actually asked to act on. The engine records
 # `EPISODE_STEPS` observations but fires DONE at `episodeSteps - 2`, so the
@@ -167,15 +195,26 @@ class RouteAgent:
     exactly once per episode, so the reset is a property of the class instead
     of something every caller has to remember.
 
-    ``clamp_orders`` chooses whether replayed market orders are cut to what
-    our state backs; see ``CLAMP_ORDERS``.
+    The three tuning constants are taken as arguments defaulting to the module
+    constants rather than read from module scope. They are coupled -- the clamp
+    changes the bank, the bank drives the signature distance, and the distance
+    is what ``match_threshold`` tests -- so they have to be moved together to
+    be measured at all, and a sweep that reassigns module globals measures
+    whichever of its own processes had already imported the module. See
+    ``CLAMP_ORDERS``, ``MATCH_THRESHOLD`` and ``HYSTERESIS_MARGIN``.
     """
 
     def __init__(
-        self, prototypes: list[Prototype], clamp_orders: bool = CLAMP_ORDERS
+        self,
+        prototypes: list[Prototype],
+        clamp_orders: bool = CLAMP_ORDERS,
+        match_threshold: float = MATCH_THRESHOLD,
+        hysteresis_margin: float = HYSTERESIS_MARGIN,
     ) -> None:
         self.prototypes = prototypes
         self.clamp_orders = clamp_orders
+        self.match_threshold = match_threshold
+        self.hysteresis_margin = hysteresis_margin
         self.current: int | None = None
         self.fallbacks = 0
 
@@ -259,7 +298,7 @@ class RouteAgent:
         """Return which route to follow this turn, or ``None`` to fall back.
 
         The nearest route wins unless one is already being followed, in which
-        case the challenger has to beat it by ``HYSTERESIS_MARGIN``. Routes
+        case the challenger has to beat it by ``hysteresis_margin``. Routes
         that have no action left for this turn are not candidates: a season's
         final observation is followed by no action at all, so the last turn of
         every episode falls back.
@@ -272,7 +311,7 @@ class RouteAgent:
 
         Returns:
             An index into ``prototypes``, or ``None`` when the nearest route
-            is further away than ``MATCH_THRESHOLD``.
+            is further away than ``match_threshold``.
         """
         distances = {
             index: distance(key, prototype.signatures[step], day)
@@ -284,9 +323,9 @@ class RouteAgent:
         best = min(distances, key=lambda index: (distances[index], index))
         incumbent = self.current
         if incumbent is not None and incumbent in distances:
-            if distances[best] > distances[incumbent] - HYSTERESIS_MARGIN:
+            if distances[best] > distances[incumbent] - self.hysteresis_margin:
                 best = incumbent
-        return best if distances[best] <= MATCH_THRESHOLD else None
+        return best if distances[best] <= self.match_threshold else None
 
 
 def realign(

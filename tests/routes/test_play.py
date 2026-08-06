@@ -186,10 +186,14 @@ def test_a_replayed_order_is_cut_down_to_what_our_own_state_backs() -> None:
     quantities have to be cut to what we can actually back -- and cut in
     order, since the engine credits a sale before it charges a later purchase.
     Five sacks at 100 pays for exactly one 400-coin cow, not the two recorded.
+
+    ``clamp_orders`` is passed explicitly because ``CLAMP_ORDERS`` measured
+    worse than replaying the recorded order whole and now defaults off; this
+    pins what the clamp does when asked for, not what the agent ships.
     """
     prototype = _prototype(market=[["SELL", "WHEAT", 40], ["BUY_ANIMAL", "COW", 2]])
 
-    action = RouteAgent([prototype]).act(
+    action = RouteAgent([prototype], clamp_orders=True).act(
         _observation(melons=1, money=0.0, shed={"WHEAT": 5})
     )
 
@@ -280,6 +284,9 @@ def test_a_transfer_the_engine_would_refuse_is_not_counted_against_the_shed() ->
     the ``PICKUP`` emptying six sacks out of the shed, and clamps the sale of
     ten that follows down to four -- revenue given away for goods we hold,
     with nothing raised and nothing logged.
+
+    Clamping is asked for explicitly: it defaults off now, and without it this
+    test would pass by never consulting the shed model at all.
     """
     prototype = _prototype(market=[["SELL", "WHEAT", 10]])
     for action in prototype.actions:
@@ -292,7 +299,9 @@ def test_a_transfer_the_engine_would_refuse_is_not_counted_against_the_shed() ->
 
     assert observation["farms"][0]["hands"] == [[5, 4]]
     assert observation["farms"][0]["tiles"][4][5] == "LOCKED"
-    assert RouteAgent([prototype]).act(observation)["market"] == [["SELL", "WHEAT", 10]]
+    assert RouteAgent([prototype], clamp_orders=True).act(observation)["market"] == [
+        ["SELL", "WHEAT", 10]
+    ]
 
 
 def test_turn_zero_starts_a_new_episode_rather_than_continuing_the_last() -> None:
