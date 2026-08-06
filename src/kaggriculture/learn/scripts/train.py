@@ -87,7 +87,9 @@ def main() -> None:
     for epoch in range(EPOCHS):
         model.train()
         total = correct = counted = 0.0
-        for board, scalars, positions, labels in tqdm(loader, desc=f"epoch {epoch}"):
+        for board, scalars, positions, labels, _market in tqdm(
+            loader, desc=f"epoch {epoch}"
+        ):
             labels = labels.to(device)
             logits = model(board.to(device), scalars.to(device), positions.to(device))
             loss = unit_loss(logits, labels)
@@ -214,9 +216,12 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> tuple[float, flo
     one. Padded slots are excluded from both numbers for the same reason they
     are excluded from the loss: predicting an absent hand's op is not a skill.
 
+    The market labels ride along in every batch but are not yet scored here;
+    no market head exists on the policy for this loss to read.
+
     Args:
         model: The policy to score.
-        loader: Batches of ``(board, scalars, positions, labels)``.
+        loader: Batches of ``(board, scalars, positions, labels, market)``.
         device: Where to run the forward pass.
 
     Returns:
@@ -225,7 +230,7 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> tuple[float, flo
     model.eval()
     total = correct = counted = 0.0
     with torch.no_grad():
-        for board, scalars, positions, labels in loader:
+        for board, scalars, positions, labels, _market in loader:
             labels = labels.to(device)
             logits = model(board.to(device), scalars.to(device), positions.to(device))
             acting = int((labels != IGNORE).sum().item())

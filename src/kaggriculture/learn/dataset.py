@@ -21,6 +21,13 @@ Unit positions are part of the row's *input*, so they come from
 step. A hand that walks north between the two has already left the tile it
 decided from, and reading positions one step late would train every moving unit
 on the surroundings it arrived at rather than the ones it chose from.
+
+The market labels are pulled from the very same ``action[i + 1]`` as the unit
+labels, not from ``action[i]``. Both are one decision by one agent on one
+turn -- a farmhand's move and that turn's trade are not two separate events
+to align independently. Taking market labels from ``action[i]`` would train
+the model to trade one turn behind its own farming, silently, since nothing
+about the shapes involved would raise.
 """
 
 import json
@@ -38,6 +45,7 @@ from kaggriculture.learn.corpus import CORPUS, Sample
 from kaggriculture.learn.encoding import (
     TooManyUnitsError,
     encode_board,
+    encode_market,
     encode_positions,
     encode_scalars,
     encode_units,
@@ -52,7 +60,7 @@ LOGGER = logging.getLogger(__name__)
 # shard, not the ~6.1 GiB the full corpus would concatenate to at stride=4.
 ROWS_PER_SHARD = 20_000
 
-_Row = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+_Row = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
 def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> int:
@@ -85,6 +93,7 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
     scalars: list[np.ndarray] = []
     positions: list[np.ndarray] = []
     labels: list[np.ndarray] = []
+    markets: list[np.ndarray] = []
     shard_index = 0
     written = 0
 
@@ -101,6 +110,7 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
             scalars=np.concatenate(scalars),
             positions=np.concatenate(positions),
             labels=np.concatenate(labels),
+            markets=np.concatenate(markets),
         )
         LOGGER.info("%s: %d rows", path.name, len(boards))
         written += len(boards)
@@ -109,6 +119,7 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
         scalars.clear()
         positions.clear()
         labels.clear()
+        markets.clear()
 
     by_archive: dict[str, list[Sample]] = {}
     for sample in samples:
@@ -124,11 +135,12 @@ def build_shard(samples: list[Sample], destination: Path, stride: int = 4) -> in
                     if row is None:
                         skipped += 1
                         continue
-                    board, scalar, position, label = row
+                    board, scalar, position, label, market = row
                     boards.append(board)
                     scalars.append(scalar)
                     positions.append(position)
                     labels.append(label)
+                    markets.append(market)
                     if len(boards) >= ROWS_PER_SHARD:
                         flush()
 
@@ -163,11 +175,15 @@ def _encode_episode(
     same-index pairing is wrong. ``action[0]`` is never read as a label, and the
     final observation is never read at all, since neither has a following
     action. Everything the row feeds the model, positions included, is read from
-    ``observation[index]``; only the label comes from the later step.
+    ``observation[index]``; only the labels come from the later step.
+
+    The market labels are encoded from the same ``action`` dict as the unit
+    labels -- one decision, both heads -- never from ``steps[index]``'s own
+    action.
 
     Yields:
-        A row's ``(board, scalars, positions, labels)`` arrays, or ``None`` for
-        a turn skipped because it exceeded ``MAX_UNITS``.
+        A row's ``(board, scalars, positions, labels, market)`` arrays, or
+        ``None`` for a turn skipped because it exceeded ``MAX_UNITS``.
     """
     steps = episode["steps"]
     for index in range(0, len(steps) - 1, stride):
@@ -190,7 +206,14 @@ def _encode_episode(
             continue
         board = encode_board(observation, sample.seat).numpy(force=True)
         scalar = encode_scalars(observation, sample.seat).numpy(force=True)
-        yield board, scalar, position.numpy(force=True), label.numpy(force=True)
+        market = encode_market(action).numpy(force=True)
+        yield (
+            board,
+            scalar,
+            position.numpy(force=True),
+            label.numpy(force=True),
+            market,
+        )
 
 
 class Shards(Dataset):
@@ -198,17 +221,19 @@ class Shards(Dataset):
 
     def __init__(self, paths: list[Path]) -> None:
         """Load every shard named by ``paths``."""
-        boards, scalars, positions, labels = [], [], [], []
+        boards, scalars, positions, labels, markets = [], [], [], [], []
         for path in paths:
             with np.load(path) as data:
                 boards.append(data["boards"])
                 scalars.append(data["scalars"])
                 positions.append(data["positions"])
                 labels.append(data["labels"])
+                markets.append(data["markets"])
         self.boards = torch.from_numpy(np.concatenate(boards))
         self.scalars = torch.from_numpy(np.concatenate(scalars))
         self.positions = torch.from_numpy(np.concatenate(positions))
         self.labels = torch.from_numpy(np.concatenate(labels))
+        self.markets = torch.from_numpy(np.concatenate(markets))
 
     def __len__(self) -> int:
         """Return how many rows this dataset holds."""
@@ -216,11 +241,12 @@ class Shards(Dataset):
 
     def __getitem__(
         self, index: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return one row's board, scalars, positions and labels, unbatched."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return one row's board, scalars, positions, unit labels and market labels."""
         return (
             self.boards[index],
             self.scalars[index],
             self.positions[index],
             self.labels[index],
+            self.markets[index],
         )

@@ -14,9 +14,11 @@ from kaggriculture.learn.corpus import CORPUS, Sample
 from kaggriculture.learn.dataset import Shards, build_shard
 from kaggriculture.learn.encoding import (
     BOARD,
+    MARKET_SLOTS,
     MAX_UNITS,
     SCALARS,
     TILE_PLANES,
+    encode_market,
     encode_units,
     unit_count,
 )
@@ -83,14 +85,29 @@ def test_a_shard_round_trips_into_tensors_of_the_declared_shape(tmp_path: Path) 
     rows = build_shard([one_sample()], destination, stride=64)
 
     assert rows > 0
-    board, scalars, positions, labels = Shards([destination])[0]
+    board, scalars, positions, labels, market = Shards([destination])[0]
     assert board.shape == (TILE_PLANES, BOARD, BOARD)
     assert scalars.shape == (SCALARS,)
     assert positions.shape == (MAX_UNITS,)
     assert labels.shape == (MAX_UNITS,)
+    assert market.shape == (len(MARKET_SLOTS) + 2,)
     assert board.dtype == torch.float32
     assert positions.dtype == torch.int64
+    assert market.dtype == torch.int64
     assert positions.ge(0).all() and positions.lt(BOARD * BOARD).all()
+
+
+@pytest.mark.slow
+@_needs_corpus
+def test_a_shard_carries_market_labels_of_the_declared_width(tmp_path: Path) -> None:
+    """A ragged market label would fail at train time, not build time."""
+    destination = tmp_path / "shard.npz"
+
+    build_shard([one_sample()], destination, stride=64)
+
+    board, scalars, positions, labels, market = Shards([destination])[0]
+    assert market.shape == (len(MARKET_SLOTS) + 2,)
+    assert market.dtype == torch.int64
 
 
 @pytest.mark.slow
@@ -143,10 +160,42 @@ def test_labels_are_the_action_taken_from_the_state_not_the_one_that_made_it(
     destination = tmp_path / "aligned.npz"
     build_shard([sample], destination, stride=1)
 
-    _, _, _, labels = Shards([destination])[turn]
+    _, _, _, labels, _ = Shards([destination])[turn]
 
     assert torch.equal(labels, encoded(turn, turn + 1))
     assert not torch.equal(labels, encoded(turn, turn))
+
+
+@pytest.mark.slow
+@_needs_corpus
+def test_market_labels_come_from_the_same_action_as_the_unit_labels(
+    tmp_path: Path,
+) -> None:
+    """Both heads must be trained on one decision, not two adjacent ones.
+
+    The unit labels are the action that follows a row's observation. If the
+    market labels were taken from the row's own index instead, the model would
+    learn to trade one turn behind its own farming, and nothing would raise.
+    """
+    sample = one_sample()
+    with zipfile.ZipFile(ARCHIVE) as bundle, bundle.open(sample.name) as member:
+        steps = json.load(member)["steps"]
+
+    turn = next(
+        i
+        for i in range(1, len(steps) - 1)
+        if not torch.equal(
+            encode_market(steps[i][sample.seat]["action"] or {})[0],
+            encode_market(steps[i + 1][sample.seat]["action"] or {})[0],
+        )
+    )
+    destination = tmp_path / "aligned.npz"
+    build_shard([sample], destination, stride=1)
+
+    _, _, _, _, market = Shards([destination])[turn]
+
+    assert torch.equal(market, encode_market(steps[turn + 1][sample.seat]["action"])[0])
+    assert not torch.equal(market, encode_market(steps[turn][sample.seat]["action"])[0])
 
 
 def test_positions_come_from_the_state_the_decision_was_made_from(

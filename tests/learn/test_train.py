@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from kaggriculture.learn.encoding import (
     BOARD,
     IGNORE,
+    MARKET_SLOTS,
     MAX_UNITS,
     SCALARS,
     TILE_PLANES,
@@ -160,7 +161,10 @@ def test_evaluate_scores_only_the_units_that_acted() -> None:
     labels = torch.full((rows, MAX_UNITS), IGNORE, dtype=torch.int64)
     labels[:, :ACTING] = predicted[:, :ACTING]
     labels[rows // 2 :, :ACTING] = (predicted[rows // 2 :, :ACTING] + 1) % len(UNIT_OPS)
-    loader = DataLoader(TensorDataset(board, scalars, positions, labels), batch_size=4)
+    market = torch.zeros(rows, len(MARKET_SLOTS) + 2, dtype=torch.int64)
+    loader = DataLoader(
+        TensorDataset(board, scalars, positions, labels, market), batch_size=4
+    )
 
     with torch.no_grad():
         logits = model(board, scalars, positions)
