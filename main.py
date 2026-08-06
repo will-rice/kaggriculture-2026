@@ -8,13 +8,35 @@ The submission tarball places this file next to the ``kaggriculture`` package,
 and the loader puts that directory on ``sys.path`` while this module executes,
 so the import below resolves both locally and on the competition runner.
 
-The agent served here is the vendored economic policy, not our own heuristic.
-Measured over 20 seeded games it beat the heuristic 20-0 at 148k to 51k, and it
-prices from the live market curve and the opponent's visible supply rather than
-from the base table. The heuristic is frozen at ``baselines/heuristic_v2.py``
-and remains a league opponent.
+The agent served here is route memory: it replays the nearest of 190 routes
+harvested from strong seats in the replay corpus, realigned onto the units we
+actually have, and falls back to the vendored economic policy on the 0.1% of
+turns where no route is near. It replaces that economic policy, which is what
+this file served until the gate below was measured.
+
+Over 128 seeded league games each, on 100 further seeds, and on 32 held-out
+seeds, all three runs agree:
+
+    agent            mean bank    league win rate     vs the recorded tape
+    economic policy    145,604    0.750 [0.71, 0.79]    0 of 32
+    route memory       162,251    0.922 [0.87, 0.95]   22 of 32
+
+The tape is the whole story. Against the three reactive opponents both agents
+win every game, so the economic policy's ceiling is exactly the one opponent it
+cannot beat: it banks 119,380 against a recording that banks 139,997, having
+re-decided all 719 turns from the live board. That gap is the reason this phase
+exists, and it is also visible on the real ladder, where a blind single-episode
+tape replay scores 1468.6 against the economic policy's 1025.4. Replaying a
+route that is *chosen* per board beats both — but only while it stays free to
+change its mind, which is what ``HYSTERESIS_MARGIN`` buys and what a lock-on
+replay, banking more coins and losing every game to the tape, does not.
+
+The store the agent replays is 3.6 MiB inside the archive and costs 3.7 s to
+decode, once, inside turn zero: 4.5% of the sandbox's 60-second overage pool,
+measured out of the built archive by ``kaggriculture.scripts.budget``. Nothing
+on this path imports torch.
 """
 
-from kaggriculture.economic_policy import agent
+from kaggriculture.routes.play import agent
 
 __all__ = ["agent"]

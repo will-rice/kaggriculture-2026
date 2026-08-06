@@ -6,7 +6,7 @@ from pathlib import Path
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
-from kaggriculture.economic_policy import agent
+from kaggriculture.routes.play import agent
 from kaggriculture.scripts.package import ENTRYPOINT, build
 from kaggriculture.task import MatchTask
 

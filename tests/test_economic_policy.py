@@ -1,10 +1,17 @@
-"""Characterization tests for the served agent.
+"""Characterization tests for the vendored economic policy.
 
-The economic policy arrived as 65KB of third-party code and is now the agent we
-submit and the code we intend to change. Refactors of something that large are
-easy to get subtly wrong in ways no unit test notices: a reordered comparison or
-a lost early return changes what the farm does on day nine, the season still
-ends with plausible-looking coins, and nothing raises.
+The economic policy arrived as 65KB of third-party code and is the code we
+intend to change. Refactors of something that large are easy to get subtly
+wrong in ways no unit test notices: a reordered comparison or a lost early
+return changes what the farm does on day nine, the season still ends with
+plausible-looking coins, and nothing raises.
+
+It is no longer the agent ``main.py`` serves -- route memory is -- but it is
+still shipped and still played, on the turns route memory finds no route near
+enough to replay, so what it does on day nine matters exactly as much as it did
+when it was the whole submission. Both tests below name the policy directly for
+that reason; the bank test used to play ``main.py``, which quietly turned it
+into a test of whatever the entrypoint happened to serve.
 
 So these pin what the agent *does* rather than how it is written, at two
 resolutions. The decision test compares every turn's action and names the first
@@ -30,6 +37,7 @@ from pathlib import Path
 import pytest
 from kaggle_environments import make
 
+from kaggriculture import economic_policy
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
 DECISIONS = json.loads(
@@ -54,9 +62,7 @@ def test_agent_makes_the_same_decisions_it_always_has(seed: int) -> None:
     actual: list[str] = []
 
     def record(obs: dict, config: object = None) -> dict:
-        from kaggriculture.economic_policy import agent
-
-        action = agent(obs)
+        action = economic_policy.agent(obs)
         actual.append(digest(action))
         return action
 
@@ -81,6 +87,6 @@ def test_agent_banks_what_it_banked_before(seed: int) -> None:
     """The coarse cross-check: a season that ends where it always ended."""
     env = make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed})
 
-    env.run(["main.py", "pass"])
+    env.run([economic_policy.agent, "pass"])
 
     assert int(env.steps[-1][0].reward) == FINGERPRINT[seed]

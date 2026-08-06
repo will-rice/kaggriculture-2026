@@ -454,6 +454,64 @@ What Phase 3 inherits: a trunk that reads a board, a market head that reads a ma
 fact that neither survives its own trajectory. That is an argument for the RL phase's frozen-teacher KL
 term rather than against the initialisation.
 
+#### Result — route memory, 2026-08-06 (gate `play-vs-league-43508ce`) — **gate passed, `main.py` repointed**
+
+Not a learned policy at all: a store of 190 routes harvested from top-decile corpus seats, matched to
+the live board each turn by an identity-free signature, replayed with the orders realigned onto the
+units we actually have, and backed by the vendored economic policy on turns where no route is near.
+Built because the clone's failure above was a failure of _sequence_ — a per-turn policy re-decides and
+hires on every turn, where its teacher hired on 14.6% of turns and only in a day's first four hours — and
+because the ladder was already telling us the same thing: a blind single-episode tape replay scores
+**1468.6** where the reactive economic policy scores **1025.4**.
+
+Comparable at a glance with the two results above. Route memory and the policy it replaces are measured
+here over 400 episodes each — 100 seeds against each of the four frozen opponents — so the intervals are
+pooled over every game rather than averaged over opponents:
+
+| agent                           | mean bank   | league win rate          | vs the recorded tape |
+| ------------------------------- | ----------- | ------------------------ | -------------------- |
+| Phase 2 clone (market head)     | 0           | 0.000 [0.000, 0.037]     | 0 of 100             |
+| `economic_policy` (was shipped) | 145,768     | 0.750 [0.705, 0.790]     | 0 of 100             |
+| **route memory (now shipped)**  | **162,747** | **0.935 [0.906, 0.955]** | **74 of 100**        |
+
+Route memory banks more on **347 of 400 paired episodes** — same seed, same opponent — for a mean of
++16,979 coins.
+
+Independently, the tracked 32-seed league gate both agents were run through at this commit, route memory
+in `ipsm421y` and the economic policy in `qrmywexm`, 128 games each and 0 errors:
+
+| opponent     | route memory       | bank    | `economic_policy`  | bank    |
+| ------------ | ------------------ | ------- | ------------------ | ------- |
+| meta-tape    | 0.688 [0.51, 0.82] | 128,780 | 0.000 [0.00, 0.11] | 119,380 |
+| heuristic-v2 | 1.000 [0.89, 1.00] | 166,760 | 1.000 [0.89, 1.00] | 150,973 |
+| heuristic-v1 | 1.000 [0.89, 1.00] | 166,847 | 1.000 [0.89, 1.00] | 150,910 |
+| starter      | 1.000 [0.89, 1.00] | 186,615 | 1.000 [0.89, 1.00] | 161,151 |
+| league       | **0.922**          | 162,251 | 0.750              | 145,604 |
+
+**The tape is the entire margin.** Both agents win every game against the three reactive opponents, so
+the economic policy's ceiling was exactly the one opponent it never beat.
+
+**The fallback is not doing the work.** It plays 0.1% of turns at the settled constants, so what is
+measured is replay. It is not idle either: on the one seed in 400 episodes where a replay derails it
+takes two turns back and recovers 20,000 coins.
+
+**All three tuning constants were guessed, all three are coupled, and the sweep was therefore joint** —
+32 configurations, not three one-at-a-time sweeps, because the order clamp changes the bank, the bank
+drives the signature distance, and the distance is what the match threshold tests. `MATCH_THRESHOLD`
+4.0 → 16.0, `CLAMP_ORDERS` on → off, `HYSTERESIS_MARGIN` unchanged at 0.25. The margin is the
+interesting one: widening it banks _more_ coins on every opponent and loses to the tape 0–100, because
+locking onto one route for a season is a recording again. Full grid in
+`.superpowers/sdd/2026-08-06-route-memory/task-5-report.md`.
+
+**Budget, measured out of the built 39.8 MiB archive**: no torch anywhere on the path, a 0.053 s import,
+turn 0 at 3.70 s decoding the 3.6 MiB store once, and turns 1+ at 0.8 ms mean and 1.2 ms max. It
+consumes 2.70 s of the 60 s overage pool — 4.5%, against the torch clone's projected ~11 s. Re-measure
+with `uv run python -m kaggriculture.scripts.budget`.
+
+**Known limits.** Replay is open-loop within a route: an opponent that recognises one can counter it,
+and the ladder is the only place that will show it. Routes were selected on final bank, which rewards
+luck as well as skill. The store is one vintage of a moving meta and nothing yet measures its decay.
+
 ### Phase 3 — RL, small model (2 weeks)
 
 - Board-shaped action head: `10×10×22`, read only at cells holding units, **illegal actions masked to
