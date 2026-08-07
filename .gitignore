@@ -246,3 +246,6 @@ prototypes.json.gz
 
 # Node — only the prettier plugin the pre-commit format hook resolves from here
 node_modules/
+
+# Autonomous worker state (logs, status, gate verdicts)
+run/
