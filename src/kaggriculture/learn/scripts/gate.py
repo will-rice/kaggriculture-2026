@@ -34,9 +34,11 @@ a policy that wins on a margin of nothing has not learned to farm.
 
 import argparse
 import functools
+import json
 import logging
 import multiprocessing
 import statistics
+import subprocess
 from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +68,15 @@ SEED_BASE = 2_000_000_000
 # of that rung are then masked and sampled the same way, which is the only
 # comparison that isolates what the reinforcement learning did from what
 # masking at play time does.
+# The pass compares a gate's opponent against the module our last submission
+# served, so the rung names have to map back to what `main.py` imports.
+OPPONENT_MODULES = {
+    "economic_policy": "kaggriculture.economic_policy",
+    "kaito": "kaggriculture.kaito_policy",
+    "best_route": "kaggriculture.routes.play",
+    "bc_clone": "kaggriculture.learn.play",
+}
+
 RUNGS: tuple[tuple[str, Path | str], ...] = (
     ("bc_clone", CHECKPOINT),
     ("economic_policy", "src/kaggriculture/economic_policy.py"),
@@ -119,15 +130,74 @@ def main() -> None:
     """Play every rung and report each one, in order, without stopping early."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("weights", type=Path, help="the policy checkpoint to gate")
+    parser.add_argument(
+        "--record",
+        type=Path,
+        help="write the top rung reached here, for the autonomous pass to read",
+    )
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
+    measured = []
     with ProcessPoolExecutor(
         max_workers=WORKERS, mp_context=multiprocessing.get_context("spawn")
     ) as workers:
         for name, opponent in RUNGS:
             rung = measure(workers, arguments.weights, name, opponent)
+            measured.append(rung)
             LOGGER.info("%s", describe(rung))
+
+    if arguments.record:
+        record(measured, arguments.record)
+
+
+def record(measured: list[Rung], destination: Path) -> None:
+    """Write the hardest rung beaten, stamped with the revision it measured.
+
+    The autonomous pass reads this rather than re-gating: 128 seeded episodes
+    take minutes, and a cron tick that re-measured every half hour would spend
+    the box re-deriving a number that has not changed.
+
+    The revision is the point of the stamp. A gate result is evidence about the
+    code it ran on and nothing else, so the pass refuses a verdict whose
+    revision does not match the tree it would build from -- which is what makes
+    this a gate rather than a rubber stamp.
+
+    The *last* rung beaten is recorded, not the best win rate: the rungs are
+    ordered by what beating them would mean, and beating a weak one after
+    losing a strong one is not progress.
+
+    Args:
+        measured: Every rung played, in the order of `RUNGS`.
+        destination: Where to write the verdict.
+    """
+    revision = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    reached = [rung for rung in measured if rung.low > 0.5]
+    top = reached[-1] if reached else measured[0]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                "revision": revision,
+                "opponent": OPPONENT_MODULES.get(top.opponent, top.opponent),
+                "games": top.games,
+                "win_rate": top.win_rate,
+                "low": top.low,
+                "high": top.high,
+                "bank": top.bank,
+                "opponent_bank": top.opponent_bank,
+                "illegal": top.illegal,
+                "rungs_beaten": [rung.opponent for rung in reached],
+            },
+            indent=2,
+        )
+    )
+    LOGGER.info("recorded %s: top rung %s", destination, top.opponent)
 
 
 def measure(workers: Executor, weights: Path, name: str, opponent: Path | str) -> Rung:

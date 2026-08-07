@@ -35,6 +35,22 @@ LOGGER = logging.getLogger(__name__)
 COMPETITION = "kaggriculture"
 DAILY_SLOTS = 5
 
+# Where `gate.py` records its verdict. The pass does not run the gate itself:
+# 128 seeded episodes take minutes, and a cron tick that re-gates every half
+# hour would spend the box on re-measuring something that has not changed. The
+# gate is run deliberately -- by the agent, or by hand -- and leaves this file.
+GATE_VERDICT = Path("run/autonomous/gate.json")
+
+# A gate result is only evidence about the revision it was measured on. If the
+# tree has moved since, the verdict describes code we are no longer shipping.
+# Refusing on a stale verdict is the difference between a gate and a rubber
+# stamp.
+#
+# Wilson lower bound rather than the raw win rate: 65 wins in 128 games is a
+# 0.508 rate whose interval still straddles a coin flip, and submitting on that
+# spends a slot and displaces the incumbent on noise.
+MIN_WIN_RATE_LOWER_BOUND = 0.55
+
 
 def main() -> None:
     """Assess the competition state and act, from the command line."""
@@ -108,10 +124,70 @@ def assess(reserve: int) -> dict[str, Any]:
         )
         return state
 
+    verdict = gate_verdict(revision)
+    state["gate"] = verdict
+    if verdict is None:
+        state["reason"] = (
+            f"no gate verdict for {revision}; run gate.py and record it first"
+        )
+        return state
+    if verdict["opponent"] != last_submitted(submissions):
+        state["reason"] = (
+            f"gate measured against {verdict['opponent']!r} but the ladder currently "
+            f"carries {last_submitted(submissions)!r}; that is not the comparison "
+            "that decides whether to replace it"
+        )
+        return state
+    if verdict["low"] <= MIN_WIN_RATE_LOWER_BOUND:
+        state["reason"] = (
+            f"gate win rate {verdict['win_rate']:.3f} "
+            f"[{verdict['low']:.3f}, {verdict['high']:.3f}] against "
+            f"{verdict['opponent']}; the lower bound does not clear "
+            f"{MIN_WIN_RATE_LOWER_BOUND}, so this is not yet evidence of an improvement"
+        )
+        return state
+
+    state["should_submit"] = True
     state["reason"] = (
-        "gate has not been run by this pass; the agent decides what to gate and when"
+        f"beats {verdict['opponent']} at {verdict['win_rate']:.3f} "
+        f"[{verdict['low']:.3f}, {verdict['high']:.3f}] over {verdict['games']} seeded "
+        f"episodes, banking {verdict['bank']:,.0f} to {verdict['opponent_bank']:,.0f}"
     )
     return state
+
+
+def gate_verdict(revision: str) -> dict[str, Any] | None:
+    """Return the recorded gate result, but only if it measured this revision.
+
+    Args:
+        revision: The commit the archive would be built from.
+
+    Returns:
+        The verdict, or None when none exists or it describes other code.
+    """
+    if not GATE_VERDICT.is_file():
+        return None
+    verdict = json.loads(GATE_VERDICT.read_text())
+    if verdict.get("revision") != revision:
+        LOGGER.info(
+            "gate verdict is for %s, tree is at %s", verdict.get("revision"), revision
+        )
+        return None
+    return verdict
+
+
+def last_submitted(submissions: list[dict[str, Any]]) -> str | None:
+    """Return the agent module our most recent submission served.
+
+    Read from the description we wrote at submission time. A gate against an
+    opponent we are not actually defending says nothing about whether to
+    replace what is on the ladder.
+    """
+    for row in submissions:
+        for token in row["description"].split():
+            if token.startswith("kaggriculture."):
+                return token.rstrip(":,;")
+    return None
 
 
 def working_revision() -> str | None:
