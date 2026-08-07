@@ -247,10 +247,15 @@ def main() -> None:
                 measured.update(evaluate(policy, iteration))
             run.log(measured)
             LOGGER.info(
-                "iteration %d | diff %.1f | %d trajectories | bank %.0f | "
+                # The reward is named, not printed as a bare weight. A column
+                # reading "diff 0.0" was read by a reviewer as a measured
+                # quantity that had come out at zero, rather than as the
+                # setting that says the differential is switched off -- and a
+                # label that invites that reading costs an investigation.
+                "iteration %d | reward=%s | %d trajectories | bank %.0f | "
                 "margin %.0f | entropy %.3f | kl %.4f | value %.4f | %.1f s",
                 iteration,
-                phase.differential,
+                "own" if phase.differential == 0.0 else f"diff{phase.differential:.2f}",
                 measured["trajectories"],
                 measured["bank/mean"],
                 measured["margin/mean"],
