@@ -61,6 +61,16 @@ policy to five-sixths of the season.
 ``REWARD_SCALE`` is the one number here that was changed because a measurement
 demanded it rather than because a paper suggested it; the constant's comment
 carries the figures.
+
+The reward the update climbs is assembled in ``reward_of`` and is *money plus
+progress*: a convex blend of the two recorded money series, plus
+``gamma * P(s') - P(s)`` over ``progress``'s potential. The money half is the
+objective and the progress half is the curriculum, and the two are combined
+differently on purpose -- see that function. What the progress half buys is
+credit assignment: without it, a coin banked on day 12 has to be attributed to a
+seed bought on day 7, across 120 turns of a 719-turn season, and the measured
+consequence of asking for that was a policy that never reached a state where
+``SELL`` was legal.
 """
 
 import logging
@@ -72,6 +82,7 @@ import torch
 from kaggriculture.constants import STARTING_MONEY
 from kaggriculture.learn.encoding import IGNORE
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.progress import progress_reward
 from kaggriculture.learn.rollout import Trajectory
 
 LOGGER = logging.getLogger(__name__)
@@ -118,6 +129,30 @@ REWARD_SCALE = 1.0 / STARTING_MONEY
 # banking coins, which is what winning is made of.
 DIFFERENTIAL = 1.0
 
+# How much of `progress.progress_reward` is added on top of the money reward.
+#
+# Added rather than blended in, unlike `differential`. The two money series are
+# alternative measurements of the same quantity and mixing them is a choice
+# about which one is the objective; the progress term is not an alternative
+# objective at all. It is `gamma * P(s') - P(s)` for a potential `P` over the
+# farm's own state, and Ng, Harada and Russell prove that adding exactly that
+# form leaves the optimal policy unchanged -- so it changes what the gradient
+# sees on the way without changing where it is going, which is the entire
+# reason to have it.
+#
+# 1.0, and there is no relative weight to tune, because `P` is denominated in
+# coins on the same scale as the bank. One coin of shed produce is worth one
+# coin. A weight other than 1 would be an assertion that a coin of standing
+# wheat is worth some other number of banked coins, and there is nothing to base
+# that on.
+#
+# The total it contributes to an episode is bounded and small: the series
+# telescopes, so a whole season's shaped return is `P(terminal)` less the
+# carrying cost, and a farm cannot hold more than a shed's worth plus its fields
+# and its livestock. It is dense where the money reward is sparse and it is
+# nearly absent from the total, which is what a curriculum term should be.
+PROGRESS = 1.0
+
 GAMMA = 0.999
 LAM = 0.95
 CLIP = 0.2
@@ -145,6 +180,31 @@ MAX_GRAD_NORM = 0.5
 KL_INITIAL = 1.0
 KL_STEPS = 100
 
+# The progress term is held at full weight for `PROGRESS_HOLD` updates and then
+# decays linearly to exactly zero at `PROGRESS_STEPS`, which is where
+# `selfplay.SHAPING_ITERATIONS` switches the money reward from our own bank to
+# the win condition. So the curriculum is one ramp rather than two: dense
+# progress and absolute money first, then the terminal objective on its own.
+#
+# Both competitors this project has a primary source for did this. FLG shaped
+# move-to-resource, clear-rubble and mine for ~65M steps and then switched to
+# their zero-sum differential; Toad Brigade shaped for the first 20M steps and
+# then distilled onto the sparse reward. Neither kept the shaping to the end.
+#
+# Unlike the teacher penalty, nothing depends on this decay: a potential-based
+# term does not move the optimum, so it can be left on forever without changing
+# what is being optimised. It decays anyway for the one effect it does have --
+# the `(1 - gamma)` carrying cost on held stock, which is a real if small
+# preference for selling early that we would rather not pay once the chain is
+# routine -- and because a reward that is still being shaped at the end of a run
+# has not been shown to work without the shaping.
+#
+# At ~55 iterations an hour a workstation day ends inside the hold, so a run of
+# this budget measures the shaped phase and nothing else. Its report says so.
+PROGRESS_INITIAL = 1.0
+PROGRESS_HOLD = 100
+PROGRESS_STEPS = 200
+
 
 @dataclass(frozen=True)
 class PpoConfig:
@@ -159,6 +219,10 @@ class PpoConfig:
             win condition alone, 0.0 the change in our own bank alone; the
             training loop schedules it, and the constant's comment says why a
             run cannot start at 1.0.
+        progress: How much of the potential-based progress reward is added on
+            top of the money reward. Added, not blended: it is a shaping term
+            in Ng, Harada and Russell's form and does not compete with the
+            objective. The training loop schedules it too.
         reward_scale: What one coin of bank differential is worth to the value
             head. Coins are large and the value regression would otherwise
             drown every other term; see the constant's comment.
@@ -175,6 +239,7 @@ class PpoConfig:
     """
 
     differential: float = DIFFERENTIAL
+    progress: float = PROGRESS
     reward_scale: float = REWARD_SCALE
     gamma: float = GAMMA
     lam: float = LAM
@@ -315,6 +380,43 @@ def kl_weight(step: int, initial: float = KL_INITIAL, steps: int = KL_STEPS) -> 
     return max(0.0, initial * (1.0 - step / steps))
 
 
+def progress_weight(
+    step: int,
+    initial: float = PROGRESS_INITIAL,
+    hold: int = PROGRESS_HOLD,
+    steps: int = PROGRESS_STEPS,
+) -> float:
+    """Return the progress term's weight at this update.
+
+    Flat at ``initial`` through ``hold`` updates, then linear to exactly zero at
+    ``steps``, then zero. The hold is the difference between this and the
+    teacher penalty's schedule and it is the point of the thing: the teacher
+    penalty is a trust region that should start relaxing immediately, while the
+    progress term is a curriculum that has to stay at full strength long enough
+    for the chain to be learned before it is taken away. A term that starts
+    decaying on update 1 is weakest exactly when the policy still cannot bank.
+
+    Args:
+        step: Which update this is, counted from zero across the whole run.
+        initial: The weight through the hold.
+        hold: How many updates the weight stays at ``initial``.
+        steps: Which update the weight reaches zero on.
+
+    Returns:
+        The weight, never negative and never above ``initial``.
+
+    Raises:
+        ValueError: If the ramp has no width, which would make the schedule a
+            cliff and divide by zero saying so.
+    """
+    if steps <= hold:
+        raise ValueError(
+            f"the progress term needs a ramp to decay across: hold {hold} is not "
+            f"before steps {steps}"
+        )
+    return initial * max(0.0, min(1.0, (steps - step) / (steps - hold)))
+
+
 def flatten(batch: Sequence[Trajectory], config: PpoConfig) -> Rows:
     """Turn episodes into rows, taking GAE inside each one before concatenating.
 
@@ -347,7 +449,7 @@ def flatten(batch: Sequence[Trajectory], config: PpoConfig) -> Rows:
     """
     estimates = [
         advantages(
-            reward_of(trajectory, config.differential) * config.reward_scale,
+            reward_of(trajectory, config) * config.reward_scale,
             torch.cat([trajectory.values, torch.zeros(1)]),
             config.gamma,
             config.lam,
@@ -382,24 +484,42 @@ def flatten(batch: Sequence[Trajectory], config: PpoConfig) -> Rows:
     )
 
 
-def reward_of(trajectory: Trajectory, differential: float) -> torch.Tensor:
-    """Return the reward this update is climbing, mixed from the two recorded series.
+def reward_of(trajectory: Trajectory, config: PpoConfig) -> torch.Tensor:
+    """Return the reward this update is climbing: money, mixed, plus progress.
 
-    A convex blend rather than a sum, so that the reward's *scale* does not
-    move when the mix does: both series are in coins, and `REWARD_SCALE` was
-    fitted against one series in coins. A sum at weight 1.0 on each would double
-    the value target halfway through a run and hand `max_grad_norm` the same
-    problem the reward scale was introduced to fix.
+    The two *money* series are blended convexly rather than summed, so that the
+    reward's scale does not move when the mix does: both are in coins, and
+    ``REWARD_SCALE`` was fitted against one series in coins. A sum at weight 1.0
+    on each would double the value target halfway through a run and hand
+    ``max_grad_norm`` the same problem the reward scale was introduced to fix.
+
+    The progress term is *added* to that blend, because it is not a competing
+    measurement of the objective -- it is ``gamma * P(s') - P(s)``, which by Ng,
+    Harada and Russell leaves the optimal policy unchanged whatever the money
+    reward beneath it is. Blending it in would make the money reward smaller
+    when shaping was strong, which is the opposite of what shaping is for. It
+    does not move the scale either: the term telescopes, so its contribution to
+    an episode's total is the terminal pipeline value, a few hundred coins
+    against a season's tens of thousands.
 
     Args:
-        trajectory: The episode, carrying both series.
-        differential: 1.0 for the opponent-relative reward alone, 0.0 for our
-            own bank alone, between for a mix.
+        trajectory: The episode, carrying all three recorded series.
+        config: The update's hyperparameters. ``differential`` mixes the money
+            series, ``progress`` weights the shaped one, and ``gamma`` is the
+            discount the shaped one has to be built with -- the same ``gamma``
+            the advantage is taken under, which is why it is read from here
+            rather than passed separately.
 
     Returns:
         ``(turns,)`` per-turn reward, in coins.
     """
-    return differential * trajectory.rewards + (1.0 - differential) * trajectory.own
+    money = (
+        config.differential * trajectory.rewards
+        + (1.0 - config.differential) * trajectory.own
+    )
+    return money + config.progress * progress_reward(
+        trajectory.potentials, config.gamma
+    )
 
 
 def update(

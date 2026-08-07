@@ -39,6 +39,17 @@ falls out past eight, and half the workers mirror the live policy instead --
 which is also where the free seat-1 data comes from, since only a mirror episode
 has both seats on-policy.
 
+**The reward pays along the chain, not only at the end of it.** Banking a coin
+takes seven steps over five in-game days, and a reward that pays only for banked
+coins is invisible to every step but the last -- measured, that produced a
+policy which never reached a state where ``SELL`` was legal. So a
+potential-based progress term is added to the money reward for the shaped phase
+of the run: see ``learn/progress.py`` for what it values and why it cannot be
+farmed, and ``ppo.progress_weight`` for the schedule that removes it. Every
+component of it is logged beside the bank on the same line, because the failure
+it could cause -- a pipeline that grows while the bank does not -- is only
+visible in the comparison, and ``refuse_farming`` stops the run on it.
+
 **A nonzero illegal count stops the run.** It means the mask that gated a logit
 and the index that was stored beside it disagree, and every update after that
 point is spent fitting a distribution nobody sampled. There is nothing to be
@@ -66,7 +77,8 @@ import wandb
 from kaggriculture.constants import STARTING_MONEY
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.play import model as cloned
-from kaggriculture.learn.ppo import KL_INITIAL, PpoConfig, update
+from kaggriculture.learn.ppo import KL_INITIAL, PpoConfig, progress_weight, update
+from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, progress_reward
 from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.report import wilson_interval
 from kaggriculture.scripts.tracking import ENTITY, PROJECT, commit
@@ -164,6 +176,24 @@ EVALUATION_BASE = 1_000_000_000
 COLLAPSE_FRACTION = 0.25
 COLLAPSE_PATIENCE = 3
 
+# When to call a run *farmed* rather than merely shaped. The failure the
+# progress reward could introduce is an agent that grows its pipeline and never
+# converts it: fields full of standing crop, a shed full of produce, a flat
+# bank. A potential-based term makes that unprofitable rather than impossible --
+# holding stock is charged `(1 - gamma)` of its value per turn and every
+# reversible cycle pays exactly zero -- but "unprofitable" is an argument and
+# this is a measurement, and this project has already shipped two agents that
+# maximised a shaped term without banking.
+#
+# Compared as the mean of the last window against the mean of the first, rather
+# than as two iterations, because a single iteration's bank swings by thousands
+# on which opponent was sampled. Twenty iterations is about twenty minutes and
+# roughly a million decisions, which is long enough that a pipeline half again
+# as large with a bank that has not moved is a behaviour rather than noise.
+FARMING_PATIENCE = 20
+FARMING_PIPELINE_RISE = 1.5
+FARMING_BANK_RISE = 1.05
+
 RUNS = Path("/data/kaggriculture/selfplay")
 
 
@@ -221,7 +251,6 @@ def main() -> None:
     )
     optimiser = torch.optim.AdamW(policy.parameters(), lr=LEARNING_RATE)
     chooser = random.Random(SEED)
-    shaping = dataclasses.replace(config, differential=0.0)
     run = wandb.init(
         entity=ENTITY,
         project=PROJECT,
@@ -249,6 +278,7 @@ def main() -> None:
     weights = directory / "learner.pt"
     pool: list[Path] = []
     banked: list[float] = []
+    pipeline: list[float] = []
     opened = time.perf_counter()
     deadline = opened + arguments.hours * 3600
     # Both schedules read this, so a resumed run has to continue the count
@@ -271,14 +301,21 @@ def main() -> None:
             collected = time.perf_counter() - started
 
             refuse_illegal(batch, iteration)
-            phase = shaping if iteration < SHAPING_ITERATIONS else config
+            phase = dataclasses.replace(
+                config,
+                differential=(
+                    config.differential if iteration >= SHAPING_ITERATIONS else 0.0
+                ),
+                progress=progress_weight(iteration),
+            )
             metrics = update(policy, teacher, optimiser, batch, iteration, phase)
             measured = {
                 **metrics,
-                **played(batch),
+                **played(batch, phase),
                 "iteration": iteration,
                 "pool": len(pool),
                 "differential": phase.differential,
+                "progress/weight": phase.progress,
                 "seconds/collect": collected,
                 "seconds/iteration": time.perf_counter() - started,
                 "hours": (time.perf_counter() - opened) / 3600,
@@ -292,13 +329,25 @@ def main() -> None:
                 # quantity that had come out at zero, rather than as the
                 # setting that says the differential is switched off -- and a
                 # label that invites that reading costs an investigation.
-                "iteration %d | reward=%s | %d trajectories | bank %.0f | "
-                "margin %.0f | entropy %.3f | kl %.4f | value %.4f | %.1f s",
+                #
+                # Bank leads and every shaped term follows it on the same line,
+                # because the failure the shaping can cause is precisely a
+                # pipeline that grows while the bank does not, and two numbers
+                # that have to be read from different charts to be compared do
+                # not get compared.
+                "iteration %d | reward=%s+%.2f*progress | %d trajectories | "
+                "bank %.0f | margin %.0f | %s | entropy %.3f | kl %.4f | "
+                "value %.4f | %.1f s",
                 iteration,
                 "own" if phase.differential == 0.0 else f"diff{phase.differential:.2f}",
+                phase.progress,
                 measured["trajectories"],
                 measured["bank/mean"],
                 measured["margin/mean"],
+                " ".join(
+                    f"{name} {measured[f'potential/{name}']:.0f}"
+                    for name in POTENTIAL_COMPONENTS
+                ),
                 measured["entropy"],
                 measured["kl"],
                 measured["loss/value"],
@@ -306,7 +355,9 @@ def main() -> None:
             )
 
             banked.append(measured["bank/mean"])
+            pipeline.append(measured["potential/total"])
             refuse_collapse(banked)
+            refuse_farming(banked, pipeline)
 
             if iteration % SNAPSHOT_EVERY == 0:
                 snapshot_into(pool, policy, directory, iteration)
@@ -591,7 +642,7 @@ def refuse_collapse(banked: Sequence[float]) -> None:
         )
 
 
-def played(batch: Sequence[Trajectory]) -> dict[str, float]:
+def played(batch: Sequence[Trajectory], config: PpoConfig) -> dict[str, float]:
     """Return what the batch's episodes did, as distinct from what the loss did.
 
     Bank and margin are both reported because they answer different questions
@@ -601,13 +652,42 @@ def played(batch: Sequence[Trajectory]) -> dict[str, float]:
     says whether anything was produced at all, and it is where a collapse into
     mutual neutralisation would show.
 
+    Every component of the progress potential is reported next to it, and this
+    is the instrument the whole shaped-reward change is answerable to. A shaped
+    term that rises while the bank stays flat is a failure and not progress, and
+    the components say which failure: ``seeds`` alone means a farm that buys and
+    never plants, ``growing`` alone means one that plants and never harvests,
+    ``carried`` or ``stored`` alone means one that harvests and never sells.
+    They are means over the season's turns rather than terminal values, because
+    a terminal potential is near zero for a farm that sold everything on the
+    last day and says nothing about what the farm was doing for 700 turns.
+
+    ``progress/return`` is what the shaped term actually contributed to an
+    episode's reward, at the weight this iteration used. It should stay small
+    against the bank: the term telescopes, so its whole-season total is the
+    terminal pipeline less the carrying cost, and a large one means the reward
+    has stopped being mostly about money.
+
     Args:
         batch: The iteration's trajectories.
+        config: The phase these episodes are being learned under, for the
+            ``progress`` weight and the ``gamma`` the shaped series is built
+            with. Passed rather than defaulted so that a logged
+            ``progress/return`` is the number the update saw and not the number
+            some other weight would have produced.
 
     Returns:
         ``trajectories``, ``decisions``, ``bank/mean``, ``bank/max``,
-        ``margin/mean`` and ``illegal``.
+        ``margin/mean``, ``illegal``, ``progress/return``,
+        ``potential/total``, and ``potential/<component>`` for each name in
+        ``POTENTIAL_COMPONENTS``.
     """
+    components = {
+        f"potential/{name}": statistics.fmean(
+            float(trajectory.potentials[:, index].mean()) for trajectory in batch
+        )
+        for index, name in enumerate(POTENTIAL_COMPONENTS)
+    }
     return {
         "trajectories": len(batch),
         "decisions": sum(len(trajectory.rewards) for trajectory in batch),
@@ -615,7 +695,65 @@ def played(batch: Sequence[Trajectory]) -> dict[str, float]:
         "bank/max": max(t.final_bank for t in batch),
         "margin/mean": statistics.fmean(t.final_margin for t in batch),
         "illegal": sum(trajectory.illegal for trajectory in batch),
+        "progress/return": statistics.fmean(
+            config.progress
+            * float(progress_reward(trajectory.potentials, config.gamma).sum())
+            for trajectory in batch
+        ),
+        **components,
+        "potential/total": sum(components.values()),
     }
+
+
+def refuse_farming(banked: Sequence[float], pipeline: Sequence[float]) -> None:
+    """Stop the run if the shaped term is being grown instead of converted.
+
+    The named failure mode of this whole change: an agent that maximises the
+    progress potential and never banks. It is meant to be unreachable -- the
+    potential is Ng, Harada and Russell's ``gamma * P(s') - P(s)``, so every
+    reversible cycle pays exactly zero and holding stock costs ``(1 - gamma)``
+    of its value per turn -- but the argument is a proof about the *optimum* and
+    a run is a finite trajectory through parameter space, and this project has
+    already produced two agents that maximised a shaped term without banking.
+
+    Windows, not iterations: the mean pipeline over the last
+    ``FARMING_PATIENCE`` iterations against the mean over the first, and the
+    same for the bank. One iteration's bank moves by thousands on which opponent
+    the chooser sampled, so a two-point comparison would fire on noise, and a
+    guard that fires on noise gets deleted.
+
+    Only fires once both windows exist, so a run shorter than
+    ``2 * FARMING_PATIENCE`` iterations is never judged by it. That is the right
+    bar: a pipeline growing in the first twenty minutes of a shaped run is the
+    shaping working, and the failure this catches is one that persists.
+
+    Args:
+        banked: Mean bank per iteration, oldest first.
+        pipeline: Mean total potential per iteration, oldest first, on the same
+            iterations and in the same order.
+
+    Raises:
+        ValueError: If the pipeline has grown by ``FARMING_PIPELINE_RISE`` while
+            the bank has grown by less than ``FARMING_BANK_RISE``.
+    """
+    if len(banked) < 2 * FARMING_PATIENCE:
+        return
+    opening_bank = statistics.fmean(banked[:FARMING_PATIENCE])
+    opening_pipeline = statistics.fmean(pipeline[:FARMING_PATIENCE])
+    recent_bank = statistics.fmean(banked[-FARMING_PATIENCE:])
+    recent_pipeline = statistics.fmean(pipeline[-FARMING_PATIENCE:])
+    if opening_pipeline <= 0.0:
+        return
+    if (
+        recent_pipeline >= FARMING_PIPELINE_RISE * opening_pipeline
+        and recent_bank < FARMING_BANK_RISE * opening_bank
+    ):
+        raise ValueError(
+            f"the pipeline grew {opening_pipeline:.0f} -> {recent_pipeline:.0f} "
+            f"while the bank went {opening_bank:.0f} -> {recent_bank:.0f} -- the "
+            f"policy is accumulating the shaped term instead of converting it, "
+            f"which is the failure the progress reward was designed against"
+        )
 
 
 def evaluate(policy: Policy, iteration: int) -> dict[str, float]:

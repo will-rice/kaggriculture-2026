@@ -35,12 +35,33 @@ a private re-implementation of any of that drifts from ``encoding.py`` the
 moment either side changes, and the engine's response to a malformed op is to
 do nothing at all.
 
-**Two reward series are recorded, and this module does not choose between
-them.** ``rewards`` is the per-turn change in (our bank - their bank) and
-``own`` is the per-turn change in our own bank alone. Both are stored on every
-trajectory; which one the gradient sees is a weight in ``PpoConfig`` and a
-schedule in the training loop, because it is a property of *where a run is*
+**Three series are recorded, and this module does not choose between them.**
+``rewards`` is the per-turn change in (our bank - their bank), ``own`` is the
+per-turn change in our own bank alone, and ``potentials`` is what the farm was
+holding on its way to the bank at each state, by component. All three are stored
+on every trajectory; how they are mixed is a set of weights in ``PpoConfig`` and
+a schedule in the training loop, because it is a property of *where a run is*
 rather than of what an episode was.
+
+``potentials`` is stored as the potentials themselves rather than as their
+differences, and that is deliberate. The shaped reward is
+``gamma * P(s') - P(s)``, and ``gamma`` belongs to the update, not to the
+rollout: a trajectory collected today has to remain usable if the discount
+changes, and a rollout that baked one in would hand PPO a shaping term that no
+longer matches the objective it is discounting against.
+
+Unlike the two money series, the potentials are recorded for the acting turns
+only and the terminal state is *not* appended. It would be the natural thing to
+append -- the other two series read their terminal value here, and a difference
+needs a state on each side of it -- and it is the one thing that must not
+happen. ``P`` at the state a trajectory stops in is the only endpoint of the
+telescoped shaping the agent can choose, so a non-zero one pays for ending the
+season holding stock: at ``gamma = 0.999`` over 719 turns, a unit held from turn
+700 to the horizon keeps 98% of its value, and refusing to sell into a market
+both farms have pushed below base would be shaped-optimal. So the terminal is a
+hard zero, and it lives in ``progress.progress_reward`` -- which takes the
+acting rows and appends the zero itself, so this module has nowhere to put a
+terminal row even by accident.
 
 The differential is the win condition rather than a proxy for it --
 ``interpreter`` ends the episode by setting each seat's reward to its own
@@ -129,6 +150,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.progress import potential
 
 LOGGER = logging.getLogger(__name__)
 
@@ -179,6 +201,13 @@ class Trajectory:
             ``rewards`` rather than instead of it: which one a gradient sees is
             ``PpoConfig.differential``, and a trajectory collected under one
             setting is usable under the other because both were kept.
+        potentials: ``(turns, len(POTENTIAL_COMPONENTS))`` coin value of
+            everything the farm held on its way to the bank, one row per turn
+            the policy acted from. Undifferenced, because the ``gamma`` in the
+            shaped reward belongs to the update; and with **no terminal row**,
+            because a non-zero potential at the state a season stops in pays
+            the agent to end it holding stock. See this module's docstring and
+            ``progress.progress_reward``.
         dones: ``(turns,)`` bool, True on the last turn alone. A rollout is
             one whole episode, so GAE bootstraps from nothing at the end.
         final_margin: This seat's terminal bank minus the other's. Positive is
@@ -204,6 +233,7 @@ class Trajectory:
     values: torch.Tensor
     rewards: torch.Tensor
     own: torch.Tensor
+    potentials: torch.Tensor
     dones: torch.Tensor
     final_margin: float
     final_bank: float
@@ -228,6 +258,8 @@ class Stream:
             ``margins`` and never derived from it -- the differential loses
             which of the two farms the coins are on, which is the whole reason
             the reward needs both.
+        potentials: What its farm held on its way to the bank before each
+            decision, by component, read on the same turns as the other two.
     """
 
     environment: int
@@ -235,6 +267,7 @@ class Stream:
     turns: list["Turn"] = field(default_factory=list)
     margins: list[float] = field(default_factory=list)
     banks: list[float] = field(default_factory=list)
+    potentials: list[list[float]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -340,6 +373,7 @@ def rollout_many(
             seen = _observation(environments, stream.environment, stream.seat)
             stream.margins.append(_margin(seen))
             stream.banks.append(_bank(seen))
+            stream.potentials.append(potential(seen))
         turns = _decide(
             policy,
             [
@@ -686,13 +720,19 @@ def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
 def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     """Stack one recorded seat's turns into the tensors the update reads.
 
-    The stream's ``margins`` and ``banks`` both end one short of the terminal
-    state, because the loop appends before each decision and there is no
-    decision after the last one; the terminal pair is read here instead, from
-    the environment the stream played. That makes each series exactly one
-    longer than ``turns``, so the differences are one per decision and each
-    telescopes -- the differential to the final margin, and our own bank to the
-    terminal bank less the ``STARTING_MONEY`` both farms open on.
+    The stream's ``margins``, ``banks`` and ``potentials`` all end one short of
+    the terminal state, because the loop appends before each decision and there
+    is no decision after the last one. The two money series read their terminal
+    value here, from the environment the stream played, which makes each of them
+    exactly one longer than ``turns`` so the differences are one per decision and
+    each telescopes -- the differential to the final margin, and our own bank to
+    the terminal bank less the ``STARTING_MONEY`` both farms open on.
+
+    The potentials do *not* get that treatment and are stored one row per turn,
+    undifferenced and terminal-free. The season's score is each seat's ``money``
+    and nothing else, so whatever is still in the shed at the horizon is worth
+    zero -- and a potential that said otherwise would be paying for the one
+    endpoint the agent controls. See the module docstring.
 
     Args:
         stream: One seat's decisions and the two money series it saw.
@@ -723,6 +763,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         values=torch.cat([turn.value for turn in turns]),
         rewards=_differences(margins),
         own=_differences(banks),
+        potentials=torch.tensor(stream.potentials, dtype=torch.float32),
         dones=dones,
         final_margin=margins[-1],
         final_bank=_bank(terminal),

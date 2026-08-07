@@ -43,6 +43,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, potential
 from kaggriculture.learn.rollout import Trajectory, rollout, rollout_many
 
 # Far enough in that the two farms have diverged. The opening position is
@@ -243,6 +244,14 @@ def test_the_recorded_state_is_the_state_the_action_was_taken_from(
     assert int((trajectory.unit_actions[DIVERGED] != IGNORE).sum()) == unit_count(
         observation, 0
     )
+    # The potentials have to be on the same clock as everything else, and they
+    # are the one array where being one row long makes an off-by-one look like a
+    # correct shape. Replaying to this turn and recomputing the potential from
+    # the position it arrives at is the only check that says row `t` is the
+    # state turn `t` acted from, rather than the state it produced.
+    assert trajectory.potentials[DIVERGED].tolist() == pytest.approx(
+        potential(observation)
+    )
 
 
 def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
@@ -310,6 +319,12 @@ def test_every_tensor_covers_the_same_turns(trajectory: Trajectory) -> None:
     assert trajectory.log_probs.shape == (turns,)
     assert trajectory.values.shape == (turns,)
     assert trajectory.dones.shape == (turns,)
+    # One row per acting turn and no terminal row. The natural thing here is
+    # the shape `advantages` asks for -- one longer, holding the state after
+    # the last action -- and it is the wrong one: the potential at the state a
+    # season stops in is the one endpoint of the telescoped shaping the agent
+    # can choose, so recording it pays for ending the season holding stock.
+    assert trajectory.potentials.shape == (turns, len(POTENTIAL_COMPONENTS))
 
 
 def test_the_crew_is_padded_exactly_as_the_engine_staffs_it(
@@ -476,6 +491,13 @@ def test_self_play_records_both_seats_and_only_one_series_negates() -> None:
     ours, theirs = trajectories
     assert torch.equal(ours.rewards, -theirs.rewards)
     assert not torch.equal(ours.own, -theirs.own)
+    # Neither does the potential, and it must not: it is read from
+    # `observation["private"]`, which the engine hands only to the seat it
+    # belongs to. A potential computed from seat 0's observation for both
+    # trajectories would be identical here and would train seat 1 on seat 0's
+    # shed -- and, since both seats of a mirror play similarly, would look
+    # entirely plausible in the charts.
+    assert not torch.equal(ours.potentials, theirs.potentials)
     assert ours.final_margin == -theirs.final_margin
     assert ours.final_bank - theirs.final_bank == pytest.approx(ours.final_margin)
     assert ours.illegal == 0 and theirs.illegal == 0

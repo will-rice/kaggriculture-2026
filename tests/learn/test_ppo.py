@@ -39,15 +39,19 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import (
     KL_STEPS,
+    PROGRESS_HOLD,
+    PROGRESS_STEPS,
     PpoConfig,
     advantages,
     flatten,
     joint_log_prob,
     kl_weight,
     policy_loss,
+    progress_weight,
     reward_of,
     update,
 )
+from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, progress_reward
 from kaggriculture.learn.rollout import Trajectory
 
 # The crew a synthetic turn is staffed with. Fewer than MAX_UNITS on purpose --
@@ -134,18 +138,180 @@ def test_the_differential_weight_chooses_which_reward_is_climbed() -> None:
     each to equal the series it names. The synthetic trajectory's two series are
     independent draws, so a blend that returned either one unconditionally, or
     their sum, fails.
+
+    Taken at ``progress=0.0`` so that this test says what it is named for and
+    nothing else; the progress term has its own tests below.
     """
     policy = _policy(seed=0)
     trajectory = _trajectory(policy, turns=6, seed=3)
 
-    relative = reward_of(trajectory, 1.0)
-    absolute = reward_of(trajectory, 0.0)
-    half = reward_of(trajectory, 0.5)
+    relative = reward_of(trajectory, PpoConfig(differential=1.0, progress=0.0))
+    absolute = reward_of(trajectory, PpoConfig(differential=0.0, progress=0.0))
+    half = reward_of(trajectory, PpoConfig(differential=0.5, progress=0.0))
 
     assert torch.equal(relative, trajectory.rewards)
     assert torch.equal(absolute, trajectory.own)
     assert not torch.allclose(relative, absolute)
     assert torch.allclose(half, (trajectory.rewards + trajectory.own) / 2)
+
+
+def test_the_progress_term_reaches_the_reward_and_its_weight_removes_it() -> None:
+    """The shaping knob has to reach the advantage, or the whole change is inert.
+
+    The failure this catches is the one that costs a run rather than a test: a
+    ``reward_of`` that computed the progress term and dropped it, or a
+    ``flatten`` that read the money series alone, would leave every logged
+    number finite and plausible -- the potentials would still be recorded, the
+    components would still be charted, and the gradient would still be the
+    sparse one the plateau was measured on.
+
+    Asserted in both directions. At weight 0 the reward is exactly the money
+    reward, so the term is genuinely removable and the schedule that decays it
+    means something; at weight 1 it is the money reward plus exactly
+    ``progress_reward``, so the term is added rather than blended -- a blend
+    would shrink the money half and is the other plausible implementation.
+    """
+    policy = _policy(seed=0)
+    trajectory = _trajectory(policy, turns=6, seed=3)
+    off = PpoConfig(differential=0.0, progress=0.0)
+    on = PpoConfig(differential=0.0, progress=1.0)
+
+    assert torch.equal(reward_of(trajectory, off), trajectory.own)
+    assert torch.allclose(
+        reward_of(trajectory, on),
+        trajectory.own + progress_reward(trajectory.potentials, on.gamma),
+    )
+    assert not torch.allclose(reward_of(trajectory, on), reward_of(trajectory, off))
+
+
+def test_the_progress_term_cannot_be_farmed_by_any_cycle() -> None:
+    """A potential pays for where you end up, never for how many times you got there.
+
+    This is the property the whole design rests on, and it is the one the brief
+    names as the failure mode: an agent that maximises the shaped term without
+    banking. Under ``gamma * P(s') - P(s)`` that is not a thing an agent can
+    choose to do, because the shaped return over a sequence of states depends
+    only on its endpoints -- so a policy that plants and digs a tile a hundred
+    times collects exactly what a policy that never touched it collects.
+
+    Checked by construction rather than by assertion about a run: a season is
+    built that returns to its opening state, and a second one that visits ten
+    times as many intermediate states on the way to the same place. At
+    ``gamma == 1`` both return exactly zero.
+
+    The ``gamma < 1`` half is the other half of the property and is why the
+    checks are separate. The real discount is 0.999, and under it the *longer*
+    cycle pays strictly less than the shorter one: holding stock costs
+    ``(1 - gamma)`` of its value every turn it is held, so churn is not merely
+    unprofitable but charged rent. An implementation that dropped the ``gamma``
+    -- the defect this project already documented in its own differential
+    reward -- passes the first check and fails this one.
+    """
+    opening = torch.full((1, len(POTENTIAL_COMPONENTS)), 50.0)
+    short = torch.cat(
+        [opening, torch.full((4, len(POTENTIAL_COMPONENTS)), 900.0), opening]
+    )
+    long = torch.cat(
+        [opening, torch.full((40, len(POTENTIAL_COMPONENTS)), 900.0), opening]
+    )
+
+    # Both episodes stop in the state they opened in, so the shaped return is
+    # the constant the telescope leaves behind -- the terminal zero less the
+    # opening potential -- and it is the *same* constant for both, however many
+    # states the long one visited on the way.
+    settled = -float(opening.sum())
+
+    assert float(progress_reward(short, gamma=1.0).sum()) == pytest.approx(settled)
+    assert float(progress_reward(long, gamma=1.0).sum()) == pytest.approx(settled)
+    assert float(progress_reward(long, gamma=0.999).sum()) < float(
+        progress_reward(short, gamma=0.999).sum()
+    )
+    assert float(progress_reward(short, gamma=0.999).sum()) < settled
+
+
+def test_a_season_that_ends_holding_stock_does_not_out_score_one_that_sold_it() -> None:
+    """The reward must not pay for hoarding, and this is where it nearly did.
+
+    The shaped return over an episode telescopes to
+    ``gamma**N * P(s_N) - P(s_0)``. The opening term is a constant and harmless.
+    The *closing* one is a function of the state the agent chose to stop in, so
+    Grze&#347; (AAMAS 2017, Eq. 3) requires the potential at a trajectory's stopping
+    state to be zero -- otherwise, in his words, "this term can modify the
+    policy".
+
+    Un-zeroed it modifies it in exactly the direction this project keeps
+    failing in. A unit held to the horizon returns ``gamma ** (N - t)`` of its
+    base price, which at 0.999 over a 719-turn season is 90% from turn 619 and
+    98% from turn 700 -- so once both farms have pushed the market below base
+    by selling into it, *not selling* becomes the shaped-optimal play for the
+    last quarter of every episode. The shed fills, the bank stays flat, and
+    every chart looks like the shaping is working.
+
+    Asserted behaviourally rather than by inspecting the terminal row, which
+    would only restate the implementation. Two episodes, identical up to the
+    turn where a full shed is either sold at a 10% discount to base or held to
+    the horizon. Selling has to win. With the terminal potential carried it
+    loses 90 to 100, which is the whole failure in two numbers.
+    """
+    full = [25.0] * len(POTENTIAL_COMPONENTS)
+    empty = [0.0] * len(POTENTIAL_COMPONENTS)
+    held = torch.tensor([empty, full, full, full])
+    sold = torch.tensor([empty, full, empty, empty])
+    # Sold on turn 1 for 10% under base, which is the sort of quote a market
+    # both farms are selling into gives back. The hoarding incentive has to be
+    # worth less than that discount, or the agent is right to sit on the shed.
+    takings = torch.tensor([0.0, 0.9 * sum(full), 0.0, 0.0])
+
+    for gamma in (1.0, 0.999):
+        selling = _discounted(takings + progress_reward(sold, gamma), gamma)
+        hoarding = _discounted(progress_reward(held, gamma), gamma)
+
+        assert selling > hoarding
+
+
+def _discounted(rewards: torch.Tensor, gamma: float) -> float:
+    """Return the discounted sum of a reward series, which is what PPO climbs."""
+    return float((rewards * gamma ** torch.arange(len(rewards))).sum())
+
+
+def test_the_progress_term_refuses_a_series_that_is_not_turn_major() -> None:
+    """One row per acting turn, and no terminal row -- an extra row is off by one.
+
+    The terminal zero belongs to ``progress_reward`` and is appended there, so a
+    caller handing over a state-major array with the terminal already in it is
+    both one turn too long and reintroducing the hoarding incentive. Raising
+    here names the array that is wrong; letting it through would produce one
+    reward too many and fail somewhere else entirely.
+    """
+    with pytest.raises(ValueError, match="no terminal row"):
+        progress_reward(torch.zeros(6), gamma=1.0)
+    with pytest.raises(ValueError, match="no terminal row"):
+        progress_reward(torch.zeros(6, len(POTENTIAL_COMPONENTS) + 1), gamma=1.0)
+
+
+def test_the_progress_weight_holds_then_falls_to_zero() -> None:
+    """A curriculum term has to be at full strength while the chain is unlearned.
+
+    The difference from ``kl_weight``, and the reason it is not the same
+    function: the teacher penalty starts relaxing on update 1, while this one
+    must not. A schedule that began decaying immediately would be weakest
+    exactly where the policy still cannot bank, which is the condition the term
+    exists for.
+
+    ``== 0.0`` exactly at the end, for the same reason the teacher penalty's
+    test demands it: a term that is still shaping on the last update of the run
+    has not been shown to work without the shaping.
+    """
+    assert progress_weight(step=0) == progress_weight(step=PROGRESS_HOLD) == 1.0
+    assert 1.0 > progress_weight(step=(PROGRESS_HOLD + PROGRESS_STEPS) // 2) > 0.0
+    assert progress_weight(step=PROGRESS_STEPS) == 0.0
+    assert progress_weight(step=PROGRESS_STEPS * 10) == 0.0
+
+
+def test_the_progress_weight_refuses_a_schedule_with_no_ramp() -> None:
+    """``hold >= steps`` is a cliff, not a decay, and would divide by zero saying so."""
+    with pytest.raises(ValueError, match="ramp"):
+        progress_weight(step=0, hold=200, steps=200)
 
 
 def test_the_shaped_reward_survives_a_zero_sum_batch() -> None:
@@ -167,11 +333,25 @@ def test_the_shaped_reward_survives_a_zero_sum_batch() -> None:
     ours = _trajectory(policy, turns=6, seed=4)
     theirs = dataclasses.replace(ours, rewards=-ours.rewards)
 
-    relative = flatten([ours, theirs], PpoConfig(differential=1.0))
-    absolute = flatten([ours, theirs], PpoConfig(differential=0.0))
+    # Progress off throughout, so this test measures the cancellation it is
+    # named for. The progress term is not zero-sum -- both seats build their own
+    # pipeline -- so leaving it on would keep the spread alive for a reason that
+    # has nothing to do with `differential`, which is what is under test.
+    relative = flatten([ours, theirs], PpoConfig(differential=1.0, progress=0.0))
+    absolute = flatten([ours, theirs], PpoConfig(differential=0.0, progress=0.0))
 
-    assert float(reward_of(ours, 1.0).sum() + reward_of(theirs, 1.0).sum()) == 0.0
-    assert float(reward_of(ours, 0.0).sum() + reward_of(theirs, 0.0).sum()) != 0.0
+    zero_sum = PpoConfig(differential=1.0, progress=0.0)
+    absolute_only = PpoConfig(differential=0.0, progress=0.0)
+    assert float(
+        reward_of(ours, zero_sum).sum() + reward_of(theirs, zero_sum).sum()
+    ) == pytest.approx(0.0)
+    assert (
+        float(
+            reward_of(ours, absolute_only).sum()
+            + reward_of(theirs, absolute_only).sum()
+        )
+        != 0.0
+    )
     assert relative.returns.std() > 0.0
     assert absolute.returns.std() > 0.0
 
@@ -278,7 +458,11 @@ def test_gae_never_runs_across_an_episode_boundary() -> None:
     policy = _policy(seed=0)
     first = _trajectory(policy, turns=4, seed=3)
     second = _trajectory(policy, turns=4, seed=4)
-    config = PpoConfig(gamma=1.0, lam=1.0)
+    # Progress off, so the target is the reward-to-go of the series this
+    # test names. With it on the target is the reward-to-go of the money
+    # reward *plus* the shaped one, which is correct and is tested
+    # elsewhere, and would make this assertion about two things at once.
+    config = PpoConfig(gamma=1.0, lam=1.0, progress=0.0)
 
     rows = flatten([first, second], config)
 
@@ -310,7 +494,11 @@ def test_the_value_target_is_the_scaled_reward_to_go() -> None:
     scaling them would leave a residue of ``V`` behind in the target.
     """
     trajectory = _trajectory(_policy(seed=0), turns=6, seed=5)
-    config = PpoConfig(gamma=1.0, lam=1.0)
+    # Progress off, so the target is the reward-to-go of the series this
+    # test names. With it on the target is the reward-to-go of the money
+    # reward *plus* the shaped one, which is correct and is tested
+    # elsewhere, and would make this assertion about two things at once.
+    config = PpoConfig(gamma=1.0, lam=1.0, progress=0.0)
 
     rows = flatten([trajectory], config)
 
@@ -387,6 +575,12 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
     # blends the two, and a synthetic trajectory whose halves were proportional
     # could not tell a blend that ignores one of them from one that does not.
     own = torch.randn(turns) * 100.0
+    # A third, independent series: the potential at each state the policy acted
+    # from, with no terminal row -- `progress_reward` supplies the terminal zero
+    # itself, and there is nowhere here to put a different one. Positive because
+    # a potential is a coin value of stock on hand and cannot be negative, so a
+    # sign error in `progress_reward` has somewhere to show.
+    potentials = torch.rand(turns, len(POTENTIAL_COMPONENTS)) * 100.0
     return Trajectory(
         board=board,
         scalars=scalars,
@@ -399,6 +593,7 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         values=values,
         rewards=rewards,
         own=own,
+        potentials=potentials,
         dones=dones,
         final_margin=float(rewards.sum()),
         final_bank=STARTING_MONEY + float(rewards.sum()),
