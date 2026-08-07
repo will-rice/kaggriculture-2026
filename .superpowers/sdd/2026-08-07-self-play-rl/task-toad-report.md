@@ -151,6 +151,58 @@ teacher; there is no shortcut and no external checkpoint to borrow.
 256 channels; theirs is 8-24 blocks × `hidden_dim: 128`. Matching their recipe means changing width as
 well as depth.
 
+## 3b. Second pass: the loss and the reward are built; the run is not
+
+Added after the coordinator confirmed both corrections and asked for phase 1 to be run.
+
+**Built and tested (`25a53ce`):**
+
+- `src/kaggriculture/learn/toad_loss.py` — their loss composition, transcribed from
+  `monobeast.py:355-425` with their line numbers quoted at each step, calling the vendored
+  `vtrace`/`upgo`/`td_lambda` unmodified. Three separate return computations, as theirs has: V-trace for
+  the policy gradient, TD(λ) for the baseline, UPGO for the second policy gradient with clipped
+  importance weights.
+- `src/kaggriculture/learn/toad_reward.py` — the section-2 mapping, with the `/500.` normaliser.
+- 14 tests, all passing.
+
+**Two findings from writing them:**
+
+1. **`flags.baseline_cost` is dead code in their learner.** It appears in every config at `1.` but is
+   never read by the loss — only `teacher_baseline_cost` is (`monobeast.py:405`). The baseline enters
+   unweighted. Harmless at `1.`, but anyone "restoring" it as a tunable would be inventing a knob.
+2. **The second divisor is a no-op for phase 1.** `reward_spaces_lux.py:227` divides by
+   `500. * max(positive_weight, negative_weight)`; both weights default to `1.`
+   (`reward_spaces_lux.py:150-151`) and phase 1's `reward_space_kwargs` sets only `step`, so `max(1,1)=1`
+   and `/500.` alone is correct here. It would stop being a no-op in any phase that sets those weights.
+
+**A guard that did not discriminate, and now does.** The first version of the reward tests stated every
+expectation as `STEP_WEIGHT / NORMALISER` — i.e. in terms of the constants under test. Setting
+`NORMALISER = 500.0 → 1.0` left all five green. They now pin the published numbers as bare literals;
+the same break turns two tests red. Recorded because the vacuous version looked like a thorough test file
+and would have shipped.
+
+**Not run.** There is still no training loop, therefore still no bank. What remains:
+
+- Per-turn shaped reward must be threaded through `rollout.py`, which currently records only bank
+  differential and own bank. `Stream` needs the five counts per turn; `toad_reward.StatefulMultiReward`
+  then consumes them. This is the last correctness-critical seam and is not written.
+- A phase-1 script: Adam(1e-4, eps 3e-4), `min_lr_mod` 0.01 decay, `unroll_length` 16, `reduction: sum`,
+  to 2e7 steps, checkpointing bank at intervals.
+- The actor/learner lag that gives V-trace something to correct. Monobeast gets it from async mp queues;
+  a synchronous stand-in (actor weights synced every *k* updates) preserves the loss exactly and must be
+  named as a deviation — **D7**, below.
+- The unit head can keep their structure per the coordinator's ruling: a per-tile 1×1 conv gathered at
+  unit positions, which our `model.py` already does. The market head stays non-spatial and is **ours,
+  not theirs** — **D8**.
+
+**D7 — synchronous actor/learner instead of monobeast's multiprocessing queues.** Same loss, same
+off-policy correction; the staleness distribution differs. Low risk to the method, but if actor and
+learner are never out of sync the importance ratios are identically 1, V-trace silently degenerates to
+TD, and the UPGO term loses its clipping — a reproduction failure that looks like a working run.
+
+**D8 — the market head has no Lux analogue and is our addition.** Kept structurally separate from the
+vendored actor rather than restructuring theirs to accommodate it, so the seam stays visible.
+
 ## 4. What is not done, and what it would take
 
 Done and committed:
