@@ -203,6 +203,55 @@ TD, and the UPGO term loses its clipping — a reproduction failure that looks l
 **D8 — the market head has no Lux analogue and is our addition.** Kept structurally separate from the
 vendored actor rather than restructuring theirs to accommodate it, so the seam stays visible.
 
+## 3c. Third pass: phase 1 runs
+
+### The most important correction in this whole report: `clip_grads: 10.0`
+
+**The five phase YAMLs are not a complete recipe.** `monobeast.py:502-505` clips the global gradient norm
+before every optimizer step:
+
+```
+total_loss.backward()
+if flags.clip_grads is not None:
+    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), flags.clip_grads)
+optimizer.step()
+```
+
+`clip_grads` appears in **none** of `conf/conv_phase{1..5}*.yaml`. It appears in the run config saved
+beside each trained checkpoint under `internal_testing/`, and **all eight of those read `clip_grads: 10.0`**
+(e.g. `internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml:53`).
+
+I missed it, launched without it, and the run diverged to a **total loss of 6.2e20 within two updates**.
+That is not a subtle degradation — with `reduction: sum` over a joint log-probability across ~41 decisions
+a turn, it is immediate. Anyone reproducing this recipe from the phase configs alone will hit the same
+wall, and the briefing analysis did not mention it.
+
+This is also the third value the analysis omitted, after `/500.` and the phase-1 `teacher_kl_cost: 0.`.
+The pattern is consistent: **the analysis captured the phase YAMLs and nothing outside them.**
+
+### Two further infidelities the first launch exposed
+
+Both now fixed, both worth recording because each would have produced a plausible-looking but wrong run:
+
+1. **The learner batch is four 16-step unrolls, not the collection round.** I had originally stacked every
+   segment of a round into one forward and taken a single optimizer step on all of it. That is a different
+   algorithm — a different effective learning rate and a different gradient — and their `batch_size: 4`
+   (`conv_phase1_shaped_reward.yaml:36`) says so plainly. It also OOMed at 34k rows, which is how it was
+   caught. One optimizer step now sees 16 × 4 = 64 transitions, so the round produces ~528 steps, i.e.
+   one update per 64 environment steps — the same ratio monobeast's actors feed its learner at.
+2. **Torch must be pinned to one thread per worker.** Twelve workers each defaulting to a 64-wide thread
+   pool drove load average past 230 and the first round never finished. `selfplay.py:509` already does
+   this; I had not. Not a correctness bug, but it is the difference between a run and a hang.
+
+The GPU is also chosen by free memory rather than hardcoded — the cards are shared with another run, and
+the first attempt died on one that was already 18.6 GiB full.
+
+**Throughput is the binding constraint.** The engine is single-threaded Python and the rollout is
+env-bound, not network-bound, so the GPUs do not help collection. Round latency is ~719 sequential turns
+regardless of worker count; parallelism buys episodes per round, not shorter rounds. 2e7 steps is not
+reachable in the time available here, so the numbers below are a **partial run** and are labelled
+provisional throughout.
+
 ## 4. What is not done, and what it would take
 
 Done and committed:
