@@ -386,6 +386,42 @@ regardless of worker count; parallelism buys episodes per round, not shorter rou
 reachable in the time available here, so the numbers below are a **partial run** and are labelled
 provisional throughout.
 
+## 3d. Reading the finished run
+
+Phase 1 is running detached (`nohup`, pid 2229773) and writes one JSON line per update to
+`/data/kaggriculture/toad/phase1_1786139116.jsonl`. It survives the session that launched it. At the
+measured 3.97M steps/hour it reaches `TOTAL_STEPS = 2e7` in ~5.0 hours, at roughly update 580.
+
+To read the result:
+
+```
+cat /data/kaggriculture/toad/phase1_1786139116.jsonl | python3 -c "
+import sys, json
+rows = [json.loads(l) for l in sys.stdin]
+for r in rows[::25]:
+    print('steps %8d  h %.2f  bank %8.1f (max %8.1f)  shaped %.5f' % (
+        r['steps'], r['hours'], r['bank_mean'], r['bank_max'], r['shaped_mean']))"
+```
+
+**The go/no-go number is `bank_mean` at `steps >= 2e7`**, against the ~21,000 shaped-PPO plateau and the
+125,773 corpus median. Nothing before that is a verdict on the recipe — bank was still ~0 at 1.0M steps
+(5.2%), which is neither surprising nor informative.
+
+**What would make the result trustworthy, and what would not:**
+
+- `shaped_mean` rising is the live signal that learning is happening at all. It ran 0.01061 (first five
+  updates) to ~0.0111 by update 30. If it goes flat for a long stretch while bank stays 0, the run has
+  stalled and the remaining hours are wasted.
+- `baseline` must stay small (it is ~1e-4). If it climbs by orders of magnitude the value head has come
+  unbound again and everything after that point is void.
+- `illegal` must stay 0. It is the encoder's own audit, and a non-zero value invalidates the trajectories.
+- A bank that rises while `shaped_mean` does not is the suspicious case, not the encouraging one.
+
+**If bank is still ~0 at 2e7, that is the valuable result**, and D1 is the first thing to look at: no
+component of Toad's shaped reward pays for selling well, and price × quantity is what banks coins here. The
+recommended next step in that case is not to tune this run but to add a market/pricing reward as a declared
+extension, having established what the unmodified recipe does.
+
 ## 4. What is not done, and what it would take
 
 Done and committed:
