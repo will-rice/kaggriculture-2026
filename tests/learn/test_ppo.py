@@ -1,0 +1,385 @@
+"""Tests for the PPO update.
+
+Nothing here plays an episode. A rollout costs 17 seconds and every property
+this file guards -- the advantage recursion, the clip, the decay, which mask the
+ratio is taken under, which slots the padding excludes -- is a property of the
+arithmetic and is visible on six synthetic turns. ``tests/learn/test_rollout.py``
+is where the real environment is exercised.
+
+The synthetic trajectories are built the way ``rollout`` builds real ones: a
+random mask that always leaves option 0 legal, an action drawn from what that
+mask permits, and a log-probability read off the masked log-softmax of the same
+policy that will later be asked to reproduce it. That last step is what makes
+``ratio == 1`` a meaningful assertion rather than a tautology -- the stored
+number came from a distribution, not from a constant.
+
+The masks are random rather than realistic on purpose. A realistic mask is one
+the update could plausibly have rederived from the board; a random one is not,
+so a ratio that comes out at 1 against it can only have been computed under the
+mask that was stored.
+"""
+
+import copy
+import dataclasses
+
+import pytest
+import torch
+
+from kaggriculture.learn.encoding import (
+    BOARD,
+    IGNORE,
+    MARKET_SLOTS,
+    MAX_UNITS,
+    QUANTITIES,
+    SCALARS,
+    TILE_PLANES,
+    UNIT_OPS,
+)
+from kaggriculture.learn.model import Policy
+from kaggriculture.learn.ppo import (
+    PpoConfig,
+    advantages,
+    flatten,
+    joint_log_prob,
+    kl_weight,
+    policy_loss,
+    update,
+)
+from kaggriculture.learn.rollout import Trajectory
+
+# The crew a synthetic turn is staffed with. Fewer than MAX_UNITS on purpose --
+# most slots of most real turns hold nobody, which is the whole reason the
+# padding has to be excluded -- and more than one, so "the padded slots" and
+# "every slot but the first" are different sets and a test cannot pass by
+# confusing them.
+CREW = 3
+
+# One update, one minibatch, so every metric returned is measured on the
+# policy exactly as it was handed in rather than after some earlier minibatch
+# has already moved it.
+ONE_STEP = PpoConfig(epochs=1, minibatch=64)
+
+
+def test_advantages_sum_toward_the_return() -> None:
+    """GAE with lambda=1 and gamma=1 is the Monte Carlo advantage."""
+    rewards = torch.ones(5)
+    values = torch.zeros(6)
+
+    computed = advantages(rewards, values, gamma=1.0, lam=1.0)
+
+    assert computed[0] == pytest.approx(5.0)
+
+
+def test_the_clip_bounds_the_step() -> None:
+    """PPO's whole safety property: one batch cannot move the policy far."""
+    ratio = torch.tensor([10.0])
+    advantage = torch.tensor([1.0])
+
+    loss = policy_loss(ratio, advantage, clip=0.2)
+
+    assert loss == pytest.approx(-1.2)
+
+
+def test_the_clip_does_not_shelter_a_bad_action() -> None:
+    """The clip is a bound on optimism, not an amnesty on a mistake.
+
+    The test above is satisfied by the clipped term alone, because with a
+    positive advantage the minimum *is* the clipped one. Flip the advantage and
+    the two part company: an action the new policy has made ten times more
+    likely and that turned out to be bad must be pulled back by its full
+    unclipped weight, and a loss built from ``clamp`` without the ``min`` would
+    cap the correction at 1.2 and leave the policy holding it.
+    """
+    loss = policy_loss(torch.tensor([10.0]), torch.tensor([-1.0]), clip=0.2)
+
+    assert loss == pytest.approx(10.0)
+
+
+def test_the_teacher_penalty_falls_to_zero() -> None:
+    """It exists to survive the first updates, not to pin us to a weak clone."""
+    assert kl_weight(step=0) > kl_weight(step=1000) > kl_weight(step=10_000)
+    assert kl_weight(step=10_000) == pytest.approx(0.0, abs=1e-3)
+
+
+def test_the_ratio_is_taken_under_the_stored_mask() -> None:
+    """``exp(new - old)`` is an importance weight only over one support.
+
+    The masks below are random, so no rule could rederive them from the board:
+    if the update gated the fresh logits with anything other than the mask
+    stored beside the action -- a mask recomputed from the observation, a mask
+    of all-True, the teacher's own -- ``new`` would be a log-probability of a
+    different distribution than ``old``, the ratio would not be 1 for a policy
+    nobody has touched, and nothing in the loss would raise.
+
+    The second half is what stops the first half being satisfied by an update
+    that ignores the stored log-probability altogether: shift ``old`` by a
+    known amount and the ratio has to move by exactly ``exp`` of it.
+    """
+    policy = _policy(seed=0)
+    trajectory = _trajectory(policy, turns=6, seed=1)
+
+    metrics = _metrics(policy, trajectory)
+    shifted = dataclasses.replace(trajectory, log_probs=trajectory.log_probs + 0.5)
+    moved = _metrics(policy, shifted)
+
+    assert float(trajectory.unit_masks.float().mean()) < 0.7
+    assert float(trajectory.market_masks.float().mean()) < 0.7
+    assert metrics["ratio"] == pytest.approx(1.0, abs=1e-4)
+    assert moved["ratio"] == pytest.approx(float(torch.tensor(-0.5).exp()), abs=1e-4)
+
+
+def test_padded_unit_slots_contribute_nothing() -> None:
+    """A padded slot holds no decision, and three terms must all agree on that.
+
+    ``rollout`` marks the slots no unit stood in with ``IGNORE``, the same
+    sentinel ``encode_units`` writes and ``train.unit_loss`` masks on. The
+    stored mask on those slots is still a real tensor, so the way to ask
+    whether they are being scored is to change it: narrow every padded slot down
+    to PASS alone and see whether the policy loss, the entropy bonus or the
+    teacher KL notices. None of them may.
+
+    The same narrowing applied to the slots that *do* hold a unit moves all
+    three, which is what keeps this from passing on an update that ignores the
+    masks entirely -- and it is the assertion the earlier padding test in this
+    project was missing, when it asserted PyTorch's default ``ignore_index``
+    rather than our own code and passed with the argument deleted.
+
+    Every metric is checked finite first. The masks here forbid roughly half of
+    every row, so any term that sums ``0 * -inf`` over the illegal options --
+    the entropy bonus and the teacher KL both would, written the obvious way --
+    returns NaN, and two NaNs compare unequal, which would turn the comparisons
+    below into a test that passes on a broken update.
+    """
+    policy = _policy(seed=0)
+    trajectory = _trajectory(policy, turns=6, seed=2)
+    padded = trajectory.unit_actions == IGNORE
+
+    baseline = _metrics(policy, trajectory)
+    ignored = _metrics(policy, _narrowed(trajectory, padded))
+    noticed = _metrics(policy, _narrowed(trajectory, ~padded))
+
+    assert torch.isfinite(torch.tensor(list(baseline.values()))).all()
+    for key in ("loss/policy", "entropy", "kl"):
+        assert ignored[key] == pytest.approx(baseline[key], abs=1e-5)
+        assert noticed[key] != pytest.approx(baseline[key], abs=1e-3)
+
+
+def test_a_padded_slot_survives_a_mask_that_forbids_its_clamped_option() -> None:
+    """``IGNORE`` clamps onto option 0, and option 0 is not legal by decree.
+
+    ``mask.unit_mask`` keeps PASS alive on padded slots today, so the gathered
+    log-probability there is finite today, and nothing enforces that beyond one
+    function's current behaviour. The moment a padded row forbids option 0 the
+    gather returns ``-inf``, and excluding it by multiplying through a float
+    mask -- the obvious way to write this -- makes ``0 * -inf`` NaN in the
+    forward pass and NaN in *every* gradient in the batch on the way back. One
+    update destroys the weights, and it looks like a loss that went to NaN on a
+    day nobody touched the loss.
+    """
+    logits = torch.randn(1, 2, len(UNIT_OPS), requires_grad=True)
+    mask = torch.ones(1, 2, len(UNIT_OPS), dtype=torch.bool)
+    mask[0, 1, 0] = False
+    units = torch.log_softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
+    market = torch.log_softmax(torch.zeros(1, 1, len(QUANTITIES)), dim=-1)
+
+    joint = joint_log_prob(
+        units, market, torch.tensor([[0, IGNORE]]), torch.tensor([[0]])
+    )
+    gradient = torch.autograd.grad(joint.sum(), logits)[0]
+
+    assert torch.isfinite(joint).all()
+    assert torch.isfinite(gradient).all()
+
+
+def test_gae_never_runs_across_an_episode_boundary() -> None:
+    """One season's opening advantage must not bootstrap off another's close.
+
+    With ``gamma`` and ``lam`` at 1 the recursion telescopes, so the value
+    target on an episode's first turn is exactly that episode's total reward.
+    An update that concatenated the batch and then took GAE once over the whole
+    block would put both episodes' rewards there instead, and the number would
+    still be finite, still be the right shape, and still train.
+    """
+    policy = _policy(seed=0)
+    first = _trajectory(policy, turns=4, seed=3)
+    second = _trajectory(policy, turns=4, seed=4)
+    config = PpoConfig(gamma=1.0, lam=1.0)
+
+    rows = flatten([first, second], config)
+
+    assert float(second.rewards.sum()) != pytest.approx(0.0, abs=1e-3)
+    assert rows.returns[0] == pytest.approx(
+        float(first.rewards.sum()) * config.reward_scale, abs=1e-4
+    )
+    assert rows.returns[4] == pytest.approx(
+        float(second.rewards.sum()) * config.reward_scale, abs=1e-4
+    )
+
+
+def test_the_value_target_is_the_scaled_reward_to_go() -> None:
+    """What the value head is asked to predict, and in what units.
+
+    A bank differential is thousands of coins, and regressed raw the value term
+    is seven orders of magnitude above the policy loss -- measured on a real
+    episode, ``0.5 * 13,089`` against ``-0.0011`` -- so ``max_grad_norm``
+    renormalises a gradient that is essentially all value head and the policy
+    stops moving. ``reward_scale`` puts the target in units of the opening bank
+    instead.
+
+    At ``gamma`` and ``lam`` of 1 the stored values cancel out of the target
+    exactly, leaving the scaled reward-to-go and nothing else -- which is what
+    makes this an assertion about the scaling rather than about the network.
+    It fails if the scale is not applied, if it is applied twice, and if it is
+    applied to ``Trajectory.values`` as well: those are the value head's own
+    outputs, already in whatever units it is being asked to predict, and
+    scaling them would leave a residue of ``V`` behind in the target.
+    """
+    trajectory = _trajectory(_policy(seed=0), turns=6, seed=5)
+    config = PpoConfig(gamma=1.0, lam=1.0)
+
+    rows = flatten([trajectory], config)
+
+    to_go = torch.flip(torch.cumsum(torch.flip(trajectory.rewards, [0]), 0), [0])
+
+    assert float(trajectory.values.abs().min()) > 1e-3
+    assert torch.allclose(rows.returns, to_go * config.reward_scale, atol=1e-4)
+
+
+def test_a_bootstrap_is_required_rather_than_assumed() -> None:
+    """A same-length pair shifts every advantage by a turn and never raises."""
+    with pytest.raises(ValueError, match="one longer"):
+        advantages(torch.ones(5), torch.zeros(5), gamma=1.0, lam=1.0)
+
+
+def _policy(seed: int) -> Policy:
+    """Return a small seeded policy.
+
+    One block at 32 channels rather than the shipped 8x256. ``ppo`` reads every
+    shape it needs from ``encoding``'s constants and nothing from ``model``'s
+    ``BLOCKS`` or ``CHANNELS``, so this exercises the identical code path;
+    ``tests/learn/test_model.py`` is where the shipped trunk is pinned.
+    """
+    torch.manual_seed(seed)
+    return Policy(blocks=1, channels=32).eval()
+
+
+def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
+    """Return a synthetic episode, stored the way ``rollout`` stores a real one.
+
+    The masks are random with option 0 forced legal -- ``UNIT_OPS[0]`` is
+    ``PASS`` and ``QUANTITIES[0]`` is "trade nothing", the two the engine never
+    refuses -- so no row is ever entirely False, which is the condition
+    ``-inf`` masking needs to avoid softmaxing a row to NaN.
+
+    The action is drawn from what the mask permits and the stored log-prob is
+    read off the same masked distribution, so ``illegal`` would be zero and the
+    ratio recomputed against these tensors is 1 for an unchanged policy.
+
+    Args:
+        policy: The behaviour policy, whose log-probs and values are stored.
+        turns: How many decisions the episode holds.
+        seed: Fixes the boards, masks and actions.
+
+    Returns:
+        The ``Trajectory``.
+    """
+    torch.manual_seed(seed)
+    board = torch.randn(turns, TILE_PLANES, BOARD, BOARD)
+    scalars = torch.randn(turns, SCALARS)
+    positions = torch.randint(0, BOARD * BOARD, (turns, MAX_UNITS))
+    unit_masks = _mask(turns, MAX_UNITS, len(UNIT_OPS))
+    market_masks = _mask(turns, len(MARKET_SLOTS) + 2, len(QUANTITIES))
+
+    with torch.no_grad():
+        unit_logits, market_logits, values = policy(board, scalars, positions)
+    units = torch.log_softmax(unit_logits.masked_fill(~unit_masks, -torch.inf), dim=-1)
+    market = torch.log_softmax(
+        market_logits.masked_fill(~market_masks, -torch.inf), dim=-1
+    )
+    unit_actions = torch.cat(
+        [
+            _draw(unit_masks[:, :CREW]),
+            torch.full((turns, MAX_UNITS - CREW), IGNORE, dtype=torch.int64),
+        ],
+        dim=1,
+    )
+    market_actions = _draw(market_masks)
+
+    dones = torch.zeros(turns, dtype=torch.bool)
+    dones[-1] = True
+    rewards = torch.randn(turns) * 100.0
+    return Trajectory(
+        board=board,
+        scalars=scalars,
+        positions=positions,
+        unit_actions=unit_actions,
+        market_actions=market_actions,
+        unit_masks=unit_masks,
+        market_masks=market_masks,
+        log_probs=joint_log_prob(units, market, unit_actions, market_actions),
+        values=values,
+        rewards=rewards,
+        dones=dones,
+        final_margin=float(rewards.sum()),
+        illegal=0,
+    )
+
+
+def _mask(turns: int, slots: int, options: int) -> torch.Tensor:
+    """Return a random legality mask whose every row keeps option 0."""
+    mask = torch.rand(turns, slots, options) < 0.5
+    mask[:, :, 0] = True
+    return mask
+
+
+def _draw(mask: torch.Tensor) -> torch.Tensor:
+    """Return one index per slot, drawn uniformly from the options it permits."""
+    rows = mask.flatten(0, -2).float()
+    return torch.multinomial(rows, 1).reshape(mask.shape[:-1])
+
+
+def _narrowed(trajectory: Trajectory, slots: torch.Tensor) -> Trajectory:
+    """Return the episode with the named unit slots narrowed to PASS and the action.
+
+    The chosen option is kept legal so that narrowing a slot that holds a real
+    unit changes the shape of its distribution without ever making the action
+    it took impossible -- an ``-inf`` log-probability there would drive the
+    ratio to zero and the comparison would be measuring the wrong thing.
+
+    Args:
+        trajectory: The episode to narrow.
+        slots: ``(turns, MAX_UNITS)`` bool, True where the mask is to be cut.
+
+    Returns:
+        A copy with ``unit_masks`` replaced.
+    """
+    narrow = torch.zeros_like(trajectory.unit_masks)
+    narrow[:, :, 0] = True
+    narrow.scatter_(2, trajectory.unit_actions.clamp(min=0)[:, :, None], True)
+    return dataclasses.replace(
+        trajectory,
+        unit_masks=torch.where(slots[:, :, None], narrow, trajectory.unit_masks),
+    )
+
+
+def _metrics(policy: Policy, trajectory: Trajectory) -> dict[str, float]:
+    """Return one update's metrics, leaving the caller's policy untouched.
+
+    ``update`` steps the optimiser, so the policy is copied first: every test
+    above compares two updates that must both start from identical weights.
+
+    The teacher is a *differently* seeded network. A teacher that is a copy of
+    the learner has a divergence of exactly zero from it, and every assertion
+    about the KL term would then be satisfied by an update that never computed
+    one -- which is how the first draft of this file passed while measuring
+    nothing.
+    """
+    learner = copy.deepcopy(policy)
+    return update(
+        learner,
+        _policy(seed=9),
+        torch.optim.AdamW(learner.parameters(), lr=3e-4),
+        [trajectory],
+        step=0,
+        config=ONE_STEP,
+    )
