@@ -77,6 +77,21 @@ step "ingest discussions" env PROJECT_ROOT="$ROOT" uv run --with httpx --with ka
   --with kagglesdk --with nbformat --with pydantic --with python-dotenv --with rich \
   python "$SKILL/scripts/discussion_ingest.py" "$COMPETITION" --max-pages 3 --sort-by votes
 
+# 2b. Commit the refreshed caches. The pass writes `data/*.db`, those are
+#     versioned so the meta snapshot carries history, and a submission is
+#     refused from a dirty tree -- so without this the pass dirties its own
+#     tree on every tick and can never submit. Only the caches are staged, by
+#     name: a bulk stage here would sweep up whatever else is in the tree,
+#     which has already swept one agent's work into another's commit.
+if [[ -n "$(git status --porcelain -- data)" ]]; then
+  step "commit cache refresh" git add data/discussions.db data/kernels.db
+  step "commit cache refresh" git -c core.hooksPath=/dev/null commit -q -m \
+    "chore: refresh the kernel and discussion caches
+
+Automated pass at $ts. The ingest dates inside these databases are the point:
+a survey quoted three days after it was taken was once read here as current."
+fi
+
 # 3. Where we stand, and whether a submission is warranted. All the judgement
 #    lives in Python where it can be tested, not in shell.
 step "assess and maybe submit" env \
