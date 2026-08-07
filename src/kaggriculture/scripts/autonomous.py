@@ -35,6 +35,13 @@ LOGGER = logging.getLogger(__name__)
 COMPETITION = "kaggriculture"
 DAILY_SLOTS = 5
 
+# What we last put on the ladder, recorded when we put it there. Kaggle's
+# submission description is a human-readable label that does not affect
+# scoring; reading machine state back out of it meant parsing our own prose,
+# which picks the wrong module when a sentence names two and finds nothing when
+# a human submits by hand. We control what we submit, so we record it.
+LEDGER = Path("run/autonomous/submitted.json")
+
 # Where `gate.py` records its verdict. The pass does not run the gate itself:
 # 128 seeded episodes take minutes, and a cron tick that re-gates every half
 # hour would spend the box on re-measuring something that has not changed. The
@@ -131,11 +138,20 @@ def assess(reserve: int) -> dict[str, Any]:
             f"no gate verdict for {revision}; run gate.py and record it first"
         )
         return state
-    if verdict["opponent"] != last_submitted(submissions):
+    defending = last_submitted(submissions)
+    state["defending"] = defending
+    if defending is None:
         state["reason"] = (
-            f"gate measured against {verdict['opponent']!r} but the ladder currently "
-            f"carries {last_submitted(submissions)!r}; that is not the comparison "
-            "that decides whether to replace it"
+            "the newest submission carries no agent marker, so what is on the "
+            "ladder is unknown; a gate cannot say whether to replace something "
+            "we cannot name"
+        )
+        return state
+    if verdict["opponent"] != defending:
+        state["reason"] = (
+            f"gate measured against {verdict['opponent']!r} but the ladder "
+            f"carries {defending!r}; that is not the comparison that decides "
+            "whether to replace it"
         )
         return state
     if verdict["low"] <= MIN_WIN_RATE_LOWER_BOUND:
@@ -177,17 +193,37 @@ def gate_verdict(revision: str) -> dict[str, Any] | None:
 
 
 def last_submitted(submissions: list[dict[str, Any]]) -> str | None:
-    """Return the agent module our most recent submission served.
+    """Return the agent module we last put on the ladder, or None if unknown.
 
-    Read from the description we wrote at submission time. A gate against an
-    opponent we are not actually defending says nothing about whether to
-    replace what is on the ladder.
+    Read from our own ledger rather than from Kaggle's description field, and
+    cross-checked against Kaggle: if the newest submission there is newer than
+    the one we recorded, something was submitted outside this system and our
+    ledger describes an agent that is no longer on the leading edge.
+
+    Returning None on that mismatch is the point. The caller refuses, because a
+    gate measured against an opponent we are not actually defending says
+    nothing about whether to replace what is there.
+
+    Args:
+        submissions: Our submissions from Kaggle, newest first.
+
+    Returns:
+        The module we last submitted, or None when unknown or superseded.
     """
-    for row in submissions:
-        for token in row["description"].split():
-            if token.startswith("kaggriculture."):
-                return token.rstrip(":,;")
-    return None
+    if not LEDGER.is_file():
+        return None
+    recorded = json.loads(LEDGER.read_text())
+    if not submissions:
+        return None
+    if submissions[0]["date"] > recorded["date"]:
+        LOGGER.info(
+            "kaggle's newest submission is %s, our ledger records %s; something "
+            "was submitted outside this system",
+            submissions[0]["date"],
+            recorded["date"],
+        )
+        return None
+    return recorded["agent"]
 
 
 def working_revision() -> str | None:
@@ -269,7 +305,7 @@ def submit(candidate: str, reason: str) -> str:
     Returns:
         The description sent to Kaggle.
     """
-    description = f"autonomous: {candidate} -- {reason}"[:500]
+    description = f"{candidate}: {reason}"[:500]
     subprocess.run(
         [
             "uv",
@@ -281,6 +317,17 @@ def submit(candidate: str, reason: str) -> str:
             "--yes",
         ],
         check=True,
+    )
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    LEDGER.write_text(
+        json.dumps(
+            {
+                "agent": candidate,
+                "date": datetime.now(timezone.utc).isoformat(sep=" "),
+                "reason": reason,
+            },
+            indent=2,
+        )
     )
     return description
 
