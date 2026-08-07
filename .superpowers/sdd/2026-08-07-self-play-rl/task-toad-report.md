@@ -282,6 +282,34 @@ not a detail, and it was not ported.** The fix is small and localised (bound the
 regress the shaped reward against it), but it is not written, so no bank number here is a measurement of
 their recipe. Everything above is provisional.
 
+### The fixed run: healthy, training, bank still ~0 at 3.5% of phase 1
+
+With the value head bounded, the same configuration trains instead of diverging. The baseline term drops
+from 1.5e17 to ~1e-4 — five orders of magnitude past "fixed", and the clearest possible confirmation that
+D9 was the whole cause.
+
+| steps | hours | bank mean | bank max | shaped | vtrace_pg | upgo_pg | baseline | entropy |
+|---|---|---|---|---|---|---|---|---|
+| 34,512 | 0.009 | 0.0 | 0.0 | 0.01049 | +0.0458 | +0.1838 | 0.00024 | −0.1426 |
+| 207,072 | 0.054 | 0.0 | 0.0 | 0.01053 | −0.0540 | +0.0782 | 0.00008 | −0.1554 |
+| 379,632 | 0.105 | 0.0 | 0.0 | 0.00990 | −0.0205 | +0.0831 | 0.00010 | −0.1449 |
+| 552,192 | 0.157 | **0.1** | **4.0** | 0.01070 | −0.0461 | +0.1092 | 0.00014 | −0.1511 |
+| 690,240 | 0.196 | 0.0 | 0.0 | 0.01160 | — | — | — | — |
+
+**Bank against the ~21,000 plateau and the 125,773 corpus median: effectively 0.** The first non-zero bank
+appears at 552k steps (mean 0.1, max 4.0) — a policy that has learned to bank a handful of coins in one
+episode out of 48.
+
+**This is 3.5% of phase 1.** At the measured 3.97M steps/hour, 2e7 is 5.0 hours away, so these numbers say
+nothing yet about whether the recipe clears the plateau. What they do establish is that the machinery is
+sound: the loss is stable at ~−0.05 to −0.11 with no divergence, the baseline is well-conditioned, V-trace
+and UPGO are both contributing non-trivially, and the shaped reward is **rising** — first five updates
+0.01061, last five 0.01160, about +9%. A flat shaped reward would have been the early warning that nothing
+was being learned; it is not flat.
+
+**The go/no-go checkpoint is not yet reached and must not be inferred from this table.** The run needs to go
+to 2e7.
+
 ### Two further infidelities the first launch exposed
 
 Both now fixed, both worth recording because each would have produced a plausible-looking but wrong run:
