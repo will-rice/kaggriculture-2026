@@ -221,6 +221,11 @@ def test_positions_come_from_the_state_the_decision_was_made_from(
 
     The synthetic episode walks seat 0's farmer to a different tile on every
     step, so the right and wrong sources cannot agree by accident.
+
+    A farmer position is ``[x, y]`` and the flat index is ``y * BOARD + x``, so
+    ``(7, 3)`` is row 3 column 7. The tiles are asymmetric on purpose: ``(9, 9)``
+    would read the same under a transposed encoder, which is how one survived
+    this suite once already.
     """
     action = {"farmer": ["NORTH"], "hands": [], "market": []}
     episode = {
@@ -241,7 +246,7 @@ def test_positions_come_from_the_state_the_decision_was_made_from(
 
     assert rows == 2
     assert shards[0][2][0].item() == 1 * BOARD + 1
-    assert shards[1][2][0].item() == 7 * BOARD + 3
+    assert shards[1][2][0].item() == 3 * BOARD + 7
 
 
 def test_a_turn_over_max_units_is_skipped_not_fatal(

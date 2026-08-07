@@ -6,6 +6,7 @@ So these check the encoding against the engine's own rules tables and against a
 board built by hand.
 """
 
+import copy
 import json
 import zipfile
 
@@ -41,9 +42,12 @@ from kaggriculture.learn.encoding import (
     SEED_SCALE,
     SHED_NAMES,
     TILE_PLANES,
+    TRANSFER_QUANTITY,
     UNIT_CARRIED_SCALE,
+    UNIT_OPS,
     bucket_of,
     decode_market,
+    decode_units,
     encode_board,
     encode_market,
     encode_positions,
@@ -130,6 +134,17 @@ def _staff(observation: dict, hands: list[list[int]], seat: int = 0) -> dict:
     return observation
 
 
+def _one_hot(op: int, units: int = 1) -> torch.Tensor:
+    """Return unit logits that ``decode_units`` will resolve to ``op`` everywhere.
+
+    Built at the logit shape the model emits rather than by calling ``_op``
+    directly, so what is measured is the action a rollout would really send.
+    """
+    logits = torch.full((1, MAX_UNITS, len(UNIT_OPS)), -10.0)
+    logits[0, :units, op] = 10.0
+    return logits
+
+
 def test_board_has_the_declared_shape_and_batch_dimension() -> None:
     """Every tensor in this project carries its batch dimension."""
     board = encode_board(empty_observation(), seat=0)
@@ -198,6 +213,11 @@ def test_the_board_says_where_the_farmer_stands() -> None:
     The whole point of the spatial head is that a unit reads the trunk at its
     own tile; if no plane marks where anyone is standing, that column carries
     the tile's crops and nothing about the unit deciding from it.
+
+    ``[7, 1]`` is ``x=7, y=1`` and the planes are indexed ``[y, x]``, so the
+    farmer's plane lights at ``[1, 7]``. The asymmetry is the point: the opening
+    position ``[4, 4]`` reads the same under either unpacking and proves
+    nothing.
     """
     here, there = empty_observation(), empty_observation()
     there["farms"][0]["farmer"] = [7, 1]
@@ -206,7 +226,8 @@ def test_the_board_says_where_the_farmer_stands() -> None:
     plane = _changed_plane(before, after)
 
     assert before[0, plane, 4, 4].item() == 1.0
-    assert after[0, plane, 7, 1].item() == 1.0
+    assert after[0, plane, 1, 7].item() == 1.0
+    assert after[0, plane, 7, 1].item() == 0.0
     assert after[0, plane, 4, 4].item() == 0.0
 
 
@@ -223,8 +244,8 @@ def test_the_hands_plane_counts_rather_than_flags() -> None:
     single, doubled = encode_board(one, seat=0), encode_board(two, seat=0)
     plane = _changed_plane(single, doubled)
 
-    assert single[0, plane, 4, 3].item() == pytest.approx(1.0 / MAX_UNITS)
-    assert doubled[0, plane, 4, 3].item() == pytest.approx(2.0 / MAX_UNITS)
+    assert single[0, plane, 3, 4].item() == pytest.approx(1.0 / MAX_UNITS)
+    assert doubled[0, plane, 3, 4].item() == pytest.approx(2.0 / MAX_UNITS)
 
 
 def test_the_opponent_s_units_occupy_their_own_planes() -> None:
@@ -251,9 +272,9 @@ def test_positions_are_ordered_exactly_as_labels_are() -> None:
 
     assert positions.shape == (1, MAX_UNITS)
     assert positions.dtype == torch.int64
-    assert positions[0, 0].item() == 2 * BOARD + 3
-    assert positions[0, 1].item() == 7 * BOARD + 1
-    assert positions[0, 2].item() == 0 * BOARD + 9
+    assert positions[0, 0].item() == 3 * BOARD + 2
+    assert positions[0, 1].item() == 1 * BOARD + 7
+    assert positions[0, 2].item() == 9 * BOARD + 0
     assert positions[0, 3:].eq(0).all()
 
 
@@ -314,7 +335,7 @@ def test_positions_and_labels_agree_on_a_real_episode() -> None:
 
             assert units == len(tiles)
             assert labels[0, units:].eq(IGNORE).all()
-            assert positions[0, :units].tolist() == [y * BOARD + x for y, x in tiles]
+            assert positions[0, :units].tolist() == [y * BOARD + x for x, y in tiles]
             assert positions[0, units:].eq(0).all()
             most = max(most, units)
             disagreements += 1 + len(action["hands"]) != units
@@ -656,7 +677,136 @@ def test_the_carried_plane_sums_units_sharing_a_tile() -> None:
     after = encode_board(both, seat=0)
     plane = _changed_plane(encode_board(lone, seat=0), after)
 
-    assert after[0, plane, 4, 3].item() == pytest.approx(5 / UNIT_CARRIED_SCALE)
+    assert after[0, plane, 3, 4].item() == pytest.approx(5 / UNIT_CARRIED_SCALE)
+
+
+# --------------------------------------------------------------------------
+# The transposition guard: a unit's position is `[x, y]`, the grid is
+# `tiles[y][x]`, and every assertion below is asymmetric on purpose.
+# --------------------------------------------------------------------------
+
+# Where the guard's unit stands: `x=7, y=1`, so the tile it acts on is
+# `tiles[1][7]` and its mirror is `tiles[7][1]`. Both are on the board and the
+# two are distinct, which the fixture's own `[4, 4]` opening position is not --
+# on a symmetric position every assertion here passes under either unpacking,
+# which is how the transposition survived a full test suite and a training run.
+_ASYMMETRIC: tuple[int, int] = (7, 1)
+
+
+def _engine_acts_at(observation: dict, seat: int = 0) -> tuple[int, int]:
+    """Return the ``(y, x)`` grid cell the engine's own dispatch reads, by DIG.
+
+    Asked of ``_apply_unit_action`` rather than asserted from the position,
+    because the position-to-grid mapping is exactly the thing under test and a
+    test that writes it out twice only proves it agrees with itself. ``DIG``
+    is the probe because it clears ``farm["tiles"][fy][fx]`` outright, so the
+    cell the engine chose is visible as the one that changed.
+    """
+    farm = copy.deepcopy(observation["farms"][seat])
+    engine._apply_unit_action(
+        farm,
+        copy.deepcopy(observation["private"]),
+        0,
+        ["DIG"],
+        BOARD,
+        observation["day"],
+        TURNS_PER_DAY,
+        SHED_CAPACITY,
+    )
+    before = observation["farms"][seat]["tiles"]
+    changed = [
+        (y, x)
+        for y in range(BOARD)
+        for x in range(BOARD)
+        if farm["tiles"][y][x] != before[y][x]
+    ]
+    assert len(changed) == 1, f"DIG did not identify one tile: {changed}"
+    return changed[0]
+
+
+def _gathered(board: torch.Tensor, positions: torch.Tensor, unit: int) -> torch.Tensor:
+    """Return the trunk column ``Policy.forward`` gathers for one unit.
+
+    The same ``flatten(2)`` plus flat index the model uses, so this measures the
+    column the per-unit head actually reads rather than a re-derivation of it.
+    """
+    return board.flatten(2)[0, :, int(positions[0, unit].item())]
+
+
+def test_the_gathered_tile_is_the_tile_the_engine_acts_on() -> None:
+    """``encode_positions`` must point at the tile ``_apply_unit_action`` reads.
+
+    A unit's position is ``[x, y]`` and the grid is ``tiles[y][x]``, so the flat
+    index is ``y * BOARD + x``. Transposed, the head gathers the mirrored tile:
+    a valid index into a valid plane, scored against this unit's real label,
+    raising nothing and training the readout on somebody else's surroundings.
+    The per-unit head exists precisely so a unit reads its own tile, so this is
+    the invariant the whole readout rests on.
+
+    Proven against the engine, not against a fixture. The acted-on cell is read
+    out of ``_apply_unit_action`` itself, and the two candidate tiles carry
+    different crops so the final assertion discriminates: swap the unpacking
+    back to ``(y, x)`` and the gathered column becomes the melon's.
+    """
+    x, y = _ASYMMETRIC
+    observation = empty_observation()
+    observation["farms"][0]["farmer"] = [x, y]
+    observation["farms"][0]["tiles"][y][x] = _plant("WHEAT")
+    observation["farms"][0]["tiles"][x][y] = _plant("MELON")
+
+    assert _engine_acts_at(observation) == (y, x)
+
+    board = encode_board(observation, seat=0)
+    column = _gathered(board, encode_positions(observation, seat=0), unit=0)
+
+    assert torch.equal(column, board[0, :, y, x])
+    assert not torch.equal(column, board[0, :, x, y])
+
+
+def test_a_unit_s_own_planes_are_written_at_the_tile_it_gathers() -> None:
+    """Occupancy and carried load must land in the column the head reads.
+
+    ``encode_positions`` and ``_write_units``/``_write_carried`` unpack the same
+    ``[x, y]`` list in three separate places, so agreeing with the engine about
+    where a unit *is* does not imply writing its planes there. Transposing only
+    the writers leaves the gathered column pointing at the right tile with the
+    unit's own presence and load missing from it -- and the previous test still
+    passes, because it compares two slices of one tensor.
+    """
+    x, y = _ASYMMETRIC
+    idle = empty_observation()
+    idle["farms"][0]["farmer"] = [x, y]
+    laden = empty_observation()
+    laden["farms"][0]["farmer"] = [x, y]
+    laden["private"]["inventories"] = [{"WHEAT": 4}]
+
+    occupancy = _changed_plane(
+        encode_board(empty_observation(), 0), encode_board(idle, 0)
+    )
+    carried = _changed_plane(encode_board(idle, 0), encode_board(laden, 0))
+    board = encode_board(laden, seat=0)
+    column = _gathered(board, encode_positions(laden, seat=0), unit=0)
+
+    assert column[occupancy].item() == 1.0
+    assert column[carried].item() == pytest.approx(4 / UNIT_CARRIED_SCALE)
+
+
+def test_every_hand_gathers_its_own_tile_and_not_another_s() -> None:
+    """Slot ``k`` reads slot ``k``'s tile, on positions no transposition fixes.
+
+    Two hands mirrored across the diagonal: under ``(y, x)`` they swap tiles
+    with each other, which is the exact failure the per-unit head was rebuilt to
+    avoid -- issuing one hand's orders from another hand's surroundings.
+    """
+    observation = _staff(empty_observation(), [[7, 1], [1, 7]])
+    observation["farms"][0]["tiles"][1][7] = _plant("WHEAT")
+    observation["farms"][0]["tiles"][7][1] = _plant("MELON")
+
+    board = encode_board(observation, seat=0)
+    positions = encode_positions(observation, seat=0)
+
+    assert torch.equal(_gathered(board, positions, 1), board[0, :, 1, 7])
+    assert torch.equal(_gathered(board, positions, 2), board[0, :, 7, 1])
 
 
 @pytest.mark.slow
@@ -871,6 +1021,108 @@ def test_the_vocabulary_covers_every_op_the_engine_implements() -> None:
     assert implemented <= {op.split(":")[0] for op in UNIT_OPS}
 
 
+def test_pickup_and_place_carry_the_item_the_engine_requires() -> None:
+    """Both return on ``len(action) < 2``, so a bare verb can never land.
+
+    While they were bare verbs every one ``decode_units`` emitted was discarded,
+    and with ``PLACE`` dead an animal bought into the shed could never reach a
+    structure -- livestock was unreachable to a learned policy for the whole of
+    training.
+
+    The item lists are asserted against ``PRODUCTS`` and ``ANIMALS`` rather than
+    against what the corpus plays. The corpus is a sample of other people's
+    agents and never places a CARROT, an EGG or a TOMATO; the engine accepts all
+    three, because PICKUP reads ``private["shed"]`` and PLACE reads a unit's
+    inventory, and neither mapping is gated by an item catalogue.
+    """
+    catalogue = set(PRODUCTS) | set(ANIMALS)
+
+    assert {op.split(":", 1)[1] for op in UNIT_OPS if op.startswith("PICKUP:")} == (
+        catalogue
+    )
+    assert {op.split(":", 1)[1] for op in UNIT_OPS if op.startswith("PLACE:")} == (
+        catalogue
+    )
+    assert "PICKUP" not in UNIT_OPS and "PLACE" not in UNIT_OPS
+
+
+def test_the_shed_the_engine_writes_is_what_pickup_and_place_can_name() -> None:
+    """The item lists are the shed's own keys, so an upstream addition is loud.
+
+    This is the ``BUY_PRODUCT`` lesson applied one verb over: a hand-written
+    vocabulary passes against another hand-written list while both are wrong.
+    ``engine._new_private()`` is the engine's own statement of what a shed holds.
+    """
+    shed = set(engine._new_private()["shed"])
+
+    assert {op.split(":", 1)[1] for op in UNIT_OPS if op.startswith("PICKUP:")} == shed
+
+
+def test_a_decoded_pickup_moves_state_in_the_engine() -> None:
+    """The end-to-end claim: what ``decode_units`` emits, the engine acts on.
+
+    Run through ``_apply_unit_action`` itself rather than asserted on the shape
+    of the list, because the failure being fixed here was precisely an action
+    whose shape looked fine and which the engine silently dropped. The farmer
+    starts on ``_default_spawn``, which is shed-adjacent, so the shed branch is
+    reachable without moving anybody.
+    """
+    observation = empty_observation()
+    observation["farms"][0]["farmer"] = list(engine._default_spawn(BOARD))
+    observation["private"]["shed"]["WHEAT"] = 5
+    farm = observation["farms"][0]
+    private = observation["private"]
+
+    op = decode_units(_one_hot(UNIT_OPS.index("PICKUP:WHEAT")), units=1)["farmer"]
+    engine._apply_unit_action(
+        farm, private, 0, op, BOARD, 0, TURNS_PER_DAY, SHED_CAPACITY
+    )
+
+    assert op == ["PICKUP", "WHEAT", TRANSFER_QUANTITY]
+    assert private["shed"]["WHEAT"] == 5 - TRANSFER_QUANTITY
+    assert private["inventories"][0] == {"WHEAT": TRANSFER_QUANTITY}
+
+
+def test_a_decoded_place_puts_a_bought_animal_onto_its_structure() -> None:
+    """The move that was unreachable: a cow leaves the shed and reaches a pasture.
+
+    ``PLACE`` pairs an animal with ``ANIMALS[item]["structure"]``, so this also
+    pins that the decoded op is the one the engine's animal branch accepts
+    rather than the shed-drop branch it would otherwise fall through to.
+    """
+    observation = empty_observation()
+    farm = observation["farms"][0]
+    x, y = farm["farmer"]
+    farm["tiles"][y][x] = {"kind": str(ANIMALS["COW"]["structure"])}
+    private = observation["private"]
+    private["inventories"][0] = {"COW": 1}
+
+    op = decode_units(_one_hot(UNIT_OPS.index("PLACE:COW")), units=1)["farmer"]
+    engine._apply_unit_action(
+        farm, private, 0, op, BOARD, 0, TURNS_PER_DAY, SHED_CAPACITY
+    )
+
+    assert farm["tiles"][y][x]["animal"] == "COW"
+    assert private["inventories"][0] == {}
+
+
+def test_a_recorded_pickup_labels_by_item_and_drops_its_quantity() -> None:
+    """``["PICKUP", "WHEAT", 2]`` and ``["PICKUP", "WHEAT", 1]`` are one label.
+
+    The vocabulary has no slot for a count, so cloning is lossy about *how much*
+    and exact about *what* -- which is the half that decides whether the op
+    lands at all. Two different items must not collide.
+    """
+    two = encode_units({"farmer": ["PICKUP", "WHEAT", 2], "hands": [], "market": []}, 1)
+    one = encode_units({"farmer": ["PICKUP", "WHEAT", 1], "hands": [], "market": []}, 1)
+    other = encode_units({"farmer": ["PICKUP", "COW", 1], "hands": [], "market": []}, 1)
+    bare = encode_units({"farmer": ["PLACE", "COW"], "hands": [], "market": []}, 1)
+
+    assert two[0, 0].item() == one[0, 0].item()
+    assert two[0, 0].item() != other[0, 0].item()
+    assert bare[0, 0].item() == UNIT_OPS.index("PLACE:COW")
+
+
 def test_buy_product_s_item_gate_matches_the_engine_exactly() -> None:
     """BUY_PRODUCT's gate is a closed literal, not an open-ended op list.
 
@@ -968,8 +1220,6 @@ def test_planting_a_crop_is_a_distinct_label_per_crop() -> None:
 
 def test_labels_round_trip_back_to_a_legal_action() -> None:
     """Training on labels the play path cannot invert would be silently useless."""
-    from kaggriculture.learn.encoding import UNIT_OPS, decode_units
-
     action = {"farmer": ["PLANT", "MELON"], "hands": [["WATER"], ["DIG"]], "market": []}
     labels = encode_units(action, units=3)
     logits = torch.full((1, MAX_UNITS, len(UNIT_OPS)), -10.0)

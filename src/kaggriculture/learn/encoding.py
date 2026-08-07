@@ -45,6 +45,19 @@ module reads, and a corpus test fails if the engine ever starts emitting one
 that appears in neither. The shed went unencoded for a whole training run
 because an absent field simply never shows up; a field that has to be named
 somewhere cannot go missing the same way.
+
+One fact about the engine's geometry is load-bearing everywhere a unit is read.
+A unit's position is ``[x, y]`` and the grid is ``tiles[y][x]``:
+``_apply_unit_action`` reads ``fx, fy = pos[0], pos[1]`` and then indexes
+``farm["tiles"][fy][fx]``. The two are not interchangeable and nothing raises
+when they are swapped -- a farmer at ``[7, 1]`` unpacked as ``(y, x)`` writes
+its plane at tile ``(1, 7)`` and reads its trunk column there too, so the
+per-unit head scores the mirrored tile against the real tile's label and trains
+perfectly happily on the wrong board. It did, until
+``test_the_gathered_tile_is_the_tile_the_engine_acts_on`` was written. Every
+unpack of a position in this module is therefore ``(x, y)``, and the tile loops
+in ``encode_board`` -- which walk ``farm["tiles"]`` directly and so are already
+in ``(y, x)`` -- are the one place that is not.
 """
 
 from typing import Any, Mapping
@@ -425,13 +438,16 @@ def _write_units(planes: torch.Tensor, base: int, farm: Mapping[str, Any]) -> No
 
     The hands plane accumulates rather than sets: several hands may stand on
     one tile, and a flag would report a crowd of five the same as a lone hand.
+
+    Positions are ``[x, y]`` and the planes are indexed ``[y, x]``, per the
+    module docstring.
     """
-    farmer_y, farmer_x = farm["farmer"]
+    farmer_x, farmer_y = farm["farmer"]
     planes[0, base + _UNIT_BASE + _UNIT_PLANES.index("FARMER"), farmer_y, farmer_x] = (
         1.0
     )
     hands = base + _UNIT_BASE + _UNIT_PLANES.index("HANDS")
-    for y, x in farm["hands"]:
+    for x, y in farm["hands"]:
         planes[0, hands, y, x] += 1.0 / MAX_UNITS
 
 
@@ -458,9 +474,12 @@ def _write_carried(
     is fine and does occur: ``_farmer_inventory`` grows the list when an action
     orders a hand the farm does not have, and that entry belongs to no unit and
     stays empty, since the engine no-ops the op that created it.
+
+    Positions are ``[x, y]`` and the planes are indexed ``[y, x]``, per the
+    module docstring.
     """
     offset = _UNIT_BASE + _UNIT_PLANES.index("CARRIED")
-    for index, (y, x) in enumerate([farm["farmer"], *farm["hands"]]):
+    for index, (x, y) in enumerate([farm["farmer"], *farm["hands"]]):
         planes[0, offset, y, x] += sum(inventories[index].values()) / UNIT_CARRIED_SCALE
 
 
@@ -556,29 +575,89 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
 # and planting wheat are different choices, not one op with a detail attached --
 # the crop is the decision that collapsed our own agent's price this morning.
 #
+# PICKUP and PLACE carry their item for a harder reason than that: without one
+# they cannot be played at all. `_apply_unit_action` returns on `len(action) < 2`
+# for both, so a bare ["PICKUP"] is a silent no-op every time it is emitted, and
+# with PLACE dead an animal bought into the shed can never reach a structure --
+# a whole branch of the game was unreachable to a learned policy. They were bare
+# here for exactly as long as nobody checked what the engine did with them.
+#
+# The item list is `SHED_NAMES`, derived from the engine's own `PRODUCTS` and
+# `ANIMALS` tables rather than from what the corpus happens to play. The engine
+# gates neither verb on an item catalogue: PICKUP reads `private["shed"]` and
+# PLACE reads the unit's inventory, and both mappings are keyed by every product
+# and every animal (`_new_private`'s shed is that union, and an animal reaches an
+# inventory only by being picked up out of it). Building this from a two-archive
+# sample instead would have omitted CARROT, EGG and TOMATO, which the sample
+# never places and the engine accepts -- the same way a hand-written list has
+# already dropped an engine verb twice in this repo.
+#
 # DROP is here even though the engine's own JSON action spec never mentions it:
 # the spec text lists seventeen ops, but `_apply_unit_action` in the engine's
 # source implements an eighteenth, DROP, and this project's own policies emit
-# it routinely. The docs are not authoritative; the engine's code is.
+# it routinely. The docs are not authoritative; the engine's code is. It stays
+# item-less because the engine's DROP takes no item: it empties the whole
+# inventory, and all 2,267 of the corpus's DROPs are one element long.
 UNIT_OPS: tuple[str, ...] = (
-    "PASS",
-    "NORTH",
-    "SOUTH",
-    "EAST",
-    "WEST",
-    "WATER",
-    "HARVEST",
-    "DIG",
-    "FEED",
-    "CARE",
-    "COLLECT_FERTILIZER",
-    "FERTILIZE",
-    "BUILD_COOP",
-    "BUILD_PASTURE",
-    "PICKUP",
-    "PLACE",
-    "DROP",
-) + tuple(f"PLANT:{crop}" for crop in CROP_NAMES)
+    (
+        "PASS",
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "WATER",
+        "HARVEST",
+        "DIG",
+        "FEED",
+        "CARE",
+        "COLLECT_FERTILIZER",
+        "FERTILIZE",
+        "BUILD_COOP",
+        "BUILD_PASTURE",
+        "DROP",
+    )
+    + tuple(f"PLANT:{crop}" for crop in CROP_NAMES)
+    + tuple(f"PICKUP:{item}" for item in SHED_NAMES)
+    + tuple(f"PLACE:{item}" for item in SHED_NAMES)
+)
+
+# The verbs whose label is ``VERB:ITEM`` rather than a bare verb. Named once so
+# `_label` and `_op` cannot disagree about which of them carry an item -- a
+# verb this set claims and `UNIT_OPS` does not would raise on the first corpus
+# row, but the reverse is silent: the op would be labelled by its bare verb,
+# which is not in the vocabulary either, and the two failures are only the same
+# because both lists come from here.
+ITEM_VERBS = frozenset({"PLANT", "PICKUP", "PLACE"})
+
+# How much one PICKUP or one item-carrying PLACE moves.
+#
+# The engine reads it from `action[2]` and defaults to 1 when the action is two
+# elements long. It is emitted explicitly rather than left to that default: a
+# default is the engine's to change, and an arity-2 action would silently mean
+# something else if it did.
+#
+# One, rather than the corpus mode or the shed's whole stock, because one is the
+# unit every consumer of a carried item is denominated in -- FEED takes exactly
+# 1 WHEAT, FERTILIZE exactly 1 FERTILIZER, and PLACE puts exactly 1 animal on a
+# structure regardless of what `action[2]` says. Larger counts are trip
+# planning, not a different decision, and a unit standing on a shed-access tile
+# may PICKUP again on the very next turn, so n=1 composes upward to any quantity
+# while a fixed n>1 does not decompose down to 1.
+#
+# Measured across all seven archives (three episodes each, 11,721 PICKUPs), no
+# single count fits: the mode is item-dependent -- WHEAT 2 (78%), FERTILIZER 3
+# (59%), COW 1 (80%), SHEEP 1 (72%), GOOSE 1 (61%) -- so any fixed n>1 is wrong
+# for the animals, which are the case that matters, since PLACE consumes one and
+# a second cow in hand is a cow neither in the shed nor on a pasture. Taking the
+# available stock instead is refuted by the same sample: 10,660 of 11,721
+# PICKUPs took strictly less than the shed held, and the shed is the only place
+# SELL draws from, so emptying it to a unit's hands forfeits the sale.
+#
+# What this costs is trips: loading three wheat for three animals is three turns
+# rather than one. If a rollout ever measures that as material, the fix is a
+# per-unit quantity head gathered off the same trunk column the op head reads --
+# not a bigger constant.
+TRANSFER_QUANTITY = 1
 
 # torch's cross entropy ignores this index, so padded units contribute no loss.
 IGNORE = -100
@@ -647,6 +726,12 @@ def encode_positions(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
     one, and a padded slot's label is ``IGNORE``, so its logits never reach the
     loss and the tile it nominally read is never learned from.
 
+    A unit's position is ``[x, y]`` and ``encode_board`` lays its planes out as
+    ``[y][x]``, so the flat index is ``y * BOARD + x``. Unpacking the position
+    the other way round returns the mirrored tile, which is a valid index into
+    a valid plane and therefore raises nothing: the head simply gathers the
+    wrong column and scores it against this unit's label.
+
     Args:
         observation: One turn's observation -- the state the decision was made
             from, so it must be the same observation the row's board encodes.
@@ -665,7 +750,7 @@ def encode_positions(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
         raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
     farm = observation["farms"][seat]
     positions = torch.zeros(1, MAX_UNITS, dtype=torch.int64)
-    for index, (y, x) in enumerate([farm["farmer"], *farm["hands"]]):
+    for index, (x, y) in enumerate([farm["farmer"], *farm["hands"]]):
         positions[0, index] = y * BOARD + x
     return positions
 
@@ -706,14 +791,23 @@ def encode_units(action: Mapping[str, Any], units: int) -> torch.Tensor:
 def _label(op: list[Any]) -> int:
     """Return the vocabulary index for one unit's recorded op.
 
+    A recorded ``PICKUP`` or ``PLACE`` may carry a quantity as well as an item,
+    and the quantity is dropped: ``["PICKUP", "WHEAT", 2]`` and
+    ``["PICKUP", "WHEAT", 1]`` are the same label, because the vocabulary has no
+    slot for a count and ``_op`` emits ``TRANSFER_QUANTITY`` for both. That is
+    lossy on purpose and is the whole content of the ``TRANSFER_QUANTITY``
+    argument; it is not lossy about *which* item, which is what makes the op
+    land at all.
+
     Args:
-        op: One unit's op, e.g. ``["WATER"]`` or ``["PLANT", "MELON"]``.
+        op: One unit's op, e.g. ``["WATER"]``, ``["PLANT", "MELON"]`` or
+            ``["PICKUP", "WHEAT", 2]``.
 
     Returns:
         The op's index into ``UNIT_OPS``.
     """
     verb = str(op[0])
-    name = f"PLANT:{op[1]}" if verb == "PLANT" else verb
+    name = f"{verb}:{op[1]}" if verb in ITEM_VERBS else verb
     return UNIT_OPS.index(name)
 
 
@@ -739,11 +833,19 @@ def decode_units(logits: torch.Tensor, units: int) -> dict[str, Any]:
 
 
 def _op(label: int) -> list[Any]:
-    """Return the op list for one vocabulary index."""
-    name = UNIT_OPS[label]
-    if name.startswith("PLANT:"):
-        return ["PLANT", name.split(":", 1)[1]]
-    return [name]
+    """Return the op list for one vocabulary index.
+
+    ``PLANT`` is emitted at arity 2 because ``_apply_unit_action`` never reads
+    ``action[2]`` for it -- a crop is planted one tile at a time. ``PICKUP`` and
+    ``PLACE`` are emitted at arity 3 carrying ``TRANSFER_QUANTITY``, which the
+    engine reads.
+    """
+    verb, _, item = UNIT_OPS[label].partition(":")
+    if not item:
+        return [verb]
+    if verb == "PLANT":
+        return [verb, item]
+    return [verb, item, TRANSFER_QUANTITY]
 
 
 # Every (verb, item) pair the engine's `_process_market` will actually act on.

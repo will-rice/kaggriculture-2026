@@ -1,8 +1,9 @@
 """Which actions the engine will actually act on, per unit and per market slot.
 
-Most of the twenty-two unit ops are illegal on any given turn: you cannot
-``HARVEST`` bare soil, ``PLANT`` without owning the seed, or ``DROP`` away from
-a shed-access tile. The engine says so by doing nothing -- ``_apply_unit_action``
+Most of ``UNIT_OPS`` is illegal on any given turn: you cannot ``HARVEST`` bare
+soil, ``PLANT`` without owning the seed, ``PICKUP`` what the shed does not hold,
+or ``DROP`` away from a shed-access tile. The engine says so by doing nothing --
+``_apply_unit_action``
 is a chain of guards each of which ``return``s silently, and ``_commit_unit``
 aborts an order by returning ``False``. An unmasked policy therefore spends its
 training budget rediscovering legality instead of strategy, and never gets a
@@ -73,6 +74,7 @@ from kaggriculture.constants import (
     LAND_ORDER,
     LAND_PRICES,
     MOVES,
+    SHED_CAPACITY,
     hire_cost,
     market_price,
     shed_access_tiles,
@@ -85,6 +87,7 @@ from kaggriculture.learn.encoding import (
     MAX_ORDERS,
     MAX_UNITS,
     QUANTITIES,
+    SHED_NAMES,
     UNIT_OPS,
     TooManyUnitsError,
     quantity_of,
@@ -110,13 +113,12 @@ def unit_mask(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
     them -- but a row of all-False would become a row of all ``-inf`` and
     softmax to NaN.
 
-    ``PICKUP`` and ``PLACE`` are never permitted. Both need an item argument
-    that ``UNIT_OPS`` does not carry, so ``decode_units`` emits the bare
-    ``["PICKUP"]`` and ``_apply_unit_action`` returns on ``len(action) < 2``
-    every time. Permitting them would burn budget on two of the twenty-two ops
-    for the whole of training. This is a hole in the action vocabulary rather
-    than in the mask -- with ``PLACE`` dead a bought animal can never leave the
-    shed -- and widening ``UNIT_OPS`` to carry the item is what closes it.
+    ``PICKUP:<item>`` and ``PLACE:<item>`` are masked per item, which is the
+    whole reason ``UNIT_OPS`` carries the item at all: while both were bare
+    verbs this mask forbade them outright, because ``_apply_unit_action``
+    returns on ``len(action) < 2`` and neither could ever land. They are now
+    masked from the engine's own guards -- what the shed holds for ``PICKUP``,
+    what the unit holds and where it stands for ``PLACE``.
 
     Args:
         observation: One turn's observation, whose ``private`` mapping is
@@ -155,9 +157,18 @@ def _legal_ops(
 
     Follows the engine's own dispatch order: the moves and ``PASS`` are decided
     before the tile is even read, the ``"LOCKED"`` check gates everything after,
-    and ``DROP`` is settled from the shed geometry rather than from the tile.
-    What is left is a question about the tile alone, which ``_tile_ops``
-    answers.
+    and the three shed transfers -- ``DROP``, ``PICKUP`` and ``PLACE`` -- are
+    settled from the shed geometry rather than from the tile. What is left is a
+    question about the tile alone, which ``_tile_ops`` answers.
+
+    ``PLACE`` is the one op both halves have a say in, and the union of the two
+    is exact rather than approximate. ``_apply_unit_action`` tries the animal
+    branch first -- an animal item onto a matching unoccupied structure, from
+    this unit's own hands -- and only falls through to the shed drop when that
+    branch's *condition* fails, never when its ``_inv_take`` does. So a bare
+    coop takes a goose wherever it stands (``_tile_ops``), a bare pasture beside
+    the shed puts that same goose back into the shed instead (here), and neither
+    branch can offer an item the other should have refused.
 
     Args:
         farm: ``seat``'s farm.
@@ -182,12 +193,26 @@ def _legal_ops(
     # `_farmer_inventory` indexes `[farmer, *hands]` exactly as the units are
     # indexed, because `_do_hire` appends an inventory as it appends a hand.
     inventory = private["inventories"][unit]
-    if inventory and (x, y) in _SHED_ACCESS:
-        # DROP empties the whole inventory. A full shed makes it destructive
-        # rather than illegal: `room` clamps to zero and the engine deletes the
-        # carried item either way, so the only guard is having something to
-        # drop.
-        legal.add("DROP")
+    if (x, y) in _SHED_ACCESS:
+        if inventory:
+            # DROP empties the whole inventory. A full shed makes it destructive
+            # rather than illegal: `room` clamps to zero and the engine deletes
+            # the carried item either way, so the only guard is having something
+            # to drop.
+            legal.add("DROP")
+        # PICKUP moves `min(n, shed[item])` and returns when that is zero, so
+        # one item in the shed is the whole guard at TRANSFER_QUANTITY of 1.
+        legal.update(
+            f"PICKUP:{item}" for item in SHED_NAMES if private["shed"][item] > 0
+        )
+        # PLACE's shed drop is the mirror, and adds the capacity check DROP does
+        # not have: `room` clamps to zero and the engine returns on `n <= 0`
+        # instead of deleting the item, so a full shed makes this one illegal
+        # where it makes DROP destructive.
+        if sum(private["shed"].values()) < SHED_CAPACITY:
+            legal.update(
+                f"PLACE:{item}" for item in SHED_NAMES if inventory.get(item, 0) > 0
+            )
     return legal | _tile_ops(tile, private, inventory, day)
 
 
@@ -196,12 +221,16 @@ def _tile_ops(
 ) -> set[str]:
     """Return the ops legal on one unlocked tile, by what is standing on it.
 
-    The engine's own tile taxonomy, in four lines: open ground, an occupied
+    The engine's own tile taxonomy, in four branches: open ground, an occupied
     structure, a plant, and everything else -- a weed or a structure nobody has
-    moved an animal into -- which can only be dug. Written as a dispatch rather
-    than as one chain of guards so that a tile kind added upstream lands in
-    exactly one place instead of falling through to whichever branch happens to
-    accept it.
+    moved an animal into, which can be dug and, if it is the right kind of
+    structure, filled. Written as a dispatch rather than as one chain of guards
+    so that a tile kind added upstream lands in exactly one place instead of
+    falling through to whichever branch happens to accept it.
+
+    This answers the tile alone. The shed transfers that depend on where the
+    unit is standing rather than on what it is standing on are ``_legal_ops``'
+    business, and ``PLACE`` is in both -- see there for why the union is exact.
 
     Args:
         tile: The tile under the unit. Never ``"LOCKED"``; the caller returns
@@ -225,7 +254,19 @@ def _tile_ops(
         return _plant_ops(tile, inventory, day)
     # A weed or a bare coop or pasture. DIG clears all three and refuses only
     # an occupied structure, which the branch above has already taken.
-    return {"DIG"}
+    #
+    # A bare structure is also the one place an animal can be PLACEd out of a
+    # unit's hands, and the engine pairs them by `ANIMALS[item]["structure"]`
+    # rather than by a shared "structure" kind -- a cow will not go in a coop.
+    # Read off the rules table so an animal added upstream with a new structure
+    # kind gets its own pairing instead of silently matching nothing.
+    legal = {"DIG"}
+    legal.update(
+        f"PLACE:{animal}"
+        for animal, data in ANIMALS.items()
+        if tile["kind"] == data["structure"] and inventory.get(animal, 0) > 0
+    )
+    return legal
 
 
 def _plant_ops(tile: Tile, inventory: Mapping[str, int], day: int) -> set[str]:

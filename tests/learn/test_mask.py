@@ -403,29 +403,95 @@ def test_dropping_into_a_full_shed_still_moves_state() -> None:
     assert _op_mask(observation, "DROP")
 
 
-def test_pickup_and_place_carry_no_item_and_so_can_never_land() -> None:
-    """``decode_units`` emits a bare ``["PICKUP"]``, which the engine always drops.
+def test_picking_up_needs_a_shed_tile_and_stock_of_that_item() -> None:
+    """``PICKUP`` moves ``min(n, shed[item])`` and returns when that is zero.
 
-    ``UNIT_OPS`` collapses PICKUP's and PLACE's item away -- ``_label`` maps
-    ``["PICKUP", "WHEAT", 3]`` to the plain ``"PICKUP"`` -- and ``_op`` decodes
-    both back as one-element lists. ``_apply_unit_action`` returns on
-    ``len(action) < 2`` for each, so neither can ever move state no matter what
-    the board holds. Masking them True would burn budget on two of the
-    twenty-two ops for the whole of training.
+    Item by item: an empty barn offers nothing, and a barn holding wheat offers
+    wheat and not the melons it does not have. The away case pins the geometry
+    guard, which is the same ``_is_shed_adjacent`` check ``DROP`` carries.
+    """
+    empty = empty_observation()
+    stocked = empty_observation()
+    stocked["private"]["shed"]["WHEAT"] = 20
+    away = empty_observation()
+    away["farms"][0]["farmer"] = [0, 0]
+    away["private"]["shed"]["WHEAT"] = 20
 
-    This is a hole in the action vocabulary, not in the mask: with PLACE dead,
-    a bought animal can never leave the shed. It is pinned here so the day
-    somebody widens ``UNIT_OPS`` to ``PICKUP:ITEM`` this test fails and points
-    at the mask that has to widen with it.
+    assert not _op_mask(empty, "PICKUP:WHEAT")
+    assert _op_mask(stocked, "PICKUP:WHEAT")
+    assert not _op_mask(stocked, "PICKUP:MELON")
+    assert not _op_mask(away, "PICKUP:WHEAT")
+
+
+def _on_a_coop_away_from_the_shed(carrying: dict[str, int]) -> dict[str, Any]:
+    """Return an observation with the farmer on a bare coop in the far corner.
+
+    Away from the shed on purpose. ``_default_spawn`` is shed-adjacent, so a
+    structure built there offers every animal in hand through ``PLACE``'s shed
+    branch -- the engine really would put a cow standing on a coop back into the
+    barn -- and the animal-to-structure pairing this pins would be invisible.
     """
     observation = empty_observation()
-    observation["private"]["shed"]["WHEAT"] = 20
-    observation["private"]["shed"]["GOOSE"] = 1
-    observation["private"]["inventories"][0] = {"GOOSE": 1}
-    _stand_on(observation, {"kind": "COOP"})
+    observation["farms"][0]["farmer"] = [0, 0]
+    observation["farms"][0]["tiles"][0][0] = {
+        "kind": str(engine.ANIMALS["GOOSE"]["structure"])
+    }
+    observation["private"]["inventories"][0] = carrying
+    return observation
 
-    assert not _op_mask(observation, "PICKUP")
-    assert not _op_mask(observation, "PLACE")
+
+def test_placing_an_animal_needs_its_own_kind_of_structure() -> None:
+    """The engine pairs an animal with ``ANIMALS[item]["structure"]``, not "any".
+
+    A goose goes in a coop and a cow does not, so a mask that offered every
+    animal on every bare structure would spend a turn per refusal. The animal
+    branch works anywhere on the farm, unlike every other shed transfer, which
+    is why these stand in the corner rather than at the spawn.
+    """
+    both = _on_a_coop_away_from_the_shed({"GOOSE": 1, "COW": 1})
+    empty_handed = _on_a_coop_away_from_the_shed({})
+
+    assert _op_mask(both, "PLACE:GOOSE")
+    assert not _op_mask(both, "PLACE:COW")
+    assert not _op_mask(empty_handed, "PLACE:GOOSE")
+
+
+def test_an_animal_beside_the_shed_may_go_back_into_the_barn() -> None:
+    """``PLACE``'s two branches, and which one the engine picks between them.
+
+    ``_apply_unit_action`` tries the animal branch first and falls through to
+    the shed drop only when its *condition* fails -- the wrong structure kind
+    here. So a cow standing on a coop beside the shed is a legal ``PLACE``, and
+    the same cow standing on a coop in the corner is not. The mask is the union
+    of the two branches and this is the case that separates them.
+    """
+    beside = _stand_on(
+        empty_observation(), {"kind": str(engine.ANIMALS["GOOSE"]["structure"])}
+    )
+    beside["private"]["inventories"][0] = {"COW": 1}
+    corner = _on_a_coop_away_from_the_shed({"COW": 1})
+
+    assert _op_mask(beside, "PLACE:COW")
+    assert not _op_mask(corner, "PLACE:COW")
+
+
+def test_placing_into_the_shed_needs_room_where_dropping_does_not() -> None:
+    """The two shed transfers differ exactly here, and the engine says so.
+
+    ``DROP`` clamps ``room`` to zero and deletes the carried item anyway, so a
+    full shed makes it destructive rather than illegal. ``PLACE``'s shed branch
+    returns on ``n <= 0`` instead, so the same full shed makes it a no-op.
+    Masking them alike in either direction would be wrong in both.
+    """
+    room = empty_observation()
+    room["private"]["inventories"][0] = {"MELON": 2}
+    full = empty_observation()
+    full["private"]["shed"]["WHEAT"] = SHED_CAPACITY
+    full["private"]["inventories"][0] = {"MELON": 2}
+
+    assert _op_mask(room, "PLACE:MELON")
+    assert not _op_mask(full, "PLACE:MELON")
+    assert _op_mask(full, "DROP")
 
 
 # --------------------------------------------------------------------------
@@ -587,12 +653,14 @@ def test_the_mask_reads_the_seat_it_is_asked_for() -> None:
 # --------------------------------------------------------------------------
 
 # One turn out of every `_UNIT_STRIDE` of each archive's first episode, both
-# seats. The unit probe applies ~22 ops per unit per turn through a fresh copy
-# of the engine and the market probe applies 21 slots x 16 buckets, so the
-# strides buy coverage across all seven archives -- the ladder's agent mix
-# changes daily and this repo has twice shipped a claim that came from
-# generalising one archive -- at a runtime measured in tens of seconds.
-_UNIT_STRIDE = 60
+# seats. The unit probe applies every one of `UNIT_OPS` per unit per turn
+# through a fresh copy of the engine and the market probe applies 21 slots x 16
+# buckets, so the strides buy coverage across all seven archives -- the ladder's
+# agent mix changes daily and this repo has twice shipped a claim that came from
+# generalising one archive -- at a runtime measured in tens of seconds. The unit
+# stride was widened when PICKUP and PLACE gained an item each and doubled the
+# vocabulary.
+_UNIT_STRIDE = 90
 _MARKET_STRIDE = 120
 
 _needs_corpus = pytest.mark.skipif(
@@ -621,9 +689,12 @@ def _corpus_turns(stride: int) -> list[tuple[str, dict[str, Any], int]]:
 def _decoded_op(unit: int, op_index: int, units: int) -> list[Any]:
     """Return the op list the policy would actually emit for one (unit, op) pair.
 
-    Routed through ``decode_units`` rather than rebuilt from ``UNIT_OPS`` so
-    the probe measures what the rollout emits, item-less ``PICKUP`` included,
-    instead of a more generous op the decoder cannot produce.
+    Routed through ``decode_units`` rather than rebuilt from ``UNIT_OPS`` so the
+    probe measures what the rollout emits -- ``TRANSFER_QUANTITY`` and all --
+    instead of a more generous op the decoder cannot produce. That distinction
+    is what made this probe agree with a mask that forbade ``PICKUP`` outright
+    while the vocabulary carried no item: the decoder really could not express
+    a landable one.
     """
     logits = torch.zeros(1, MAX_UNITS, len(UNIT_OPS))
     logits[0, :, UNIT_OPS.index("PASS")] = 1.0
@@ -675,10 +746,17 @@ def test_the_unit_mask_agrees_with_the_engine_on_real_observations() -> None:
     move exists. Widening the mask until the numbers agree would fit it to
     whatever this probe happens to do; the numbers are asserted at zero
     instead.
+
+    Zero disagreements is also what a probe that exercises nothing reports, so
+    the verbs whose masks are newest are counted as well. While ``PICKUP`` and
+    ``PLACE`` were bare verbs, both sides of every comparison involving them was
+    ``False`` on every turn and this test passed as loudly as it does now. The
+    counts are asserted non-zero so that can never be true again silently.
     """
     turns = _corpus_turns(_UNIT_STRIDE)
     permissive: list[str] = []
     strict: list[str] = []
+    exercised: dict[str, int] = {"PICKUP": 0, "PLACE": 0}
 
     assert turns, "no archives on disk, so this proved nothing"
     for archive, observation, seat in turns:
@@ -694,9 +772,15 @@ def test_the_unit_mask_agrees_with_the_engine_on_real_observations() -> None:
                     permissive.append(f"{where}: mask allows {name}, engine refuses it")
                 if accepted and not allowed:
                     strict.append(f"{where}: engine accepts {name}, mask forbids it")
+                if accepted and op[0] in exercised:
+                    exercised[op[0]] += 1
 
     assert not permissive, f"{len(permissive)} over-permissive: {permissive[:5]}"
     assert not strict, f"{len(strict)} over-strict: {strict[:5]}"
+    assert all(exercised.values()), (
+        f"the engine accepted no {[k for k, v in exercised.items() if not v]} on any "
+        "sampled turn, so their masks were never tested"
+    )
 
 
 def _committed(observation: dict[str, Any], seat: int, slot: int, quantity: int) -> int:
