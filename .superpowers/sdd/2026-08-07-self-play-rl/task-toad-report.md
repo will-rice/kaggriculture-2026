@@ -226,8 +226,20 @@ That is not a subtle degradation — with `reduction: sum` over a joint log-prob
 a turn, it is immediate. Anyone reproducing this recipe from the phase configs alone will hit the same
 wall, and the briefing analysis did not mention it.
 
-This is also the third value the analysis omitted, after `/500.` and the phase-1 `teacher_kl_cost: 0.`.
-The pattern is consistent: **the analysis captured the phase YAMLs and nothing outside them.**
+### Four omissions, one cause — read this before reproducing anything
+
+| # | Value | Where it actually lives | Cost of omitting it |
+|---|---|---|---|
+| 1 | `/500.` normaliser on the whole shaped reward | `reward_spaces.py:227` (code, not config) | shaped signal 500× too large |
+| 2 | phase 1 `teacher_kl_cost: 0.` | `conv_phase1_shaped_reward.yaml:66` | a teacher on the from-scratch phase, which has none |
+| 3 | `clip_grads: 10.0` | run configs beside their checkpoints — **not in any phase YAML** | 6.2e20 loss in two updates |
+| 4 | value head bounded to the reward range | `nns/models.py:177-181` (code, not config) | 1.5e17 baseline term; run diverges |
+
+**The five phase YAMLs are not a complete recipe.** Two of these four live in their Python rather than in
+any config, and a third lives only in the run configs saved beside each trained checkpoint under
+`internal_testing/`. The briefing analysis captured the phase YAMLs and nothing outside them, which is
+exactly the set of values it got right — and the four it missed are each individually fatal to a run.
+Anyone repeating this must read `reward_spaces.py`, `nns/models.py` and `monobeast.py`, not just `conf/`.
 
 ### The run's actual result: the baseline diverges, and the value head is why
 
@@ -286,6 +298,25 @@ Both now fixed, both worth recording because each would have produced a plausibl
 
 The GPU is also chosen by free memory rather than hardcoded — the cards are shared with another run, and
 the first attempt died on one that was already 18.6 GiB full.
+
+### Retraction: throughput is *not* the constraint
+
+An earlier draft of this report claimed 2e7 steps was unreachable. **That claim was wrong and is
+withdrawn.** It was derived from a measurement taken *before* `torch.set_num_threads(1)` was added, when
+twelve workers were each claiming all 64 cores and the machine was thrashing at load average 230.
+
+Measured from the actual run's own log, after the fix:
+
+| | steps | hours |
+|---|---|---|
+| update 1 | 34,512 | 0.0086 |
+| update 2 | 69,024 | 0.0173 |
+
+**3.97M steps/hour, putting 2e7 at 5.0 hours** — a single overnight run, and consistent with the
+independent 9.7M steps/hour estimate to within the difference in worker count. There is no throughput
+cliff in evidence. Phase 1 should simply be run to completion, and no work should be spent on throughput.
+
+### The original (superseded) throughput note
 
 **Throughput is the binding constraint.** The engine is single-threaded Python and the rollout is
 env-bound, not network-bound, so the GPUs do not help collection. Round latency is ~719 sequential turns
