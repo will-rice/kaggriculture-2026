@@ -47,6 +47,7 @@ learned by continuing and a whole budget to be wasted, so the loop raises.
 
 import argparse
 import copy
+import dataclasses
 import functools
 import logging
 import multiprocessing
@@ -94,13 +95,46 @@ THREADS = 1
 WORKERS = 12
 ENVIRONMENTS = 4
 
-# How many workers mirror the live policy rather than playing a snapshot. A
-# mirror episode yields two on-policy trajectories and a snapshot episode one,
-# so this is also the knob that trades data rate against the pool diversity
-# that keeps self-play from cycling against a single opponent.
-MIRROR_SHARE = 0.5
+# How many workers mirror the live policy rather than playing an opponent from
+# the pool. A mirror episode yields two on-policy trajectories and a pool
+# episode one, so this trades data rate against opponent diversity -- and a
+# mirror episode of a policy that banks nothing is worth *less* than half a pool
+# episode, because both seats bankrupt identically and the differential is zero
+# on every turn. OpenAI Five sampled 80% latest-self; this run starts at 0.25
+# because the pool's fixed agents are the only thing in it that can bank.
+MIRROR_SHARE = 0.25
 POOL_SIZE = 8
 SNAPSHOT_EVERY = 10
+
+# The pool the workers sample from, kaito excluded. The learner's own past
+# snapshots are not a pool on their own: a policy that banks nothing plays a
+# copy of itself that banks nothing, the differential is zero on every turn of
+# every episode, and PPO is handed an advantage of -0.0008 +- 0.0128 to climb.
+# Measured over 30 iterations and about 2,000 seasons, with a best episode of 4
+# coins out of a possible 200,000.
+#
+# So the pool opens with two agents that do bank -- the hand-written economic
+# policy at 169,166 and the single richest harvested route at 186,163, both
+# measured here -- and the learner's snapshots join them as they are written.
+# Against a producing opponent the differential is large and signed, and every
+# coin we bank moves it.
+#
+# Kaito is not in this list and must not be. It is the gate, and an agent that
+# trained against it would have been shown the answer.
+FIXED_OPPONENTS = (
+    "src/kaggriculture/economic_policy.py",
+    "baselines/best_route.py",
+)
+
+# Iterations spent on the own-bank reward before the differential is switched
+# on. Every single-box winner with a primary source shaped first and switched
+# after -- Toad Brigade at 20M steps, FLG at 65M, Frog Parade "as soon as
+# training was running stably" -- and at this loop's ~12,000 decisions per
+# trajectory-hour, 20M steps is more than a workstation day. This budget cannot
+# reach their phase-1 lengths, so the split is stated rather than tuned: two
+# thirds shaped, one third on the win condition, and the report says which
+# phase the run ended in.
+SHAPING_ITERATIONS = 200
 
 # The win-rate curve. Eight seeds is far too few to gate on -- the gate is a
 # separate evaluation over 128 -- but enough to see a curve move, and it costs
@@ -126,15 +160,17 @@ class Match:
             read by every worker. A file rather than a pickled state dict
             because twelve workers reading one 41 MB file out of the page cache
             costs less than twelve copies of it down a pipe.
-        opponent: A snapshot to play, or ``None`` to mirror the live policy.
-            ``None`` is the case that yields both seats: only then are seat 1's
-            log-probabilities the learner's own.
+        opponent: A snapshot checkpoint to load, an agent spec to build, or
+            ``None`` to mirror the live policy. ``None`` is the only case that
+            yields both seats: only then are seat 1's log-probabilities the
+            learner's own. The three cases are told apart by type rather than
+            by a flag, so a caller cannot name a snapshot and get a mirror.
         seeds: One episode seed per environment, unique across the whole run so
             no iteration replays another's season.
     """
 
     weights: Path
-    opponent: Path | None
+    opponent: Path | str | None
     seeds: tuple[int, ...]
 
 
@@ -153,6 +189,7 @@ def main() -> None:
     )
     optimiser = torch.optim.AdamW(policy.parameters(), lr=LEARNING_RATE)
     chooser = random.Random(SEED)
+    shaping = dataclasses.replace(config, differential=0.0)
     run = wandb.init(
         entity=ENTITY,
         project=PROJECT,
@@ -168,6 +205,8 @@ def main() -> None:
             "mirror_share": MIRROR_SHARE,
             "pool_size": POOL_SIZE,
             "snapshot_every": SNAPSHOT_EVERY,
+            "shaping_iterations": SHAPING_ITERATIONS,
+            "fixed_opponents": list(FIXED_OPPONENTS),
             "commit": revision,
             "directory": str(directory),
             **{f"ppo/{field}": value for field, value in vars(config).items()},
@@ -192,12 +231,14 @@ def main() -> None:
             collected = time.perf_counter() - started
 
             refuse_illegal(batch, iteration)
-            metrics = update(policy, teacher, optimiser, batch, iteration, config)
+            phase = shaping if iteration < SHAPING_ITERATIONS else config
+            metrics = update(policy, teacher, optimiser, batch, iteration, phase)
             measured = {
                 **metrics,
                 **played(batch),
                 "iteration": iteration,
                 "pool": len(pool),
+                "differential": phase.differential,
                 "seconds/collect": collected,
                 "seconds/iteration": time.perf_counter() - started,
                 "hours": (time.perf_counter() - opened) / 3600,
@@ -206,9 +247,10 @@ def main() -> None:
                 measured.update(evaluate(policy, iteration))
             run.log(measured)
             LOGGER.info(
-                "iteration %d | %d trajectories | bank %.0f | margin %.0f | "
-                "entropy %.3f | kl %.4f | value %.4f | %.1f s",
+                "iteration %d | diff %.1f | %d trajectories | bank %.0f | "
+                "margin %.0f | entropy %.3f | kl %.4f | value %.4f | %.1f s",
                 iteration,
+                phase.differential,
                 measured["trajectories"],
                 measured["bank/mean"],
                 measured["margin/mean"],
@@ -299,7 +341,9 @@ def assignments(
 
     Args:
         weights: The learner's current weights.
-        pool: Snapshot checkpoints, oldest first. Empty until the first one.
+        pool: Snapshot checkpoints, oldest first. Empty until the first one is
+            written; ``FIXED_OPPONENTS`` are sampled from either way, which is
+            what stops the opening iterations being mirror-only.
         iteration: Which iteration this is, for the seed stride.
         chooser: The run's opponent-sampling stream.
 
@@ -312,8 +356,8 @@ def assignments(
             weights=weights,
             opponent=(
                 None
-                if not pool or chooser.random() < MIRROR_SHARE
-                else chooser.choice(pool)
+                if chooser.random() < MIRROR_SHARE
+                else chooser.choice([*FIXED_OPPONENTS, *pool])
             ),
             seeds=tuple(
                 base + worker * ENVIRONMENTS + index for index in range(ENVIRONMENTS)
@@ -345,7 +389,13 @@ def play(match: Match) -> list[Trajectory]:
     """Play one worker's group of environments in lockstep. Runs in the worker."""
     policy = learner()
     policy.load_state_dict(torch.load(match.weights, map_location=DEVICE))
-    opponent = policy if match.opponent is None else snapshot(match.opponent)
+    opponent = (
+        policy
+        if match.opponent is None
+        else snapshot(match.opponent)
+        if isinstance(match.opponent, Path)
+        else match.opponent
+    )
     return rollout_many(policy, opponent, match.seeds)
 
 

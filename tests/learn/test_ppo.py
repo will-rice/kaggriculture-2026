@@ -45,6 +45,7 @@ from kaggriculture.learn.ppo import (
     joint_log_prob,
     kl_weight,
     policy_loss,
+    reward_of,
     update,
 )
 from kaggriculture.learn.rollout import Trajectory
@@ -118,6 +119,61 @@ def test_the_teacher_penalty_falls_to_zero() -> None:
     )
     assert kl_weight(step=KL_STEPS) == 0.0
     assert kl_weight(step=KL_STEPS * 10) == 0.0
+
+
+def test_the_differential_weight_chooses_which_reward_is_climbed() -> None:
+    """The curriculum knob has to actually reach the advantage, or it is a comment.
+
+    ``differential`` is what a run schedules from 0.0 to 1.0, and the failure it
+    guards against is silent in every other metric: a ``flatten`` that ignored
+    the weight would produce finite advantages, a finite value loss and a
+    plausible policy loss on every setting, and the whole shaped phase would be
+    training on the differential it was introduced to avoid.
+
+    So the two endpoints are computed and required to differ from each other and
+    each to equal the series it names. The synthetic trajectory's two series are
+    independent draws, so a blend that returned either one unconditionally, or
+    their sum, fails.
+    """
+    policy = _policy(seed=0)
+    trajectory = _trajectory(policy, turns=6, seed=3)
+
+    relative = reward_of(trajectory, 1.0)
+    absolute = reward_of(trajectory, 0.0)
+    half = reward_of(trajectory, 0.5)
+
+    assert torch.equal(relative, trajectory.rewards)
+    assert torch.equal(absolute, trajectory.own)
+    assert not torch.allclose(relative, absolute)
+    assert torch.allclose(half, (trajectory.rewards + trajectory.own) / 2)
+
+
+def test_the_shaped_reward_survives_a_zero_sum_batch() -> None:
+    """Two seats of one mirrored episode cancel on the differential, not on ``own``.
+
+    This is the configuration the run actually collects in: one policy plays
+    both seats, so the batch holds a trajectory and its exact negation. On
+    ``differential=1.0`` those two advantage series are equal and opposite and
+    the batch's mean advantage is zero by construction -- which is harmless when
+    the rewards are large and fatal when they are not, because a bankrupt mirror
+    makes every term zero rather than merely balanced.
+
+    On ``differential=0.0`` the two seats carry their own banks, which are not
+    negations of each other, so the spread survives. The assertion is on the
+    spread rather than the mean: a zero mean is what advantage normalisation
+    wants, and it is the *scale* that says whether there is anything to learn.
+    """
+    policy = _policy(seed=0)
+    ours = _trajectory(policy, turns=6, seed=4)
+    theirs = dataclasses.replace(ours, rewards=-ours.rewards)
+
+    relative = flatten([ours, theirs], PpoConfig(differential=1.0))
+    absolute = flatten([ours, theirs], PpoConfig(differential=0.0))
+
+    assert float(reward_of(ours, 1.0).sum() + reward_of(theirs, 1.0).sum()) == 0.0
+    assert float(reward_of(ours, 0.0).sum() + reward_of(theirs, 0.0).sum()) != 0.0
+    assert relative.returns.std() > 0.0
+    assert absolute.returns.std() > 0.0
 
 
 def test_the_ratio_is_taken_under_the_stored_mask() -> None:
@@ -327,6 +383,10 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
     dones = torch.zeros(turns, dtype=torch.bool)
     dones[-1] = True
     rewards = torch.randn(turns) * 100.0
+    # A second, independent series. Not a scaling of `rewards`: `reward_of`
+    # blends the two, and a synthetic trajectory whose halves were proportional
+    # could not tell a blend that ignores one of them from one that does not.
+    own = torch.randn(turns) * 100.0
     return Trajectory(
         board=board,
         scalars=scalars,
@@ -338,6 +398,7 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         log_probs=joint_log_prob(units, market, unit_actions, market_actions),
         values=values,
         rewards=rewards,
+        own=own,
         dones=dones,
         final_margin=float(rewards.sum()),
         final_bank=STARTING_MONEY + float(rewards.sum()),

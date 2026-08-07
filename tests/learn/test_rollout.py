@@ -21,7 +21,12 @@ import pytest
 import torch
 from kaggle_environments import make
 
-from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS, TURNS_PER_DAY
+from kaggriculture.constants import (
+    ENVIRONMENT,
+    EPISODE_STEPS,
+    STARTING_MONEY,
+    TURNS_PER_DAY,
+)
 from kaggriculture.learn.encoding import (
     IGNORE,
     MARKET_SLOTS,
@@ -84,15 +89,28 @@ def test_a_trajectory_covers_every_acting_turn() -> None:
     assert len(trajectory.rewards) == 719
 
 
-def test_reward_is_the_change_in_bank_differential() -> None:
-    """Dense, sums to the terminal margin, and is the win condition itself.
+def test_both_reward_series_telescope_to_their_own_outcome() -> None:
+    """Each series is dense, and every coin of it accounted for by one number.
 
-    Terminal bank alone is one scalar after 719 decisions. This is the same
-    quantity, delivered per turn.
+    ``rewards`` is a difference of a difference and sums to the terminal
+    margin; ``own`` is a difference and sums to what our farm made on top of
+    the ``STARTING_MONEY`` it opened with. Both identities are exact, and they
+    are asserted together because the failure worth catching is the two series
+    being the *same* series under different names -- which satisfies either
+    identity alone whenever we and the opponent bank equally, and is what a
+    copy-paste in ``_trajectory`` would produce.
+
+    The final assertion is what rules that out on this fixture: the untrained
+    policy banks nothing and ``starter`` banks thousands, so the two sums are
+    different numbers and a single series cannot satisfy both.
     """
     trajectory = rollout(_untrained(), "starter", seed=0)
 
     assert trajectory.rewards.sum() == pytest.approx(trajectory.final_margin, abs=1.0)
+    assert trajectory.own.sum() == pytest.approx(
+        trajectory.final_bank - STARTING_MONEY, abs=1.0
+    )
+    assert not torch.allclose(trajectory.rewards, trajectory.own, atol=1.0)
 
 
 def test_sampled_actions_are_always_legal() -> None:
@@ -232,31 +250,31 @@ def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
     return torch.nn.functional.one_hot(chosen[None], options).float()
 
 
-def test_the_reward_is_a_differential_and_not_our_own_bank(
+def test_each_reward_lands_on_the_turn_that_earned_it(
     trajectory: Trajectory,
 ) -> None:
-    """Our bank alone rates a 6,000-against-20,000 season as a good one.
+    """The sum identities are satisfied by any sequence with the right total.
 
-    The ladder scores the margin, so the reward has to be the margin's
-    increments. A rollout that recorded our own bank change instead would still
-    be dense, would still telescope to a terminal scalar, and would pass every
-    other test in this file -- it would just be optimising a different game.
+    Only a per-turn comparison says each value belongs to the turn beside it,
+    so this rebuilds both series from the two banks as the *encoder* recorded
+    them -- a second, independent record of the same money, written into the
+    scalars by ``encode_scalars`` rather than read by ``_margin`` and ``_bank``.
 
-    Checked against both banks as the encoder recorded them, turn by turn,
-    rather than against the terminal margin alone: the sum identity above is
-    satisfied by any sequence with the right total, and only the per-turn
-    comparison says the reward lands on the turn that earned it. The second
-    assertion is what makes the first one mean something -- it fails if
-    ``starter`` never banked a coin, which would make the two candidate rewards
-    the same sequence.
+    The cross-assertions are what stop each half passing on the other's data.
+    ``own`` computed as the differential is the degenerate reward this project
+    ran thirty iterations on and learned nothing from; ``rewards`` computed as
+    our own bank is a policy that rates a 6,000-against-20,000 season as a good
+    one. Both are dense, both telescope, and neither is distinguishable from the
+    right answer without this test.
     """
     banks = trajectory.scalars[:, MONEY : MONEY + 2] * 10_000.0
-    margins = banks[:, 0] - banks[:, 1]
+    ours, theirs = banks[:, 0], banks[:, 1]
+    margins = ours - theirs
 
     assert torch.allclose(trajectory.rewards[:-1], margins[1:] - margins[:-1], atol=1.0)
-    assert not torch.allclose(
-        trajectory.rewards[:-1], banks[1:, 0] - banks[:-1, 0], atol=1.0
-    )
+    assert torch.allclose(trajectory.own[:-1], ours[1:] - ours[:-1], atol=1.0)
+    assert not torch.allclose(trajectory.own[:-1], margins[1:] - margins[:-1], atol=1.0)
+    assert not torch.allclose(trajectory.rewards[:-1], ours[1:] - ours[:-1], atol=1.0)
 
 
 def test_only_the_final_turn_is_done(trajectory: Trajectory) -> None:
@@ -435,20 +453,29 @@ def test_the_final_bank_is_this_seat_s_own_and_not_the_margin(
     assert all(trajectory.final_margin < 0.0 for trajectory in group)
 
 
-def test_self_play_records_both_seats_as_one_episode_seen_twice() -> None:
-    """Seat 1's 719 decisions are free data, and its reward is seat 0's negated.
+def test_self_play_records_both_seats_and_only_one_series_negates() -> None:
+    """Seat 1's 719 decisions are free data, and the two series behave differently.
 
-    The reward is a differential, so the two seats of one episode disagree by a
+    The differential is zero-sum, so the two seats of one episode disagree by a
     sign and nothing else -- exactly, not approximately, because both are read
-    from the same two banks. A driver that recorded seat 1's reward from seat
-    0's point of view would train the opponent's half of the batch to lose, and
-    every other number here would look right.
+    from the same two banks. A driver that recorded seat 1's differential from
+    seat 0's point of view would train the opponent's half of the batch to lose,
+    and every other number here would look right.
+
+    ``own`` must *not* negate, and that is the whole reason it exists. When one
+    policy plays both seats and the reward is a pure difference, the two halves
+    of the batch carry exactly opposite rewards; two copies of a bankrupt policy
+    then produce identically zero on every turn, which is the fixed point this
+    project measured for thirty iterations. ``own`` is each seat's own money,
+    so it is not the negation of anything, and it still has a gradient when the
+    two seats are the same weights.
     """
     trajectories = rollout_many(_untrained(), _untrained(), (13,))
 
     assert len(trajectories) == 2
     ours, theirs = trajectories
     assert torch.equal(ours.rewards, -theirs.rewards)
+    assert not torch.equal(ours.own, -theirs.own)
     assert ours.final_margin == -theirs.final_margin
     assert ours.final_bank - theirs.final_bank == pytest.approx(ours.final_margin)
     assert ours.illegal == 0 and theirs.illegal == 0

@@ -35,15 +35,42 @@ a private re-implementation of any of that drifts from ``encoding.py`` the
 moment either side changes, and the engine's response to a malformed op is to
 do nothing at all.
 
-**The reward is the per-turn change in (our bank - their bank).** It is the win
-condition rather than a proxy for it -- ``interpreter`` ends the episode by
-setting each seat's reward to its own ``money``, and ``MatchTask.evaluate``
-compares the two -- and because it is a difference of a difference it telescopes:
-the 719 rewards sum to the terminal margin exactly, and both farms open on the
-same ``startingMoney``, so no constant leaks in. That is what makes it dense
-without being shaped. Our own bank change is *not* the same signal: an episode
-where we bank 6,000 against an opponent's 20,000 is a loss, and a policy trained
-on our bank alone would rate it a strong one.
+**Two reward series are recorded, and this module does not choose between
+them.** ``rewards`` is the per-turn change in (our bank - their bank) and
+``own`` is the per-turn change in our own bank alone. Both are stored on every
+trajectory; which one the gradient sees is a weight in ``PpoConfig`` and a
+schedule in the training loop, because it is a property of *where a run is*
+rather than of what an episode was.
+
+The differential is the win condition rather than a proxy for it --
+``interpreter`` ends the episode by setting each seat's reward to its own
+``money``, and ``MatchTask.evaluate`` compares the two -- and because it is a
+difference of a difference it telescopes: the 719 values sum to the terminal
+margin exactly, and both farms open on the same ``startingMoney``, so no
+constant leaks in. It is the right final objective and the wrong starting one.
+
+It is the wrong starting one because a purely relative reward has a fixed point
+that self-play falls straight into, and this one did. Two copies of a policy
+that banks nothing bankrupt each other identically, so the differential is zero
+on every turn of every episode and no gradient distinguishes any action from any
+other. Measured here over 30 iterations and about 2,000 seasons: mean bank 0,
+best episode 4 coins of a possible 200,000, advantage -0.0008 +- 0.0128, value
+loss 0.0002 -- a critic that had correctly learned that everything is zero.
+
+``own`` is what a run trains on until that stops being true. It telescopes to
+``final_bank - STARTING_MONEY``, so its total over a season is just what the
+farm made, and it is deliberately the thinnest possible shaping: it pays for
+banking coins, which is the objective itself measured absolutely rather than
+relatively, and it encodes no opinion about *how* to farm. Every single-box
+winner this project reads from did some version of this and then switched --
+Toad Brigade shaped for 20M steps, FLG for 65M before moving to a zero-sum
+differential of the same construction as ours, and Frog Parade moved to sparse
+win/loss "as soon as training was running stably".
+
+Our own bank cannot replace the differential, which is why both are kept rather
+than one being chosen here: an episode where we bank 6,000 against an
+opponent's 20,000 is a loss, and a policy trained on ``own`` alone would rate it
+a strong one.
 
 The episode is driven a step at a time through ``Environment.step`` rather than
 handed to ``Environment.run``. ``run`` reaches an agent only as a callable it
@@ -146,7 +173,12 @@ class Trajectory:
             and a turn's action is all of it at once.
         values: ``(turns,)`` the value head's estimate at that state.
         rewards: ``(turns,)`` change in (our bank - their bank) across the
-            turn. Sums to ``final_margin``.
+            turn. Sums to ``final_margin`` exactly.
+        own: ``(turns,)`` change in our own bank across the turn. Sums to
+            ``final_bank - STARTING_MONEY`` exactly. Recorded alongside
+            ``rewards`` rather than instead of it: which one a gradient sees is
+            ``PpoConfig.differential``, and a trajectory collected under one
+            setting is usable under the other because both were kept.
         dones: ``(turns,)`` bool, True on the last turn alone. A rollout is
             one whole episode, so GAE bootstraps from nothing at the end.
         final_margin: This seat's terminal bank minus the other's. Positive is
@@ -171,6 +203,7 @@ class Trajectory:
     log_probs: torch.Tensor
     values: torch.Tensor
     rewards: torch.Tensor
+    own: torch.Tensor
     dones: torch.Tensor
     final_margin: float
     final_bank: float
@@ -190,14 +223,18 @@ class Stream:
         environment: Which environment of the group this reads.
         seat: Which seat it plays.
         turns: Every decision it made, in order.
-        margins: Its bank differential before each decision, and once more
-            after the last one, so the differences are one per decision.
+        margins: Its bank differential before each decision.
+        banks: Its own bank before each decision, read on the same turns as
+            ``margins`` and never derived from it -- the differential loses
+            which of the two farms the coins are on, which is the whole reason
+            the reward needs both.
     """
 
     environment: int
     seat: int
     turns: list["Turn"] = field(default_factory=list)
     margins: list[float] = field(default_factory=list)
+    banks: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -300,9 +337,9 @@ def rollout_many(
 
     while not environments[0].done:
         for stream in streams:
-            stream.margins.append(
-                _margin(_observation(environments, stream.environment, stream.seat))
-            )
+            seen = _observation(environments, stream.environment, stream.seat)
+            stream.margins.append(_margin(seen))
+            stream.banks.append(_bank(seen))
         turns = _decide(
             policy,
             [
@@ -649,14 +686,16 @@ def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
 def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     """Stack one recorded seat's turns into the tensors the update reads.
 
-    The stream's ``margins`` end one short of the terminal state, because the
-    loop appends before each decision and there is no decision after the last
-    one; the terminal differential is read here instead, from the environment
-    the stream played. That makes ``margins`` exactly one longer than ``turns``,
-    so the differences are one per decision and telescope to the final margin.
+    The stream's ``margins`` and ``banks`` both end one short of the terminal
+    state, because the loop appends before each decision and there is no
+    decision after the last one; the terminal pair is read here instead, from
+    the environment the stream played. That makes each series exactly one
+    longer than ``turns``, so the differences are one per decision and each
+    telescopes -- the differential to the final margin, and our own bank to the
+    terminal bank less the ``STARTING_MONEY`` both farms open on.
 
     Args:
-        stream: One seat's decisions and the differentials it saw.
+        stream: One seat's decisions and the two money series it saw.
         environment: The episode it played, for its terminal position.
 
     Returns:
@@ -665,6 +704,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     turns = stream.turns
     terminal = environment.state[stream.seat].observation
     margins = [*stream.margins, _margin(terminal)]
+    banks = [*stream.banks, _bank(terminal)]
     dones = torch.zeros(len(turns), dtype=torch.bool)
     dones[-1] = True
     unit_actions = torch.cat([turn.units for turn in turns])
@@ -681,19 +721,36 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         market_masks=market_masks,
         log_probs=torch.cat([turn.log_prob for turn in turns]),
         values=torch.cat([turn.value for turn in turns]),
-        rewards=torch.tensor(
-            [
-                after - before
-                for before, after in zip(margins[:-1], margins[1:], strict=True)
-            ],
-            dtype=torch.float32,
-        ),
+        rewards=_differences(margins),
+        own=_differences(banks),
         dones=dones,
         final_margin=margins[-1],
         final_bank=_bank(terminal),
         illegal=(
             _illegal(unit_actions, unit_masks) + _illegal(market_actions, market_masks)
         ),
+    )
+
+
+def _differences(series: list[float]) -> torch.Tensor:
+    """Return the per-turn change in a money series that is one longer than the turns.
+
+    ``strict=True`` on the zip, because the ragged truncation it forbids is
+    exactly how an off-by-one here would look: a series the same length as the
+    turns would silently yield one reward fewer than there were decisions, and
+    every reward in the episode would be attributed to the turn after the one
+    that earned it.
+
+    Args:
+        series: The quantity at each state, terminal state included.
+
+    Returns:
+        ``(turns,)`` float32 differences, which sum to ``series[-1] -
+        series[0]``.
+    """
+    return torch.tensor(
+        [after - before for before, after in zip(series[:-1], series[1:], strict=True)],
+        dtype=torch.float32,
     )
 
 
