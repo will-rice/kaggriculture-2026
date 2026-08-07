@@ -310,6 +310,40 @@ was being learned; it is not flat.
 **The go/no-go checkpoint is not yet reached and must not be inferred from this table.** The run needs to go
 to 2e7.
 
+### Not a deviation: the value-head bound is exactly theirs
+
+Recorded because it is a genuine trap that has already caught one careful reader, and getting it "more
+faithful" would break the run.
+
+Reading `StatefulMultiReward.get_reward_spec()` alone (`reward_spaces_lux.py:141-146`) suggests the value
+head should be bounded to `±1/MAX_DAYS` = **±0.002778**, i.e. ~360× tighter than our `VALUE_BOUND = 1.0`.
+That reading stops one branch too early. `BaselineLayer.__init__` (`nns/models.py:157-160`) then does:
+
+```
+if not reward_space.only_once:
+    # Expand reward space to n_steps for rewards that occur more than once
+    reward_space_expanded = GAME_CONSTANTS["PARAMETERS"]["MAX_DAYS"]
+    self.reward_min *= reward_space_expanded
+    self.reward_max *= reward_space_expanded
+```
+
+`StatefulMultiReward` sets `only_once=False` (`reward_spaces_lux.py:145`), and `MAX_DAYS = 360`, so:
+
+    ±(1/360) × 360 = ±1.000000
+
+**Their effective bound is exactly `[-1, +1]`.** `VALUE_BOUND = 1.0` is faithful, not a loosening, and it
+belongs in no deviation list. The `±1/MAX_DAYS` figure is a pre-expansion intermediate that never reaches
+the sigmoid.
+
+The comment in their code says why the expansion exists, and the reasoning transfers to us unchanged: the
+head estimates a *multi-step return*, so bounding it by the *per-step* reward range would be a category
+error. A per-step bound of ±0.0028 could not even represent our observed episode returns of ~0.01-0.05, and
+tightening toward it — the obvious "increase faithfulness" move — would clip every value target to the rail
+and destroy the run while looking like a correction.
+
+**Any future ablation on this constant should start from `[-1, +1]` as the faithful baseline**, and treat a
+tighter bound as the deviation requiring justification, not the reverse.
+
 ### Two further infidelities the first launch exposed
 
 Both now fixed, both worth recording because each would have produced a plausible-looking but wrong run:
