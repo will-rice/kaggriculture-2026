@@ -65,6 +65,11 @@ BATCH_SEGMENTS = 4
 # network is 8 blocks at 256 channels; the width is theirs, not ours.
 BLOCKS = 8
 CHANNELS = 128
+# toad/nns/models.py:157-160 and :181. StatefulMultiReward's spec is
+# +/-1/MAX_DAYS and its `only_once` is False, so BaselineLayer expands the range
+# by MAX_DAYS: the value head is confined to [-1, +1]. Ours was unbounded, and
+# that alone diverged the first run.
+VALUE_BOUND = 1.0
 # Episodes per collection round. Their n_actor_envs is 16 across 2 actors; ours
 # is one synchronous group, and both seats of a self-play episode are recorded.
 ENVIRONMENTS = 24
@@ -88,7 +93,7 @@ def main() -> None:
     log = RUNS / f"phase1_{int(time.time())}.jsonl"
 
     device = _device()
-    learner = Policy(blocks=BLOCKS, channels=CHANNELS).to(device)
+    learner = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND).to(device)
     parameters = sum(p.numel() for p in learner.parameters())
     LOGGER.info("phase 1: %d params, device %s, log %s", parameters, device, log)
 
@@ -191,7 +196,7 @@ def _play(work: tuple[dict[str, torch.Tensor], list[int]]) -> list[Trajectory]:
     """
     torch.set_num_threads(THREADS)
     state, seeds = work
-    actor = Policy(blocks=BLOCKS, channels=CHANNELS)
+    actor = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND)
     actor.load_state_dict(state)
     actor.eval()
     with torch.no_grad():
