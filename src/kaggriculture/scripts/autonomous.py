@@ -23,6 +23,7 @@ A tie is not an improvement. Absent evidence, the incumbent stays.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
@@ -154,6 +155,20 @@ def assess(reserve: int) -> dict[str, Any]:
             "whether to replace it"
         )
         return state
+    if verdict.get("candidate") != state["candidate"]:
+        state["reason"] = (
+            f"gate measured {verdict.get('candidate')!r} but main.py serves "
+            f"{state['candidate']!r}; the archive would ship something the gate "
+            "never played"
+        )
+        return state
+    if verdict["candidate"] == verdict["opponent"]:
+        state["reason"] = (
+            f"gate pitted {verdict['candidate']!r} against itself; beating "
+            "yourself is not evidence for replacing yourself, and submitting on "
+            "it would re-submit the incumbent every tick"
+        )
+        return state
     if verdict["low"] <= MIN_WIN_RATE_LOWER_BOUND:
         state["reason"] = (
             f"gate win rate {verdict['win_rate']:.3f} "
@@ -227,22 +242,52 @@ def last_submitted(submissions: list[dict[str, Any]]) -> str | None:
 
 
 def working_revision() -> str | None:
-    """Return the short commit if the tree is clean, otherwise None.
+    """Return a fingerprint of what would ship, or None if the tree is dirty.
 
-    A submission from a dirty tree is a measurement of code that exists nowhere,
-    which is the same reason `tracking` refuses to record one.
+    Not `HEAD`. A commit is the wrong thing to stamp a gate verdict with, in
+    both directions:
+
+    * It changes when nothing that ships changed. This pass commits refreshed
+      cache databases every tick, so stamping HEAD invalidated every verdict
+      before the next pass could read it -- the system could only ever have
+      submitted on a tick whose ingests happened to be byte-identical.
+    * It does not change when something that ships *does* change. `package.py`
+      copies `REQUIRED` artifacts that are deliberately gitignored, so a
+      re-harvested prototype store alters the agent's behaviour while HEAD and
+      a clean tree both stay exactly as they were.
+
+    The fingerprint covers the package source, the entrypoint, and every
+    artifact `package.py` copies in -- which is the set that decides what the
+    archive does.
+
+    Returns:
+        A short hex digest of the shipped set, or None when the tree is dirty.
     """
     dirty = subprocess.run(
         ["git", "status", "--porcelain"], capture_output=True, text=True, check=False
     ).stdout.strip()
     if dirty:
         return None
-    return subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
+
+    from kaggriculture.scripts.package import ENTRYPOINT, PACKAGE_ROOT, REQUIRED
+
+    digest = hashlib.sha256()
+    tree = subprocess.run(
+        ["git", "rev-parse", f"HEAD:{PACKAGE_ROOT.relative_to(Path.cwd())}"],
         capture_output=True,
         text=True,
         check=False,
     ).stdout.strip()
+    digest.update(tree.encode())
+    digest.update(ENTRYPOINT.read_bytes())
+    for artifact in sorted(REQUIRED):
+        if not artifact.is_file():
+            raise RuntimeError(
+                f"{artifact} is required by package.py but absent; the archive "
+                "cannot be built and a gate verdict about it would be fiction"
+            )
+        digest.update(artifact.read_bytes())
+    return digest.hexdigest()[:12]
 
 
 def served_agent() -> str:

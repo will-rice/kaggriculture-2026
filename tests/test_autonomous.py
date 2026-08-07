@@ -104,3 +104,46 @@ def test_a_stale_gate_verdict_is_refused(
 
     assert autonomous.gate_verdict("a122855") is None
     assert autonomous.gate_verdict("deadbee") is not None
+
+
+def test_a_gate_against_itself_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Beating yourself is not evidence for replacing yourself.
+
+    A review found this was the live shape: `main.py` served the incumbent, the
+    gate measured the incumbent, and the guard compared only the opponent
+    against the ladder -- so it passed, and would have re-submitted the
+    incumbent every tick until the slot reserve stopped it, displacing the
+    scored pair three times over.
+    """
+    verdict = {
+        "candidate": "kaggriculture.kaito_policy",
+        "opponent": "kaggriculture.kaito_policy",
+    }
+
+    assert verdict["candidate"] == verdict["opponent"]
+
+
+@pytest.mark.skipif(
+    autonomous.working_revision() is None,
+    reason="needs a clean tree: a dirty one fingerprints as None either way",
+)
+def test_the_fingerprint_covers_artifacts_git_does_not_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`package.py` ships gitignored artifacts, so HEAD does not describe the archive.
+
+    A re-harvested prototype store changes what the agent does while the tree
+    stays clean and HEAD stays put. Stamping a verdict with HEAD would let a
+    gate measured on the old store authorise shipping the new one.
+    """
+    from kaggriculture.scripts.package import REQUIRED
+
+    before = autonomous.working_revision()
+    artifact = next(iter(REQUIRED))
+    original = artifact.read_bytes()
+    try:
+        artifact.write_bytes(original + b"changed")
+        assert autonomous.working_revision() != before
+    finally:
+        artifact.write_bytes(original)
+    assert autonomous.working_revision() == before

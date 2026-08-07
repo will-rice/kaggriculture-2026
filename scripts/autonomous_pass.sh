@@ -84,12 +84,12 @@ step "ingest discussions" env PROJECT_ROOT="$ROOT" uv run --with httpx --with ka
 #     name: a bulk stage here would sweep up whatever else is in the tree,
 #     which has already swept one agent's work into another's commit.
 if [[ -n "$(git status --porcelain -- data)" ]]; then
-  step "commit cache refresh" git add data/discussions.db data/kernels.db
   step "commit cache refresh" git -c core.hooksPath=/dev/null commit -q -m \
     "chore: refresh the kernel and discussion caches
 
 Automated pass at $ts. The ingest dates inside these databases are the point:
-a survey quoted three days after it was taken was once read here as current."
+a survey quoted three days after it was taken was once read here as current." \
+    -- data/discussions.db data/kernels.db
 fi
 
 # 3. Where we stand, and whether a submission is warranted. All the judgement

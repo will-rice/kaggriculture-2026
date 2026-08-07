@@ -38,7 +38,6 @@ import json
 import logging
 import multiprocessing
 import statistics
-import subprocess
 from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -171,12 +170,14 @@ def record(measured: list[Rung], destination: Path) -> None:
         measured: Every rung played, in the order of `RUNGS`.
         destination: Where to write the verdict.
     """
-    revision = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
+    from kaggriculture.scripts.autonomous import served_agent, working_revision
+
+    revision = working_revision()
+    if revision is None:
+        raise RuntimeError(
+            "refusing to record a verdict from a dirty tree: it would describe "
+            "code that exists nowhere, and a later clean tree could match it"
+        )
     reached = [rung for rung in measured if rung.low > 0.5]
     top = reached[-1] if reached else measured[0]
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +185,7 @@ def record(measured: list[Rung], destination: Path) -> None:
         json.dumps(
             {
                 "revision": revision,
+                "candidate": served_agent(),
                 "opponent": OPPONENT_MODULES.get(top.opponent, top.opponent),
                 "games": top.games,
                 "win_rate": top.win_rate,
