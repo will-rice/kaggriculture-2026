@@ -37,6 +37,6 @@ measured out of the built archive by ``kaggriculture.scripts.budget``. Nothing
 on this path imports torch.
 """
 
-from kaggriculture.routes.play import agent
+from kaggriculture.kaito_policy import agent
 
 __all__ = ["agent"]

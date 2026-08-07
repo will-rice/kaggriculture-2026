@@ -37,6 +37,24 @@ select = ["C", "E", "F", "I", "W", "D", "N", "B", "PTH", "ANN"]
 ignore = ["D107"]
 exclude = [".venv"]
 
+# `kaito_policy.py` is a decoded copy of a published kernel's agent. It is
+# formatted and import-sorted like everything else -- provenance is checked by
+# diffing against the cached kernel under /data/kaggriculture/kernels, not by
+# leaving our copy untouched, and `tests/test_kaito_policy.py` pins its
+# behaviour.
+#
+# What is ignored is only the rules that would have us assert things about it
+# we have not established. Annotating nineteen functions nobody here has read
+# means writing down types we have not checked, and documenting them means
+# claiming to know what they do. Named rules rather than a blanket exclude, so
+# an undefined name, an unused import or a mutable default still fails.
+[tool.ruff.lint.per-file-ignores]
+"src/kaggriculture/kaito_policy.py" = [
+  "ANN",  # types we have not verified
+  "D103", # docstrings would claim understanding we do not have
+  "C901", # the retrieval function is complex; it is not ours to simplify
+]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
