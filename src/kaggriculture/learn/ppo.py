@@ -106,12 +106,22 @@ ENTROPY_WEIGHT = 0.01
 MAX_GRAD_NORM = 0.5
 
 # The penalty opens at 1.0 -- the same order as the policy loss, so it is a real
-# constraint rather than a decoration -- and reaches exactly zero after 4,000
-# updates. Linear rather than exponential because "decays to zero" should mean
-# zero: an exponential is still tethering the learner to the clone at every step
-# of the run, by an amount too small to see and too large to be nothing.
+# constraint rather than a decoration -- and reaches exactly zero after
+# `KL_STEPS` updates. Linear rather than exponential because "decays to zero"
+# should mean zero: an exponential is still tethering the learner to the clone
+# at every step of the run, by an amount too small to see and too large to be
+# nothing.
+#
+# 100, not the 4,000 this was written with. `step` here counts *updates*, not
+# minibatches -- `update` reads it once per call -- and 4,000 was picked before
+# any run length existed. Task 5 measured the loop at roughly 55 iterations per
+# hour, so 4,000 updates is three days: the weight would still be 0.92 at the
+# end of a six-hour run, and a penalty that never decays is not a decaying
+# penalty, it is a constraint on the whole run. 100 reaches zero about a third
+# of the way in, which is what "survive the first updates and then let go"
+# means at this budget. Any run that changes length has to revisit this number.
 KL_INITIAL = 1.0
-KL_STEPS = 4_000
+KL_STEPS = 100
 
 
 @dataclass(frozen=True)

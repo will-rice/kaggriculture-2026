@@ -15,6 +15,7 @@ guards go to stop running.
 """
 
 import functools
+import pathlib
 
 import pytest
 import torch
@@ -37,7 +38,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.rollout import Trajectory, rollout
+from kaggriculture.learn.rollout import Trajectory, rollout, rollout_many
 
 # Far enough in that the two farms have diverged. The opening position is
 # identical for both seats -- same tiles, same money, same empty shed -- so a
@@ -330,3 +331,177 @@ def test_self_play_runs_the_policy_on_both_seats() -> None:
     assert len(trajectory.rewards) == 719
     assert trajectory.illegal == 0
     assert trajectory.rewards.sum() == pytest.approx(trajectory.final_margin, abs=1.0)
+
+
+GROUP = (11, 12)
+
+
+@pytest.fixture(scope="module")
+def group() -> list[Trajectory]:
+    """Return a lockstep group of two episodes against ``starter``."""
+    return rollout_many(_untrained(), "starter", GROUP)
+
+
+def test_a_lockstep_group_returns_one_trajectory_per_seed(
+    group: list[Trajectory],
+) -> None:
+    """A named opponent is not the learner, so only seat 0 is on-policy.
+
+    Recording seat 1 against anything but the learner's own weights would hand
+    PPO an ``old`` log-probability that no distribution in the update ever
+    produced. The count is the cheapest statement that it does not.
+    """
+    assert len(group) == len(GROUP)
+    assert all(len(trajectory.rewards) == 719 for trajectory in group)
+    assert all(trajectory.illegal == 0 for trajectory in group)
+
+
+def test_a_lockstep_group_keeps_each_environment_s_rows_apart(
+    group: list[Trajectory],
+) -> None:
+    """The failure batching introduces is env *i*'s row landing on env *j*.
+
+    Nothing else in this file can see it: every trajectory in a mixed-up group
+    is still 719 turns long, still legal against the mask stored beside it,
+    still telescopes to some margin. What is wrong is only *which* episode each
+    row came from -- and a run trained on that is regressing a value function on
+    another season's returns.
+
+    So the *second* environment of the group is replayed on its own, from its
+    own stored actions, in a fresh environment at its own seed, and the state
+    it arrives at is compared against what was stored. Deliberately the second
+    and not the first: a driver that dispatched every action to environment 0,
+    or sliced every row out of the batch at index 0, reproduces environment 0
+    exactly and fails only here.
+
+    The two episodes are asserted to differ first, because if the seeds
+    happened to produce the same season the comparison would hold however the
+    rows were shuffled.
+    """
+    first, second = group
+
+    assert not torch.equal(first.board[DIVERGED], second.board[DIVERGED])
+
+    environment = make(
+        ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": GROUP[1]}
+    )
+    environment.reset(2)
+    starter = environment.agents["starter"]
+    for turn in range(DIVERGED):
+        acted = second.unit_actions[turn] != IGNORE
+        action = decode_units(
+            _one_hot(second.unit_actions[turn].clamp(min=0), len(UNIT_OPS)),
+            int(acted.sum()),
+        )
+        action["market"] = decode_market(
+            _one_hot(second.market_actions[turn], len(QUANTITIES))
+        )
+        environment.step([action, starter(environment.state[1].observation)])
+
+    observation = environment.state[0].observation
+
+    assert torch.equal(
+        encode_board(observation, 0), second.board[DIVERGED : DIVERGED + 1]
+    )
+    assert torch.equal(
+        unit_mask(observation, 0), second.unit_masks[DIVERGED : DIVERGED + 1]
+    )
+    assert torch.equal(
+        market_mask(observation, 0), second.market_masks[DIVERGED : DIVERGED + 1]
+    )
+
+
+def test_the_final_bank_is_this_seat_s_own_and_not_the_margin(
+    group: list[Trajectory],
+) -> None:
+    """A margin says who won; only a bank says whether anything was produced.
+
+    The self-play collapse this project is watching for -- two policies that
+    learn to neutralise each other and bank nothing -- is invisible in the
+    margin, which sits at zero whether both farms made 200,000 coins or none.
+    So ``final_bank`` has to be the seat's own money, and the two are told
+    apart by sign: the engine never lets a farm's money go below zero, while
+    this untrained policy loses to ``starter`` on both seeds and its margin is
+    negative on both. Each assertion below is the other's failure -- a
+    ``final_bank`` reading the margin goes negative, a ``final_margin`` reading
+    the bank cannot.
+
+    That the bank is exactly zero is not incidental and is the reason the
+    training loop logs it: this policy spends its opening 3,000 and never
+    completes a SELL, which is the same failure the behaviour-cloned checkpoint
+    has, and it is invisible in a margin.
+    """
+    assert all(trajectory.final_bank >= 0.0 for trajectory in group)
+    assert all(trajectory.final_margin < 0.0 for trajectory in group)
+
+
+def test_self_play_records_both_seats_as_one_episode_seen_twice() -> None:
+    """Seat 1's 719 decisions are free data, and its reward is seat 0's negated.
+
+    The reward is a differential, so the two seats of one episode disagree by a
+    sign and nothing else -- exactly, not approximately, because both are read
+    from the same two banks. A driver that recorded seat 1's reward from seat
+    0's point of view would train the opponent's half of the batch to lose, and
+    every other number here would look right.
+    """
+    trajectories = rollout_many(_untrained(), _untrained(), (13,))
+
+    assert len(trajectories) == 2
+    ours, theirs = trajectories
+    assert torch.equal(ours.rewards, -theirs.rewards)
+    assert ours.final_margin == -theirs.final_margin
+    assert ours.final_bank - theirs.final_bank == pytest.approx(ours.final_margin)
+    assert ours.illegal == 0 and theirs.illegal == 0
+    assert not torch.equal(ours.board[DIVERGED], theirs.board[DIVERGED])
+
+
+def test_a_named_opponent_at_seat_one_sees_the_engine_s_shared_fields(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Seat 1's *stored* observation has no ``step``; only ``run`` puts it back.
+
+    ``Environment.__get_state`` strips every property the specification marks
+    shared from every seat past the first, and ``Environment.run`` refills them
+    before calling an agent. Driving the episode through ``Environment.step``
+    does not, so an opponent in seat 1 was being handed an observation the
+    engine would never give it -- which is invisible for ``starter``, and fatal
+    for an agent that indexes a recorded route by the step: the vendored kaito
+    agent banked 0 from seat 1 and 201,485 from seat 0, by replaying turn zero
+    for the whole season.
+
+    The auditor below raises rather than reports, because ``rollout_many``
+    calls a built agent directly and lets the traceback out. It checks both
+    halves of the failure: a missing ``step`` raises ``KeyError``, and a
+    ``step`` refilled from the wrong place disagrees with the ``day`` and
+    ``hour`` the interpreter mirrors onto both seats.
+    """
+    spec = tmp_path / "auditor.py"
+    spec.write_text(
+        "def agent(observation):\n"
+        '    step = observation["step"]\n'
+        f'    if step != observation["day"] * {TURNS_PER_DAY} + observation["hour"]:\n'
+        '        raise ValueError(f"step {step} is not the turn being played")\n'
+        '    return {"farmer": ["PASS"], "hands": [], "market": []}\n'
+    )
+
+    trajectory = rollout(_untrained(), str(spec), seed=15)
+
+    assert len(trajectory.rewards) == 719
+    assert trajectory.illegal == 0
+
+
+def test_a_pool_opponent_is_a_second_policy_and_records_one_seat() -> None:
+    """A frozen checkpoint's log-probabilities are not the learner's.
+
+    ``rollout_many`` decides seat 1 with a second batched forward when the
+    opponent is a different ``Policy``, and records nothing from it. The
+    identity test is what separates this from self-play, so a pool opponent
+    that happens to hold identical weights is still only one trajectory.
+    """
+    torch.manual_seed(1)
+    pool = Policy(blocks=1, channels=32).eval()
+    trajectories = rollout_many(_untrained(), pool, (14,))
+
+    assert len(trajectories) == 1
+    assert trajectories[0].illegal == 0
+    assert len(trajectories[0].rewards) == 719

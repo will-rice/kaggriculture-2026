@@ -58,12 +58,32 @@ the decision, which is what the bank differential is read from.
 place, so every recorded step aliases the same farm dicts and the whole history
 reads as the final position. The two banks are therefore snapshotted as floats
 on the turn they are seen.
+
+**Episodes are driven in lockstep so that one forward serves all of them.**
+``rollout_many`` is the primitive and ``rollout`` is the one-seed case of it.
+Measured in Task 3, 78% of an episode's cost was the network: one forward per
+environment per turn, at batch 1, of a 10M-parameter trunk. Stepping ``N``
+environments together turns that into one forward of batch ``N`` -- the same
+arithmetic, issued once -- which is what makes a GPU worth having here and what
+moves the bottleneck onto the encoders, where it belongs. Nothing about *what*
+is recorded changes: every row of the batch is encoded, masked, sampled and
+stored by the same code that served a single environment, so the mask that
+gated a logit is still the mask stored beside the action it produced.
+
+**Both seats are recorded when, and only when, the opponent is the learner
+itself.** A self-play episode samples 719 decisions on each side and throwing
+one side away halves the data per unit of wall clock for nothing. But that is
+free only while both seats are the *same weights*: PPO's ratio is
+``exp(new - old)`` against the behaviour policy that acted, and a frozen pool
+checkpoint's log-probabilities are not the learner's. So the rule is identity --
+``opponent is policy`` -- rather than a flag a caller can set wrongly, and an
+episode against anything else records seat 0 alone.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import signature
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from kaggle_environments import make
@@ -129,8 +149,13 @@ class Trajectory:
             turn. Sums to ``final_margin``.
         dones: ``(turns,)`` bool, True on the last turn alone. A rollout is
             one whole episode, so GAE bootstraps from nothing at the end.
-        final_margin: Our terminal bank minus theirs, read from the engine's
-            own end-of-episode rewards. Positive is a win.
+        final_margin: This seat's terminal bank minus the other's. Positive is
+            a win.
+        final_bank: This seat's terminal bank on its own. Not derivable from
+            ``final_margin``, and the loop logs both: a margin says who won and
+            a bank says whether either farm produced anything, which is the
+            number that separates "learned to outproduce" from "learned to
+            neutralise".
         illegal: How many stored action indices their stored mask forbids.
             Zero unless the sampling or the storing is broken; see the module
             docstring.
@@ -148,7 +173,31 @@ class Trajectory:
     rewards: torch.Tensor
     dones: torch.Tensor
     final_margin: float
+    final_bank: float
     illegal: int
+
+
+@dataclass
+class Stream:
+    """One recorded seat of one environment, accumulating its own episode.
+
+    Internal to this module. A lockstep group holds one of these per recorded
+    seat, so a self-play episode holds two -- same environment, different seat,
+    different sign of the same reward -- and an episode against a named agent
+    holds one.
+
+    Attributes:
+        environment: Which environment of the group this reads.
+        seat: Which seat it plays.
+        turns: Every decision it made, in order.
+        margins: Its bank differential before each decision, and once more
+            after the last one, so the differences are one per decision.
+    """
+
+    environment: int
+    seat: int
+    turns: list["Turn"] = field(default_factory=list)
+    margins: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -176,6 +225,10 @@ class Turn:
 def rollout(policy: Policy, opponent: Policy | str, seed: int) -> Trajectory:
     """Play one episode from seat 0 and return everything the update needs.
 
+    The one-seed case of ``rollout_many``, and seat 0's trajectory out of it.
+    There is no second implementation: a single episode is a lockstep group of
+    one.
+
     Args:
         policy: The network being trained. Played by sampling, not by argmax:
             PPO's ratio is only defined against a stochastic behaviour policy,
@@ -192,56 +245,233 @@ def rollout(policy: Policy, opponent: Policy | str, seed: int) -> Trajectory:
         720 and the engine marks the season done on the last one, so there are
         720 recorded states and 719 decisions between them.
     """
-    generator = torch.Generator().manual_seed(seed)
-    environment = make(
-        ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed}
+    return rollout_many(policy, opponent, (seed,))[0]
+
+
+def rollout_many(
+    policy: Policy, opponent: Policy | str, seeds: Sequence[int]
+) -> list[Trajectory]:
+    """Play a group of episodes in lockstep, one forward per turn for all of them.
+
+    Every environment takes its turn at the same time, so the observations of
+    the whole group are encoded into one batch and the trunk is evaluated once
+    rather than ``len(seeds)`` times. That is the whole reason this function
+    exists: Task 3 measured 78% of an episode's wall clock inside the network,
+    at batch 1.
+
+    Seat 1 is recorded as its own trajectory when ``opponent is policy`` and
+    not otherwise. The reward is a differential, so seat 1's is the negation of
+    seat 0's, and both are on-policy only while both seats carry the same
+    weights. See the module docstring.
+
+    Args:
+        policy: The network being trained.
+        opponent: Another ``Policy``, or a spec the environment can build.
+        seeds: One seed per environment in the group. Each seeds its own
+            episode; the first also seeds the group's shared sampling stream.
+
+    Returns:
+        The group's trajectories, environment-major and seat-minor, so seat 0
+        of the first environment is first.
+
+    Raises:
+        ValueError: If the group's episodes do not all end on the same turn,
+            which would leave the recorded streams ragged.
+    """
+    generator = torch.Generator().manual_seed(int(seeds[0]))
+    environments = [
+        make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed})
+        for seed in seeds
+    ]
+    for environment in environments:
+        environment.reset(2)
+
+    mirror = opponent is policy
+    streams = [
+        Stream(environment=index, seat=seat)
+        for index in range(len(environments))
+        for seat in ((LEARNER, OPPONENT) if mirror else (LEARNER,))
+    ]
+    actors = (
+        ()
+        if isinstance(opponent, Policy)
+        else [_opponent_actor(opponent, environment) for environment in environments]
     )
-    environment.reset(2)
-    act = _opponent_actor(opponent, environment, generator)
 
-    turns: list[Turn] = []
-    margins: list[float] = []
-    while not environment.done:
-        observation = environment.state[LEARNER].observation
-        margins.append(_margin(observation))
-        turn = _decide(policy, observation, LEARNER, generator)
-        turns.append(turn)
-        environment.step([turn.action, act(environment.state[OPPONENT].observation)])
-    margins.append(_margin(environment.state[LEARNER].observation))
+    while not environments[0].done:
+        for stream in streams:
+            stream.margins.append(
+                _margin(_observation(environments, stream.environment, stream.seat))
+            )
+        turns = _decide(
+            policy,
+            [
+                (
+                    _observation(environments, stream.environment, stream.seat),
+                    stream.seat,
+                )
+                for stream in streams
+            ],
+            generator,
+        )
+        actions: list[list[Any]] = [[None, None] for _ in environments]
+        for stream, turn in zip(streams, turns, strict=True):
+            stream.turns.append(turn)
+            actions[stream.environment][stream.seat] = turn.action
+        for index, action in enumerate(
+            _opponent_actions(policy, opponent, actors, environments, generator)
+        ):
+            actions[index][OPPONENT] = action
+        for environment, pair in zip(environments, actions, strict=True):
+            environment.step(pair)
 
-    LOGGER.info("rollout of %d turns, margin %.0f", len(turns), margins[-1])
-    return _trajectory(turns, margins)
+    if not all(environment.done for environment in environments):
+        raise ValueError(
+            "the group's episodes ended on different turns, so their recorded "
+            "streams are ragged"
+        )
+
+    LOGGER.info("rolled out %d episodes into %d trajectories", len(seeds), len(streams))
+    return [_trajectory(stream, environments[stream.environment]) for stream in streams]
+
+
+def _observation(
+    environments: list[Environment], index: int, seat: int
+) -> Mapping[str, Any]:
+    """Return one seat's own observation, whose ``private`` mapping it alone sees."""
+    return environments[index].state[seat].observation
+
+
+def _agent_observation(environment: Environment, seat: int) -> Mapping[str, Any]:
+    """Return the observation the engine would hand an agent standing in this seat.
+
+    ``Environment.__get_state`` deletes every property the specification marks
+    ``shared`` from the schema of every seat past the first, and only
+    ``Environment.run`` puts them back -- it calls each agent with
+    ``__get_shared_state(position)``, which refills the shared properties from
+    seat 0. Driving the episode through ``Environment.step`` skips that, so
+    ``state[1].observation`` is what the engine *stores*, not what an agent
+    sees.
+
+    For this game the difference is one key. The interpreter writes ``farms``,
+    ``market``, ``town``, ``day`` and ``hour`` onto both seats itself, so they
+    survive; ``step`` it does not, and seat 1's stored observation has no
+    ``step`` at all. That is enough to destroy an agent that indexes a recorded
+    route by it -- the vendored kaito agent banks 201,485 from either seat under
+    ``run`` and 0 from seat 1 without this, silently, by replaying turn 0 for
+    the whole season.
+
+    Our own encoders are unaffected and do not go through here: they derive the
+    step from ``day`` and ``hour`` precisely because seat 1 has no ``step``, and
+    the masks read ``day``.
+
+    The refill is driven off the specification rather than off a literal
+    ``"step"``, so a shared property added to the game reaches opponents
+    without this function being edited. It is shallow: the engine deep-copies,
+    but the stored observation is already handed to opponents unowned today,
+    and a per-turn deep copy of two farms of a hundred tiles would cost more
+    than the encoders it is protecting.
+
+    Args:
+        environment: The episode.
+        seat: Which seat's observation to build.
+
+    Returns:
+        That seat's observation with the shared properties refilled.
+    """
+    observation = dict(environment.state[seat].observation)
+    for name, prop in environment.specification["observation"].items():
+        if prop.get("shared"):
+            observation[name] = environment.state[0].observation[name]
+    return observation
+
+
+def _opponent_actions(
+    policy: Policy,
+    opponent: Policy | str,
+    actors: Sequence[Callable[[Mapping[str, Any]], Any]],
+    environments: list[Environment],
+    generator: torch.Generator,
+) -> list[Any]:
+    """Return seat 1's action for every environment in the group.
+
+    Three cases. A mirror opponent's seat-1 action came out of the learner's own
+    batched forward -- the same weights, sampled in the same call -- so there is
+    nothing left to do and this returns nothing. A *distinct* ``Policy`` -- a
+    frozen checkpoint from the pool -- gets its own batched forward, so the pool
+    costs one extra forward for the group rather than one per environment.
+    Anything else is a named agent, and goes through its own environment's actor.
+
+    Args:
+        policy: The learner, to recognise the mirror case by identity.
+        opponent: What seat 1 is.
+        actors: One built agent per environment, empty for a ``Policy``.
+        environments: The group.
+        generator: The sampling stream.
+
+    Returns:
+        One action per environment, or an empty list when seat 1 was already
+        decided by the learner's own forward.
+    """
+    if opponent is policy:
+        return []
+    if isinstance(opponent, Policy):
+        return [
+            turn.action
+            for turn in _decide(
+                opponent,
+                [
+                    (_observation(environments, index, OPPONENT), OPPONENT)
+                    for index in range(len(environments))
+                ],
+                generator,
+            )
+        ]
+    return [
+        act(_agent_observation(environments[index], OPPONENT))
+        for index, act in enumerate(actors)
+    ]
 
 
 def _margin(observation: Mapping[str, Any]) -> float:
-    """Return our bank minus theirs, as a number rather than a live reference.
+    """Return this seat's bank minus the other's, as a number not a reference.
 
     Read now and kept, because ``Environment.step`` appends the state object
     itself and the interpreter mutates the farms in place: the recorded history
     aliases one set of dicts, so asking ``env.steps[t]`` for turn ``t``'s money
     after the fact returns the terminal money for every ``t``.
 
-    Both farms are public, so this is knowable from either seat's observation.
+    The seat is read from the observation rather than passed, because the
+    engine stamps each seat's own index into the observation it hands that seat
+    and a differential taken for the wrong seat is a sign error that telescopes
+    just as neatly to the wrong answer. Both farms are public, so the other
+    seat's bank is legible from here.
 
     Args:
-        observation: One turn's observation.
+        observation: One seat's own observation.
 
     Returns:
-        ``farms[0]["money"] - farms[1]["money"]``.
+        ``farms[player]["money"] - farms[1 - player]["money"]``.
     """
+    seat = int(observation["player"])
     farms = observation["farms"]
-    return float(farms[LEARNER]["money"]) - float(farms[OPPONENT]["money"])
+    return float(farms[seat]["money"]) - float(farms[1 - seat]["money"])
+
+
+def _bank(observation: Mapping[str, Any]) -> float:
+    """Return this seat's own bank, which the margin cannot recover."""
+    return float(observation["farms"][int(observation["player"])]["money"])
 
 
 def _opponent_actor(
-    opponent: Policy | str, environment: Environment, generator: torch.Generator
+    opponent: str, environment: Environment
 ) -> Callable[[Mapping[str, Any]], Any]:
     """Return the function that turns seat 1's observation into its action.
 
-    A ``Policy`` opponent goes through ``_decide``, so self-play has both seats
-    sampling from masked logits by the same code. Anything else is a spec the
-    environment knows how to build: a built-in name, or a path whose last
-    callable is the agent.
+    One actor per environment, never shared: ``build_agent`` execs the spec into
+    a fresh namespace, and the vendored heuristics keep per-episode state at
+    module level, so a single actor driving a group of environments would carry
+    one episode's memory into another's decisions.
 
     ``build_agent`` is used rather than ``kaggle_environments.agent.Agent``
     because ``Agent.act`` converts an exception into the returned action and
@@ -259,19 +489,12 @@ def _opponent_actor(
     not of callables in general.
 
     Args:
-        opponent: A policy, or a spec the environment can build.
+        opponent: A spec the environment can build.
         environment: The episode, for its agent registry and configuration.
-        generator: The sampling stream, shared with the learner so one seed
-            reproduces the whole episode.
 
     Returns:
         A callable from seat 1's observation to seat 1's action.
     """
-    if isinstance(opponent, Policy):
-        return lambda observation: (
-            _decide(opponent, observation, OPPONENT, generator).action
-        )
-
     agent, _parallelizable = build_agent(opponent, environment.agents, environment.name)
     arguments = len(signature(agent).parameters)
     return lambda observation: agent(
@@ -281,15 +504,23 @@ def _opponent_actor(
 
 def _decide(
     policy: Policy,
-    observation: Mapping[str, Any],
-    seat: int,
+    requests: Sequence[tuple[Mapping[str, Any], int]],
     generator: torch.Generator,
-) -> Turn:
-    """Sample one turn's action from the masked heads.
+) -> list[Turn]:
+    """Sample one turn's action for every ``(observation, seat)`` in the batch.
 
-    The observation is encoded once and every consumer -- both heads, both
-    masks, the value estimate -- reads that one encoding, so the state stored
-    in the trajectory is provably the state the action was chosen from.
+    Each row is encoded once and every consumer -- both heads, both masks, the
+    value estimate -- reads that one encoding, so the state stored in the
+    trajectory is provably the state the action was chosen from. The rows are
+    then stacked and the trunk runs once: batching changes which arithmetic is
+    issued together and nothing about which state produced which action, since
+    every tensor a row contributes is sliced back out at the row's own index.
+
+    The forward runs on whatever device the policy is on and the logits come
+    straight back to the CPU. Sampling, masking and storage stay on the CPU
+    deliberately: the masks are built there by pure Python, the trajectory is
+    consumed there, and one ``torch.Generator`` then seeds the whole run rather
+    than one per device.
 
     Ops for slots past the crew are sampled anyway, because a row of the unit
     head exists for every slot and ``masked_fill`` would leave an all-``-inf``
@@ -301,44 +532,66 @@ def _decide(
 
     Args:
         policy: The network to sample from.
-        observation: That seat's own observation, whose ``private`` mapping is
-            the only one legible to it.
-        seat: Which seat is acting.
+        requests: One ``(observation, seat)`` per row. The observation must be
+            that seat's own, whose ``private`` mapping is the only one legible
+            to it.
         generator: The sampling stream.
 
     Returns:
-        The ``Turn``.
+        One ``Turn`` per request, in the order the requests were given.
     """
-    board = encode_board(observation, seat)
-    scalars = encode_scalars(observation, seat)
-    positions = encode_positions(observation, seat)
-    units = unit_mask(observation, seat)
-    trades = market_mask(observation, seat)
+    board = torch.cat([encode_board(*request) for request in requests])
+    scalars = torch.cat([encode_scalars(*request) for request in requests])
+    positions = torch.cat([encode_positions(*request) for request in requests])
+    units = torch.cat([unit_mask(*request) for request in requests])
+    trades = torch.cat([market_mask(*request) for request in requests])
 
+    device = next(policy.parameters()).device
     with torch.no_grad():
-        unit_logits, market_logits, value = policy(board, scalars, positions)
+        unit_logits, market_logits, value = policy(
+            board.to(device), scalars.to(device), positions.to(device)
+        )
+    unit_logits, market_logits, value = (
+        unit_logits.cpu(),
+        market_logits.cpu(),
+        value.cpu(),
+    )
     chosen_units, unit_log = _sample(unit_logits, units, generator)
     chosen_market, market_log = _sample(market_logits, trades, generator)
 
-    count = unit_count(observation, seat)
-    action = decode_units(_one_hot(chosen_units, unit_logits.shape[-1]), count)
-    action["market"] = decode_market(_one_hot(chosen_market, market_logits.shape[-1]))
-
-    return Turn(
-        action=action,
-        board=board,
-        scalars=scalars,
-        positions=positions,
-        units=torch.cat(
-            [chosen_units[:, :count], torch.full_like(chosen_units[:, count:], IGNORE)],
-            dim=1,
-        ),
-        market=chosen_market,
-        unit_mask=units,
-        market_mask=trades,
-        log_prob=unit_log[:, :count].sum(dim=1) + market_log.sum(dim=1),
-        value=value,
-    )
+    turns: list[Turn] = []
+    for row, request in enumerate(requests):
+        count = unit_count(*request)
+        rows = slice(row, row + 1)
+        action = decode_units(
+            _one_hot(chosen_units[rows], unit_logits.shape[-1]), count
+        )
+        action["market"] = decode_market(
+            _one_hot(chosen_market[rows], market_logits.shape[-1])
+        )
+        turns.append(
+            Turn(
+                action=action,
+                board=board[rows],
+                scalars=scalars[rows],
+                positions=positions[rows],
+                units=torch.cat(
+                    [
+                        chosen_units[rows, :count],
+                        torch.full_like(chosen_units[rows, count:], IGNORE),
+                    ],
+                    dim=1,
+                ),
+                market=chosen_market[rows],
+                unit_mask=units[rows],
+                market_mask=trades[rows],
+                log_prob=(
+                    unit_log[rows, :count].sum(dim=1) + market_log[rows].sum(dim=1)
+                ),
+                value=value[rows],
+            )
+        )
+    return turns
 
 
 def _sample(
@@ -393,20 +646,25 @@ def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
     return torch.nn.functional.one_hot(chosen, options).float()
 
 
-def _trajectory(turns: list[Turn], margins: list[float]) -> Trajectory:
-    """Stack the episode's turns into the tensors the update reads.
+def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
+    """Stack one recorded seat's turns into the tensors the update reads.
 
-    ``margins`` is one longer than ``turns``: it holds the bank differential
-    before every decision and once more after the last one, so the differences
-    are exactly one per decision and telescope to the terminal margin.
+    The stream's ``margins`` end one short of the terminal state, because the
+    loop appends before each decision and there is no decision after the last
+    one; the terminal differential is read here instead, from the environment
+    the stream played. That makes ``margins`` exactly one longer than ``turns``,
+    so the differences are one per decision and telescope to the final margin.
 
     Args:
-        turns: Every decision, in order.
-        margins: The bank differential at each state, including the terminal.
+        stream: One seat's decisions and the differentials it saw.
+        environment: The episode it played, for its terminal position.
 
     Returns:
         The ``Trajectory``.
     """
+    turns = stream.turns
+    terminal = environment.state[stream.seat].observation
+    margins = [*stream.margins, _margin(terminal)]
     dones = torch.zeros(len(turns), dtype=torch.bool)
     dones[-1] = True
     unit_actions = torch.cat([turn.units for turn in turns])
@@ -432,6 +690,7 @@ def _trajectory(turns: list[Turn], margins: list[float]) -> Trajectory:
         ),
         dones=dones,
         final_margin=margins[-1],
+        final_bank=_bank(terminal),
         illegal=(
             _illegal(unit_actions, unit_masks) + _illegal(market_actions, market_masks)
         ),

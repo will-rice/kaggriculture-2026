@@ -25,6 +25,7 @@ import dataclasses
 import pytest
 import torch
 
+from kaggriculture.constants import STARTING_MONEY
 from kaggriculture.learn.encoding import (
     BOARD,
     IGNORE,
@@ -37,6 +38,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import (
+    KL_STEPS,
     PpoConfig,
     advantages,
     flatten,
@@ -96,9 +98,26 @@ def test_the_clip_does_not_shelter_a_bad_action() -> None:
 
 
 def test_the_teacher_penalty_falls_to_zero() -> None:
-    """It exists to survive the first updates, not to pin us to a weak clone."""
-    assert kl_weight(step=0) > kl_weight(step=1000) > kl_weight(step=10_000)
-    assert kl_weight(step=10_000) == pytest.approx(0.0, abs=1e-3)
+    """It exists to survive the first updates, not to pin us to a weak clone.
+
+    Written against ``KL_STEPS`` rather than against literal step counts,
+    because the number is set from a measured run length and has already moved
+    once: it was 4,000, chosen before any run length existed, and Task 5's
+    throughput made that three days of updates on a six-hour run. A test
+    holding 1,000 and 10,000 passed at 4,000 and asserted nothing at 100.
+
+    ``== 0.0`` exactly, not ``approx``. That is the whole difference between
+    this schedule and an exponential one, which would satisfy every inequality
+    here and every tolerance and still be tethering the learner to a clone that
+    banks nothing on the last update of the run.
+    """
+    assert (
+        kl_weight(step=0)
+        > kl_weight(step=KL_STEPS // 4)
+        > kl_weight(step=KL_STEPS // 2)
+    )
+    assert kl_weight(step=KL_STEPS) == 0.0
+    assert kl_weight(step=KL_STEPS * 10) == 0.0
 
 
 def test_the_ratio_is_taken_under_the_stored_mask() -> None:
@@ -321,6 +340,7 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         rewards=rewards,
         dones=dones,
         final_margin=float(rewards.sum()),
+        final_bank=STARTING_MONEY + float(rewards.sum()),
         illegal=0,
     )
 
