@@ -63,6 +63,7 @@ import torch
 from lightning import seed_everything
 
 import wandb
+from kaggriculture.constants import STARTING_MONEY
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.play import model as cloned
 from kaggriculture.learn.ppo import KL_INITIAL, PpoConfig, update
@@ -156,6 +157,13 @@ EVALUATION_OPPONENTS = ("src/kaggriculture/economic_policy.py", "starter")
 # just been fitted on.
 EVALUATION_BASE = 1_000_000_000
 
+# When to call a run destroyed rather than merely noisy. A quarter of the
+# opening bank for three iterations running is far outside anything the clone
+# arm's climb did -- it dipped from 8,087 to 5,940 and recovered -- and far
+# inside what the collapse did, which reached 0.3% of its opening by the third.
+COLLAPSE_FRACTION = 0.25
+COLLAPSE_PATIENCE = 3
+
 RUNS = Path("/data/kaggriculture/selfplay")
 
 
@@ -194,15 +202,22 @@ def main() -> None:
     )
     directory.mkdir(parents=True)
     policy, teacher = initialise(arguments.initialisation)
-    # The teacher penalty is on for exactly one of the three starts. Pulling a
-    # random network toward its own random initialisation is noise with a
-    # gradient, and pulling a resumed policy back toward the weights it is
-    # meant to continue from would undo the run it is continuing -- Jump-Start
-    # RL reports precisely that failure, a pretrained policy forgotten because
-    # the signal holding it was wrong. Only the clone has competence worth not
-    # wrecking in the first updates.
+    # The teacher penalty is off for a fresh start and on for the other two.
+    # Pulling a random network toward its own random initialisation is noise
+    # with a gradient, so there is nothing there worth holding.
+    #
+    # It is on for a resumed start because the alternative was measured and it
+    # destroyed the run. Continuing a checkpoint that banked 17,675 with the
+    # penalty at zero took the bank to 9 in five iterations while the KL rose
+    # 0.12 -> 1.46: with nothing holding it, the policy left a competent
+    # behaviour immediately and the critic's loss rose as it went. The argument
+    # for switching it off -- Jump-Start RL on a pretrained policy forgotten
+    # because the signal holding it was wrong -- is about a *fresh critic*, and
+    # a resumed run carries its critic with it. The penalty here is a trust
+    # region around a policy that is already worth something, which is exactly
+    # what the clone arm had while it climbed from 1,411 to 18,233.
     config = PpoConfig(
-        kl_initial=KL_INITIAL if arguments.initialisation == "clone" else 0.0
+        kl_initial=0.0 if arguments.initialisation == "fresh" else KL_INITIAL
     )
     optimiser = torch.optim.AdamW(policy.parameters(), lr=LEARNING_RATE)
     chooser = random.Random(SEED)
@@ -232,6 +247,7 @@ def main() -> None:
 
     weights = directory / "learner.pt"
     pool: list[Path] = []
+    banked: list[float] = []
     opened = time.perf_counter()
     deadline = opened + arguments.hours * 3600
     iteration = 0
@@ -281,6 +297,9 @@ def main() -> None:
                 measured["loss/value"],
                 measured["seconds/iteration"],
             )
+
+            banked.append(measured["bank/mean"])
+            refuse_collapse(banked)
 
             if iteration % SNAPSHOT_EVERY == 0:
                 snapshot_into(pool, policy, directory, iteration)
@@ -520,6 +539,42 @@ def refuse_illegal(batch: Sequence[Trajectory], iteration: int) -> None:
             f"iteration {iteration} sampled {illegal} actions their own stored "
             f"mask forbids across {len(batch)} trajectories -- the mask and the "
             f"sampler disagree, and training through it would waste the run"
+        )
+
+
+def refuse_collapse(banked: Sequence[float]) -> None:
+    """Stop the run if the update is destroying the policy it started from.
+
+    Measured, and this is why it exists: continuing a checkpoint that banked
+    17,675 took it to 17,675 -> 10,869 -> 1,557 -> 45 -> 33 -> 9 over five
+    iterations. Every other number stayed plausible -- finite losses, a rising
+    KL, an illegal count of zero -- and a run left alone would have spent four
+    hours making a good policy worse and then gated it.
+
+    Only fires when there was something to destroy, and the bar for that is
+    ``STARTING_MONEY``: a farm that ends the season below the 3,000 it opened
+    with has not preserved its own capital, and a fall from 100 to 0 is noise
+    rather than a policy being destroyed. A run that starts from noise sits far
+    below the bar for its whole life, so the guard is about protecting a
+    competent start rather than about demanding progress from any start.
+
+    Args:
+        banked: Mean bank per iteration, oldest first.
+
+    Raises:
+        ValueError: If the last ``COLLAPSE_PATIENCE`` iterations all banked
+            below ``COLLAPSE_FRACTION`` of what the first one did.
+    """
+    opening = banked[0]
+    recent = banked[-COLLAPSE_PATIENCE:]
+    if opening < STARTING_MONEY or len(recent) < COLLAPSE_PATIENCE:
+        return
+    if all(bank < COLLAPSE_FRACTION * opening for bank in recent):
+        raise ValueError(
+            f"the policy banked {opening:.0f} on the first iteration and "
+            f"{', '.join(f'{bank:.0f}' for bank in recent)} since -- the update "
+            f"is destroying what it started from, and the rest of the budget "
+            f"would be spent making it worse"
         )
 
 
