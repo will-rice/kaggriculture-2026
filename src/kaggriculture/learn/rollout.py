@@ -129,6 +129,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.toad_reward import Counts, counts, rank, shaped
 
 LOGGER = logging.getLogger(__name__)
 
@@ -174,6 +175,12 @@ class Trajectory:
         values: ``(turns,)`` the value head's estimate at that state.
         rewards: ``(turns,)`` change in (our bank - their bank) across the
             turn. Sums to ``final_margin`` exactly.
+        shaped: ``(turns,)`` Toad's phase-1 shaped reward for this seat --
+            their five weighted per-turn deltas plus the 10x terminal result,
+            all through their /500 normaliser. Recorded alongside ``rewards``
+            and ``own`` rather than instead of them, for the same reason those
+            two coexist: which one a gradient sees is the learner's choice, and
+            a trajectory collected once is then usable under any of them.
         own: ``(turns,)`` change in our own bank across the turn. Sums to
             ``final_bank - STARTING_MONEY`` exactly. Recorded alongside
             ``rewards`` rather than instead of it: which one a gradient sees is
@@ -204,6 +211,7 @@ class Trajectory:
     values: torch.Tensor
     rewards: torch.Tensor
     own: torch.Tensor
+    shaped: torch.Tensor
     dones: torch.Tensor
     final_margin: float
     final_bank: float
@@ -235,6 +243,7 @@ class Stream:
     turns: list["Turn"] = field(default_factory=list)
     margins: list[float] = field(default_factory=list)
     banks: list[float] = field(default_factory=list)
+    counts: list[Counts] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -340,6 +349,7 @@ def rollout_many(
             seen = _observation(environments, stream.environment, stream.seat)
             stream.margins.append(_margin(seen))
             stream.banks.append(_bank(seen))
+            stream.counts.append(counts(seen, stream.seat))
         turns = _decide(
             policy,
             [
@@ -705,6 +715,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     terminal = environment.state[stream.seat].observation
     margins = [*stream.margins, _margin(terminal)]
     banks = [*stream.banks, _bank(terminal)]
+    series = [*stream.counts, counts(terminal, stream.seat)]
     dones = torch.zeros(len(turns), dtype=torch.bool)
     dones[-1] = True
     unit_actions = torch.cat([turn.units for turn in turns])
@@ -723,6 +734,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         values=torch.cat([turn.value for turn in turns]),
         rewards=_differences(margins),
         own=_differences(banks),
+        shaped=shaped(series, rank(series[-1].money, _other(terminal, stream.seat))),
         dones=dones,
         final_margin=margins[-1],
         final_bank=_bank(terminal),
@@ -730,6 +742,11 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
             _illegal(unit_actions, unit_masks) + _illegal(market_actions, market_masks)
         ),
     )
+
+
+def _other(observation: Mapping[str, Any], seat: int) -> float:
+    """Return the opposing seat's terminal bank."""
+    return float(observation["farms"][1 - seat]["money"])
 
 
 def _differences(series: list[float]) -> torch.Tensor:

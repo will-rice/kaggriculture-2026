@@ -33,6 +33,8 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
+import torch
+
 from kaggriculture.observation import is_plant
 
 # reward_spaces_lux.py:166-177, verbatim. `step` defaults to 0. there and phase 1
@@ -165,14 +167,58 @@ class StatefulMultiReward:
             # (reward_spaces_lux.py:111-112). Ours ranks on coins banked, which
             # is our terminal objective the way city tiles are theirs.
             other = observation["farms"][1 - self.seat]["money"]
-            total += GAME_RESULT_WEIGHT * _rank(current.money, other)
+            total += GAME_RESULT_WEIGHT * rank(current.money, other)
         else:
             self.previous = current
 
         return total / NORMALISER
 
 
-def _rank(ours: float, theirs: float) -> float:
+def shaped(series: list[Counts], won: float) -> torch.Tensor:
+    """Return the per-turn shaped reward for a counts series.
+
+    The stateful class above is the faithful transcription of their per-step
+    space; this is the same arithmetic over a whole episode at once, so it can
+    sit beside ``rollout._differences`` and be read the same way. The series is
+    one longer than the number of decisions -- one entry per state, terminal
+    state included -- so the differences are one per decision, and a series the
+    same length as the turns raises rather than silently shifting every reward
+    onto the turn after the one that earned it.
+
+    Args:
+        series: The counts at each state, terminal state included.
+        won: The terminal result in {-1., 0., +1.}, added on the last turn at
+            ``GAME_RESULT_WEIGHT`` exactly as their ``game_result`` component
+            does.
+
+    Returns:
+        ``(turns,)`` float32 shaped rewards, already divided by ``NORMALISER``.
+
+    Raises:
+        ValueError: If ``series`` holds fewer than two states.
+    """
+    if len(series) < 2:
+        raise ValueError(
+            f"a shaped series needs one state per turn plus the terminal one, "
+            f"got {len(series)}"
+        )
+    rewards = []
+    for before, after in zip(series[:-1], series[1:], strict=True):
+        total = (
+            CITY_WEIGHT * (after.city - before.city)
+            + UNIT_WEIGHT * (after.unit - before.unit)
+            + RESEARCH_WEIGHT * (after.research - before.research)
+            # Clamped at zero, their line 201: selling stock must not read as a
+            # loss, because the sale is already paid for through game_result.
+            + FUEL_WEIGHT * max(after.fuel - before.fuel, 0)
+            + STEP_WEIGHT
+        )
+        rewards.append(total / NORMALISER)
+    rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER
+    return torch.tensor(rewards, dtype=torch.float32)
+
+
+def rank(ours: float, theirs: float) -> float:
     """Return +1 for a win, -1 for a loss, 0 for a draw.
 
     ``scipy.rankdata`` on two players maps to ``(rank - 1) * 2 - 1``, which is
