@@ -235,7 +235,7 @@ def test_a_season_that_ends_holding_stock_does_not_out_score_one_that_sold_it() 
     The shaped return over an episode telescopes to
     ``gamma**N * P(s_N) - P(s_0)``. The opening term is a constant and harmless.
     The *closing* one is a function of the state the agent chose to stop in, so
-    Grze&#347; (AAMAS 2017, Eq. 3) requires the potential at a trajectory's stopping
+    Grzes (AAMAS 2017, Eq. 3) requires the potential at a trajectory's stopping
     state to be zero -- otherwise, in his words, "this term can modify the
     policy".
 

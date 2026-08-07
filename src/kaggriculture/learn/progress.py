@@ -237,7 +237,7 @@ def progress_reward(potentials: torch.Tensor, gamma: float) -> torch.Tensor:
     detail.** The shaped return over a whole episode telescopes to
     ``gamma**N * P(s_N) - P(s_0)``. The second term is a constant and cannot
     change a policy. The first is a function of the state the agent chose to
-    end in, and Grze&#347; (AAMAS 2017) shows it therefore *does* change the policy
+    end in, and Grzes (AAMAS 2017) shows it therefore *does* change the policy
     unless the potential at a trajectory's stopping state is set to zero.
 
     Left un-zeroed here, that term would pay the agent to finish the season
