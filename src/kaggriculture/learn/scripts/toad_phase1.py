@@ -45,6 +45,7 @@ from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
+    CLIP_GRADS,
     LEARNING_RATE,
     MIN_LR_MOD,
     TOTAL_STEPS,
@@ -310,6 +311,9 @@ def _step(
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()
+    # monobeast.py:502-505, with their saved runs' clip_grads of 10.0. Without
+    # it this diverges to a loss of 6e20 inside two updates.
+    torch.nn.utils.clip_grad_norm_(learner.parameters(), CLIP_GRADS)
     optimizer.step()
     return {
         "vtrace_pg": terms.vtrace_pg.item(),

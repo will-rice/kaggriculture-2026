@@ -40,6 +40,14 @@ MIN_LR_MOD = 0.01
 TOTAL_STEPS = int(2e7)
 UNROLL_LENGTH = 16
 REDUCTION = "sum"
+# monobeast.py:502-505 clips the global gradient norm before every optimizer
+# step. The value is NOT in the five phase YAMLs -- it is in the run config saved
+# beside each of their trained checkpoints (e.g.
+# internal_testing/hall_of_fame/11-09_21-32-04_59822400/lux_ai/rl_agent/config.yaml:53),
+# where every one of the eight reads `clip_grads: 10.0`. Leaving it out is not a
+# small omission: with `reduction: sum` and a joint log-probability over ~41
+# decisions a turn, the run diverged to a loss of 6e20 within two updates.
+CLIP_GRADS = 10.0
 
 
 @dataclasses.dataclass(frozen=True)
