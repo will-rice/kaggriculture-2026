@@ -55,6 +55,66 @@ def observation(hands: list[list[int]]) -> Mapping[str, Any]:
     return state
 
 
+@pytest.fixture
+def checkpoint_without_a_value_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Policy]:
+    """Point the wrapper at a checkpoint shaped like the real one on disk.
+
+    ``policy.pt`` was behaviour-cloned before the value head existed, so it
+    carries every trunk and head key but no ``value.*`` -- this is the exact
+    shape ``model()`` has to load in the sandbox.
+    """
+    torch.manual_seed(0)
+    trained = Policy()
+    state = {
+        name: tensor
+        for name, tensor in trained.state_dict().items()
+        if not name.startswith("value.")
+    }
+    path = tmp_path / "policy.pt"
+    torch.save(state, path)
+    monkeypatch.setattr(play_module, "CHECKPOINT", path)
+    play_module.model.cache_clear()
+    yield trained
+    play_module.model.cache_clear()
+
+
+def test_model_loads_a_checkpoint_that_predates_the_value_head(
+    checkpoint_without_a_value_head: Policy,
+) -> None:
+    """The shipped checkpoint has no value head.
+
+    Loading it must not fail or leave the trunk randomly initialised.
+    """
+    loaded = play_module.model()
+
+    assert torch.equal(loaded.stem.weight, checkpoint_without_a_value_head.stem.weight)
+
+
+def test_model_refuses_a_checkpoint_missing_more_than_the_value_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint missing a trunk key too must be refused, not silently loaded.
+
+    ``strict=False`` alone would let this through with the trunk half-random
+    and every other check still passing -- this proves the extra key check
+    actually discriminates a genuinely broken checkpoint from one that merely
+    predates the value head.
+    """
+    state = Policy().state_dict()
+    del state["stem.weight"]
+    path = tmp_path / "policy.pt"
+    torch.save(state, path)
+    monkeypatch.setattr(play_module, "CHECKPOINT", path)
+    play_module.model.cache_clear()
+
+    with pytest.raises(ValueError, match="stem.weight"):
+        play_module.model()
+
+    play_module.model.cache_clear()
+
+
 def test_the_agent_is_the_last_callable_in_the_file() -> None:
     """The environment execs an agent path and plays whatever callable ends it.
 

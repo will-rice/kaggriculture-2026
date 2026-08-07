@@ -61,7 +61,7 @@ class Residual(torch.nn.Module):
 
 
 class Policy(torch.nn.Module):
-    """Board trunk with two heads: one op per unit, and what the farm trades."""
+    """Board trunk with three heads: one op per unit, what the farm trades, and V(s)."""
 
     def __init__(self, blocks: int = BLOCKS, channels: int = CHANNELS) -> None:
         """Build the policy."""
@@ -77,11 +77,12 @@ class Policy(torch.nn.Module):
         self.trade_head = torch.nn.Linear(
             channels, (len(MARKET_SLOTS) + 2) * len(QUANTITIES)
         )
+        self.value = torch.nn.Linear(channels, 1)
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return per-unit op logits and per-slot market logits.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-unit op logits, per-slot market logits, and V(s).
 
         The market is projected and added to the spatial tensor rather than
         broadcast as constant planes: ``SCALARS`` numbers that decide the game
@@ -108,6 +109,13 @@ class Policy(torch.nn.Module):
         every slot for the same reason the unit head shares one: which slot is
         HIRE or SELL:WHEAT should not change how it is read out.
 
+        PPO's advantage is ``r + gamma * V(s') - V(s)``, and ``V(s)`` is a
+        property of the position for the same reason a trade is: how well the
+        farm is doing is not a fact about any one tile. So the value head
+        reads the same pooled ``features.mean(dim=(2, 3))`` the trade head
+        reads, through its own ``Linear`` down to one number, rather than
+        gathering a unit's column the way the op head does.
+
         Args:
             board: ``(batch, TILE_PLANES, BOARD, BOARD)`` planes.
             scalars: ``(batch, SCALARS)`` market and phase features.
@@ -115,8 +123,9 @@ class Policy(torch.nn.Module):
                 the order ``encode_units`` labels the units.
 
         Returns:
-            A tuple of ``(batch, MAX_UNITS, len(UNIT_OPS))`` unit logits and
-            ``(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` market logits.
+            A tuple of ``(batch, MAX_UNITS, len(UNIT_OPS))`` unit logits,
+            ``(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` market logits,
+            and ``(batch,)`` state values.
         """
         features = self.stem(board) + self.market(scalars)[:, :, None, None]
         for block in self.blocks:
@@ -128,4 +137,5 @@ class Policy(torch.nn.Module):
         market = self.trade_head(pooled).reshape(
             pooled.shape[0], len(MARKET_SLOTS) + 2, len(QUANTITIES)
         )
-        return units, market
+        value = self.value(pooled).squeeze(-1)
+        return units, market, value

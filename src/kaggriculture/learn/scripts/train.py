@@ -104,7 +104,7 @@ def main() -> None:
         ):
             labels = labels.to(device)
             market = market.to(device)
-            logits, market_logits = model(
+            logits, market_logits, _value = model(
                 board.to(device), scalars.to(device), positions.to(device)
             )
             units, trades = (
@@ -314,7 +314,7 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> dict[str, float]
         for board, scalars, positions, labels, market in loader:
             labels = labels.to(device)
             market = market.to(device)
-            logits, market_logits = model(
+            logits, market_logits, _value = model(
                 board.to(device), scalars.to(device), positions.to(device)
             )
             acting = int((labels != IGNORE).sum().item())

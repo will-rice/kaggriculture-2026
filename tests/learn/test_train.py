@@ -211,7 +211,7 @@ def test_evaluate_scores_only_the_units_that_acted() -> None:
     scalars = torch.randn(rows, SCALARS)
     positions = torch.randint(0, BOARD * BOARD, (rows, MAX_UNITS))
     with torch.no_grad():
-        predicted, _market = model(board, scalars, positions)
+        predicted, _market, _value = model(board, scalars, positions)
         predicted = predicted.argmax(dim=-1)
 
     # Half the acting slots agree with the model and half deliberately do not,
@@ -227,7 +227,7 @@ def test_evaluate_scores_only_the_units_that_acted() -> None:
     )
 
     with torch.no_grad():
-        logits, _market = model(board, scalars, positions)
+        logits, _market, _value = model(board, scalars, positions)
 
     metrics = evaluate(model, loader, "cpu")
 
