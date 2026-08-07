@@ -128,12 +128,20 @@ FIXED_OPPONENTS = (
 
 # Iterations spent on the own-bank reward before the differential is switched
 # on. Every single-box winner with a primary source shaped first and switched
-# after -- Toad Brigade at 20M steps, FLG at 65M, Frog Parade "as soon as
-# training was running stably" -- and at this loop's ~12,000 decisions per
-# trajectory-hour, 20M steps is more than a workstation day. This budget cannot
-# reach their phase-1 lengths, so the split is stated rather than tuned: two
-# thirds shaped, one third on the win condition, and the report says which
-# phase the run ended in.
+# after: Toad Brigade at 20M steps, FLG at 65M, Frog Parade "as soon as
+# training was running stably".
+#
+# This is deliberately set beyond what a workstation day reaches, and the run
+# is expected to end inside phase 1. At ~75 s and ~45,000 decisions per
+# iteration, 200 iterations is about 9M decisions -- less than half of Toad
+# Brigade's shaped phase and a seventh of FLG's. Switching to the win condition
+# before the policy can bank would hand it back the reward that was measured
+# here to have no gradient: 35 iterations of the differential from a fresh
+# start moved the bank from 0 to 0.
+#
+# So the constant marks where the switch belongs for a run long enough to
+# reach it, and the report says which phase this one ended in rather than
+# pretending it completed a curriculum it had no budget for.
 SHAPING_ITERATIONS = 200
 
 # The win-rate curve. Eight seeds is far too few to gate on -- the gate is a
