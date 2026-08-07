@@ -230,6 +230,7 @@ def main() -> None:
         config={
             "initialisation": arguments.initialisation,
             "hours": arguments.hours,
+            "from_iteration": arguments.from_iteration,
             "seed": SEED,
             "learning_rate": LEARNING_RATE,
             "workers": WORKERS,
@@ -250,7 +251,13 @@ def main() -> None:
     banked: list[float] = []
     opened = time.perf_counter()
     deadline = opened + arguments.hours * 3600
-    iteration = 0
+    # Both schedules read this, so a resumed run has to continue the count
+    # rather than restart it. Restarting puts the teacher penalty back to its
+    # full initial weight against a policy that had already earned its way out
+    # from under it, and puts the reward back into a shaping phase the previous
+    # run may have finished -- in both cases silently, since every logged number
+    # stays plausible.
+    iteration = arguments.from_iteration
 
     # Spawned, not forked. The learner is already on the GPU by this point, and
     # a forked child inherits a CUDA context it cannot use.
@@ -317,7 +324,7 @@ def _label(initialisation: str) -> str:
 
 
 def parse() -> argparse.Namespace:
-    """Return the two things a run is allowed to vary.
+    """Return the three things a run is allowed to vary.
 
     Everything else is a constant in this module, because a run whose
     hyperparameters came from the shell is one whose numbers cannot be read back
@@ -326,7 +333,7 @@ def parse() -> argparse.Namespace:
     whose arms differ by an edit is not a paired one.
 
     Returns:
-        ``initialisation`` and ``hours``.
+        ``initialisation``, ``hours`` and ``from_iteration``.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -337,6 +344,12 @@ def parse() -> argparse.Namespace:
         ),
     )
     parser.add_argument("hours", type=float, help="wall-clock budget for collection")
+    parser.add_argument(
+        "--from-iteration",
+        type=int,
+        default=0,
+        help="continue a schedule from this iteration rather than restarting it",
+    )
     return parser.parse_args()
 
 
