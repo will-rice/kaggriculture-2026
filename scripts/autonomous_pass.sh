@@ -94,10 +94,15 @@ fi
 
 # 3. Where we stand, and whether a submission is warranted. All the judgement
 #    lives in Python where it can be tested, not in shell.
-step "assess and maybe submit" env \
-  KAGGRICULTURE_RESERVE_SLOTS="$RESERVE_SLOTS" \
-  KAGGRICULTURE_SUBMIT="$SUBMIT_ENABLED" \
-  uv run python -m kaggriculture.scripts.autonomous --status "$STATUS"
+# The flags are passed explicitly rather than read from the environment inside
+# Python: an env var the callee ignores looks identical to a disabled switch,
+# and this one governs whether we spend public submission slots.
+SUBMIT_FLAG=()
+if [[ "$SUBMIT_ENABLED" == "1" ]]; then
+  SUBMIT_FLAG=(--submit)
+fi
+step "assess and maybe submit" uv run python -m kaggriculture.scripts.autonomous \
+  --status "$STATUS" --reserve "$RESERVE_SLOTS" "${SUBMIT_FLAG[@]+"${SUBMIT_FLAG[@]}"}"
 
 if [[ "$FAILS" -eq 0 ]]; then
   date -u +%Y-%m-%dT%H:%M:%SZ >"$STATE/last_success_utc"

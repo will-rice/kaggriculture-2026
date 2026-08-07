@@ -189,9 +189,18 @@ def main() -> None:
     seed_everything(SEED, workers=True)
     revision = commit()
 
-    directory = RUNS / f"{arguments.initialisation}-{revision}-{int(time.time())}"
+    directory = (
+        RUNS / f"{_label(arguments.initialisation)}-{revision}-{int(time.time())}"
+    )
     directory.mkdir(parents=True)
     policy, teacher = initialise(arguments.initialisation)
+    # The teacher penalty is on for exactly one of the three starts. Pulling a
+    # random network toward its own random initialisation is noise with a
+    # gradient, and pulling a resumed policy back toward the weights it is
+    # meant to continue from would undo the run it is continuing -- Jump-Start
+    # RL reports precisely that failure, a pretrained policy forgotten because
+    # the signal holding it was wrong. Only the clone has competence worth not
+    # wrecking in the first updates.
     config = PpoConfig(
         kl_initial=KL_INITIAL if arguments.initialisation == "clone" else 0.0
     )
@@ -202,7 +211,7 @@ def main() -> None:
         entity=ENTITY,
         project=PROJECT,
         job_type="self-play",
-        name=f"rl-{arguments.initialisation}-{arguments.hours:g}h-{revision}",
+        name=f"rl-{_label(arguments.initialisation)}-{arguments.hours:g}h-{revision}",
         config={
             "initialisation": arguments.initialisation,
             "hours": arguments.hours,
@@ -283,6 +292,11 @@ def main() -> None:
     run.finish()
 
 
+def _label(initialisation: str) -> str:
+    """Return a filename-safe name for a start that may be a path."""
+    return initialisation if initialisation in ("fresh", "clone") else "resumed"
+
+
 def parse() -> argparse.Namespace:
     """Return the two things a run is allowed to vary.
 
@@ -298,8 +312,10 @@ def parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "initialisation",
-        choices=("fresh", "clone"),
-        help="start from random weights, or from the behaviour-cloned checkpoint",
+        help=(
+            '"fresh" for random weights, "clone" for the behaviour-cloned '
+            "checkpoint, or a path to a checkpoint to continue from"
+        ),
     )
     parser.add_argument("hours", type=float, help="wall-clock budget for collection")
     return parser.parse_args()
@@ -312,24 +328,37 @@ def initialise(initialisation: str) -> tuple[Policy, Policy]:
     same thing: how far the policy has travelled from where it began. Whether
     that distance is *penalised* is a separate decision, and it lives in
     ``PpoConfig.kl_initial`` -- 1.0 from the clone, whose competence is worth
-    not wrecking in the first updates, and 0.0 from noise, which is worth
-    nothing to stay near.
+    not wrecking in the first updates, and 0.0 from noise or from a checkpoint
+    this loop already trained, neither of which is worth staying near.
+
+    Three starts, and the third exists because the curriculum outgrew one
+    session. A shaped phase that the literature sizes at 20M to 65M steps does
+    not fit in a workstation evening, so a run has to be able to continue one
+    rather than re-earn it: a checkpoint path resumes from exactly the weights
+    a previous run finished on. It is loaded strictly, because it came from this
+    same ``Policy`` and a missing key would mean a silently reinitialised head.
 
     The clone is loaded through ``learn.play.model``, which is the one place
-    that checks the checkpoint against the current trunk: it predates the value
-    head, so it must load non-strict, and ``strict=False`` on its own would load
-    just as quietly with a trunk key missing. Deep-copied twice because that
-    function caches and returns one object, and training the policy would
-    otherwise train the teacher.
+    that checks the behaviour-cloned checkpoint against the current trunk: it
+    predates the value head, so it must load non-strict, and ``strict=False`` on
+    its own would load just as quietly with a trunk key missing. Deep-copied
+    twice because that function caches and returns one object, and training the
+    policy would otherwise train the teacher.
 
     Args:
-        initialisation: ``"fresh"`` or ``"clone"``.
+        initialisation: ``"fresh"``, ``"clone"``, or a checkpoint path.
 
     Returns:
         The policy in train mode and the teacher in eval mode, both on
         ``DEVICE``.
     """
-    start = Policy() if initialisation == "fresh" else cloned()
+    start = (
+        Policy()
+        if initialisation == "fresh"
+        else cloned()
+        if initialisation == "clone"
+        else resumed(Path(initialisation))
+    )
     policy = copy.deepcopy(start).to(DEVICE).train()
     teacher = copy.deepcopy(start).to(DEVICE).eval()
     LOGGER.info(
@@ -339,6 +368,25 @@ def initialise(initialisation: str) -> tuple[Policy, Policy]:
         DEVICE,
     )
     return policy, teacher
+
+
+def resumed(weights: Path) -> Policy:
+    """Return a policy this loop already trained, loaded strictly.
+
+    Strict on purpose, unlike the behaviour-cloned checkpoint: this file was
+    written by ``main`` from the current ``Policy``, so every key is present,
+    and a non-strict load would quietly accept a checkpoint from a different
+    trunk and continue training a partly random network.
+
+    Args:
+        weights: A checkpoint a previous run wrote.
+
+    Returns:
+        The policy, on the CPU, for the caller to copy and place.
+    """
+    policy = Policy()
+    policy.load_state_dict(torch.load(weights, map_location="cpu"))
+    return policy
 
 
 def assignments(
