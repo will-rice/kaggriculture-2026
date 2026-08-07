@@ -129,3 +129,68 @@ def _with_money(
     farms[0]["money"] = ours
     farms[1]["money"] = theirs
     return {**observation, "farms": farms}
+
+
+def _series(**deltas: float) -> list[toad_reward.Counts]:
+    """Return a two-state counts series differing by the given deltas."""
+    base = toad_reward.Counts(city=25, unit=1, research=0, fuel=10, money=1000.0)
+    after = toad_reward.Counts(
+        city=25 + int(deltas.get("city", 0)),
+        unit=1 + int(deltas.get("unit", 0)),
+        research=0 + int(deltas.get("research", 0)),
+        fuel=10 + int(deltas.get("fuel", 0)),
+        money=1000.0 + deltas.get("money", 0.0),
+    )
+    return [base, after]
+
+
+def test_the_money_component_is_off_by_default() -> None:
+    """The baseline reward must be exactly Toad's five components.
+
+    The running baseline was measured under this default, and a money term
+    leaking into it would silently invalidate the comparison phase-1b exists to
+    make.
+    """
+    # A pure sale: 648 coins in, 8 units of stock out, nothing else changed.
+    series = _series(money=648.0, fuel=-8)
+    baseline = toad_reward.shaped(series, won=0.0)
+    # step alone: 0.005 / 500. The stock delta is clamped away and money is off.
+    assert float(baseline[0]) == pytest.approx(0.00001)
+
+
+def test_a_sale_turn_scores_positive_under_phase_1b() -> None:
+    """Selling must pay, and pay distinguishably -- not merely fail to hurt.
+
+    This is the whole point of phase-1b. Under the baseline the same turn is
+    worth 1e-05, which is the step reward and nothing else: Toad's components
+    are blind to the act that banks the coins.
+
+      money 648 * 0.001 = 0.648
+      fuel  max(-8, 0)  = 0
+      step              = 0.005
+      total 0.653 / 500 = 0.001306
+    """
+    series = _series(money=648.0, fuel=-8)
+    phase_1b = toad_reward.shaped(
+        series, won=0.0, money_weight=toad_reward.MONEY_WEIGHT
+    )
+    assert float(phase_1b[0]) == pytest.approx(0.001306)
+    # Strictly greater than the baseline, by a hundredfold, on the same turn.
+    assert float(phase_1b[0]) > float(toad_reward.shaped(series, won=0.0)[0])
+
+
+def test_spending_coins_is_not_punished() -> None:
+    """The money delta is clamped, as their fuel delta is.
+
+    Buying seeds, hands or land is how the chain advances, and the return on it
+    is already paid when the goods are sold. An unclamped term would make the
+    shaped reward fight investment.
+    """
+    series = _series(money=-500.0)
+    reward = toad_reward.shaped(series, won=0.0, money_weight=toad_reward.MONEY_WEIGHT)
+    assert float(reward[0]) == pytest.approx(0.00001)
+
+
+def test_the_money_weight_is_the_derived_one() -> None:
+    """Pin the weight as a literal, for the reason the other constants are pinned."""
+    assert toad_reward.MONEY_WEIGHT == 0.001

@@ -52,6 +52,28 @@ STEP_WEIGHT = 0.005
 # at -0.01 (:172-174). Kept disabled, as the winning recipe had it.
 FULL_WORKERS_WEIGHT = 0.0
 
+# OURS, NOT THEIRS. Deviation D1 made explicit: Toad's component set pays for
+# every link of their chain, and ours is missing exactly one -- converting shed
+# stock into coins. Nothing in their five components rewards selling, and price
+# times quantity is what decides our game.
+#
+# The weight is anchored on their own ratios rather than picked. Their
+# score-deciding component is `city` at 1.0, so one city tile is worth
+# 1.0 / 500 = 0.002. Measured over a real 719-turn episode (kaito vs kaito, seed
+# 7, banking 128,341 against the 125,773 corpus median): 129 of 719 turns bank
+# anything, the median sale is 648 coins and the season gains 155,526.
+#
+#   one median sale  648 * 0.001 / 500 = 0.0013  = 0.65 city tiles
+#   season total  155,526 * 0.001 / 500 = 0.311  vs their ~0.2 for city
+#   ratio to game_result             = 15.6x     vs their ~10x
+#
+# All three land within a small factor of theirs, and 0.001 is a round number in
+# the style of their 1.0 / 0.5 / 0.1 / 0.005. Erring slightly high is deliberate:
+# coins are our *sole* score-decider, where theirs splits between city and units.
+#
+# Off by default. The baseline reward must stay exactly as it was measured.
+MONEY_WEIGHT = 0.001
+
 # reward_spaces_lux.py:227. Tuned against their 360-turn game; ours runs 719
 # decisions. Kept verbatim rather than rescaled, because faithfulness is the
 # point of this pass -- see the deviation list in the task report.
@@ -174,7 +196,9 @@ class StatefulMultiReward:
         return total / NORMALISER
 
 
-def shaped(series: list[Counts], won: float) -> torch.Tensor:
+def shaped(
+    series: list[Counts], won: float, money_weight: float = 0.0
+) -> torch.Tensor:
     """Return the per-turn shaped reward for a counts series.
 
     The stateful class above is the faithful transcription of their per-step
@@ -190,6 +214,13 @@ def shaped(series: list[Counts], won: float) -> torch.Tensor:
         won: The terminal result in {-1., 0., +1.}, added on the last turn at
             ``GAME_RESULT_WEIGHT`` exactly as their ``game_result`` component
             does.
+        money_weight: Weight on the per-turn coin delta. Zero -- the default --
+            reproduces Toad's component set exactly and is what the baseline
+            run measures. ``MONEY_WEIGHT`` enables phase-1b, the one deliberate
+            addition. Clamped non-negative like their ``fuel``, so that spending
+            coins on seeds, hands or land is not punished: investment is how the
+            chain advances, and the return on it is already paid when the goods
+            are sold.
 
     Returns:
         ``(turns,)`` float32 shaped rewards, already divided by ``NORMALISER``.
@@ -212,6 +243,8 @@ def shaped(series: list[Counts], won: float) -> torch.Tensor:
             # loss, because the sale is already paid for through game_result.
             + FUEL_WEIGHT * max(after.fuel - before.fuel, 0)
             + STEP_WEIGHT
+            # Ours. Zero unless phase-1b enables it; see MONEY_WEIGHT.
+            + money_weight * max(after.money - before.money, 0.0)
         )
         rewards.append(total / NORMALISER)
     rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER

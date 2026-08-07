@@ -129,7 +129,13 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.toad_reward import Counts, counts, rank, shaped
+from kaggriculture.learn.toad_reward import (
+    MONEY_WEIGHT,
+    Counts,
+    counts,
+    rank,
+    shaped,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -181,6 +187,11 @@ class Trajectory:
             and ``own`` rather than instead of them, for the same reason those
             two coexist: which one a gradient sees is the learner's choice, and
             a trajectory collected once is then usable under any of them.
+        shaped_money: ``(turns,)`` the same reward plus our one added component,
+            a clamped per-turn coin delta at ``MONEY_WEIGHT``. This is phase-1b,
+            and it is ours rather than Toad's -- see ``toad_reward.MONEY_WEIGHT``.
+            Carried beside ``shaped`` so the ablation reads the same episode
+            twice rather than playing it twice.
         own: ``(turns,)`` change in our own bank across the turn. Sums to
             ``final_bank - STARTING_MONEY`` exactly. Recorded alongside
             ``rewards`` rather than instead of it: which one a gradient sees is
@@ -212,6 +223,7 @@ class Trajectory:
     rewards: torch.Tensor
     own: torch.Tensor
     shaped: torch.Tensor
+    shaped_money: torch.Tensor
     dones: torch.Tensor
     final_margin: float
     final_bank: float
@@ -716,6 +728,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     margins = [*stream.margins, _margin(terminal)]
     banks = [*stream.banks, _bank(terminal)]
     series = [*stream.counts, counts(terminal, stream.seat)]
+    won = rank(series[-1].money, _other(terminal, stream.seat))
     dones = torch.zeros(len(turns), dtype=torch.bool)
     dones[-1] = True
     unit_actions = torch.cat([turn.units for turn in turns])
@@ -734,7 +747,13 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         values=torch.cat([turn.value for turn in turns]),
         rewards=_differences(margins),
         own=_differences(banks),
-        shaped=shaped(series, rank(series[-1].money, _other(terminal, stream.seat))),
+        shaped=shaped(series, won),
+        # Phase-1b's reward, computed from the same episode so the ablation is
+        # baseline vs baseline+money with everything else -- seeds, trajectories,
+        # actions -- held identical. Recording both costs one pass over a list
+        # of counts and removes the only other way to run the comparison, which
+        # is to play the season twice and hope it was deterministic.
+        shaped_money=shaped(series, won, money_weight=MONEY_WEIGHT),
         dones=dones,
         final_margin=margins[-1],
         final_bank=_bank(terminal),

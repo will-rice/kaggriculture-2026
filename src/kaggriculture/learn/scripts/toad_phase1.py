@@ -70,6 +70,12 @@ CHANNELS = 128
 # by MAX_DAYS: the value head is confined to [-1, +1]. Ours was unbounded, and
 # that alone diverged the first run.
 VALUE_BOUND = 1.0
+# Which reward the learner trains on. "shaped" is Toad's five components exactly
+# and is the baseline. "shaped_money" is phase-1b: the same five plus our one
+# added component paying for coins banked, deviation D1 made explicit. Both are
+# recorded on every trajectory, so switching this constant is the entire diff
+# between the two arms and the ablation shares seeds, episodes and actions.
+REWARD_FIELD = "shaped"
 # Episodes per collection round. Their n_actor_envs is 16 across 2 actors; ours
 # is one synchronous group, and both seats of a self-play episode are recorded.
 ENVIRONMENTS = 24
@@ -276,7 +282,7 @@ def _step(
     unit_masks = stacked("unit_masks")
     market_masks = stacked("market_masks")
     behaviour = stacked("log_probs")
-    rewards = stacked("shaped")
+    rewards = stacked(REWARD_FIELD)
     dones = stacked("dones")
 
     turns, width = behaviour.shape
@@ -352,7 +358,7 @@ def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
         "unit_masks",
         "market_masks",
         "log_probs",
-        "shaped",
+        REWARD_FIELD,
         "dones",
     )
     return [
