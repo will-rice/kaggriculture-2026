@@ -229,6 +229,47 @@ wall, and the briefing analysis did not mention it.
 This is also the third value the analysis omitted, after `/500.` and the phase-1 `teacher_kl_cost: 0.`.
 The pattern is consistent: **the analysis captured the phase YAMLs and nothing outside them.**
 
+### The run's actual result: the baseline diverges, and the value head is why
+
+Phase 1 ran. Two checkpoints, then stopped deliberately:
+
+| update | steps | wall | bank mean | bank max | vtrace_pg | upgo_pg | entropy | **baseline** |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 34,512 | ~30 s | **0.0** | 0.0 | 0.10 | 0.15 | -0.017 | **1.5e17** |
+| 2 | 69,024 | ~60 s | **0.0** | 0.0 | 0.00 | 0.00 | 0.00 | **7.4e17** |
+
+**Bank is 0 against the ~21,000 plateau and the 125,773 corpus median.** A randomly-initialised policy banks
+nothing, which is expected at 69k steps out of 2e7 — but the run is not merely early, it is *diverging*, and
+the number would not have improved by waiting.
+
+The three policy terms are healthy and correctly scaled (0.10, 0.15, -0.017). **The baseline term alone
+carries the entire 1e17.** By update 2 the policy terms have gone to exactly 0.0 — the value head has
+swamped everything.
+
+**Cause, identified but not yet fixed.** Toad's value head is not a plain linear layer. `BaselineLayer`
+(`nns/models.py:140-181`) ends:
+
+```
+x = self.activation(x)                                    # Sigmoid, or Softmax if zero-sum
+return x * (self.reward_max - self.reward_min) + self.reward_min
+```
+
+Their value output is **structurally bounded to the reward space's range** — for `StatefulMultiReward`,
+`±1/MAX_DAYS` expanded by `MAX_DAYS` (because `only_once=False`), i.e. `[-1, +1]`. Every phase config sets
+`rescale_value_input: True`.
+
+Our `model.py` value head is `Linear(channels, 1)` with no activation and no bound — inherited from the PPO
+model, where it regressed coin-scale returns in the thousands. Fed Toad's shaped reward, which is ~1e-5 per
+turn after the `/500.` normaliser, an unbounded head initialised for coin scale produces a smooth-L1 target
+mismatch that no gradient clip can rescue: clipping bounds the *gradient*, not the loss, and the run
+diverged with clipping correctly in place.
+
+This is the same failure mode this project already hit once — a value target left on the coin scale — arriving
+from the opposite direction. **D9: their bounded `BaselineLayer` is a load-bearing part of the architecture,
+not a detail, and it was not ported.** The fix is small and localised (bound the value head to `[-1, +1]` and
+regress the shaped reward against it), but it is not written, so no bank number here is a measurement of
+their recipe. Everything above is provisional.
+
 ### Two further infidelities the first launch exposed
 
 Both now fixed, both worth recording because each would have produced a plausible-looking but wrong run:
