@@ -141,6 +141,13 @@ def main() -> None:
         "policy without one.",
     )
     parser.add_argument(
+        "--teacher-kl-cost",
+        type=float,
+        default=TEACHER_KL_COST,
+        help="teacher KL weight. Their cascade drops it to 0.001 at phase 3, "
+        "where the policy should start out-earning its teacher.",
+    )
+    parser.add_argument(
         "--value-warmup",
         action="store_true",
         help="train the value head alone for VALUE_WARMUP_BATCHES before the "
@@ -213,6 +220,7 @@ def main() -> None:
             "value_bound": VALUE_BOUND,
             "reward_field": field,
             "money_weight": money_weight() if arguments.phase1b else 0.0,
+            "teacher_kl_cost": arguments.teacher_kl_cost,
             "clone_init": arguments.clone_init,
             "money_signed": arguments.money_signed,
             "environments": ENVIRONMENTS,
@@ -245,7 +253,9 @@ def main() -> None:
         teacher.eval()
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
-        LOGGER.info("teacher: frozen clone, kl_cost %.4f", TEACHER_KL_COST)
+        LOGGER.info(
+            "teacher: frozen clone, kl_cost %.4f", arguments.teacher_kl_cost
+        )
     actor = copy.deepcopy(learner).eval()
     warmup_left = VALUE_WARMUP_BATCHES if arguments.value_warmup else 0
     if warmup_left:
@@ -261,7 +271,14 @@ def main() -> None:
         batch = _collect(pool, weights, seeds, arguments.channels)
         steps += sum(int(t.shaped.shape[0]) for t in batch)
         terms, consumed = _update(
-            learner, optimizer, batch, device, field, warmup_left, teacher
+            learner,
+            optimizer,
+            batch,
+            device,
+            field,
+            warmup_left,
+            teacher,
+            arguments.teacher_kl_cost,
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -526,6 +543,7 @@ def _update(
     field: str,
     warmup_left: int = 0,
     teacher: Policy | None = None,
+    teacher_kl_cost: float = TEACHER_KL_COST,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -555,6 +573,7 @@ def _update(
             field,
             baseline_only=steps < warmup_left,
             teacher=teacher,
+            teacher_kl_cost=teacher_kl_cost,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -570,6 +589,7 @@ def _step(
     field: str,
     baseline_only: bool = False,
     teacher: Policy | None = None,
+    teacher_kl_cost: float = TEACHER_KL_COST,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -647,6 +667,7 @@ def _step(
         dones=dones,
         baseline_only=baseline_only,
         teacher_kl=teacher_kl,
+        teacher_kl_cost=teacher_kl_cost,
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()
