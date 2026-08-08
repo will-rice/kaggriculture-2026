@@ -30,6 +30,7 @@ measure it rather than paper over it.
 """
 
 import dataclasses
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -73,6 +74,22 @@ FULL_WORKERS_WEIGHT = 0.0
 #
 # Off by default. The baseline reward must stay exactly as it was measured.
 MONEY_WEIGHT = 0.001
+
+# Arm W escalates the weight tenfold. Read from the environment rather than
+# passed down, because the rollout runs in worker subprocesses that inherit the
+# environment but not our arguments -- a weight threaded through the parent
+# alone would leave every worker silently on the default and the arm would
+# measure nothing.
+MONEY_WEIGHT_ENV = "TOAD_MONEY_WEIGHT"
+
+
+def money_weight() -> float:
+    """Return the money component's weight for this run.
+
+    Returns:
+        ``MONEY_WEIGHT`` unless the environment overrides it.
+    """
+    return float(os.environ.get(MONEY_WEIGHT_ENV, MONEY_WEIGHT))
 
 # reward_spaces_lux.py:227. Tuned against their 360-turn game; ours runs 719
 # decisions. Kept verbatim rather than rescaled, because faithfulness is the

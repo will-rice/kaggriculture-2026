@@ -31,6 +31,7 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
 
 import argparse
 import copy
+import os
 import json
 import logging
 import time
@@ -42,10 +43,11 @@ import torch
 import wandb
 from lightning import seed_everything
 
+from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
-from kaggriculture.learn.toad_reward import MONEY_WEIGHT
+from kaggriculture.learn.toad_reward import MONEY_WEIGHT, MONEY_WEIGHT_ENV, money_weight
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -110,6 +112,24 @@ def main() -> None:
         "components. The two arms must differ by this flag and nothing else.",
     )
     parser.add_argument(
+        "--money-weight",
+        type=float,
+        default=None,
+        help="override the money component's weight (arm W uses 0.01). Set into "
+        "the environment so the rollout workers see it too.",
+    )
+    parser.add_argument(
+        "--clone-init",
+        action="store_true",
+        help="warm-start trunk and both heads from the BC clone instead of "
+        "random init (arm C). The bounded value head is always fresh.",
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="wandb run name and file prefix, so arms cannot collide",
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -123,13 +143,19 @@ def main() -> None:
     # The single constant the ablation turns on. Everything downstream -- file
     # names, wandb run name, which reward the learner reads -- follows from it,
     # so the two arms cannot drift apart in any other respect.
+    if arguments.money_weight is not None:
+        # Into the environment before the worker pool forks, so every rollout
+        # process computes `shaped_money` at this arm's weight.
+        os.environ[MONEY_WEIGHT_ENV] = repr(arguments.money_weight)
     field = "shaped_money" if arguments.phase1b else REWARD_FIELD
-    prefix = "phase1b" if arguments.phase1b else "phase1"
+    prefix = arguments.name or ("phase1b" if arguments.phase1b else "phase1")
 
     device = _device()
     learner = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND).to(
         device
     )
+    if arguments.clone_init:
+        _warm_start(learner, device)
     optimizer = torch.optim.Adam(learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
     schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, _decay)
 
@@ -142,14 +168,15 @@ def main() -> None:
     run = wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
-        name=("toad-phase1b-money-component" if arguments.phase1b
-              else "toad-phase1-baseline"),
+        name=arguments.name
+        or ("toad-phase1b-money-component" if arguments.phase1b else "toad-phase1-baseline"),
         config={
             "blocks": BLOCKS,
             "channels": CHANNELS,
             "value_bound": VALUE_BOUND,
             "reward_field": field,
-            "money_weight": MONEY_WEIGHT if arguments.phase1b else 0.0,
+            "money_weight": money_weight() if arguments.phase1b else 0.0,
+            "clone_init": arguments.clone_init,
             "environments": ENVIRONMENTS,
             "batch_segments": BATCH_SEGMENTS,
             "unroll_length": UNROLL_LENGTH,
@@ -202,6 +229,12 @@ def main() -> None:
             # sell round trip that loses coins still earns shaped reward -- and
             # this project has hit that failure three times. It must be visible
             # in the charts from update 1, not reconstructed afterwards.
+            # Gross coins spent per episode. If the pump fires, buy volume
+            # rises alongside money_term -- the two together separate "learned
+            # to trade" from "learned to churn".
+            "gross_purchases": float(
+                torch.stack([(-t.own.clamp(max=0.0)).sum() for t in batch]).mean()
+            ),
             "money_term": float(
                 torch.stack(
                     [(t.shaped_money - t.shaped).sum() for t in batch]
@@ -223,6 +256,40 @@ def main() -> None:
             record["total"],
         )
     wandb.finish()
+
+
+def _warm_start(learner: Policy, device: str) -> None:
+    """Load the BC clone into the trunk and both heads, leaving the value head fresh.
+
+    The clone predates the value head, so it carries no ``value.*`` keys. That
+    makes a non-strict load necessary -- and dangerous, because ``strict=False``
+    would swallow a missing *trunk* key just as quietly and leave the arm
+    measuring a half-initialised network while looking fine. So the missing keys
+    are checked explicitly against the value head, and anything else raises. This
+    is the discipline ``learn/play.py`` already applies for the same reason.
+
+    Args:
+        learner: The network to warm-start, modified in place.
+        device: Where to map the checkpoint.
+
+    Raises:
+        ValueError: If the checkpoint is missing or renaming anything beyond the
+            value head.
+    """
+    state = torch.load(CHECKPOINT, map_location=device, weights_only=True)
+    incompatible = learner.load_state_dict(state, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    missing = [key for key in incompatible.missing_keys if not key.startswith("value.")]
+    if unexpected or missing:
+        raise ValueError(
+            f"clone checkpoint does not match the network: "
+            f"unexpected={unexpected}, missing-beyond-value-head={missing}"
+        )
+    LOGGER.info(
+        "warm started from %s; fresh value head (%s)",
+        CHECKPOINT,
+        ", ".join(incompatible.missing_keys),
+    )
 
 
 def _decay(step: int) -> float:

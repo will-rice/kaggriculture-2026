@@ -130,9 +130,9 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad_reward import (
-    MONEY_WEIGHT,
     Counts,
     counts,
+    money_weight,
     rank,
     shaped,
 )
@@ -753,7 +753,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         # actions -- held identical. Recording both costs one pass over a list
         # of counts and removes the only other way to run the comparison, which
         # is to play the season twice and hope it was deterministic.
-        shaped_money=shaped(series, won, money_weight=MONEY_WEIGHT),
+        shaped_money=shaped(series, won, money_weight=money_weight()),
         dones=dones,
         final_margin=margins[-1],
         final_bank=_bank(terminal),
