@@ -382,8 +382,8 @@ def _record(
         # same-episode comparisons take +3.3% on mean sale price at FLAT
         # volume. Volume is logged beside price so a price rise bought by
         # simply selling less is visible rather than inferred.
-        **_sales(econ_batch, "vs_econ"),
-        **_sales(mirror_batch, "mirror"),
+        **_population(econ_batch, "vs_econ"),
+        **_population(mirror_batch, "mirror"),
         "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
         # The episode total of the series the learner is actually reading.
         # `shaped_mean` is logged unconditionally and is the counterfactual
@@ -431,20 +431,27 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else float("nan")
 
 
-def _sales(batch: list[Trajectory], population: str) -> dict[str, float]:
-    """Return one population's sale metrics, suffixed by which population it is.
+def _population(batch: list[Trajectory], population: str) -> dict[str, float]:
+    """Return one population's per-episode outcomes, suffixed by which it is.
 
     Computed every update rather than every Nth, because it is free: measured
-    against a full 17.5-second episode, building the 719 snapshots costs 0.6 ms
-    and scanning them costs 0.3 ms, which together is 0.01% of collection.
+    against a full 17.5-second episode, building the 719 snapshots the sale
+    scan reads costs 0.6 ms and scanning them costs 0.3 ms, which together is
+    0.01% of collection.
+
+    ``final_capital`` is here because it is half of a pre-registered read: if
+    the margin improves while capital and bank both collapse, the absolute term
+    is too weak and that is to be reported rather than tuned around. A read
+    nobody can take is not pre-registered, so the number it needs is logged
+    from update one rather than reconstructed afterwards.
 
     Args:
         batch: That population's trajectories, possibly empty.
         population: ``"vs_econ"`` or ``"mirror"``, appended to every key.
 
     Returns:
-        Mean sale price, realisation, sales, units and purchases for the
-        population, keyed so the two never merge.
+        Sale price, realisation, volume, purchases and end-of-season capital
+        for the population, keyed so the two never merge.
     """
     return {
         f"{name}_{population}": _mean([getattr(t, name) for t in batch])
@@ -454,6 +461,7 @@ def _sales(batch: list[Trajectory], population: str) -> dict[str, float]:
             "sales",
             "units_sold",
             "bought",
+            "final_capital",
         )
     }
 
