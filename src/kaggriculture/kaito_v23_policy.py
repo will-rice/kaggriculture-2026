@@ -21,14 +21,19 @@ docstring is our work.
 
 Unlike v21.1 and v22 its `agent` takes the engine configuration as a second
 argument, and branches on it: `townCenterSellInterval >= 24` selects a route
-fitted for the announced PR #1394 rebalance, and anything below it -- including
-the 12 our installed 1.32.3 engine reports -- selects the legacy route. So on
-today's engine this plays the legacy branch, and the rebalance table is dead
-weight that becomes the whole agent the day the engine changes.
+fitted for the announced PR #1394 rebalance, and anything below it selects the
+legacy route. **That branch has flipped.** kaggle-environments 1.32.6, which
+the ladder moved to on 2026-08-07 and which this project installed on
+2026-08-08, reports 24 -- so this file now plays the rebalance table, which had
+never once been executed in this repository before. Every earlier measurement
+of "v23" here measured a different agent than the one that runs today, and none
+of them transfers. It is the only vendored agent that adapts on its own; v21.1
+and v22 carry one table each and cannot.
 
 The author's own measurement, from the notebook's first cell: the legacy branch
 wins 42 of 45 at a mean margin of +3,249, the route refresh alone wins 40, and
-"stale public v22" wins 3 of 23 at -3,228.
+"stale public v22" wins 3 of 23 at -3,228. Those are all legacy-branch numbers,
+so they describe the branch we no longer run.
 
 Left unlinted and untyped for the same reason `kaito_policy.py` is: reformatting
 code we did not write and cannot meaningfully review would only obscure which

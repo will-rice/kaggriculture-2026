@@ -94,16 +94,25 @@ OPPONENT_MODULES = {
 # kept as its own rung rather than replaced: it is the rung every earlier gate
 # result in this project was measured against, and dropping it would make those
 # numbers uncomparable. The three above it are later public publications,
-# ordered by what a head-to-head actually puts them in. Over 128 seeded games
-# per pair on the pinned 1.32.3 engine, v23 beats v21.1 128-0 and v22 124-4;
-# over 128 games per pair on 1.32.6, boatlee_v14 beats v23 and v23 beats v21.1.
+# ordered by what a head-to-head actually puts them in.
 #
-# Two of these rungs are measured under an engine the ladder no longer runs.
-# The competition moved to kaggle-environments 1.32.6, where
-# `townCenterSellInterval` is 24 rather than the 12 this project still pins, and
-# v23 is the only vendored agent that branches on it -- on the real engine it
-# plays a route table this gate never sees. So rungs 5 and 6 are a lower bound
-# on the standard they represent until the pin moves.
+# Re-measured on kaggle-environments 1.32.6, the build the ladder moved to on
+# 2026-08-07, over 512 seeded games per pair (256 per seat order) on this
+# script's own held-out seed block. The order is strict and total, and it is
+# the same order 1.32.3 gave -- the eightfold town-centre demand collapse
+# halved everyone's bank and reordered nobody:
+#
+#     boatlee_v14 0.960 > kaito_v23 0.697 > kaito_v22 0.516 > kaito 0.209
+#
+# with boatlee_v14 beating both kaito_v23 and kaito 512-0, and kaito_v23
+# beating kaito 512-0. See docs/research/2026-08-08-engine-1326-rebaseline.md.
+#
+# One caveat survives the pin move, inverted. `kaito_v23` is the only vendored
+# agent that reads the configuration, and `townCenterSellInterval >= 24` now
+# selects the route it fitted for the PR #1394 rebalance -- a table that had
+# never executed here before. Its rung is therefore a first measurement rather
+# than a re-measurement, and every earlier v23 number in this project describes
+# the legacy branch instead.
 RUNGS: tuple[tuple[str, Path | str], ...] = (
     ("bc_clone", CHECKPOINT),
     ("economic_policy", "src/kaggriculture/economic_policy.py"),

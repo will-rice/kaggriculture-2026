@@ -8,7 +8,17 @@ The submission tarball places this file next to the ``kaggriculture`` package,
 and the loader puts that directory on ``sys.path`` while this module executes,
 so the import below resolves both locally and on the competition runner.
 
-The agent served here is route memory: it replays the nearest of 190 routes
+**Everything below this paragraph is void and the import no longer matches it.**
+The agent actually served is ``kaggriculture.kaito_policy``, vendored kaito
+v21.1. Every number below was measured on ``kaggle-environments`` 1.32.3; the
+ladder moved to 1.32.6 on 2026-08-07, late-season town-centre demand fell about
+eightfold, and every bank quoted here roughly halved. On the re-measured
+reference table v21.1 is the *weakest* of the four vendored agents — it loses
+512-0 to ``boatlee_v14_policy`` and 512-0 to ``kaito_v23_policy`` over held-out
+seeds. See ``docs/research/2026-08-08-engine-1326-rebaseline.md``. What to serve
+instead is a human decision and has deliberately not been taken here.
+
+The agent the text below describes is route memory: it replays the nearest of 190 routes
 harvested from strong seats in the replay corpus, realigned onto the units we
 actually have, and falls back to the vendored economic policy on the 0.1% of
 turns where no route is near. It replaces that economic policy, which is what

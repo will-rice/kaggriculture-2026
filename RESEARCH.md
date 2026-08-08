@@ -517,6 +517,9 @@ DeepMind, 2019. https://storage.googleapis.com/deepmind-media/research/alphastar
 [14] Kaggriculture competition and environment source, `kaggle_environments/envs/kaggriculture/`
 v1.32.3; primary measurements taken in this repository; 400 episodes mined from
 `kaggle/kaggriculture-episodes-2026-08-02`. https://www.kaggle.com/competitions/kaggriculture
+**Superseded 2026-08-08:** the ladder runs v1.32.6, which deleted the town centre's escalating demand
+schedule and doubled `townCenterSellInterval`. Every bank measured under [14] is void; the engine delta
+and the re-measured reference table are in `docs/research/2026-08-08-engine-1326-rebaseline.md`.
 
 [15] SIDHAARTH SHREE. _Crucial Information for Starters and Organizers: Documentation vs. Engine
 Discrepancies._ https://www.kaggle.com/competitions/kaggriculture/discussion/732450

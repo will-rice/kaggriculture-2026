@@ -456,6 +456,12 @@ term rather than against the initialisation.
 
 #### Result — route memory, 2026-08-06 (gate `play-vs-league-43508ce`) — **gate passed, `main.py` repointed**
 
+> **Void as of 2026-08-08.** Every bank and win rate in this section was measured on
+> `kaggle-environments` 1.32.3. The ladder moved to 1.32.6 on 2026-08-07, late-season town-centre
+> demand fell about eightfold, and every bank here roughly halved. The recorded meta-tape opponent is
+> itself a 1.32.3 replay, so results against it are void twice over. Re-measured reference table:
+> [`docs/research/2026-08-08-engine-1326-rebaseline.md`](docs/research/2026-08-08-engine-1326-rebaseline.md).
+
 Not a learned policy at all: a store of 190 routes harvested from top-decile corpus seats, matched to
 the live board each turn by an identity-free signature, replayed with the orders realigned onto the
 units we actually have, and backed by the vendored economic policy on turns where no route is near.
