@@ -20,9 +20,11 @@ different:
 
 **The policy is played the way it was trained** -- masked, and sampled rather
 than argmaxed -- through ``rollout_many``. That is a deliberate choice over
-routing it through ``learn.play``, which argmaxes *unmasked* logits and would
-therefore be measuring a different agent than the one the run produced, on a
-distribution it was never optimised for. It also means ``Trajectory.illegal``
+routing it through ``learn.play``, which argmaxes: an argmax and a sample are
+different agents on the same weights, and this gate asks what the *run*
+produced. (``learn.play`` argmaxed *unmasked* logits when this was written,
+which made it a third agent again; it is masked now, and the remaining
+difference is only argmax against sampling.) It also means ``Trajectory.illegal``
 is available for every episode, which is what makes the illegal-action rate a
 number this script reports rather than one it assumes.
 

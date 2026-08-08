@@ -145,6 +145,21 @@ def _one_hot(op: int, units: int = 1) -> torch.Tensor:
     return logits
 
 
+def _permit(logits: torch.Tensor) -> torch.Tensor:
+    """Return an all-True mask shaped like ``logits``.
+
+    The decoders take a legality mask because the play path must not select an
+    op the engine would discard, and that behaviour is tested where it belongs,
+    against real observations, in ``test_play.py`` and ``test_mask.py``. The
+    tests below ask a narrower question -- what op list a *given* vocabulary
+    index decodes to, its arity, its item, the order the market slots come out
+    in -- and a mask would only stop them reaching the index they mean to
+    exercise. Permitting everything keeps each of these a test of the spelling
+    rules alone.
+    """
+    return torch.ones_like(logits, dtype=torch.bool)
+
+
 def test_board_has_the_declared_shape_and_batch_dimension() -> None:
     """Every tensor in this project carries its batch dimension."""
     board = encode_board(empty_observation(), seat=0)
@@ -1073,7 +1088,8 @@ def test_a_decoded_pickup_moves_state_in_the_engine() -> None:
     farm = observation["farms"][0]
     private = observation["private"]
 
-    op = decode_units(_one_hot(UNIT_OPS.index("PICKUP:WHEAT")), units=1)["farmer"]
+    logits = _one_hot(UNIT_OPS.index("PICKUP:WHEAT"))
+    op = decode_units(logits, 1, _permit(logits))["farmer"]
     engine._apply_unit_action(
         farm, private, 0, op, BOARD, 0, TURNS_PER_DAY, SHED_CAPACITY
     )
@@ -1097,7 +1113,8 @@ def test_a_decoded_place_puts_a_bought_animal_onto_its_structure() -> None:
     private = observation["private"]
     private["inventories"][0] = {"COW": 1}
 
-    op = decode_units(_one_hot(UNIT_OPS.index("PLACE:COW")), units=1)["farmer"]
+    logits = _one_hot(UNIT_OPS.index("PLACE:COW"))
+    op = decode_units(logits, 1, _permit(logits))["farmer"]
     engine._apply_unit_action(
         farm, private, 0, op, BOARD, 0, TURNS_PER_DAY, SHED_CAPACITY
     )
@@ -1226,7 +1243,7 @@ def test_labels_round_trip_back_to_a_legal_action() -> None:
     for unit in range(3):
         logits[0, unit, int(labels[0, unit].item())] = 10.0
 
-    decoded = decode_units(logits, units=3)
+    decoded = decode_units(logits, 3, _permit(logits))
 
     assert decoded["farmer"] == ["PLANT", "MELON"]
     assert decoded["hands"] == [["WATER"], ["DIG"]]
@@ -1306,7 +1323,7 @@ def test_decoding_never_exceeds_the_engine_s_order_cap() -> None:
     logits = torch.zeros(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))
     logits[0, :, 1] = 10.0
 
-    orders = decode_market(logits)
+    orders = decode_market(logits, _permit(logits))
 
     assert len(orders) <= MAX_ORDERS
 
@@ -1317,7 +1334,7 @@ def test_decoding_puts_sells_before_buys() -> None:
     logits[0, MARKET_SLOTS.index(("SELL", "WHEAT")), 2] = 10.0
     logits[0, MARKET_SLOTS.index(("BUY_SEED", "MELON")), 2] = 10.0
 
-    orders = decode_market(logits)
+    orders = decode_market(logits, _permit(logits))
 
     assert [order[0] for order in orders] == ["SELL", "BUY_SEED"]
 
@@ -1327,4 +1344,4 @@ def test_an_empty_market_decodes_to_no_orders() -> None:
     logits = torch.zeros(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))
     logits[0, :, 0] = 10.0
 
-    assert decode_market(logits) == []
+    assert decode_market(logits, _permit(logits)) == []

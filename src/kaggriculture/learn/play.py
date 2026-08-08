@@ -8,10 +8,15 @@ that pool rather than assuming it fits.
 It deliberately imports nothing from ``learn.scripts``, ``learn.corpus`` or
 ``learn.dataset``: those reach for wandb, tqdm and a ``/data`` path, none of
 which exist in the sandbox, and an import that reaches the network forfeits the
-episode on turn zero. ``CHECKPOINT`` comes from ``kaggriculture.learn`` so that
-training, play and packaging share one statement of where the weights live;
-two constants would let training write somewhere the agent does not read, and
-the failure would look like an untrained model rather than a missing file.
+episode on turn zero. ``learn.mask`` is safe to import and is imported here:
+it is pure torch over ``kaggriculture.constants``, ``kaggriculture.observation``
+and ``learn.encoding``, all of which this module already loads, so it adds no
+dependency the sandbox does not already have.
+
+``CHECKPOINT`` comes from ``kaggriculture.learn`` so that training, play and
+packaging share one statement of where the weights live; two constants would
+let training write somewhere the agent does not read, and the failure would
+look like an untrained model rather than a missing file.
 
 The whole file is arranged so ``agent`` is the last callable defined:
 ``kaggle_environments`` execs an agent path and takes the last callable in the
@@ -33,6 +38,7 @@ from kaggriculture.learn.encoding import (
     encode_scalars,
     unit_count,
 )
+from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
 
 # The sandbox has two cores. Timing at 64 flatters it by an order of magnitude,
@@ -98,6 +104,22 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     whatever the unit head predicts. That was measured over 400 episodes before
     the market head existed.
 
+    **Both heads are decoded under the same legality masks the policy was
+    trained and gated under.** This path used to argmax the raw logits, which
+    made the deployed agent a different agent than the measured one: it chose
+    by a rule the training distribution never used, and it could name ops the
+    engine silently discards -- ``_apply_unit_action`` returns without a word
+    and the unit has spent its turn. Nothing raises, nothing logs, and the only
+    symptom is a season that banks less than the gate said it would. The masks
+    are built here, from this turn's observation, exactly as ``rollout`` builds
+    them, so play and training cannot disagree about which ops exist.
+
+    Selection stays an ``argmax``, where ``rollout`` samples: deployment is
+    deterministic, so a league result is reproducible from the seed alone.
+
+    The masks cost ~1.1 ms a turn, measured, against a one-second turn budget --
+    see ``scripts/budget.py`` for the whole-episode figure.
+
     Args:
         raw_obs: One turn's observation, as the environment hands it over.
 
@@ -112,6 +134,8 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
             encode_scalars(raw_obs, seat),
             encode_positions(raw_obs, seat),
         )
-    action = decode_units(unit_logits, unit_count(raw_obs, seat))
-    action["market"] = decode_market(market_logits)
+    action = decode_units(
+        unit_logits, unit_count(raw_obs, seat), unit_mask(raw_obs, seat)
+    )
+    action["market"] = decode_market(market_logits, market_mask(raw_obs, seat))
     return action

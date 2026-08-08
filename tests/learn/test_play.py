@@ -1,24 +1,48 @@
 """Tests for the wrapper that plays a checkpoint against the league."""
 
+import copy
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator, Mapping
 
 import pytest
 import torch
 from kaggle_environments import make
 from kaggle_environments.agent import get_last_callable
+from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
-from kaggriculture.constants import ENVIRONMENT
+from kaggriculture.constants import (
+    BOARD_SIZE,
+    ENVIRONMENT,
+    EPISODE_STEPS,
+    SHED_CAPACITY,
+    TURNS_PER_DAY,
+)
 from kaggriculture.learn import play as play_module
-from kaggriculture.learn.encoding import MARKET_SLOTS, MAX_ORDERS, QUANTITIES, UNIT_OPS
+from kaggriculture.learn.encoding import (
+    MARKET_SLOTS,
+    MAX_ORDERS,
+    QUANTITIES,
+    UNIT_OPS,
+    decode_units,
+    encode_board,
+    encode_positions,
+    encode_scalars,
+    unit_count,
+)
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.play import agent
 
 SOURCE = Path(play_module.__file__)
 VERBS = {name.split(":")[0] for name in UNIT_OPS}
 MARKET_VERBS = {verb for verb, _ in MARKET_SLOTS} | {"HIRE", "BUY_LAND"}
+
+# The episode the acceptance test below plays. Seeded so the season, and
+# therefore the set of ops the agent is asked to choose between, is the same one
+# every run.
+EPISODE_SEED = 42
 
 
 @pytest.fixture
@@ -220,3 +244,203 @@ def test_the_checkpoint_sits_inside_the_shipped_package() -> None:
     random weights with no error to say so.
     """
     assert play_module.CHECKPOINT.parent == SOURCE.parent
+
+
+def _engine_acts_on(
+    observation: Mapping[str, Any], seat: int, unit: int, op: list[Any]
+) -> bool:
+    """Return whether ``_apply_unit_action`` moves any state for one unit's op.
+
+    The engine reports nothing when it refuses: an illegal op is a silent
+    ``return`` out of a chain of guards, and the unit has spent its turn. So
+    legality is read off the state instead -- copy the farm and the private
+    mapping, apply the op, and ask whether anything moved. This is the same
+    probe ``test_mask.py`` uses to hold the mask against the engine; it is
+    repeated here because what is under test is different. There, it asks
+    whether ``unit_mask`` was right about an op. Here, it asks whether the
+    shipped agent ever *chooses* one the engine will drop.
+
+    ``PASS`` is the one op for which "nothing moved" means accepted rather than
+    refused, and it is the one op the engine always permits, so it is answered
+    directly.
+
+    Args:
+        observation: The turn the op was chosen from.
+        seat: Whose farm the unit belongs to.
+        unit: Index into ``[farmer, *hands]``.
+        op: The decoded op, as the action dict carries it.
+
+    Returns:
+        True if the engine acted on the op.
+    """
+    if op[0] == "PASS":
+        return True
+    farm = copy.deepcopy(observation["farms"][seat])
+    private = copy.deepcopy(observation["private"])
+    before = (copy.deepcopy(farm), copy.deepcopy(private))
+    engine._apply_unit_action(
+        farm,
+        private,
+        unit,
+        op,
+        BOARD_SIZE,
+        observation["day"],
+        TURNS_PER_DAY,
+        SHED_CAPACITY,
+    )
+    return (farm, private) != before
+
+
+def _market_state_after(
+    observation: Mapping[str, Any], seat: int, orders: list[list[Any]]
+) -> tuple[Any, ...]:
+    """Return the state ``_process_market`` reaches from ``observation`` on ``orders``.
+
+    Run through ``_process_market`` itself rather than through ``_commit_unit``
+    in a loop, so the per-unit lockstep, the re-quoting of a moving price and
+    the abort-on-refusal are the engine's own. The opponent is given a fresh
+    private mapping and no orders: their real one is hidden from this seat, and
+    an idle opponent is the only opponent a single-seat probe can honestly
+    model.
+
+    Args:
+        observation: The turn the orders were chosen from.
+        seat: Whose orders these are.
+        orders: The order list to process, or a prefix of one.
+
+    Returns:
+        The farm, the private mapping and the market after processing --
+        everything a market order can move, for comparing one prefix against
+        the next.
+    """
+    farms = copy.deepcopy(observation["farms"])
+    market = copy.deepcopy(observation["market"])
+    privates = [engine._new_private(), engine._new_private()]
+    privates[seat] = copy.deepcopy(observation["private"])
+    state = [
+        SimpleNamespace(
+            observation=SimpleNamespace(
+                farms=farms, market=market, private=privates[player]
+            ),
+            action={"market": list(orders) if player == seat else []},
+        )
+        for player in (0, 1)
+    ]
+    engine._process_market(state, SimpleNamespace(configuration={}))
+    return (farms[seat], privates[seat], market)
+
+
+def test_the_agent_refuses_an_op_the_unmasked_argmax_would_have_thrown_away(
+    checkpoint: Path,
+) -> None:
+    """The bug, on the board the engine deals at the start of every game.
+
+    This path used to select by ``logits.argmax(dim=-1)`` over raw logits. On
+    the opening observation the seeded fixture policy's highest-scoring op for
+    the farmer is ``PLANT:STRAWBERRY`` -- and the farm opens holding no
+    strawberry seed, so ``_apply_unit_action`` falls out of its ``seeds`` guard
+    without moving anything and the farmer has spent turn zero standing still.
+    Nothing raises and nothing logs; the only trace is a season that banks less
+    than the gate said it would.
+
+    Both halves are asserted. That the unmasked argmax really does pick an op
+    the engine discards is what makes this test discriminate: without it, a
+    masked path that happened to agree with the raw one would pass and prove
+    nothing. That the masked path picks an op the engine acts on is the fix.
+
+    The unmasked selection is reproduced by handing ``decode_units`` an all-True
+    mask, which is exactly the arithmetic the old signature performed, rather
+    than by keeping a second copy of the decoder alive to be tested against.
+    """
+    state = observation([])
+    seat = 0
+    with torch.no_grad():
+        unit_logits, _market_logits, _value = play_module.model()(
+            encode_board(state, seat),
+            encode_scalars(state, seat),
+            encode_positions(state, seat),
+        )
+    units = unit_count(state, seat)
+
+    unmasked = decode_units(
+        unit_logits, units, torch.ones_like(unit_logits, dtype=torch.bool)
+    )
+    played = agent(state)
+
+    assert unmasked["farmer"] == ["PLANT", "STRAWBERRY"]
+    assert not _engine_acts_on(state, seat, 0, unmasked["farmer"])
+    assert played["farmer"] != unmasked["farmer"]
+    assert _engine_acts_on(state, seat, 0, played["farmer"])
+
+
+@pytest.mark.slow
+def test_every_op_a_full_episode_emits_is_one_the_engine_acts_on() -> None:
+    """719 turns of the shipped checkpoint, every op put back through the engine.
+
+    The unit heads' claim is absolute and is asserted that way: across a whole
+    season, not one op the agent chooses may be silently discarded. A wasted op
+    is a wasted turn for that unit, it costs nothing visible, and before the
+    masks were threaded through this path 371 of 2,267 ops in this same episode
+    were dropped.
+
+    The market's claim is weaker, and the difference is the point rather than
+    an exception being made for it. ``unit_mask`` gates each unit against a
+    tile and an inventory nobody else is spending, so a per-slot mask makes the
+    whole action legal. ``market_mask`` gates each slot against the farm's
+    *whole* balance and the slots then spend from that one balance together, so
+    orders that are each individually affordable can still overdraw -- which
+    ``mask.py`` documents as a limit no per-slot mask can express. So rather
+    than tolerate a count, every dropped order is required to be one the engine
+    *would* have filled had it been the turn's only order. That pins the loss
+    to the shared balance and to nothing else: a genuine mask error, an order
+    for an item the shed does not hold or a quantity the market cannot fill,
+    would fail in isolation too and fail this test.
+
+    Non-vacuity is asserted alongside. A wrapper that emitted ``PASS`` for
+    every unit and no orders at all would satisfy every claim above while
+    playing no game, and that is precisely the degenerate agent masking could
+    collapse into if a mask were ever inverted.
+    """
+    ops = 0
+    orders = 0
+    isolated_failures: list[tuple[int, list[Any]]] = []
+    discarded_ops: list[tuple[int, int, list[Any]]] = []
+    turn = 0
+
+    def watched(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
+        """Play one turn and put everything it emits back through the engine."""
+        nonlocal ops, orders, turn
+        action = agent(raw_obs)
+        seat = int(raw_obs["player"])
+        turn += 1
+        for unit, op in enumerate([action["farmer"], *action["hands"]]):
+            ops += 1
+            if not _engine_acts_on(raw_obs, seat, unit, op):
+                discarded_ops.append((turn, unit, op))
+        # Each order is isolated by replaying the turn's list one order longer
+        # and asking whether the extra one moved anything. Comparing whole
+        # states rather than counting per (verb, item) is what keeps a SELL and
+        # a BUY_PRODUCT of the same item from netting to zero and reading as
+        # two dropped orders when both were filled.
+        previous = _market_state_after(raw_obs, seat, [])
+        for index, order in enumerate(action["market"]):
+            orders += 1
+            current = _market_state_after(raw_obs, seat, action["market"][: index + 1])
+            if current == previous:
+                alone = _market_state_after(raw_obs, seat, [order])
+                if alone == _market_state_after(raw_obs, seat, []):
+                    isolated_failures.append((turn, order))
+            previous = current
+        return action
+
+    environment = make(
+        ENVIRONMENT,
+        configuration={"episodeSteps": EPISODE_STEPS, "seed": EPISODE_SEED},
+    )
+    environment.run([watched, "starter"])
+
+    assert turn == EPISODE_STEPS - 1
+    assert discarded_ops == []
+    assert isolated_failures == []
+    assert ops > 3000, f"only {ops} ops over {turn} turns, so the crew never grew"
+    assert orders > 0, "an agent that never trades cannot bank a coin"

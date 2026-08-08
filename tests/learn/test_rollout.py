@@ -214,9 +214,11 @@ def test_the_recorded_state_is_the_state_the_action_was_taken_from(
         action = decode_units(
             _one_hot(trajectory.unit_actions[turn].clamp(min=0), len(UNIT_OPS)),
             int(acted.sum()),
+            trajectory.unit_masks[turn : turn + 1],
         )
         action["market"] = decode_market(
-            _one_hot(trajectory.market_actions[turn], len(QUANTITIES))
+            _one_hot(trajectory.market_actions[turn], len(QUANTITIES)),
+            trajectory.market_masks[turn : turn + 1],
         )
         environment.step([action, starter(environment.state[1].observation)])
 
@@ -425,9 +427,11 @@ def test_a_lockstep_group_keeps_each_environment_s_rows_apart(
         action = decode_units(
             _one_hot(second.unit_actions[turn].clamp(min=0), len(UNIT_OPS)),
             int(acted.sum()),
+            second.unit_masks[turn : turn + 1],
         )
         action["market"] = decode_market(
-            _one_hot(second.market_actions[turn], len(QUANTITIES))
+            _one_hot(second.market_actions[turn], len(QUANTITIES)),
+            second.market_masks[turn : turn + 1],
         )
         environment.step([action, starter(environment.state[1].observation)])
 

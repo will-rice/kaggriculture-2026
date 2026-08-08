@@ -811,12 +811,38 @@ def _label(op: list[Any]) -> int:
     return UNIT_OPS.index(name)
 
 
-def decode_units(logits: torch.Tensor, units: int) -> dict[str, Any]:
-    """Return the action dict implied by per-unit logits.
+def decode_units(
+    logits: torch.Tensor, units: int, mask: torch.Tensor
+) -> dict[str, Any]:
+    """Return the action dict implied by per-unit logits, under the legality mask.
+
+    The mask is required rather than defaulted, and that is the whole point of
+    this signature. Selection used to be a bare ``argmax`` over raw logits,
+    which meant the deployed agent chose actions by a different rule than the
+    one it was trained and gated under -- ``rollout`` samples from
+    ``masked_fill(~mask, -inf)`` -- and could name an op the engine silently
+    discards. An illegal op is not an error anywhere: ``_apply_unit_action``
+    just ``return``s, and the unit has spent its turn. Over 719 turns that is a
+    quiet, unmeasurable leak, so there is deliberately no overload of this
+    function that can select without a mask.
+
+    Masking before the ``argmax`` rather than after it is what makes the choice
+    the *best legal* op instead of a legal fallback: filling the illegal
+    positions with ``-inf`` leaves the comparison between the surviving ops
+    exactly as the network scored them.
+
+    Selection stays an ``argmax`` -- deployment is deterministic, where
+    ``rollout`` samples -- so the same observation and the same weights always
+    produce the same turn.
 
     Args:
         logits: A ``(1, MAX_UNITS, len(UNIT_OPS))`` tensor.
         units: How many units are actually on the board this turn.
+        mask: A ``(1, MAX_UNITS, len(UNIT_OPS))`` bool tensor from
+            ``learn.mask.unit_mask``, True where the engine would act on the
+            op. No row may be entirely False, which ``unit_mask`` guarantees by
+            keeping ``PASS`` alive on every slot -- an all-``-inf`` row has no
+            meaningful ``argmax``.
 
     Returns:
         An action dict with ``farmer``, ``hands`` and an empty ``market``
@@ -827,8 +853,8 @@ def decode_units(logits: torch.Tensor, units: int) -> dict[str, Any]:
     """
     if units > MAX_UNITS:
         raise TooManyUnitsError(f"{units} units exceeds MAX_UNITS={MAX_UNITS}")
-    chosen = logits[0, :units].argmax(dim=-1)
-    ops = [_op(int(index.item())) for index in chosen]
+    legal = logits[0, :units].masked_fill(~mask[0, :units], -torch.inf)
+    ops = [_op(int(index)) for index in legal.argmax(dim=-1)]
     return {"farmer": ops[0], "hands": ops[1:], "market": []}
 
 
@@ -995,8 +1021,29 @@ def encode_market(action: Mapping[str, Any]) -> torch.Tensor:
     return torch.tensor(labels, dtype=torch.int64).reshape(1, len(MARKET_SLOTS) + 2)
 
 
-def decode_market(logits: torch.Tensor) -> list[list[Any]]:
-    """Return the market orders implied by per-slot logits.
+def decode_market(logits: torch.Tensor, mask: torch.Tensor) -> list[list[Any]]:
+    """Return the market orders implied by per-slot logits, under the legality mask.
+
+    The mask is required for the same reason it is on ``decode_units``: the
+    deployed agent must select by the rule it was trained under, and an order
+    the engine will not fill is silently dropped rather than refused.
+
+    What the mask can promise here is weaker than on the unit head, and the
+    difference is worth stating rather than discovering. ``unit_mask`` gates
+    each unit against a resource -- a tile, an inventory -- that no other unit
+    is spending, so a per-slot mask makes the whole action legal.
+    ``market_mask`` gates each slot against the farm's *whole* balance, and the
+    slots then spend from that one balance together, so ten individually
+    affordable orders can still overdraw and ``_commit_unit`` will abort the
+    later ones. Masking per slot therefore removes the orders that could never
+    have filled, not every order that will not fill.
+
+    In the other direction the mask is slightly conservative, and deliberately
+    so: it prices every purchase against the balance *before* this turn's
+    sales, while the orders below are emitted sells-first precisely so a sale
+    can fund a purchase. A buy that only becomes affordable mid-turn is
+    therefore masked off. That costs an order; permitting it would cost a
+    ``_commit_unit`` abort and the orders queued behind it.
 
     Orders are emitted in ``MARKET_SLOTS`` order, so every ``SELL`` precedes
     every ``BUY_*`` since the ``SELL`` block is built first. The engine
@@ -1012,11 +1059,16 @@ def decode_market(logits: torch.Tensor) -> list[list[Any]]:
 
     Args:
         logits: A ``(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` tensor.
+        mask: A ``(1, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` bool tensor
+            from ``learn.mask.market_mask``, True where the engine would fill
+            the whole order. No row may be entirely False, which
+            ``market_mask`` guarantees by keeping bucket 0 -- "trade nothing",
+            which emits no order at all -- alive on every slot.
 
     Returns:
         A list of order lists, e.g. ``["SELL", "WHEAT", 4]`` or ``["HIRE"]``.
     """
-    buckets = logits[0].argmax(dim=-1)
+    buckets = logits[0].masked_fill(~mask[0], -torch.inf).argmax(dim=-1)
     orders: list[list[Any]] = []
     for slot, (verb, item) in enumerate(MARKET_SLOTS):
         bucket = int(buckets[slot].item())

@@ -27,13 +27,21 @@ correctly but stored the wrong mask reports illegal actions even though the
 episode was played legally, which is exactly the failure that needs a voice.
 
 **The action is built by the same decoders the dataset uses.** ``decode_units``
-and ``decode_market`` take logits and argmax them, so the sampled indices are
-handed back as one-hot rows rather than being turned into engine ops by a second
-copy of ``_op``'s spelling rules. ``PICKUP`` needs its item and its quantity,
-``PLANT`` must be arity 2, ``BUY_LAND`` is a flag and ``HIRE`` repeats by count:
-a private re-implementation of any of that drifts from ``encoding.py`` the
-moment either side changes, and the engine's response to a malformed op is to
-do nothing at all.
+and ``decode_market`` take logits and a mask and argmax them under it, so the
+sampled indices are handed back as one-hot rows -- alongside the very masks
+they were sampled under -- rather than being turned into engine ops by a second
+copy of ``_op``'s spelling rules. The mask is redundant on this path and passed
+anyway: an index sampled under a mask is legal under it, so the masked argmax
+of its one-hot row is that same index. It is required by the signature because
+the *deployment* path, ``learn.play``, has no sampler to make it redundant, and
+an optional mask there is what let deployment argmax raw logits and quietly
+play a different agent than the one measured here.
+
+``PICKUP`` needs its item and its quantity, ``PLANT`` must be arity 2,
+``BUY_LAND`` is a flag and ``HIRE`` repeats by count: a private
+re-implementation of any of that drifts from ``encoding.py`` the moment either
+side changes, and the engine's response to a malformed op is to do nothing at
+all.
 
 **Three series are recorded, and this module does not choose between them.**
 ``rewards`` is the per-turn change in (our bank - their bank), ``own`` is the
@@ -635,10 +643,13 @@ def _decide(
         count = unit_count(*request)
         rows = slice(row, row + 1)
         action = decode_units(
-            _one_hot(chosen_units[rows], unit_logits.shape[-1]), count
+            _one_hot(chosen_units[rows], unit_logits.shape[-1]),
+            count,
+            units[rows],
         )
         action["market"] = decode_market(
-            _one_hot(chosen_market[rows], market_logits.shape[-1])
+            _one_hot(chosen_market[rows], market_logits.shape[-1]),
+            trades[rows],
         )
         turns.append(
             Turn(
@@ -701,7 +712,9 @@ def _sample(
 def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
     """Return sampled indices as logits the encoding module's decoders can read.
 
-    ``decode_units`` and ``decode_market`` argmax their input, so a one-hot row
+    ``decode_units`` and ``decode_market`` argmax their input under the mask,
+    and the index was sampled under that same mask, so its one-hot row survives
+    the ``masked_fill`` at 1.0 while every rival is either 0.0 or ``-inf`` and
     decodes to exactly the index that was sampled. Handing the sample back
     through them, rather than spelling the engine ops out here, is what keeps
     the arity of a ``PICKUP``, the item on a ``PLANT`` and the repetition of a

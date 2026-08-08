@@ -9,9 +9,13 @@ no market verbs cannot gain a coin — the engine credits money in exactly one
 place, a completed SELL — so it banks its opening 3,000 and loses to anything
 that trades. Playing the checkpoint is therefore the only way this project's
 learned policy can score at all, and `learn/play.py`, `learn/model.py`,
-`learn/encoding.py` and the checkpoint beside this file now ship. What still
-never ships is `learn/scripts/`, `corpus.py` and `dataset.py`: they import
-wandb, tqdm and a `/data` path, none of which exist in the sandbox.
+`learn/encoding.py`, `learn/mask.py` and the checkpoint beside this file now
+ship. `mask.py` is on that list because the agent selects its action under the
+same legality masks it was trained and gated under; it is pure torch over the
+engine constants, so it costs the sandbox nothing beyond what `encoding.py`
+already imports. What still never ships is `learn/scripts/`, `corpus.py` and
+`dataset.py`: they import wandb, tqdm and a `/data` path, none of which exist
+in the sandbox.
 
 The 10.7 seconds are still spent, on the first turn, out of the overage pool.
 `scripts/budget.py` measures whether a full 720-turn episode fits inside

@@ -695,11 +695,18 @@ def _decoded_op(unit: int, op_index: int, units: int) -> list[Any]:
     is what made this probe agree with a mask that forbade ``PICKUP`` outright
     while the vocabulary carried no item: the decoder really could not express
     a landable one.
+
+    The mask handed to ``decode_units`` is all-True on purpose, and this is the
+    one place in the project that should hand it one. The probe exists to ask
+    the engine whether ``unit_mask`` was right about an op; passing
+    ``unit_mask`` itself would make the decoder refuse exactly the ops the mask
+    forbids, so the over-permissive count would read zero however wrong the
+    mask was and the test would be asserting its own premise.
     """
     logits = torch.zeros(1, MAX_UNITS, len(UNIT_OPS))
     logits[0, :, UNIT_OPS.index("PASS")] = 1.0
     logits[0, unit, op_index] = 2.0
-    action = decode_units(logits, units)
+    action = decode_units(logits, units, torch.ones_like(logits, dtype=torch.bool))
     return [action["farmer"], *action["hands"]][unit]
 
 
