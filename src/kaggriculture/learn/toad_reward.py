@@ -36,6 +36,7 @@ from typing import Any
 
 import torch
 
+from kaggriculture.learn.encoding import ANIMAL_NAMES
 from kaggriculture.observation import is_plant
 
 # reward_spaces_lux.py:166-177, verbatim. `step` defaults to 0. there and phase 1
@@ -73,6 +74,26 @@ FULL_WORKERS_WEIGHT = 0.0
 # coins are our *sole* score-decider, where theirs splits between city and units.
 #
 # Off by default. The baseline reward must stay exactly as it was measured.
+# A MAPPING CORRECTION, not a new component. Toad's `city` at 1.0 is their
+# COMPOUNDING, SCORE-DECIDING asset. We pointed that weight at our terrain --
+# unlocked tiles and plants -- and left our actual economic engine, the animals,
+# in `fuel` at 0.005, where the shed sums them in with fertilizer. A COW and one
+# unit of fertilizer have been earning the identical 0.005 all along, which is
+# why the livestock potential read zero in every logged iteration.
+#
+# Measured on economic_policy over a full season (seed 7, banking 125,691): it
+# finishes with 15 PASTURE tiles, so one animal structure is worth roughly 8,379
+# coins a season. Against MONEY_WEIGHT that is ~8.4 reward units, i.e. an animal
+# is about 1.7 million times more valuable per unit than the fertilizer it is
+# currently priced beside.
+#
+# The weight is 1.0 rather than 8.4 because the point is to put the noun in
+# Toad's existing compounding-asset slot, not to invent a bigger one. Their
+# ratios cap that slot at 1.0 and this stays inside their scheme.
+#
+# Land needs no change: quadrants already enter `city` through unlocked tiles.
+CAPITAL_WEIGHT = 1.0
+
 MONEY_WEIGHT = 0.001
 
 # Arm W escalates the weight tenfold. Read from the environment rather than
@@ -136,7 +157,10 @@ class Counts:
         research: Shops the town has unlocked. Their research points are an
             irreversible one-way capability unlock and this is our only other
             monotone progress counter.
-        fuel: Total goods in the shed. Their fuel is stored spendable resource
+        capital: Producing animals -- those standing on the board and those
+            still in the shed. Our compounding asset, in Toad's `city` slot.
+        fuel: Product stock in the shed. Animals are excluded; they are capital,
+            not consumable stock. Their fuel is stored spendable resource
             in hand; ours is harvested stock not yet sold.
         money: Coins banked. Not a shaped component -- it decides
             ``game_result`` alone, exactly as their city-tile count does.
@@ -146,7 +170,17 @@ class Counts:
     unit: int
     research: int
     fuel: int
+    capital: int
     money: float
+
+
+_ANIMALS = frozenset(ANIMAL_NAMES)
+
+
+def _is_pasture(tile: object) -> bool:
+    """Whether a tile hosts a producing animal."""
+    kind = tile.get("kind") if hasattr(tile, "get") else None
+    return kind == "PASTURE"
 
 
 def counts(observation: Mapping[str, Any], seat: int) -> Counts:
@@ -165,11 +199,20 @@ def counts(observation: Mapping[str, Any], seat: int) -> Counts:
     tiles = farm["tiles"]
     unlocked = sum(tile != "LOCKED" for row in tiles for tile in row)
     plants = sum(is_plant(tile) for row in tiles for tile in row)
+    shed = observation["private"]["shed"]
+    herd = sum(count for good, count in shed.items() if good in _ANIMALS)
+    pastures = sum(
+        1
+        for row in tiles
+        for tile in row
+        if tile is not None and getattr(tile, "get", dict().get) and _is_pasture(tile)
+    )
     return Counts(
         city=unlocked + plants,
         unit=1 + len(farm["hands"]),
         research=len(observation["town"]["unlocked_shops"]),
-        fuel=sum(observation["private"]["shed"].values()),
+        fuel=sum(count for good, count in shed.items() if good not in _ANIMALS),
+        capital=herd + pastures,
         money=farm["money"],
     )
 
@@ -286,6 +329,7 @@ def shaped(
             + RESEARCH_WEIGHT * (after.research - before.research)
             # Clamped at zero, their line 201: selling stock must not read as a
             # loss, because the sale is already paid for through game_result.
+            + CAPITAL_WEIGHT * (after.capital - before.capital)
             + FUEL_WEIGHT * max(after.fuel - before.fuel, 0)
             + STEP_WEIGHT
             # Ours. Zero unless phase-1b enables it; see MONEY_WEIGHT.
