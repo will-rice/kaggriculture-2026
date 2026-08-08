@@ -6,21 +6,26 @@ from pathlib import Path
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
-from kaggriculture.boatlee_v14_policy import agent
 from kaggriculture.scripts.package import ENTRYPOINT, build
 from kaggriculture.task import MatchTask
 
 
 def test_entrypoint_exposes_the_agent_last() -> None:
-    """Kaggle takes the last callable in main.py, so it must be the served agent.
+    """Nothing may be defined after the agent: Kaggle plays the LAST callable.
 
-    Imported by name rather than checked structurally, so switching which agent
-    `main.py` serves fails here until the switch is deliberate. It caught the
-    move from kaito v21.1 to boatlee v14 on 2026-08-08.
+    The invariant is about position, not identity -- appending a helper below
+    the import silently ships that helper as the agent, and the episode fails
+    on turn zero with no clue why. So this compares the last callable against
+    whatever ``main`` binds to ``agent``, and stays true whichever agent we
+    serve. An earlier version imported one policy by name and asserted equality
+    with it, which only restated the import line and had to be rewritten every
+    time the served agent changed.
     """
-    loaded = get_last_callable(ENTRYPOINT.read_text(), path=str(ENTRYPOINT))
+    source = ENTRYPOINT.read_text()
+    namespace: dict[str, object] = {}
+    exec(compile(source, str(ENTRYPOINT), "exec"), namespace)
 
-    assert loaded is agent
+    assert get_last_callable(source, path=str(ENTRYPOINT)) is namespace["agent"]
 
 
 def test_entrypoint_plays_a_full_episode() -> None:
