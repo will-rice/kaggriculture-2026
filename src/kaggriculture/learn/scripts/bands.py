@@ -11,6 +11,16 @@ and because the meta moves with it. ``DAYS`` selects which archives the deep
 pass reads; the cheap pass always reads all of them, so the drift is visible
 rather than assumed.
 
+**And stratified by engine build.** The corpus spans five releases of
+``kaggle-environments``, 1.32.2 to 1.32.6, and one of them changed the economy:
+1.32.6 replaced the town centre's escalating demand curve with a flat rate and
+doubled its interval, cutting late-season demand roughly eightfold. At an
+unchanged rating the median seat banks 120,800 on 1.32.5 and 80,660 on 1.32.6.
+An archive is therefore not one economy -- 268 of the 675 episodes dated
+2026-08-07 are on the new build -- and any bank statistic pooled across builds
+reads as a finding about players when it is a finding about the release notes.
+Every ladder number this writes is cut by ``(archive, build)``.
+
 Five training runs and an evaluator share this box. The pool is small and
 nice'd on purpose: the deep pass is bounded by JSON decoding, one episode is
 32 MB, and finishing ten minutes sooner is not worth slowing a training run.
@@ -20,7 +30,8 @@ import argparse
 import json
 import logging
 import os
-from collections.abc import Sequence
+import zipfile
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -57,6 +68,12 @@ OURS_SCORE = 1_014.0
 OURS_MEASURED = "2026-08-04"
 # Bank buckets for the rating-against-bank table, in coins.
 BUCKETS = (0, 60_000, 100_000, 120_000, 140_000, 160_000, 10**9)
+# Smallest stratum worth quoting a correlation or a bucket mean from. The
+# engine cut splits some archives into a large cell and a sliver, and a
+# correlation over forty seats is a number that will be quoted and should not
+# be.
+MIN_CELL = 200
+MIN_BUCKET = 30
 # Scalars the band comparison ranks. Everything else in a ``Profile`` is either
 # an identifier or a per-day series.
 FEATURES = (
@@ -97,10 +114,18 @@ def main() -> None:
     rows = banding.index(banding.archives())
     LOGGER.info("indexed %d episodes", len(rows))
     LOGGER.info("rating attribution converged after %d passes", banding.attribute(rows))
-    ladder = correlations(rows)
+    build = engines(rows)
+    LOGGER.info(
+        "engine builds across the corpus: %s",
+        ", ".join(
+            f"{version} x{sum(1 for v in build.values() if v == version)}"
+            for version in sorted(set(build.values()))
+        ),
+    )
+    ladder = correlations(rows, build)
 
     assignment = banding.band_of(rows)
-    recent = field(rows, assignment)
+    recent = field(rows, assignment, build)
     chosen = sample(rows, assignment, arguments.per_band)
     LOGGER.info("profiling %d episodes over %d days", len(chosen), len(DAYS))
     measured = run(chosen, assignment)
@@ -131,33 +156,84 @@ def main() -> None:
     report(summary)
 
 
-def correlations(rows: Sequence[Indexed]) -> dict:
-    """Return the bank-against-rating correlation, overall and per day.
+def engines(rows: Sequence[Indexed]) -> dict[tuple[str, int], str]:
+    """Return the ``kaggle-environments`` build each episode was played on.
 
-    The per-day figures are the ones that mean anything. Ratings inflate daily,
-    and so does play, so a correlation pooled across archives is mostly a
-    correlation with the calendar.
+    Read from ``module_version``, which the exporter writes into the head of
+    every episode beside the team names, so this costs another truncated read
+    and no decoding.
+
+    It lives here rather than on ``Indexed`` only because ``learn/bands.py`` is
+    being edited concurrently for the same 1.32.6 upgrade and this could not
+    extend it without committing that work in progress. It belongs there.
+
+    Args:
+        rows: Indexed episodes.
+
+    Returns:
+        ``(day, episode) -> build``, e.g. ``"1.32.6"``.
+    """
+    decoder = json.JSONDecoder()
+    wanted: dict[str, set[int]] = {}
+    for row in rows:
+        wanted.setdefault(row.archive, set()).add(row.episode)
+    out: dict[tuple[str, int], str] = {}
+    for archive, episodes in wanted.items():
+        day = archive[-14:-4]
+        with zipfile.ZipFile(banding.CORPUS / archive) as bundle:
+            for episode in episodes:
+                with bundle.open(f"{episode}.json") as member:
+                    head = member.read(banding.HEAD_BYTES).decode("utf-8", "ignore")
+                marker = '"module_version": '
+                start = head.find(marker)
+                if start < 0:
+                    continue
+                out[day, episode] = decoder.raw_decode(head, start + len(marker))[0]
+    return out
+
+
+def correlations(rows: Sequence[Indexed], build: Mapping[tuple[str, int], str]) -> dict:
+    """Return the bank-against-rating correlation, cut by archive and by build.
+
+    The ``(archive, build)`` cells are the only figures here that mean anything.
+    Pooling across archives buys a correlation with the calendar, because
+    ratings inflate daily; pooling across builds buys a correlation with the
+    release notes, because 1.32.6 cut the town's demand and with it every bank
+    in the episodes it played. Both pooled figures are reported anyway, so the
+    size of what stratifying removes is on the record rather than asserted.
 
     Args:
         rows: Indexed episodes, already attributed.
+        build: The output of ``engines``.
 
     Returns:
-        Pooled and per-day correlations, plus the within-episode ordering check.
+        Pooled, per-day and per-(day, build) correlations, plus the
+        within-episode ordering check.
     """
     rating = np.array([value for row in rows for value in row.ratings])
     bank = np.array([value for row in rows for value in row.banks])
     day = np.array([row.day for row in rows for _ in row.ratings])
+    engine = np.array(
+        [build.get((row.day, row.episode), "") for row in rows for _ in row.ratings]
+    )
 
-    per_day = {}
-    for name in sorted(set(day)):
-        mask = day == name
-        per_day[name] = {
+    def cell(mask: np.ndarray) -> dict:
+        """Return one stratum's correlation and central tendencies."""
+        return {
             "seats": int(mask.sum()),
             "pearson": _pearson(rating[mask], bank[mask]),
             "spearman": _spearman(rating[mask], bank[mask]),
             "median_bank": float(np.median(bank[mask])),
             "median_rating": float(np.median(rating[mask])),
         }
+
+    per_day = {name: cell(day == name) for name in sorted(set(day))}
+    per_build = {
+        f"{name} {version}": cell((day == name) & (engine == version))
+        for name in sorted(set(day))
+        for version in sorted(set(engine[day == name]))
+        if ((day == name) & (engine == version)).sum() >= MIN_CELL
+    }
 
     gaps, agree = [], []
     for row in rows:
@@ -185,11 +261,14 @@ def correlations(rows: Sequence[Indexed]) -> dict:
         "pooled_pearson": _pearson(rating, bank),
         "pooled_spearman": _spearman(rating, bank),
         "per_day": per_day,
+        "per_day_build": per_build,
         "within_episode": ordering,
     }
 
 
-def field(rows: Sequence[Indexed], assignment: dict) -> dict:
+def field(
+    rows: Sequence[Indexed], assignment: dict, build: Mapping[tuple[str, int], str]
+) -> dict:
     """Return what the recent field looks like from the index alone.
 
     Everything here is answerable without decoding an episode, and all of it
@@ -197,35 +276,84 @@ def field(rows: Sequence[Indexed], assignment: dict) -> dict:
     bank rather than the bank against the ladder, and ask whether a low bank is
     a property of the seat or of the pair it was drawn into.
 
+    The bucket table is emitted twice, pooled and per build, and the pair is the
+    point. Pooled, mean rating falls monotonically from the poorest bucket to
+    the richest and looks like "the best bankers are the weakest players".
+    Inside one build it is flat, because the poorest buckets are simply where
+    1.32.6's episodes live. This is the single place in the study where
+    stratifying overturned a conclusion rather than sharpening it, so the
+    superseded version stays visible next to the one that replaced it.
+
     Args:
         rows: Indexed episodes, already attributed.
         assignment: The output of ``band_of``.
+        build: The output of ``engines``.
 
     Returns:
-        The bank buckets with their mean rating, where our own agent's bank
-        falls in that distribution, whether extreme banks come in pairs, and
-        each band's episode total against its own day's median.
+        The bank buckets pooled and per build, where our own agent's bank falls
+        in that distribution, whether extreme banks come in pairs, and each
+        band's episode total against its own day's median.
     """
     recent = [row for row in rows if row.day in DAYS]
     rating = np.array([value for row in recent for value in row.ratings])
     bank = np.array([value for row in recent for value in row.banks])
     other = np.array([value for row in recent for value in row.banks[::-1]])
-    elite = np.percentile(rating, 90.0)
+    engine = np.array(
+        [build.get((row.day, row.episode), "") for row in recent for _ in row.ratings]
+    )
 
-    buckets = []
-    for low, high in zip(BUCKETS[:-1], BUCKETS[1:], strict=True):
-        mask = (bank >= low) & (bank < high)
-        if not mask.any():
-            continue
-        buckets.append(
-            {
-                "from": low,
-                "to": high,
-                "seats": int(mask.sum()),
-                "mean_rating": float(rating[mask].mean()),
-                "top_decile_share": float((rating[mask] >= elite).mean()),
-            }
-        )
+    def key(row: Indexed) -> str:
+        """Return one episode's build."""
+        return build.get((row.day, row.episode), "")
+
+    def table(mask: np.ndarray) -> list[dict]:
+        """Return the bank buckets for one stratum of seats."""
+        elite = np.percentile(rating[mask], 90.0)
+        out = []
+        for low, high in zip(BUCKETS[:-1], BUCKETS[1:], strict=True):
+            inside = mask & (bank >= low) & (bank < high)
+            if inside.sum() < MIN_BUCKET:
+                continue
+            out.append(
+                {
+                    "from": low,
+                    "to": high,
+                    "seats": int(inside.sum()),
+                    "mean_rating": float(rating[inside].mean()),
+                    "top_decile_share": float((rating[inside] >= elite).mean()),
+                }
+            )
+        return out
+
+    everything = np.ones(bank.size, dtype=bool)
+    buckets = table(everything)
+    per_build = {
+        version: table(engine == version)
+        for version in sorted(set(engine))
+        if version and (engine == version).sum() >= MIN_CELL
+    }
+
+    # How much of a seat's bank is the episode rather than the seat. Both seats
+    # trade one book, so if the book is what sets the level this correlation is
+    # near 1 and a seat's own contribution is only the margin on top -- which is
+    # the mechanism behind every null in this study, and the reason a
+    # bank-shaped reward is mostly rewarding the draw.
+    pairing = {
+        version: {
+            "episodes": int(
+                len(pairs := [row for row in recent if key(row) == version])
+            ),
+            "seat_to_opponent_bank": _pearson(
+                np.array([row.banks[0] for row in pairs]),
+                np.array([row.banks[1] for row in pairs]),
+            ),
+            "median_seat_bank": float(
+                np.median([value for row in pairs for value in row.banks])
+            ),
+        }
+        for version in sorted(set(engine))
+        if version and sum(1 for row in recent if key(row) == version) >= MIN_BUCKET
+    }
 
     poor = bank < BUCKETS[1]
     rich = bank >= BUCKETS[-2]
@@ -248,7 +376,12 @@ def field(rows: Sequence[Indexed], assignment: dict) -> dict:
     return {
         "days": list(DAYS),
         "seats": int(bank.size),
+        "builds": {
+            version: int((engine == version).sum()) for version in sorted(set(engine))
+        },
         "buckets": buckets,
+        "buckets_by_build": per_build,
+        "pairing_by_build": pairing,
         "ours": {
             "bank": OURS,
             "leaderboard": OURS_SCORE,

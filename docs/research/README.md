@@ -23,12 +23,13 @@ the expensive way:
 
 ## Documents
 
-| document                                                                   | answers                                                                                                                                                                                                                                       | do not use it for                                                                                    |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| [2026-08-07-self-play-rl-findings.md](2026-08-07-self-play-rl-findings.md) | Why our self-play loop learned nothing: advantage cancellation with a difference reward, policy-invariance of shaping, what single-box Lux winners actually did, whether a league is needed, whether throughput is the constraint.            | Its Finding 5 (drop the KL to a weak clone) was **refuted by measurement** — see below.              |
-| [2026-08-07-fable-rl-grounding.md](2026-08-07-fable-rl-grounding.md)       | Which published solution is closest to our problem _and_ reproducible. Ranks Lux S1/S2/S3, Halite, Kore candidates against game shape, single-box compute, and whether a public artifact exists. Picks Toad Brigade and specifies its recipe. | Its recipe values are incomplete — four load-bearing values live outside the phase YAMLs. See below. |
-| [2026-08-08-market-execution-rl.md](2026-08-08-market-execution-rl.md)     | Selling into a market you move yourself: optimal execution and market impact RL, multi-agent settings where actions form prices, and reward designs for selling _well_ rather than merely selling.                                            | (in progress)                                                                                        |
-| [2026-08-08-what-wins-elo.md](2026-08-08-what-wins-elo.md)                 | Whether banked coins move the ladder (they no longer do), what separates the winner of an episode from its loser, and how much of the margin is price impact on the opponent. Measured off the nine daily archives, not off the literature.   | Anything about how to train it. It says what to optimise, not how.                                   |
+| document                                                                     | answers                                                                                                                                                                                                                                       | do not use it for                                                                                    |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| [2026-08-07-self-play-rl-findings.md](2026-08-07-self-play-rl-findings.md)   | Why our self-play loop learned nothing: advantage cancellation with a difference reward, policy-invariance of shaping, what single-box Lux winners actually did, whether a league is needed, whether throughput is the constraint.            | Its Finding 5 (drop the KL to a weak clone) was **refuted by measurement** — see below.              |
+| [2026-08-07-fable-rl-grounding.md](2026-08-07-fable-rl-grounding.md)         | Which published solution is closest to our problem _and_ reproducible. Ranks Lux S1/S2/S3, Halite, Kore candidates against game shape, single-box compute, and whether a public artifact exists. Picks Toad Brigade and specifies its recipe. | Its recipe values are incomplete — four load-bearing values live outside the phase YAMLs. See below. |
+| [2026-08-08-market-execution-rl.md](2026-08-08-market-execution-rl.md)       | Selling into a market you move yourself: optimal execution and market impact RL, multi-agent settings where actions form prices, and reward designs for selling _well_ rather than merely selling.                                            | (in progress)                                                                                        |
+| [2026-08-08-what-wins-elo.md](2026-08-08-what-wins-elo.md)                   | Whether banked coins move the ladder (they no longer do), what separates the winner of an episode from its loser, and how much of the margin is price impact on the opponent. Measured off the nine daily archives, not off the literature.   | Anything about how to train it. It says what to optimise, not how. Its bank figures are pre-1.32.6.  |
+| [2026-08-08-engine-1326-rebaseline.md](2026-08-08-engine-1326-rebaseline.md) | What kaggle-environments 1.32.6 changed, the head-to-head reference table re-measured on it (five scripted agents, 512 games per pair, plus the shaped-PPO checkpoint), and an explicit list of every project number the upgrade voided.      | Deciding what to submit. It recommends and stops; submission is a human decision.                    |
 
 ## Corrections these documents do not contain
 
@@ -36,6 +37,13 @@ Recorded here because the documents are snapshots and the measurements came
 later. The full experimental ledger is at
 `.superpowers/sdd/2026-08-07-self-play-rl/progress.md` (git-ignored scratch).
 
+- **The engine changed under all of them.** The ladder moved to
+  `kaggle-environments` 1.32.6 on 2026-08-07 and this project re-pinned on
+  2026-08-08. Late-season town-centre demand fell about eightfold and every
+  bank figure filed here roughly halved. The agent _ranking_ did not change.
+  [2026-08-08-engine-1326-rebaseline.md](2026-08-08-engine-1326-rebaseline.md)
+  section 4 lists which numbers in the documents above are now void; read it
+  before quoting a bank from any of them.
 - **The teacher KL is load-bearing, not a pin.** The self-play findings doc
   argues the KL toward a zero-banking clone is a cost. We ran the no-KL arm:
   removing it gradually _and_ abruptly both collapse the policy. The doc's own
@@ -63,7 +71,17 @@ later. The full experimental ledger is at
   and shows why any single number for it is misleading: the median seat banked
   129,152 on 2026-08-04 and 109,032 on 2026-08-07.
 - **The bank is no longer the objective.** Rating against final bank reads
-  −0.043 on the 2026-08-07 archive over 1,350 seats, and it has been ~0 since
-  2026-08-01, though it was +0.686 on 2026-07-30. See
+  −0.059 over the 536 seats of the 2026-08-07 archive that were played on
+  kaggle-environments 1.32.6, and every archive-and-build cell since 2026-08-01
+  falls between −0.064 and +0.175, though it was +0.686 on 2026-07-30. The
+  reason is that a seat's bank correlates **+0.98 with its opponent's**: the
+  shared book sets the level and the seat only contributes the 2.2% margin. See
   [2026-08-08-what-wins-elo.md](2026-08-08-what-wins-elo.md); every document
   written before it assumes banking is the goal.
+- **Cut corpus statistics by engine build, not only by date.** The nine archives
+  span kaggle-environments 1.32.2 to 1.32.6 and the builds are mixed _within_
+  an archive — 268 of the 675 episodes dated 2026-08-07 are 1.32.6, which banks
+  80,660 at the median against 1.32.5's 120,800 on the same day at the same
+  rating. Pooling across builds produced a confident, monotone and entirely
+  false "the best bankers are the weakest players" in the first draft of that
+  document. `module_version` sits in the first 8 KB of every episode.

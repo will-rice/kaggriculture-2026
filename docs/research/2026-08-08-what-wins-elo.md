@@ -11,6 +11,20 @@ output is `docs/research/2026-08-08-what-wins-elo.json` and the code is
 **The question.** The project has optimised banked coins since it started. This
 asks the thing nobody had asked: does banking coins move the ladder?
 
+> **The corpus is five economies, not one.** Every episode records the
+> `kaggle-environments` build it was played on, and the nine archives span
+> 1.32.2 to 1.32.6. One of those releases changed the market: 1.32.6 replaced
+> the town centre's escalating demand curve with a flat rate and doubled its
+> interval, cutting late-season demand roughly eightfold. At an unchanged rating
+> the median seat banks **120,800 on 1.32.5 and 80,660 on 1.32.6** — and 268 of
+> the 675 episodes in the 2026-08-07 archive are already on the new build. Every
+> bank figure below is therefore cut by `(archive, build)`. An earlier draft of
+> this document pooled them and reported a monotone negative relationship
+> between bank and rating; that relationship is an artefact of the pooling and
+> section 1 says so explicitly. See
+> [2026-08-08-engine-1326-rebaseline.md](2026-08-08-engine-1326-rebaseline.md)
+> for what the upgrade voids elsewhere.
+
 ---
 
 ## 1. The headline: the bank does not track the ladder any more
@@ -19,6 +33,33 @@ Ladder rating and final bank, correlated per archive. Per archive and not
 pooled, because the rating scale inflates roughly 250 points a day and a pooled
 correlation is mostly a correlation with the calendar — pooled over all nine it
 reads +0.606, which is that artefact and not a finding.
+
+Cut further by engine build, which is the version that should be quoted (cells
+under 200 seats omitted):
+
+| archive    | build  | seats |    Pearson |   Spearman | median rating | median bank |
+| ---------- | ------ | ----: | ---------: | ---------: | ------------: | ----------: |
+| 2026-07-30 | 1.32.2 | 1,728 | **+0.686** |     +0.704 |           688 |      28,860 |
+| 2026-07-31 | 1.32.2 | 1,856 |     +0.355 |     +0.403 |         1,181 |      95,418 |
+| 2026-08-01 | 1.32.2 | 1,658 |     +0.083 |     +0.088 |         1,353 |     115,880 |
+| 2026-08-02 | 1.32.2 | 1,586 |     −0.035 |     −0.030 |         2,326 |     122,699 |
+| 2026-08-03 | 1.32.2 |   562 |     +0.132 |     +0.132 |         2,710 |     128,979 |
+| 2026-08-03 | 1.32.3 | 1,012 |     +0.175 |     +0.091 |         2,752 |     130,705 |
+| 2026-08-04 | 1.32.3 |   998 |     −0.029 |     −0.035 |         2,765 |     129,559 |
+| 2026-08-04 | 1.32.4 |   512 |     −0.064 |     −0.092 |         2,780 |     127,480 |
+| 2026-08-05 | 1.32.4 | 1,484 |     +0.025 |     +0.016 |         2,844 |     125,855 |
+| 2026-08-06 | 1.32.4 |   514 |     +0.020 |     +0.019 |         2,967 |     113,858 |
+| 2026-08-06 | 1.32.5 |   852 |     +0.029 |     +0.031 |         2,984 |     117,364 |
+| 2026-08-07 | 1.32.5 |   814 |     −0.016 |     −0.006 |         3,035 |     120,800 |
+| 2026-08-07 | 1.32.6 |   536 | **−0.059** | **−0.031** |         3,028 |  **80,660** |
+
+**Every cell since 2026-08-01 lies between −0.064 and +0.175.** On the economy
+we now play — 2026-08-07 on 1.32.6, 536 seats — it is **−0.059** (Spearman
+−0.031). This is a **null, not a negative**: banked coins carry essentially no
+information about a seat's ladder rating.
+
+The unstratified per-archive view, for comparison, and to show what the build
+cut does and does not change:
 
 | archive    | seats |    Pearson |   Spearman | median rating | median bank |
 | ---------- | ----: | ---------: | ---------: | ------------: | ----------: |
@@ -32,60 +73,74 @@ reads +0.606, which is that artefact and not a finding.
 | 2026-08-06 | 1,366 |     +0.042 |     +0.043 |         2,976 |     115,658 |
 | 2026-08-07 | 1,350 | **−0.043** | **−0.005** |         3,032 |     109,032 |
 
-**On the most recent archive the correlation is −0.043 (Spearman −0.005) over
-1,350 seats.** It has been indistinguishable from zero on every archive since
-2026-08-01. It was +0.686 on 2026-07-30, so the project was not wrong to chase
-the bank in July; it is wrong to chase it now.
+The null is the same either way, which is the good news — a null is hard to
+manufacture. What the build cut overturns is the _story_ an earlier draft told
+about why. **Two claims are withdrawn:**
 
-The same table read down the last two columns is the second half of the
-finding: **as the field's rating rose 263 points over the four most recent
-archives, its median bank fell 20,120 coins**, from 129,152 to 109,032. The
-field is getting stronger and banking less.
+- ~~"As the field's rating rose, its median bank fell: the field is getting
+  stronger and banking less."~~ The 20,120-coin decline from 2026-08-04 to
+  2026-08-07 is the engine, not the field. Held to one build the median bank
+  _rose_ over that window, 117,364 to 120,800, both 1.32.5.
+- ~~"The best-banking seats in the corpus are the weakest seats in it."~~ Pooled
+  over the four recent archives, mean rating falls monotonically from 3,030 in
+  the under-60,000 bucket to 2,828 in the over-160,000 bucket. Inside a single
+  build it is flat:
 
-Pooling the four most recent archives (5,710 seats) and bucketing by bank makes
-the sign explicit:
+| final bank      | 1.32.4 (n=2,510) | 1.32.5 (n=1,666) | 1.32.6 (n=536) |
+| --------------- | ---------------: | ---------------: | -------------: |
+| under 60,000    |                — |                — |          3,045 |
+| 60,000–100,000  |            2,875 |            3,008 |          3,039 |
+| 100,000–120,000 |            2,874 |            3,009 |          3,035 |
+| 120,000–140,000 |            2,857 |            3,012 |          3,040 |
+| 140,000–160,000 |            2,843 |            3,014 |              — |
 
-| final bank      | seats | mean rating | share in that day's top decile |
-| --------------- | ----: | ----------: | -----------------------------: |
-| under 60,000    |   105 |   **3,030** |                       **0.39** |
-| 60,000–100,000  | 1,160 |       2,950 |                           0.14 |
-| 100,000–120,000 | 1,514 |       2,912 |                           0.09 |
-| 120,000–140,000 | 1,803 |       2,897 |                           0.09 |
-| 140,000–160,000 | 1,032 |       2,863 |                           0.06 |
-| 160,000 and up  |    96 |   **2,828** |                       **0.02** |
+Mean attributed rating, by bank bucket, by build. The 1.32.5 column moves 6
+points across the entire range of banks; the 1.32.6 column moves 10. The pooled
+decline was the low buckets filling with 1.32.6 episodes, which are all
+late-2026-08-07 and therefore high-rated. **Banking a lot does not make a seat
+weak. It says nothing about the seat at all.**
 
-The best-banking seats in the corpus are the _weakest_ seats in it. Our own
-submissions say the same thing from outside the corpus: `economic_policy` banks
-161,730, which is the **98.8th percentile** of those 5,710 seats, and scored
-**~1,014** on the public leaderboard on 2026-08-04 against a top of 3,207.5.
+Our own submission is that null seen from outside the corpus, and it is the one
+figure here that needs no stratifying: `economic_policy` banks 161,730 — the
+**98.8th percentile** of the 5,710 recent seats — and scored **~1,014** on the
+public leaderboard on 2026-08-04, against a top of 3,207.5.
 
-### Why the low-banking seats are strong
+### Why the bank says nothing: it is 98% a property of the episode
 
-Not because strong players bank badly on their own. Because two strong players
-share one price-forming book and take it down together. Of the 105 seats that
-banked under 60,000, **84% faced an opponent who also banked under 60,000**.
-The 96 seats that banked over 160,000 faced opponents who banked a median
-162,348. The bank is a property of the _pair_, not of the seat.
+The two seats share one price-forming book, and the book turns out to set almost
+the entire level. Correlating the two seats' final banks across the episodes of
+one build:
 
-The clearest single case in the 2026-08-07 archive is episode 90775503, the
-second-highest-rated episode of the day at avg 3,130.2: two seats rated 3,136.9
-and 3,123.5 banked 32,488 and 32,732. Their combined 65,220 is **30% of that
-day's median episode total** of 218,102, in a field whose 140,000-plus bankers
-average a rating of 2,863.
+| build  | episodes | corr(seat bank, opponent bank) | median seat bank |
+| ------ | -------: | -----------------------------: | ---------------: |
+| 1.32.3 |      499 |                         +0.792 |          129,559 |
+| 1.32.4 |    1,255 |                         +0.944 |          123,424 |
+| 1.32.5 |      833 |                     **+0.977** |          119,022 |
+| 1.32.6 |      268 |                     **+0.976** |           80,660 |
 
-Within a single archive, where the day's meta is held fixed, the effect is
-smaller but perfectly ordered. Each episode's two-seat total, divided by its
-own day's median, by the band of the episode:
+**A seat's bank is +0.98 predicted by its opponent's.** Whatever makes an
+episode a 120,000-coin episode or a 40,000-coin one — the build, the seed, which
+shops the town opened, how hard the pair collectively leant on the book — both
+seats get it in common. What is left for the seat itself is the margin on top,
+and section 2 shows that is 2.2% of the bank.
 
-| band   | episodes | total / that day's median |
-| ------ | -------: | ------------------------: |
-| top    |      282 |                 **0.977** |
-| upper  |      714 |                     0.989 |
-| middle |      849 |                     0.998 |
-| low    |      718 |                     1.002 |
+That is the mechanism behind every null in this document, and it is the single
+most actionable sentence in it: **a reward proportional to the bank is, to 98%,
+rewarding the draw.**
 
-The better the pair, the less money comes out of the season. Being good at this
-game destroys value.
+The pairing is visible at the tails too. Within 1.32.6, 18% of seats bank under
+60,000 — but **90% of those seats faced an opponent who also banked under
+60,000**, against the 18% independence would predict. Episode 90775503, the
+second-highest-rated episode of 2026-08-07 at avg 3,130.2, has two seats rated
+3,136.9 and 3,123.5 banking 32,488 and 32,732. It is a 1.32.6 episode, so its
+tiny total is mostly the new demand curve; an earlier draft cited it as proof
+that strong pairs destroy value, and it is not that.
+
+Within a single archive the episode total does still fall slightly across rating
+bands — 0.977 of the day's median for a top-decile episode against 1.002 for a
+low one, over 2,563 episodes — but two of those four archives straddle a build
+change, so read the 2.5% as an upper bound on any "strong pairs extract less"
+effect rather than as a measurement of one.
 
 ---
 
@@ -243,9 +298,9 @@ so **the denial edge is half the median margin** (median ratio **0.509**).
 
 Every seat denies a lot: the mean seat removes **29,141 coins, 22.7%** of what
 its opponent would otherwise have earned. This is not a rare tactic, it is the
-ambient condition of the market — and it is the mechanism behind section 1,
-because two seats each taking a fifth out of the other's prices is where the
-missing coins in a top-decile episode went.
+ambient condition of the market — and it is why section 1's two seats move
+together at +0.98. Each is taking about a fifth out of the other's prices, so
+whatever one of them does to the book arrives on the other's balance sheet.
 
 **How confident, and in what.** Confident in the mechanism and the sign;
 much less confident in the interpretation.
@@ -284,8 +339,10 @@ Mean bank per day, top band against middle band, over the profiled sample:
 
 The bands are identical until day 9 (top ahead by 10 coins on day 9), and the
 gap then widens monotonically to −4,163 by day 29 — the top band ending _below_
-the middle, which is section 1 restated over time. Nothing happens early, and
-the build-out is the same everywhere:
+the middle, which is section 1's null restated over time and not a claim that
+the top band banks less. The sample straddles two builds and the band means are
+one standard error apart. Nothing happens early, and the build-out is the same
+everywhere:
 
 | day                    |    5 |   10 |   15 |   29 |
 | ---------------------- | ---: | ---: | ---: | ---: |
@@ -322,6 +379,16 @@ same, and everything that separates seats happens in the trading of days
   the evidence that this matters more than anything else here: the same
   measurement returns +0.686 and −0.043 eight days apart. Every deep result is
   from 2026-08-04 to 2026-08-07 only. It may not hold next week.
+- **And the engine moves underneath the meta.** The deep sample was drawn before
+  the build cut existed, so it is 1.32.3 to 1.32.6 pooled, with roughly 40% of
+  its 2026-08-07 episodes on the new economy. Sections 4 to 6 are paired within
+  an episode, and a build is a property of the episode, so it cannot create a
+  winner/loser difference — but it does mean those numbers average two market
+  regimes. The one figure it corrupts outright is `coverage` for the 1.32.6
+  episodes, whose town drain `bands.drain` deliberately models as 1.32.3;
+  `denied` is unaffected, because `impact` reads the recorded inventory and
+  never the drain. Redrawing the deep sample within one build is the obvious
+  next measurement and was not done here.
 - **The sale inference misses about a third of real trade.** `sale_metrics`
   reads a completed sale off the bank rising while shed stock falls, so a turn
   that sells and spends more than it sold for is invisible. Measured against the
@@ -373,11 +440,11 @@ thing being ordered.
 
 ## 8. What to do about it
 
-1. **Stop optimising banked coins.** It has not correlated with rating since
-   2026-08-01 and the relationship across bank buckets is now negative. The
-   current 161,730-coin `economic_policy` is a 98.8th-percentile banker and a
-   1,014-rated agent, and those two facts are not in tension — they are the
-   finding.
+1. **Stop optimising banked coins.** Bank and rating have been uncorrelated in
+   every archive-and-build cell since 2026-08-01, and −0.059 over the 536 seats
+   of the economy we now play. The current 161,730-coin `economic_policy` is a
+   98.8th-percentile banker and a 1,014-rated agent, and those two facts are not
+   in tension — they are the finding.
 2. **Optimise realised price, per unit.** The winner and loser of an episode
    sell the same number of units; the winner gets 3.3% more for each. That is
    the entire margin. `sales.sale_metrics` already computes realisation and
