@@ -285,6 +285,10 @@ def main() -> None:
                 ).mean()
             ),
             "lr": schedule.get_last_lr()[0],
+            # True while the value head is training alone, so the warmup
+            # window is readable off the data rather than inferred from a
+            # batch count.
+            "warming": warming,
             "warmup_left": warmup_left,
             **terms,
         }
