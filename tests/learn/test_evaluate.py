@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from kaggriculture.learn.sales import sale_metrics
-from kaggriculture.learn.scripts.evaluate import Tally
+from kaggriculture.learn.sales import buy_units, sale_metrics
+from kaggriculture.learn.scripts.evaluate import BUY_UNITS_ALARM, Tally
 
 PRICES = {"WHEAT": 25, "MELON": 250}
 
@@ -51,6 +51,7 @@ def test_pairwise_tally_equals_scoring_the_whole_series() -> None:
     assert record["mean_sale_price"] == pytest.approx(whole["mean_sale_price"])
     assert record["mean_market_price"] == pytest.approx(whole["mean_market_price"])
     assert record["realisation"] == pytest.approx(whole["price_realisation"])
+    assert record["buy_units_per_episode"] == buy_units(SERIES, seat=0)
 
 
 def test_the_sale_count_is_per_episode() -> None:
@@ -74,4 +75,17 @@ def test_a_policy_that_never_sells_reads_zero_rather_than_dividing_by_zero() -> 
         "mean_sale_price": 0.0,
         "mean_market_price": 0.0,
         "realisation": 0.0,
+        "buy_units_per_episode": 0.0,
     }
+
+
+def test_the_buy_count_is_per_episode_and_below_the_alarm_here() -> None:
+    """The tripwire reads a rate, so the same season twice is not twice the rate."""
+    tally = Tally()
+    for _ in range(2):
+        for before, after in zip(SERIES[:-1], SERIES[1:], strict=True):
+            tally.add(before, after)
+
+    bought = tally.record(episodes=2)["buy_units_per_episode"]
+    assert bought == buy_units(SERIES, seat=0)
+    assert bought < BUY_UNITS_ALARM

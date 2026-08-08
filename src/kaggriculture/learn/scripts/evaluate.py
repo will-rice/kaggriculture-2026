@@ -31,6 +31,12 @@ through ``rollout_many``: a ``Trajectory`` keeps the encoded tensors and throws
 the observations away, and the shed and the market book live only in the
 observation. Two states per environment are held at a time, never the season.
 
+**Buying is watched from the same pairs.** ``sales.buy_units`` counts what
+purchases credited to the shed, because the shaped reward's ``fuel`` term pays a
+flat rate per unit and charges nothing for the coins, so an arm can raise its
+return by shopping. That is a tripwire rather than a diagnostic: see
+``BUY_UNITS_ALARM``.
+
 The deliverable is the eval curve over training time. If self-play bank climbs
 while eval bank does not, the run is inflating against itself and the opponent
 pool moves up the queue.
@@ -74,7 +80,7 @@ from kaggriculture.learn.rollout import (
 from kaggriculture.learn.rollout import (
     OPPONENT as OPPONENT_SEAT,
 )
-from kaggriculture.learn.sales import sale_metrics
+from kaggriculture.learn.sales import buy_units, sale_metrics
 from kaggriculture.learn.scripts.gate import SEED_BASE
 
 LOGGER = logging.getLogger(__name__)
@@ -101,6 +107,25 @@ CORPUS_CACHE = RUNS / "corpus_banks.npy"
 # land near it or one of the two numbers is wrong and neither should be trusted.
 CORPUS_MEDIAN = 125_773.0
 POLL_SECONDS = 60
+# Buying is free shaped reward and the gradient knows it. `toad_reward`'s `fuel`
+# term pays a flat rate per unit of shed stock -- a fertilizer unit pays what a
+# melon unit pays -- and in the baseline arm (`money_weight = 0.0`) the coins
+# that bought the stock are never charged, so an arm can raise its shaped return
+# by shopping. `_commit_unit` credits the shed on BUY_PRODUCT and BUY_ANIMAL
+# without a capacity check, so purchased stock is not even held to the 100-unit
+# cap.
+#
+# The ceiling: a unit is worth `FUEL_WEIGHT / NORMALISER` = 0.005 / 500 = 1e-5
+# of shaped return, and 64 units a turn over 719 turns is 46,016 units, so
+# 46,016 * 1e-5 = 0.460 -- against a shaped total of about 0.130, roughly 3.5x
+# the entire signal. Today the term is ~1.5% of the signal, which is why the
+# arms are running rather than restarted, but the gradient points uphill toward
+# that ceiling the whole way.
+#
+# 1,300 units an episode is the line between the noise and an arm that has found
+# it: under 3% of that ceiling, and far above what ordinary farming buys.
+# Sustained above it, the arm is shopping rather than playing.
+BUY_UNITS_ALARM = 1_300.0
 # ``--once`` measures a checkpoint that has no training curve of its own, and a
 # lone point at x=0 does not read as the line the arms are being compared
 # against. The single measurement is published at both ends of the arms' axis so
@@ -202,7 +227,8 @@ def watch(prefixes: Sequence[str], banks: np.ndarray) -> None:
         publish(runs[prefix], record)
         LOGGER.info(
             "%s update %d: ours %.0f vs economic_policy %.0f, "
-            "win rate %.2f, percentile %.1f, %.1f sales/episode at %.2f realisation",
+            "win rate %.2f, percentile %.1f, %.1f sales/episode at %.2f "
+            "realisation, %.0f buy-units/episode",
             prefix,
             record["update"],
             record["eval_bank_mean"],
@@ -211,7 +237,17 @@ def watch(prefixes: Sequence[str], banks: np.ndarray) -> None:
             record["eval_percentile"],
             record["sales_per_episode"],
             record["realisation"],
+            record["buy_units_per_episode"],
         )
+        if record["buy_units_per_episode"] > BUY_UNITS_ALARM:
+            LOGGER.warning(
+                "%s update %d buys %.0f units an episode, over the %.0f alarm: "
+                "this arm may be farming the fuel term rather than playing",
+                prefix,
+                record["update"],
+                record["buy_units_per_episode"],
+                BUY_UNITS_ALARM,
+            )
 
 
 def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, Any]:
@@ -234,7 +270,7 @@ def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, An
         publish(run, {**record, "update": step})
     LOGGER.info(
         "%s: ours %.0f vs economic_policy %.0f, win rate %.2f, percentile %.1f, "
-        "%.1f sales/episode at %.2f realisation",
+        "%.1f sales/episode at %.2f realisation, %.0f buy-units/episode",
         name,
         record["eval_bank_mean"],
         record["opponent_bank_mean"],
@@ -242,6 +278,7 @@ def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, An
         record["eval_percentile"],
         record["sales_per_episode"],
         record["realisation"],
+        record["buy_units_per_episode"],
     )
     run.finish()
     return record
@@ -353,12 +390,12 @@ def evaluate(
 
 @dataclass
 class Tally:
-    """Completed sales accumulated a turn at a time, over any number of episodes.
+    """What the turn pairs said, accumulated over any number of episodes.
 
-    ``sale_metrics`` scores a sequence of observations, and this adds one
-    consecutive pair to a running total so the caller never has to hold a whole
-    season. The totals are exact rather than an average of averages: a pair's
-    proceeds are ``mean_sale_price * units`` and its market reference is
+    ``sale_metrics`` and ``buy_units`` both score a sequence of observations, and
+    this adds one consecutive pair to a running total so the caller never has to
+    hold a whole season. The totals are exact rather than an average of averages:
+    a pair's proceeds are ``mean_sale_price * units`` and its market reference is
     ``mean_market_price * units``, both of which are the sums the function
     divided by, so accumulating them and dividing once at the end gives the same
     number as scoring the whole series in one call.
@@ -369,12 +406,14 @@ class Tally:
         proceeds: Coins the clears banked.
         market: The volume-weighted market value of what was sold, priced at the
             book standing before each clear.
+        bought: Units credited to the shed by purchases.
     """
 
     sales: float = 0.0
     units: float = 0.0
     proceeds: float = 0.0
     market: float = 0.0
+    bought: float = 0.0
 
     def add(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
         """Add one consecutive pair of the learner's observations.
@@ -383,24 +422,27 @@ class Tally:
             before: The state before the turn.
             after: The state after it.
         """
-        metrics = sale_metrics((before, after), LEARNER)
+        pair = (before, after)
+        metrics = sale_metrics(pair, LEARNER)
         self.sales += metrics["sales"]
         self.units += metrics["units"]
         self.proceeds += metrics["mean_sale_price"] * metrics["units"]
         self.market += metrics["mean_market_price"] * metrics["units"]
+        self.bought += buy_units(pair, LEARNER)
 
     def record(self, episodes: int) -> dict[str, float]:
         """Return the eval-record fields for these totals.
 
         Args:
-            episodes: How many episodes were tallied, so the sale count reads
-                per episode rather than per group and stays comparable when
-                ``GAMES`` changes.
+            episodes: How many episodes were tallied, so the counts read per
+                episode rather than per group and stay comparable when ``GAMES``
+                changes.
 
         Returns:
-            ``sales_per_episode``, ``mean_sale_price``, ``mean_market_price``
-            and ``realisation`` -- realised over market, where 1.0 is par and
-            below 1.0 is selling into a depressed book.
+            ``sales_per_episode``, ``mean_sale_price``, ``mean_market_price``,
+            ``realisation`` -- realised over market, where 1.0 is par and below
+            1.0 is selling into a depressed book -- and
+            ``buy_units_per_episode``.
         """
         sale = self.proceeds / self.units if self.units else 0.0
         market = self.market / self.units if self.units else 0.0
@@ -409,6 +451,7 @@ class Tally:
             "mean_sale_price": sale,
             "mean_market_price": market,
             "realisation": (sale / market) if market else 0.0,
+            "buy_units_per_episode": self.bought / episodes,
         }
 
 

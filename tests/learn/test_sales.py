@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from kaggriculture.learn.sales import sale_metrics
+from kaggriculture.learn.sales import buy_units, sale_metrics
 
 PRICES = {"WHEAT": 25, "MELON": 250}
 
@@ -129,3 +129,55 @@ def test_an_animal_leaving_the_shed_is_a_placement_and_not_a_sale() -> None:
     assert metrics["units"] == 10.0
     assert metrics["mean_sale_price"] == pytest.approx(25.0)
     assert metrics["price_realisation"] == pytest.approx(1.0)
+
+
+def test_a_purchase_counts_its_units() -> None:
+    """Stock rises and the bank falls: ten units were bought."""
+    series = [
+        _state(1000.0, {"WHEAT": 0, "MELON": 0}),
+        _state(750.0, {"WHEAT": 10, "MELON": 0}),
+    ]
+    assert buy_units(series, seat=0) == 10.0
+
+
+def test_a_harvest_is_not_a_purchase() -> None:
+    """Stock rises and the bank does not fall: the field paid for it, not us.
+
+    The whole point of the bank gate. Without it this counter climbs through
+    ordinary farming and the tripwire it feeds fires on a policy doing exactly
+    what it should, which would tell us nothing.
+    """
+    series = [
+        _state(1000.0, {"WHEAT": 0, "MELON": 0}),
+        _state(1000.0, {"WHEAT": 40, "MELON": 0}),
+    ]
+    assert buy_units(series, seat=0) == 0.0
+
+
+def test_buying_an_animal_counts_even_though_the_market_will_not_price_it() -> None:
+    """BUY_ANIMAL is one of the two verbs under watch, and this is a unit count."""
+    series = [
+        _state(1000.0, {"WHEAT": 0, "MELON": 0, "COW": 0}),
+        _state(400.0, {"WHEAT": 0, "MELON": 0, "COW": 2}),
+    ]
+    assert buy_units(series, seat=0) == 2.0
+
+
+def test_a_sale_is_not_a_purchase() -> None:
+    """Stock falls and the bank rises: the mirror case must read zero."""
+    series = [
+        _state(1000.0, {"WHEAT": 10, "MELON": 0}),
+        _state(1250.0, {"WHEAT": 0, "MELON": 0}),
+    ]
+    assert buy_units(series, seat=0) == 0.0
+
+
+def test_purchases_accumulate_across_turns() -> None:
+    """Three separate buys are the sum of their units, not the largest."""
+    series = [
+        _state(1000.0, {"WHEAT": 0, "MELON": 0}),
+        _state(900.0, {"WHEAT": 4, "MELON": 0}),
+        _state(800.0, {"WHEAT": 4, "MELON": 1}),
+        _state(700.0, {"WHEAT": 9, "MELON": 1}),
+    ]
+    assert buy_units(series, seat=0) == 10.0

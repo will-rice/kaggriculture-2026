@@ -11,6 +11,13 @@ drops orders it cannot fill, and this project has already been bitten by
 conflating the two; a counter reading emitted orders would report sales as
 frequent when they are rare, and send the reward design in exactly the wrong
 direction.
+
+``buy_units`` is the mirror image and is here rather than beside it because it
+is read from the same consecutive pair, on the same completion discipline. It
+answers a different question: ``toad_reward.Counts.fuel`` pays a flat rate per
+unit of shed stock and charges nothing for the coins that bought it, so cheap
+goods are free shaped reward, and this is the counter that says whether an arm
+has found that out.
 """
 
 from collections.abc import Mapping, Sequence
@@ -91,3 +98,51 @@ def sale_metrics(
         "mean_market_price": mean_market,
         "price_realisation": (mean_sale / mean_market) if mean_market else 0.0,
     }
+
+
+def buy_units(observations: Sequence[Mapping[str, Any]], seat: int) -> float:
+    """Return how many units purchases credited to the shed, over one episode.
+
+    The mirror image of the sale inference, and for the same reason: the engine
+    drops orders it cannot fill, so a purchase is read from what happened to the
+    observation -- shed stock rising while the bank falls -- rather than from
+    what the policy emitted.
+
+    The bank falling is what separates a purchase from a harvest. ``HARVEST``
+    credits the shed out of the field and costs nothing, so a turn whose bank did
+    not fall contributes nothing here no matter how much stock appeared. Without
+    that gate the counter would climb through ordinary farming and the tripwire
+    it feeds would fire on a policy doing exactly what it should.
+
+    Animals count. ``BUY_ANIMAL`` is one of the two verbs under watch, and unlike
+    a sale a purchase needs no market price -- this is a unit count, which is
+    precisely what makes it comparable to the ``fuel`` term it exists to watch.
+
+    Attribution is per turn, as it is for sales: a turn that both harvests and
+    buys credits every new unit to the purchase, because the observation cannot
+    separate them. That inflates the count on mixed turns and the threshold it
+    is compared against is three orders of magnitude above the noise, which is
+    the trade this is making deliberately.
+
+    Args:
+        observations: One seat's observation at each state, in order. The shed
+            lives in the unindexed ``private`` mapping, so these must be that
+            seat's own observations.
+        seat: Which seat to score.
+
+    Returns:
+        Units credited to the shed on turns the bank fell.
+    """
+    bought = 0
+    for before, after in zip(observations[:-1], observations[1:], strict=True):
+        spent = float(before["farms"][seat]["money"]) - float(
+            after["farms"][seat]["money"]
+        )
+        if spent <= 0.0:
+            continue
+        shed_before = before["private"]["shed"]
+        bought += sum(
+            max(count - shed_before.get(good, 0), 0)
+            for good, count in after["private"]["shed"].items()
+        )
+    return float(bought)
