@@ -26,6 +26,9 @@ def sale_metrics(
     produces: a good's shed stock falls while the bank rises on the same turn.
     An order the engine dropped moves neither, so it cannot be counted.
 
+    Only goods the market prices are candidates. The shed also holds animals
+    waiting to be placed, and an animal is not something the market buys.
+
     Proceeds are attributed per turn rather than per good, because the bank is a
     single number and several goods can clear together. The realised price is
     therefore the turn's coins gained divided by the turn's units sold, and the
@@ -56,21 +59,30 @@ def sale_metrics(
             continue
         shed_before = before["private"]["shed"]
         shed_after = after["private"]["shed"]
+        prices = before["market"]["prices"]
+        # The market book is what defines a sellable good, so it is what the
+        # scan iterates. The shed is wider than the book -- BUY_ANIMAL parks a
+        # COW there until it is placed -- and an animal leaving the shed on a
+        # turn the bank happens to rise is a placement, not a sale. Reading the
+        # shed instead and pricing whatever fell out of it asks the book for a
+        # COW, which is a KeyError, not a wrong number: it took down two of the
+        # four evaluated arms the first time this ran against real episodes.
         sold = {
             good: shed_before[good] - shed_after.get(good, 0)
-            for good in shed_before
+            for good in prices
             if shed_before[good] > shed_after.get(good, 0)
         }
         if not sold:
             continue
-        prices = before["market"]["prices"]
         sales += len(sold)
         units += sum(sold.values())
         proceeds += gained
         for good, count in sold.items():
             weighted_market.extend([float(prices[good])] * count)
 
-    mean_market = sum(weighted_market) / len(weighted_market) if weighted_market else 0.0
+    mean_market = (
+        sum(weighted_market) / len(weighted_market) if weighted_market else 0.0
+    )
     mean_sale = proceeds / units if units else 0.0
     return {
         "sales": float(sales),

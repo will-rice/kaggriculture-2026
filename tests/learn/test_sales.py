@@ -110,3 +110,22 @@ def test_sales_are_counted_across_turns() -> None:
     assert metrics["sales"] == 2.0
     assert metrics["units"] == 10.0
     assert metrics["mean_sale_price"] == pytest.approx(25.0)
+
+
+def test_an_animal_leaving_the_shed_is_a_placement_and_not_a_sale() -> None:
+    """The shed is wider than the market book, and the book is the sale test.
+
+    BUY_ANIMAL parks a COW in the shed until it is placed, and the market does
+    not price livestock. Scanning the shed and pricing whatever fell out of it
+    asks the book for a COW -- a KeyError, not a wrong number -- which is
+    exactly how this failed against real episodes.
+    """
+    series = [
+        _state(1000.0, {"WHEAT": 10, "MELON": 0, "COW": 1}),
+        _state(1250.0, {"WHEAT": 0, "MELON": 0, "COW": 0}),
+    ]
+    metrics = sale_metrics(series, seat=0)
+    assert metrics["sales"] == 1.0
+    assert metrics["units"] == 10.0
+    assert metrics["mean_sale_price"] == pytest.approx(25.0)
+    assert metrics["price_realisation"] == pytest.approx(1.0)
