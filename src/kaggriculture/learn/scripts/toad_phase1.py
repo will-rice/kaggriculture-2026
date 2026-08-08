@@ -101,6 +101,7 @@ WORKERS = 12
 THREADS = 1
 # How many updates the actor's weights lag the learner's. See D7 above.
 SYNC_EVERY = 4
+OPPONENT = "src/kaggriculture/economic_policy.py"
 RUNS = Path("/data/kaggriculture/toad")
 # Every 25 updates is ~13 minutes of work at the measured 3.97M steps/hour.
 # Attempt one had none, and an external kill at update 253 cost 2.3 hours.
@@ -139,6 +140,14 @@ def main() -> None:
         help="hold the policy near the clone with monobeast's teacher KL at "
         "their phase-2 cost (arm C''). Toad never continues from a competent "
         "policy without one.",
+    )
+    parser.add_argument(
+        "--econ-fraction",
+        type=float,
+        default=0.0,
+        help="fraction of each round's environments played against "
+        "economic_policy instead of the mirror. Only our seat trains from "
+        "those: the scripted agent is market pressure, not a tape to clone.",
     )
     parser.add_argument(
         "--teacher-kl-cost",
@@ -268,7 +277,10 @@ def main() -> None:
     while steps < TOTAL_STEPS:
         seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
-        batch = _collect(pool, weights, seeds, arguments.channels)
+        mirror_batch, econ_batch = _collect(
+            pool, weights, seeds, arguments.channels, arguments.econ_fraction
+        )
+        batch = mirror_batch + econ_batch
         steps += sum(int(t.shaped.shape[0]) for t in batch)
         terms, consumed = _update(
             learner,
@@ -294,12 +306,21 @@ def main() -> None:
             _checkpoint(learner, optimizer, schedule, steps, update, prefix)
 
         banks = [t.final_bank for t in batch]
+        # Kept apart on purpose. The mirror number is a private equilibrium --
+        # C'' self-played at ~50 while banking 8 against economic_policy -- so
+        # averaging the two populations together would rebuild exactly the
+        # illusion the external evaluator just exposed.
+        mirror_banks = [t.final_bank for t in mirror_batch] or [float("nan")]
+        econ_banks = [t.final_bank for t in econ_batch] or [float("nan")]
         record = {
             "update": update,
             "steps": steps,
             "hours": round((time.monotonic() - started) / 3600.0, 4),
             "bank_mean": sum(banks) / len(banks),
             "bank_max": max(banks),
+            "bank_mirror": sum(mirror_banks) / len(mirror_banks),
+            "bank_vs_econ": sum(econ_banks) / len(econ_banks),
+            "n_econ_envs": len(econ_batch),
             "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
             "illegal": sum(t.illegal for t in batch),
             # The money component's own realised contribution, separable
@@ -482,7 +503,8 @@ def _collect(
     state: dict[str, torch.Tensor],
     seeds: Sequence[int],
     channels: int = CHANNELS,
-) -> list[Trajectory]:
+    econ_fraction: float = 0.0,
+) -> tuple[list[Trajectory], list[Trajectory]]:
     """Play ``seeds`` across worker processes and return every trajectory.
 
     Both seats of each episode are recorded, because the actor plays itself and
@@ -497,15 +519,23 @@ def _collect(
     Returns:
         Every recorded trajectory, two per seed.
     """
-    chunks = [list(seeds[index::WORKERS]) for index in range(WORKERS)]
-    batches = pool.map(
-        _play, [(state, chunk, channels) for chunk in chunks if chunk]
-    )
-    return [trajectory for batch in batches for trajectory in batch]
+    split = int(len(seeds) * econ_fraction)
+    econ_seeds, mirror_seeds = list(seeds[:split]), list(seeds[split:])
+    work = []
+    for group, versus in ((mirror_seeds, None), (econ_seeds, OPPONENT)):
+        share = max(1, WORKERS // 2) if econ_seeds else WORKERS
+        chunks = [group[index::share] for index in range(share)]
+        work.extend((state, chunk, channels, versus) for chunk in chunks if chunk)
+    played = list(pool.map(_play, work))
+    mirror: list[Trajectory] = []
+    econ: list[Trajectory] = []
+    for (_, _, _, versus), batch in zip(work, played, strict=True):
+        (econ if versus else mirror).extend(batch)
+    return mirror, econ
 
 
 def _play(
-    work: tuple[dict[str, torch.Tensor], list[int], int],
+    work: tuple[dict[str, torch.Tensor], list[int], int, str | None],
 ) -> list[Trajectory]:
     """Play one worker's share of a round. Runs in a subprocess.
 
@@ -516,12 +546,15 @@ def _play(
     past 230 and the round did not finish.
     """
     torch.set_num_threads(THREADS)
-    state, seeds, channels = work
+    state, seeds, channels, versus = work
     actor = Policy(blocks=BLOCKS, channels=channels, value_bound=VALUE_BOUND)
     actor.load_state_dict(state)
     actor.eval()
     with torch.no_grad():
-        return rollout_many(actor, actor, seeds)
+        # A mirror records both seats; against a named agent `rollout_many`
+        # records seat 0 alone, which is exactly what we want -- we never train
+        # on the scripted agent's actions.
+        return rollout_many(actor, versus if versus else actor, seeds)
 
 
 def _batches_per_update() -> int:
