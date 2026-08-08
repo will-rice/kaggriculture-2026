@@ -386,6 +386,18 @@ regardless of worker count; parallelism buys episodes per round, not shorter rou
 reachable in the time available here, so the numbers below are a **partial run** and are labelled
 provisional throughout.
 
+## 3c-bis. Attempt one ended by external kill, not by instability
+
+`phase1_1786139116.jsonl` holds 253 updates and stops at 8,731,536 steps (43.7% of 2e7). **It was killed
+externally, mid-rollout, at 00:04:34.** Not a crash and not a completion: kernel logs were clean, 212 GB was
+free, and the log captures stderr but holds no traceback — it simply stops. **Nobody should read that
+truncation as the run going unstable.** Loss was healthy throughout; bank was 0.0 except one max-4.0 blip at
+552k steps.
+
+The expensive part is that the runner never called `torch.save`, so 2.3 hours of training died with the
+process while the metrics survived. Toad's monobeast checkpoints continuously; our runner was the one
+non-vendored piece in the stack and it was the one that dropped the property. Fixed in attempt two.
+
 ## 3d. Reading the finished run
 
 Phase 1 is running detached (`nohup`, pid 2229773) and writes one JSON line per update to
