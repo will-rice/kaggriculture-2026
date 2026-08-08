@@ -47,7 +47,13 @@ from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
-from kaggriculture.learn.toad_reward import MONEY_WEIGHT, MONEY_WEIGHT_ENV, money_weight
+from kaggriculture.learn.toad_reward import (
+    MONEY_SIGNED_ENV,
+    MONEY_WEIGHT,
+    MONEY_WEIGHT_ENV,
+    money_signed,
+    money_weight,
+)
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -126,6 +132,12 @@ def main() -> None:
         "Toad's hidden_dim of 128 -- a declared deviation, not a tuning knob.",
     )
     parser.add_argument(
+        "--money-signed",
+        action="store_true",
+        help="keep both signs on the money delta (arm W'). Makes the component "
+        "potential-based, so the pump is unprofitable by construction.",
+    )
+    parser.add_argument(
         "--clone-init",
         action="store_true",
         help="warm-start trunk and both heads from the BC clone instead of "
@@ -150,6 +162,8 @@ def main() -> None:
     # The single constant the ablation turns on. Everything downstream -- file
     # names, wandb run name, which reward the learner reads -- follows from it,
     # so the two arms cannot drift apart in any other respect.
+    if arguments.money_signed:
+        os.environ[MONEY_SIGNED_ENV] = "1"
     if arguments.money_weight is not None:
         # Into the environment before the worker pool forks, so every rollout
         # process computes `shaped_money` at this arm's weight.
@@ -184,6 +198,7 @@ def main() -> None:
             "reward_field": field,
             "money_weight": money_weight() if arguments.phase1b else 0.0,
             "clone_init": arguments.clone_init,
+            "money_signed": arguments.money_signed,
             "environments": ENVIRONMENTS,
             "batch_segments": BATCH_SEGMENTS,
             "unroll_length": UNROLL_LENGTH,

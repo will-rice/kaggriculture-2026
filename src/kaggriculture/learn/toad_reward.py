@@ -81,6 +81,34 @@ MONEY_WEIGHT = 0.001
 # alone would leave every worker silently on the default and the arm would
 # measure nothing.
 MONEY_WEIGHT_ENV = "TOAD_MONEY_WEIGHT"
+MONEY_SIGNED_ENV = "TOAD_MONEY_SIGNED"
+
+
+def money_signed() -> bool:
+    """Whether the money component keeps both signs.
+
+    Arm W clamped the delta at zero, mirroring their ``fuel`` term, and at a
+    weight of 0.01 that produced a money pump: buying in order to sell back
+    earns shaped reward because the clamp forgives the purchase while the spread
+    quietly eats the coins. Measured over updates 1-34, ``money_term`` climbed
+    0.0064 -> 0.028 with ``gross_purchases`` tracking it 3320 -> 4414 and
+    ``bank_mean`` pinned at zero.
+
+    Unclamped, the per-turn deltas telescope to exactly the net coins banked
+    over the episode, so a round trip that loses to the spread earns
+    net-negative reward and the pump is unprofitable by construction. Genuine
+    investment -- seeds, hires, land -- goes negative on the turn it is paid and
+    recoups at the sale, a gap gamma=0.999 comfortably spans.
+
+    This also makes the component potential-based with Phi = money (Ng, Harada
+    and Russell 1999): a potential-based shaping term cannot change the optimal
+    policy's ranking of whole episodes, only guide exploration toward it. That is
+    a strictly stronger safety property than the clamped version had.
+
+    Returns:
+        True when the environment asks for the signed form.
+    """
+    return os.environ.get(MONEY_SIGNED_ENV, "") == "1"
 
 
 def money_weight() -> float:
@@ -261,7 +289,12 @@ def shaped(
             + FUEL_WEIGHT * max(after.fuel - before.fuel, 0)
             + STEP_WEIGHT
             # Ours. Zero unless phase-1b enables it; see MONEY_WEIGHT.
-            + money_weight * max(after.money - before.money, 0.0)
+            + money_weight
+            * (
+                (after.money - before.money)
+                if money_signed()
+                else max(after.money - before.money, 0.0)
+            )
         )
         rewards.append(total / NORMALISER)
     rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER
