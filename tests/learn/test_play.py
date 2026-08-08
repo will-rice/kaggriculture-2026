@@ -442,5 +442,17 @@ def test_every_op_a_full_episode_emits_is_one_the_engine_acts_on() -> None:
     assert turn == EPISODE_STEPS - 1
     assert discarded_ops == []
     assert isolated_failures == []
-    assert ops > 3000, f"only {ops} ops over {turn} turns, so the crew never grew"
+    # Non-vacuity, expressed as a floor rather than a recorded count. The farm
+    # starts with a farmer and no hands, so an agent that never hired emits
+    # exactly one op per turn and `ops == turn`; the degenerate all-PASS agent
+    # this guards against sits precisely there. Requiring double that is a crew
+    # that demonstrably grew.
+    #
+    # It used to read `> 3000`, which passed on kaggle-environments 1.32.3 and
+    # failed on 1.32.6 at 2,344 ops -- the clone hires a smaller crew now that
+    # the town's demand is an eighth of what it was. That is the economy
+    # changing, not the masking breaking, and re-recording the magic number on
+    # every engine bump would test nothing. The three assertions above are the
+    # ones with content and none of them moved.
+    assert ops > 2 * turn, f"only {ops} ops over {turn} turns, so the crew never grew"
     assert orders > 0, "an agent that never trades cannot bank a coin"

@@ -214,21 +214,61 @@ def test_trading_nothing_is_always_available() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_unit_on_a_locked_tile_may_only_move_or_pass() -> None:
-    """The engine returns on `tile == "LOCKED"` before every tile op.
+def test_a_unit_on_a_locked_tile_away_from_the_shed_may_only_move_or_pass() -> None:
+    """The engine returns on `tile == "LOCKED"` before every op that reads it.
 
-    A hand can spawn on a locked shed-access tile, so this is a state the game
-    reaches on its own rather than a contrived one.
+    Stood at ``[1, 1]``: an interior tile, so all four moves are in bounds and
+    the only thing being tested is the guard, and not one of the four
+    shed-access tiles, which the test below covers separately.
     """
     observation = empty_observation()
     observation["private"]["seeds"]["WHEAT"] = 9
     observation["private"]["inventories"][0] = {"WHEAT": 9, "FERTILIZER": 9}
+    observation["farms"][0]["farmer"] = [1, 1]
     _stand_on(observation, "LOCKED")
 
     mask = unit_mask(observation, 0)[0, 0]
     allowed = {UNIT_OPS[index] for index in mask.nonzero().flatten().tolist()}
 
     assert allowed == {"PASS", "NORTH", "SOUTH", "EAST", "WEST"}
+
+
+def test_a_locked_shed_access_tile_still_reaches_the_shed() -> None:
+    """kaggle-environments 1.32.6 resolves the shed transfers before the guard.
+
+    Three of the four shed-access tiles start ``"LOCKED"`` and a hand can spawn
+    on one, so guarding the tile first would make the shed unreachable from
+    them -- which is why the engine moved ``DROP``, ``PICKUP`` and ``PLACE``
+    above the guard. They use the tile only as a standing position; the shed
+    itself is always owned.
+
+    Everything that mutates the tile stays forbidden, which is what separates
+    this from simply dropping the guard. ``PLACE`` is the op that proves it:
+    its shed-drop branch is permitted here, while its animal branch cannot be,
+    because that branch needs a structure dict and a locked tile is the string
+    ``"LOCKED"``.
+    """
+    observation = empty_observation()
+    observation["private"]["seeds"]["WHEAT"] = 9
+    observation["private"]["inventories"][0] = {"WHEAT": 9, "FERTILIZER": 9}
+    observation["private"]["shed"]["WHEAT"] = 3
+    # The default spawn is shed-adjacent, so locking it is the real state.
+    _stand_on(observation, "LOCKED")
+
+    mask = unit_mask(observation, 0)[0, 0]
+    allowed = {UNIT_OPS[index] for index in mask.nonzero().flatten().tolist()}
+
+    assert allowed == {
+        "PASS",
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "DROP",
+        "PICKUP:WHEAT",
+        "PLACE:WHEAT",
+        "PLACE:FERTILIZER",
+    }
 
 
 def test_a_move_off_the_board_is_masked() -> None:

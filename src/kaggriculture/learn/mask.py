@@ -156,10 +156,20 @@ def _legal_ops(
     """Return the ops ``_apply_unit_action`` would act on for one unit.
 
     Follows the engine's own dispatch order: the moves and ``PASS`` are decided
-    before the tile is even read, the ``"LOCKED"`` check gates everything after,
-    and the three shed transfers -- ``DROP``, ``PICKUP`` and ``PLACE`` -- are
-    settled from the shed geometry rather than from the tile. What is left is a
-    question about the tile alone, which ``_tile_ops`` answers.
+    before the tile is even read, then the three shed transfers -- ``DROP``,
+    ``PICKUP`` and ``PLACE`` -- are settled from the shed geometry, and only
+    then does the ``"LOCKED"`` check gate everything that mutates the tile.
+    What is left is a question about the tile alone, which ``_tile_ops``
+    answers.
+
+    **The shed transfers come before the guard, not after.** They use the tile
+    only as a standing position -- the shed itself is always owned -- and three
+    of the four shed-access tiles start ``"LOCKED"``, so guarding them first
+    makes the shed unreachable from those tiles. kaggle-environments 1.32.6
+    moved them above the guard for exactly that reason; until this mask
+    followed, it forbade ``PICKUP`` on turns the engine accepted it, which does
+    not raise anywhere and simply deletes the move from what the policy can
+    learn.
 
     ``PLACE`` is the one op both halves have a say in, and the union of the two
     is exact rather than approximate. ``_apply_unit_action`` tries the animal
@@ -186,10 +196,6 @@ def _legal_ops(
         if 0 <= x + dx < BOARD_SIZE and 0 <= y + dy < BOARD_SIZE:
             legal.add(op)
 
-    tile = farm["tiles"][y][x]
-    if tile == "LOCKED":
-        return legal
-
     # `_farmer_inventory` indexes `[farmer, *hands]` exactly as the units are
     # indexed, because `_do_hire` appends an inventory as it appends a hand.
     inventory = private["inventories"][unit]
@@ -213,6 +219,14 @@ def _legal_ops(
             legal.update(
                 f"PLACE:{item}" for item in SHED_NAMES if inventory.get(item, 0) > 0
             )
+
+    # Positions are `[x, y]` and tiles are indexed `tiles[y][x]`. Everything
+    # from here down mutates the tile the unit stands on, so the engine's
+    # `LOCKED` guard covers all of it -- including `PLACE`'s animal branch,
+    # which needs a structure dict and can never match the string `"LOCKED"`.
+    tile = farm["tiles"][y][x]
+    if tile == "LOCKED":
+        return legal
     return legal | _tile_ops(tile, private, inventory, day)
 
 
@@ -396,6 +410,15 @@ def _fillable(
     costs at least as much as the last and a flat ``money // price`` bound buys
     one more than the market will sell.
 
+    **Both purchases that land in the shed are also bounded by the room left in
+    it.** kaggle-environments 1.32.6 gave ``_commit_unit`` a ``shed_capacity``
+    argument and made ``BUY_PRODUCT`` and ``BUY_ANIMAL`` refuse outright when
+    the shed is full; before that they overfilled it silently. ``BUY_SEED`` is
+    not bounded, because seeds go to ``private["seeds"]`` and never touch the
+    shed. Like ``money``, the room is a per-slot bound rather than a budget
+    shared across the turn's slots -- the mask has always priced one order at a
+    time.
+
     Args:
         verb: The order's verb, one of ``MARKET_SLOTS``' four.
         item: The order's item.
@@ -411,13 +434,15 @@ def _fillable(
         return private["shed"][item]
     if verb == "BUY_SEED":
         return int(money // int(CROPS[item]["seed"]))
+
+    room = SHED_CAPACITY - sum(private["shed"].values())
     if verb == "BUY_ANIMAL":
-        return int(money // int(ANIMALS[item]["cost"]))
+        return min(int(money // int(ANIMALS[item]["cost"])), room)
 
     inventory = market["inventory"][item]
     params = market.get("params")
     filled = 0
-    while filled < _MAX_QUANTITY:
+    while filled < min(_MAX_QUANTITY, room):
         price = market_price(item, inventory - 1 - filled, params)
         if money < price:
             break
