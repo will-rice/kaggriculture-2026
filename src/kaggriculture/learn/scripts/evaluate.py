@@ -37,6 +37,15 @@ flat rate per unit and charges nothing for the coins, so an arm can raise its
 return by shopping. That is a tripwire rather than a diagnostic: see
 ``BUY_UNITS_ALARM``.
 
+**The opponent is measured out of the same episodes.** ``economic_policy`` banks
+~158,000 to our ~3, so its trading profile is the target shape, and a bare bank
+number does not say whether the gap is selling less often, selling smaller, or
+buying less. Its ``private`` mapping is not shared, but it is stored on its own
+seat, so scoring seat 1 alongside seat 0 costs one extra copy per turn and
+yields the reference out of the *same* seeds, the same market and the same 719
+turns -- which a second run against a different opponent could not. Those fields
+ride every record under ``opponent_``.
+
 The deliverable is the eval curve over training time. If self-play bank climbs
 while eval bank does not, the run is inflating against itself and the opponent
 pool moves up the queue.
@@ -227,8 +236,9 @@ def watch(prefixes: Sequence[str], banks: np.ndarray) -> None:
         publish(runs[prefix], record)
         LOGGER.info(
             "%s update %d: ours %.0f vs economic_policy %.0f, "
-            "win rate %.2f, percentile %.1f, %.1f sales/episode at %.2f "
-            "realisation, %.0f buy-units/episode",
+            "win rate %.2f, percentile %.1f | ours %.1f sales/%.0f units at "
+            "%.2f realisation, %.0f bought | theirs %.1f sales/%.0f units at "
+            "%.2f realisation, %.0f bought",
             prefix,
             record["update"],
             record["eval_bank_mean"],
@@ -236,8 +246,13 @@ def watch(prefixes: Sequence[str], banks: np.ndarray) -> None:
             record["win_rate"],
             record["eval_percentile"],
             record["sales_per_episode"],
+            record["units_per_episode"],
             record["realisation"],
             record["buy_units_per_episode"],
+            record["opponent_sales_per_episode"],
+            record["opponent_units_per_episode"],
+            record["opponent_realisation"],
+            record["opponent_buy_units_per_episode"],
         )
         if record["buy_units_per_episode"] > BUY_UNITS_ALARM:
             LOGGER.warning(
@@ -270,13 +285,14 @@ def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, An
         publish(run, {**record, "update": step})
     LOGGER.info(
         "%s: ours %.0f vs economic_policy %.0f, win rate %.2f, percentile %.1f, "
-        "%.1f sales/episode at %.2f realisation, %.0f buy-units/episode",
+        "%.1f sales/%.0f units at %.2f realisation, %.0f buy-units/episode",
         name,
         record["eval_bank_mean"],
         record["opponent_bank_mean"],
         record["win_rate"],
         record["eval_percentile"],
         record["sales_per_episode"],
+        record["units_per_episode"],
         record["realisation"],
         record["buy_units_per_episode"],
     )
@@ -385,6 +401,14 @@ def evaluate(
         "games": len(played.ours),
         "seconds": round(time.monotonic() - started, 1),
         **played.tally.record(len(played.ours)),
+        # The reference line, out of the same episodes rather than a second run:
+        # same seeds, same market, same 719 turns, so a difference between the
+        # two profiles is the policy and not the conditions. `economic_policy`
+        # banks ~158,000 against our ~3, and until now nothing said what its
+        # trading looks like -- how often it sells, how big a clear is, how much
+        # it buys. Every arm's record now carries it, so the target shape is on
+        # the same axes at every update instead of as one flat line.
+        **played.opponent_tally.record(len(played.ours), prefix="opponent_"),
     }
 
 
@@ -401,6 +425,9 @@ class Tally:
     number as scoring the whole series in one call.
 
     Attributes:
+        seat: Which seat this is scoring. The shed is only legible in that
+            seat's own observation, so the pairs handed to ``add`` must be its
+            own and this must be the index it sits at.
         sales: Completed clears -- one per good that cleared on a turn.
         units: How many items those clears moved.
         proceeds: Coins the clears banked.
@@ -409,6 +436,7 @@ class Tally:
         bought: Units credited to the shed by purchases.
     """
 
+    seat: int = LEARNER
     sales: float = 0.0
     units: float = 0.0
     proceeds: float = 0.0
@@ -416,42 +444,46 @@ class Tally:
     bought: float = 0.0
 
     def add(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
-        """Add one consecutive pair of the learner's observations.
+        """Add one consecutive pair of this seat's own observations.
 
         Args:
             before: The state before the turn.
             after: The state after it.
         """
         pair = (before, after)
-        metrics = sale_metrics(pair, LEARNER)
+        metrics = sale_metrics(pair, self.seat)
         self.sales += metrics["sales"]
         self.units += metrics["units"]
         self.proceeds += metrics["mean_sale_price"] * metrics["units"]
         self.market += metrics["mean_market_price"] * metrics["units"]
-        self.bought += buy_units(pair, LEARNER)
+        self.bought += buy_units(pair, self.seat)
 
-    def record(self, episodes: int) -> dict[str, float]:
+    def record(self, episodes: int, prefix: str = "") -> dict[str, float]:
         """Return the eval-record fields for these totals.
 
         Args:
             episodes: How many episodes were tallied, so the counts read per
                 episode rather than per group and stay comparable when ``GAMES``
                 changes.
+            prefix: Prepended to every key, so the opponent's profile can ride
+                in the same flat record as ours without either shadowing the
+                other.
 
         Returns:
-            ``sales_per_episode``, ``mean_sale_price``, ``mean_market_price``,
-            ``realisation`` -- realised over market, where 1.0 is par and below
-            1.0 is selling into a depressed book -- and
-            ``buy_units_per_episode``.
+            ``sales_per_episode``, ``units_per_episode``, ``mean_sale_price``,
+            ``mean_market_price``, ``realisation`` -- realised over market,
+            where 1.0 is par and below 1.0 is selling into a depressed book --
+            and ``buy_units_per_episode``, each under ``prefix``.
         """
         sale = self.proceeds / self.units if self.units else 0.0
         market = self.market / self.units if self.units else 0.0
         return {
-            "sales_per_episode": self.sales / episodes,
-            "mean_sale_price": sale,
-            "mean_market_price": market,
-            "realisation": (sale / market) if market else 0.0,
-            "buy_units_per_episode": self.bought / episodes,
+            f"{prefix}sales_per_episode": self.sales / episodes,
+            f"{prefix}units_per_episode": self.units / episodes,
+            f"{prefix}mean_sale_price": sale,
+            f"{prefix}mean_market_price": market,
+            f"{prefix}realisation": (sale / market) if market else 0.0,
+            f"{prefix}buy_units_per_episode": self.bought / episodes,
         }
 
 
@@ -462,12 +494,15 @@ class Games:
     Attributes:
         ours: Each episode's terminal bank for the learner's seat.
         theirs: Each episode's terminal bank for the scripted opponent.
-        tally: Completed sales across the whole group.
+        tally: Our completed sales and purchases across the whole group.
+        opponent_tally: The same, for the scripted opponent, out of the same
+            episodes.
     """
 
     ours: list[float] = field(default_factory=list)
     theirs: list[float] = field(default_factory=list)
     tally: Tally = field(default_factory=Tally)
+    opponent_tally: Tally = field(default_factory=lambda: Tally(seat=OPPONENT_SEAT))
 
 
 def play(policy: Policy, seeds: Sequence[int]) -> Games:
@@ -499,7 +534,12 @@ def play(policy: Policy, seeds: Sequence[int]) -> Games:
     actors = [_opponent_actor(OPPONENT, environment) for environment in environments]
 
     games = Games()
-    previous = [snapshot(environment) for environment in environments]
+    tallies = {LEARNER: games.tally, OPPONENT_SEAT: games.opponent_tally}
+    previous = {
+        (index, seat): snapshot(environment, seat)
+        for index, environment in enumerate(environments)
+        for seat in tallies
+    }
     while not environments[0].done:
         turns = _decide(
             policy,
@@ -514,9 +554,10 @@ def play(policy: Policy, seeds: Sequence[int]) -> Games:
                 [turn.action, act(_agent_observation(environment, OPPONENT_SEAT))]
             )
         for index, environment in enumerate(environments):
-            seen = snapshot(environment)
-            games.tally.add(previous[index], seen)
-            previous[index] = seen
+            for seat, tally in tallies.items():
+                seen = snapshot(environment, seat)
+                tally.add(previous[index, seat], seen)
+                previous[index, seat] = seen
 
     for environment in environments:
         terminal = environment.state[LEARNER].observation["farms"]
@@ -530,8 +571,8 @@ def play(policy: Policy, seeds: Sequence[int]) -> Games:
     return games
 
 
-def snapshot(environment: Environment) -> dict[str, Any]:
-    """Return the learner's observation, copied out of the state that mutates.
+def snapshot(environment: Environment, seat: int) -> dict[str, Any]:
+    """Return one seat's own observation, copied out of the state that mutates.
 
     ``Environment.step`` appends ``self.state`` without copying and the
     interpreter mutates the farms and the shed in place, so a kept reference to
@@ -540,14 +581,21 @@ def snapshot(environment: Environment) -> dict[str, Any]:
     things ``sale_metrics`` reads are copied, so holding the previous state of
     sixteen environments costs a few hundred floats.
 
+    The shed is the reason this takes a seat at all. ``private`` is not a shared
+    property -- the engine gives each seat its own, and the specification agrees
+    -- so the opponent's shed is legible only from the opponent's own stored
+    observation. That is what makes the opponent measurable out of the very same
+    episodes rather than out of a second run against different conditions.
+
     Args:
         environment: The episode to read.
+        seat: Which seat's observation to copy.
 
     Returns:
-        A standalone mapping with the learner's ``farms`` money, its own shed,
-        and the market book.
+        A standalone mapping with both farms' money, this seat's own shed, and
+        the market book.
     """
-    observation = environment.state[LEARNER].observation
+    observation = environment.state[seat].observation
     return {
         "farms": [{"money": float(farm["money"])} for farm in observation["farms"]],
         "private": {"shed": dict(observation["private"]["shed"])},
