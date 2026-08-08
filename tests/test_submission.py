@@ -6,13 +6,18 @@ from pathlib import Path
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
-from kaggriculture.kaito_policy import agent
+from kaggriculture.boatlee_v14_policy import agent
 from kaggriculture.scripts.package import ENTRYPOINT, build
 from kaggriculture.task import MatchTask
 
 
 def test_entrypoint_exposes_the_agent_last() -> None:
-    """Kaggle takes the last callable in main.py, so it must be the served agent."""
+    """Kaggle takes the last callable in main.py, so it must be the served agent.
+
+    Imported by name rather than checked structurally, so switching which agent
+    `main.py` serves fails here until the switch is deliberate. It caught the
+    move from kaito v21.1 to boatlee v14 on 2026-08-08.
+    """
     loaded = get_last_callable(ENTRYPOINT.read_text(), path=str(ENTRYPOINT))
 
     assert loaded is agent

@@ -47,6 +47,21 @@ measured out of the built archive by ``kaggriculture.scripts.budget``. Nothing
 on this path imports torch.
 """
 
-from kaggriculture.kaito_policy import agent
+# Serves `boatlee_v14_policy`, measured 2026-08-08 on kaggle-environments
+# 1.32.6 -- the engine the ladder actually runs since the 08-07 rebalance.
+# Over 512 seeded games per ordered pair against every other agent we hold
+# (2,048 games each, both seat orders), the ranking is strict and total:
+#
+#   boatlee_v14   0.960 [0.951, 0.968]   bank 87,991
+#   kaito_v23     0.697 [0.677, 0.717]   bank 85,700
+#   kaito_v22     0.516 [0.494, 0.537]   bank 83,213
+#   kaito v21.1   0.209 [0.192, 0.228]   bank 79,033   <- what this served
+#   economic_policy 0.117 [0.104, 0.132] bank 73,428
+#
+# boatlee beats v21.1 512-0. We had been serving the weakest agent we own
+# because nothing ever read the kernel cache the nightly job was filling: the
+# author we vendor published two further versions and a third party built on
+# them, all sitting unread while we submitted the first.
+from kaggriculture.boatlee_v14_policy import agent
 
 __all__ = ["agent"]
