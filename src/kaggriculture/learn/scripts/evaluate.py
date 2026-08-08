@@ -24,6 +24,13 @@ logged against an explicit ``eval/ckpt_step`` step metric, which makes the
 order records arrive in irrelevant, and every record already in the jsonl is
 replayed into the run at startup so a fresh run carries the whole history.
 
+**Completed sales are measured beside the bank.** A bank number says how much a
+policy made and nothing about how it failed to. ``sales.sale_metrics`` reads
+that off consecutive observations, so this drives the episode itself rather than
+through ``rollout_many``: a ``Trajectory`` keeps the encoded tensors and throws
+the observations away, and the shed and the market book live only in the
+observation. Two states per environment are held at a time, never the season.
+
 The deliverable is the eval curve over training time. If self-play bank climbs
 while eval bank does not, the run is inflating against itself and the opponent
 pool moves up the queue.
@@ -36,16 +43,38 @@ import os
 import random
 import time
 import zipfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-import wandb
+from kaggle_environments import make
+from kaggle_environments.core import Environment
 
+import wandb
+from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 from kaggriculture.learn import corpus
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.rollout import Trajectory, rollout_many
+
+# The eval rollout drives the episode itself so that it can keep observations,
+# but it does not decide anything itself: the masked sampling and the opponent
+# actor come from `rollout`, so the policy this measures plays from exactly the
+# distribution training samples from. A second implementation of masked
+# sampling here would be a second thing to keep in step, and `rollout`'s module
+# docstring is explicit that the mask must be applied before the softmax --
+# which is one more reason not to spell it twice.
+from kaggriculture.learn.rollout import (
+    LEARNER,
+    _agent_observation,
+    _decide,
+    _opponent_actor,
+)
+from kaggriculture.learn.rollout import (
+    OPPONENT as OPPONENT_SEAT,
+)
+from kaggriculture.learn.sales import sale_metrics
 from kaggriculture.learn.scripts.gate import SEED_BASE
 
 LOGGER = logging.getLogger(__name__)
@@ -173,17 +202,19 @@ def watch(prefixes: Sequence[str], banks: np.ndarray) -> None:
         publish(runs[prefix], record)
         LOGGER.info(
             "%s update %d: ours %.0f vs economic_policy %.0f, "
-            "win rate %.2f, percentile %.1f",
+            "win rate %.2f, percentile %.1f, %.1f sales/episode at %.2f realisation",
             prefix,
             record["update"],
             record["eval_bank_mean"],
             record["opponent_bank_mean"],
             record["win_rate"],
             record["eval_percentile"],
+            record["sales_per_episode"],
+            record["realisation"],
         )
 
 
-def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, float]:
+def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, Any]:
     """Measure one checkpoint and publish it as a flat reference line.
 
     Args:
@@ -202,12 +233,15 @@ def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, fl
     for step in REFERENCE_SPAN:
         publish(run, {**record, "update": step})
     LOGGER.info(
-        "%s: ours %.0f vs economic_policy %.0f, win rate %.2f, percentile %.1f",
+        "%s: ours %.0f vs economic_policy %.0f, win rate %.2f, percentile %.1f, "
+        "%.1f sales/episode at %.2f realisation",
         name,
         record["eval_bank_mean"],
         record["opponent_bank_mean"],
         record["win_rate"],
         record["eval_percentile"],
+        record["sales_per_episode"],
+        record["realisation"],
     )
     run.finish()
     return record
@@ -279,7 +313,7 @@ def recorded(prefix: str) -> Iterator[dict]:
 
 def evaluate(
     checkpoint: Path, banks: np.ndarray, arm: str, update: int
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Play one checkpoint against the scripted opponent and score it.
 
     Args:
@@ -294,24 +328,187 @@ def evaluate(
     started = time.monotonic()
     policy = _load(checkpoint)
     seeds = tuple(SEED_BASE + index for index in range(GAMES))
-    played: Sequence[Trajectory] = rollout_many(policy, OPPONENT, seeds)
+    played = play(policy, seeds)
 
-    ours = [t.final_bank for t in played]
-    # `final_margin` is our bank minus theirs, so their bank recovers exactly.
-    theirs = [t.final_bank - t.final_margin for t in played]
-    wins = sum(1.0 for t in played if t.final_margin > 0)
-    mean = float(np.mean(ours))
+    wins = sum(
+        1.0
+        for ours, theirs in zip(played.ours, played.theirs, strict=True)
+        if ours > theirs
+    )
+    mean = float(np.mean(played.ours))
     return {
         "arm": arm,
         "update": update,
         "checkpoint": checkpoint.name,
         "eval_bank_mean": mean,
-        "eval_bank_max": float(np.max(ours)),
-        "opponent_bank_mean": float(np.mean(theirs)),
-        "win_rate": wins / len(played),
+        "eval_bank_max": float(np.max(played.ours)),
+        "opponent_bank_mean": float(np.mean(played.theirs)),
+        "win_rate": wins / len(played.ours),
         "eval_percentile": percentile(mean, banks),
-        "games": len(played),
+        "games": len(played.ours),
         "seconds": round(time.monotonic() - started, 1),
+        **played.tally.record(len(played.ours)),
+    }
+
+
+@dataclass
+class Tally:
+    """Completed sales accumulated a turn at a time, over any number of episodes.
+
+    ``sale_metrics`` scores a sequence of observations, and this adds one
+    consecutive pair to a running total so the caller never has to hold a whole
+    season. The totals are exact rather than an average of averages: a pair's
+    proceeds are ``mean_sale_price * units`` and its market reference is
+    ``mean_market_price * units``, both of which are the sums the function
+    divided by, so accumulating them and dividing once at the end gives the same
+    number as scoring the whole series in one call.
+
+    Attributes:
+        sales: Completed clears -- one per good that cleared on a turn.
+        units: How many items those clears moved.
+        proceeds: Coins the clears banked.
+        market: The volume-weighted market value of what was sold, priced at the
+            book standing before each clear.
+    """
+
+    sales: float = 0.0
+    units: float = 0.0
+    proceeds: float = 0.0
+    market: float = 0.0
+
+    def add(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
+        """Add one consecutive pair of the learner's observations.
+
+        Args:
+            before: The state before the turn.
+            after: The state after it.
+        """
+        metrics = sale_metrics((before, after), LEARNER)
+        self.sales += metrics["sales"]
+        self.units += metrics["units"]
+        self.proceeds += metrics["mean_sale_price"] * metrics["units"]
+        self.market += metrics["mean_market_price"] * metrics["units"]
+
+    def record(self, episodes: int) -> dict[str, float]:
+        """Return the eval-record fields for these totals.
+
+        Args:
+            episodes: How many episodes were tallied, so the sale count reads
+                per episode rather than per group and stays comparable when
+                ``GAMES`` changes.
+
+        Returns:
+            ``sales_per_episode``, ``mean_sale_price``, ``mean_market_price``
+            and ``realisation`` -- realised over market, where 1.0 is par and
+            below 1.0 is selling into a depressed book.
+        """
+        sale = self.proceeds / self.units if self.units else 0.0
+        market = self.market / self.units if self.units else 0.0
+        return {
+            "sales_per_episode": self.sales / episodes,
+            "mean_sale_price": sale,
+            "mean_market_price": market,
+            "realisation": (sale / market) if market else 0.0,
+        }
+
+
+@dataclass(frozen=True)
+class Games:
+    """One group of evaluation episodes, played to the end.
+
+    Attributes:
+        ours: Each episode's terminal bank for the learner's seat.
+        theirs: Each episode's terminal bank for the scripted opponent.
+        tally: Completed sales across the whole group.
+    """
+
+    ours: list[float] = field(default_factory=list)
+    theirs: list[float] = field(default_factory=list)
+    tally: Tally = field(default_factory=Tally)
+
+
+def play(policy: Policy, seeds: Sequence[int]) -> Games:
+    """Play a group of episodes against the scripted opponent, keeping observations.
+
+    The lockstep loop of ``rollout_many`` without the trajectory: every
+    environment is stepped together so one forward serves the group, and the
+    decisions come from ``rollout``'s own sampler so this measures the same
+    distribution training samples from. What it keeps instead of tensors is the
+    part ``sale_metrics`` needs, and only the previous state of each
+    environment -- one pair at a time, not the season.
+
+    Args:
+        policy: The checkpoint to measure, in eval mode.
+        seeds: One seed per episode. The first also seeds the sampling stream,
+            matching ``rollout_many``, so these episodes are the ones the gate
+            would have played.
+
+    Returns:
+        The group's terminal banks and its completed-sale totals.
+    """
+    generator = torch.Generator().manual_seed(int(seeds[0]))
+    environments = [
+        make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed})
+        for seed in seeds
+    ]
+    for environment in environments:
+        environment.reset(2)
+    actors = [_opponent_actor(OPPONENT, environment) for environment in environments]
+
+    games = Games()
+    previous = [snapshot(environment) for environment in environments]
+    while not environments[0].done:
+        turns = _decide(
+            policy,
+            [
+                (environment.state[LEARNER].observation, LEARNER)
+                for environment in environments
+            ],
+            generator,
+        )
+        for environment, turn, act in zip(environments, turns, actors, strict=True):
+            environment.step(
+                [turn.action, act(_agent_observation(environment, OPPONENT_SEAT))]
+            )
+        for index, environment in enumerate(environments):
+            seen = snapshot(environment)
+            games.tally.add(previous[index], seen)
+            previous[index] = seen
+
+    for environment in environments:
+        terminal = environment.state[LEARNER].observation["farms"]
+        games.ours.append(float(terminal[LEARNER]["money"]))
+        games.theirs.append(float(terminal[OPPONENT_SEAT]["money"]))
+    LOGGER.info(
+        "played %d episodes: %.1f completed sales each",
+        len(games.ours),
+        games.tally.sales / len(games.ours),
+    )
+    return games
+
+
+def snapshot(environment: Environment) -> dict[str, Any]:
+    """Return the learner's observation, copied out of the state that mutates.
+
+    ``Environment.step`` appends ``self.state`` without copying and the
+    interpreter mutates the farms and the shed in place, so a kept reference to
+    an observation reads as the terminal position at every turn -- every pair
+    would then show no change and every sale would go uncounted. Only the three
+    things ``sale_metrics`` reads are copied, so holding the previous state of
+    sixteen environments costs a few hundred floats.
+
+    Args:
+        environment: The episode to read.
+
+    Returns:
+        A standalone mapping with the learner's ``farms`` money, its own shed,
+        and the market book.
+    """
+    observation = environment.state[LEARNER].observation
+    return {
+        "farms": [{"money": float(farm["money"])} for farm in observation["farms"]],
+        "private": {"shed": dict(observation["private"]["shed"])},
+        "market": {"prices": dict(observation["market"]["prices"])},
     }
 
 
