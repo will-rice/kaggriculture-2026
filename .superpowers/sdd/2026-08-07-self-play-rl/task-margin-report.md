@@ -241,6 +241,62 @@ The absolute term is currently 0.05 × 1.5 / 500 = 0.00015 against a reward of
 −0.098 — **0.15%**. It is small because the policy owns almost no capital; at
 the reference's 15 it would be the designed ~6%.
 
+## First 26 updates (u201-u226), and the first checkpoint
+
+Checkpoint `toad-phase1m-margin_000225.pt` written at 22:30, no stale `.tmp`,
+and it **reloads**: update 225, step 7,549,500, `lr = 6.11399e-05` exactly
+`1e-4 × decay(225)`, Adam moments present. `illegal` is 0 on every update.
+
+**No cliff at the resume.** The Jump-Start tripwire did not fire. `total` sat at
+0.001-0.006 through warmup, stepped to 0.35 at u211-212 as `warming` went False
+and the policy gradient switched on, peaked ~1.5 at u217-218 and settled
+0.3-1.1. That is the gradient engaging, not a collapse — and it is the first
+time this project has changed a reward under a resumed critic without one.
+
+|                           | first 5   | last 5    |
+| ------------------------- | --------- | --------- |
+| **`win_rate_vs_econ`**    | **0.000** | **0.000** |
+| `margin_mean_vs_econ`     | −138,830  | −139,782  |
+| `bank_vs_econ`            | 4.8       | **114.0** |
+| `units_sold_vs_econ`      | 26.8      | **71.0**  |
+| `mean_sale_price_vs_econ` | 40.3      | 47.6      |
+| `realisation_vs_econ`     | 0.931     | 0.972     |
+| `final_capital_vs_econ`   | 1.38      | 1.62      |
+| `bank_mirror`             | 39.5      | 78.9      |
+
+So: production is climbing hard (bank 24x, volume 2.6x, price +18%) and **the
+margin is flat**. That is not any of the pre-registered branches exactly — it is
+neither "margin improving while win rate stays 0" nor "bank collapsing while
+margin improves", and in particular it is _not_ the signature that says the
+absolute term is too weak. It is 26 updates of roughly 580.
+
+**The measurement that explains it, and my sharpened concern.** Against
+`economic_policy` the margin is almost entirely made of the opponent's bank,
+which our seat barely influences:
+
+|            | min     | max     | sd    |
+| ---------- | ------- | ------- | ----- |
+| our bank   | 1.3     | 246.4   | 72    |
+| their bank | 126,693 | 149,774 | 6,658 |
+
+Their per-update variation is **92x** ours. In reward units, our bank's _entire_
+observed range is worth 0.00049 while their swing between updates is worth
+0.046 — **94x larger**. So in the scripted half the margin term is currently
+about 99% variance we do not control, and only the terminal rank (a constant
+−0.02, because we lose every one) and the absolute term are clean.
+
+The mirror half is the mirror image of that problem: there the margin is purely
+relative play and its variance _is_ action-correlated, but with one policy in
+both seats it is what cancels in expectation. So at today's skill level neither
+half yields a clean margin gradient, which is a sharper statement of the
+mechanism than "the differential needs an opponent" and was not visible before
+the arm ran.
+
+This is reported, not tuned. It should shrink on its own as our bank approaches
+the opponent's, and the value baseline absorbs the predictable part of the
+opponent's draw. The thing to watch is whether `bank_vs_econ` keeps climbing far
+enough for our contribution to the margin to stop being rounding error.
+
 ## Pre-registered reads (unchanged)
 
 - `win_rate_vs_econ` off 0 → the objective is right; main line.
