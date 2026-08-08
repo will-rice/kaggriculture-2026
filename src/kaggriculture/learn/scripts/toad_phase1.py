@@ -29,6 +29,7 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
   run measures it.
 """
 
+import argparse
 import copy
 import json
 import logging
@@ -38,6 +39,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import torch
+import wandb
 from lightning import seed_everything
 
 from kaggriculture.learn.model import Policy
@@ -89,32 +91,72 @@ THREADS = 1
 # How many updates the actor's weights lag the learner's. See D7 above.
 SYNC_EVERY = 4
 RUNS = Path("/data/kaggriculture/toad")
+# Every 25 updates is ~13 minutes of work at the measured 3.97M steps/hour.
+# Attempt one had none, and an external kill at update 253 cost 2.3 hours.
+CHECKPOINT_EVERY = 25
+WANDB_ENTITY = "will-rice"
+WANDB_PROJECT = "kaggriculture-2026"
 
 
 def main() -> None:
-    """Run phase 1 to ``TOTAL_STEPS`` and log the bank as it goes."""
+    """Run phase 1 to ``TOTAL_STEPS``, checkpointing and logging as it goes."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="checkpoint to continue from, restoring weights, optimizer, "
+        "schedule and counters",
+    )
+    arguments = parser.parse_args()
+
     seed_everything(SEED, workers=True)
     RUNS.mkdir(parents=True, exist_ok=True)
-    log = RUNS / f"phase1_{int(time.time())}.jsonl"
 
     device = _device()
-    learner = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND).to(device)
+    learner = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND).to(
+        device
+    )
+    optimizer = torch.optim.Adam(learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
+    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, _decay)
+
+    steps, update = 0, 0
+    if arguments.resume is not None:
+        steps, update = _restore(arguments.resume, learner, optimizer, schedule, device)
+        LOGGER.info("resumed from %s at update %d, step %d", arguments.resume, update, steps)
+
+    log = RUNS / f"phase1_{int(time.time())}.jsonl"
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        name=log.stem,
+        config={
+            "blocks": BLOCKS,
+            "channels": CHANNELS,
+            "value_bound": VALUE_BOUND,
+            "reward_field": REWARD_FIELD,
+            "environments": ENVIRONMENTS,
+            "batch_segments": BATCH_SEGMENTS,
+            "unroll_length": UNROLL_LENGTH,
+            "sync_every": SYNC_EVERY,
+            "lr": LEARNING_RATE,
+            "adam_eps": ADAM_EPS,
+            "clip_grads": CLIP_GRADS,
+            "total_steps": TOTAL_STEPS,
+        },
+    )
     parameters = sum(p.numel() for p in learner.parameters())
-    LOGGER.info("phase 1: %d params, device %s, log %s", parameters, device, log)
+    LOGGER.info(
+        "phase 1: %d params, device %s, log %s, wandb %s",
+        parameters,
+        device,
+        log,
+        run.url,
+    )
 
-    optimizer = torch.optim.Adam(
-        learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS
-    )
-    # Their min_lr_mod is 0.01, i.e. the floor is 1% of the initial rate, decayed
-    # linearly over the run.
-    schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: max(1.0 - step / max(_updates(), 1), MIN_LR_MOD),
-    )
     actor = copy.deepcopy(learner).eval()
-
-    started, steps, update = time.monotonic(), 0, 0
+    started = time.monotonic()
     pool = ProcessPoolExecutor(max_workers=WORKERS)
     while steps < TOTAL_STEPS:
         seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
@@ -126,6 +168,8 @@ def main() -> None:
         update += 1
         if update % SYNC_EVERY == 0:
             actor.load_state_dict(learner.state_dict())
+        if update % CHECKPOINT_EVERY == 0:
+            _checkpoint(learner, optimizer, schedule, steps, update)
 
         banks = [t.final_bank for t in batch]
         record = {
@@ -134,15 +178,14 @@ def main() -> None:
             "hours": round((time.monotonic() - started) / 3600.0, 4),
             "bank_mean": sum(banks) / len(banks),
             "bank_max": max(banks),
-            "shaped_mean": float(
-                torch.stack([t.shaped.sum() for t in batch]).mean()
-            ),
+            "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
             "illegal": sum(t.illegal for t in batch),
             "lr": schedule.get_last_lr()[0],
             **terms,
         }
         with log.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
+        wandb.log(record, step=steps)
         LOGGER.info(
             "update %d steps %d bank %.1f (max %.1f) shaped %.4f total_loss %.3f",
             update,
@@ -152,6 +195,90 @@ def main() -> None:
             record["shaped_mean"],
             record["total"],
         )
+    wandb.finish()
+
+
+def _decay(step: int) -> float:
+    """Return the LR multiplier at ``step``, floored at their ``min_lr_mod``.
+
+    A module-level function rather than a lambda so that resuming restores the
+    same schedule object: a lambda cannot be pickled into a checkpoint, and a
+    schedule silently rebuilt from step zero would restore the initial learning
+    rate and quietly change the recipe partway through a run.
+    """
+    return max(1.0 - step / max(_updates(), 1), MIN_LR_MOD)
+
+
+def _checkpoint(
+    learner: Policy,
+    optimizer: torch.optim.Optimizer,
+    schedule: torch.optim.lr_scheduler.LRScheduler,
+    steps: int,
+    update: int,
+) -> Path:
+    """Write everything needed to continue the run, atomically.
+
+    Toad's monobeast checkpoints continuously; ours did not, and an external
+    kill at update 253 cost 2.3 hours of training because the weights lived only
+    in the process. Written to a temporary name and renamed, so a kill during
+    the write leaves the previous checkpoint intact rather than a truncated one.
+
+    Args:
+        learner: The network being trained.
+        optimizer: Its optimizer, whose Adam moments matter as much as the weights.
+        schedule: The LR schedule, so the recipe continues rather than restarts.
+        steps: Environment steps consumed so far.
+        update: Optimizer rounds so far.
+
+    Returns:
+        The path written.
+    """
+    path = RUNS / f"phase1_{update:06d}.pt"
+    temporary = path.with_suffix(".pt.tmp")
+    torch.save(
+        {
+            "learner": learner.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "schedule": schedule.state_dict(),
+            "steps": steps,
+            "update": update,
+        },
+        temporary,
+    )
+    temporary.rename(path)
+    LOGGER.info("checkpoint %s", path)
+    return path
+
+
+def _restore(
+    path: Path,
+    learner: Policy,
+    optimizer: torch.optim.Optimizer,
+    schedule: torch.optim.lr_scheduler.LRScheduler,
+    device: str,
+) -> tuple[int, int]:
+    """Load a checkpoint in place and return its ``(steps, update)``.
+
+    Restores the schedule's own state rather than fast-forwarding it, because
+    recomputing the position by stepping it ``update`` times is exactly where an
+    off-by-one would hide, and a schedule one step out changes the learning rate
+    for the rest of the run.
+
+    Args:
+        path: The checkpoint.
+        learner: Network to load into.
+        optimizer: Optimizer to load into.
+        schedule: Schedule to load into.
+        device: Where to map the tensors.
+
+    Returns:
+        The ``(steps, update)`` the checkpoint was written at.
+    """
+    state = torch.load(path, map_location=device, weights_only=False)
+    learner.load_state_dict(state["learner"])
+    optimizer.load_state_dict(state["optimizer"])
+    schedule.load_state_dict(state["schedule"])
+    return int(state["steps"]), int(state["update"])
 
 
 def _device() -> str:
