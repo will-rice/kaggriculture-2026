@@ -28,6 +28,7 @@ the expensive way:
 | [2026-08-07-self-play-rl-findings.md](2026-08-07-self-play-rl-findings.md) | Why our self-play loop learned nothing: advantage cancellation with a difference reward, policy-invariance of shaping, what single-box Lux winners actually did, whether a league is needed, whether throughput is the constraint.            | Its Finding 5 (drop the KL to a weak clone) was **refuted by measurement** — see below.              |
 | [2026-08-07-fable-rl-grounding.md](2026-08-07-fable-rl-grounding.md)       | Which published solution is closest to our problem _and_ reproducible. Ranks Lux S1/S2/S3, Halite, Kore candidates against game shape, single-box compute, and whether a public artifact exists. Picks Toad Brigade and specifies its recipe. | Its recipe values are incomplete — four load-bearing values live outside the phase YAMLs. See below. |
 | [2026-08-08-market-execution-rl.md](2026-08-08-market-execution-rl.md)     | Selling into a market you move yourself: optimal execution and market impact RL, multi-agent settings where actions form prices, and reward designs for selling _well_ rather than merely selling.                                            | (in progress)                                                                                        |
+| [2026-08-08-what-wins-elo.md](2026-08-08-what-wins-elo.md)                 | Whether banked coins move the ladder (they no longer do), what separates the winner of an episode from its loser, and how much of the margin is price impact on the opponent. Measured off the nine daily archives, not off the literature.   | Anything about how to train it. It says what to optimise, not how.                                   |
 
 ## Corrections these documents do not contain
 
@@ -57,4 +58,12 @@ later. The full experimental ledger is at
 - **Corpus median seat banks 114,404**, directly measured from 396 seats across
   8 daily archives on 2026-08-08. An earlier figure of 125,773 did not
   reproduce; sampling bias was ruled out (head-of-archive vs randomised differ
-  by 1%). Quote the archive set and date with any future figure.
+  by 1%). Quote the archive set and date with any future figure. The full index
+  of all nine archives puts the same statistic at 112,866 over 14,112 seats,
+  and shows why any single number for it is misleading: the median seat banked
+  129,152 on 2026-08-04 and 109,032 on 2026-08-07.
+- **The bank is no longer the objective.** Rating against final bank reads
+  −0.043 on the 2026-08-07 archive over 1,350 seats, and it has been ~0 since
+  2026-08-01, though it was +0.686 on 2026-07-30. See
+  [2026-08-08-what-wins-elo.md](2026-08-08-what-wins-elo.md); every document
+  written before it assumes banking is the goal.

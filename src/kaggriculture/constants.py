@@ -14,6 +14,8 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
     MARKET_PARAMS,
     PRODUCTS,
     SHOPS,
+    TOWN_CENTER_DEMAND_SCHEDULE,
+    TOWN_CENTER_PRODUCTS,
     market_price,
 )
 
@@ -27,6 +29,10 @@ __all__ = [
     "MARKET_PARAMS",
     "PRODUCTS",
     "SHOPS",
+    "TOWN_CENTER_DEMAND_SCHEDULE",
+    "TOWN_CENTER_PRODUCTS",
+    "TOWN_SHOP_SELL_INTERVAL",
+    "TOWN_CENTER_SELL_INTERVAL",
     "market_price",
     "BOARD_SIZE",
     "TURNS_PER_DAY",
@@ -60,6 +66,14 @@ STARTING_MONEY = 3000
 SHED_CAPACITY = 100
 MAX_MARKET_ORDERS_PER_TURN = 10
 ACT_TIMEOUT = 1.0
+
+# The town is the market's demand side: every few turns its shops and its centre
+# take stock out of the book, which is what lifts prices back after a sale. The
+# drain is a fixed quantity per interval and never depends on the inventory
+# level, so the book is exactly additive in what the two farms put into it --
+# which is what makes one farm's price impact on the other one computable.
+TOWN_SHOP_SELL_INTERVAL = 4
+TOWN_CENTER_SELL_INTERVAL = 12
 
 # Movement op -> (dx, dy); y grows downward.
 MOVES = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
