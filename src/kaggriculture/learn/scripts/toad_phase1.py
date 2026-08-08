@@ -45,6 +45,7 @@ from lightning import seed_everything
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
+from kaggriculture.learn.toad_reward import MONEY_WEIGHT
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -103,6 +104,12 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--phase1b",
+        action="store_true",
+        help="train on the money-augmented reward instead of Toad's five "
+        "components. The two arms must differ by this flag and nothing else.",
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -113,6 +120,11 @@ def main() -> None:
 
     seed_everything(SEED, workers=True)
     RUNS.mkdir(parents=True, exist_ok=True)
+    # The single constant the ablation turns on. Everything downstream -- file
+    # names, wandb run name, which reward the learner reads -- follows from it,
+    # so the two arms cannot drift apart in any other respect.
+    field = "shaped_money" if arguments.phase1b else REWARD_FIELD
+    prefix = "phase1b" if arguments.phase1b else "phase1"
 
     device = _device()
     learner = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND).to(
@@ -126,16 +138,18 @@ def main() -> None:
         steps, update = _restore(arguments.resume, learner, optimizer, schedule, device)
         LOGGER.info("resumed from %s at update %d, step %d", arguments.resume, update, steps)
 
-    log = RUNS / f"phase1_{int(time.time())}.jsonl"
+    log = RUNS / f"{prefix}_{int(time.time())}.jsonl"
     run = wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
-        name=log.stem,
+        name=("toad-phase1b-money-component" if arguments.phase1b
+              else "toad-phase1-baseline"),
         config={
             "blocks": BLOCKS,
             "channels": CHANNELS,
             "value_bound": VALUE_BOUND,
-            "reward_field": REWARD_FIELD,
+            "reward_field": field,
+            "money_weight": MONEY_WEIGHT if arguments.phase1b else 0.0,
             "environments": ENVIRONMENTS,
             "batch_segments": BATCH_SEGMENTS,
             "unroll_length": UNROLL_LENGTH,
@@ -163,13 +177,13 @@ def main() -> None:
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
         batch = _collect(pool, weights, seeds)
         steps += sum(int(t.shaped.shape[0]) for t in batch)
-        terms = _update(learner, optimizer, batch, device)
+        terms = _update(learner, optimizer, batch, device, field)
         schedule.step()
         update += 1
         if update % SYNC_EVERY == 0:
             actor.load_state_dict(learner.state_dict())
         if update % CHECKPOINT_EVERY == 0:
-            _checkpoint(learner, optimizer, schedule, steps, update)
+            _checkpoint(learner, optimizer, schedule, steps, update, prefix)
 
         banks = [t.final_bank for t in batch]
         record = {
@@ -180,6 +194,19 @@ def main() -> None:
             "bank_max": max(banks),
             "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
             "illegal": sum(t.illegal for t in batch),
+            # The money component's own realised contribution, separable
+            # because both rewards ride on every trajectory. Logged for BOTH
+            # arms: on the baseline it is the counterfactual, on phase-1b it is
+            # the thing being paid for. Rising here while bank_mean stays flat
+            # is the money-pump signature -- a clamped delta means a buy-then-
+            # sell round trip that loses coins still earns shaped reward -- and
+            # this project has hit that failure three times. It must be visible
+            # in the charts from update 1, not reconstructed afterwards.
+            "money_term": float(
+                torch.stack(
+                    [(t.shaped_money - t.shaped).sum() for t in batch]
+                ).mean()
+            ),
             "lr": schedule.get_last_lr()[0],
             **terms,
         }
@@ -215,6 +242,7 @@ def _checkpoint(
     schedule: torch.optim.lr_scheduler.LRScheduler,
     steps: int,
     update: int,
+    prefix: str,
 ) -> Path:
     """Write everything needed to continue the run, atomically.
 
@@ -229,11 +257,13 @@ def _checkpoint(
         schedule: The LR schedule, so the recipe continues rather than restarts.
         steps: Environment steps consumed so far.
         update: Optimizer rounds so far.
+        prefix: Run-distinguishing stem, so the two arms cannot clobber each
+            other's checkpoints.
 
     Returns:
         The path written.
     """
-    path = RUNS / f"phase1_{update:06d}.pt"
+    path = RUNS / f"{prefix}_{update:06d}.pt"
     temporary = path.with_suffix(".pt.tmp")
     torch.save(
         {
@@ -346,6 +376,7 @@ def _update(
     optimizer: torch.optim.Optimizer,
     batch: list[Trajectory],
     device: str,
+    field: str,
 ) -> dict[str, float]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -368,7 +399,7 @@ def _update(
     steps = 0
     for start in range(0, len(segments) - BATCH_SEGMENTS + 1, BATCH_SEGMENTS):
         terms = _step(
-            learner, optimizer, segments[start : start + BATCH_SEGMENTS], device
+            learner, optimizer, segments[start : start + BATCH_SEGMENTS], device, field
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -381,6 +412,7 @@ def _step(
     optimizer: torch.optim.Optimizer,
     segments: list[dict[str, torch.Tensor]],
     device: str,
+    field: str,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -409,7 +441,7 @@ def _step(
     unit_masks = stacked("unit_masks")
     market_masks = stacked("market_masks")
     behaviour = stacked("log_probs")
-    rewards = stacked(REWARD_FIELD)
+    rewards = stacked(field)
     dones = stacked("dones")
 
     turns, width = behaviour.shape
@@ -485,7 +517,8 @@ def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
         "unit_masks",
         "market_masks",
         "log_probs",
-        REWARD_FIELD,
+        "shaped",
+        "shaped_money",
         "dones",
     )
     return [

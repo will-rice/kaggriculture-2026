@@ -42,7 +42,7 @@ def test_resuming_continues_the_schedule_rather_than_restarting_it(
     policy, optimizer, schedule = _fresh()
     for _ in range(25):
         schedule.step()
-    path = toad_phase1._checkpoint(policy, optimizer, schedule, steps=863_000, update=25)
+    path = toad_phase1._checkpoint(policy, optimizer, schedule, steps=863_000, update=25, prefix="phase1")
     assert path.is_file()
 
     restored_policy, restored_optimizer, restored_schedule = _fresh()
@@ -72,7 +72,7 @@ def test_the_checkpoint_carries_weights_and_adam_moments(tmp_path, monkeypatch) 
     )[2].sum().backward()
     optimizer.step()
 
-    path = toad_phase1._checkpoint(policy, optimizer, schedule, steps=1, update=25)
+    path = toad_phase1._checkpoint(policy, optimizer, schedule, steps=1, update=25, prefix="phase1")
     restored_policy, restored_optimizer, restored_schedule = _fresh()
     toad_phase1._restore(path, restored_policy, restored_optimizer, restored_schedule, "cpu")
 
@@ -87,6 +87,6 @@ def test_the_checkpoint_write_is_atomic(tmp_path, monkeypatch) -> None:
     """No temporary file may survive, or a kill mid-write leaves a torn checkpoint."""
     monkeypatch.setattr(toad_phase1, "RUNS", tmp_path)
     policy, optimizer, schedule = _fresh()
-    toad_phase1._checkpoint(policy, optimizer, schedule, steps=1, update=50)
+    toad_phase1._checkpoint(policy, optimizer, schedule, steps=1, update=50, prefix="phase1b")
     assert list(tmp_path.glob("*.pt"))
     assert not list(tmp_path.glob("*.tmp"))
