@@ -1,6 +1,6 @@
-"""The four-rung gate: what a trained policy beats, and where it stops.
+"""The seven-rung gate: what a trained policy beats, and where it stops.
 
-Four opponents in a fixed order of strength, and the run reports the rung it
+Seven opponents in a fixed order of strength, and the run reports the rung it
 reached rather than the best number it found. Each rung means something
 different:
 
@@ -13,10 +13,19 @@ different:
    heuristics someone sat down and wrote.
 3. **The fixed best route.** One harvested route replayed open-loop. Beating it
    means the policy is worth more than the best single season in the corpus.
-4. **Vendored kaito.** The published kernel this repository currently submits,
-   and the only rung whose meaning is "we exceeded what was available to copy".
-   It is held out of the training pool for exactly that reason: an agent that
-   trained against it would have been shown the answer.
+4. **Vendored kaito v21.1.** The published kernel this repository currently
+   submits.
+5. **Vendored kaito v22.** The same author's next publication.
+6. **Vendored kaito v23.** The same author's newest.
+7. **Vendored boatlee v14.** Another author's descendant of v23, and the
+   strongest agent anyone has published for this competition that we have
+   measured.
+
+Rungs 4 to 7 are the ones whose meaning is "we exceeded what was available to
+copy", and rung 7 is the honest version of that claim: clearing rung 4 now only
+means we beat a generation the field has already moved past. All four are held
+out of the training pool for that reason -- an agent that trained against them
+would have been shown the answer.
 
 **The policy is played the way it was trained** -- masked, and sampled rather
 than argmaxed -- through ``rollout_many``. That is a deliberate choice over
@@ -74,15 +83,35 @@ SEED_BASE = 2_000_000_000
 OPPONENT_MODULES = {
     "economic_policy": "kaggriculture.economic_policy",
     "kaito": "kaggriculture.kaito_policy",
+    "kaito_v22": "kaggriculture.kaito_v22_policy",
+    "kaito_v23": "kaggriculture.kaito_v23_policy",
+    "boatlee_v14": "kaggriculture.boatlee_v14_policy",
     "best_route": "kaggriculture.routes.play",
     "bc_clone": "kaggriculture.learn.play",
 }
 
+# `kaito` is v21.1, the generation this repository submitted first, and it is
+# kept as its own rung rather than replaced: it is the rung every earlier gate
+# result in this project was measured against, and dropping it would make those
+# numbers uncomparable. The three above it are later public publications,
+# ordered by what a head-to-head actually puts them in. Over 128 seeded games
+# per pair on the pinned 1.32.3 engine, v23 beats v21.1 128-0 and v22 124-4;
+# over 128 games per pair on 1.32.6, boatlee_v14 beats v23 and v23 beats v21.1.
+#
+# Two of these rungs are measured under an engine the ladder no longer runs.
+# The competition moved to kaggle-environments 1.32.6, where
+# `townCenterSellInterval` is 24 rather than the 12 this project still pins, and
+# v23 is the only vendored agent that branches on it -- on the real engine it
+# plays a route table this gate never sees. So rungs 5 and 6 are a lower bound
+# on the standard they represent until the pin moves.
 RUNGS: tuple[tuple[str, Path | str], ...] = (
     ("bc_clone", CHECKPOINT),
     ("economic_policy", "src/kaggriculture/economic_policy.py"),
     ("best_route", "baselines/best_route.py"),
     ("kaito", "src/kaggriculture/kaito_policy.py"),
+    ("kaito_v22", "src/kaggriculture/kaito_v22_policy.py"),
+    ("kaito_v23", "src/kaggriculture/kaito_v23_policy.py"),
+    ("boatlee_v14", "src/kaggriculture/boatlee_v14_policy.py"),
 )
 
 

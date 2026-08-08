@@ -37,13 +37,15 @@ select = ["C", "E", "F", "I", "W", "D", "N", "B", "PTH", "ANN"]
 ignore = ["D107"]
 exclude = [".venv"]
 
-# `kaito_policy.py` is a decoded copy of a published kernel's agent. It is
-# formatted and import-sorted like everything else -- provenance is checked by
-# diffing against the cached kernel under /data/kaggriculture/kernels, not by
-# leaving our copy untouched, and `tests/test_kaito_policy.py` pins its
+# The vendored policies are decoded copies of published kernels' agents: three
+# generations of one author's agent (v21.1, v22, v23) and one descendant of
+# them by another author. They are formatted and import-sorted like everything
+# else -- provenance is checked by diffing against the cached kernel under
+# /data/kaggriculture/kernels, not by leaving our copy untouched, and
+# `tests/test_kaito_policy.py` and `tests/test_vendored_policies.py` pin their
 # behaviour.
 #
-# What is ignored is only the rules that would have us assert things about it
+# What is ignored is only the rules that would have us assert things about them
 # we have not established. Annotating nineteen functions nobody here has read
 # means writing down types we have not checked, and documenting them means
 # claiming to know what they do. Named rules rather than a blanket exclude, so
@@ -54,9 +56,33 @@ exclude = [".venv"]
   "D103", # docstrings would claim understanding we do not have
   "C901", # the retrieval function is complex; it is not ours to simplify
 ]
+"src/kaggriculture/kaito_v22_policy.py" = ["ANN", "D103", "C901", "B905"]
+"src/kaggriculture/kaito_v23_policy.py" = ["ANN", "D103", "C901", "B905"]
+"src/kaggriculture/boatlee_v14_policy.py" = ["ANN", "D103", "C901", "B905"]
+# These tests reach into the vendored modules' private tables on purpose: the
+# tables are the agent, and a truncated blob is invisible from outside.
+"tests/test_vendored_policies.py" = ["ANN001", "SLF001"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+# The same bargain the ruff per-file-ignores above strike, for the type checker.
+# The vendored agents read an untyped observation dict and feed it to `int()`,
+# which ty cannot prove is safe and neither can we -- the author can, and the
+# published kernel runs. Narrowing it would mean editing code we do not own to
+# satisfy a checker, which is exactly the rewrite this project refuses. One
+# rule, named, on the vendored files only: everything else about them is still
+# checked, and every file we did write is checked in full.
+[[tool.ty.overrides]]
+include = [
+  "src/kaggriculture/kaito_policy.py",
+  "src/kaggriculture/kaito_v22_policy.py",
+  "src/kaggriculture/kaito_v23_policy.py",
+  "src/kaggriculture/boatlee_v14_policy.py",
+]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
