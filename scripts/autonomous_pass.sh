@@ -92,6 +92,15 @@ a survey quoted three days after it was taken was once read here as current." \
     -- data/discussions.db data/kernels.db
 fi
 
+# 2c. Read the caches back. Steps 1 and 2 spent Kaggle calls filling databases
+#     that, until this step existed, nothing ever opened: the author whose
+#     agent we vendor published two further versions while we went on
+#     submitting the first, both of them sitting in `data/kernels.db` the whole
+#     time. Reporting is not judgement, so this only prints -- but it prints
+#     into the same log the agent reads, which is where that miss should have
+#     surfaced. It is read-only and offline, so it runs after the commit above.
+step "meta report" uv run python -m kaggriculture.scripts.meta
+
 # 3. Where we stand, and whether a submission is warranted. All the judgement
 #    lives in Python where it can be tested, not in shell.
 # The flags are passed explicitly rather than read from the environment inside
