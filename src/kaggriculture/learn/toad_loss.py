@@ -53,6 +53,12 @@ CLIP_GRADS = 10.0
 # the situation arm C hit: a competent policy meeting a reward its critic has not
 # learned yet. Random init has nothing to protect and skips it; clone init does not.
 VALUE_WARMUP_BATCHES = 4000
+# conv_phase2_game_result.yaml:61. Their phase-2 value -- the first phase that
+# continues from a competent policy. teacher_baseline_cost is absent there and
+# inherits conv_config.yaml's 0.0, so only the KL term is active. Toad never
+# continues from a trained policy without one; clone init with kl=0 is a
+# configuration their recipe does not contain.
+TEACHER_KL_COST = 0.005
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +72,7 @@ class Losses:
         baseline: Smooth L1 of the value head against TD(lambda) targets.
         entropy: The entropy term, already multiplied by ``ENTROPY_COST``.
             Negative entropy, so a smaller total loss means a broader policy.
+        teacher: The teacher-KL term, already scaled. Zero when no teacher.
         total: What to call ``.backward()`` on.
     """
 
@@ -73,6 +80,7 @@ class Losses:
     upgo_pg: torch.Tensor
     baseline: torch.Tensor
     entropy: torch.Tensor
+    teacher: torch.Tensor
     total: torch.Tensor
 
 
@@ -159,6 +167,8 @@ def losses(
     entropy_cost: float = ENTROPY_COST,
     reduction: str = REDUCTION,
     baseline_only: bool = False,
+    teacher_kl: torch.Tensor | None = None,
+    teacher_kl_cost: float = TEACHER_KL_COST,
 ) -> Losses:
     """Return Toad's four loss terms for one batch of unrolled segments.
 
@@ -245,11 +255,23 @@ def losses(
     # monobeast.py:412. Added, not subtracted: `negative_entropy` is already
     # sum p*log p, so minimising the total broadens the policy.
     entropy = entropy_cost * reduce(negative_entropy, reduction)
+    # monobeast.py:400-403. Their KL is F.kl_div(learner_log_probs, teacher_probs),
+    # i.e. KL(teacher || learner) -- the forward direction, which penalises the
+    # learner for putting low mass where the teacher puts high mass. Our own
+    # ppo.divergence_of is the reverse direction and is deliberately not reused.
+    teacher = (
+        torch.zeros_like(baseline)
+        if teacher_kl is None
+        else teacher_kl_cost * reduce(teacher_kl, reduction)
+    )
 
     return Losses(
         vtrace_pg=vtrace_pg,
         upgo_pg=upgo_pg,
         baseline=baseline,
         entropy=entropy,
-        total=baseline if baseline_only else vtrace_pg + upgo_pg + baseline + entropy,
+        teacher=teacher,
+        total=baseline
+        if baseline_only
+        else vtrace_pg + upgo_pg + baseline + entropy + teacher,
     )

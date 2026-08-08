@@ -56,6 +56,7 @@ from kaggriculture.learn.toad_reward import (
 )
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
+    TEACHER_KL_COST,
     CLIP_GRADS,
     VALUE_WARMUP_BATCHES,
     LEARNING_RATE,
@@ -131,6 +132,13 @@ def main() -> None:
         default=CHANNELS,
         help="trunk width. Arm C needs 256 to match the BC clone, against "
         "Toad's hidden_dim of 128 -- a declared deviation, not a tuning knob.",
+    )
+    parser.add_argument(
+        "--teacher",
+        action="store_true",
+        help="hold the policy near the clone with monobeast's teacher KL at "
+        "their phase-2 cost (arm C''). Toad never continues from a competent "
+        "policy without one.",
     )
     parser.add_argument(
         "--value-warmup",
@@ -226,6 +234,18 @@ def main() -> None:
         run.url,
     )
 
+    teacher = None
+    if arguments.teacher:
+        # The same weights the run initialises from, frozen. Their phase 3+ uses
+        # a SMALLER teacher ("small teacher"); ours is same-size. Deviation, named.
+        teacher = Policy(
+            blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
+        ).to(device)
+        _warm_start(teacher, device)
+        teacher.eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad_(False)
+        LOGGER.info("teacher: frozen clone, kl_cost %.4f", TEACHER_KL_COST)
     actor = copy.deepcopy(learner).eval()
     warmup_left = VALUE_WARMUP_BATCHES if arguments.value_warmup else 0
     if warmup_left:
@@ -241,7 +261,7 @@ def main() -> None:
         batch = _collect(pool, weights, seeds, arguments.channels)
         steps += sum(int(t.shaped.shape[0]) for t in batch)
         terms, consumed = _update(
-            learner, optimizer, batch, device, field, warmup_left
+            learner, optimizer, batch, device, field, warmup_left, teacher
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -505,6 +525,7 @@ def _update(
     device: str,
     field: str,
     warmup_left: int = 0,
+    teacher: Policy | None = None,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -533,6 +554,7 @@ def _update(
             device,
             field,
             baseline_only=steps < warmup_left,
+            teacher=teacher,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -547,6 +569,7 @@ def _step(
     device: str,
     field: str,
     baseline_only: bool = False,
+    teacher: Policy | None = None,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -601,6 +624,16 @@ def _step(
         + entropy_of(market, flat_market_masks).sum(dim=-1)
     ).view(turns, width)
 
+    teacher_kl = None
+    if teacher is not None:
+        with torch.no_grad():
+            teacher_units, teacher_market, _ = teacher(
+                board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
+            )
+        teacher_kl = _kl(units, teacher_units, flat_unit_masks).view(
+            turns, width
+        ) + _kl(market, teacher_market, flat_market_masks).view(turns, width)
+
     values = values.view(turns, width)
     terms = losses(
         behaviour_log_probs=behaviour,
@@ -613,6 +646,7 @@ def _step(
         rewards=rewards,
         dones=dones,
         baseline_only=baseline_only,
+        teacher_kl=teacher_kl,
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()
@@ -625,8 +659,38 @@ def _step(
         "upgo_pg": terms.upgo_pg.item(),
         "baseline": terms.baseline.item(),
         "entropy": terms.entropy.item(),
+        "teacher": terms.teacher.item(),
         "total": terms.total.item(),
     }
+
+
+def _kl(
+    learner_log_probs: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return per-row KL(teacher || learner), summed over slots.
+
+    monobeast.py:129-140. Theirs is ``F.kl_div(learner_log_probs, teacher_probs)``
+    -- the forward direction, penalising the learner for putting low mass where
+    the teacher puts high. Our ``ppo.divergence_of`` is the reverse direction and
+    is deliberately not reused. Masked positions are zeroed before summing so the
+    ``-inf`` they carry never reaches the arithmetic.
+
+    Args:
+        learner_log_probs: ``(rows, slots, options)`` masked log-probabilities.
+        teacher_logits: ``(rows, slots, options)`` raw teacher logits.
+        mask: ``(rows, slots, options)`` legality mask.
+
+    Returns:
+        ``(rows,)`` summed divergences.
+    """
+    teacher_log_probs = torch.log_softmax(
+        teacher_logits.masked_fill(~mask, -torch.inf), dim=-1
+    )
+    teacher_probs = teacher_log_probs.exp()
+    per_option = teacher_probs * (teacher_log_probs - learner_log_probs)
+    return per_option.masked_fill(~mask, 0.0).sum(dim=-1).sum(dim=-1)
 
 
 def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
