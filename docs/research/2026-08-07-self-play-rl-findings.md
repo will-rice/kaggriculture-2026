@@ -171,10 +171,10 @@ Measured 2026-08-07 21:03–22:21 from two runs resumed from the same checkpoint
 (`resumed-5a0add8-1786129121/snapshot-00080.pt`), same seed, same reward label
 `own+1.00*progress`, differing only in the last line of `progress_reward`:
 
-| arm | commit | terminal potential | iters | bank iter 0 -> last |
-|---|---|---|---|---|
-| control | `3f96a02` | zeroed (Grzes condition enforced) | 23 | 22,384 -> 18,785 |
-| ablation | `3cc6068` | carried | 8+ | 22,384 -> 19,256 |
+| arm      | commit    | terminal potential                | iters | bank iter 0 -> last |
+| -------- | --------- | --------------------------------- | ----- | ------------------- |
+| control  | `3f96a02` | zeroed (Grzes condition enforced) | 23    | 22,384 -> 18,785    |
+| ablation | `3cc6068` | carried                           | 8+    | 22,384 -> 19,256    |
 
 **The two arms are indistinguishable.** Iteration-by-iteration bank, `stored`,
 entropy and `kl` all agree within run-to-run noise (iter 3: 19,765 vs 20,440;
@@ -201,7 +201,7 @@ Two structural facts in the same logs say where the gap is:
 - `growing` (2,570–3,480) and `stored` (920–1,160) are flat across 31
   iterations. The pipeline is neither filling nor draining.
 
-A shaped term that makes an action free does not make it *sampled*. The chain
+A shaped term that makes an action free does not make it _sampled_. The chain
 reward was justified by a fresh policy reaching `SELL`-legal on 0 of 719 turns —
 an exploration measurement — but it was then applied to a checkpoint that
 already has the chain, where it can only re-pay behaviour already present. On
