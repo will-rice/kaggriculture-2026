@@ -542,8 +542,8 @@ def _step(
     segments: list[dict[str, torch.Tensor]],
     device: str,
     field: str,
-    warmup_left: int = 0,
-) -> tuple[dict[str, float], int]:
+    baseline_only: bool = False,
+) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
     Each unroll is re-scored under the learner's current weights, which is what
