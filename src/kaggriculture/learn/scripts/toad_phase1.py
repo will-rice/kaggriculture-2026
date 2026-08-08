@@ -119,6 +119,13 @@ def main() -> None:
         "the environment so the rollout workers see it too.",
     )
     parser.add_argument(
+        "--channels",
+        type=int,
+        default=CHANNELS,
+        help="trunk width. Arm C needs 256 to match the BC clone, against "
+        "Toad's hidden_dim of 128 -- a declared deviation, not a tuning knob.",
+    )
+    parser.add_argument(
         "--clone-init",
         action="store_true",
         help="warm-start trunk and both heads from the BC clone instead of "
@@ -151,9 +158,9 @@ def main() -> None:
     prefix = arguments.name or ("phase1b" if arguments.phase1b else "phase1")
 
     device = _device()
-    learner = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND).to(
-        device
-    )
+    learner = Policy(
+        blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
+    ).to(device)
     if arguments.clone_init:
         _warm_start(learner, device)
     optimizer = torch.optim.Adam(learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
@@ -172,7 +179,7 @@ def main() -> None:
         or ("toad-phase1b-money-component" if arguments.phase1b else "toad-phase1-baseline"),
         config={
             "blocks": BLOCKS,
-            "channels": CHANNELS,
+            "channels": arguments.channels,
             "value_bound": VALUE_BOUND,
             "reward_field": field,
             "money_weight": money_weight() if arguments.phase1b else 0.0,
@@ -202,7 +209,7 @@ def main() -> None:
     while steps < TOTAL_STEPS:
         seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
-        batch = _collect(pool, weights, seeds)
+        batch = _collect(pool, weights, seeds, arguments.channels)
         steps += sum(int(t.shaped.shape[0]) for t in batch)
         terms = _update(learner, optimizer, batch, device, field)
         schedule.step()
@@ -395,6 +402,7 @@ def _collect(
     pool: ProcessPoolExecutor,
     state: dict[str, torch.Tensor],
     seeds: Sequence[int],
+    channels: int = CHANNELS,
 ) -> list[Trajectory]:
     """Play ``seeds`` across worker processes and return every trajectory.
 
@@ -411,11 +419,15 @@ def _collect(
         Every recorded trajectory, two per seed.
     """
     chunks = [list(seeds[index::WORKERS]) for index in range(WORKERS)]
-    batches = pool.map(_play, [(state, chunk) for chunk in chunks if chunk])
+    batches = pool.map(
+        _play, [(state, chunk, channels) for chunk in chunks if chunk]
+    )
     return [trajectory for batch in batches for trajectory in batch]
 
 
-def _play(work: tuple[dict[str, torch.Tensor], list[int]]) -> list[Trajectory]:
+def _play(
+    work: tuple[dict[str, torch.Tensor], list[int], int],
+) -> list[Trajectory]:
     """Play one worker's share of a round. Runs in a subprocess.
 
     Torch is pinned to one thread here for the same reason ``selfplay`` pins it
@@ -425,8 +437,8 @@ def _play(work: tuple[dict[str, torch.Tensor], list[int]]) -> list[Trajectory]:
     past 230 and the round did not finish.
     """
     torch.set_num_threads(THREADS)
-    state, seeds = work
-    actor = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=VALUE_BOUND)
+    state, seeds, channels = work
+    actor = Policy(blocks=BLOCKS, channels=channels, value_bound=VALUE_BOUND)
     actor.load_state_dict(state)
     actor.eval()
     with torch.no_grad():
