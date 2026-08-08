@@ -48,6 +48,11 @@ REDUCTION = "sum"
 # small omission: with `reduction: sum` and a joint log-probability over ~41
 # decisions a turn, the run diverged to a loss of 6e20 within two updates.
 CLIP_GRADS = 10.0
+# conv_phase2_game_result.yaml:78. Their phase-2 transition trains the value head
+# alone for this many batches before the policy gradient fires, built for exactly
+# the situation arm C hit: a competent policy meeting a reward its critic has not
+# learned yet. Random init has nothing to protect and skips it; clone init does not.
+VALUE_WARMUP_BATCHES = 4000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -153,6 +158,7 @@ def losses(
     lmb: float = LMB,
     entropy_cost: float = ENTROPY_COST,
     reduction: str = REDUCTION,
+    baseline_only: bool = False,
 ) -> Losses:
     """Return Toad's four loss terms for one batch of unrolled segments.
 
@@ -185,6 +191,13 @@ def losses(
         lmb: Lambda for both TD(lambda) and UPGO. Their 0.8 for phases 1-4.
         entropy_cost: Coefficient on the entropy term.
         reduction: Passed to ``reduce``.
+        baseline_only: Train the value head alone, monobeast.py:416-418. The
+            policy gradient and entropy terms are excluded from the total so a
+            warm-started policy is not dragged around by advantages from an
+            untrained critic. Note that their version still backpropagates the
+            baseline loss through the shared trunk, so warmup is not perfectly
+            policy-neutral even in their code; that is what they shipped and won
+            with, and it is reproduced rather than corrected.
 
     Returns:
         The four terms and their sum.
@@ -238,5 +251,5 @@ def losses(
         upgo_pg=upgo_pg,
         baseline=baseline,
         entropy=entropy,
-        total=vtrace_pg + upgo_pg + baseline + entropy,
+        total=baseline if baseline_only else vtrace_pg + upgo_pg + baseline + entropy,
     )

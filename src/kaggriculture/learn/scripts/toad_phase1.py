@@ -57,6 +57,7 @@ from kaggriculture.learn.toad_reward import (
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
+    VALUE_WARMUP_BATCHES,
     LEARNING_RATE,
     MIN_LR_MOD,
     TOTAL_STEPS,
@@ -130,6 +131,13 @@ def main() -> None:
         default=CHANNELS,
         help="trunk width. Arm C needs 256 to match the BC clone, against "
         "Toad's hidden_dim of 128 -- a declared deviation, not a tuning knob.",
+    )
+    parser.add_argument(
+        "--value-warmup",
+        action="store_true",
+        help="train the value head alone for VALUE_WARMUP_BATCHES before the "
+        "policy gradient fires (arm C'). Their phase-2 mechanism, for a "
+        "warm-started policy whose critic is untrained.",
     )
     parser.add_argument(
         "--money-signed",
@@ -219,6 +227,12 @@ def main() -> None:
     )
 
     actor = copy.deepcopy(learner).eval()
+    warmup_left = VALUE_WARMUP_BATCHES if arguments.value_warmup else 0
+    if warmup_left:
+        LOGGER.info(
+            'value warmup: %d batches (~%.1f updates at %d batches/update)',
+            warmup_left, warmup_left / _batches_per_update(), _batches_per_update(),
+        )
     started = time.monotonic()
     pool = ProcessPoolExecutor(max_workers=WORKERS)
     while steps < TOTAL_STEPS:
@@ -226,10 +240,18 @@ def main() -> None:
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
         batch = _collect(pool, weights, seeds, arguments.channels)
         steps += sum(int(t.shaped.shape[0]) for t in batch)
-        terms = _update(learner, optimizer, batch, device, field)
+        terms, consumed = _update(
+            learner, optimizer, batch, device, field, warmup_left
+        )
+        warming = warmup_left > 0
+        warmup_left = max(0, warmup_left - consumed)
         schedule.step()
         update += 1
-        if update % SYNC_EVERY == 0:
+        # No sync while the value head warms up: the actor must keep rolling
+        # out the warm-started policy so the critic learns on the distribution
+        # it will actually have to evaluate. Syncing here is precisely what
+        # destroyed arm C at update 5.
+        if not warming and update % SYNC_EVERY == 0:
             actor.load_state_dict(learner.state_dict())
         if update % CHECKPOINT_EVERY == 0:
             _checkpoint(learner, optimizer, schedule, steps, update, prefix)
@@ -263,6 +285,7 @@ def main() -> None:
                 ).mean()
             ),
             "lr": schedule.get_last_lr()[0],
+            "warmup_left": warmup_left,
             **terms,
         }
         with log.open("a") as handle:
@@ -460,6 +483,12 @@ def _play(
         return rollout_many(actor, actor, seeds)
 
 
+def _batches_per_update() -> int:
+    """Return how many learner batches one collection round yields."""
+    segments = ENVIRONMENTS * 2 * ((719) // UNROLL_LENGTH)
+    return segments // BATCH_SEGMENTS
+
+
 def _updates() -> int:
     """Return roughly how many updates the run will take, for the LR schedule."""
     return TOTAL_STEPS // (ENVIRONMENTS * 719 * 2)
@@ -471,7 +500,8 @@ def _update(
     batch: list[Trajectory],
     device: str,
     field: str,
-) -> dict[str, float]:
+    warmup_left: int = 0,
+) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
     Their learner consumes batches of four 16-step unrolls and steps once per
@@ -493,12 +523,17 @@ def _update(
     steps = 0
     for start in range(0, len(segments) - BATCH_SEGMENTS + 1, BATCH_SEGMENTS):
         terms = _step(
-            learner, optimizer, segments[start : start + BATCH_SEGMENTS], device, field
+            learner,
+            optimizer,
+            segments[start : start + BATCH_SEGMENTS],
+            device,
+            field,
+            baseline_only=steps < warmup_left,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
         steps += 1
-    return {key: value / max(steps, 1) for key, value in totals.items()}
+    return {key: value / max(steps, 1) for key, value in totals.items()}, steps
 
 
 def _step(
@@ -507,7 +542,8 @@ def _step(
     segments: list[dict[str, torch.Tensor]],
     device: str,
     field: str,
-) -> dict[str, float]:
+    warmup_left: int = 0,
+) -> tuple[dict[str, float], int]:
     """Take one gradient step on one batch of unrolls.
 
     Each unroll is re-scored under the learner's current weights, which is what
@@ -572,6 +608,7 @@ def _step(
         bootstrap_value=values[-1].detach(),
         rewards=rewards,
         dones=dones,
+        baseline_only=baseline_only,
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()
