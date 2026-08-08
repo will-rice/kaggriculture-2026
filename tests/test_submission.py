@@ -3,10 +3,15 @@
 import tarfile
 from pathlib import Path
 
+import pytest
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
-from kaggriculture.scripts.package import ENTRYPOINT, build
+from kaggriculture.scripts.package import (
+    ENTRYPOINT,
+    _refuse_a_shadowed_entrypoint,
+    build,
+)
 from kaggriculture.task import MatchTask
 
 
@@ -105,3 +110,34 @@ def test_the_submission_ships_no_training_code(tmp_path: Path) -> None:
     assert "kaggriculture/learn/corpus.py" not in names
     assert "kaggriculture/learn/dataset.py" not in names
     assert "kaggriculture/routes/scripts/harvest.py" not in names
+
+
+def test_the_build_refuses_a_shadowed_entrypoint(tmp_path: Path) -> None:
+    """A broken entrypoint must not be able to become an archive.
+
+    The positional invariant above is also enforced at build time, because
+    `main.py` is edited by automation -- a subagent decoding a public kernel
+    clobbered it once by executing a notebook cell. A test reports the damage
+    after the fact; a build that refuses means the broken archive never exists
+    to be uploaded, which is the difference between noticing and being safe.
+    """
+    entrypoint = tmp_path / "main.py"
+    entrypoint.write_text(
+        "from kaggriculture.boatlee_v14_policy import agent\n"
+        "\n"
+        "\n"
+        "def _appended_below():\n"
+        "    return None\n"
+    )
+
+    with pytest.raises(RuntimeError, match="after its agent"):
+        _refuse_a_shadowed_entrypoint(entrypoint)
+
+
+def test_the_build_refuses_an_entrypoint_with_no_agent(tmp_path: Path) -> None:
+    """An entrypoint binding no `agent` would ship an archive that plays nothing."""
+    entrypoint = tmp_path / "main.py"
+    entrypoint.write_text("def helper():\n    return None\n")
+
+    with pytest.raises(RuntimeError, match="binds no"):
+        _refuse_a_shadowed_entrypoint(entrypoint)

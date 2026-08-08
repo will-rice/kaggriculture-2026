@@ -12,6 +12,8 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from kaggle_environments.agent import get_last_callable
+
 from kaggriculture.routes import STORE
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -98,10 +100,47 @@ def build(output: Path = SUBMISSION) -> Path:
         for artifact in REQUIRED:
             shutil.copy(artifact, package / artifact.relative_to(PACKAGE_ROOT))
         shutil.copy(ENTRYPOINT, root / ENTRYPOINT.name)
+        _refuse_a_shadowed_entrypoint(root / ENTRYPOINT.name)
         with tarfile.open(output, "w:gz") as archive:
             for path in sorted(root.iterdir()):
                 archive.add(path, arcname=path.name)
     return output
+
+
+def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
+    """Raise unless the last callable in the staged entrypoint is its agent.
+
+    ``kaggle_environments`` plays whatever callable is defined last, so anything
+    appended below the agent import is served instead of the agent, and the
+    episode dies on turn zero with no useful diagnostic -- after the upload has
+    spent a submission slot and displaced an agent from the scored pair.
+
+    Checked here rather than only in a test because this file is edited by
+    automation: a subagent decoding a public kernel already clobbered it once by
+    executing a notebook cell. A test reports the damage; a build that refuses
+    means a broken archive cannot exist to be uploaded.
+
+    Args:
+        entrypoint: The staged copy of ``main.py``, checked as it will ship
+            rather than as it sits in the repository.
+
+    Raises:
+        RuntimeError: If the entrypoint binds no ``agent``, or if some other
+            callable is defined after it.
+    """
+    source = entrypoint.read_text()
+    namespace: dict[str, object] = {}
+    exec(compile(source, str(entrypoint), "exec"), namespace)  # noqa: S102
+    agent = namespace.get("agent")
+    if agent is None:
+        raise RuntimeError(f"{entrypoint} binds no `agent`; nothing would play")
+    served = get_last_callable(source, path=str(entrypoint))
+    if served is not agent:
+        raise RuntimeError(
+            f"{entrypoint} defines {getattr(served, '__name__', served)!r} after "
+            "its agent, so the runner would play that instead. Move it above the "
+            "agent import or into the package."
+        )
 
 
 if __name__ == "__main__":
