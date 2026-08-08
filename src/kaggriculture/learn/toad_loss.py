@@ -208,6 +208,12 @@ def losses(
             baseline loss through the shared trunk, so warmup is not perfectly
             policy-neutral even in their code; that is what they shipped and won
             with, and it is reproduced rather than corrected.
+        teacher_kl: ``(turns, batch)`` per-step KL(teacher || learner), or None
+            for the teacher-free phases. monobeast.py:129-140.
+        teacher_kl_cost: Coefficient on that KL. Their cascade runs 0. in phase
+            1, 0.005 in phase 2 and 0.001 from phase 3, and this project has
+            bracketed the window: 0.005 holds and 0.001 cliffs in five updates
+            when the reward is not yet self-sufficient.
 
     Returns:
         The four terms and their sum.

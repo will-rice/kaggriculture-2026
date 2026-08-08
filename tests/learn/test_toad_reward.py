@@ -75,7 +75,7 @@ def test_selling_stock_is_not_punished(observation: Mapping[str, Any]) -> None:
     """
     reward = toad_reward.StatefulMultiReward(observation, 0)
     reward.previous = toad_reward.Counts(
-        city=25, unit=1, research=0, fuel=40, capital=0, money=100.0
+        city=25, unit=1, research=0, fuel=40, capital=0, money=100.0, opponent=0.0
     )
     emptied = _with_shed(observation, 0)
     # Only `step` survives: the -40 stock delta is clamped away.
@@ -133,7 +133,9 @@ def _with_money(
 
 def _series(**deltas: float) -> list[toad_reward.Counts]:
     """Return a two-state counts series differing by the given deltas."""
-    base = toad_reward.Counts(city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0)
+    base = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0, opponent=0.0
+    )
     after = toad_reward.Counts(
         capital=0,
         city=25 + int(deltas.get("city", 0)),
@@ -141,6 +143,7 @@ def _series(**deltas: float) -> list[toad_reward.Counts]:
         research=0 + int(deltas.get("research", 0)),
         fuel=10 + int(deltas.get("fuel", 0)),
         money=1000.0 + deltas.get("money", 0.0),
+        opponent=0.0 + deltas.get("opponent", 0.0),
     )
     return [base, after]
 
@@ -197,7 +200,9 @@ def test_the_money_weight_is_the_derived_one() -> None:
     assert toad_reward.MONEY_WEIGHT == 0.001
 
 
-def test_the_clamped_money_term_pays_for_a_losing_round_trip(monkeypatch) -> None:
+def test_the_clamped_money_term_pays_for_a_losing_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The clamp is what made arm W pump, and this pins the mechanism.
 
     Buy 648 coins of stock, sell it back for 600. The farm is 48 coins poorer,
@@ -206,10 +211,18 @@ def test_the_clamped_money_term_pays_for_a_losing_round_trip(monkeypatch) -> Non
     gross_purchases tracking it and bank_mean pinned at zero.
     """
     monkeypatch.delenv(toad_reward.MONEY_SIGNED_ENV, raising=False)
-    buy = toad_reward.Counts(city=25, unit=1, research=0, fuel=18, capital=0, money=352.0)
-    sell = toad_reward.Counts(city=25, unit=1, research=0, fuel=10, capital=0, money=952.0)
-    opening = toad_reward.Counts(city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0)
-    total = float(toad_reward.shaped([opening, buy, sell], won=0.0, money_weight=0.01).sum())
+    buy = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=18, capital=0, money=352.0, opponent=0.0
+    )
+    sell = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=10, capital=0, money=952.0, opponent=0.0
+    )
+    opening = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0, opponent=0.0
+    )
+    total = float(
+        toad_reward.shaped([opening, buy, sell], won=0.0, money_weight=0.01).sum()
+    )
     # Net -48 coins, yet the reward is positive:
     #   sale 600 * 0.01 = 6.0 | stock +8 * 0.005 = 0.04 | 2 steps = 0.01
     #   6.05 / 500 = 0.0121
@@ -217,7 +230,9 @@ def test_the_clamped_money_term_pays_for_a_losing_round_trip(monkeypatch) -> Non
     assert total == pytest.approx(0.0121)
 
 
-def test_the_signed_money_term_punishes_a_losing_round_trip(monkeypatch) -> None:
+def test_the_signed_money_term_punishes_a_losing_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Unclamped, the deltas telescope to net coins, so the pump cannot pay.
 
     Same round trip, now worth the net -48 coins it actually cost:
@@ -225,9 +240,17 @@ def test_the_signed_money_term_punishes_a_losing_round_trip(monkeypatch) -> None
       -0.43 / 500 = -0.00086
     """
     monkeypatch.setenv(toad_reward.MONEY_SIGNED_ENV, "1")
-    buy = toad_reward.Counts(city=25, unit=1, research=0, fuel=18, capital=0, money=352.0)
-    sell = toad_reward.Counts(city=25, unit=1, research=0, fuel=10, capital=0, money=952.0)
-    opening = toad_reward.Counts(city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0)
-    total = float(toad_reward.shaped([opening, buy, sell], won=0.0, money_weight=0.01).sum())
+    buy = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=18, capital=0, money=352.0, opponent=0.0
+    )
+    sell = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=10, capital=0, money=952.0, opponent=0.0
+    )
+    opening = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0, opponent=0.0
+    )
+    total = float(
+        toad_reward.shaped([opening, buy, sell], won=0.0, money_weight=0.01).sum()
+    )
     assert total < 0.0
     assert total == pytest.approx(-0.00086)

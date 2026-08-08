@@ -42,9 +42,7 @@ def _segment(turns: int = 16) -> dict[str, torch.Tensor]:
 def _policy() -> tuple[Policy, torch.optim.Optimizer]:
     """Return a tiny policy and its optimizer."""
     policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
-    return policy, torch.optim.Adam(
-        policy.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS
-    )
+    return policy, torch.optim.Adam(policy.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
 
 def test_the_runner_can_take_a_warmup_step() -> None:

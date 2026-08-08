@@ -96,6 +96,84 @@ CAPITAL_WEIGHT = 1.0
 
 MONEY_WEIGHT = 0.001
 
+# OURS, AND NOT A SHAPING TERM AT ALL. The competition's win condition, verbatim,
+# is "having the most coins in the bank at the end of 720 turns", so the quantity
+# to maximise is our bank MINUS the opponent's, and a coin denied is worth exactly
+# a coin earned. Every arm this project has run maximised our own bank instead;
+# corpus mining over 1,350 seats then measured bank against ladder rating at
+# Pearson -0.043, and our 98.8th-percentile banker scores ~1,014.
+#
+# `margin` below is not shaping added to an objective -- it IS the objective,
+# decomposed onto the turns that produced it. The per-turn deltas telescope to
+# the terminal margin exactly (both farms open on the same `startingMoney`, so
+# the opening margin is zero and no constant leaks in).
+#
+# THE WEIGHT IS THE MONEY WEIGHT, deliberately. `margin` and `money` are both
+# denominated in coins, so reusing 0.001 says the two rewards put a coin of
+# margin and a coin of bank on the same scale, and the arm's whole diff is which
+# coin it counts. It also keeps the episode total in the band the value head has
+# already been trained over: a 160,000-coin margin reads
+# 160,000 * 0.001 / 500 = 0.32, against the 0.13-0.31 the shaped reward spanned,
+# and well inside VALUE_BOUND.
+MARGIN_WEIGHT = 0.001
+
+# OURS, AND NOT OPTIONAL. A purely differential reward is a fixed point of mirror
+# self-play: two copies of a policy that banks nothing bankrupt each other
+# identically, R_1 = -R_0, and the advantage vanishes. Measured here over 30
+# iterations -- mean bank 0, best episode 4 coins of a possible 200,000,
+# advantage -0.0008 +- 0.0128. FLG kept `+0.3 PER FACTORY` alongside their
+# differentials for exactly this reason, and note what that is: a COUNT of a
+# durable asset, not revenue.
+#
+# WHAT IT IS: the per-turn change in producing capital -- animals owned, whether
+# still in the shed or already standing on their structure. It is a floor under
+# the differential, NOT a co-objective, and it is deliberately not denominated in
+# coins.
+#
+# WHY NOT OUR OWN BANK, which was the obvious choice and is wrong. A seat's final
+# bank correlates +0.98 with its OPPONENT'S final bank (1.32.5: +0.977, 1.32.6:
+# +0.976, measured across the corpus by build). The shared order book sets the
+# level for both players and the seat contributes only the ~2.2% margin on top,
+# so a bank-proportional reward is 98% a measurement of the market draw. That is
+# why four bank-shaped arms went nowhere. Sizing makes it concrete -- at the
+# competitive operating point (1.32.6 median bank 80,660, median winning margin
+# 2,561) a per-coin absolute term large enough to matter anywhere is ruinous
+# here:
+#
+#   margin term    0.001 * 2,561              = +2.56
+#   terminal rank  10.0                       = +10.0
+#   own bank at 0.0002 * 77,660               = +15.53   <- SIX TIMES the margin
+#   own bank at 0.00002 * 77,660              = +1.55    <- still 61% of it
+#   capital at 0.05 * 15 structures           = +0.75    <- 6% of the objective
+#
+# A COUNT does not scale with the draw, so its share stays ~6% whether the market
+# paid 80,000 or 160,000. A coin-denominated term cannot have that property.
+#
+# WHY 0.05, AND WHY IT CANNOT PUMP. An un-priced count is exactly the shape that
+# gave this project three "shaped up, bank down" failures, so the weight is set
+# by a structural inequality rather than by taste: the margin term already
+# charges the full purchase price of anything bought, so acquiring capital is
+# reward-NEGATIVE unless the animal later earns its keep through the margin.
+#
+# That inequality only holds because the count is of ANIMALS, not of the
+# structures they stand on. `BUILD_COOP` and `BUILD_PASTURE` cost nothing at all
+# in this engine, so a structure count would have been free reward -- roughly a
+# hundred buildable tiles at 0.05 is 0.01 after the normaliser, against an
+# objective worth 0.025 at the competitive point. See `_hosts_animal`.
+#
+#   GOOSE  cost 300 -> margin -0.300, capital +0.050, net -0.250
+#   COW    cost 400 -> margin -0.400, capital +0.050, net -0.350
+#   SHEEP  cost 500 -> margin -0.500, capital +0.050, net -0.450
+#
+# Every animal in the game clears that test with 6x to 9x of headroom, so the
+# weight would have to rise above 0.30 before a buying spree paid for itself.
+# 0.05 is an order of magnitude below the cheapest animal's charge. Anchored on
+# the reference: economic_policy finishes a season with ~15 structures.
+#
+# If the margin improves while capital and bank both collapse, THIS WEIGHT IS TOO
+# SMALL. That read is pre-registered rather than something to tune around mid-run.
+ABSOLUTE_WEIGHT = 0.05
+
 # Arm W escalates the weight tenfold. Read from the environment rather than
 # passed down, because the rollout runs in worker subprocesses that inherit the
 # environment but not our arguments -- a weight threaded through the parent
@@ -140,6 +218,7 @@ def money_weight() -> float:
     """
     return float(os.environ.get(MONEY_WEIGHT_ENV, MONEY_WEIGHT))
 
+
 # reward_spaces_lux.py:227. Tuned against their 360-turn game; ours runs 719
 # decisions. Kept verbatim rather than rescaled, because faithfulness is the
 # point of this pass -- see the deviation list in the task report.
@@ -159,11 +238,19 @@ class Counts:
             monotone progress counter.
         capital: Producing animals -- those standing on the board and those
             still in the shed. Our compounding asset, in Toad's `city` slot.
+            Empty structures are excluded: building one is free, so counting it
+            would pay for nothing.
         fuel: Product stock in the shed. Animals are excluded; they are capital,
             not consumable stock. Their fuel is stored spendable resource
             in hand; ours is harvested stock not yet sold.
         money: Coins banked. Not a shaped component -- it decides
             ``game_result`` alone, exactly as their city-tile count does.
+        opponent: The other seat's coins banked. Public, unlike the shed, so
+            unlike ``fuel`` it is legible from either seat's observation. Held
+            here rather than recomputed at the call site so that one series of
+            ``Counts`` is sufficient for every reward in this module -- the
+            margin reward cannot then be handed a series that silently lacks
+            the quantity it is a difference of.
     """
 
     city: int
@@ -172,15 +259,30 @@ class Counts:
     fuel: int
     capital: int
     money: float
+    opponent: float
 
 
 _ANIMALS = frozenset(ANIMAL_NAMES)
 
 
-def _is_pasture(tile: object) -> bool:
-    """Whether a tile hosts a producing animal."""
-    kind = tile.get("kind") if hasattr(tile, "get") else None
-    return kind == "PASTURE"
+def _hosts_animal(tile: object) -> bool:
+    """Whether a tile has a producing animal standing on it.
+
+    THE TEST IS THE ANIMAL, NEVER THE STRUCTURE, and the difference is a pump.
+    ``BUILD_COOP`` and ``BUILD_PASTURE`` cost NOTHING -- they need only an empty
+    tile -- so a count of ``kind in {"COOP", "PASTURE"}`` pays for up to a
+    hundred free structures a season, which at any weight worth having swamps
+    the margin term. Counting the animal instead prices the same asset at the
+    300-500 coins it actually costs, which is what makes the capital term
+    unpumpable.
+
+    The engine writes ``{"kind": "PASTURE"}`` for an empty structure and
+    replaces it wholesale with ``_new_animal(...)`` -- a dict carrying an
+    ``"animal"`` key -- when one is placed, so the two states are disjoint and
+    nothing is counted twice. Tiles are also sometimes ``None`` or the string
+    ``"LOCKED"``, hence the type check rather than a bare ``in``.
+    """
+    return isinstance(tile, dict) and "animal" in tile
 
 
 def counts(observation: Mapping[str, Any], seat: int) -> Counts:
@@ -201,19 +303,15 @@ def counts(observation: Mapping[str, Any], seat: int) -> Counts:
     plants = sum(is_plant(tile) for row in tiles for tile in row)
     shed = observation["private"]["shed"]
     herd = sum(count for good, count in shed.items() if good in _ANIMALS)
-    pastures = sum(
-        1
-        for row in tiles
-        for tile in row
-        if tile is not None and getattr(tile, "get", dict().get) and _is_pasture(tile)
-    )
+    placed = sum(1 for row in tiles for tile in row if _hosts_animal(tile))
     return Counts(
         city=unlocked + plants,
         unit=1 + len(farm["hands"]),
         research=len(observation["town"]["unlocked_shops"]),
         fuel=sum(count for good, count in shed.items() if good not in _ANIMALS),
-        capital=herd + pastures,
+        capital=herd + placed,
         money=farm["money"],
+        opponent=float(observation["farms"][1 - seat]["money"]),
     )
 
 
@@ -284,9 +382,7 @@ class StatefulMultiReward:
         return total / NORMALISER
 
 
-def shaped(
-    series: list[Counts], won: float, money_weight: float = 0.0
-) -> torch.Tensor:
+def shaped(series: list[Counts], won: float, money_weight: float = 0.0) -> torch.Tensor:
     """Return the per-turn shaped reward for a counts series.
 
     The stateful class above is the faithful transcription of their per-step
@@ -341,6 +437,72 @@ def shaped(
             )
         )
         rewards.append(total / NORMALISER)
+    rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER
+    return torch.tensor(rewards, dtype=torch.float32)
+
+
+def margin(series: list[Counts], won: float) -> torch.Tensor:
+    """Return the per-turn margin reward for a counts series.
+
+    The win condition, decomposed onto the turns that produced it, plus the
+    smallest absolute term that survives mirror self-play. Three components and
+    no others:
+
+    * ``MARGIN_WEIGHT`` on the per-turn change in (our bank - theirs). Telescopes
+      to the terminal margin exactly.
+    * ``ABSOLUTE_WEIGHT`` on the per-turn change in producing capital. Present
+      only so that the reward is not identically zero-sum, which is a fixed
+      point self-play falls straight into. A count rather than coins, because a
+      seat's bank correlates +0.98 with its opponent's and a coin-denominated
+      floor is therefore 98% a reading of the shared market draw.
+    * ``GAME_RESULT_WEIGHT`` on the terminal rank, on the last turn alone --
+      Toad's own component, unmodified, and the literal statement that what is
+      being maximised is *winning* rather than the size of the win. At 10/500 =
+      0.02 it dominates the margin term for the near-parity episodes the corpus
+      says decide this ladder (a 2,561-coin median margin reads 0.005).
+
+    **No un-zeroed potential survives to the horizon.** The Grzes (AAMAS 2017)
+    condition is that a potential must be zero at a trajectory's stopping state,
+    or its ``g^N Phi(s_N)`` term modifies the policy. This project shipped that
+    bug once, by carrying the value of *held produce* into turn 719: at
+    gamma 0.999 holding from turn 619 returned 0.905 of its shaped value, so in a
+    market both farms were pushing below base, refusing to sell was
+    shaped-optimal, and "shed fills, bank flat" was built into the reward.
+
+    Two of the three components here cannot express that mistake, being coins or
+    a terminal rank. The capital term is the one that does carry a state to the
+    horizon, and it is made safe STRUCTURALLY rather than by zeroing: the margin
+    term already charges the full purchase price of an animal, which is 6x to 9x
+    what the capital term pays for it, so ending the season holding capital is
+    only ever profitable if that capital *earned* through the margin. There is no
+    turn late enough to make a buying spree pay. Held produce, meanwhile, is
+    worth exactly nothing here -- ``fuel`` never enters this reward.
+
+    Args:
+        series: The counts at each state, terminal state included, so the
+            differences are one per decision. One longer than the turns.
+        won: The terminal result in {-1., 0., +1.}, from ``rank``.
+
+    Returns:
+        ``(turns,)`` float32 rewards, already divided by ``NORMALISER``.
+
+    Raises:
+        ValueError: If ``series`` holds fewer than two states.
+    """
+    if len(series) < 2:
+        raise ValueError(
+            f"a margin series needs one state per turn plus the terminal one, "
+            f"got {len(series)}"
+        )
+    rewards = [
+        (
+            MARGIN_WEIGHT
+            * ((after.money - after.opponent) - (before.money - before.opponent))
+            + ABSOLUTE_WEIGHT * (after.capital - before.capital)
+        )
+        / NORMALISER
+        for before, after in zip(series[:-1], series[1:], strict=True)
+    ]
     rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER
     return torch.tensor(rewards, dtype=torch.float32)
 

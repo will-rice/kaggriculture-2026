@@ -129,12 +129,16 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.sales import buy_units, sale_metrics
 from kaggriculture.learn.toad_reward import (
     Counts,
     counts,
     money_weight,
     rank,
     shaped,
+)
+from kaggriculture.learn.toad_reward import (
+    margin as margin_reward,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -187,6 +191,12 @@ class Trajectory:
             and ``own`` rather than instead of them, for the same reason those
             two coexist: which one a gradient sees is the learner's choice, and
             a trajectory collected once is then usable under any of them.
+        margin: ``(turns,)`` the margin reward -- the win condition itself,
+            decomposed onto the turns that produced it, plus a small signed
+            own-bank term and Toad's terminal rank. See
+            ``toad_reward.margin``. Recorded beside the others for the same
+            reason they coexist: one episode, every reward, so an arm is a
+            choice of field rather than a re-run.
         shaped_money: ``(turns,)`` the same reward plus our one added component,
             a clamped per-turn coin delta at ``MONEY_WEIGHT``. This is phase-1b,
             and it is ours rather than Toad's -- see ``toad_reward.MONEY_WEIGHT``.
@@ -209,6 +219,18 @@ class Trajectory:
         illegal: How many stored action indices their stored mask forbids.
             Zero unless the sampling or the storing is broken; see the module
             docstring.
+        final_capital: Producing animals owned at the horizon -- the count the
+            margin reward's absolute term is a difference of. Logged because
+            "margin improves while capital and bank both collapse" is the
+            pre-registered read that says that term is too weak, and it cannot
+            be read off the reward total without it.
+        sales: Completed clears over the episode, from ``sales.sale_metrics``.
+        units_sold: Units those clears moved. The corpus says winners take
+            +3.3% on price at FLAT volume, so this is the control on
+            ``mean_sale_price`` rather than a target of its own.
+        mean_sale_price: Coins per unit actually realised.
+        realisation: Realised price over the market book, 1.0 being par.
+        bought: Units purchases credited to the shed, from ``sales.buy_units``.
     """
 
     board: torch.Tensor
@@ -224,10 +246,17 @@ class Trajectory:
     own: torch.Tensor
     shaped: torch.Tensor
     shaped_money: torch.Tensor
+    margin: torch.Tensor
     dones: torch.Tensor
     final_margin: float
     final_bank: float
+    final_capital: float
     illegal: int
+    sales: float
+    units_sold: float
+    mean_sale_price: float
+    realisation: float
+    bought: float
 
 
 @dataclass
@@ -248,6 +277,8 @@ class Stream:
             ``margins`` and never derived from it -- the differential loses
             which of the two farms the coins are on, which is the whole reason
             the reward needs both.
+        snapshots: The three things ``sales`` reads, copied out of each
+            observation as it is seen. See ``_snapshot``.
     """
 
     environment: int
@@ -256,6 +287,7 @@ class Stream:
     margins: list[float] = field(default_factory=list)
     banks: list[float] = field(default_factory=list)
     counts: list[Counts] = field(default_factory=list)
+    snapshots: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -362,6 +394,7 @@ def rollout_many(
             stream.margins.append(_margin(seen))
             stream.banks.append(_bank(seen))
             stream.counts.append(counts(seen, stream.seat))
+            stream.snapshots.append(_snapshot(seen))
         turns = _decide(
             policy,
             [
@@ -728,7 +761,9 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     margins = [*stream.margins, _margin(terminal)]
     banks = [*stream.banks, _bank(terminal)]
     series = [*stream.counts, counts(terminal, stream.seat)]
+    snapshots = [*stream.snapshots, _snapshot(terminal)]
     won = rank(series[-1].money, _other(terminal, stream.seat))
+    sold = sale_metrics(snapshots, stream.seat)
     dones = torch.zeros(len(turns), dtype=torch.bool)
     dones[-1] = True
     unit_actions = torch.cat([turn.units for turn in turns])
@@ -754,13 +789,57 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         # of counts and removes the only other way to run the comparison, which
         # is to play the season twice and hope it was deterministic.
         shaped_money=shaped(series, won, money_weight=money_weight()),
+        margin=margin_reward(series, won),
         dones=dones,
         final_margin=margins[-1],
         final_bank=_bank(terminal),
+        final_capital=float(series[-1].capital),
         illegal=(
             _illegal(unit_actions, unit_masks) + _illegal(market_actions, market_masks)
         ),
+        sales=sold["sales"],
+        units_sold=sold["units"],
+        mean_sale_price=sold["mean_sale_price"],
+        realisation=sold["price_realisation"],
+        bought=buy_units(snapshots, stream.seat),
     )
+
+
+def _snapshot(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy the three things ``sales`` reads out of one observation.
+
+    This exists for MEMORY, and specifically not for aliasing. I assumed the
+    aliasing and then measured it: ``Environment.state[seat].observation`` is a
+    fresh object with a fresh ``farms`` list on every step, and retaining the
+    live observations instead of these projections gives byte-identical sale
+    metrics over a real 719-turn episode. The alias warning in this module's
+    docstring is about ``env.steps``, which is a different structure, and it
+    does not reach this path.
+
+    What does reach this path is size. A round is 24 environments of 719 turns
+    with both seats recorded, and a full observation carries a 10x10 grid of
+    tile dicts; retaining them would hold roughly two orders of magnitude more
+    per trajectory than the 15.4 MB one already costs, in every one of the
+    twelve worker processes at once. So this takes exactly the fields
+    ``sale_metrics`` and ``buy_units`` index -- both seats' money, our shed and
+    the market book -- into a fresh dict shaped the way they expect.
+
+    It is a projection of an observation and not a substitute for one; nothing
+    else may be read from it, which is why it is built here beside its only two
+    consumers rather than exposed.
+
+    Args:
+        observation: One seat's observation, as seen at decision time.
+
+    Returns:
+        A standalone mapping with the same shape at the keys those two functions
+        reach through.
+    """
+    return {
+        "farms": [{"money": float(farm["money"])} for farm in observation["farms"]],
+        "private": {"shed": dict(observation["private"]["shed"])},
+        "market": {"prices": dict(observation["market"]["prices"])},
+    }
 
 
 def _other(observation: Mapping[str, Any], seat: int) -> float:

@@ -405,10 +405,17 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         # learner reading the wrong one from a learner reading the right one.
         shaped=torch.randn(turns) * 0.01,
         shaped_money=torch.randn(turns) * 0.01,
+        margin=torch.randn(turns) * 0.01,
         dones=dones,
         final_margin=float(rewards.sum()),
         final_bank=STARTING_MONEY + float(rewards.sum()),
+        final_capital=0.0,
         illegal=0,
+        sales=0.0,
+        units_sold=0.0,
+        mean_sale_price=0.0,
+        realisation=0.0,
+        bought=0.0,
     )
 
 

@@ -31,39 +31,40 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
 
 import argparse
 import copy
-import os
 import json
 import logging
+import os
 import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
+from importlib import metadata
 from pathlib import Path
 
 import torch
-import wandb
 from lightning import seed_everything
 
+import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
-from kaggriculture.learn.toad_reward import (
-    MONEY_SIGNED_ENV,
-    MONEY_WEIGHT,
-    MONEY_WEIGHT_ENV,
-    money_signed,
-    money_weight,
-)
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
-    TEACHER_KL_COST,
     CLIP_GRADS,
-    VALUE_WARMUP_BATCHES,
     LEARNING_RATE,
     MIN_LR_MOD,
+    TEACHER_KL_COST,
     TOTAL_STEPS,
     UNROLL_LENGTH,
+    VALUE_WARMUP_BATCHES,
     losses,
+)
+from kaggriculture.learn.toad_reward import (
+    ABSOLUTE_WEIGHT,
+    MARGIN_WEIGHT,
+    MONEY_SIGNED_ENV,
+    MONEY_WEIGHT_ENV,
+    money_weight,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -119,6 +120,13 @@ def main() -> None:
         action="store_true",
         help="train on the money-augmented reward instead of Toad's five "
         "components. The two arms must differ by this flag and nothing else.",
+    )
+    parser.add_argument(
+        "--margin",
+        action="store_true",
+        help="train on the margin reward -- the competition's actual win "
+        "condition -- instead of Toad's shaped components. Mutually exclusive "
+        "with --phase1b.",
     )
     parser.add_argument(
         "--money-weight",
@@ -200,8 +208,8 @@ def main() -> None:
         # Into the environment before the worker pool forks, so every rollout
         # process computes `shaped_money` at this arm's weight.
         os.environ[MONEY_WEIGHT_ENV] = repr(arguments.money_weight)
-    field = "shaped_money" if arguments.phase1b else REWARD_FIELD
-    prefix = arguments.name or ("phase1b" if arguments.phase1b else "phase1")
+    field = _field(arguments)
+    prefix = _prefix(arguments)
 
     device = _device()
     learner = Policy(
@@ -215,33 +223,12 @@ def main() -> None:
     steps, update = 0, 0
     if arguments.resume is not None:
         steps, update = _restore(arguments.resume, learner, optimizer, schedule, device)
-        LOGGER.info("resumed from %s at update %d, step %d", arguments.resume, update, steps)
+        LOGGER.info(
+            "resumed from %s at update %d, step %d", arguments.resume, update, steps
+        )
 
     log = RUNS / f"{prefix}_{int(time.time())}.jsonl"
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        name=arguments.name
-        or ("toad-phase1b-money-component" if arguments.phase1b else "toad-phase1-baseline"),
-        config={
-            "blocks": BLOCKS,
-            "channels": arguments.channels,
-            "value_bound": VALUE_BOUND,
-            "reward_field": field,
-            "money_weight": money_weight() if arguments.phase1b else 0.0,
-            "teacher_kl_cost": arguments.teacher_kl_cost,
-            "clone_init": arguments.clone_init,
-            "money_signed": arguments.money_signed,
-            "environments": ENVIRONMENTS,
-            "batch_segments": BATCH_SEGMENTS,
-            "unroll_length": UNROLL_LENGTH,
-            "sync_every": SYNC_EVERY,
-            "lr": LEARNING_RATE,
-            "adam_eps": ADAM_EPS,
-            "clip_grads": CLIP_GRADS,
-            "total_steps": TOTAL_STEPS,
-        },
-    )
+    run = _start_run(arguments, field)
     parameters = sum(p.numel() for p in learner.parameters())
     LOGGER.info(
         "phase 1: %d params, device %s, log %s, wandb %s",
@@ -251,26 +238,15 @@ def main() -> None:
         run.url,
     )
 
-    teacher = None
-    if arguments.teacher:
-        # The same weights the run initialises from, frozen. Their phase 3+ uses
-        # a SMALLER teacher ("small teacher"); ours is same-size. Deviation, named.
-        teacher = Policy(
-            blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
-        ).to(device)
-        _warm_start(teacher, device)
-        teacher.eval()
-        for parameter in teacher.parameters():
-            parameter.requires_grad_(False)
-        LOGGER.info(
-            "teacher: frozen clone, kl_cost %.4f", arguments.teacher_kl_cost
-        )
+    teacher = _teacher(arguments, device)
     actor = copy.deepcopy(learner).eval()
     warmup_left = VALUE_WARMUP_BATCHES if arguments.value_warmup else 0
     if warmup_left:
         LOGGER.info(
-            'value warmup: %d batches (~%.1f updates at %d batches/update)',
-            warmup_left, warmup_left / _batches_per_update(), _batches_per_update(),
+            "value warmup: %d batches (~%.1f updates at %d batches/update)",
+            warmup_left,
+            warmup_left / _batches_per_update(),
+            _batches_per_update(),
         )
     started = time.monotonic()
     pool = ProcessPoolExecutor(max_workers=WORKERS)
@@ -305,64 +281,308 @@ def main() -> None:
         if update % CHECKPOINT_EVERY == 0:
             _checkpoint(learner, optimizer, schedule, steps, update, prefix)
 
-        banks = [t.final_bank for t in batch]
-        # Kept apart on purpose. The mirror number is a private equilibrium --
-        # C'' self-played at ~50 while banking 8 against economic_policy -- so
-        # averaging the two populations together would rebuild exactly the
-        # illusion the external evaluator just exposed.
-        mirror_banks = [t.final_bank for t in mirror_batch] or [float("nan")]
-        econ_banks = [t.final_bank for t in econ_batch] or [float("nan")]
-        record = {
-            "update": update,
-            "steps": steps,
-            "hours": round((time.monotonic() - started) / 3600.0, 4),
-            "bank_mean": sum(banks) / len(banks),
-            "bank_max": max(banks),
-            "bank_mirror": sum(mirror_banks) / len(mirror_banks),
-            "bank_vs_econ": sum(econ_banks) / len(econ_banks),
-            "n_econ_envs": len(econ_batch),
-            "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
-            "illegal": sum(t.illegal for t in batch),
-            # The money component's own realised contribution, separable
-            # because both rewards ride on every trajectory. Logged for BOTH
-            # arms: on the baseline it is the counterfactual, on phase-1b it is
-            # the thing being paid for. Rising here while bank_mean stays flat
-            # is the money-pump signature -- a clamped delta means a buy-then-
-            # sell round trip that loses coins still earns shaped reward -- and
-            # this project has hit that failure three times. It must be visible
-            # in the charts from update 1, not reconstructed afterwards.
-            # Gross coins spent per episode. If the pump fires, buy volume
-            # rises alongside money_term -- the two together separate "learned
-            # to trade" from "learned to churn".
-            "gross_purchases": float(
-                torch.stack([(-t.own.clamp(max=0.0)).sum() for t in batch]).mean()
-            ),
-            "money_term": float(
-                torch.stack(
-                    [(t.shaped_money - t.shaped).sum() for t in batch]
-                ).mean()
-            ),
-            "lr": schedule.get_last_lr()[0],
-            # True while the value head is training alone, so the warmup
-            # window is readable off the data rather than inferred from a
-            # batch count.
-            "warming": warming,
-            "warmup_left": warmup_left,
-            **terms,
-        }
+        record = _record(
+            mirror_batch,
+            econ_batch,
+            field,
+            update=update,
+            steps=steps,
+            hours=round((time.monotonic() - started) / 3600.0, 4),
+            lr=schedule.get_last_lr()[0],
+            warming=warming,
+            warmup_left=warmup_left,
+            terms=terms,
+        )
         with log.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
         wandb.log(record, step=steps)
         LOGGER.info(
-            "update %d steps %d bank %.1f (max %.1f) shaped %.4f total_loss %.3f",
+            "update %d steps %d win_vs_econ %.3f margin %.1f bank %.1f "
+            "sale_price %.1f reward %.4f total_loss %.3f",
             update,
             steps,
+            record["win_rate_vs_econ"],
+            record["margin_mean_vs_econ"],
             record["bank_mean"],
-            record["bank_max"],
-            record["shaped_mean"],
+            record["mean_sale_price_vs_econ"],
+            record["reward_mean"],
             record["total"],
         )
     wandb.finish()
+
+
+def _record(
+    mirror_batch: list[Trajectory],
+    econ_batch: list[Trajectory],
+    field: str,
+    *,
+    update: int,
+    steps: int,
+    hours: float,
+    lr: float,
+    warming: bool,
+    warmup_left: int,
+    terms: dict[str, float],
+) -> dict[str, object]:
+    """Return one update's metrics, with the two populations kept apart.
+
+    THE SEPARATION IS THE POINT. C'' self-played at a mean bank of ~50 while
+    banking 8 against economic_policy, and the conflated number read as
+    capability for 209 updates. So every population-dependent metric is
+    suffixed, and the win rate that decides this arm is the scripted one alone.
+
+    Args:
+        mirror_batch: This round's self-play trajectories, both seats.
+        econ_batch: This round's scripted-opponent trajectories, our seat only.
+        field: The reward series the learner read.
+        update: Optimizer rounds so far.
+        steps: Environment steps so far.
+        hours: Wall clock since the run started.
+        lr: The schedule's current learning rate.
+        warming: Whether the value head is still training alone.
+        warmup_left: Batches still owed to that warmup.
+        terms: The loss terms from this round.
+
+    Returns:
+        The record written to the jsonl and to wandb.
+    """
+    batch = mirror_batch + econ_batch
+    banks = [t.final_bank for t in batch]
+    # THE NUMBER THAT DECIDES THIS ARM. "Winning the match (having the most
+    # coins in the bank at the end of 720 turns)" is the competition's own
+    # statement of the objective, and `final_margin` is exactly that
+    # quantity, so a win is `final_margin > 0` and nothing needs deriving.
+    #
+    # Read off the SCRIPTED population alone. The mirror rate is 0.5 by
+    # construction -- both seats of a self-play episode are recorded and one
+    # of them wins -- so averaging the two populations would produce a
+    # number that starts at 0.25 and looks like progress it has not made.
+    # This is the same conflation that made the mirror bank read as
+    # capability for 209 updates.
+    #
+    # Bank is now a diagnostic. Corpus mining over 1,350 seats put bank
+    # against ladder rating at Pearson -0.043; seats banking over 160k
+    # averaged rating 2,828 against 3,030 for seats banking under 60k.
+    mirror_banks = [t.final_bank for t in mirror_batch] or [float("nan")]
+    econ_banks = [t.final_bank for t in econ_batch] or [float("nan")]
+    record = {
+        "update": update,
+        "steps": steps,
+        "hours": hours,
+        "bank_mean": sum(banks) / len(banks),
+        "bank_max": max(banks),
+        "bank_mirror": sum(mirror_banks) / len(mirror_banks),
+        "bank_vs_econ": sum(econ_banks) / len(econ_banks),
+        "n_econ_envs": len(econ_batch),
+        "win_rate_vs_econ": _mean([float(t.final_margin > 0.0) for t in econ_batch]),
+        "win_rate_mirror": _mean([float(t.final_margin > 0.0) for t in mirror_batch]),
+        "margin_mean_vs_econ": _mean([t.final_margin for t in econ_batch]),
+        "margin_mean_mirror": _mean([t.final_margin for t in mirror_batch]),
+        # Where the corpus says the edge actually lives: winners in paired
+        # same-episode comparisons take +3.3% on mean sale price at FLAT
+        # volume. Volume is logged beside price so a price rise bought by
+        # simply selling less is visible rather than inferred.
+        **_sales(econ_batch, "vs_econ"),
+        **_sales(mirror_batch, "mirror"),
+        "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
+        # The episode total of the series the learner is actually reading.
+        # `shaped_mean` is logged unconditionally and is the counterfactual
+        # on this arm, not the objective -- reading it as progress here
+        # would be watching the wrong curve entirely.
+        "reward_mean": float(
+            torch.stack([getattr(t, field).sum() for t in batch]).mean()
+        ),
+        "illegal": sum(t.illegal for t in batch),
+        # The money component's own realised contribution, separable
+        # because both rewards ride on every trajectory. Logged for BOTH
+        # arms: on the baseline it is the counterfactual, on phase-1b it is
+        # the thing being paid for. Rising here while bank_mean stays flat
+        # is the money-pump signature -- a clamped delta means a buy-then-
+        # sell round trip that loses coins still earns shaped reward -- and
+        # this project has hit that failure three times. It must be visible
+        # in the charts from update 1, not reconstructed afterwards.
+        # Gross coins spent per episode. If the pump fires, buy volume
+        # rises alongside money_term -- the two together separate "learned
+        # to trade" from "learned to churn".
+        "gross_purchases": float(
+            torch.stack([(-t.own.clamp(max=0.0)).sum() for t in batch]).mean()
+        ),
+        "money_term": float(
+            torch.stack([(t.shaped_money - t.shaped).sum() for t in batch]).mean()
+        ),
+        "lr": lr,
+        # True while the value head is training alone, so the warmup
+        # window is readable off the data rather than inferred from a
+        # batch count.
+        "warming": warming,
+        "warmup_left": warmup_left,
+        **terms,
+    }
+    return record
+
+
+def _mean(values: list[float]) -> float:
+    """Return the mean, or NaN for an empty population.
+
+    An arm with ``--econ-fraction 0`` has no scripted episodes at all, and a
+    zero would be a *reading* -- "we win none of them" -- rather than the
+    absence of one. NaN is the honest value and wandb draws no point for it.
+    """
+    return sum(values) / len(values) if values else float("nan")
+
+
+def _sales(batch: list[Trajectory], population: str) -> dict[str, float]:
+    """Return one population's sale metrics, suffixed by which population it is.
+
+    Computed every update rather than every Nth, because it is free: measured
+    against a full 17.5-second episode, building the 719 snapshots costs 0.6 ms
+    and scanning them costs 0.3 ms, which together is 0.01% of collection.
+
+    Args:
+        batch: That population's trajectories, possibly empty.
+        population: ``"vs_econ"`` or ``"mirror"``, appended to every key.
+
+    Returns:
+        Mean sale price, realisation, sales, units and purchases for the
+        population, keyed so the two never merge.
+    """
+    return {
+        f"{name}_{population}": _mean([getattr(t, name) for t in batch])
+        for name in (
+            "mean_sale_price",
+            "realisation",
+            "sales",
+            "units_sold",
+            "bought",
+        )
+    }
+
+
+def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_run.Run":
+    """Open the tracked wandb run for this arm.
+
+    Every knob that distinguishes one arm from another is recorded here, so a
+    run's identity can be read off the dashboard rather than reconstructed from
+    a shell command nobody kept. That includes the weights of whichever reward
+    is live and zeroes for the ones that are not.
+
+    Args:
+        arguments: The parsed command line.
+        field: The reward series the learner will read.
+
+    Returns:
+        The started run.
+    """
+    return wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        name=arguments.name or _default_name(arguments),
+        config={
+            "blocks": BLOCKS,
+            "channels": arguments.channels,
+            "value_bound": VALUE_BOUND,
+            "reward_field": field,
+            "money_weight": money_weight() if arguments.phase1b else 0.0,
+            "margin_weight": MARGIN_WEIGHT if arguments.margin else 0.0,
+            "absolute_weight": ABSOLUTE_WEIGHT if arguments.margin else 0.0,
+            "econ_fraction": arguments.econ_fraction,
+            "value_warmup": arguments.value_warmup,
+            "teacher_kl_cost": arguments.teacher_kl_cost,
+            "clone_init": arguments.clone_init,
+            "money_signed": arguments.money_signed,
+            "environments": ENVIRONMENTS,
+            "batch_segments": BATCH_SEGMENTS,
+            "unroll_length": UNROLL_LENGTH,
+            "sync_every": SYNC_EVERY,
+            "lr": LEARNING_RATE,
+            "adam_eps": ADAM_EPS,
+            "clip_grads": CLIP_GRADS,
+            "total_steps": TOTAL_STEPS,
+            "engine": metadata.version("kaggle-environments"),
+        },
+    )
+
+
+def _teacher(arguments: argparse.Namespace, device: str) -> Policy | None:
+    """Return the frozen clone the learner is held near, or None.
+
+    The same weights the run initialises from. Toad never continues from a
+    competent policy without one, and this project has measured both sides of
+    that: removing the penalty took the bank from 17,675 to 9 in five updates,
+    and dropping the cost to 0.001 cliffed within a single sync cycle.
+
+    Their phase 3+ uses a SMALLER teacher; ours is the same size. Declared
+    deviation.
+
+    Args:
+        arguments: The parsed command line.
+        device: Where to place the teacher.
+
+    Returns:
+        The frozen policy, or None when the arm runs teacher-free.
+    """
+    if not arguments.teacher:
+        return None
+    teacher = Policy(
+        blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
+    ).to(device)
+    _warm_start(teacher, device)
+    teacher.eval()
+    teacher.requires_grad_(False)
+    LOGGER.info("teacher: frozen clone, kl_cost %.4f", arguments.teacher_kl_cost)
+    return teacher
+
+
+def _prefix(arguments: argparse.Namespace) -> str:
+    """Return the stem for this arm's checkpoints and jsonl.
+
+    Distinct per arm, because two arms sharing a prefix overwrite each other's
+    checkpoints silently and the evaluator globs on it.
+    """
+    if arguments.name:
+        return arguments.name
+    if arguments.margin:
+        return "phase1m"
+    if arguments.phase1b:
+        return "phase1b"
+    return "phase1"
+
+
+def _default_name(arguments: argparse.Namespace) -> str:
+    """Return the run name for an arm that did not pass ``--name``."""
+    if arguments.margin:
+        return "toad-phase1m-margin"
+    if arguments.phase1b:
+        return "toad-phase1b-money-component"
+    return "toad-phase1-baseline"
+
+
+def _field(arguments: argparse.Namespace) -> str:
+    """Return which recorded reward series this arm trains on.
+
+    Every trajectory carries all of them, so the arm is a choice of field and
+    nothing else -- which is what lets two arms share seeds, episodes and
+    actions and differ by one string.
+
+    Args:
+        arguments: The parsed command line.
+
+    Returns:
+        The ``Trajectory`` attribute name the learner reads.
+
+    Raises:
+        ValueError: If two rewards are asked for at once.
+    """
+    if arguments.margin and arguments.phase1b:
+        raise ValueError(
+            "--margin and --phase1b name two different rewards; an arm trains "
+            "on one of them"
+        )
+    if arguments.margin:
+        return "margin"
+    if arguments.phase1b:
+        return "shaped_money"
+    return REWARD_FIELD
 
 
 def _warm_start(learner: Policy, device: str) -> None:
@@ -494,7 +714,9 @@ def _device() -> str:
     """
     if not torch.cuda.is_available():
         return "cpu"
-    free = [torch.cuda.mem_get_info(index)[0] for index in range(torch.cuda.device_count())]
+    free = [
+        torch.cuda.mem_get_info(index)[0] for index in range(torch.cuda.device_count())
+    ]
     return f"cuda:{free.index(max(free))}"
 
 
@@ -515,9 +737,13 @@ def _collect(
         pool: The process pool to spread episodes over.
         state: The actor's weights, on CPU so they pickle to the workers.
         seeds: One seed per episode.
+        channels: Trunk width, so the workers rebuild the actor at this arm's
+            size rather than the module default.
+        econ_fraction: Share of the round played against ``OPPONENT`` instead of
+            the mirror. Those episodes record our seat only.
 
     Returns:
-        Every recorded trajectory, two per seed.
+        Every recorded trajectory: two per mirror seed and one per scripted one.
     """
     split = int(len(seeds) * econ_fraction)
     econ_seeds, mirror_seeds = list(seeds[:split]), list(seeds[split:])
@@ -590,6 +816,10 @@ def _update(
         optimizer: Its optimizer.
         batch: The trajectories collected this round.
         device: Where to run the learner.
+        field: Which recorded reward series the learner reads.
+        warmup_left: Batches still owed to the value head alone.
+        teacher: The frozen clone to stay near, or None.
+        teacher_kl_cost: Coefficient on that KL.
 
     Returns:
         The four loss terms and their total, averaged over the round's steps.
@@ -635,6 +865,11 @@ def _step(
         optimizer: Its optimizer.
         segments: ``BATCH_SEGMENTS`` unrolls of ``UNROLL_LENGTH`` turns.
         device: Where to run the learner.
+        field: Which recorded reward series the learner reads.
+        baseline_only: Train the value head alone, excluding the policy gradient
+            and entropy terms from the total.
+        teacher: The frozen clone to stay near, or None.
+        teacher_kl_cost: Coefficient on that KL.
 
     Returns:
         The four loss terms and their total, as floats.
@@ -772,6 +1007,7 @@ def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
         "log_probs",
         "shaped",
         "shaped_money",
+        "margin",
         "dones",
     )
     return [
