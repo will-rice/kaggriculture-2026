@@ -25,6 +25,26 @@ fixture to make a failing test pass.** A change here means the policy changed,
 which is sometimes the intent and must never be an accident — when it is
 deliberate, re-record and say why in the commit message.
 
+A characterization test pins an agent against an *engine*, and this one has now
+been re-recorded once for a reason that was not a policy change at all. Both
+recordings are kept below rather than one overwriting the other, because a
+fixture that silently rebaselines records nothing:
+
+- **kaggle-environments 1.32.3**, measured 2026-08-04. ``LEGACY_FINGERPRINT``.
+- **kaggle-environments 1.32.6**, measured 2026-08-08. ``FINGERPRINT``, and the
+  digests in ``economic_policy_decisions.json``. The ladder moved to 1.32.6 on
+  2026-08-07; it deleted the town centre's escalating demand schedule and
+  doubled ``townCenterSellInterval`` from 12 to 24, cutting late-season
+  town-centre demand about eightfold. The policy source is byte-identical
+  across the two recordings — what changed is the economy it prices into.
+  Divergence begins at turn 73 (day 3, hour 1) on all three seeds, which is the
+  turn after the first shop opens and the agent first prices the book, and
+  574–584 of the 719 turns differ thereafter.
+
+So the two tables below are not "old" and "new" values of one measurement. They
+are the same agent measured in two different economies, and the gap between
+them is the size of the engine change, not of any edit of ours.
+
 The opponent is `pass`, which keeps the other player out of the market entirely,
 so these depend only on our own decisions and on the seed's weeds and shop
 unlocks. That makes them a test of this agent rather than of a matchup.
@@ -44,8 +64,10 @@ DECISIONS = json.loads(
     (Path(__file__).parent / "fixtures" / "economic_policy_decisions.json").read_text()
 )
 
-# Measured 2026-08-04 from the vendored policy as pulled, before any edits.
-FINGERPRINT = {11: 152803, 22: 152145, 33: 159087}
+# Terminal bank, seat 0, opponent `pass`. See the module docstring: same agent,
+# two engines. The 1.32.3 column is history and no decision may be taken on it.
+LEGACY_FINGERPRINT = {11: 152803, 22: 152145, 33: 159087}  # 1.32.3, 2026-08-04
+FINGERPRINT = {11: 149176, 22: 147181, 33: 108290}  # 1.32.6, 2026-08-08
 
 
 def digest(action: dict) -> str:
@@ -89,4 +111,8 @@ def test_agent_banks_what_it_banked_before(seed: int) -> None:
 
     env.run([economic_policy.agent, "pass"])
 
-    assert int(env.steps[-1][0].reward) == FINGERPRINT[seed]
+    assert int(env.steps[-1][0].reward) == FINGERPRINT[seed], (
+        f"seed {seed}: this pins the agent on kaggle-environments 1.32.6; it "
+        f"banked {LEGACY_FINGERPRINT[seed]} here on 1.32.3. If the installed "
+        f"engine moved again, re-record both tables rather than one"
+    )

@@ -6,6 +6,10 @@ against. Kaggle runs submissions inside that same package, so the import is
 available both locally and on the competition runner.
 """
 
+import json
+from pathlib import Path
+
+from kaggle_environments.envs.kaggriculture import kaggriculture as kaggriculture_env
 from kaggle_environments.envs.kaggriculture.kaggriculture import (
     ANIMALS,
     CROPS,
@@ -14,10 +18,64 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
     MARKET_PARAMS,
     PRODUCTS,
     SHOPS,
-    TOWN_CENTER_DEMAND_SCHEDULE,
     TOWN_CENTER_PRODUCTS,
     market_price,
 )
+
+# The 1.32.3 town-centre demand curve, kept here because the engine deleted it.
+#
+# Until kaggle-environments 1.32.6 the town centre's appetite escalated with the
+# calendar -- `TOWN_CENTER_DEMAND_SCHEDULE = [(20, 4), (10, 2), (0, 1)]`, read
+# highest-threshold-first -- so late-season demand was four times the opening
+# rate. 1.32.6 deleted the schedule for a flat rate and doubled
+# `townCenterSellInterval` from 12 to 24, cutting late-game town-centre demand
+# about eightfold.
+#
+# Anything reconstructing demand *from the archives* has to pick a curve per
+# episode, because the corpus straddles the change: measured 2026-08-08, the
+# eight archives dated 2026-07-30 to 2026-08-06 are entirely legacy, and the
+# 2026-08-07 archive is 404 legacy episodes and 271 flat-rate ones. Anything
+# reasoning about the game we now play uses neither of these. They are
+# historical constants, named as such, and deliberately not re-exported from
+# the live rules block above.
+#
+# Each archived episode states which it was played under: its JSON carries the
+# whole `configuration`, so `townCenterSellInterval` is the discriminator and
+# no guess is required. `learn.bands.drain` takes it as a required argument for
+# that reason -- a default would silently mis-model a quarter of the newest
+# archive.
+LEGACY_TOWN_CENTER_DEMAND_SCHEDULE = [(20, 4), (10, 2), (0, 1)]
+LEGACY_TOWN_CENTER_SELL_INTERVAL = 12
+
+# The interval that shipped alongside the flat rate, in 1.32.6. An archived
+# episode reporting this or more was played after the schedule was deleted; one
+# reporting less was played under `LEGACY_TOWN_CENTER_DEMAND_SCHEDULE`.
+#
+# Written out rather than read from the live engine on purpose. It happens to
+# equal `TOWN_CENTER_SELL_INTERVAL` today, but it is a statement about episodes
+# already on disk, and a future engine that moved the interval again would
+# otherwise silently reclassify every archive we have.
+FLAT_TOWN_CENTER_SELL_INTERVAL = 24
+
+
+def _config_default(name: str, fallback: int) -> int:
+    """Return a configuration default from the environment's own schema.
+
+    Args:
+        name: Key under ``configuration`` in ``kaggriculture.json``.
+        fallback: Value to use if the key or its default is absent.
+
+    Returns:
+        The schema's default for that key.
+    """
+    schema = json.loads(
+        (Path(kaggriculture_env.__file__).parent / "kaggriculture.json").read_text()
+    )
+    entry = schema.get("configuration", {}).get(name)
+    if isinstance(entry, dict) and "default" in entry:
+        return int(entry["default"])
+    return fallback
+
 
 __all__ = [
     "ENVIRONMENT",
@@ -29,7 +87,9 @@ __all__ = [
     "MARKET_PARAMS",
     "PRODUCTS",
     "SHOPS",
-    "TOWN_CENTER_DEMAND_SCHEDULE",
+    "FLAT_TOWN_CENTER_SELL_INTERVAL",
+    "LEGACY_TOWN_CENTER_DEMAND_SCHEDULE",
+    "LEGACY_TOWN_CENTER_SELL_INTERVAL",
     "TOWN_CENTER_PRODUCTS",
     "TOWN_SHOP_SELL_INTERVAL",
     "TOWN_CENTER_SELL_INTERVAL",
@@ -72,8 +132,13 @@ ACT_TIMEOUT = 1.0
 # drain is a fixed quantity per interval and never depends on the inventory
 # level, so the book is exactly additive in what the two farms put into it --
 # which is what makes one farm's price impact on the other one computable.
-TOWN_SHOP_SELL_INTERVAL = 4
-TOWN_CENTER_SELL_INTERVAL = 12
+#
+# These are read from the environment's own schema rather than typed here. The
+# hardcoded 12 that used to sit on the next line silently became wrong when
+# 1.32.6 doubled the interval to 24, which is precisely the drift this module's
+# docstring exists to prevent -- a rules table is only safe if it is imported.
+TOWN_SHOP_SELL_INTERVAL = _config_default("townShopSellInterval", 4)
+TOWN_CENTER_SELL_INTERVAL = _config_default("townCenterSellInterval", 24)
 
 # Movement op -> (dx, dy); y grows downward.
 MOVES = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}

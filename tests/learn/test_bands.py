@@ -6,10 +6,18 @@ disagree about what a sale is, that the town-drain transcription has drifted
 from the engine, and that the rating attribution is assigning coin flips.
 """
 
+import json
+import zipfile
 from typing import Any
 
 import pytest
 
+from kaggriculture.constants import (
+    FLAT_TOWN_CENTER_SELL_INTERVAL as FLAT,
+)
+from kaggriculture.constants import (
+    LEGACY_TOWN_CENTER_SELL_INTERVAL as LEGACY,
+)
 from kaggriculture.constants import PRODUCTS
 from kaggriculture.learn.bands import (
     attribute,
@@ -81,7 +89,7 @@ def test_the_town_drains_the_book_on_its_own_schedule() -> None:
     buys on top -- three wool in all. Wheat is not something the yarn store
     buys, so it sees the centre's one unit only.
     """
-    removed = drain(0, ["YARN_STORE"], day=0)
+    removed = drain(0, ["YARN_STORE"], day=0, center_interval=LEGACY)
 
     assert removed["WOOL"] == 3
     assert removed["WHEAT"] == 1
@@ -89,14 +97,38 @@ def test_the_town_drains_the_book_on_its_own_schedule() -> None:
 
 def test_nothing_drains_between_the_towns_intervals() -> None:
     """Turn 1 is neither a shop turn nor a centre turn."""
-    assert drain(1, ["YARN_STORE"], day=0) == {}
+    assert drain(1, ["YARN_STORE"], day=0, center_interval=LEGACY) == {}
 
 
-def test_the_centre_buys_more_as_the_season_runs_out() -> None:
-    """Its schedule steps up on day 10 and again on day 20."""
-    assert drain(12, [], day=5)["WHEAT"] == 1
-    assert drain(12, [], day=15)["WHEAT"] == 2
-    assert drain(12, [], day=25)["WHEAT"] == 4
+def test_a_legacy_episode_gets_the_escalating_centre_it_was_played_under() -> None:
+    """The pre-1.32.6 schedule stepped up on day 10 and again on day 20.
+
+    Deliberately *not* the installed engine's behaviour. Eight of the nine
+    archives on disk, and 404 of the 675 episodes in the ninth, report
+    ``townCenterSellInterval`` 12 and were played under the escalating
+    schedule. Asserting the flat rate for them would make ``bands`` wrong about
+    most of the data it reads.
+    """
+    assert drain(12, [], day=5, center_interval=LEGACY)["WHEAT"] == 1
+    assert drain(12, [], day=15, center_interval=LEGACY)["WHEAT"] == 2
+    assert drain(12, [], day=25, center_interval=LEGACY)["WHEAT"] == 4
+
+
+def test_a_flat_rate_episode_gets_one_unit_whatever_the_day() -> None:
+    """The other side of the same corpus: 271 episodes dated 2026-08-07.
+
+    Same function, same days, and the answer has to differ -- this is what a
+    single global constant got wrong, and what makes ``center_interval`` a
+    required argument rather than a default.
+    """
+    for day in (5, 15, 25):
+        assert drain(24, [], day=day, center_interval=FLAT)["WHEAT"] == 1
+
+    # Turn 12 is a centre tick for a legacy episode and a quiet turn for a
+    # flat-rate one. The two builds disagree about the same turn index, which is
+    # exactly why the interval cannot be read from the installed engine.
+    assert drain(12, [], day=25, center_interval=LEGACY)["WHEAT"] == 4
+    assert drain(12, [], day=25, center_interval=FLAT) == {}
 
 
 def test_impact_prices_what_one_seats_selling_took_from_the_other() -> None:
@@ -203,18 +235,57 @@ def test_summing_the_per_good_clears_reproduces_the_aggregate() -> None:
         assert sum(sum(turn.values()) for turn in counted) == aggregate["units"]
 
 
+def _episode_on(interval: int) -> dict[str, Any]:
+    """Return the first archived episode played at a given centre interval.
+
+    The build is read from the head of each episode's JSON rather than by
+    decoding it. ``configuration`` is the first key the exporter writes, and
+    the flat-rate episodes are not at the front of the archive, so selecting
+    them by decoding would mean parsing tens of 32 MB documents to find one.
+
+    Args:
+        interval: The ``townCenterSellInterval`` to look for.
+
+    Returns:
+        The decoded replay.
+
+    Raises:
+        AssertionError: If the archive holds no episode on that build.
+    """
+    decoder = json.JSONDecoder()
+    marker = '"townCenterSellInterval": '
+    with zipfile.ZipFile(ARCHIVE) as bundle:
+        for name in bundle.namelist():
+            if not name.endswith(".json"):
+                continue
+            with bundle.open(name) as member:
+                head = member.read(2048).decode("utf-8", "ignore")
+            value, _ = decoder.raw_decode(head, head.find(marker) + len(marker))
+            if int(value) == interval:
+                return load(ARCHIVE, int(name.removesuffix(".json")))
+    raise AssertionError(f"no episode at townCenterSellInterval {interval}")
+
+
 @real
-def test_the_drain_transcription_matches_the_engine_on_quiet_turns() -> None:
+@pytest.mark.parametrize("interval", [LEGACY, FLAT])
+def test_the_drain_transcription_matches_the_build_that_played_the_episode(
+    interval: int,
+) -> None:
     """On a turn where neither farm traded, the town is the only thing moving.
 
     This is what licenses the price-impact counterfactual. The book is additive
     in the two farms' trading only if the town's demand never depends on the
-    inventory level, and the way to check that against the shipped engine
-    without running it is to find the turns where the farms did nothing and
-    confirm the book moved by exactly the transcribed amount.
+    inventory level, and the way to check that without running an engine is to
+    find the turns where the farms did nothing and confirm the book moved by
+    exactly the transcribed amount.
+
+    Checked against the engine *in the replay*, not the one installed, and
+    checked once per build because the 2026-08-07 archive holds both: 404
+    episodes at ``townCenterSellInterval`` 12 and 271 at 24. A single-episode
+    version of this test passed while ``drain`` modelled one build globally,
+    which is how the flat-rate quarter of the archive went unnoticed.
     """
-    rows = index([ARCHIVE])
-    episode = load(ARCHIVE, rows[0].episode)
+    episode = _episode_on(interval)
     steps = episode["steps"]
     views = {seat: [step[seat]["observation"] for step in steps] for seat in (0, 1)}
 
@@ -229,7 +300,7 @@ def test_the_drain_transcription_matches_the_engine_on_quiet_turns() -> None:
             for seat in (0, 1)
         ):
             continue
-        removed = drain(turn, state["town"]["unlocked_shops"], state["day"])
+        removed = drain(turn, state["town"]["unlocked_shops"], state["day"], interval)
         for good in PRODUCTS:
             moved = (
                 views[0][turn + 1]["market"]["inventory"][good]
@@ -284,4 +355,6 @@ def test_coverage_reports_how_much_trade_the_shed_inference_misses() -> None:
         for seat, view in views.items()
     }
 
-    assert 0.3 < coverage(views[0], net) < 1.0
+    interval = int(episode["configuration"]["townCenterSellInterval"])
+
+    assert 0.3 < coverage(views[0], net, interval) < 1.0

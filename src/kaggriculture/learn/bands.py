@@ -18,6 +18,13 @@ Two things make the comparison harder than banding on the manifest:
   1,212; the 2026-08-07 archive's rates 3,150. Pooling nine days of ratings
   compares a July median against an August top decile, so every band in here is
   a *within-day* percentile.
+- **The corpus straddles an engine change, inside a single archive.** Measured
+  2026-08-08 off the episodes' own ``configuration``: the eight archives dated
+  2026-07-30 to 2026-08-06 all report ``townCenterSellInterval`` 12, and the
+  2026-08-07 archive is 404 episodes at 12 and 271 at 24 -- the 1.32.6 build,
+  which deleted the town centre's escalating demand schedule for a flat rate.
+  So ``drain`` takes the interval per episode and refuses a default; see its
+  docstring. Nothing here reads the *installed* engine's town constants.
 
 The deep pass decodes sampled episodes and profiles both seats. It reuses
 ``sales.sale_metrics`` and ``sales.buy_units`` verbatim rather than restating
@@ -42,13 +49,13 @@ from typing import Any
 from pydantic import BaseModel
 
 from kaggriculture.constants import (
+    FLAT_TOWN_CENTER_SELL_INTERVAL,
+    LEGACY_TOWN_CENTER_DEMAND_SCHEDULE,
     MARKET_PARAMS,
     PRODUCTS,
     SEASON_DAYS,
     SHOPS,
-    TOWN_CENTER_DEMAND_SCHEDULE,
     TOWN_CENTER_PRODUCTS,
-    TOWN_CENTER_SELL_INTERVAL,
     TOWN_SHOP_SELL_INTERVAL,
     TURNS_PER_DAY,
     market_price,
@@ -321,19 +328,39 @@ def purchases(
     }
 
 
-def drain(step: int, shops: Sequence[str], day: int) -> dict[str, int]:
-    """Return how much stock the town takes out of the book on one turn.
+def drain(
+    step: int, shops: Sequence[str], day: int, center_interval: int
+) -> dict[str, int]:
+    """Return how much stock the town took out of the book on one archived turn.
 
-    The demand side of the market, transcribed from ``_town_consume``. Its only
-    inputs are the turn index, the day and which shops have opened, all three of
-    which the observation records, and it never looks at the inventory -- so the
+    The demand side of the market, transcribed from ``_town_consume``, for
+    whichever engine played the episode. ``center_interval`` is that episode's
+    own ``configuration["townCenterSellInterval"]`` and it selects the model:
+    below ``FLAT_TOWN_CENTER_SELL_INTERVAL`` the town centre escalates with the
+    calendar on ``LEGACY_TOWN_CENTER_DEMAND_SCHEDULE``, and at or above it the
+    rate is a flat one. The release that deleted the schedule is the release
+    that doubled the interval, so the interval is a complete discriminator.
+
+    It is a required argument rather than a default because the corpus
+    straddles the change -- the 2026-08-07 archive is 404 legacy episodes and
+    271 flat-rate ones -- so any default would silently mis-model a quarter of
+    it. This function is never called with the *live* engine's constants; it
+    reads archives, and each archive states what it was played under.
+
+    Its only inputs are the turn index, the day, which shops have opened and
+    that one configuration value. It never looks at the inventory -- so the
     book is exactly additive in the two farms' trading, and the counterfactual
-    in ``impact`` is a subtraction rather than a simulation.
+    in ``impact`` is a subtraction rather than a simulation. That holds on both
+    engines: 1.32.6 changed how much the town takes, not whether the amount
+    depends on what is in the book.
 
     Args:
         step: The turn index, which is the ``step`` the interpreter sees.
-        shops: The shops open at the start of the turn.
+        shops: The shops open at the start of the turn. One entry per shop
+            instance, so a shop listed twice drains twice -- which 1.32.6 made
+            reachable by drawing shops with replacement.
         day: The day that turn falls on.
+        center_interval: The episode's ``townCenterSellInterval``.
 
     Returns:
         Units removed per good.
@@ -345,8 +372,12 @@ def drain(step: int, shops: Sequence[str], day: int) -> dict[str, int]:
             multiplier = 2 if len(products) == 1 else 1
             for item in products:
                 removed[item] += multiplier
-    if step % TOWN_CENTER_SELL_INTERVAL == 0:
-        centre = next(m for at, m in TOWN_CENTER_DEMAND_SCHEDULE if day >= at)
+    if step % center_interval == 0:
+        centre = (
+            1
+            if center_interval >= FLAT_TOWN_CENTER_SELL_INTERVAL
+            else next(m for at, m in LEGACY_TOWN_CENTER_DEMAND_SCHEDULE if day >= at)
+        )
         for item in TOWN_CENTER_PRODUCTS:
             removed[item] += centre
     return removed
@@ -355,6 +386,7 @@ def drain(step: int, shops: Sequence[str], day: int) -> dict[str, int]:
 def coverage(
     book: Sequence[Mapping[str, Any]],
     net: Mapping[int, Sequence[Mapping[str, int]]],
+    center_interval: int,
 ) -> float:
     """Return what fraction of real trade the shed inference accounts for.
 
@@ -366,10 +398,6 @@ def coverage(
     that says how far the trade profile and the price-impact figures can be
     pushed.
 
-    Args:
-        book: Seat 0's observations, which carry the shared market and the town.
-        net: Every seat's per-turn net contribution to the book, per good.
-
     Compared over the season rather than turn by turn, because what the
     counterfactual actually depends on is the running total a seat has put into
     the book, not the timing of any one clear.
@@ -377,6 +405,8 @@ def coverage(
     Args:
         book: Seat 0's observations, which carry the shared market and the town.
         net: Every seat's per-turn net contribution to the book, per good.
+        center_interval: The episode's ``townCenterSellInterval``, passed
+            straight to ``drain``.
 
     Returns:
         Inferred net units over true net units, summed over goods as absolute
@@ -385,7 +415,9 @@ def coverage(
     inferred: dict[str, int] = defaultdict(int)
     truth: dict[str, int] = defaultdict(int)
     for turn, state in enumerate(book[:-1]):
-        removed = drain(turn, state["town"]["unlocked_shops"], state["day"])
+        removed = drain(
+            turn, state["town"]["unlocked_shops"], state["day"], center_interval
+        )
         levels = state["market"]["inventory"]
         after = book[turn + 1]["market"]["inventory"]
         for good in PRODUCTS:
@@ -511,7 +543,12 @@ def profiles(
         for seat, view in views.items()
     }
     impacts = {seat: impact(views[0], sold, net, seat) for seat in seats}
-    accounted = coverage(views[0], net)
+    # From the replay's own configuration, not from the installed engine: the
+    # corpus straddles the 1.32.6 town-centre change and a quarter of the newest
+    # archive was played under the new rate.
+    accounted = coverage(
+        views[0], net, int(episode["configuration"]["townCenterSellInterval"])
+    )
     sold_mix = {seat: _mix(sold[seat]) for seat in seats}
 
     out: list[Profile] = []

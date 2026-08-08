@@ -18,6 +18,36 @@ def test_board_defaults_match_environment() -> None:
     assert configuration.maxMarketOrdersPerTurn == constants.MAX_MARKET_ORDERS_PER_TURN
 
 
+def test_town_sell_intervals_match_environment() -> None:
+    """The town's two clocks are the environment's, not numbers we typed.
+
+    These were hardcoded until kaggle-environments 1.32.6 doubled
+    ``townCenterSellInterval`` from 12 to 24 and nothing failed: the constant
+    stayed at 12 and every consumer of it silently modelled an engine that no
+    longer existed. This is the assertion that would have caught it.
+    """
+    configuration = make("kaggriculture").configuration
+
+    assert configuration.townShopSellInterval == constants.TOWN_SHOP_SELL_INTERVAL
+    assert configuration.townCenterSellInterval == constants.TOWN_CENTER_SELL_INTERVAL
+
+
+def test_the_legacy_town_constants_are_not_the_live_ones() -> None:
+    """The historical values are pinned as history, and differ from the engine.
+
+    ``learn.bands`` reads pre-1.32.6 replay archives and must reconstruct the
+    town they were played under. If a later engine bump ever made the legacy
+    constants coincide with the live ones this test fails, which is the signal
+    that the distinction has stopped being load-bearing rather than a licence
+    to delete one side of it.
+    """
+    assert constants.LEGACY_TOWN_CENTER_SELL_INTERVAL == 12
+    assert constants.LEGACY_TOWN_CENTER_SELL_INTERVAL != (
+        constants.TOWN_CENTER_SELL_INTERVAL
+    )
+    assert not hasattr(env_module, "TOWN_CENTER_DEMAND_SCHEDULE")
+
+
 def test_movement_offsets_match_environment() -> None:
     """Our move table matches the offsets the interpreter applies."""
     assert constants.MOVES == env_module.FARMER_MOVES
