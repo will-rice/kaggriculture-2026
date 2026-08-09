@@ -37,7 +37,14 @@ ENTROPY_COST = 0.001
 LEARNING_RATE = 1e-4
 ADAM_EPS = 0.0003
 MIN_LR_MOD = 0.01
-TOTAL_STEPS = int(2e7)
+# DECLARED DEVIATION, and the only variable in this arm. Their phase 1 is
+# `total_steps: 2e7`, which is what every arm this project has run has used --
+# and phase 1 is one of five, ~9e7 across the published cascade. Ten arms have
+# now failed at a tenth to a fifteenth of the budget the recipe was won on, so
+# "we never trained long enough" is untested rather than refuted. 5x their
+# phase 1 settles it. The LR schedule is keyed on this, so lengthening the
+# budget stretches the decay rather than leaving it floored at 2e7.
+TOTAL_STEPS = int(1e8)
 UNROLL_LENGTH = 16
 REDUCTION = "sum"
 # monobeast.py:502-505 clips the global gradient norm before every optimizer

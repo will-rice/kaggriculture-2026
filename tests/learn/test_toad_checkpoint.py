@@ -7,6 +7,7 @@ schedule silently restarted from step zero restores the initial rate and changes
 the recipe for the remainder of the run without anything looking wrong.
 """
 
+import itertools
 import pathlib
 
 import pytest
@@ -14,7 +15,15 @@ import torch
 
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts import toad_phase1
-from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE
+from kaggriculture.learn.toad_loss import (
+    ADAM_EPS,
+    LEARNING_RATE,
+    MIN_LR_MOD,
+    TOTAL_STEPS,
+)
+
+# The arm's own mix, so the schedule under test is the one that runs.
+ECON_FRACTION = 0.5
 
 
 def _fresh() -> tuple[
@@ -23,8 +32,35 @@ def _fresh() -> tuple[
     """Return a policy, optimizer and schedule as `main` builds them."""
     policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
     optimizer = torch.optim.Adam(policy.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
-    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, toad_phase1._decay)
+    schedule = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, toad_phase1._decay(ECON_FRACTION)
+    )
     return policy, optimizer, schedule
+
+
+@pytest.mark.parametrize(("econ_fraction", "seats"), [(0.0, 48), (0.5, 36), (0.25, 42)])
+def test_the_schedule_reaches_its_floor_no_earlier_than_the_budget(
+    econ_fraction: float, seats: int
+) -> None:
+    """The decay must span the budget, not floor a quarter of the way short.
+
+    Their linear schedule reaches ``min_lr_mod`` at 99% of ``total_steps``. An
+    arm that mixes opponents records fewer seats per round than the environment
+    count suggests -- 36 rather than 48 at ``--econ-fraction 0.5`` -- so a
+    schedule keyed on the naive count floors at 74% of the budget and the last
+    quarter of the run trains at 1e-6. The seat counts are literals and the run
+    is played forward a round at a time, so this fails on the real quantity
+    rather than agreeing with the helper it checks.
+    """
+    decay = toad_phase1._decay(econ_fraction)
+    steps, update = 0, 0
+    while steps < TOTAL_STEPS:
+        steps += seats * toad_phase1.TURNS
+        update += 1
+    floor = next(step for step in itertools.count() if decay(step) == MIN_LR_MOD)
+
+    assert decay(0) == 1.0
+    assert floor / update > 0.98
 
 
 def test_resuming_continues_the_schedule_rather_than_restarting_it(

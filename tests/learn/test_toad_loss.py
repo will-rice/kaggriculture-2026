@@ -175,6 +175,16 @@ def test_the_phase_one_constants_are_the_published_ones() -> None:
     assert toad_loss.ENTROPY_COST == 0.001
     assert toad_loss.LEARNING_RATE == 1e-4
     assert toad_loss.ADAM_EPS == 0.0003
-    assert toad_loss.TOTAL_STEPS == 20_000_000
     assert toad_loss.UNROLL_LENGTH == 16
     assert toad_loss.REDUCTION == "sum"
+
+
+def test_the_budget_is_the_declared_deviation_from_their_phase_one() -> None:
+    """``TOTAL_STEPS`` is the one constant here that is NOT their published value.
+
+    Split out of the pin above so the deviation is visible rather than buried in
+    a list of faithful numbers. Theirs is 2e7 for phase 1 of five; this arm runs
+    5x that, because every arm this project has run stopped at their phase-1
+    length and none of them was ever given the budget the recipe was won on.
+    """
+    assert toad_loss.TOTAL_STEPS == 100_000_000

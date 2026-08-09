@@ -35,7 +35,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from importlib import metadata
 from pathlib import Path
@@ -94,10 +94,18 @@ REWARD_FIELD = "shaped"
 # Episodes per collection round. Their n_actor_envs is 16 across 2 actors; ours
 # is one synchronous group, and both seats of a self-play episode are recorded.
 ENVIRONMENTS = 24
+# Decisions in a season. The engine runs 720 turns and the last one takes no
+# action, so a recorded seat is 719 rows.
+TURNS = 719
 # The engine is single-threaded Python and is the bottleneck -- measured, the
 # rollout is env-bound rather than network-bound, so the GPU does not fix it.
 # Collection is spread over processes the way `selfplay.collect` does it.
-WORKERS = 12
+#
+# One per environment. `_collect` splits the pool in half when an arm mixes
+# opponents, so 12 gave each worker two episodes to play in series on a 64-core
+# box that was running about ten of them. ENVIRONMENTS is deliberately NOT
+# changed with it: that would move the effective batch and therefore the recipe.
+WORKERS = ENVIRONMENTS
 # Torch threads per worker. One, so WORKERS processes do not each claim the
 # whole machine; see _play.
 THREADS = 1
@@ -219,7 +227,9 @@ def main() -> None:
     if arguments.clone_init:
         _warm_start(learner, device)
     optimizer = torch.optim.Adam(learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
-    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, _decay)
+    schedule = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, _decay(arguments.econ_fraction)
+    )
 
     steps, update = 0, 0
     if arguments.resume is not None:
@@ -246,8 +256,8 @@ def main() -> None:
         LOGGER.info(
             "value warmup: %d batches (~%.1f updates at %d batches/update)",
             warmup_left,
-            warmup_left / _batches_per_update(),
-            _batches_per_update(),
+            warmup_left / _batches_per_update(arguments.econ_fraction),
+            _batches_per_update(arguments.econ_fraction),
         )
     started = time.monotonic()
     pool = ProcessPoolExecutor(max_workers=WORKERS)
@@ -634,15 +644,36 @@ def _warm_start(learner: Policy, device: str) -> None:
     )
 
 
-def _decay(step: int) -> float:
-    """Return the LR multiplier at ``step``, floored at their ``min_lr_mod``.
+def _decay(econ_fraction: float) -> Callable[[int], float]:
+    """Return the LR multiplier function, floored at their ``min_lr_mod``.
 
-    A module-level function rather than a lambda so that resuming restores the
-    same schedule object: a lambda cannot be pickled into a checkpoint, and a
-    schedule silently rebuilt from step zero would restore the initial learning
-    rate and quietly change the recipe partway through a run.
+    Toad's schedule reaches the floor exactly at ``total_steps``, so ours has to
+    be keyed on what this arm actually collects per round rather than on the
+    environment count. Those differ whenever an arm mixes opponents: a mirror
+    episode records both seats and a scripted one records ours alone, so
+    ``--econ-fraction 0.5`` collects 36 seats a round against the 48 the naive
+    count assumes. Keyed on 48 the learning rate reaches the floor at three
+    quarters of the budget and the rest of the run trains at 1e-6 -- which is
+    tolerable in a 2e7 arm and is a quarter of this one.
+
+    A plain function rather than a lambda so a resume restores the same
+    schedule: ``LambdaLR.state_dict`` stores ``None`` for a function and the
+    multiplier is rebuilt here from the current ``TOTAL_STEPS``, where a
+    schedule silently restarted from step zero would restore the initial rate
+    and quietly change the recipe partway through a run.
+
+    Args:
+        econ_fraction: Share of each round played against ``OPPONENT``.
+
+    Returns:
+        The multiplier at a given schedule step.
     """
-    return max(1.0 - step / max(_updates(), 1), MIN_LR_MOD)
+    updates = max(TOTAL_STEPS // (_seats_per_update(econ_fraction) * TURNS), 1)
+
+    def decay(step: int) -> float:
+        return max(1.0 - step / updates, MIN_LR_MOD)
+
+    return decay
 
 
 def _checkpoint(
@@ -798,15 +829,27 @@ def _play(
         return rollout_many(actor, versus if versus else actor, seeds)
 
 
-def _batches_per_update() -> int:
+def _seats_per_update(econ_fraction: float) -> int:
+    """Return how many recorded seats one collection round yields.
+
+    ``rollout_many`` records both seats of a mirror episode and ours alone
+    against a scripted opponent, so the round's size is not ``ENVIRONMENTS``
+    doubled unless the arm is a pure mirror.
+
+    Args:
+        econ_fraction: Share of each round played against ``OPPONENT``.
+
+    Returns:
+        Trajectories, and so ``TURNS`` times this many environment steps.
+    """
+    econ = int(ENVIRONMENTS * econ_fraction)
+    return 2 * (ENVIRONMENTS - econ) + econ
+
+
+def _batches_per_update(econ_fraction: float) -> int:
     """Return how many learner batches one collection round yields."""
-    segments = ENVIRONMENTS * 2 * ((719) // UNROLL_LENGTH)
+    segments = _seats_per_update(econ_fraction) * (TURNS // UNROLL_LENGTH)
     return segments // BATCH_SEGMENTS
-
-
-def _updates() -> int:
-    """Return roughly how many updates the run will take, for the LR schedule."""
-    return TOTAL_STEPS // (ENVIRONMENTS * 719 * 2)
 
 
 def _update(
