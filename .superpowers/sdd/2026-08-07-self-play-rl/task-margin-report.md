@@ -380,6 +380,72 @@ reward term must answer, before it is weighted:
 If the answer is "nothing, because the objective already charges full price for
 it", say so explicitly and show the inequality, as `ABSOLUTE_WEIGHT` does above.
 
+## VERDICT — the run finished its full budget, and the answer is negative
+
+Completed normally at update 707, 20,025,588 steps, `wandb.finish()` called,
+20 checkpoints, **0 illegal actions in ~13.1 million decisions**.
+
+**`win_rate_vs_econ` was 0.0000 on all 507 updates. It never once left zero.**
+`bank_vs_econ` peaked at 357.8 and never reached even the first reporting
+threshold of 1,000, let alone the 10,000 decision point.
+
+| block    | bank  | units | bought | ratio | realis. | margin   | baseline |
+| -------- | ----- | ----- | ------ | ----- | ------- | -------- | -------- |
+| u201-300 | 104.9 | 69.6  | 48.5   | 0.70  | 0.967   | −139,200 | 0.005    |
+| u301-400 | 116.5 | 91.4  | 74.1   | 0.81  | 0.969   | −139,805 | 0.003    |
+| u401-500 | 85.8  | 117.0 | 102.6  | 0.88  | 0.953   | −139,297 | 0.002    |
+| u501-600 | 50.4  | 158.9 | 145.8  | 0.92  | 0.936   | −139,165 | 0.002    |
+| u601-700 | 64.5  | 191.9 | 179.2  | 0.93  | 0.933   | −139,580 | 0.001    |
+
+**The margin never moved.** −139,640 at the start, −139,173 at the end. Over a
+full 2e7-step budget the primary term did not shift its own target by more than
+noise. `reward_mean` went −0.09957 → −0.09936: unchanged to four significant
+figures across 500 updates.
+
+**What the policy learned instead was churn.** The bought/sold ratio climbed
+0.70 → 0.93, so by the end nearly every unit sold was a unit it had bought;
+volume tripled (70 → 192) while realisation _fell_ 0.967 → 0.933 and bank went
+nowhere. It learned to move more goods at worse prices for no gain. This is the
+coordinator's watch condition 1, and the sale-side metrics name it as both
+problems at once — buying what it resells, and realising less on it.
+
+**Why there was no gradient, from the loss terms.** `baseline` fell to 0.0014:
+the critic learned to predict the return almost perfectly, which it can, because
+the return is dominated by a near-constant −0.28 that our seat does not
+influence. A perfectly predicted return means **advantage ≈ 0**, and sure
+enough `vtrace_pg` collapsed 0.058 → **−0.0026**. With the policy-gradient term
+at zero, what was left steering the policy was UPGO (0.48 → 0.74) and entropy
+(−0.16 → −0.32) — drift, not learning. The 92x variance measurement at update 26
+predicted exactly this, and the full run is that prediction completed.
+
+Note this is the _opposite_ of watch condition 2: the critic did not fail to
+predict the opponent's draw, it succeeded, and succeeding is what destroyed the
+signal. A variance-reduction change would not have helped.
+
+**A correction to my own earlier report.** At update 226 I wrote "production
+climbing hard (bank 4.8 → 114)". Over the full run bank went 69.6 (u201-250) →
+68.9 (u651-700): no net progress. The early rise was recovery from the warmup
+transient plus noise on a very small base. I did flag the 1.2σ caution at u250,
+but the u226 framing was too optimistic and should not have been stated that
+confidently off 26 updates.
+
+**What this establishes.** The pre-registration anticipated two outcomes — win
+rate climbing, or margin improving without wins. The actual outcome is a third
+and more informative one: **the differential is not slow at this skill level, it
+is inert.** That is the phase-order argument confirmed at full budget rather
+than assumed. Toad shaped to competence for 2e7 steps _before_ switching to the
+zero-sum reward, and this run is the measurement of what happens if you skip
+that.
+
+**Implication for the next arm**, stated as a recommendation and not acted on:
+shape to competence first and introduce the margin only once `bank_vs_econ` is
+within an order of magnitude of the opponent's. The comparison worth making is
+that C6 (opponent mix, own-bank reward) reached bank_vs_econ 164 in 73 updates
+where this reached ~140 at best in 500 — though C6 was on the deleted 1.32.3
+economy, and C7's apparently better number is now suspect for the free-build
+reason above, so neither is a clean baseline. Re-running C6's configuration on
+1.32.6 would give one.
+
 ## Pre-registered reads (unchanged)
 
 - `win_rate_vs_econ` off 0 → the objective is right; main line.
