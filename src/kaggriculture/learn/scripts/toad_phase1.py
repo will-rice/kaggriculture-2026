@@ -61,6 +61,7 @@ from kaggriculture.learn.toad_loss import (
 )
 from kaggriculture.learn.toad_reward import (
     ABSOLUTE_WEIGHT,
+    CAPITAL_WEIGHT,
     MARGIN_WEIGHT,
     MONEY_SIGNED_ENV,
     MONEY_WEIGHT_ENV,
@@ -493,6 +494,12 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "money_weight": money_weight() if arguments.phase1b else 0.0,
             "margin_weight": MARGIN_WEIGHT if arguments.margin else 0.0,
             "absolute_weight": ABSOLUTE_WEIGHT if arguments.margin else 0.0,
+            # Live on every arm that reads a `shaped` field and zero on the
+            # margin arm, which prices capital through ABSOLUTE_WEIGHT instead.
+            # Recorded because it is the one weight in the shaped set that is
+            # not Toad's published number, so a run's reward is not identifiable
+            # without it.
+            "capital_weight": 0.0 if arguments.margin else CAPITAL_WEIGHT,
             "econ_fraction": arguments.econ_fraction,
             "value_warmup": arguments.value_warmup,
             "teacher_kl_cost": arguments.teacher_kl_cost,

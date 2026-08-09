@@ -6,6 +6,7 @@ non-negative clamp on the stock term, and the 10x terminal result riding inside
 the shaped reward rather than replacing it.
 """
 
+import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
@@ -137,7 +138,7 @@ def _series(**deltas: float) -> list[toad_reward.Counts]:
         city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0, opponent=0.0
     )
     after = toad_reward.Counts(
-        capital=0,
+        capital=0 + int(deltas.get("capital", 0)),
         city=25 + int(deltas.get("city", 0)),
         unit=1 + int(deltas.get("unit", 0)),
         research=0 + int(deltas.get("research", 0)),
@@ -254,3 +255,122 @@ def test_the_signed_money_term_punishes_a_losing_round_trip(
     )
     assert total < 0.0
     assert total == pytest.approx(-0.00086)
+
+
+# The reference operating point on kaggle-environments 1.32.6, measured over
+# economic_policy mirror seasons at seeds 7 and 11. Both seats end holding
+# fifteen animals; the `fuel` term totals 0.0092-0.0098 for the produce those
+# fields and that herd actually yielded, and the shaped reward excluding capital
+# totals 0.146-0.157. Written as literals because they are what sizes
+# CAPITAL_WEIGHT, and a weight sized against numbers nobody can see is a weight
+# nobody can check.
+REFERENCE_ANIMALS = 15
+REFERENCE_FUEL_TERM = 0.0092
+# startingMoney 3000 over GOOSE at 300: the most capital reachable without
+# selling anything at all.
+FLOAT_ANIMALS = 10
+
+
+def test_the_capital_weight_stays_under_the_produce_it_enables() -> None:
+    """Cap the weight below the produce it enables, with no margin term to help.
+
+    THE INEQUALITY THE CAPITAL WEIGHT RESTS ON. In the margin arm this term was
+    safe because the margin charged the animal's full 300-500 coins, six to nine
+    times what capital paid. This arm has no
+    margin and no money term, so coins carry no reward at all and that guard is
+    simply absent. The replacement is a magnitude bound: acquiring the asset must
+    pay less than operating it, or the reward points at buying rather than at
+    farming -- the shape behind all four of this project's pump defects.
+
+    Toad's published 1.0 for this slot fails the bound by 3x, which is why the
+    slot's own number is not reused.
+    """
+    ceiling = REFERENCE_FUEL_TERM * toad_reward.NORMALISER / REFERENCE_ANIMALS
+    assert ceiling == pytest.approx(0.3067, abs=1e-4)
+    assert toad_reward.CAPITAL_WEIGHT == 0.05
+    assert toad_reward.CAPITAL_WEIGHT < ceiling
+    # An order of magnitude inside it, not a hair inside it.
+    assert toad_reward.CAPITAL_WEIGHT * 5 < ceiling
+    # And the number actually reused for this slot would not have cleared it.
+    assert toad_reward.CITY_WEIGHT > ceiling
+
+
+def test_spending_the_whole_opening_float_on_animals_cannot_rival_winning() -> None:
+    """A season of buying and never selling must stay far below the terminal result.
+
+    Capital is bounded by coins irreversibly spent, so the reachable total
+    without ever completing a sale is the opening float divided by the cheapest
+    animal. That number has to be small against `game_result`, or a policy can
+    out-score winning by liquidating its float into livestock on day one.
+    """
+    hoarded = float(
+        toad_reward.shaped(_series(capital=FLOAT_ANIMALS), won=0.0).sum()
+    ) - float(toad_reward.shaped(_series(), won=0.0).sum())
+    terminal = toad_reward.GAME_RESULT_WEIGHT / toad_reward.NORMALISER
+
+    assert hoarded == pytest.approx(0.001)
+    assert terminal == pytest.approx(0.02)
+    # At most a twentieth of what winning the match is worth. Stated on the
+    # constants rather than on the float32 rewards, which land a few ulps over
+    # the boundary and would make the guard a coin toss rather than a bound.
+    assert (
+        FLOAT_ANIMALS * toad_reward.CAPITAL_WEIGHT * 20
+        <= toad_reward.GAME_RESULT_WEIGHT
+    )
+
+
+def test_carrying_an_animal_out_of_the_shed_and_onto_a_tile_scores_zero() -> None:
+    """The one capital cycle the engine permits must be exactly reward-neutral.
+
+    PICKUP takes the animal out of the shed and PLACE puts it on its structure;
+    `capital` counts both halves, so the pair telescopes. This is only true
+    because the term is UNCLAMPED. Clamped like `fuel`, the negative leg would be
+    forgiven and one animal would pay forever -- so the test drives the cycle
+    rather than asserting on the source, and a clamp added later breaks it.
+    """
+    shed = toad_reward.Counts(
+        city=25, unit=1, research=0, fuel=10, capital=1, money=1000.0, opponent=0.0
+    )
+    carried = dataclasses.replace(shed, capital=0)
+    placed = dataclasses.replace(shed, capital=1)
+
+    cycle = toad_reward.shaped([shed, carried, placed], won=0.0)
+    steps = 2 * toad_reward.STEP_WEIGHT / toad_reward.NORMALISER
+
+    # An absolute tolerance, because the two legs are float32 and cancel to a
+    # number far smaller than themselves; a relative tolerance on 2e-05 sits
+    # below float32's own resolution at 1e-04 and would fail on rounding alone.
+    assert float(cycle.sum()) == pytest.approx(steps, abs=1e-9)
+    # The negative leg lands first, so the cycle can never be entered for profit.
+    assert float(cycle[0]) < float(cycle[1])
+
+
+def test_an_empty_structure_earns_nothing_under_the_shaped_reward() -> None:
+    """BUILD_COOP and BUILD_PASTURE are free, so they must not reach the reward.
+
+    Verified against the engine: both ops write a tile and charge nothing. At
+    this weight a count of structures rather than animals would pay 0.01 a season
+    off roughly a hundred buildable tiles -- half the terminal result, for coins
+    nobody spent.
+    """
+    environment = make(ENVIRONMENT, debug=True)
+    environment.reset(2)
+    observation = environment.state[0].observation
+    tiles = [list(row) for row in observation["farms"][0]["tiles"]]
+    built = 0
+    for row in tiles:
+        for index, tile in enumerate(row):
+            if tile is None:
+                row[index] = {"kind": "PASTURE"}
+                built += 1
+    assert built > 0
+    farms = [dict(farm) for farm in observation["farms"]]
+    farms[0] = {**farms[0], "tiles": tiles}
+
+    before = toad_reward.counts(observation, 0)
+    after = toad_reward.counts({**observation, "farms": farms}, 0)
+
+    assert after.capital == before.capital
+    assert float(toad_reward.shaped([before, after], won=0.0).sum()) == pytest.approx(
+        toad_reward.STEP_WEIGHT / toad_reward.NORMALISER
+    )

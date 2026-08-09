@@ -81,18 +81,62 @@ FULL_WORKERS_WEIGHT = 0.0
 # unit of fertilizer have been earning the identical 0.005 all along, which is
 # why the livestock potential read zero in every logged iteration.
 #
-# Measured on economic_policy over a full season (seed 7, banking 125,691): it
-# finishes with 15 PASTURE tiles, so one animal structure is worth roughly 8,379
-# coins a season. Against MONEY_WEIGHT that is ~8.4 reward units, i.e. an animal
-# is about 1.7 million times more valuable per unit than the fertilizer it is
-# currently priced beside.
+# THE WEIGHT IS NOT THEIR 1.0, and the reason is measured rather than argued.
+# This project has produced four pump-shaped defects and all four share one
+# shape: a term paying for something free or reversible. So the question is
+# asked before the weight is set -- what does this pay for that costs nothing,
+# or can be undone and redone? -- and the answer here is "nothing", by three
+# engine facts and two inequalities.
 #
-# The weight is 1.0 rather than 8.4 because the point is to put the noun in
-# Toad's existing compounding-asset slot, not to invent a bigger one. Their
-# ratios cap that slot at 1.0 and this stays inside their scheme.
+# COSTS NOTHING? No. `_commit_unit`'s BUY_ANIMAL charges `ANIMALS[item]["cost"]`
+# -- a fixed 300/400/500, not a market quote that can be walked down. Contrast
+# the count this term deliberately is NOT: `BUILD_COOP` and `BUILD_PASTURE`
+# write a tile for zero coins on any empty square, so a structure count would
+# pay for roughly a hundred free tiles a season. See `_hosts_animal`.
+#
+# UNDONE AND REDONE? No, and three separate engine rules close it.
+#   * `_process_market` quotes SELL only for `item in PRODUCTS`, and ANIMALS is
+#     disjoint from PRODUCTS, so an animal can never be turned back into coins.
+#   * DIG returns early on a tile holding an animal ("Does NOT remove a placed
+#     animal").
+#   * The one cycle that does exist -- PICKUP an animal out of the shed, PLACE
+#     it on its structure -- moves it between `herd` and `placed`, and `capital`
+#     sums both, so the round trip is exactly zero. It is also unclamped, unlike
+#     `fuel`: the negative leg lands first and is not forgiven. Measured over a
+#     reference season, gross positive capital deltas are 29 against a net 15,
+#     which is that cycle showing up and cancelling.
+#   Capital falls only when an animal escapes after two consecutive unfed days,
+#   which destroys the asset with no refund.
+#
+# SO THE SEASON TOTAL IS BOUNDED BY COINS IRREVERSIBLY SPENT:
+#
+#   capital <= 3000/300 + earned/300         (startingMoney over the cheapest animal)
+#   reward  <= 0.05 * (10 + earned/300)/500 = 0.0010 + earned * 3.3e-7
+#
+# An agent that sells nothing all season caps at 0.0010, one twentieth of the
+# terminal `game_result` at 10/500 = 0.020. Every animal past the tenth has to
+# be paid for by running the whole production chain first.
+#
+# AND ACQUIRING MUST NOT OUT-PAY OPERATING, which is what fixes the magnitude.
+# Measured on 1.32.6, economic_policy mirror, seeds 7 and 11: it ends the season
+# holding 15 animals, its `fuel` term totals 0.0092-0.0098 (the ~950 units of
+# produce its fields and herd actually yielded) and its whole shaped reward
+# excluding capital is 0.146-0.157.
+#
+#   capital at 0.05 * 15 / 500 = 0.0015   <- 15% of the produce it enabled, 1.0%
+#                                            of the shaped total
+#   capital at 1.00 * 15 / 500 = 0.0300   <- 3x every unit of produce harvested
+#                                            all season, and 1.5x game_result
+#
+# Requiring the term to stay under the produce it enables caps the weight at
+# 0.0098 * 500 / 15 = 0.33. Toad's published 1.0 for this slot fails that by 3x,
+# so it is not reused; 0.05 sits an order of magnitude inside the bound and is
+# the value the margin arm already ran animals at. PRE-REGISTERED: if this arm
+# underperforms, this weight is the first knob and 0.33 is its ceiling -- not
+# something to tune mid-run.
 #
 # Land needs no change: quadrants already enter `city` through unlocked tiles.
-CAPITAL_WEIGHT = 1.0
+CAPITAL_WEIGHT = 0.05
 
 MONEY_WEIGHT = 0.001
 
@@ -423,9 +467,14 @@ def shaped(series: list[Counts], won: float, money_weight: float = 0.0) -> torch
             CITY_WEIGHT * (after.city - before.city)
             + UNIT_WEIGHT * (after.unit - before.unit)
             + RESEARCH_WEIGHT * (after.research - before.research)
+            # DELIBERATELY UNCLAMPED, unlike `fuel` directly below. `capital`
+            # sums animals in the shed and animals on their structures, so
+            # PICKUP then PLACE is a round trip through both halves. Clamping
+            # would forgive the negative leg and pay for every cycle -- an
+            # unbounded pump out of one animal. Unclamped it is exactly zero.
+            + CAPITAL_WEIGHT * (after.capital - before.capital)
             # Clamped at zero, their line 201: selling stock must not read as a
             # loss, because the sale is already paid for through game_result.
-            + CAPITAL_WEIGHT * (after.capital - before.capital)
             + FUEL_WEIGHT * max(after.fuel - before.fuel, 0)
             + STEP_WEIGHT
             # Ours. Zero unless phase-1b enables it; see MONEY_WEIGHT.
