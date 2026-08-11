@@ -27,6 +27,7 @@ from kaggriculture.constants import (
     STARTING_MONEY,
     TURNS_PER_DAY,
 )
+from kaggriculture.learn import CHECKPOINT, toad_reward
 from kaggriculture.learn.encoding import (
     IGNORE,
     MARKET_SLOTS,
@@ -42,7 +43,7 @@ from kaggriculture.learn.encoding import (
     unit_count,
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import BLOCKS, CHANNELS, Policy
 from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, potential
 from kaggriculture.learn.rollout import Trajectory, rollout, rollout_many
 
@@ -83,6 +84,26 @@ def trajectory() -> Trajectory:
     return rollout(_untrained(), "starter", seed=0)
 
 
+@pytest.fixture(scope="module", name="clone")
+def _clone() -> Policy:
+    """Return the behaviour-cloned policy, for the tests that need play to happen.
+
+    ``_untrained`` is right for everything about *recording*, and useless for
+    anything about *selling*: it has ``SELL`` legal on 0 of 719 turns, so any
+    sale metric read off it is zero no matter what the code under test does.
+    This one completes 45 clears a season, which is what makes those guards
+    discriminate. Its known defects -- it banks almost nothing and over-hires --
+    do not touch what is asserted against it here.
+    """
+    policy = Policy(blocks=BLOCKS, channels=CHANNELS, value_bound=1.0)
+    incompatible = policy.load_state_dict(
+        torch.load(CHECKPOINT, map_location="cpu", weights_only=True), strict=False
+    )
+    assert not incompatible.unexpected_keys
+    assert all(key.startswith("value.") for key in incompatible.missing_keys)
+    return policy.eval()
+
+
 def test_a_trajectory_covers_every_acting_turn() -> None:
     """719 decisions; a short trajectory silently truncates the season."""
     trajectory = rollout(_untrained(), "starter", seed=0)
@@ -112,6 +133,64 @@ def test_both_reward_series_telescope_to_their_own_outcome() -> None:
         trajectory.final_bank - STARTING_MONEY, abs=1.0
     )
     assert not torch.allclose(trajectory.rewards, trajectory.own, atol=1.0)
+
+
+def test_the_margin_reward_telescopes_on_a_real_episode() -> None:
+    """The wiring, not the arithmetic, is what this pins.
+
+    The reward the learner reads must be the objective this seat achieved.
+
+    ``toad_reward.margin`` is unit-tested on hand-built series. What this adds
+    is that ``_trajectory`` hands it the right one -- a series carrying the
+    TERMINAL state, and carrying the OPPONENT's bank rather than a second copy
+    of ours. Both mistakes leave a finite, plausible-looking reward: dropping
+    the terminal state loses the last turn's coins silently, and duplicating
+    our bank makes every margin identically zero, which on a mirror is
+    indistinguishable from a policy that has simply drawn.
+
+    The fixture rules the second one out on its own numbers: the untrained
+    policy banks nothing against ``starter``, so the margin is large and
+    negative and cannot be confused with zero.
+    """
+    trajectory = rollout(_untrained(), "starter", seed=0)
+
+    theirs = trajectory.final_bank - trajectory.final_margin
+    expected = (
+        toad_reward.MARGIN_WEIGHT * trajectory.final_margin
+        + toad_reward.ABSOLUTE_WEIGHT * trajectory.final_capital
+        + toad_reward.GAME_RESULT_WEIGHT
+        * toad_reward.rank(trajectory.final_bank, theirs)
+    ) / toad_reward.NORMALISER
+
+    assert trajectory.final_margin < 0.0
+    assert float(trajectory.margin.sum()) == pytest.approx(expected, abs=1e-5)
+
+
+def test_the_sale_metrics_are_our_own_seat_s(clone: Policy) -> None:
+    """The metrics must be read from the seat whose shed the snapshots carry.
+
+    THE FIXTURE HAS TO SELL, or this test asserts nothing. An untrained policy
+    has ``SELL`` legal on 0 of 719 turns and banks nothing, so every number here
+    would be zero and would stay zero under any wiring mistake -- which is
+    exactly how a guard ends up passing while asserting ``X == X``. The
+    behaviour-cloned policy completes 45 clears of 126 units in this episode, so
+    the numbers are live.
+
+    A snapshot carries BOTH farms' money but only OUR shed, so reading the
+    opponent's seat pairs their bank rises against our shed falls. That is not a
+    crash and not a zero; it is a plausible-looking 21 coins a unit at 0.45
+    realisation, against the 96 and 0.95 the seat actually achieved. The
+    realisation band is what separates them.
+    """
+    trajectory = rollout(clone, "starter", seed=0)
+
+    assert trajectory.sales > 20.0
+    assert trajectory.units_sold >= trajectory.sales
+    # Selling at the book, within the few percent the corpus says decides the
+    # ladder. Cross-seat attribution lands at 0.45 and cannot reach this band.
+    assert 0.8 < trajectory.realisation < 1.2
+    assert trajectory.mean_sale_price > 50.0
+    assert trajectory.bought > 0.0
 
 
 def test_sampled_actions_are_always_legal() -> None:
@@ -321,6 +400,9 @@ def test_every_tensor_covers_the_same_turns(trajectory: Trajectory) -> None:
     assert trajectory.log_probs.shape == (turns,)
     assert trajectory.values.shape == (turns,)
     assert trajectory.dones.shape == (turns,)
+    assert trajectory.shaped.shape == (turns,)
+    assert trajectory.shaped_money.shape == (turns,)
+    assert trajectory.margin.shape == (turns,)
     # One row per acting turn and no terminal row. The natural thing here is
     # the shape `advantages` asks for -- one longer, holding the state after
     # the last action -- and it is the wrong one: the potential at the state a

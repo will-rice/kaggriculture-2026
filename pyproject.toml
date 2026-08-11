@@ -84,6 +84,40 @@ include = [
 [tool.ty.overrides.rules]
 invalid-argument-type = "ignore"
 
+# The same bargain again, for Toad Brigade's learner. `.pre-commit-config.yaml`
+# already excludes this tree from every formatting hook, and for the identical
+# reason: it is vendored verbatim from the artifact we are reproducing, and a
+# copy we have edited can no longer tell a bad result in their recipe from a bad
+# transcription of it.
+#
+# The diagnostics here are not fixable in principle, only in appearance. The
+# tree imports `lux_gym`, `omegaconf` and other modules from the parts of their
+# repository we deliberately did NOT vendor -- we took the learner, not the Lux
+# game -- so those imports cannot resolve and would not resolve if we tried. The
+# rest follow from their functions being unannotated, which is a property of
+# their source.
+#
+# This is scoped to the vendored directory alone. Everything we wrote around it
+# -- `toad_loss.py`, `toad_reward.py`, `scripts/toad_phase1.py` and their tests
+# -- is still checked in full.
+[[tool.ty.overrides]]
+include = ["src/kaggriculture/learn/toad/**"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+invalid-return-type = "ignore"
+unsupported-operator = "ignore"
+not-subscriptable = "ignore"
+invalid-type-form = "ignore"
+call-non-callable = "ignore"
+no-matching-overload = "ignore"
+# Their `torch.cuda.amp.autocast` call. Modernising it would be an edit to the
+# artifact, which is the one thing this vendoring may not do.
+deprecated = "ignore"
+
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = ["slow: reads the replay corpus; minutes, not seconds"]

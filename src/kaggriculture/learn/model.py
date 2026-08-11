@@ -63,9 +63,30 @@ class Residual(torch.nn.Module):
 class Policy(torch.nn.Module):
     """Board trunk with three heads: one op per unit, what the farm trades, and V(s)."""
 
-    def __init__(self, blocks: int = BLOCKS, channels: int = CHANNELS) -> None:
-        """Build the policy."""
+    def __init__(
+        self,
+        blocks: int = BLOCKS,
+        channels: int = CHANNELS,
+        value_bound: float | None = None,
+    ) -> None:
+        """Build the policy.
+
+        Args:
+            blocks: Residual blocks in the trunk.
+            channels: Trunk width.
+            value_bound: If set, squash the value head through a sigmoid and
+                rescale it to ``[-value_bound, +value_bound]``, the way Toad
+                Brigade's ``BaselineLayer`` does (``toad/nns/models.py:177-181``).
+                Their value output is structurally confined to the reward
+                space's range in every one of their configs, and leaving ours
+                unbounded is what diverged the first phase-1 run: a head
+                initialised for coin-scale PPO returns, regressed against a
+                shaped reward of ~1e-5 a turn, drove the baseline term to 1.5e17
+                while all three policy terms stayed healthy. Defaults to ``None``
+                so the PPO path keeps the unbounded head it was trained with.
+        """
         super().__init__()
+        self.value_bound = value_bound
         self.stem = torch.nn.Conv2d(TILE_PLANES, channels, 3, padding=1)
         self.market = torch.nn.Sequential(
             torch.nn.Linear(SCALARS, channels),
@@ -138,4 +159,9 @@ class Policy(torch.nn.Module):
             pooled.shape[0], len(MARKET_SLOTS) + 2, len(QUANTITIES)
         )
         value = self.value(pooled).squeeze(-1)
+        if self.value_bound is not None:
+            # toad/nns/models.py:179-181: sigmoid to [0, 1], then rescaled onto
+            # the reward space. Theirs is not zero-sum for the shaped phase, so
+            # the activation is Sigmoid rather than Softmax.
+            value = torch.sigmoid(value) * (2.0 * self.value_bound) - self.value_bound
         return units, market, value

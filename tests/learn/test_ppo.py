@@ -593,11 +593,24 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         values=values,
         rewards=rewards,
         own=own,
+        # A third independent series, for the same reason `own` is independent
+        # of `rewards`: Toad's shaped reward is on its own scale entirely, and a
+        # synthetic trajectory whose series were proportional could not tell a
+        # learner reading the wrong one from a learner reading the right one.
+        shaped=torch.randn(turns) * 0.01,
+        shaped_money=torch.randn(turns) * 0.01,
+        margin=torch.randn(turns) * 0.01,
         potentials=potentials,
         dones=dones,
         final_margin=float(rewards.sum()),
         final_bank=STARTING_MONEY + float(rewards.sum()),
+        final_capital=0.0,
         illegal=0,
+        sales=0.0,
+        units_sold=0.0,
+        mean_sale_price=0.0,
+        realisation=0.0,
+        bought=0.0,
     )
 
 
