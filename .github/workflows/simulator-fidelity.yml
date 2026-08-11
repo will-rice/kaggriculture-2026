@@ -1,0 +1,59 @@
+# The batched simulator's only justification is being identical to the
+# reference engine, so every change runs the tests that prove it -- not just
+# the fast ones.
+#
+# Jobs select tests by MARKER, never by filename. An earlier version named
+# `tests/sim/test_episodes.py` in the nightly job, which silently excluded the
+# mutation suite that proves the differential tests can fail at all. A new test
+# file must be picked up because it is marked, not because someone remembered
+# to add it here.
+#
+# Everything runs CPU-only: the CUDA tests skip cleanly on a runner without a
+# GPU (verified 2026-08-11, 3 skipped), and the whole slow suite finishes in
+# about a minute at smoke size.
+name: simulator-fidelity
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  # Everything that is fast enough to run on every change.
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest tests/sim -m "not slow"
+
+  # The fidelity proof, on every change. Small enough to be affordable and
+  # large enough to be evidence: the mutation suite runs here too, because a
+  # differential campaign nobody has seen fail is not evidence of anything.
+  fidelity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest tests/sim -m slow --sim-episodes=2 --sim-turns=40
+
+  # The long campaign, nightly. Full-length episodes are the only way to reach
+  # late-season rules -- lifespans, shop unlocks, the terminal turn -- that a
+  # 40-turn smoke run never sees.
+  differential-full:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest tests/sim -m slow --sim-episodes=50 --sim-turns=719
