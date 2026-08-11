@@ -20,6 +20,7 @@ from kaggriculture.sim.state import (
     SimState,
     unpack,
 )
+from kaggriculture.sim.tensors import tensor_constant
 
 GROWING = 0.4
 ScriptedOpponent = Callable[[Mapping[str, Any]], Mapping[str, Any]]
@@ -31,10 +32,51 @@ _MARKET_TYPES = {
     "BUY_ANIMAL": (4, ANIMAL_NAMES),
 }
 
+# `potential` runs twice per collected turn, so its six price tables are frozen
+# here and handed to `tensor_constant` rather than rebuilt with `torch.tensor`
+# on every call. Rebuilding them copied host memory to the device inside the
+# rollout loop, which is both per-turn work the season does not need and an
+# unpinned host-to-device copy -- the kind CUDA graph capture refuses outright.
+# The leading zero in the indexed tables is the "nothing here" code, so the
+# tables are indexed by `crop`/`occupant` directly.
+_SEED_COST = tuple(float(CROPS[name]["seed"]) for name in CROP_NAMES)
+_CUMULATIVE_LAND = (
+    0.0,
+    *torch.tensor(LAND_PRICES, dtype=torch.float32).cumsum(0).tolist(),
+)
+_CROP_SEED = (0.0, *_SEED_COST)
+_CROP_VALUE = (0.0, *(float(MARKET_PARAMS[name]["base"]) for name in CROP_NAMES))
+_ANIMAL_COST = (0.0, *(float(ANIMALS[name]["cost"]) for name in ANIMAL_NAMES))
+_ANIMAL_PRODUCT_VALUE = (
+    0.0,
+    *(
+        float(MARKET_PARAMS[str(ANIMALS[name]["product"])]["base"])
+        for name in ANIMAL_NAMES
+    ),
+)
+_ITEM_VALUE = tuple(
+    float(MARKET_PARAMS[name]["base"])
+    if name in MARKET_PARAMS
+    else float(ANIMALS[name]["cost"])
+    for name in SHED_NAMES
+)
+
 
 @dataclass(frozen=True)
 class Trajectory:
-    """One fixed-length on-device segment, time-major and batch-preserving."""
+    """One fixed-length on-device segment, time-major and batch-preserving.
+
+    Every field is a device tensor, ``illegal`` included. It is a scalar
+    ``int64`` count and not a Python ``int`` because reading one back on the
+    host is a synchronisation, and a single synchronisation anywhere inside
+    ``collect_segment`` aborts a CUDA graph capture of it -- which is where the
+    collection loop's speedup lives. Callers that genuinely need the number,
+    which in practice means logging it or failing a run on it, call ``int()`` on
+    it themselves, outside any captured region. What it counts is unchanged:
+    sampled actions their own stored mask forbade, summed over the segment's
+    turns, its alive units and its market slots, for the learning seat alone
+    when a scripted opponent occupies seat 1 and for both seats otherwise.
+    """
 
     board: torch.Tensor
     scalars: torch.Tensor
@@ -49,7 +91,7 @@ class Trajectory:
     own: torch.Tensor
     potentials: torch.Tensor
     dones: torch.Tensor
-    illegal: int
+    illegal: torch.Tensor
 
 
 def potential(state: SimState, seat: int) -> torch.Tensor:
@@ -57,23 +99,15 @@ def potential(state: SimState, seat: int) -> torch.Tensor:
     if seat not in (0, 1):
         raise ValueError(f"seat must be 0 or 1, got {seat}")
     device = state.step.device
-    seed_cost = torch.tensor(
-        [float(CROPS[name]["seed"]) for name in CROP_NAMES], device=device
-    )
+    scalar = {"dtype": torch.float32, "device": device}
+    seed_cost = tensor_constant(_SEED_COST, **scalar)
     seeds = (state.seeds[:, seat].to(torch.float32) * seed_cost).sum(dim=-1)
-    cumulative_land = torch.tensor(
-        [0.0, *torch.tensor(LAND_PRICES, dtype=torch.float32).cumsum(0).tolist()],
-        device=device,
-    )
+    cumulative_land = tensor_constant(_CUMULATIVE_LAND, **scalar)
     land = cumulative_land[(state.quadrants[:, seat].to(torch.int64) - 1).clamp(0, 3)]
 
-    crop_seed = torch.tensor(
-        [0.0, *(float(CROPS[name]["seed"]) for name in CROP_NAMES)], device=device
-    )[state.crop[:, seat].to(torch.int64)]
-    crop_value = torch.tensor(
-        [0.0, *(float(MARKET_PARAMS[name]["base"]) for name in CROP_NAMES)],
-        device=device,
-    )[state.crop[:, seat].to(torch.int64)]
+    crop = state.crop[:, seat].to(torch.int64)
+    crop_seed = tensor_constant(_CROP_SEED, **scalar)[crop]
+    crop_value = tensor_constant(_CROP_VALUE, **scalar)[crop]
     plant = state.kind[:, seat] == 3
     growing = torch.where(
         plant,
@@ -81,20 +115,9 @@ def potential(state: SimState, seat: int) -> torch.Tensor:
         0.0,
     ).sum(dim=(1, 2))
 
-    animal_cost = torch.tensor(
-        [0.0, *(float(ANIMALS[name]["cost"]) for name in ANIMAL_NAMES)],
-        device=device,
-    )[state.occupant[:, seat].to(torch.int64)]
-    animal_product_value = torch.tensor(
-        [
-            0.0,
-            *(
-                float(MARKET_PARAMS[str(ANIMALS[name]["product"])]["base"])
-                for name in ANIMAL_NAMES
-            ),
-        ],
-        device=device,
-    )[state.occupant[:, seat].to(torch.int64)]
+    occupant = state.occupant[:, seat].to(torch.int64)
+    animal_cost = tensor_constant(_ANIMAL_COST, **scalar)[occupant]
+    animal_product_value = tensor_constant(_ANIMAL_PRODUCT_VALUE, **scalar)[occupant]
     occupied = state.occupant[:, seat] > 0
     livestock = torch.where(
         occupied,
@@ -102,13 +125,7 @@ def potential(state: SimState, seat: int) -> torch.Tensor:
         0.0,
     ).sum(dim=(1, 2))
 
-    item_value = []
-    for name in SHED_NAMES:
-        if name in MARKET_PARAMS:
-            item_value.append(float(MARKET_PARAMS[name]["base"]))
-        else:
-            item_value.append(float(ANIMALS[name]["cost"]))
-    values = torch.tensor(item_value, dtype=torch.float32, device=device)
+    values = tensor_constant(_ITEM_VALUE, **scalar)
     carried = (state.inv_count[:, seat].to(torch.float32) * values[None, None, :]).sum(
         dim=(1, 2)
     )
@@ -198,7 +215,36 @@ def collect_segment(
     generator: torch.Generator | None = None,
     opponent: ScriptedOpponent | None = None,
 ) -> tuple[SimState, Trajectory]:
-    """Collect a fixed-length segment, optionally bridging a scripted seat 1."""
+    """Collect a fixed-length segment, optionally bridging a scripted seat 1.
+
+    With ``opponent=None`` the whole body is device work and holds no
+    synchronisation, so it can be captured as a CUDA graph. That matters
+    because the loop is launch-bound -- a segment costs about the same at batch
+    128 as at batch 4096 -- so replaying one capture is worth several times the
+    eager loop. Capture has two requirements this function cannot enforce for
+    the caller: the successor state must be copied back over ``state``'s own
+    buffers inside the captured region, otherwise every replay recomputes the
+    same turn from unchanged inputs; and ``generator`` must either be ``None``,
+    for the default CUDA generator that ``torch.cuda.graph`` registers itself,
+    or a CUDA generator the caller registered with the graph. A CPU generator
+    never reaches these tensors.
+
+    A scripted ``opponent`` is the exception, and it is not one that can be
+    removed: ``scripted_actions`` reads each row's state on the host and asks a
+    Python function what to play. That is a synchronisation per row per turn,
+    so a scripted segment cannot be captured and is not meant to be.
+
+    Args:
+        state: The batch to advance. Left untouched; the successor is returned.
+        policy: The network, called once per turn with both seats batched.
+        turns: Turns to collect. Every turn is recorded.
+        generator: The sampling stream, or ``None`` for the device default.
+        opponent: A scripted seat 1, or ``None`` for self-play on the policy.
+
+    Returns:
+        The state after ``turns`` turns, and the segment's ``Trajectory``. Every
+        field of it is a device tensor, ``illegal`` included.
+    """
     records: dict[str, list[torch.Tensor]] = {
         name: []
         for name in (
@@ -286,6 +332,6 @@ def collect_segment(
         state = next_state
     trajectory = Trajectory(
         **{name: torch.stack(values) for name, values in records.items()},
-        illegal=int(illegal_count.cpu()),
+        illegal=illegal_count,
     )
     return state, trajectory

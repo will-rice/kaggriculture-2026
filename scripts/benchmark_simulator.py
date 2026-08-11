@@ -43,20 +43,32 @@ season with actions that change every turn, and reports the units a plan can be
 budgeted in: seconds per season at a stated batch size, seasons per hour, and
 seconds per game so the per-game cost curve is visible.
 
-Three engines, all doing the same per-turn work:
+Four engines, all doing the same per-turn work:
 
 ``store``
     ``sim.rollout.collect_segment``, the path PPO actually collects on: it
     records every tensor the update reads. This is the real cost of collection.
+``store-graph``
+    That same ``collect_segment`` call, one whole segment of it captured as a
+    CUDA graph and replayed. This is the row that answers what collection would
+    cost captured, rather than what a stripped-down stand-in for it would.
 ``eager``
     The same per-turn work in a plain Python loop, without the trajectory
-    bookkeeping. Kept because it is the only body a CUDA graph can capture, so
-    it is the honest comparison for ``graph``; the gap to ``store`` is what the
-    recording costs, measured rather than assumed.
+    bookkeeping. Kept because the gap to ``store`` is what the recording costs,
+    measured rather than assumed.
 ``graph``
     That same body captured once and replayed, with the successor state copied
     back over the input buffers inside the capture so each replay genuinely
     advances the season.
+
+``collect_segment`` used to be uncapturable, and the first version of this file
+said so: it ended every call with ``int(illegal_count.cpu())``, and one host
+synchronisation anywhere in a captured region aborts the capture. It also
+rebuilt six price tables per ``potential`` call with ``torch.tensor(...,
+device=cuda)``, an unpinned host-to-device copy that capture refuses for the
+same reason. Both are gone -- ``Trajectory.illegal`` is a device tensor the
+caller materialises when it logs it, and the tables are cached per device --
+which is what makes ``store-graph`` a row rather than a hypothetical.
 
 Two policy settings, reported separately rather than blended: ``network`` runs
 the real ``Policy`` trunk in the loop, ``none`` substitutes ``ZeroPolicy``,
@@ -106,7 +118,7 @@ from kaggriculture.sim.decode import decode_market_buckets
 from kaggriculture.sim.engine import reset, step
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
-from kaggriculture.sim.rollout import collect_segment
+from kaggriculture.sim.rollout import Trajectory, collect_segment
 from kaggriculture.sim.state import SimState
 
 LOGGER = logging.getLogger("benchmark_simulator")
@@ -118,7 +130,7 @@ LOGGER = logging.getLogger("benchmark_simulator")
 SEASON_TURNS = EPISODE_STEPS - 1
 
 BATCHES = (128, 256, 1024, 4096)
-ENGINES = ("store", "eager", "graph")
+ENGINES = ("store", "store-graph", "eager", "graph")
 
 # `collect_segment` keeps every turn of a segment resident: at batch 4096 the
 # board planes alone are 157 MB per turn. The segment length is therefore capped
@@ -144,7 +156,16 @@ REFERENCE_WORKERS = WORKERS
 # check, not a throughput one: every field of every state must match.
 VERIFY_BATCH = 32
 VERIFY_TURNS = 40
+VERIFY_SEGMENT = 5
 WARMUP_TURNS = 3
+WARMUP_SEGMENTS = 2
+
+# The logit gap a `PeakedPolicy` puts between adjacent options. Large enough
+# that `exp` of the gap underflows to zero in float32, so the masked softmax is
+# one-hot and the multinomial draw off it is deterministic whatever the RNG
+# does -- which is what lets a sampling body be compared against an eager run
+# turn for turn.
+PEAK = 1e4
 
 
 def main() -> None:
@@ -188,6 +209,8 @@ def main() -> None:
 
     if "graph" in args.engines:
         verify_graph(device)
+    if "store-graph" in args.engines:
+        verify_segment_graph(device)
 
     reference = (
         None
@@ -218,7 +241,8 @@ class Measurement:
     """One timed configuration, carrying everything needed to read its number.
 
     Attributes:
-        engine: ``store``, ``eager``, ``graph`` or ``reference``.
+        engine: ``store``, ``store-graph``, ``eager``, ``graph`` or
+            ``reference``.
         batch: Seasons the configuration plays at once. For the simulator that
             is the tensor batch; for the reference it is the total number of
             episodes across all of its worker processes.
@@ -285,6 +309,31 @@ class ZeroPolicy(torch.nn.Module):
         )
 
 
+class PeakedPolicy(ZeroPolicy):
+    """Stand-in whose masked softmax is one-hot, so sampling is deterministic.
+
+    ``collect_segment`` always samples; it has no argmax mode, and it should not
+    grow one just to be verifiable. So the determinism is put in the policy
+    instead: logits spaced ``PEAK`` apart make every masked distribution one-hot
+    on its highest-numbered legal option, and a multinomial draw off a one-hot
+    distribution returns that option whatever random number it drew. The
+    captured segment and the eager segment therefore play the same actions and
+    can be compared field by field, which is what ``verify_segment_graph``
+    needs. The masks still change every turn, so the season is still a real one.
+    """
+
+    def forward(
+        self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return logits that peak on one option per slot, and a zero value."""
+        units, market, value = super().forward(board, scalars, positions)
+        return (
+            units + PEAK * torch.arange(units.shape[-1], device=units.device),
+            market + PEAK * torch.arange(market.shape[-1], device=market.device),
+            value,
+        )
+
+
 def benchmark(
     device: torch.device,
     *,
@@ -300,7 +349,10 @@ def benchmark(
         device: The CUDA device.
         batch: Environments advanced together.
         turns: Turns to advance. State changes on every one of them.
-        engine: ``store``, ``eager`` or ``graph``.
+            ``store-graph`` advances in whole captured segments, so it plays the
+            largest multiple of its segment length that fits and its row is
+            marked extrapolated; every other engine plays exactly ``turns``.
+        engine: ``store``, ``store-graph``, ``eager`` or ``graph``.
         policy_in_loop: Whether to run the real ``Policy`` trunk.
         reference: The reference measurement, for ``versus_reference``.
 
@@ -320,6 +372,7 @@ def benchmark(
     torch.cuda.synchronize()
 
     state = reset(Config(), seeds)
+    measured = turns
     if engine == "graph":
         captured = _capture(state, policy)
         torch.cuda.synchronize()
@@ -330,6 +383,19 @@ def benchmark(
         elapsed = time.perf_counter() - started
         advanced = int(state.step[0])
         del captured
+    elif engine == "store-graph":
+        length = segment_length(batch)
+        replays = max(1, turns // length)
+        measured = replays * length
+        captured, trajectory = _capture_segment(state, policy, length, generator)
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        for _ in range(replays):
+            captured.replay()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        advanced = int(state.step[0])
+        del captured, trajectory
     else:
         started = time.perf_counter()
         state = (
@@ -340,29 +406,29 @@ def benchmark(
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
         advanced = int(state.step[0])
-    if advanced != turns:
+    if advanced != measured:
         raise RuntimeError(
-            f"{engine} at batch {batch} advanced {advanced} turns, not {turns}; "
+            f"{engine} at batch {batch} advanced {advanced} turns, not {measured}; "
             "the configuration is not stepping the season it claims to"
         )
     peak = torch.cuda.max_memory_allocated(device) / 1e9
     del state, policy
     torch.cuda.empty_cache()
 
-    seconds_per_season = elapsed * SEASON_TURNS / turns
+    seconds_per_season = elapsed * SEASON_TURNS / measured
     seconds_per_game = seconds_per_season / batch
     measurement = Measurement(
         engine=engine,
         batch=batch,
         workers=1,
-        turns=turns,
+        turns=measured,
         policy_in_loop=policy_in_loop,
         device=str(device),
         seconds=elapsed,
         seconds_per_season=seconds_per_season,
         seconds_per_game=seconds_per_game,
         seasons_per_hour=3600.0 / seconds_per_game,
-        extrapolated=turns != SEASON_TURNS,
+        extrapolated=measured != SEASON_TURNS,
         load_average=os.getloadavg()[0],
         versus_reference=(
             None if reference is None else reference.seconds_per_game / seconds_per_game
@@ -475,13 +541,13 @@ def turn(state: SimState, policy: torch.nn.Module, *, sample: bool) -> SimState:
     """Advance one turn: observe both seats, mask, decide, and step.
 
     The same per-turn work ``sim.rollout.collect_segment`` does, minus its
-    trajectory bookkeeping. It is spelled out here rather than reused because
-    ``collect_segment`` ends each call with ``int(illegal_count.cpu())``, a host
-    synchronisation that aborts a CUDA graph capture -- and a graph mode that
-    captured a *different* body than the eager mode timed would be the same
-    class of mistake this file was rewritten to remove. The ``store`` engine
-    times ``collect_segment`` itself, so the difference between the two bodies
-    is a measured row rather than an assumption.
+    trajectory bookkeeping. It is spelled out here rather than reused so that
+    the cost of the bookkeeping is a measured gap -- ``store`` against ``eager``
+    -- rather than an assumption. It was originally spelled out for a second
+    reason that no longer holds: ``collect_segment`` used to end every call with
+    ``int(illegal_count.cpu())``, a host synchronisation that aborts a CUDA
+    graph capture, so this was the only body ``graph`` could capture. It is now
+    capturable itself, which is what the ``store-graph`` engine times.
 
     Args:
         state: The batch to advance.
@@ -571,7 +637,7 @@ def _run_store(
     Returns:
         The state after the last segment.
     """
-    length = max(1, min(SEGMENT_TURNS, SEGMENT_ROWS // state.batch_size))
+    length = segment_length(state.batch_size)
     remaining = turns
     while remaining > 0:
         state, _trajectory = collect_segment(
@@ -579,6 +645,69 @@ def _run_store(
         )
         remaining -= min(length, remaining)
     return state
+
+
+def segment_length(batch: int) -> int:
+    """Return the segment length used at a batch, by both ``store`` engines.
+
+    Shared so that the captured row and the eager row collect segments of the
+    same shape. A graph row measured against an eager row of a different
+    segment length would be comparing two different amounts of work.
+
+    Args:
+        batch: Environments advanced together.
+
+    Returns:
+        Turns per segment.
+    """
+    return max(1, min(SEGMENT_TURNS, SEGMENT_ROWS // batch))
+
+
+def _capture_segment(
+    state: SimState, policy: torch.nn.Module, length: int, generator: torch.Generator
+) -> tuple[torch.cuda.CUDAGraph, Trajectory]:
+    """Capture one whole ``collect_segment`` call, so a replay collects a segment.
+
+    The copy-back is the same mechanism ``_capture`` uses and is needed for the
+    same reason: ``collect_segment`` returns a successor state and leaves its
+    input alone, so without it every replay would re-collect the first segment
+    of the season from unchanged buffers. Here it is a whole segment rather than
+    a turn, so one replay advances ``length`` turns.
+
+    ``generator`` is registered with the graph before capture. An unregistered
+    generator would replay one fixed draw forever -- the frozen-computation
+    failure this file exists to prevent -- and registering the explicit one lets
+    the captured row sample from exactly the stream the eager row does.
+
+    Args:
+        state: The buffers the graph reads and writes; the season's live state.
+        policy: The network, or ``ZeroPolicy``.
+        length: Turns per captured segment.
+        generator: The sampling stream, registered with the graph.
+
+    Returns:
+        The captured graph, and the ``Trajectory`` its replays overwrite.
+    """
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        warm = state
+        for _ in range(WARMUP_SEGMENTS):
+            warm = collect_segment(warm, policy, turns=length, generator=generator)[0]
+    torch.cuda.current_stream().wait_stream(side)
+    del warm
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    graph.register_generator_state(generator)
+    with torch.cuda.graph(graph):
+        successor, trajectory = collect_segment(
+            state, policy, turns=length, generator=generator
+        )
+        for field in fields(SimState):
+            getattr(state, field.name).copy_(getattr(successor, field.name))
+    torch.cuda.synchronize()
+    return graph, trajectory
 
 
 def _capture(state: SimState, policy: torch.nn.Module) -> torch.cuda.CUDAGraph:
@@ -717,6 +846,127 @@ def _capture_deterministic(
             getattr(state, field.name).copy_(getattr(successor, field.name))
     torch.cuda.synchronize()
     return graph
+
+
+def verify_segment_graph(device: torch.device) -> None:
+    """Prove a captured ``collect_segment`` collects what the eager one collects.
+
+    ``verify_graph`` proves the *turn* body replays honestly. This proves the
+    same for the body the training loop would actually capture, and it is a
+    stronger statement, because a segment carries more than a state: replaying
+    it must reproduce every recorded tensor as well.
+
+    The first check replays a captured segment under ``PeakedPolicy``, whose
+    one-hot distributions make sampling deterministic, and compares the result
+    against the same number of eager ``collect_segment`` calls from the same
+    seeds -- all 39 ``SimState`` fields and all 14 ``Trajectory`` fields,
+    ``illegal`` included. A graph that replayed a frozen segment would sit at
+    the first segment's clock; one that advanced but computed something else
+    would differ in some plane or some recorded row.
+
+    The second check replays the sampling body and requires the season clock to
+    reach the right turn, a farm's bank to have moved, and two replays to have
+    recorded different actions. A captured RNG that did not advance would give a
+    state that moves but a policy that replays one fixed segment forever.
+
+    Args:
+        device: The CUDA device.
+
+    Raises:
+        RuntimeError: If the captured segment disagrees with the eager one on
+            any state field or any recorded tensor, if the clock does not reach
+            the turn the replays claim, or if the sampled actions never change.
+    """
+    seeds = torch.arange(VERIFY_BATCH, dtype=torch.int64, device=device) + SEED_BASE
+    replays = VERIFY_TURNS // VERIFY_SEGMENT
+    advanced = replays * VERIFY_SEGMENT
+
+    peaked = PeakedPolicy().to(device)
+    replayed = reset(Config(), seeds)
+    graph, trajectory = _capture_segment(
+        replayed,
+        peaked,
+        VERIFY_SEGMENT,
+        torch.Generator(device=device).manual_seed(SEED_BASE),
+    )
+    for _ in range(replays):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    stepped = reset(Config(), seeds)
+    eager = torch.Generator(device=device).manual_seed(SEED_BASE)
+    for _ in range(replays):
+        stepped, collected = collect_segment(
+            stepped, peaked, turns=VERIFY_SEGMENT, generator=eager
+        )
+    divergent = [
+        field.name
+        for field in fields(SimState)
+        if not torch.equal(getattr(replayed, field.name), getattr(stepped, field.name))
+    ] + [
+        f"trajectory.{field.name}"
+        for field in fields(Trajectory)
+        if not torch.equal(
+            getattr(trajectory, field.name), getattr(collected, field.name)
+        )
+    ]
+    if divergent:
+        raise RuntimeError(
+            f"the captured segment diverged from the eager one after {replays} "
+            f"segments of {VERIFY_SEGMENT} turns in: {', '.join(divergent)}"
+        )
+    if int(replayed.step[0]) != advanced:
+        raise RuntimeError(
+            f"{replays} segment replays advanced the season to step "
+            f"{int(replayed.step[0])}, not {advanced}"
+        )
+    del graph, trajectory, replayed, stepped, collected
+
+    sampled = reset(Config(), seeds)
+    graph, trajectory = _capture_segment(
+        sampled,
+        ZeroPolicy().to(device),
+        VERIFY_SEGMENT,
+        torch.Generator(device=device).manual_seed(SEED_BASE),
+    )
+    banks = [sampled.money.clone()]
+    actions = []
+    for _ in range(replays):
+        graph.replay()
+        banks.append(sampled.money.clone())
+        actions.append(trajectory.unit_actions.clone())
+    torch.cuda.synchronize()
+    if int(sampled.step[0]) != advanced:
+        raise RuntimeError(
+            f"{replays} segment replays advanced the season to step "
+            f"{int(sampled.step[0])}, not {advanced}; the captured segment is "
+            "not advancing state"
+        )
+    if all(torch.equal(banks[0], later) for later in banks[1:]):
+        raise RuntimeError(
+            "no replay moved either farm's bank, so the captured segment is not "
+            "playing the game it is being timed on"
+        )
+    if all(torch.equal(actions[0], later) for later in actions[1:]):
+        raise RuntimeError(
+            "every replay recorded the same actions, so the captured RNG is not "
+            "advancing and the segment is one fixed segment replayed"
+        )
+    if int(trajectory.illegal):
+        raise RuntimeError(
+            f"the captured segment recorded {int(trajectory.illegal)} actions "
+            "its own stored mask forbade"
+        )
+    del graph, trajectory, sampled
+    torch.cuda.empty_cache()
+    LOGGER.info(
+        "segment graph verified: %d replays of a %d-turn captured segment match "
+        "%d eager turns on every state field and every recorded tensor, and the "
+        "season advances under sampling",
+        replays,
+        VERIFY_SEGMENT,
+        advanced,
+    )
 
 
 def report(measurements: list[Measurement]) -> None:

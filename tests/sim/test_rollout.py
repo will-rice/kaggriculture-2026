@@ -91,7 +91,8 @@ def test_collect_segment_keeps_actions_legal_and_tensors_on_device() -> None:
     assert next_state.step.tolist() == [2, 2]
     assert trajectory.board.shape[:3] == (2, 2, 2)
     assert trajectory.unit_actions.shape == (2, 2, 2, 20)
-    assert trajectory.illegal == 0
+    assert int(trajectory.illegal) == 0
+    assert trajectory.illegal.device == state.step.device
     assert trajectory.board.device == state.step.device
 
 
@@ -127,7 +128,7 @@ def test_collect_segment_accepts_a_scripted_opponent() -> None:
     )
 
     assert next_state.step.tolist() == [2]
-    assert trajectory.illegal == 0
+    assert int(trajectory.illegal) == 0
 
 
 def test_terminal_segment_rewards_telescope_to_the_terminal_margin() -> None:

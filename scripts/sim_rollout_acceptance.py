@@ -42,9 +42,13 @@ def legality_gate(device: torch.device, batch: int, turns: int) -> dict[str, int
     decisions = turns * batch * 2 * (MAX_UNITS + len(MARKET_SLOTS) + 2)
     if decisions < 1_000_000:
         raise AssertionError(f"only {decisions} decisions; one million required")
-    if trajectory.illegal:
-        raise AssertionError(f"rollout produced {trajectory.illegal} illegal decisions")
-    return {"decisions": decisions, "illegal": trajectory.illegal}
+    # `Trajectory.illegal` stays on the device so that `collect_segment` holds
+    # no synchronisation; the gate is the place that genuinely needs the number,
+    # and reading it here costs one synchronisation for the whole run.
+    illegal = int(trajectory.illegal)
+    if illegal:
+        raise AssertionError(f"rollout produced {illegal} illegal decisions")
+    return {"decisions": decisions, "illegal": illegal}
 
 
 def economic_parity(device: torch.device, games: int) -> dict[str, object]:
