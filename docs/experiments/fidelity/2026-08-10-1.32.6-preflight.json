@@ -1,0 +1,42 @@
+{
+  "accepted": false,
+  "date": "2026-08-10",
+  "kaggle_environments_version": "1.32.6",
+  "reference": {
+    "kaggriculture_py_sha256": "fb9215c5e21a25243e2d13e75b3d70a79cf7d78fff150a90f1bb5eacf9ba2bcf",
+    "kaggriculture_json_sha256": "7f196f4aaf9b4e482fbd61ba4bf19f5cec4da0f81938ece756954035a65c0bb5",
+    "conditional_sites": 107,
+    "conditional_manifest_sha256": "0dc3ee31ac94553509880334b17873fd34c204c2b8bd675f93cb968cedc9d942"
+  },
+  "simulator_base_git_sha": "2b4f168664ee93c9ade522746521971ccc703bf8",
+  "simulator_has_uncommitted_changes": true,
+  "checks": {
+    "replay_codec_states": 50000,
+    "replay_codec_divergences": 0,
+    "replay_codec_seconds": 783.816,
+    "seeded_mutations": 24,
+    "seeded_mutations_detected": 24,
+    "rollout_decisions": 1049600,
+    "rollout_illegal_decisions": 0,
+    "rollout_legality_device": "cpu",
+    "rollout_legality_seconds": 46.821,
+    "fast_sim_tests_passed": 55,
+    "full_repository_tests_passed": 509,
+    "full_repository_tests_skipped": 1
+  },
+  "acceptance_campaign": {
+    "required_episodes": 10000,
+    "required_turn_comparisons": 14380000,
+    "completed_episodes": 0,
+    "divergences": null,
+    "branch_minimum_hits": null
+  },
+  "throughput": {
+    "cuda_available": false,
+    "measurements": []
+  },
+  "blockers": [
+    "No CUDA device is visible, so the B=64/128/256/1024 throughput matrix and 110000 steps/s gate cannot be measured.",
+    "The 10000-episode acceptance campaign has not been executed."
+  ]
+}
