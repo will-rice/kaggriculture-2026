@@ -35,8 +35,8 @@ MUTATIONS = (
     Mutation(
         2,
         "market.py",
-        "state.shed.sum(dim=-1) < SHED_CAPACITY",
-        "state.shed.sum(dim=-1) <= SHED_CAPACITY",
+        "room = (SHED_CAPACITY - state.shed.sum(dim=-1))",
+        "room = (SHED_CAPACITY + 1 - state.shed.sum(dim=-1))",
         "test_capacity_is_rechecked_for_each_bought_unit",
     ),
     Mutation(
@@ -84,17 +84,16 @@ MUTATIONS = (
     Mutation(
         9,
         "market.py",
-        "state.inventory[:, product] - 1",
-        "state.inventory[:, product]",
+        "torch.cat((levels, levels - 1), dim=-1)",
+        "torch.cat((levels, levels), dim=-1)",
         "test_buy_product_quote_at_inventory_minus_one_nets_zero_round_trip",
     ),
     Mutation(
         10,
         "market.py",
-        "quoted = market_prices(state.inventory[:, product], product)[:, None]\n"
-        "        price.copy_(torch.where(selected, quoted, price))",
-        "quoted = market_prices(state.inventory[:, product], product)[:, None]\n"
-        "        price.copy_(torch.where(selected, quoted + torch.arange(2, device=price.device), price))",
+        "    quoted = prices_for(torch.cat((levels, levels - 1), dim=-1), product[..., None])",
+        "    quoted = prices_for(torch.cat((levels, levels - 1), dim=-1), product[..., None])\n"
+        "    quoted = quoted + torch.arange(2, device=levels.device)[:, None]",
         "test_tensor_market_matches_sale_funding_later_purchase_and_lockstep",
     ),
     Mutation(
@@ -151,8 +150,8 @@ MUTATIONS = (
     Mutation(
         18,
         "units.py",
-        "selected = harvesting & (kind == 3) & (crop == crop_index + 1) & mature",
-        "selected = harvesting & (kind == 3) & (crop == crop_index + 1)",
+        "selected = harvesting & (kind == 3) & (crop >= 1) & mature",
+        "selected = harvesting & (kind == 3) & (crop >= 1)",
         "test_harvest_refuses_a_crop_before_first_yield_day",
     ),
     Mutation(
