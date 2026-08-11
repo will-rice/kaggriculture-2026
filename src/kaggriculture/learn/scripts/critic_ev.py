@@ -69,6 +69,7 @@ from pathlib import Path
 
 import torch
 
+from kaggriculture.learn.critic import explained_variance, monte_carlo
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import rollout_many
 from kaggriculture.learn.scripts.toad_phase1 import BATCH_SEGMENTS, OPPONENT
@@ -412,42 +413,26 @@ def diagnostics(episodes: Sequence[Episode]) -> dict[str, float]:
     }
 
 
-def monte_carlo(rewards: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
-    """Return the discounted return-to-go over a whole episode.
-
-    Computed by the learner's own ``td_lambda`` at ``lmb=1.0``, where the
-    ``(1 - lmb)`` factor deletes the only term values enter through, so this is
-    the pure Monte Carlo return and it cannot disagree with the learner's target
-    about the discount, the ordering or the episode boundary.
-
-    Args:
-        rewards: ``(turns,)`` per-turn reward.
-        dones: ``(turns,)`` bool, True on the last turn.
-
-    Returns:
-        ``(turns,)`` discounted return-to-go.
-    """
-    discounts = (~dones).float() * DISCOUNTING
-    zero = torch.zeros(())
-    return td_lambda.td_lambda(
-        rewards=rewards,
-        values=torch.zeros_like(rewards),
-        bootstrap_value=zero,
-        discounts=discounts,
-        lmb=1.0,
-    ).vs
-
-
 def segment_terms(
     episodes: Sequence[Episode], substitute: torch.Tensor | None = None
 ) -> dict[str, float]:
     """Return the learner's own segment-shaped value target and advantage statistics.
 
-    The episodes are chopped and batched exactly as ``toad_phase1._segments`` and
-    ``toad_phase1._step`` do it -- ``UNROLL_LENGTH`` turns per segment,
+    The episodes are chopped and batched the way the arms in ``ARMS`` were
+    trained -- ``UNROLL_LENGTH`` turns per segment tiled forward from turn 0,
     ``BATCH_SEGMENTS`` segments per batch, bootstrapping from the value of the
     batch's own last row -- because the value loss and the advantage both scale
     with that shape, and a segment of a different length is a different number.
+
+    That is deliberately **no longer** what ``toad_phase1._segments`` and
+    ``_step`` do. Both defects this reconstruction faithfully reproduces -- the
+    ragged tail that dropped the season's only ``done``, and the bootstrap taken
+    from inside the segment rather than from the state after it -- were fixed on
+    2026-08-11, and fixing them took a fresh critic's explained variance against
+    the real return from -14.4 to +0.94. This function is kept as it is on
+    purpose: every checkpoint in ``ARMS`` was trained under the old target, and
+    scoring them under the new one would report a value loss none of them was
+    ever optimising. It is a historical instrument, not a mirror of the runner.
 
     The behaviour and target log-probabilities are the same tensor here: a
     checkpoint is scored as the policy that played, so the importance ratios are
@@ -554,22 +539,6 @@ def variance_split(pool: ProcessPoolExecutor, arm: Arm) -> dict[str, float]:
         )
         record[f"{name}_mean"] = float(table.mean())
     return record
-
-
-def explained_variance(returns: torch.Tensor, values: torch.Tensor) -> float:
-    """Return ``1 - Var(returns - values) / Var(returns)``.
-
-    Args:
-        returns: Whatever the critic is being scored against.
-        values: The critic's estimate at the same states, same shape.
-
-    Returns:
-        The explained variance, or NaN when the returns carry none.
-    """
-    total = float(returns.var(unbiased=False))
-    if total <= 0.0:
-        return float("nan")
-    return 1.0 - float((returns - values).var(unbiased=False)) / total
 
 
 def correlation(left: torch.Tensor, right: torch.Tensor) -> float:

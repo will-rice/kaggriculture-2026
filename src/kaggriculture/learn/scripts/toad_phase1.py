@@ -45,6 +45,7 @@ from lightning import seed_everything
 
 import wandb
 from kaggriculture.learn import CHECKPOINT
+from kaggriculture.learn.critic import critic_scores
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
@@ -112,6 +113,23 @@ THREADS = 1
 # How many updates the actor's weights lag the learner's. See D7 above.
 SYNC_EVERY = 4
 OPPONENT = "src/kaggriculture/economic_policy.py"
+# What a segment carries, split by how many rows of it there are. The acted
+# fields have one row per decision. The observed fields have one more, because
+# the value target bootstraps from the state *after* the segment's last action
+# and not from that action's own state; see `_segments` for why the difference
+# is the whole ballgame.
+ACTED_FIELDS = (
+    "unit_actions",
+    "market_actions",
+    "unit_masks",
+    "market_masks",
+    "log_probs",
+    "shaped",
+    "shaped_money",
+    "margin",
+    "dones",
+)
+OBSERVED_FIELDS = ("board", "scalars", "positions")
 RUNS = Path("/data/kaggriculture/toad")
 # Every 25 updates is ~13 minutes of work at the measured 3.97M steps/hour.
 # Attempt one had none, and an external kill at update 253 cost 2.3 hours.
@@ -395,6 +413,18 @@ def _record(
         # simply selling less is visible rather than inferred.
         **_population(econ_batch, "vs_econ"),
         **_population(mirror_batch, "mirror"),
+        # WHAT THE `baseline` TERM DOES NOT SAY. That term is the value head's
+        # distance from its OWN bootstrapped target, so it measures
+        # self-consistency; a critic can sit at 0.998 explained variance against
+        # its own target while explaining the real return twelvefold WORSE than
+        # a constant, and ten arms read the falling term as the critic learning.
+        # These are the accuracy, against the actual discounted return-to-go of
+        # the episodes just played, and a run whose `baseline` falls while these
+        # stay negative has not trained a critic. Split by population for the
+        # reason everything else here is: a mirror seat's return is very nearly
+        # deterministic, so the two are not comparable numbers.
+        **_critic(econ_batch, field, "vs_econ"),
+        **_critic(mirror_batch, field, "mirror"),
         "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
         # The episode total of the series the learner is actually reading.
         # `shaped_mean` is logged unconditionally and is the counterfactual
@@ -475,6 +505,32 @@ def _population(batch: list[Trajectory], population: str) -> dict[str, float]:
             "final_capital",
         )
     }
+
+
+def _critic(batch: list[Trajectory], field: str, population: str) -> dict[str, float]:
+    """Return one population's critic accuracy, suffixed by which it is.
+
+    The values are the ones the ACTOR emitted while playing, so they lag the
+    learner by up to ``SYNC_EVERY`` updates. That is the honest reading -- it is
+    the critic that actually shaped this round's advantages -- and it costs
+    nothing, since a rollout already recorded them and the return is one
+    backward scan over rewards the trajectory is already carrying.
+
+    Args:
+        batch: That population's trajectories, possibly empty.
+        field: The reward series the learner reads, so the critic is scored
+            against the return it was trained on and not another one.
+        population: ``"vs_econ"`` or ``"mirror"``, appended to every key.
+
+    Returns:
+        Explained variance against the real return, pooled and within-turn.
+    """
+    scores = critic_scores(
+        [t.values for t in batch],
+        [getattr(t, field) for t in batch],
+        [t.dones for t in batch],
+    )
+    return {f"{name}_{population}": value for name, value in scores.items()}
 
 
 def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_run.Run":
@@ -948,9 +1004,19 @@ def _step(
     dones = stacked("dones")
 
     turns, width = behaviour.shape
+    # The observed fields are one row longer than the acted ones, so this
+    # forwards `turns + 1` states per segment. Only the trailing state's *value*
+    # is wanted -- no action was taken there -- so its logits are sliced off
+    # immediately and its value becomes the bootstrap. monobeast.py:292-296 does
+    # exactly this split.
     unit_logits, market_logits, values = learner(
         board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
     )
+    values = values.view(turns + 1, width)
+    bootstrap_value = values[-1].detach()
+    values = values[:-1]
+    unit_logits = _acted(unit_logits, turns, width)
+    market_logits = _acted(market_logits, turns, width)
     flat_unit_masks = unit_masks.flatten(0, 1)
     flat_market_masks = market_masks.flatten(0, 1)
     units = torch.log_softmax(
@@ -976,19 +1042,21 @@ def _step(
             teacher_units, teacher_market, _ = teacher(
                 board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
             )
-        teacher_kl = _kl(units, teacher_units, flat_unit_masks).view(
-            turns, width
-        ) + _kl(market, teacher_market, flat_market_masks).view(turns, width)
+        teacher_kl = _kl(
+            units, _acted(teacher_units, turns, width), flat_unit_masks
+        ).view(turns, width) + _kl(
+            market, _acted(teacher_market, turns, width), flat_market_masks
+        ).view(turns, width)
 
-    values = values.view(turns, width)
     terms = losses(
         behaviour_log_probs=behaviour,
         learner_log_probs=learner_log_probs,
         negative_entropy=negative_entropy,
         values=values,
-        # The unroll is a slice out of the middle of an episode, so it
-        # bootstraps from the value the learner assigns its own last state.
-        bootstrap_value=values[-1].detach(),
+        # The value of the state *after* the segment's last action, which is
+        # what couples one segment to the next and is the only route by which
+        # the end of the season reaches a target built in the middle of it.
+        bootstrap_value=bootstrap_value,
         rewards=rewards,
         dones=dones,
         baseline_only=baseline_only,
@@ -1009,6 +1077,21 @@ def _step(
         "teacher": terms.teacher.item(),
         "total": terms.total.item(),
     }
+
+
+def _acted(logits: torch.Tensor, turns: int, width: int) -> torch.Tensor:
+    """Drop the trailing bootstrap state's row from a flattened head output.
+
+    Args:
+        logits: ``((turns + 1) * width, ...)`` one head's output over every
+            forwarded state.
+        turns: Acted rows per segment.
+        width: Segments in the batch.
+
+    Returns:
+        ``(turns * width, ...)``, the acted states alone.
+    """
+    return logits.view(turns + 1, width, *logits.shape[1:])[:-1].flatten(0, 1)
 
 
 def _kl(
@@ -1041,40 +1124,86 @@ def _kl(
 
 
 def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
-    """Chop one episode into ``UNROLL_LENGTH`` segments, dropping the ragged tail.
+    """Chop one episode into ``UNROLL_LENGTH`` segments, anchored to its end.
 
     Their unroll_length is 16 and their reduction is ``sum``, so the loss scales
     with the segment shape; keeping both is part of keeping their coefficients
-    meaningful.
+    meaningful. Two things beyond the length are load-bearing, and both were
+    wrong until the critic was measured against the return it is supposed to
+    predict rather than against its own target.
+
+    **The segments are anchored to the last turn, not the first.** Tiling
+    forward from turn 0 and dropping whatever does not fill a segment discards
+    the final 15 turns of 719 -- and the terminal turn with them, which is the
+    only row in the whole episode where ``dones`` is True. The learner therefore
+    never saw a done, no discount was ever zeroed, and no target it ever built
+    knew the season ends at all. Anchored to the end instead, the same 44
+    segments cover turns 15-718 and the terminal is always the last acted row of
+    the last segment. What gets dropped is the opening, whose encoded state is
+    byte-identical across seeds anyway.
+
+    **A segment carries one state more than it has decisions.** monobeast's
+    buffers are ``unroll_length + 1`` long and it bootstraps from
+    ``learner_outputs["baseline"][-1]`` (monobeast.py:292) after slicing the
+    acted rows off with ``learner_outputs[:-1]`` (:296) -- i.e. from the value
+    of the state *after* the segment's last action. Ours bootstrapped from the
+    last acted row's own value, which seals each 16-turn window off from every
+    state outside it: nothing beyond the window can enter the target, adjacent
+    segments are never coupled, and the horizon can never propagate backwards
+    however long the run goes on. The fixed point of that sealed target is
+    ``r / (1 - gamma)``, the local reward rate extrapolated to an *infinite*
+    horizon -- 1000x a turn's reward at their gamma of 0.999, regardless of how
+    many turns the season actually has left. That is precisely the critic the
+    2026-08-09 measurement found: running to its -1 rail while the true
+    return-to-go rose toward zero, at a predicted-over-actual ratio of 1.95
+    rising to 8.91 across the season, and explaining the return worse than a
+    constant would.
 
     Args:
         trajectory: One recorded seat's episode.
 
     Returns:
-        One dict of stacked tensors per whole segment.
+        One dict per segment, ``ACTED_FIELDS`` carrying ``UNROLL_LENGTH`` rows
+        and ``OBSERVED_FIELDS`` carrying one more.
     """
     turns = int(trajectory.dones.shape[0])
-    fields = (
-        "board",
-        "scalars",
-        "positions",
-        "unit_actions",
-        "market_actions",
-        "unit_masks",
-        "market_masks",
-        "log_probs",
-        "shaped",
-        "shaped_money",
-        "margin",
-        "dones",
-    )
     return [
         {
-            name: getattr(trajectory, name)[start : start + UNROLL_LENGTH]
-            for name in fields
+            **{
+                name: getattr(trajectory, name)[start : start + UNROLL_LENGTH]
+                for name in ACTED_FIELDS
+            },
+            **{
+                name: getattr(trajectory, name)[_observed(turns, start)]
+                for name in OBSERVED_FIELDS
+            },
         }
-        for start in range(0, turns - UNROLL_LENGTH + 1, UNROLL_LENGTH)
+        for start in range(
+            turns % UNROLL_LENGTH, turns - UNROLL_LENGTH + 1, UNROLL_LENGTH
+        )
     ]
+
+
+def _observed(turns: int, start: int) -> torch.Tensor:
+    """Return the state rows one segment reads: its acted rows plus its bootstrap.
+
+    The last segment of an episode ends the season, so the state after it does
+    not exist. Its last acted row carries ``dones``, which zeroes that step's
+    discount and so deletes the bootstrap from every return ``toad_loss``
+    computes -- the value read there cannot reach the target whatever it is, and
+    the final state is repeated only to keep every segment one shape. Clamping
+    rather than special-casing is what stops the ragged tail coming back: there
+    is no index this can return that is out of range, so a segment can never be
+    short and no episode remainder can ever be silently dropped again.
+
+    Args:
+        turns: Acted rows in the episode.
+        start: The segment's first acted row.
+
+    Returns:
+        ``(UNROLL_LENGTH + 1,)`` int64 row indices.
+    """
+    return torch.arange(start, start + UNROLL_LENGTH + 1).clamp(max=turns - 1)
 
 
 if __name__ == "__main__":

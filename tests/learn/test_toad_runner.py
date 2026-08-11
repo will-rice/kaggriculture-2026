@@ -25,12 +25,18 @@ from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE
 
 
 def _segment(turns: int = 16) -> dict[str, torch.Tensor]:
-    """Return one synthetic unroll shaped exactly as ``_segments`` produces."""
+    """Return one synthetic unroll shaped exactly as ``_segments`` produces.
+
+    The observed fields carry one row more than the acted ones. That extra state
+    is the one the value target bootstraps from -- it is deliberately outside the
+    segment's own decisions -- so a stand-in built at equal lengths would not be
+    the shape the runner is handed. See ``toad_phase1._segments``.
+    """
     slots = len(MARKET_SLOTS) + 2
     return {
-        "board": torch.randn(turns, TILE_PLANES, 10, 10),
-        "scalars": torch.randn(turns, SCALARS),
-        "positions": torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
+        "board": torch.randn(turns + 1, TILE_PLANES, 10, 10),
+        "scalars": torch.randn(turns + 1, SCALARS),
+        "positions": torch.zeros(turns + 1, MAX_UNITS, dtype=torch.int64),
         "unit_actions": torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
         "market_actions": torch.zeros(turns, slots, dtype=torch.int64),
         "unit_masks": torch.ones(turns, MAX_UNITS, len(UNIT_OPS), dtype=torch.bool),
