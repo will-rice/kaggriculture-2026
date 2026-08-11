@@ -12,6 +12,12 @@ def pytest_addoption(parser: Any) -> None:  # noqa: ANN401
     """Register scalable differential-campaign controls."""
     parser.addoption("--sim-episodes", type=int, default=4)
     parser.addoption("--sim-turns", type=int, default=48)
+    # The market coupling campaign costs roughly a second per round and almost
+    # nothing per environment, because the oracle it is checked against is a
+    # Python scan over unit-rounds while the batch axis stays vectorised. Widen
+    # it before lengthening it.
+    parser.addoption("--sim-market-rounds", type=int, default=8)
+    parser.addoption("--sim-market-batch", type=int, default=512)
 
 
 def _reference_projection(reference: Any, seat: int) -> dict[str, Any]:  # noqa: ANN401
