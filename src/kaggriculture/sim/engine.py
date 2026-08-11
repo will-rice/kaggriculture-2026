@@ -47,6 +47,42 @@ class MarketActions:
             order_qty=torch.zeros(shape, dtype=torch.int32, device=device),
         )
 
+    def compacted(self) -> MarketActions:
+        """Return the same orders left-aligned into the reference's queue.
+
+        The reference engine reads each seat's market action as a list with no
+        holes and resolves the ``i``-th entry of one seat against the ``i``-th
+        entry of the other, so queue position is what couples two seats into a
+        lockstep round. A slot typed ``ORDER_NONE`` means the seat submitted no
+        order there, not that it submitted a dead one, so it must not consume a
+        position. Sliding the present orders down restores that alignment; an
+        order that is merely dead -- malformed, zero quantity, or unaffordable
+        -- still holds its position, exactly as it does in the reference list.
+
+        Returns:
+            Orders whose non-empty slots occupy the low indices in their
+            original relative order, padded with empty slots.
+        """
+        width = self.order_type.shape[-1]
+        present = self.order_type != ORDER_NONE
+        rank = present.to(torch.int64).cumsum(dim=-1) - 1
+        destination = torch.where(present, rank, torch.full_like(rank, width))
+        padded = (*self.order_type.shape[:-1], width + 1)
+        device = self.order_type.device
+        return MarketActions(
+            order_type=torch.zeros(padded, dtype=self.order_type.dtype, device=device)
+            .scatter_(2, destination, self.order_type)[..., :width]
+            .contiguous(),
+            order_item=torch.full(
+                padded, -1, dtype=self.order_item.dtype, device=device
+            )
+            .scatter_(2, destination, self.order_item)[..., :width]
+            .contiguous(),
+            order_qty=torch.zeros(padded, dtype=self.order_qty.dtype, device=device)
+            .scatter_(2, destination, self.order_qty)[..., :width]
+            .contiguous(),
+        )
+
 
 def reset(
     config: Config, seeds: torch.Tensor, device: torch.device | str | None = None

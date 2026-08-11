@@ -14,7 +14,12 @@ from kaggriculture.sim.state import (
     pack,
     unpack,
 )
-from tests.sim.states import hire_ladder, price_at_floor, shed_one_below_capacity
+from tests.sim.states import (
+    book_at,
+    hire_ladder,
+    price_at_floor,
+    shed_one_below_capacity,
+)
 
 
 def _assert_observations(environment, state) -> None:
@@ -149,6 +154,44 @@ def test_buy_product_quote_at_inventory_minus_one_nets_zero_round_trip() -> None
     actual = apply_day_phases(apply_market_phase(state, actions))
 
     _assert_observations(environment, actual)
+
+
+def test_orders_couple_by_queue_position_not_by_slot_index() -> None:
+    # The reference reads each seat's market action as a hole-free list, so two
+    # orders couple when they share a queue position, not a slot index. Seat one
+    # leaves slot zero empty; both orders are still first in their queue and so
+    # must quote off the same book in lockstep. Resolving them in separate slots
+    # instead serialises them: seat zero would buy twice off an untouched book
+    # at 27 each and seat one twice off a book already four units lower at 28
+    # each, rather than both paying 27 then 28.
+    environment = book_at("WHEAT", inventory=9_996, money=(58, 63))
+    state = pack([environment])
+    actions = MarketActions.empty(1)
+    actions.order_type[0, 0, 0] = 3
+    actions.order_item[0, 0, 0] = 0  # WHEAT
+    actions.order_qty[0, 0, 0] = 3
+    actions.order_type[0, 1, 1] = 3
+    actions.order_item[0, 1, 1] = 0  # WHEAT
+    actions.order_qty[0, 1, 1] = 2
+    reference = [
+        {
+            "farmer": ["PASS"],
+            "hands": [],
+            "market": [["BUY_PRODUCT", "WHEAT", 3]],
+        },
+        {
+            "farmer": ["PASS"],
+            "hands": [],
+            "market": [["BUY_PRODUCT", "WHEAT", 2]],
+        },
+    ]
+
+    environment.step(reference)
+    actual = apply_day_phases(apply_market_phase(state, actions))
+
+    _assert_observations(environment, actual)
+    farms = environment.state[0].observation.farms
+    assert (farms[0].money, farms[1].money) == (3.0, 8.0)
 
 
 def test_hire_cost_uses_current_hires_today_fibonacci_index() -> None:

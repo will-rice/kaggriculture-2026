@@ -176,12 +176,19 @@ def _resolve(
 
 
 def apply_market_phase(original: SimState, actions: MarketActions) -> SimState:
-    """Apply ten ordered market slots over a tensor quantity axis."""
+    """Apply ten ordered market slots over a tensor quantity axis.
+
+    Slot index is what pairs the two seats into a lockstep round, so the orders
+    are compacted first: the reference reads a hole-free list per seat, and a
+    caller that leaves an empty slot between two orders would otherwise couple
+    the wrong pair.
+    """
     expected = (original.batch_size, 2, 10)
     if tuple(actions.order_type.shape) != expected:
         raise ValueError(
             f"expected market actions {expected}, got {tuple(actions.order_type.shape)}"
         )
+    actions = actions.compacted()
     state = _clone(original)
     device = state.step.device
     rules = market_orders(device)

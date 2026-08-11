@@ -23,9 +23,11 @@ The generators are deliberate, not merely random. Each round supplies books
 already at the price floor (where a sale stops adding supply and the climb
 clamps), seats too poor to fill what they asked for (where the cumulative-cost
 prefix truncates), sheds at or beside capacity (where the room cap binds),
-quantities drawn across the whole decoder bucket range, and -- the case this
-module exists for -- both seats ordering the same product in one slot with
-lopsided quantities, so one seat dies first and the handover has to fire.
+quantities drawn across the whole decoder bucket range, seats whose empty slots
+fall in different places (where queue position, not slot index, decides which
+orders meet), and -- the case this module exists for -- both seats ordering the
+same product at one queue position with lopsided quantities, so one seat dies
+first and the handover has to fire.
 ``COVERAGE_FLOOR`` asserts those cases actually occurred, so a generator that
 silently stops producing them fails loudly instead of passing vacuously.
 
@@ -96,6 +98,7 @@ COVERAGE_FLOOR = {
     "cross_role": 300,
     "broke_seat": 150,
     "full_shed": 100,
+    "misaligned": 1_800,
 }
 COVERAGE_SCALE = 10_000
 
@@ -169,7 +172,10 @@ def adversarial_orders(batch: int, generator: torch.Generator) -> MarketActions:
 
     Every order type is reachable, including the malformed one, and quantities
     are drawn from the decoder's own bucket table as well as uniformly across
-    the axis. Half the slots are then overwritten with a coupled pair: both
+    the axis. Empty slots are punched with a hole pattern that is shared between
+    the seats half the time and independent the other half, so a slot-aligned
+    pair sometimes survives compaction and sometimes is pulled apart. Two thirds
+    of the slots are then overwritten with a coupled pair: both
     seats trade the same product, one of them selling and -- where the product
     is buyable at all -- the other buying, with lopsided quantities so the pair
     separates part-way through the slot.
@@ -190,6 +196,14 @@ def adversarial_orders(batch: int, generator: torch.Generator) -> MarketActions:
     orders = MarketActions.empty(batch, DEVICE)
     orders.order_type.copy_(rand(ORDER_TYPES, shape).to(torch.int8))
     silent = rand(3, shape) == 0
+    # Empty slots are holes in the queue, not dead orders, so the phase slides
+    # the survivors down before pairing seats. Half the environments punch the
+    # same holes in both seats, which shifts a slot-aligned pair intact and
+    # keeps it coupled; the other half hole independently, which pulls such a
+    # pair apart and must stop it coupling. Both directions have to be searched,
+    # since a phase that ignored queue position would pass on the first alone.
+    shared = rand(2, (batch, 1, 1)) == 0
+    silent = torch.where(shared, silent[:, :1].expand_as(silent), silent)
     orders.order_type.copy_(
         torch.where(silent, torch.zeros_like(orders.order_type), orders.order_type)
     )
@@ -209,7 +223,10 @@ def adversarial_orders(batch: int, generator: torch.Generator) -> MarketActions:
     buyable = torch.tensor([PRODUCT_NAMES.index(name) for name in BUY_PRODUCTS])
     reverse = torch.full((len(PRODUCT_NAMES),), -1, dtype=torch.int64)
     reverse[buyable] = torch.arange(len(BUY_PRODUCTS))
-    paired = rand(2, slot) == 0
+    # Two thirds of slots, rather than half, because a pair only stays coupled
+    # when both seats reach it at the same queue position, and the independent
+    # holes above pull roughly half of them apart.
+    paired = rand(3, slot) > 0
     product = torch.where(
         rand(2, slot) == 0,
         buyable[rand(len(BUY_PRODUCTS), slot)],
@@ -258,16 +275,23 @@ def adversarial_orders(batch: int, generator: torch.Generator) -> MarketActions:
     return orders
 
 
-def coverage(state: SimState, orders: MarketActions) -> dict[str, int]:
+def coverage(state: SimState, submitted: MarketActions) -> dict[str, int]:
     """Count how many order slots reach each adversarial case.
+
+    Coupling is read off the compacted queue rather than the submitted slots,
+    because that is what the phase resolves: an empty slot is not a queue
+    position. ``misaligned`` counts the slots where the two differ, so a
+    generator that stops leaving holes -- and therefore stops testing the queue
+    rule at all -- fails instead of passing vacuously.
 
     Args:
         state: The state the slots are applied to.
-        orders: The orders for all ten slots.
+        submitted: The orders for all ten slots, holes included.
 
     Returns:
         A count per ``COVERAGE_FLOOR`` key, summed over seats and slots.
     """
+    orders = submitted.compacted()
     rules = market_orders(DEVICE)
     order_type = orders.order_type.to(torch.int64)
     code = (orders.order_item.to(torch.int64) + 1).clamp(0, ORDER_ITEMS - 1)
@@ -293,6 +317,7 @@ def coverage(state: SimState, orders: MarketActions) -> dict[str, int]:
         "cross_role": int((both & (role != role.flip(1))).sum()) // 2,
         "broke_seat": int((state.money < BROKE).sum()),
         "full_shed": int((state.shed.sum(dim=-1) >= SHED_CAPACITY - 2).sum()),
+        "misaligned": int((orders.order_type != submitted.order_type).sum()),
     }
 
 

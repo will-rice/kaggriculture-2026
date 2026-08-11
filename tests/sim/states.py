@@ -48,6 +48,26 @@ def money_exactly(price: int, *, for_order: list[Any]) -> Environment:
     return _sync(environment)
 
 
+def book_at(product: str, *, inventory: int, money: Sequence[int]) -> Environment:
+    """Place one product's book at a level and set both seats' coin.
+
+    Args:
+        product: Market product whose book level is set.
+        inventory: Level the book sits at before the market phase.
+        money: Coin for seat zero and seat one.
+
+    Returns:
+        An environment with both observations synchronized.
+    """
+    environment = _fresh()
+    public = environment.state[0].observation
+    public.market.inventory[product] = inventory
+    public.market.prices[product] = market_price(product, inventory)
+    for seat, amount in enumerate(money):
+        public.farms[seat].money = float(amount)
+    return _sync(environment)
+
+
 def price_at_floor(product: str) -> Environment:
     environment = _fresh()
     inventory = 10_000

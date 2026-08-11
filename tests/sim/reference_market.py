@@ -180,6 +180,36 @@ def _commit(
     return success
 
 
+def _compacted(actions: MarketActions) -> MarketActions:
+    """Slide each seat's present orders onto consecutive queue positions.
+
+    ``_process_market`` reads a seat's market action as ``q = list(m)`` and
+    resolves ``q[i]`` for both seats in one lockstep round, so a queue holds no
+    holes and it is position, not slot index, that pairs two seats. Written as a
+    Python scan for the same reason as everything else in this module: it must
+    not share an implementation with the tensor phase it contradicts.
+    """
+    batches, seats, slots = actions.order_type.shape
+    packed = MarketActions.empty(batches, actions.order_type.device)
+    for batch in range(batches):
+        for seat in range(seats):
+            position = 0
+            for slot in range(slots):
+                if int(actions.order_type[batch, seat, slot]) == 0:
+                    continue
+                packed.order_type[batch, seat, position] = actions.order_type[
+                    batch, seat, slot
+                ]
+                packed.order_item[batch, seat, position] = actions.order_item[
+                    batch, seat, slot
+                ]
+                packed.order_qty[batch, seat, position] = actions.order_qty[
+                    batch, seat, slot
+                ]
+                position += 1
+    return packed
+
+
 def apply_market_phase(original: SimState, actions: MarketActions) -> SimState:
     """Apply ten order indices with a fixed 65-iteration quantity scan."""
     expected = (original.batch_size, 2, 10)
@@ -190,6 +220,7 @@ def apply_market_phase(original: SimState, actions: MarketActions) -> SimState:
     torch._assert(
         (actions.order_qty <= 64).all(), "market order quantity exceeds fixed scan"
     )
+    actions = _compacted(actions)
     state = _clone(original)
     for slot in range(10):
         order_type = actions.order_type[..., slot].to(torch.int64)

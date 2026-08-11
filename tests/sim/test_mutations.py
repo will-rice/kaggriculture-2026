@@ -196,6 +196,13 @@ MUTATIONS = (
         "drawn = (choices.gather(1, first[:, None]).squeeze(1) + state.shop_count) % 8",
         "test_shop_draw_can_repeat_an_existing_shop",
     ),
+    Mutation(
+        25,
+        "market.py",
+        "actions = actions.compacted()",
+        "actions = actions",
+        "test_orders_couple_by_queue_position_not_by_slot_index",
+    ),
 )
 
 
