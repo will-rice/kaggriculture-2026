@@ -6,6 +6,7 @@ directly and never cross the runner boundary -- so arm C' launched, crashed on
 its first batch, and burned the slot. These call what the runner calls.
 """
 
+import copy
 from typing import Any
 
 import pytest
@@ -21,7 +22,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts import toad_phase1
-from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE
+from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE, TEACHER_KL_COST
 
 
 def _segment(turns: int = 16) -> dict[str, torch.Tensor]:
@@ -97,3 +98,150 @@ def test_the_warmup_budget_is_counted_down_in_batches(
     assert consumed == len(segments) // toad_phase1.BATCH_SEGMENTS
     # Every batch was inside the warmup budget, so the mean total is the mean baseline.
     assert terms["total"] == terms["baseline"]
+
+
+def _fitted(segments: list[dict[str, torch.Tensor]], value_passes: int) -> float:
+    """Return the value loss left on ``segments`` after one round of training.
+
+    The probe is a copy, so measuring does not train: ``_step`` computes its
+    terms at the weights it is handed and only then steps, which makes the
+    returned ``baseline`` a readout of the fit rather than of the update.
+
+    Args:
+        segments: The round's unrolls.
+        value_passes: Extra value-only passes to run inside ``_update``.
+
+    Returns:
+        Mean ``baseline`` loss over every batch of ``segments``.
+    """
+    torch.manual_seed(0)
+    policy, optimizer = _policy()
+
+    class _Fake:
+        dones = torch.zeros(64, dtype=torch.bool)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(toad_phase1, "_segments", lambda trajectory: segments)  # noqa: ARG005
+        batch: list[Any] = [_Fake()]
+        toad_phase1._update(
+            policy, optimizer, batch, "cpu", "shaped", value_passes=value_passes
+        )
+    probe = copy.deepcopy(policy)
+    spare = torch.optim.Adam(probe.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
+    losses = [
+        toad_phase1._step(
+            probe,
+            spare,
+            segments[start : start + toad_phase1.BATCH_SEGMENTS],
+            "cpu",
+            "shaped",
+            baseline_only=True,
+        )["baseline"]
+        for start in range(0, len(segments), toad_phase1.BATCH_SEGMENTS)
+    ]
+    return sum(losses) / len(losses)
+
+
+def test_extra_value_passes_leave_the_critic_better_fitted() -> None:
+    """The point of ``value_passes`` is the fit, so pin the fit and not the count.
+
+    A test that counted ``_step`` calls would pass on an implementation that
+    shuffled without stepping, or that stepped a detached value head. This
+    measures what the extra passes are for: the value loss left on the same
+    round afterwards. Measured 2026-08-15 -- one look per sample is the whole
+    gap between a critic at -0.103 within-step and the same target, trained over
+    the same data, at +0.276.
+
+    Verified by mutation: making the passes a no-op fails this and nothing else.
+    It does **not** catch passes that replay the *full* loss -- the value term is
+    inside that total, so the fit improves either way. That property has no
+    behavioural signature here and is guarded structurally by
+    ``test_the_extra_passes_never_replay_the_policy_gradient``.
+    """
+    torch.manual_seed(1)
+    segments = [_segment() for _ in range(16)]
+    assert _fitted(segments, value_passes=5) < _fitted(segments, value_passes=0)
+
+
+def test_no_value_passes_reproduces_the_earlier_arms() -> None:
+    """Zero extra passes must leave the round bit-identical to before the change.
+
+    Ten arms and their controls were run without this knob, and the corrected
+    arm they are compared against is one of them. If the default moved them, the
+    comparison would be against a configuration that never ran.
+    """
+    torch.manual_seed(1)
+    segments = [_segment() for _ in range(8)]
+    torch.manual_seed(0)
+    policy, optimizer = _policy()
+    reference = [
+        toad_phase1._step(
+            policy,
+            optimizer,
+            segments[start : start + toad_phase1.BATCH_SEGMENTS],
+            "cpu",
+            "shaped",
+        )
+        for start in range(0, len(segments), toad_phase1.BATCH_SEGMENTS)
+    ]
+    expected = sum(terms["baseline"] for terms in reference) / len(reference)
+    torch.manual_seed(0)
+    fresh, fresh_optimizer = _policy()
+
+    class _Fake:
+        dones = torch.zeros(64, dtype=torch.bool)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(toad_phase1, "_segments", lambda trajectory: segments)  # noqa: ARG005
+        batch: list[Any] = [_Fake()]
+        terms, _ = toad_phase1._update(fresh, fresh_optimizer, batch, "cpu", "shaped")
+    assert terms["baseline"] == pytest.approx(expected)
+    # With no extra passes there is nothing else to report, so the new term must
+    # fall back to the round's own baseline rather than to a misleading zero.
+    assert terms["baseline_passes"] == pytest.approx(expected)
+
+
+def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
+    """Every extra pass must be value-only, and no behavioural test can say so.
+
+    Replaying a round through the full loss would fit the value head just as
+    well -- the baseline term is inside that total -- so the fit test above
+    cannot tell the two apart, and it was checked by mutation that it does not.
+    What it would change is the algorithm: the policy gradient would take five
+    steps on one round of stale actions instead of one, which is off-policy
+    repetition V-trace's clipping was never asked to cover. The property is
+    structural, so it is pinned structurally rather than left unguarded.
+    """
+    torch.manual_seed(1)
+    segments = [_segment() for _ in range(8)]
+    policy, optimizer = _policy()
+    seen: list[bool] = []
+    real = toad_phase1._step
+
+    def _recording(
+        learner: Policy,
+        optimizer: torch.optim.Optimizer,
+        batch: list[dict[str, torch.Tensor]],
+        device: str,
+        field: str,
+        baseline_only: bool = False,
+        teacher: Policy | None = None,
+        teacher_kl_cost: float = TEACHER_KL_COST,
+    ) -> dict[str, float]:
+        seen.append(baseline_only)
+        return real(
+            learner,
+            optimizer,
+            batch,
+            device,
+            field,
+            baseline_only,
+            teacher,
+            teacher_kl_cost,
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(toad_phase1, "_step", _recording)
+        toad_phase1._value_passes(policy, optimizer, segments, "cpu", "shaped", 3)
+    assert seen
+    assert all(seen)

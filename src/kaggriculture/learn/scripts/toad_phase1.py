@@ -199,6 +199,16 @@ def main() -> None:
         "warm-started policy whose critic is untrained.",
     )
     parser.add_argument(
+        "--value-passes",
+        type=int,
+        default=0,
+        help="extra value-only passes over each round after the policy's one "
+        "(arm S uses 4). A round is otherwise seen once and discarded, and the "
+        "ceiling experiment put a critic trained 150 times over the same data at "
+        "+0.276 within-step where the live arm that produced it sat at -0.103. "
+        "Zero reproduces every earlier arm exactly.",
+    )
+    parser.add_argument(
         "--money-signed",
         action="store_true",
         help="keep both signs on the money delta (arm W'). Makes the component "
@@ -296,6 +306,7 @@ def main() -> None:
             warmup_left,
             teacher,
             arguments.teacher_kl_cost,
+            arguments.value_passes,
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -568,6 +579,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "capital_weight": 0.0 if arguments.margin else CAPITAL_WEIGHT,
             "econ_fraction": arguments.econ_fraction,
             "value_warmup": arguments.value_warmup,
+            "value_passes": arguments.value_passes,
             "teacher_kl_cost": arguments.teacher_kl_cost,
             "clone_init": arguments.clone_init,
             "money_signed": arguments.money_signed,
@@ -917,6 +929,7 @@ def _update(
     warmup_left: int = 0,
     teacher: Policy | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
+    value_passes: int = 0,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -924,6 +937,19 @@ def _update(
     batch, continuously fed by the actors. Collecting a whole round and stepping
     once on all of it would be a different algorithm with a different effective
     learning rate, so the round is chopped into their batch shape instead.
+
+    **A round's data is otherwise seen once and thrown away**, and that is what
+    ``value_passes`` exists to change. Measured on 2026-08-15: a fresh value head
+    trained on 32 episodes from a live arm's own checkpoint reaches held-out
+    explained variance of 0.348 under this exact target -- ``_segments`` feeding
+    ``_step(baseline_only=True)`` -- against a clock-only critic's 0.121, while
+    the critic inside the arm that produced those episodes sat at -0.103
+    within-step. The target was not the difference; the number of looks was, 150
+    against one. Each extra pass reshuffles and replays the same round through the
+    value head alone, which is the same call ``--value-warmup`` already makes, so
+    the deviation is in how often it is made rather than in what it does. Their
+    warmup backpropagates through the shared trunk too, so this is not
+    policy-neutral -- monobeast.py:416-418 and ``toad_loss.losses``.
 
     Args:
         learner: The network being trained, updated in place.
@@ -934,9 +960,16 @@ def _update(
         warmup_left: Batches still owed to the value head alone.
         teacher: The frozen clone to stay near, or None.
         teacher_kl_cost: Coefficient on that KL.
+        value_passes: Extra value-only passes over the same round, after the
+            policy has taken its one. Zero reproduces every earlier arm exactly.
 
     Returns:
-        The four loss terms and their total, averaged over the round's steps.
+        The loss terms averaged over the round's policy steps, plus
+        ``baseline_passes`` -- the value loss averaged over the extra passes, or
+        the round's own baseline when there are none -- and the number of batches
+        the policy pass consumed. The extra passes are deliberately absent from
+        that count: it is the warmup budget's clock, and warmup is measured in
+        batches the *policy* did not learn from.
     """
     segments = [s for trajectory in batch for s in _segments(trajectory)]
     totals: dict[str, float] = {}
@@ -955,7 +988,55 @@ def _update(
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
         steps += 1
-    return {key: value / max(steps, 1) for key, value in totals.items()}, steps
+    means = {key: value / max(steps, 1) for key, value in totals.items()}
+    means["baseline_passes"] = _value_passes(
+        learner, optimizer, segments, device, field, value_passes
+    ) or means.get("baseline", 0.0)
+    return means, steps
+
+
+def _value_passes(
+    learner: Policy,
+    optimizer: torch.optim.Optimizer,
+    segments: list[dict[str, torch.Tensor]],
+    device: str,
+    field: str,
+    passes: int,
+) -> float:
+    """Replay a round through the value head alone and return the mean loss.
+
+    Reshuffled each pass, because the segments arrive ordered by episode and then
+    by turn: walking that order repeatedly would hand the optimizer a sequence of
+    batches drawn from one episode at a time, which is the correlation the
+    ceiling experiment's ``randperm`` did not have.
+
+    Args:
+        learner: The network being trained, updated in place.
+        optimizer: Its optimizer.
+        segments: The round's unrolls.
+        device: Where to run the learner.
+        field: Which recorded reward series the learner reads.
+        passes: How many times to replay. Zero returns 0.0 and touches nothing.
+
+    Returns:
+        The mean ``baseline`` loss across every extra batch, or 0.0 if there were
+        none.
+    """
+    total, steps = 0.0, 0
+    for _ in range(passes):
+        order = torch.randperm(len(segments))
+        for start in range(0, len(segments) - BATCH_SEGMENTS + 1, BATCH_SEGMENTS):
+            terms = _step(
+                learner,
+                optimizer,
+                [segments[index] for index in order[start : start + BATCH_SEGMENTS]],
+                device,
+                field,
+                baseline_only=True,
+            )
+            total += terms["baseline"]
+            steps += 1
+    return total / steps if steps else 0.0
 
 
 def _step(
