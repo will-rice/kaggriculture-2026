@@ -9,7 +9,7 @@ import torch
 from kaggriculture.constants import ANIMALS, CROPS, LAND_PRICES, MARKET_PARAMS
 from kaggriculture.learn.encoding import IGNORE, MAX_UNITS, UNIT_OPS
 from kaggriculture.sim.decode import decode_market_buckets
-from kaggriculture.sim.engine import MarketActions, step
+from kaggriculture.sim.engine import MAX_MARKET_ORDERS_PER_TURN, MarketActions, step
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.state import (
@@ -157,7 +157,65 @@ def _unit_index(action: object) -> int:
     return UNIT_OPS.index(name) if name in UNIT_OPS else UNIT_OPS.index("PASS")
 
 
-def scripted_actions(  # noqa: C901 - mirrors the reference action grammar
+@dataclass(frozen=True)
+class TurnActions:
+    """One turn's actions as simulator codes, independent of batch and seat.
+
+    Attributes:
+        units: One op index per unit slot, ``PASS`` where the turn named none.
+        orders: ``(order_type, order_item, order_qty)`` per market slot, in the
+            queue position the reference reads them in. Type 0 is "no order",
+            and ``order_item`` is -1 wherever the verb carries no item.
+    """
+
+    units: tuple[int, ...]
+    orders: tuple[tuple[int, int, int], ...]
+
+
+def encode_turn(action: Mapping[str, Any]) -> TurnActions:
+    """Return one action dict as simulator codes.
+
+    Args:
+        action: A turn in the engine's action grammar.
+
+    Returns:
+        The encoded turn. Malformed orders become the "aborted" code 7, which is
+        what the reference does with an order it cannot parse.
+    """
+    units = [UNIT_OPS.index("PASS")] * MAX_UNITS
+    units[0] = _unit_index(action.get("farmer", ["PASS"]))
+    hands = action.get("hands") or []
+    if isinstance(hands, list):
+        for unit, unit_action in enumerate(hands[: MAX_UNITS - 1], start=1):
+            units[unit] = _unit_index(unit_action)
+
+    orders: list[tuple[int, int, int]] = [(0, -1, 0)] * MAX_MARKET_ORDERS_PER_TURN
+    given = action.get("market") or []
+    if isinstance(given, list):
+        for slot, order in enumerate(given[:MAX_MARKET_ORDERS_PER_TURN]):
+            orders[slot] = _encode_order(order)
+    return TurnActions(units=tuple(units), orders=tuple(orders))
+
+
+def _encode_order(order: object) -> tuple[int, int, int]:
+    """Return one market order's ``(type, item, quantity)`` codes."""
+    if not isinstance(order, (list, tuple)) or not order:
+        return (7, -1, 0)
+    verb = str(order[0])
+    if verb == "HIRE":
+        return (5, -1, 1)
+    if verb == "BUY_LAND":
+        return (6, -1, 1)
+    if verb in _MARKET_TYPES and len(order) >= 3:
+        kind, catalogue = _MARKET_TYPES[verb]
+        item, quantity = str(order[1]), order[2]
+        if item not in catalogue or not isinstance(quantity, int):
+            return (7, -1, 0)
+        return (kind, catalogue.index(item), max(0, min(64, quantity)))
+    return (7, -1, 0)
+
+
+def scripted_actions(
     state: SimState, opponent: ScriptedOpponent, seat: int = 1
 ) -> tuple[torch.Tensor, MarketActions]:
     """Bridge a dict-based scripted opponent into fixed simulator tensors."""
@@ -172,38 +230,13 @@ def scripted_actions(  # noqa: C901 - mirrors the reference action grammar
     )
     markets = MarketActions.empty(state.batch_size, device=device)
     for batch in range(state.batch_size):
-        action = opponent(unpack(state, batch, seat))
-        units[batch, 0] = _unit_index(action.get("farmer", ["PASS"]))
-        hands = action.get("hands", [])
-        if isinstance(hands, list):
-            for unit, unit_action in enumerate(hands[: MAX_UNITS - 1], start=1):
-                units[batch, unit] = _unit_index(unit_action)
-        orders = action.get("market", [])
-        if not isinstance(orders, list):
-            continue
-        for slot, order in enumerate(orders[:10]):
-            if not isinstance(order, (list, tuple)) or not order:
-                markets.order_type[batch, seat, slot] = 7
-                continue
-            verb = str(order[0])
-            if verb == "HIRE":
-                markets.order_type[batch, seat, slot] = 5
-                markets.order_qty[batch, seat, slot] = 1
-            elif verb == "BUY_LAND":
-                markets.order_type[batch, seat, slot] = 6
-                markets.order_qty[batch, seat, slot] = 1
-            elif verb in _MARKET_TYPES and len(order) >= 3:
-                kind, catalogue = _MARKET_TYPES[verb]
-                item = str(order[1])
-                quantity = order[2]
-                if item not in catalogue or not isinstance(quantity, int):
-                    markets.order_type[batch, seat, slot] = 7
-                    continue
-                markets.order_type[batch, seat, slot] = kind
-                markets.order_item[batch, seat, slot] = catalogue.index(item)
-                markets.order_qty[batch, seat, slot] = max(0, min(64, quantity))
-            else:
-                markets.order_type[batch, seat, slot] = 7
+        encoded = encode_turn(opponent(unpack(state, batch, seat)))
+        for unit, op in enumerate(encoded.units):
+            units[batch, unit] = op
+        for slot, (kind, item, quantity) in enumerate(encoded.orders):
+            markets.order_type[batch, seat, slot] = kind
+            markets.order_item[batch, seat, slot] = item
+            markets.order_qty[batch, seat, slot] = quantity
     return units, markets
 
 

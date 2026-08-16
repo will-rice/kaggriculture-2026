@@ -12,7 +12,7 @@ from kaggriculture.learn.progress import potential as reference_potential
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.engine import reset, step
 from kaggriculture.sim.rollout import collect_segment, potential, scripted_actions
-from kaggriculture.sim.state import SHED_NAMES, pack
+from kaggriculture.sim.state import PRODUCT_NAMES, SHED_NAMES, pack
 from tests.sim.conftest import assert_identical
 
 
@@ -157,3 +157,25 @@ def test_terminal_segment_rewards_telescope_to_the_terminal_margin() -> None:
     assert torch.equal(
         trajectory.rewards[:, :, 0].sum(0), (final_margin - initial_margin).float()
     )
+
+
+def test_encode_turn_maps_the_action_grammar_to_simulator_codes() -> None:
+    """One reader of the grammar, used by both the scripted bridge and routes."""
+    from kaggriculture.sim.rollout import encode_turn
+
+    encoded = encode_turn(
+        {
+            "farmer": ["PLANT", "WHEAT"],
+            "hands": [["WATER"], ["PASS"]],
+            "market": [["SELL", "WHEAT", 3], ["HIRE"]],
+        }
+    )
+
+    assert encoded.units[0] == UNIT_OPS.index("PLANT:WHEAT")
+    assert encoded.units[1] == UNIT_OPS.index("WATER")
+    # SELL is order type 1 and WHEAT is index 0 of PRODUCT_NAMES.
+    assert encoded.orders[0] == (1, PRODUCT_NAMES.index("WHEAT"), 3)
+    # HIRE carries no item, so the item slot stays at the unused sentinel.
+    assert encoded.orders[1] == (5, -1, 1)
+    # Unused slots are the "no order" code.
+    assert encoded.orders[2] == (0, -1, 0)
