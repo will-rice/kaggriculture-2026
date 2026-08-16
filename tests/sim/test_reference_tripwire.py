@@ -7,7 +7,7 @@ from pathlib import Path
 
 from kaggriculture.sim.fidelity import reference_branches, reference_identity
 
-MANIFEST = Path(__file__).with_name("reference-1.32.6.json")
+MANIFEST = Path(__file__).with_name("reference-1.32.7.json")
 
 
 def test_installed_reference_matches_reviewed_files() -> None:

@@ -34,6 +34,11 @@ from kaggriculture.constants import (
 BOARD_SIZE = 10
 # The market baseline the engine starts every product at.
 EQUILIBRIUM = 10000
+# Every shape the vendored price model claims to implement. One list, used both
+# to parametrize the agreement test and to assert that the engine names nothing
+# outside it -- because when those were two lists, this file went on passing
+# through engine 1.32.7 adding `hinge` while `_shape` had no branch for it.
+SHAPES = ("linear", "sq", "sqrt", "log", "log10", "hinge")
 
 
 @pytest.mark.parametrize("item", PRODUCTS)
@@ -50,13 +55,46 @@ def test_price_model_agrees_with_the_engine(item: str, offset: int) -> None:
     assert ep._price_at(item, inventory, None) == market_price(item, inventory, None)
 
 
-@pytest.mark.parametrize("name", ["linear", "sq", "sqrt", "log", "log10"])
-@pytest.mark.parametrize("value", [0.0, 1.0, 7.5, 400.0])
-def test_shape_functions_match_the_engine_curves(name: str, value: float) -> None:
-    """The five price-curve shapes are the engine's, not approximations of them."""
+@pytest.mark.parametrize("name", SHAPES)
+@pytest.mark.parametrize("value", [0.0, 1.0, 7.5, 400.0, 900.0])
+@pytest.mark.parametrize("throughput", [200.0, 450.0])
+def test_shape_functions_match_the_engine_curves(
+    name: str, value: float, throughput: float
+) -> None:
+    """Every price-curve shape is the engine's, not an approximation of it.
+
+    The list is parametrized from the shapes the engine actually has, and it had
+    to be: this test named five shapes and stayed green through engine 1.32.7
+    adding a sixth, while ``_shape`` had no ``hinge`` branch at all and silently
+    priced carrot, tomato and egg on the fall-through. A shape the engine can
+    name and this test cannot is exactly the gap that hides.
+
+    ``throughput`` is varied because ``hinge`` is the first shape whose value
+    depends on ``T``; every other shape ignores it, so the same assertion pins
+    that they still do.
+    """
     from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
-    assert ep._shape(name, value) == pytest.approx(engine._shape(name, value))
+    assert ep._shape(name, value, throughput) == pytest.approx(
+        engine._shape(name, value, throughput)
+    )
+
+
+def test_every_engine_shape_is_covered_by_this_suite() -> None:
+    """The parametrization above must name every shape the engine implements.
+
+    Otherwise the suite goes on passing while a new curve prices three products
+    through a fall-through branch, which is what happened at 1.32.7.
+    """
+    from kaggle_environments.envs.kaggriculture import kaggriculture as engine
+
+    used = {
+        str(params[key])
+        for params in engine.MARKET_PARAMS.values()
+        for key in ("below_func", "above_func")
+    }
+
+    assert used <= set(SHAPES)
 
 
 @pytest.mark.parametrize("hires", range(12))

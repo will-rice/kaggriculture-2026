@@ -201,11 +201,13 @@ PRODUCTS = (
 
 MARKET: dict[str, tuple[int, int, str, float, str, float]] = {
     "WHEAT": (25, 400, "sqrt", 0.80, "log", 0.20),
-    "CARROT": (35, 450, "log", 0.20, "sqrt", 0.70),
-    "TOMATO": (60, 200, "linear", 0.40, "sqrt", 0.60),
+    # Carrot, tomato and egg moved onto the hinge curve below I0 at engine
+    # 1.32.7, and carrot's below_target went 0.20 -> 1.00 with it.
+    "CARROT": (35, 450, "hinge", 1.00, "sqrt", 0.70),
+    "TOMATO": (60, 200, "hinge", 0.40, "sqrt", 0.60),
     "STRAWBERRY": (120, 100, "sqrt", 0.70, "linear", 1.60),
     "MELON": (250, 300, "log", 0.20, "sq", 3.60),
-    "EGG": (50, 332, "linear", 0.40, "log", 0.20),
+    "EGG": (50, 332, "hinge", 0.40, "log", 0.20),
     "MILK": (160, 122, "sqrt", 0.60, "linear", 1.60),
     "WOOL": (200, 105, "log", 0.20, "sq", 3.20),
     "FERTILIZER": (100, 200, "linear", 0.40, "linear", 0.40),
@@ -243,6 +245,8 @@ MOVES = (
 
 LAND_PRICES = (1000, 2000, 4000)
 MARKET_I0 = 10000
+# kaggriculture.py:56, engine 1.32.7. The quadratic weight past the hinge knee.
+HINGE_GAIN = 8.0
 TOTAL_DAYS = 30
 MAX_MARKET_ORDERS = 10
 MAX_HANDS = 12
@@ -297,7 +301,7 @@ def _cfg(config: Config, key: str, default: int) -> int:
     return getattr(config, key, default)
 
 
-def _shape(name: str, value: float) -> float:
+def _shape(name: str, value: float, throughput: float | None = None) -> float:
     value = max(0.0, float(value))
     if name == "linear":
         return value
@@ -309,6 +313,16 @@ def _shape(name: str, value: float) -> float:
         return math.log1p(value)
     if name == "log10":
         return math.log10(1.0 + value)
+    if name == "hinge":
+        # Engine 1.32.7 put carrot, tomato and egg on this below I0, so their
+        # price runs away once the product is genuinely scarce. Degenerates to
+        # linear without a positive T, which is what the engine does
+        # (kaggriculture.py:64-70) -- kept rather than raised because `obs` can
+        # override T per product and this path prices from a live observation.
+        if not throughput or throughput <= 0:
+            return value
+        unit = value / throughput
+        return unit + HINGE_GAIN * max(0.0, unit - 1.0) ** 2
     return value
 
 
@@ -341,11 +355,15 @@ def _price_at(item: str, inventory: float, obs: Observation | None = None) -> in
         equilibrium,
     ) = _market_parameters(obs, item)
     if inventory < equilibrium:
-        amplitude = below_move * base / max(1e-9, _shape(below_fn, throughput))
-        value = base + amplitude * _shape(below_fn, equilibrium - inventory)
+        amplitude = (
+            below_move * base / max(1e-9, _shape(below_fn, throughput, throughput))
+        )
+        value = base + amplitude * _shape(below_fn, equilibrium - inventory, throughput)
     else:
-        amplitude = above_move * base / max(1e-9, _shape(above_fn, throughput))
-        value = base - amplitude * _shape(above_fn, inventory - equilibrium)
+        amplitude = (
+            above_move * base / max(1e-9, _shape(above_fn, throughput, throughput))
+        )
+        value = base - amplitude * _shape(above_fn, inventory - equilibrium, throughput)
     return max(1, int(round(value)))
 
 

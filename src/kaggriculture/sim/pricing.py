@@ -11,16 +11,34 @@ from kaggriculture.sim.tensors import tensor_constant
 PRICE_FLOOR = 1
 
 # Every shape the reference curve can name, in the order the gathered shape
-# codes index them.
-_SHAPES = ("linear", "sq", "sqrt", "log", "log10")
+# codes index them. ``hinge`` arrived with engine 1.32.7, which put carrot,
+# tomato and egg on it below ``I0`` so their prices spike once the product is
+# genuinely scarce (kaggriculture.py:52-72 and discussion 735311).
+_SHAPES = ("linear", "sq", "sqrt", "log", "log10", "hinge")
+
+# kaggriculture.py:56. The quadratic weight past the knee.
+HINGE_GAIN = 8.0
 
 # An inventory this large prices every product at the floor, so it bounds the
 # search for the level where each curve bottoms out.
 _UNREACHABLE_LEVEL = 1 << 62
 
 
-def _shape(name: str, value: torch.Tensor) -> torch.Tensor:
-    """Apply one reference price-curve shape in float64."""
+def _shape(name: str, value: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+    """Apply one reference price-curve shape in float64.
+
+    Args:
+        name: The reference's shape name.
+        value: Distance from ``I0``, clamped at zero the way the reference does.
+        threshold: The product's ``T``. Every shape but ``hinge`` ignores it --
+            the reference takes it as an optional argument and only ``hinge``
+            reads it -- but it is required here rather than defaulted, because a
+            silently-missing ``T`` would turn the spike back into a straight
+            line and nothing downstream would say so.
+
+    Returns:
+        The shaped value, same shape as ``value``.
+    """
     value = torch.clamp_min(value, 0.0)
     if name == "linear":
         return value
@@ -32,12 +50,22 @@ def _shape(name: str, value: torch.Tensor) -> torch.Tensor:
         return torch.log1p(value)
     if name == "log10":
         return torch.log10(1.0 + value)
+    if name == "hinge":
+        # kaggriculture.py:64-70. Linear in x/T below the knee, quadratic above,
+        # so f(T) == 1 exactly and `target` keeps the meaning it has for every
+        # other shape. The reference degenerates to linear when T is missing or
+        # non-positive; every product in MARKET_PARAMS has T > 0, so that branch
+        # is unreachable here and is left out rather than written and untested.
+        unit = value / threshold
+        return unit + HINGE_GAIN * torch.clamp_min(unit - 1.0, 0.0) ** 2
     return value
 
 
-def _shaped(value: torch.Tensor, code: torch.Tensor) -> torch.Tensor:
+def _shaped(
+    value: torch.Tensor, code: torch.Tensor, threshold: torch.Tensor
+) -> torch.Tensor:
     """Apply the curve shape each element names, without a runtime name scan."""
-    shapes = torch.stack([_shape(name, value) for name in _SHAPES])
+    shapes = torch.stack([_shape(name, value, threshold) for name in _SHAPES])
     return shapes.gather(0, code.expand(value.shape)[None]).squeeze(0)
 
 
@@ -54,8 +82,8 @@ def _curve(device_type: str, device_index: int | None) -> tuple[torch.Tensor, ..
         device_index: Device ordinal, or ``None`` for the default device.
 
     Returns:
-        Base, initial level, below and above amplitudes, and below and above
-        shape codes, each a tensor indexed by product.
+        Base, initial level, threshold, below and above amplitudes, and below
+        and above shape codes, each a tensor indexed by product.
     """
     device = (
         torch.device(device_type)
@@ -70,15 +98,19 @@ def _curve(device_type: str, device_index: int | None) -> tuple[torch.Tensor, ..
         threshold = tensor_constant(
             float(params["T"]), dtype=torch.float64, device=device
         )
+        # The reference derives its amplitude as ``target * base / f(T, T)``
+        # (kaggriculture.py:199-205), so the threshold is passed twice here for
+        # the same reason: ``hinge`` reads it, and evaluating it at its own knee
+        # is what makes ``f(T) == 1``.
         below_amplitude.append(
             float(params["below_target"])
             * base
-            / _shape(str(params["below_func"]), threshold)
+            / _shape(str(params["below_func"]), threshold, threshold)
         )
         above_amplitude.append(
             float(params["above_target"])
             * base
-            / _shape(str(params["above_func"]), threshold)
+            / _shape(str(params["above_func"]), threshold, threshold)
         )
     scalar = {"dtype": torch.float64, "device": device}
     return (
@@ -87,6 +119,9 @@ def _curve(device_type: str, device_index: int | None) -> tuple[torch.Tensor, ..
         ),
         tensor_constant(
             [float(MARKET_PARAMS[n]["I0"]) for n in PRODUCT_NAMES], **scalar
+        ),
+        tensor_constant(
+            [float(MARKET_PARAMS[n]["T"]) for n in PRODUCT_NAMES], **scalar
         ),
         torch.cat(below_amplitude),
         torch.cat(above_amplitude),
@@ -121,17 +156,23 @@ def prices_for(inventory: torch.Tensor, product: torch.Tensor) -> torch.Tensor:
     Returns:
         An int64 tensor with the same shape and device as ``inventory``.
     """
-    base, initial, below_amplitude, above_amplitude, below_code, above_code = _tables(
-        inventory.device
-    )
+    (
+        base,
+        initial,
+        threshold,
+        below_amplitude,
+        above_amplitude,
+        below_code,
+        above_code,
+    ) = _tables(inventory.device)
     index = product.expand(inventory.shape)
     values = inventory.to(torch.float64)
     start = initial[index]
     below = base[index] + below_amplitude[index] * _shaped(
-        start - values, below_code[index]
+        start - values, below_code[index], threshold[index]
     )
     above = base[index] - above_amplitude[index] * _shaped(
-        values - start, above_code[index]
+        values - start, above_code[index], threshold[index]
     )
     prices = torch.where(values < start, below, above)
     return torch.clamp_min(torch.round(prices).to(torch.int64), PRICE_FLOOR)
