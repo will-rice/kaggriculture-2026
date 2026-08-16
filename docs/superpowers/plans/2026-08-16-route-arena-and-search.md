@@ -758,6 +758,33 @@ def test_a_mutation_changes_exactly_one_turn() -> None:
         assert description
 
 
+def test_the_mutation_set_can_reach_the_hinge_products() -> None:
+    """The search must be able to plant a tomato and buy a goose.
+
+    The town drains 264 tomato a season into a market the whole field supplies
+    with 15 units, and capturing that is the reason this search exists. A
+    mutation set that cannot express `PLANT:TOMATO` or `BUY_SEED TOMATO` would
+    hill-climb forever without reaching it and return a negative that looked
+    honest. This asserts the reachability directly rather than trusting the
+    constant lists to stay right.
+    """
+    route = _route()
+    route[3]["market"] = [["BUY_SEED", "WHEAT", 2], ["BUY_ANIMAL", "COW", 1]]
+    seen = set()
+
+    for seed in range(400):
+        mutated, _ = mutate(route, random.Random(seed))
+        for turn in mutated:
+            seen.add(tuple(turn["farmer"]))
+            for order in turn["market"]:
+                seen.add(tuple(order[:2]))
+
+    # Engine grammar specifically: ["PLANT", "TOMATO"], not our ["PLANT:TOMATO"].
+    assert ("PLANT", "TOMATO") in seen
+    assert ("BUY_SEED", "TOMATO") in seen
+    assert ("BUY_ANIMAL", "GOOSE") in seen
+
+
 def test_a_mutation_does_not_alter_its_parent() -> None:
     """The search keeps the incumbent; an in-place edit would corrupt it."""
     original = _route()
@@ -797,7 +824,24 @@ from kaggriculture.search.route import Route
 
 TURNS_PER_DAY = 24
 SELLABLE = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")
-UNIT_OPS_POOL = ("PASS", "WATER", "HARVEST", "COLLECT_FERTILIZER", "NORTH", "SOUTH", "EAST", "WEST")
+CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
+ANIMALS = ("GOOSE", "COW", "SHEEP")
+# Engine grammar, not our internal op names. `encode_turn` would accept
+# ["PLANT:TOMATO"] because that is how UNIT_OPS spells it, but the reference
+# engine reads ["PLANT", "TOMATO"] and a route has to replay there -- the final
+# gate is on the reference engine, not on the simulator.
+#
+# The PLANT entries are in the pool on purpose. Without them the search cannot
+# put a tomato in the ground, and the whole reason for building it is that the
+# town drains 264 tomato a season into a market the entire field supplies with
+# 15 units. A mutation set that cannot represent the answer would hill-climb
+# forever and return an honest-looking negative.
+UNIT_OPS_POOL = (
+    ("PASS",), ("WATER",), ("HARVEST",), ("COLLECT_FERTILIZER",),
+    ("NORTH",), ("SOUTH",), ("EAST",), ("WEST",),
+    ("PLANT", "WHEAT"), ("PLANT", "CARROT"), ("PLANT", "TOMATO"),
+    ("PLANT", "STRAWBERRY"), ("PLANT", "MELON"),
+)
 
 
 def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
@@ -819,9 +863,9 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
 
     if choice == "unit":
         turn = rng.randrange(len(route))
-        op = rng.choice(UNIT_OPS_POOL)
-        mutated[turn]["farmer"] = [op]
-        return mutated, f"turn {turn}: farmer -> {op}"
+        op = list(rng.choice(UNIT_OPS_POOL))
+        mutated[turn]["farmer"] = op
+        return mutated, f"turn {turn}: farmer -> {' '.join(op)}"
 
     turn = rng.choice(with_orders)
     slot = rng.randrange(len(mutated[turn]["market"]))
@@ -833,8 +877,13 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         mutated[turn]["market"][slot] = order
         return mutated, f"turn {turn} slot {slot}: quantity -> {quantity}"
 
-    if choice == "retarget" and len(order) >= 3 and order[0] == "SELL":
-        item = rng.choice(SELLABLE)
+    # Retargeting covers BUY_SEED and BUY_ANIMAL as well as SELL, for the same
+    # reason the PLANT ops are in the pool: buying tomato seed and buying a
+    # goose are the two market edits that make the hinge products reachable at
+    # all, and a SELL-only retarget can never emit either.
+    catalogues = {"SELL": SELLABLE, "BUY_SEED": CROPS, "BUY_ANIMAL": ANIMALS}
+    if choice == "retarget" and len(order) >= 3 and order[0] in catalogues:
+        item = rng.choice(catalogues[order[0]])
         order[1] = item
         mutated[turn]["market"][slot] = order
         return mutated, f"turn {turn} slot {slot}: item -> {item}"
