@@ -1,0 +1,1164 @@
+# Route Arena and Search Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Search for a stronger 720-turn route by replaying candidates against a league of decoded opponents on the batched GPU simulator.
+
+**Architecture:** A route is one seat's 720 turns of actions in the engine's own grammar. It is encoded to action tensors once and replayed across a batch of seeds with no host synchronisation, which is the only workload the simulator is fast at. Candidates are scored by seat-swapped win rate against a league, and improved by single-edit hill-climbing.
+
+**Tech Stack:** Python 3.11, PyTorch, `kaggle-environments` 1.32.7, pytest, `uv`.
+
+## Global Constraints
+
+- Engine is `kaggle-environments>=1.32.7`. Do not upgrade it inside this plan.
+- `tests/sim` must stay green, including `test_reference_tripwire.py`. If a
+  change makes the simulator disagree with the reference, the change is wrong —
+  the reference is not to be re-recorded to accommodate it.
+- The shipped agent must not import torch. Anything under
+  `src/kaggriculture/search/` is offline-only and must be excluded from the
+  submission archive (Task 8 enforces this with a test).
+- Run everything with `uv run` from the repository root.
+- `uv run pre-commit run -a` must pass before every commit. It runs the full
+  pytest suite and takes ~2 minutes; run it in the background and do not edit
+  files while it runs, because pre-commit stashes unstaged changes and restores
+  them afterwards, destroying concurrent edits.
+- Stage explicit paths. Never `git add -A`.
+
+---
+
+### Task 1: Route representation and harvesting
+
+A route is the unit everything else operates on, and the cheapest source of
+strong ones is the episodes we already have on disk.
+
+**Files:**
+
+- Create: `src/kaggriculture/search/__init__.py`
+- Create: `src/kaggriculture/search/route.py`
+- Test: `tests/search/__init__.py`, `tests/search/test_route.py`
+
+**Interfaces:**
+
+- Consumes: nothing from earlier tasks.
+- Produces: `Route = list[dict]` (720 entries, each with keys `farmer`,
+  `hands`, `market`); `from_episode(episode: dict, seat: int) -> Route`;
+  `load(path: Path) -> Route`; `save(route: Route, path: Path) -> None`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""Routes are harvested from episodes and survive a round trip."""
+
+import json
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from kaggriculture.search import route as route_module
+
+ARCHIVE = Path("/data/kaggriculture/episodes/kaggriculture-episodes-2026-08-15.zip")
+
+
+@pytest.mark.skipif(not ARCHIVE.exists(), reason="replay corpus not on this machine")
+def test_a_harvested_route_has_one_entry_per_turn() -> None:
+    """An episode's seat is 720 turns of actions in the engine's own grammar."""
+    with zipfile.ZipFile(ARCHIVE) as bundle:
+        episode = json.loads(bundle.read("93454366.json"))
+
+    harvested = route_module.from_episode(episode, seat=0)
+
+    assert len(harvested) == 720
+    assert all(set(turn) == {"farmer", "hands", "market"} for turn in harvested)
+    assert any(turn["market"] for turn in harvested)
+
+
+def test_a_route_survives_a_round_trip(tmp_path: Path) -> None:
+    """Saving and loading must not alter a single order."""
+    original = [
+        {"farmer": ["PASS"], "hands": [["WATER"]], "market": [["SELL", "WHEAT", 3]]}
+    ] * 720
+
+    route_module.save(original, tmp_path / "route.json")
+
+    assert route_module.load(tmp_path / "route.json") == original
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/search/test_route.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.search'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/kaggriculture/search/__init__.py` holding only a docstring:
+
+```python
+"""Offline route search. Never imported by the shipped agent."""
+```
+
+Create `src/kaggriculture/search/route.py`:
+
+```python
+"""A route: one seat's whole season, in the engine's own action grammar.
+
+The engine reads an action as ``{"farmer": [...], "hands": [[...], ...],
+"market": [[...], ...]}``, and a route is 720 of them. Keeping that grammar
+rather than inventing one means a route can be harvested from any replay, handed
+straight back to the reference engine, and diffed against a competitor's tape
+without a translation layer in between.
+"""
+
+import json
+from pathlib import Path
+from typing import Any
+
+Route = list[dict[str, Any]]
+
+TURNS = 720
+
+
+def from_episode(episode: dict[str, Any], seat: int) -> Route:
+    """Return one seat's actions from a decoded episode replay.
+
+    Args:
+        episode: A replay as published in the daily episode archives.
+        seat: Which player to harvest, 0 or 1.
+
+    Returns:
+        One action per turn, normalised so every entry has all three keys.
+    """
+    if seat not in (0, 1):
+        raise ValueError(f"seat must be 0 or 1, got {seat}")
+    return [_normalise(step[seat].get("action")) for step in episode["steps"]]
+
+
+def load(path: Path) -> Route:
+    """Return the route stored at ``path``."""
+    return [_normalise(turn) for turn in json.loads(Path(path).read_text())]
+
+
+def save(route: Route, path: Path) -> None:
+    """Write ``route`` to ``path`` as JSON."""
+    Path(path).write_text(json.dumps(route))
+
+
+def _normalise(action: dict[str, Any] | None) -> dict[str, Any]:
+    """Return one turn's action with every key present and every order a list."""
+    action = action or {}
+    return {
+        "farmer": list(action.get("farmer") or ["PASS"]),
+        "hands": [list(order or ["PASS"]) for order in (action.get("hands") or [])],
+        "market": [list(order) for order in (action.get("market") or [])],
+    }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/search/test_route.py -v`
+Expected: PASS (2 passed, or 1 passed 1 skipped without the corpus)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/__init__.py src/kaggriculture/search/route.py tests/search/__init__.py tests/search/test_route.py
+git commit -m "feat: harvest routes from episode replays"
+```
+
+---
+
+### Task 2: Extract turn encoding so one grammar reader serves both callers
+
+`sim/rollout.scripted_actions` already turns an action dict into simulator
+codes, but it does it per batch row inside a loop. The route encoder needs the
+same mapping applied once. Extract it rather than writing a second copy: this
+project already carries three copies of the price curve and two of them were
+wrong.
+
+**Files:**
+
+- Modify: `src/kaggriculture/sim/rollout.py:148-208`
+- Test: `tests/sim/test_rollout.py`
+
+**Interfaces:**
+
+- Consumes: nothing from earlier tasks.
+- Produces: `encode_turn(action: Mapping[str, Any]) -> TurnActions`, where
+  `TurnActions` is a frozen dataclass with `units: tuple[int, ...]` of length
+  `MAX_UNITS` and `orders: tuple[tuple[int, int, int], ...]` of length 10, each
+  `(order_type, order_item, order_qty)` and `order_item` `-1` when unused.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_encode_turn_maps_the_action_grammar_to_simulator_codes() -> None:
+    """One reader of the grammar, used by both the scripted bridge and routes."""
+    from kaggriculture.sim.rollout import encode_turn
+
+    encoded = encode_turn(
+        {
+            "farmer": ["PLANT", "WHEAT"],
+            "hands": [["WATER"], ["PASS"]],
+            "market": [["SELL", "WHEAT", 3], ["HIRE"]],
+        }
+    )
+
+    assert encoded.units[0] == UNIT_OPS.index("PLANT:WHEAT")
+    assert encoded.units[1] == UNIT_OPS.index("WATER")
+    # SELL is order type 1 and WHEAT is index 0 of PRODUCT_NAMES.
+    assert encoded.orders[0] == (1, PRODUCT_NAMES.index("WHEAT"), 3)
+    # HIRE carries no item, so the item slot stays at the unused sentinel.
+    assert encoded.orders[1] == (5, -1, 1)
+    # Unused slots are the "no order" code.
+    assert encoded.orders[2] == (0, -1, 0)
+```
+
+Add `from kaggriculture.sim.state import PRODUCT_NAMES` and
+`from kaggriculture.learn.encoding import UNIT_OPS` to the test module's imports
+if they are not already present.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/sim/test_rollout.py::test_encode_turn_maps_the_action_grammar_to_simulator_codes -v`
+Expected: FAIL with `ImportError: cannot import name 'encode_turn'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `src/kaggriculture/sim/rollout.py`, add above `scripted_actions`:
+
+```python
+@dataclass(frozen=True)
+class TurnActions:
+    """One turn's actions as simulator codes, independent of batch and seat.
+
+    Attributes:
+        units: One op index per unit slot, ``PASS`` where the turn named none.
+        orders: ``(order_type, order_item, order_qty)`` per market slot, in the
+            queue position the reference reads them in. Type 0 is "no order",
+            and ``order_item`` is -1 wherever the verb carries no item.
+    """
+
+    units: tuple[int, ...]
+    orders: tuple[tuple[int, int, int], ...]
+
+
+def encode_turn(action: Mapping[str, Any]) -> TurnActions:
+    """Return one action dict as simulator codes.
+
+    Args:
+        action: A turn in the engine's action grammar.
+
+    Returns:
+        The encoded turn. Malformed orders become the "aborted" code 7, which is
+        what the reference does with an order it cannot parse.
+    """
+    units = [UNIT_OPS.index("PASS")] * MAX_UNITS
+    units[0] = _unit_index(action.get("farmer", ["PASS"]))
+    hands = action.get("hands") or []
+    if isinstance(hands, list):
+        for unit, unit_action in enumerate(hands[: MAX_UNITS - 1], start=1):
+            units[unit] = _unit_index(unit_action)
+
+    orders: list[tuple[int, int, int]] = [(0, -1, 0)] * MAX_MARKET_ORDERS_PER_TURN
+    given = action.get("market") or []
+    if isinstance(given, list):
+        for slot, order in enumerate(given[:MAX_MARKET_ORDERS_PER_TURN]):
+            orders[slot] = _encode_order(order)
+    return TurnActions(units=tuple(units), orders=tuple(orders))
+
+
+def _encode_order(order: object) -> tuple[int, int, int]:
+    """Return one market order's ``(type, item, quantity)`` codes."""
+    if not isinstance(order, (list, tuple)) or not order:
+        return (7, -1, 0)
+    verb = str(order[0])
+    if verb == "HIRE":
+        return (5, -1, 1)
+    if verb == "BUY_LAND":
+        return (6, -1, 1)
+    if verb in _MARKET_TYPES and len(order) >= 3:
+        kind, catalogue = _MARKET_TYPES[verb]
+        item, quantity = str(order[1]), order[2]
+        if item not in catalogue or not isinstance(quantity, int):
+            return (7, -1, 0)
+        return (kind, catalogue.index(item), max(0, min(64, quantity)))
+    return (7, -1, 0)
+```
+
+Add `MAX_MARKET_ORDERS_PER_TURN` to the imports from
+`kaggriculture.sim.engine`, and `dataclass` to the `dataclasses` import.
+
+Then replace the body of `scripted_actions`'s per-row loop so it calls
+`encode_turn` instead of re-reading the grammar:
+
+```python
+    for batch in range(state.batch_size):
+        encoded = encode_turn(opponent(unpack(state, batch, seat)))
+        for unit, op in enumerate(encoded.units):
+            units[batch, unit] = op
+        for slot, (kind, item, quantity) in enumerate(encoded.orders):
+            markets.order_type[batch, seat, slot] = kind
+            markets.order_item[batch, seat, slot] = item
+            markets.order_qty[batch, seat, slot] = quantity
+    return units, markets
+```
+
+- [ ] **Step 4: Run the whole simulator suite, not just the new test**
+
+Run: `uv run pytest tests/sim -q`
+Expected: PASS, 61 passed. `scripted_actions` is exercised by the differential
+tests, so this is what proves the extraction changed no behaviour.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/sim/rollout.py tests/sim/test_rollout.py
+git commit -m "refactor: one reader of the action grammar, not two"
+```
+
+---
+
+### Task 3: Encode a whole route to tensors once
+
+**Files:**
+
+- Create: `src/kaggriculture/search/encode.py`
+- Test: `tests/search/test_encode.py`
+
+**Interfaces:**
+
+- Consumes: `route.Route` from Task 1; `sim.rollout.encode_turn` from Task 2.
+- Produces: `encode_route(route: Route, device: torch.device | str) -> EncodedRoute`,
+  where `EncodedRoute` is a frozen dataclass with `units: torch.Tensor` of shape
+  `(720, MAX_UNITS)` int16 and `order_type` / `order_item` / `order_qty` each of
+  shape `(720, 10)` and dtypes int8 / int8 / int32.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""A route becomes tensors once, not once per batch row."""
+
+import torch
+
+from kaggriculture.learn.encoding import MAX_UNITS, UNIT_OPS
+from kaggriculture.search.encode import encode_route
+from kaggriculture.sim.state import PRODUCT_NAMES
+
+
+def test_encode_route_produces_one_row_per_turn() -> None:
+    """Shapes and dtypes must match what `step` consumes."""
+    route = [{"farmer": ["PASS"], "hands": [], "market": []}] * 720
+    route[5] = {"farmer": ["WATER"], "hands": [], "market": [["SELL", "WHEAT", 4]]}
+
+    encoded = encode_route(route, device="cpu")
+
+    assert encoded.units.shape == (720, MAX_UNITS)
+    assert encoded.units.dtype == torch.int16
+    assert encoded.order_type.shape == (720, 10)
+    assert encoded.units[5, 0] == UNIT_OPS.index("WATER")
+    assert encoded.order_type[5, 0] == 1
+    assert encoded.order_item[5, 0] == PRODUCT_NAMES.index("WHEAT")
+    assert encoded.order_qty[5, 0] == 4
+    assert encoded.order_type[4, 0] == 0
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/search/test_encode.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.search.encode'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+```python
+"""Encoding a route into the tensors ``sim.engine.step`` consumes.
+
+A route is the same for every game in a batch, so it is encoded once and the
+per-turn rows are broadcast across the batch at replay time. That is the whole
+reason a route replays without host synchronisation and a scripted Python
+opponent does not.
+"""
+
+import dataclasses
+
+import torch
+
+from kaggriculture.learn.encoding import MAX_UNITS
+from kaggriculture.search.route import Route
+from kaggriculture.sim.rollout import encode_turn
+
+
+@dataclasses.dataclass(frozen=True)
+class EncodedRoute:
+    """One route's whole season as device tensors, indexed by turn.
+
+    Attributes:
+        units: ``(turns, MAX_UNITS)`` int16 op indices.
+        order_type: ``(turns, 10)`` int8 market order kinds.
+        order_item: ``(turns, 10)`` int8 catalogue indices, -1 where unused.
+        order_qty: ``(turns, 10)`` int32 quantities.
+    """
+
+    units: torch.Tensor
+    order_type: torch.Tensor
+    order_item: torch.Tensor
+    order_qty: torch.Tensor
+
+
+def encode_route(route: Route, device: torch.device | str) -> EncodedRoute:
+    """Return ``route`` as per-turn tensors on ``device``.
+
+    Args:
+        route: One seat's season in the engine's action grammar.
+        device: Where the tensors are wanted.
+
+    Returns:
+        The encoded route.
+    """
+    turns = [encode_turn(action) for action in route]
+    units = torch.tensor(
+        [turn.units for turn in turns], dtype=torch.int16, device=device
+    )
+    orders = [[list(order) for order in turn.orders] for turn in turns]
+    stacked = torch.tensor(orders, dtype=torch.int64, device=device)
+    return EncodedRoute(
+        units=units.view(len(turns), MAX_UNITS),
+        order_type=stacked[:, :, 0].to(torch.int8),
+        order_item=stacked[:, :, 1].to(torch.int8),
+        order_qty=stacked[:, :, 2].to(torch.int32),
+    )
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/search/test_encode.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/encode.py tests/search/test_encode.py
+git commit -m "feat: encode a route to simulator tensors once"
+```
+
+---
+
+### Task 4: Replay two routes, and prove it against the reference
+
+**This is the linchpin task.** Everything downstream is unfalsifiable if the
+arena's replay does not reproduce the reference engine. The test is unusually
+strong and cheap: the engine is deterministic given a seed and both seats'
+actions, so replaying a real episode's own actions on its own seed must
+reproduce its recorded final banks exactly.
+
+If that test fails, stop and fix it before Task 5. Do not weaken it to a
+tolerance.
+
+**Files:**
+
+- Create: `src/kaggriculture/search/arena.py`
+- Test: `tests/search/test_arena.py`
+
+**Interfaces:**
+
+- Consumes: `encode_route` / `EncodedRoute` from Task 3; `route.from_episode`
+  from Task 1; `sim.engine.reset`, `sim.engine.step`, `sim.engine.MarketActions`,
+  `sim.config.Config`.
+- Produces: `play(seat_zero: Route, seat_one: Route, seeds: Sequence[int],
+device: torch.device | str = "cpu") -> torch.Tensor` returning an int64 tensor
+  of shape `(len(seeds), 2)` holding each game's final bank per seat.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""Replaying a real episode's own actions must reproduce its own result."""
+
+import json
+import zipfile
+from pathlib import Path
+
+import pytest
+import torch
+
+from kaggriculture.search.arena import play
+from kaggriculture.search.route import from_episode
+
+ARCHIVE = Path("/data/kaggriculture/episodes/kaggriculture-episodes-2026-08-15.zip")
+
+
+@pytest.mark.skipif(not ARCHIVE.exists(), reason="replay corpus not on this machine")
+def test_replaying_an_episode_reproduces_its_recorded_banks() -> None:
+    """The engine is deterministic given seed and actions, so this is exact.
+
+    This is the whole warrant for the arena. A tape replayed on a board it was
+    not recorded on can misalign, and this test is what distinguishes "our
+    replay is faithful" from "our replay is plausible".
+    """
+    with zipfile.ZipFile(ARCHIVE) as bundle:
+        episode = json.loads(bundle.read("93454366.json"))
+    seed = int(episode["configuration"]["seed"])
+    expected = [int(reward) for reward in episode["rewards"]]
+
+    banks = play(
+        from_episode(episode, seat=0), from_episode(episode, seat=1), [seed]
+    )
+
+    assert banks.shape == (1, 2)
+    assert banks[0].tolist() == expected
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/search/test_arena.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.search.arena'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+```python
+"""Replaying routes against each other on the batched simulator."""
+
+from collections.abc import Sequence
+
+import torch
+
+from kaggriculture.search.encode import EncodedRoute, encode_route
+from kaggriculture.search.route import Route
+from kaggriculture.sim.config import Config
+from kaggriculture.sim.engine import MarketActions, reset, step
+
+
+def play(
+    seat_zero: Route,
+    seat_one: Route,
+    seeds: Sequence[int],
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Play two routes against each other across ``seeds``.
+
+    Both routes are encoded once and their per-turn rows broadcast across the
+    batch, so the loop holds no host synchronisation and every game in ``seeds``
+    advances together.
+
+    Args:
+        seat_zero: The route to play in seat 0.
+        seat_one: The route to play in seat 1.
+        seeds: One episode seed per game.
+        device: Where to run.
+
+    Returns:
+        ``(games, 2)`` int64 final banks.
+    """
+    config = Config()
+    state = reset(
+        config, torch.tensor(list(seeds), dtype=torch.int64, device=device), device
+    )
+    encoded = (encode_route(seat_zero, device), encode_route(seat_one, device))
+    batch = len(seeds)
+    for turn in range(config.episode_steps - 1):
+        state = step(state, _units(encoded, turn, batch), _orders(encoded, turn, batch))
+    return state.money.to(torch.int64)
+
+
+def _units(encoded: tuple[EncodedRoute, EncodedRoute], turn: int, batch: int) -> torch.Tensor:
+    """Return ``(batch, 2, MAX_UNITS)`` unit ops for one turn."""
+    return torch.stack(
+        [side.units[turn].expand(batch, -1) for side in encoded], dim=1
+    ).contiguous()
+
+
+def _orders(
+    encoded: tuple[EncodedRoute, EncodedRoute], turn: int, batch: int
+) -> MarketActions:
+    """Return one turn's market orders for both seats, batched."""
+    return MarketActions(
+        order_type=torch.stack(
+            [side.order_type[turn].expand(batch, -1) for side in encoded], dim=1
+        ).contiguous(),
+        order_item=torch.stack(
+            [side.order_item[turn].expand(batch, -1) for side in encoded], dim=1
+        ).contiguous(),
+        order_qty=torch.stack(
+            [side.order_qty[turn].expand(batch, -1) for side in encoded], dim=1
+        ).contiguous(),
+    ).compacted()
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/search/test_arena.py -v`
+Expected: PASS, banks equal to the episode's own `rewards`.
+
+If it fails, the likely causes in order: the turn loop runs one turn too many or
+too few (the engine records 720 steps but the last takes no action, so 719
+`step` calls); `compacted()` is not being applied and queue positions therefore
+do not pair the way the reference pairs them; or `order_item` is signed-8-bit
+and a catalogue index has overflowed. Diagnose against a single seed with
+`unpack(state, 0, 0)` and compare turn by turn with the replay — do not adjust
+the assertion.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/arena.py tests/search/test_arena.py
+git commit -m "feat: replay two routes, proven against a recorded episode"
+```
+
+---
+
+### Task 5: Seat-swapped win rate against a league
+
+**Files:**
+
+- Modify: `src/kaggriculture/search/arena.py`
+- Test: `tests/search/test_arena.py`
+
+**Interfaces:**
+
+- Consumes: `play` from Task 4.
+- Produces: `evaluate(candidate: Route, league: Mapping[str, Route],
+seeds: Sequence[int], device: torch.device | str = "cpu") -> dict[str, float]`
+  returning one win rate per league member, each over `2 * len(seeds)` games.
+
+**What the league can and cannot contain.** Every member is a _route_, because
+that is what replays without host synchronisation. A _policy_ — Kaito v27,
+`economic_policy`, our own boatlee v14 — cannot be a faithful league member:
+recording one into a route freezes it against the seed it was recorded on and
+throws away the adaptivity that makes it worth playing. The spec's §3.B named
+those three and was wrong to.
+
+So the league is tapes: boatlee V16-RC5's decoded `_ACTIONS`, and routes
+harvested with `from_episode` from top-rated episodes across several days, which
+is where "several meta generations" comes from. Policy opponents are handled by
+the reference-engine gate after the search, not inside it. That is an acceptable
+split because the field is mostly tapes — but it does mean the arena cannot see
+an opponent that reacts to us, and gate 3 in the spec (self-play) is the only
+thing that probes adaptation.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_a_route_against_itself_scores_exactly_half() -> None:
+    """Seat-swapping makes the mirror exactly 0.5, which catches a seat bug.
+
+    A win rate that is not 0.5 here means one seat is being favoured -- by an
+    unswapped replay, a seed reused between the two orderings, or ties counted
+    for one side only.
+    """
+    route = [{"farmer": ["PASS"], "hands": [], "market": []}] * 720
+
+    scores = evaluate(route, {"mirror": route}, seeds=[1, 2, 3, 4])
+
+    assert scores["mirror"] == pytest.approx(0.5)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/search/test_arena.py::test_a_route_against_itself_scores_exactly_half -v`
+Expected: FAIL with `NameError: name 'evaluate' is not defined`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Append to `src/kaggriculture/search/arena.py`:
+
+```python
+def evaluate(
+    candidate: Route,
+    league: Mapping[str, Route],
+    seeds: Sequence[int],
+    device: torch.device | str = "cpu",
+) -> dict[str, float]:
+    """Return the candidate's win rate against each league member.
+
+    Every seed is played twice, once with the candidate in each seat, because
+    the seats are not symmetric: they hold different quadrants and their orders
+    pair by queue position. Scoring one ordering only would measure the seat as
+    much as the route.
+
+    A tie counts as half a win, which is what the ladder's rating does with it.
+
+    Args:
+        candidate: The route being scored.
+        league: Opponent routes by name.
+        seeds: Episode seeds; each is played in both orderings.
+        device: Where to run.
+
+    Returns:
+        One win rate per league member, over ``2 * len(seeds)`` games each.
+    """
+    scores = {}
+    for name, opponent in league.items():
+        first = play(candidate, opponent, seeds, device)
+        second = play(opponent, candidate, seeds, device)
+        ours = torch.cat([first[:, 0], second[:, 1]])
+        theirs = torch.cat([first[:, 1], second[:, 0]])
+        wins = (ours > theirs).sum() + 0.5 * (ours == theirs).sum()
+        scores[name] = float(wins) / float(ours.numel())
+    return scores
+```
+
+Add `from collections.abc import Mapping, Sequence` to the imports.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/search/test_arena.py -v`
+Expected: PASS, both tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/arena.py tests/search/test_arena.py
+git commit -m "feat: score a route seat-swapped against a league"
+```
+
+---
+
+### Task 6: Single-edit mutations
+
+Every mutation changes exactly one thing inside one day. With a noisy binary
+fitness, a candidate that differs from its parent in several places cannot tell
+us which edit paid.
+
+**Files:**
+
+- Create: `src/kaggriculture/search/mutate.py`
+- Test: `tests/search/test_mutate.py`
+
+**Interfaces:**
+
+- Consumes: `route.Route` from Task 1.
+- Produces: `mutate(route: Route, rng: random.Random) -> tuple[Route, str]`
+  returning a new route and a human-readable description of the single edit.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""A mutation changes one thing, and leaves a route the engine can still read."""
+
+import random
+
+from kaggriculture.search.mutate import mutate
+
+
+def _route() -> list[dict]:
+    route = [{"farmer": ["PASS"], "hands": [["PASS"]], "market": []} for _ in range(720)]
+    for turn in range(0, 720, 7):
+        route[turn]["market"] = [["SELL", "WHEAT", 3]]
+    return route
+
+
+def test_a_mutation_changes_exactly_one_turn() -> None:
+    """Anything more and a fitness difference cannot be attributed."""
+    original = _route()
+
+    for seed in range(40):
+        mutated, description = mutate(original, random.Random(seed))
+
+        differing = [i for i, (a, b) in enumerate(zip(original, mutated, strict=True)) if a != b]
+        assert len(differing) == 1, description
+        assert len(mutated) == 720
+        assert description
+
+
+def test_a_mutation_does_not_alter_its_parent() -> None:
+    """The search keeps the incumbent; an in-place edit would corrupt it."""
+    original = _route()
+    before = [dict(turn) for turn in original]
+
+    mutate(original, random.Random(0))
+
+    assert original == before
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/search/test_mutate.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.search.mutate'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+```python
+"""Single-edit mutations over a route.
+
+Four edits, each confined to one turn: retime a market order within its day,
+resize one, retarget one, or replace a unit's op. Compound edits are excluded
+deliberately -- the fitness is a win rate over a few hundred noisy games, and a
+candidate differing in several places tells us nothing about which edit paid.
+
+Legality is not checked here. The engine masks an op the board does not permit
+and partially fills an order larger than the shed holds, so an illegal edit
+simply scores badly and the search discards it. Checking here would mean a
+second implementation of the rules, which is the defect this project has hit
+most often.
+"""
+
+import copy
+import random
+
+from kaggriculture.search.route import Route
+
+TURNS_PER_DAY = 24
+SELLABLE = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")
+UNIT_OPS_POOL = ("PASS", "WATER", "HARVEST", "COLLECT_FERTILIZER", "NORTH", "SOUTH", "EAST", "WEST")
+
+
+def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
+    """Return a copy of ``route`` with exactly one turn changed.
+
+    Args:
+        route: The parent route, left untouched.
+        rng: The stream deciding the edit, so a run is reproducible.
+
+    Returns:
+        The mutated route and a description of the edit.
+    """
+    mutated = copy.deepcopy(route)
+    with_orders = [turn for turn, action in enumerate(route) if action["market"]]
+    edits = ["unit"]
+    if with_orders:
+        edits += ["retime", "resize", "retarget"]
+    choice = rng.choice(edits)
+
+    if choice == "unit":
+        turn = rng.randrange(len(route))
+        op = rng.choice(UNIT_OPS_POOL)
+        mutated[turn]["farmer"] = [op]
+        return mutated, f"turn {turn}: farmer -> {op}"
+
+    turn = rng.choice(with_orders)
+    slot = rng.randrange(len(mutated[turn]["market"]))
+    order = list(mutated[turn]["market"][slot])
+
+    if choice == "resize" and len(order) >= 3:
+        quantity = max(1, min(64, int(order[2]) + rng.choice((-4, -2, -1, 1, 2, 4))))
+        order[2] = quantity
+        mutated[turn]["market"][slot] = order
+        return mutated, f"turn {turn} slot {slot}: quantity -> {quantity}"
+
+    if choice == "retarget" and len(order) >= 3 and order[0] == "SELL":
+        item = rng.choice(SELLABLE)
+        order[1] = item
+        mutated[turn]["market"][slot] = order
+        return mutated, f"turn {turn} slot {slot}: item -> {item}"
+
+    # Retiming is a reorder within the turn, not a move to another turn. Moving
+    # an order across turns would change two turns at once, and then a fitness
+    # difference could not be attributed to one edit. Queue position is what
+    # pairs the two seats' orders in the reference engine, so a reorder inside
+    # one turn is a real edit rather than a no-op.
+    slots = mutated[turn]["market"]
+    other = rng.randrange(len(slots))
+    slots[slot], slots[other] = slots[other], slots[slot]
+    return mutated, f"turn {turn}: slots {slot} and {other} swapped"
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/search/test_mutate.py -v`
+Expected: PASS, both tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/mutate.py tests/search/test_mutate.py
+git commit -m "feat: single-edit route mutations"
+```
+
+---
+
+### Task 7: Build the league
+
+The searcher needs opponents on disk before it can run, and the two sources are
+already available: boatlee's V16-RC5 tape, decoded from its published notebook,
+and routes harvested from top-rated episodes in the daily archives.
+
+**Files:**
+
+- Create: `src/kaggriculture/search/scripts/__init__.py`
+- Create: `src/kaggriculture/search/scripts/build_league.py`
+- Test: `tests/search/test_build_league.py`
+
+**Interfaces:**
+
+- Consumes: `route.from_episode` and `route.save` from Task 1.
+- Produces: `harvest(archive: Path, count: int, output: Path) -> list[Path]`,
+  writing one JSON route per harvested seat and returning the paths written.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""The league is built from the strongest seats of the strongest episodes."""
+
+from pathlib import Path
+
+import pytest
+
+from kaggriculture.search.scripts.build_league import harvest
+
+ARCHIVE = Path("/data/kaggriculture/episodes/kaggriculture-episodes-2026-08-15.zip")
+
+
+@pytest.mark.skipif(not ARCHIVE.exists(), reason="replay corpus not on this machine")
+def test_harvest_writes_one_route_per_requested_opponent(tmp_path: Path) -> None:
+    """Each harvested file is a 720-turn route the arena can load."""
+    from kaggriculture.search.route import load
+
+    written = harvest(ARCHIVE, count=2, output=tmp_path)
+
+    assert len(written) == 2
+    for path in written:
+        assert len(load(path)) == 720
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/search/test_build_league.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.search.scripts'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/kaggriculture/search/scripts/__init__.py` with a docstring, then
+`src/kaggriculture/search/scripts/build_league.py`:
+
+```python
+"""Harvest league opponents from the published episode archives.
+
+The winning seat of a top-rated episode is a route by construction: the archive
+records every action it took. Harvesting several days rather than one is
+deliberate -- Kaito Fukami's own advice is that optimising against the latest
+Top-30 alone loses to older meta generations still active on the ladder.
+"""
+
+import argparse
+import json
+import logging
+import zipfile
+from pathlib import Path
+
+from kaggriculture.learn.corpus import read_manifest
+from kaggriculture.search.route import from_episode, save
+
+LOGGER = logging.getLogger(__name__)
+ENGINE = "1.32.7"
+
+
+def harvest(archive: Path, count: int, output: Path) -> list[Path]:
+    """Write the winning seats of the archive's best episodes as routes.
+
+    Args:
+        archive: A daily episode ``.zip``.
+        count: How many opponents to write.
+        output: Directory to write them into.
+
+    Returns:
+        The paths written, best episode first.
+    """
+    output.mkdir(parents=True, exist_ok=True)
+    rows = sorted(read_manifest(archive), key=lambda row: -row.avg_score)
+    written: list[Path] = []
+    with zipfile.ZipFile(archive) as bundle:
+        for row in rows:
+            if len(written) >= count:
+                break
+            episode = json.loads(bundle.read(f"{row.episode_id}.json"))
+            if str(episode.get("module_version")) != ENGINE:
+                continue
+            rewards = episode.get("rewards") or [0, 0]
+            seat = 0 if rewards[0] >= rewards[1] else 1
+            path = output / f"{archive.stem}-{row.episode_id}-seat{seat}.json"
+            save(from_episode(episode, seat), path)
+            written.append(path)
+            LOGGER.info("%s rating %.0f bank %s", path.name, row.avg_score, rewards[seat])
+    return written
+
+
+def main() -> None:
+    """Harvest a league from one or more daily archives."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path, help="directory for league routes")
+    parser.add_argument("archives", type=Path, nargs="+", help="daily episode zips")
+    parser.add_argument("--per-archive", type=int, default=3)
+    arguments = parser.parse_args()
+    for archive in arguments.archives:
+        harvest(archive, arguments.per_archive, arguments.output)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/search/test_build_league.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/scripts/__init__.py src/kaggriculture/search/scripts/build_league.py tests/search/test_build_league.py
+git commit -m "feat: harvest a league of opponents from the episode archives"
+```
+
+Note for whoever runs it: boatlee's V16-RC5 tape is a second source, decoded
+from its published notebook by base85 + zlib into a 720-entry `_ACTIONS` list,
+which is already a route and needs only `save`.
+
+---
+
+### Task 8: The hill-climb loop, and keeping it out of the submission
+
+`package.py` copies the package tree with `EXCLUDED` applied at every directory
+level. A new `search` package would ship into the submission unless excluded,
+and it imports torch — which the packaging notes measure at 10.7 s of the 60 s
+overage pool. A tuple entry alone is not evidence; the test builds the archive
+and looks inside it.
+
+**Files:**
+
+- Create: `src/kaggriculture/search/scripts/hillclimb.py`
+- Modify: `src/kaggriculture/scripts/package.py:44`
+- Test: `tests/test_package.py`
+
+**Interfaces:**
+
+- Consumes: `arena.evaluate` from Task 5, `mutate.mutate` from Task 6,
+  `route.load` / `route.save` from Task 1, and a league directory built by
+  Task 7.
+- Produces: a command-line entry point; no importable interface later tasks rely
+  on.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_the_archive_does_not_ship_the_search_package(tmp_path: Path) -> None:
+    """Search code imports torch, which costs 10.7s of the 60s overage pool."""
+    import tarfile
+
+    from kaggriculture.scripts.package import build
+
+    archive = build(tmp_path / "submission.tar.gz")
+
+    with tarfile.open(archive) as bundle:
+        names = bundle.getnames()
+    assert not [name for name in names if "/search/" in name or name.endswith("/search")]
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_package.py::test_the_archive_does_not_ship_the_search_package -v`
+Expected: FAIL — the archive contains `kaggriculture/search/...`
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `src/kaggriculture/scripts/package.py:44`, add `"search"` to the excluded
+names and extend the comment above it to say why:
+
+```python
+EXCLUDED = shutil.ignore_patterns(
+    "__pycache__", "scripts", "learn", "search", "*.pt", STORE.name
+)
+```
+
+Then create `src/kaggriculture/search/scripts/hillclimb.py`:
+
+```python
+"""Hill-climb a route against a league, one edit at a time.
+
+Accepts a candidate only when its mean league win rate beats the incumbent's by
+more than the standard error of the comparison, so a run does not walk uphill on
+noise. Every accepted route is written out, because the interesting artefact is
+the sequence of edits that paid, not only the final tape.
+"""
+
+import argparse
+import json
+import logging
+import random
+from pathlib import Path
+
+from kaggriculture.search.arena import evaluate
+from kaggriculture.search.mutate import mutate
+from kaggriculture.search.route import load, save
+
+LOGGER = logging.getLogger(__name__)
+SEEDS = tuple(range(500_000, 500_064))
+
+
+def main() -> None:
+    """Run the hill-climb until the candidate budget is exhausted."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("seed_route", type=Path, help="route to start from")
+    parser.add_argument("league", type=Path, help="directory of opponent routes")
+    parser.add_argument("output", type=Path, help="directory for accepted routes")
+    parser.add_argument("--candidates", type=int, default=200)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--rng", type=int, default=0)
+    arguments = parser.parse_args()
+
+    league = {path.stem: load(path) for path in sorted(arguments.league.glob("*.json"))}
+    if not league:
+        raise SystemExit(f"no opponent routes in {arguments.league}")
+    incumbent = load(arguments.seed_route)
+    arguments.output.mkdir(parents=True, exist_ok=True)
+
+    scores = evaluate(incumbent, league, SEEDS, arguments.device)
+    best = sum(scores.values()) / len(scores)
+    LOGGER.info("incumbent %.4f %s", best, json.dumps(scores))
+
+    rng = random.Random(arguments.rng)
+    for candidate in range(arguments.candidates):
+        mutated, description = mutate(incumbent, rng)
+        scores = evaluate(mutated, league, SEEDS, arguments.device)
+        mean = sum(scores.values()) / len(scores)
+        # The standard error of a win rate over this many games, doubled because
+        # incumbent and candidate are both estimates.
+        games = 2 * len(SEEDS) * len(league)
+        threshold = 2 * (0.25 / games) ** 0.5
+        if mean > best + threshold:
+            incumbent, best = mutated, mean
+            save(incumbent, arguments.output / f"accepted-{candidate:04d}.json")
+            LOGGER.info("accepted %.4f (%s) %s", mean, description, json.dumps(scores))
+        else:
+            LOGGER.info("rejected %.4f (%s)", mean, description)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 4: Run the test and the full suite**
+
+Run: `uv run pytest tests/test_package.py -v`
+Expected: PASS
+
+Run: `uv run pre-commit run -a` in the background, and wait for it.
+Expected: all hooks pass, including the full pytest suite.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/kaggriculture/search/scripts/hillclimb.py src/kaggriculture/scripts/package.py tests/test_package.py
+git commit -m "feat: hill-climb routes, and keep the searcher out of the archive"
+```
+
+---
+
+## After the plan
+
+The plan ends with a searcher, not a submission. Before anything is submitted,
+run the spec's §5 gate: **128 seat-swapped games on the reference engine**
+against the agent we currently serve, with the win rate's 95% interval excluding
+0.5. The simulator is fidelity-proven and Task 4 proves the arena on top of it,
+but the thing we submit is measured on the thing that scores it.
+
+Two failure modes worth watching for, both of which have already happened once
+on this project today:
+
+- **A candidate that wins in the arena and loses on the engine.** That means the
+  arena and the reference have diverged, and Task 4's test should be re-run on a
+  fresh episode before trusting any further search output.
+- **A search that accepts steadily and improves nothing.** The threshold in
+  `hillclimb` guards against walking uphill on noise, but it assumes the league
+  win rates are independent; they are not, since one seed set is reused. If
+  acceptances stop correlating with the gate result, widen the seed set before
+  widening the threshold.
