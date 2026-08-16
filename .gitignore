@@ -249,3 +249,7 @@ node_modules/
 
 # Autonomous worker state (logs, status, gate verdicts)
 run/
+
+# Kaggle skill caches: regenerable from the competition, and binary churn on
+# every ingest. The findings that matter are written up in docs/, not here.
+data/*.db
