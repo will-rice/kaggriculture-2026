@@ -224,6 +224,34 @@ def test_unit_index_raises_on_a_place_quantity_outside_its_domain() -> None:
         )
 
 
+def test_encode_order_raises_on_a_quantity_over_64() -> None:
+    """The reference has no cap; clamping to 64 would silently alter the order.
+
+    The RL action space never emits a quantity this large, so this never
+    fires for it -- only for an order outside the simulator's domain.
+    """
+    from kaggriculture.sim.rollout import encode_turn
+
+    with pytest.raises(ValueError, match="SELL.*WHEAT.*100"):
+        encode_turn(
+            {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 100]]}
+        )
+
+
+def test_encode_order_raises_on_a_numeric_string_quantity() -> None:
+    """The reference coerces a quantity via ``int()`` and executes it.
+
+    Encoding it as the "aborted" code 7 instead would silently diverge from
+    what the reference actually replays.
+    """
+    from kaggriculture.sim.rollout import encode_turn
+
+    with pytest.raises(ValueError, match="SELL.*WHEAT.*3"):
+        encode_turn(
+            {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", "3"]]}
+        )
+
+
 def test_unit_index_accepts_the_in_domain_quantity_of_one() -> None:
     """Quantity 1 is the whole supported domain, and it still works."""
     from kaggriculture.sim.rollout import encode_turn

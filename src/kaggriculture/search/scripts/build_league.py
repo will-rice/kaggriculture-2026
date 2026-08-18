@@ -4,19 +4,28 @@ The winning seat of a top-rated episode is a route by construction: the archive
 records every action it took. Harvesting several days rather than one is
 deliberate -- Kaito Fukami's own advice is that optimising against the latest
 Top-30 alone loses to older meta generations still active on the ladder.
+
+``ENGINE`` is read from the installed ``kaggle-environments`` package rather
+than hardcoded, because it is the engine the arena replays on -- deriving the
+pin keeps the harvested league and the arena that scores it on the same
+build by construction. Two mid-competition engine bumps have already
+happened; a hardcoded pin would silently skip every episode in the next one
+and build a stale or empty league.
 """
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import zipfile
 from pathlib import Path
 
+from kaggriculture.constants import EPISODE_STEPS
 from kaggriculture.learn.corpus import read_manifest
 from kaggriculture.search.route import from_episode, save
 
 LOGGER = logging.getLogger(__name__)
-ENGINE = "1.32.7"
+ENGINE = importlib.metadata.version("kaggle-environments")
 
 
 def harvest(
@@ -58,13 +67,27 @@ def harvest(
             if episode.get("module_version") != ENGINE:
                 continue
             rewards = episode.get("rewards")
-            if not isinstance(rewards, list) or len(rewards) != 2:
+            if (
+                not isinstance(rewards, list)
+                or len(rewards) != 2
+                or not all(isinstance(value, (int, float)) for value in rewards)
+            ):
                 raise ValueError(f"Episode {row.episode_id} missing or invalid rewards")
             seat = 0 if rewards[0] >= rewards[1] else 1
-            path = output / f"{archive.stem}-{row.episode_id}-seat{seat}.json"
-            save(from_episode(episode, seat), path)
-            written.append(path)
+            route = from_episode(episode, seat)
             seen.add(row.episode_id)
+            if len(route) != EPISODE_STEPS:
+                LOGGER.info(
+                    "episode %s: skipping, %d turns (expected %d) -- an "
+                    "early-terminated episode is bad league material anyway",
+                    row.episode_id,
+                    len(route),
+                    EPISODE_STEPS,
+                )
+                continue
+            path = output / f"{archive.stem}-{row.episode_id}-seat{seat}.json"
+            save(route, path)
+            written.append(path)
             LOGGER.info(
                 "%s rating %.0f bank %s", path.name, row.avg_score, rewards[seat]
             )

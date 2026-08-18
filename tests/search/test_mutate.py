@@ -115,6 +115,62 @@ def test_buy_product_orders_are_reachable() -> None:
     assert "FERTILIZER" in seen_items
 
 
+def test_resize_is_stratified_by_verb_like_retarget() -> None:
+    """A SELL-dominated route must not drown the lone BUY_SEED resize.
+
+    ``_route`` carries roughly 100 SELL orders (turns 0, 7, 14, ... 714) and
+    this test adds exactly one BUY_SEED order. Choosing uniformly over every
+    order (the old behaviour) gives that order about a 1-in-100 chance of
+    being resized; choosing a verb first, as ``retarget`` already does, gives
+    it about a 1-in-2 chance among the verbs actually present. Growing a
+    BUY_SEED quantity is the hinge edit the search exists to find, so it must
+    be reached often, not almost never.
+    """
+    route = _route()
+    route[3]["market"] = [["BUY_SEED", "TOMATO", 2]]
+
+    buy_seed_resizes = 0
+    for seed in range(2000):
+        mutated, _ = mutate(route, random.Random(seed))
+        if mutated[3]["market"][0][2] != 2:
+            buy_seed_resizes += 1
+
+    # Stratified: ~1/3 chance of "resize" * ~1/2 chance of the BUY_SEED verb
+    # over 2000 seeds is ~333. Uniform-over-orders would give ~6.5. 200 sits
+    # far above the uniform expectation and comfortably below the stratified
+    # one.
+    assert buy_seed_resizes > 200
+
+
+def _route_with_malformed_quantity() -> list[dict]:
+    """A minimal route with one valid and one malformed SELL order.
+
+    Only two market orders exist in the whole route, so a resize that is not
+    filtered against the malformed one has a real chance of landing on it
+    inside a small number of seeds.
+    """
+    route = [
+        {"farmer": ["PASS"], "hands": [["PASS"]], "market": []} for _ in range(720)
+    ]
+    route[2]["market"] = [["SELL", "WHEAT", 3]]
+    route[5]["market"] = [["SELL", "WHEAT", None]]
+    return route
+
+
+def test_a_malformed_recorded_quantity_is_skipped_not_crashed_on() -> None:
+    """A harvested tape can carry an order the engine recorded but never filled.
+
+    The engine records actions verbatim and only aborts a malformed order at
+    execution time, so a route can carry ``['SELL', 'WHEAT', None]``.
+    ``kind_slots`` must skip it, or ``resize``'s ``int(order[2])`` crashes a
+    multi-hour run the first time the sampler lands on that slot.
+    """
+    route = _route_with_malformed_quantity()
+
+    for seed in range(500):
+        mutate(route, random.Random(seed))  # must not raise
+
+
 def test_a_mutation_does_not_alter_its_parent() -> None:
     """The search keeps the incumbent; an in-place edit would corrupt it."""
     original = _route()

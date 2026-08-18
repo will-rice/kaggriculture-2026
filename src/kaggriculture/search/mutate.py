@@ -32,21 +32,18 @@ most often.
 import copy
 import random
 
+from kaggriculture.constants import ANIMALS as _ENGINE_ANIMALS
+from kaggriculture.constants import CROPS as _ENGINE_CROPS
+from kaggriculture.constants import PRODUCTS as _ENGINE_PRODUCTS
 from kaggriculture.search.route import Route
 
-SELLABLE = (
-    "WHEAT",
-    "CARROT",
-    "TOMATO",
-    "STRAWBERRY",
-    "MELON",
-    "EGG",
-    "MILK",
-    "WOOL",
-    "FERTILIZER",
-)
-CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
-ANIMALS = ("GOOSE", "COW", "SHEEP")
+# Built from `kaggriculture.constants`, which itself imports live from the
+# installed engine, rather than hand-copied -- verified equal to the engine's
+# own lists when this was written, but a copy cannot be verified equal after
+# the next engine bump. An import can.
+SELLABLE = tuple(_ENGINE_PRODUCTS)
+CROPS = tuple(_ENGINE_CROPS)
+ANIMALS = tuple(_ENGINE_ANIMALS)
 # Engine grammar, not our internal op names. `encode_turn` would accept
 # ["PLANT:TOMATO"] because that is how UNIT_OPS spells it, but the reference
 # engine reads ["PLANT", "TOMATO"] and a route has to replay there -- the final
@@ -66,12 +63,7 @@ UNIT_OPS_POOL = (
     ("SOUTH",),
     ("EAST",),
     ("WEST",),
-    ("PLANT", "WHEAT"),
-    ("PLANT", "CARROT"),
-    ("PLANT", "TOMATO"),
-    ("PLANT", "STRAWBERRY"),
-    ("PLANT", "MELON"),
-)
+) + tuple(("PLANT", crop) for crop in CROPS)
 
 # Retargeting covers BUY_SEED and BUY_ANIMAL as well as SELL, for the same
 # reason the PLANT ops are in the pool: buying tomato seed and buying a goose
@@ -104,20 +96,25 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     turns = range(1, len(route))
 
     # Order slots grouped by verb. A route typically carries far more SELL
-    # orders than BUY_SEED or BUY_ANIMAL ones, so retarget chooses a verb
-    # first, uniformly, and only then an order of that verb -- a buy-side
-    # retarget is exactly as likely as a sell-side one regardless of how
-    # lopsided the counts are. Choosing uniformly over every order instead
-    # would drown the one BUY_SEED order among a hundred SELL orders and
-    # make BUY_SEED:TOMATO unreachable inside a hill-climb's budget.
+    # orders than BUY_SEED or BUY_ANIMAL ones, so resize and retarget both
+    # choose a verb first, uniformly, and only then an order of that verb --
+    # a buy-side edit is exactly as likely as a sell-side one regardless of
+    # how lopsided the counts are. Choosing uniformly over every order
+    # instead would drown the one BUY_SEED order among a hundred SELL orders
+    # and make BUY_SEED:TOMATO unreachable inside a hill-climb's budget.
+    #
+    # An order whose quantity is not an int (a harvested tape records actions
+    # verbatim, and the engine merely aborts a malformed one at execution
+    # rather than rejecting it at parse time) is skipped here entirely, the
+    # same tolerance `_parse_order` shows -- so one bad quantity cannot crash
+    # a multi-hour run inside `resize`'s `int(order[2])`.
     kind_slots: dict[str, list[tuple[int, int]]] = {
         kind: [] for kind in MARKET_CATALOGUES
     }
     for turn in turns:
         for slot, order in enumerate(route[turn]["market"]):
-            if len(order) >= 3 and order[0] in kind_slots:
+            if len(order) >= 3 and order[0] in kind_slots and isinstance(order[2], int):
                 kind_slots[order[0]].append((turn, slot))
-    order_slots = [pair for slots in kind_slots.values() for pair in slots]
     # A turn only admits a real retime if two of its orders differ in
     # content. Two `SELL WHEAT 3` orders queued back to back swap into an
     # identical list -- a route a real season plausibly produces -- so a
@@ -130,7 +127,7 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     ]
 
     edits = ["unit"]
-    if order_slots:
+    if any(kind_slots.values()):
         edits += ["resize", "retarget"]
     if retimable_turns:
         edits.append("retime")
@@ -175,7 +172,12 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         return mutated, f"turn {turn}: slots {slot} and {other} swapped"
 
     if choice == "resize":
-        turn, slot = rng.choice(order_slots)
+        # Verb first, then an order of that verb -- see the `kind_slots`
+        # comment above for why. Sharing that stratification with `retarget`
+        # is what keeps a buy-side resize from being drowned by a hundred
+        # SELL orders.
+        kind = rng.choice([k for k, slots in kind_slots.items() if slots])
+        turn, slot = rng.choice(kind_slots[kind])
         order = list(mutated[turn]["market"][slot])
         current_quantity = int(order[2])
         deltas = [

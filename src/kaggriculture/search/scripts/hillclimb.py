@@ -101,11 +101,21 @@ def load_league(directory: Path) -> dict[str, Opponent]:
 
     Returns:
         Opponents keyed by file stem, routes and agent paths together.
+
+    Raises:
+        ValueError: If a ``.json`` route and a ``.py`` agent share a stem --
+            keying by stem means the second glob would otherwise silently
+            overwrite the first opponent rather than adding a second one.
     """
     league: dict[str, Opponent] = {}
     for path in sorted(directory.glob("*.json")):
         league[path.stem] = load(path)
     for path in sorted(directory.glob("*.py")):
+        if path.stem in league:
+            raise ValueError(
+                f"league stem collision: {path.stem!r} names both a .json "
+                "route and a .py agent"
+            )
         league[path.stem] = str(path)
     return league
 

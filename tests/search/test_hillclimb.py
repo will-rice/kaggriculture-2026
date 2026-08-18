@@ -8,6 +8,21 @@ import pytest
 from kaggriculture.search.scripts.hillclimb import load_league, paired_difference
 
 
+def test_load_league_raises_on_a_stem_collision(tmp_path: Path) -> None:
+    """A ``.json`` route and a ``.py`` agent sharing a stem must not collide.
+
+    Keying opponents by file stem means the ``.py`` glob, run second, would
+    otherwise silently overwrite the ``.json`` opponent and drop that tape
+    from the league without a trace.
+    """
+    route = [{"farmer": ["PASS"], "hands": [], "market": []}] * 720
+    (tmp_path / "boatlee.json").write_text(json.dumps(route))
+    (tmp_path / "boatlee.py").write_text("# not executed by this test\n")
+
+    with pytest.raises(ValueError, match="boatlee"):
+        load_league(tmp_path)
+
+
 def test_identical_outcomes_produce_a_zero_mean_difference_and_are_rejected() -> None:
     """A candidate identical to the incumbent must never be accepted.
 

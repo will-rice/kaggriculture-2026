@@ -3,9 +3,17 @@
 import tarfile
 from pathlib import Path
 
+import pytest
+
+from kaggriculture.routes import STORE
 from kaggriculture.scripts.package import build
 
+_needs_prototype_store = pytest.mark.skipif(
+    not STORE.exists(), reason="prototype store not present on this machine"
+)
 
+
+@_needs_prototype_store
 def test_the_archive_does_not_ship_the_search_package(tmp_path: Path) -> None:
     """The search package has no place in a 4 MB agent archive.
 

@@ -187,6 +187,11 @@ def encode_turn(action: Mapping[str, Any]) -> TurnActions:
     Returns:
         The encoded turn. Malformed orders become the "aborted" code 7, which is
         what the reference does with an order it cannot parse.
+
+    Raises:
+        ValueError: If a unit action or market order names a quantity outside
+            the simulator's supported domain that the reference engine would
+            still execute. See ``_unit_index`` and ``_encode_order``.
     """
     units = [UNIT_OPS.index("PASS")] * MAX_UNITS
     units[0] = _unit_index(action.get("farmer", ["PASS"]))
@@ -203,8 +208,60 @@ def encode_turn(action: Mapping[str, Any]) -> TurnActions:
     return TurnActions(units=tuple(units), orders=tuple(orders))
 
 
+def _order_quantity(verb: str, item: str, quantity: object) -> int:
+    """Return the in-domain quantity for one market order, or ``-1`` to abort.
+
+    Args:
+        verb: The order's verb, for the raised message only.
+        item: The order's item, for the raised message only.
+        quantity: The order's raw, unvalidated quantity.
+
+    Returns:
+        The quantity to encode, or ``-1`` if the reference's own
+        ``int(order[2])`` would raise and abort the order -- the same
+        exclusion, reached without making the call. A route is parsed from
+        JSON, so anything not ``int | float | str`` here (``None``, a list, a
+        dict) is exactly such a case.
+
+    Raises:
+        ValueError: If the quantity is outside the simulator's supported
+            domain but the reference engine's ``_parse_order`` would still
+            accept it -- an int quantity over 64 (the reference has no cap),
+            or a non-int the reference would coerce via ``int()`` and execute
+            (a numeric string, say). Silently clamping the former or aborting
+            the latter would diverge from what the reference actually
+            replays; the RL action space only ever emits small int
+            quantities, so this never fires for it.
+    """
+    if not isinstance(quantity, (int, float, str)):
+        return -1
+    try:
+        coerced = int(quantity)
+    except (TypeError, ValueError):
+        return -1
+    if isinstance(quantity, int):
+        if coerced > 64:
+            raise ValueError(
+                f"{verb} {item!r} quantity {quantity!r} is outside the "
+                "simulator's supported domain: quantity must not exceed 64"
+            )
+        return max(0, coerced)
+    if coerced <= 0:
+        return -1
+    raise ValueError(
+        f"{verb} {item!r} quantity {quantity!r} is outside the simulator's "
+        f"supported domain: quantity must be an int, not {type(quantity).__name__}"
+    )
+
+
 def _encode_order(order: object) -> tuple[int, int, int]:
-    """Return one market order's ``(type, item, quantity)`` codes."""
+    """Return one market order's ``(type, item, quantity)`` codes.
+
+    Raises:
+        ValueError: If the quantity is outside the simulator's supported
+            domain but the reference engine would still execute it. See
+            ``_order_quantity``.
+    """
     if not isinstance(order, (list, tuple)) or not order:
         return (7, -1, 0)
     verb = str(order[0])
@@ -214,10 +271,13 @@ def _encode_order(order: object) -> tuple[int, int, int]:
         return (6, -1, 1)
     if verb in _MARKET_TYPES and len(order) >= 3:
         kind, catalogue = _MARKET_TYPES[verb]
-        item, quantity = str(order[1]), order[2]
-        if item not in catalogue or not isinstance(quantity, int):
+        item = str(order[1])
+        if item not in catalogue:
             return (7, -1, 0)
-        return (kind, catalogue.index(item), max(0, min(64, quantity)))
+        quantity = _order_quantity(verb, item, order[2])
+        if quantity < 0:
+            return (7, -1, 0)
+        return (kind, catalogue.index(item), quantity)
     return (7, -1, 0)
 
 
