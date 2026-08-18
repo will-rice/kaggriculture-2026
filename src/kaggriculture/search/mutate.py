@@ -28,7 +28,6 @@ import random
 
 from kaggriculture.search.route import Route
 
-TURNS_PER_DAY = 24
 SELLABLE = (
     "WHEAT",
     "CARROT",
@@ -102,14 +101,21 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
             if len(order) >= 3 and order[0] in kind_slots:
                 kind_slots[order[0]].append((turn, slot))
     order_slots = [pair for slots in kind_slots.values() for pair in slots]
-    multi_order_turns = [
-        turn for turn, action in enumerate(route) if len(action["market"]) >= 2
+    # A turn only admits a real retime if two of its orders differ in
+    # content. Two `SELL WHEAT 3` orders queued back to back swap into an
+    # identical list -- a route a real season plausibly produces -- so a
+    # turn where every order is the same as every other cannot retime at
+    # all, not even by picking a different pair.
+    retimable_turns = [
+        turn
+        for turn, action in enumerate(route)
+        if len({tuple(order) for order in action["market"]}) >= 2
     ]
 
     edits = ["unit"]
     if order_slots:
         edits += ["resize", "retarget"]
-    if multi_order_turns:
+    if retimable_turns:
         edits.append("retime")
     choice = rng.choice(edits)
 
@@ -126,10 +132,15 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         # order across turns would change two turns at once, and then a
         # fitness difference could not be attributed to one edit. Queue
         # position is what pairs the two seats' orders in the reference
-        # engine, so a reorder inside one turn is a real edit, not a no-op.
-        turn = rng.choice(multi_order_turns)
+        # engine, so a reorder inside one turn is a real edit, not a no-op
+        # -- provided the two slots swapped actually differ in content. The
+        # turn was chosen because it holds at least two distinct orders, so
+        # every slot has at least one differing partner to swap with.
+        turn = rng.choice(retimable_turns)
         slots = mutated[turn]["market"]
-        slot, other = rng.sample(range(len(slots)), 2)
+        slot = rng.randrange(len(slots))
+        candidates = [i for i in range(len(slots)) if slots[i] != slots[slot]]
+        other = rng.choice(candidates)
         slots[slot], slots[other] = slots[other], slots[slot]
         return mutated, f"turn {turn}: slots {slot} and {other} swapped"
 

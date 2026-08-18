@@ -14,6 +14,40 @@ def _route() -> list[dict]:
     return route
 
 
+def _route_with_multi_orders() -> list[dict]:
+    """A route with turns carrying more than one order, exercising retime.
+
+    Turn 0 holds two orders with *identical* content -- two `SELL WHEAT 3`
+    queued back to back, which a real season plausibly produces. A naive
+    index-based swap of that turn produces a route equal to its parent, since
+    the two slots read the same either way. Turn 7 holds a genuine pair for
+    contrast.
+    """
+    route = _route()
+    route[0]["market"] = [["SELL", "WHEAT", 3], ["SELL", "WHEAT", 3]]
+    route[7]["market"] = [["SELL", "WHEAT", 3], ["SELL", "CARROT", 5]]
+    return route
+
+
+def test_a_mutation_changes_exactly_one_turn_even_with_identical_orders() -> None:
+    """A retime landing on two identical orders must not emit a no-op.
+
+    Neither `_route` (at most one order per turn) nor the earlier version of
+    this fixture exercised the retime swap at all, so a no-op retime on a
+    turn of identical orders went uncaught. `mutate` must pick a differing
+    pair to swap, or not retime that turn.
+    """
+    original = _route_with_multi_orders()
+
+    for seed in range(2000):
+        mutated, description = mutate(original, random.Random(seed))
+
+        differing = [
+            i for i, (a, b) in enumerate(zip(original, mutated, strict=True)) if a != b
+        ]
+        assert len(differing) == 1, description
+
+
 def test_a_mutation_changes_exactly_one_turn() -> None:
     """Anything more and a fitness difference cannot be attributed."""
     original = _route()
