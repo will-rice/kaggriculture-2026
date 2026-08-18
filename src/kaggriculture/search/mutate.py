@@ -137,9 +137,9 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     choice = rng.choice(edits)
 
     if choice == "unit":
-        # Roughly 90% of a route's labour lives in the hands, not the farmer
-        # (~5,642 non-PASS hand ops against ~646 farmer ops across a sampled
-        # route's up to 12 hands a turn), so the unit edited on the chosen
+        # Roughly 89.6% of a route's labour lives in the hands, not the farmer
+        # (11,137 non-PASS hand ops against 1,286 non-PASS farmer ops, both seats,
+        # in kaggriculture episode 93212493), so the unit edited on the chosen
         # turn is drawn uniformly from the farmer and whichever hands that
         # turn happens to carry -- not the farmer alone.
         turn = rng.choice(turns)
