@@ -1135,7 +1135,9 @@ which is already a route and needs only `save`.
 
 `package.py` copies the package tree with `EXCLUDED` applied at every directory
 level. A new `search` package would ship into the submission unless excluded,
-and it imports torch — which the packaging notes measure at 10.7 s of the 60 s
+and it is offline-only tooling with no place in a 4 MB agent archive. The
+rationale the packaging notes give for keeping such code out is torch, measured
+at 10.7 s of the 60 s
 overage pool. A tuple entry alone is not evidence; the test builds the archive
 and looks inside it.
 
@@ -1218,7 +1220,7 @@ def main() -> None:
     parser.add_argument("league", type=Path, help="directory of opponent routes")
     parser.add_argument("output", type=Path, help="directory for accepted routes")
     parser.add_argument("--candidates", type=int, default=200)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--rng", type=int, default=0)
     arguments = parser.parse_args()
 
@@ -1228,14 +1230,14 @@ def main() -> None:
     incumbent = load(arguments.seed_route)
     arguments.output.mkdir(parents=True, exist_ok=True)
 
-    scores = evaluate(incumbent, league, SEEDS, arguments.device)
+    scores = evaluate(incumbent, league, SEEDS, arguments.workers)
     best = sum(scores.values()) / len(scores)
     LOGGER.info("incumbent %.4f %s", best, json.dumps(scores))
 
     rng = random.Random(arguments.rng)
     for candidate in range(arguments.candidates):
         mutated, description = mutate(incumbent, rng)
-        scores = evaluate(mutated, league, SEEDS, arguments.device)
+        scores = evaluate(mutated, league, SEEDS, arguments.workers)
         mean = sum(scores.values()) / len(scores)
         # The standard error of a win rate over this many games, doubled because
         # incumbent and candidate are both estimates.
