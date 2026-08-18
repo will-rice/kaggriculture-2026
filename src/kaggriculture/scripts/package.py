@@ -41,7 +41,16 @@ SUBMISSION = REPO_ROOT / "submission.tar.gz"
 # thing that decides they ship. Left to ``copytree``, each would be included
 # exactly when a harvest run happened to have left it in the source tree, and
 # absent without complaint when it had not.
-EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "learn", "*.pt", STORE.name)
+#
+# ``search`` is offline hill-climbing tooling: it plays hundreds of games
+# against a league to find a better route, work that has no place in a 4 MB
+# agent archive regardless of what it imports today. It happens to import no
+# torch right now, but that is not the reason it is excluded -- a later edit
+# could add one, and this entry means that edit cannot also reintroduce it
+# into the submission.
+EXCLUDED = shutil.ignore_patterns(
+    "__pycache__", "scripts", "learn", "search", "*.pt", STORE.name
+)
 
 # The two build artifacts the archive cannot be assembled without, each mapped
 # to the module that produces it. Both are gitignored, so a fresh checkout has
