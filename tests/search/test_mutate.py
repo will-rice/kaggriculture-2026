@@ -17,14 +17,17 @@ def _route() -> list[dict]:
 def _route_with_multi_orders() -> list[dict]:
     """A route with turns carrying more than one order, exercising retime.
 
-    Turn 0 holds two orders with *identical* content -- two `SELL WHEAT 3`
+    Turn 14 holds two orders with *identical* content -- two `SELL WHEAT 3`
     queued back to back, which a real season plausibly produces. A naive
     index-based swap of that turn produces a route equal to its parent, since
     the two slots read the same either way. Turn 7 holds a genuine pair for
     contrast.
+
+    Turn 0 is deliberately not used for either case: `mutate` never edits it,
+    since `arena._replay` never submits it.
     """
     route = _route()
-    route[0]["market"] = [["SELL", "WHEAT", 3], ["SELL", "WHEAT", 3]]
+    route[14]["market"] = [["SELL", "WHEAT", 3], ["SELL", "WHEAT", 3]]
     route[7]["market"] = [["SELL", "WHEAT", 3], ["SELL", "CARROT", 5]]
     return route
 
@@ -90,6 +93,28 @@ def test_the_mutation_set_can_reach_the_hinge_products() -> None:
     assert ("BUY_ANIMAL", "GOOSE") in seen
 
 
+def test_buy_product_orders_are_reachable() -> None:
+    """BUY_PRODUCT orders must be resizable and retargetable, not frozen.
+
+    A sampled route carries 72 BUY_PRODUCT orders. Without a catalogue entry
+    for it, ``resize`` and ``retarget`` can never select one -- it would sit
+    in no catalogue at all.
+    """
+    route = _route()
+    route[3]["market"] = [["BUY_PRODUCT", "WHEAT", 2]]
+    seen_quantities = set()
+    seen_items = set()
+
+    for seed in range(400):
+        mutated, _ = mutate(route, random.Random(seed))
+        order = mutated[3]["market"][0]
+        seen_quantities.add(order[2])
+        seen_items.add(order[1])
+
+    assert seen_quantities != {2}
+    assert "FERTILIZER" in seen_items
+
+
 def test_a_mutation_does_not_alter_its_parent() -> None:
     """The search keeps the incumbent; an in-place edit would corrupt it."""
     original = _route()
@@ -98,3 +123,42 @@ def test_a_mutation_does_not_alter_its_parent() -> None:
     mutate(original, random.Random(0))
 
     assert original == before
+
+
+def test_a_mutation_never_touches_turn_zero() -> None:
+    """Turn 0's action is never submitted, so editing it wastes an evaluation.
+
+    ``arena._replay`` serves ``route[observation["step"] + 1]``, and the
+    engine's first observation already reads ``step == 0``, so index 0 is
+    never the index requested. A mutation set that can still land on turn 0
+    would occasionally produce a candidate that scores identically to its
+    parent while still costing a full evaluation to discover that.
+    """
+    route = _route_with_multi_orders()
+    route[3]["market"] = [["BUY_SEED", "WHEAT", 2], ["BUY_ANIMAL", "COW", 1]]
+
+    for seed in range(1000):
+        mutated, description = mutate(route, random.Random(seed))
+        assert mutated[0] == route[0], description
+
+
+def test_unit_edits_reach_the_hands_not_only_the_farmer() -> None:
+    """~90% of a route's labour lives in the hands, and the unit edit must reach it.
+
+    Rewriting only ``action["farmer"]`` would leave every hand op permanently
+    unreachable by the search. This asserts a hand op is actually changed
+    across many seeds, not merely that hands are present in the route.
+    """
+    route = _route()
+    for turn in route:
+        turn["hands"] = [["PASS"], ["PASS"], ["PASS"]]
+
+    hand_edits = 0
+    for seed in range(500):
+        mutated, description = mutate(route, random.Random(seed))
+        for original_turn, mutated_turn in zip(route, mutated, strict=True):
+            if original_turn["hands"] != mutated_turn["hands"]:
+                hand_edits += 1
+                assert original_turn["farmer"] == mutated_turn["farmer"], description
+
+    assert hand_edits > 0

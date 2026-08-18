@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from kaggriculture.search import arena
-from kaggriculture.search.arena import evaluate, play
+from kaggriculture.search.arena import evaluate, outcomes, play, summarize
 from kaggriculture.search.route import Route, from_episode
 
 ARCHIVE = Path("/data/kaggriculture/episodes/kaggriculture-episodes-2026-08-15.zip")
@@ -86,6 +86,81 @@ def test_a_policy_can_stand_in_for_a_route() -> None:
     )
 
     assert set(scores) == {"econ"}
+
+
+def test_outcomes_orders_games_by_member_then_seed_then_seat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``outcomes`` must return one entry per game in a fixed, documented order.
+
+    A paired hill-climb comparison relies on index ``i`` in a candidate's
+    outcomes and an incumbent's outcomes referring to the same board and seat
+    ordering, which only holds if the order is deterministic: league member,
+    then seed, then seat ordering. This pins that order structurally, by
+    intercepting ``play`` rather than by an outcome value that could pass by
+    coincidence.
+    """
+    candidate: Route = [{"marker": "candidate"}]
+    league = {"alpha": "alpha-route", "beta": "beta-route"}
+    seeds = [1, 2]
+    calls: list[tuple[object, object, tuple[int, ...]]] = []
+
+    def fake_play(
+        seat_zero: object,
+        seat_one: object,
+        seeds: list[int],
+        workers: int | None = None,
+    ) -> list[tuple[int, int]]:
+        calls.append((seat_zero, seat_one, tuple(seeds)))
+        # seat_zero always banks 1, seat_one always banks 0.
+        return [(1, 0) for _ in seeds]
+
+    monkeypatch.setattr(arena, "play", fake_play)
+
+    result = outcomes(candidate, league, seeds)
+
+    assert calls == [
+        (candidate, "alpha-route", (1, 2)),
+        ("alpha-route", candidate, (1, 2)),
+        (candidate, "beta-route", (1, 2)),
+        ("beta-route", candidate, (1, 2)),
+    ]
+    # Per member: seed 1 candidate-first win (1.0), seed 1 candidate-second
+    # loss (0.0), seed 2 candidate-first win (1.0), seed 2 candidate-second
+    # loss (0.0) -- seed before seat ordering, member before seed.
+    assert result == [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_summarize_groups_outcomes_back_into_per_member_win_rates() -> None:
+    """``summarize`` must invert ``outcomes``'s own chunking exactly."""
+    league = {"alpha": "alpha-route", "beta": "beta-route"}
+    seeds = [1, 2]
+    scores = [1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+
+    grouped = summarize(scores, league, seeds)
+
+    assert grouped == {"alpha": 0.5, "beta": 1.0}
+
+
+def test_evaluate_is_summarize_of_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``evaluate`` must be one scoring rule, not a second implementation of it."""
+    candidate: Route = [{"marker": "candidate"}]
+    league = {"alpha": "alpha-route"}
+    seeds = [1, 2, 3]
+
+    def fake_play(
+        seat_zero: object,
+        seat_one: object,
+        seeds: list[int],
+        workers: int | None = None,
+    ) -> list[tuple[int, int]]:
+        return [(1, 1) for _ in seeds]
+
+    monkeypatch.setattr(arena, "play", fake_play)
+
+    assert evaluate(candidate, league, seeds) == summarize(
+        outcomes(candidate, league, seeds), league, seeds
+    )
 
 
 @pytest.mark.skipif(not ARCHIVE.exists(), reason="replay corpus not on this machine")

@@ -1,10 +1,16 @@
 """Single-edit mutations over a route.
 
-Four edits, each confined to one turn: replace a unit's op, retime two of a
-turn's orders against each other, resize one, or retarget one. Compound edits
-are excluded deliberately -- the fitness is a win rate over a few hundred
-noisy games, and a candidate differing in several places tells us nothing
-about which edit paid.
+Four edits, each confined to one turn: replace one unit's op (the farmer or
+one of that turn's hands), retime two of a turn's orders against each other,
+resize one, or retarget one. Compound edits are excluded deliberately -- the
+fitness is a win rate over a few hundred noisy games, and a candidate
+differing in several places tells us nothing about which edit paid.
+
+Turn 0 is never chosen, by any edit. ``arena._replay`` serves
+``route[observation["step"] + 1]``, and the engine's first observation already
+reads ``step == 0``, so index 0 is never the one requested -- an edit there is
+textually different but behaviourally identical to its parent, and would
+still cost a full evaluation to discover that.
 
 Whole-order insertion was considered and left out on purpose. Every hinge
 product the search needs is already reachable by rewriting an order that
@@ -71,7 +77,17 @@ UNIT_OPS_POOL = (
 # reason the PLANT ops are in the pool: buying tomato seed and buying a goose
 # are the two market edits that make the hinge products reachable at all, and
 # a SELL-only catalogue can never emit either.
-MARKET_CATALOGUES = {"SELL": SELLABLE, "BUY_SEED": CROPS, "BUY_ANIMAL": ANIMALS}
+#
+# BUY_PRODUCT is in the catalogue too, with the two items `sim.rollout`'s
+# `_MARKET_TYPES` accepts for it. A sampled route carries 72 BUY_PRODUCT
+# orders; without an entry here they sit in no catalogue at all, so resize
+# and retarget can never touch them.
+MARKET_CATALOGUES = {
+    "SELL": SELLABLE,
+    "BUY_SEED": CROPS,
+    "BUY_ANIMAL": ANIMALS,
+    "BUY_PRODUCT": ("WHEAT", "FERTILIZER"),
+}
 
 
 def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
@@ -85,6 +101,7 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         The mutated route and a description of the edit.
     """
     mutated = copy.deepcopy(route)
+    turns = range(1, len(route))
 
     # Order slots grouped by verb. A route typically carries far more SELL
     # orders than BUY_SEED or BUY_ANIMAL ones, so retarget chooses a verb
@@ -96,8 +113,8 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     kind_slots: dict[str, list[tuple[int, int]]] = {
         kind: [] for kind in MARKET_CATALOGUES
     }
-    for turn, action in enumerate(route):
-        for slot, order in enumerate(action["market"]):
+    for turn in turns:
+        for slot, order in enumerate(route[turn]["market"]):
             if len(order) >= 3 and order[0] in kind_slots:
                 kind_slots[order[0]].append((turn, slot))
     order_slots = [pair for slots in kind_slots.values() for pair in slots]
@@ -108,8 +125,8 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     # all, not even by picking a different pair.
     retimable_turns = [
         turn
-        for turn, action in enumerate(route)
-        if len({tuple(order) for order in action["market"]}) >= 2
+        for turn in turns
+        if len({tuple(order) for order in route[turn]["market"]}) >= 2
     ]
 
     edits = ["unit"]
@@ -120,12 +137,25 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     choice = rng.choice(edits)
 
     if choice == "unit":
-        turn = rng.randrange(len(route))
-        current = tuple(route[turn]["farmer"])
+        # Roughly 90% of a route's labour lives in the hands, not the farmer
+        # (~5,642 non-PASS hand ops against ~646 farmer ops across a sampled
+        # route's up to 12 hands a turn), so the unit edited on the chosen
+        # turn is drawn uniformly from the farmer and whichever hands that
+        # turn happens to carry -- not the farmer alone.
+        turn = rng.choice(turns)
+        units: list[tuple[str, int | None]] = [("farmer", None)]
+        units += [("hands", index) for index in range(len(route[turn]["hands"]))]
+        unit, index = rng.choice(units)
+        current = tuple(
+            route[turn]["farmer"] if unit == "farmer" else route[turn]["hands"][index]
+        )
         choices = [op for op in UNIT_OPS_POOL if op != current]
         op = list(rng.choice(choices))
-        mutated[turn]["farmer"] = op
-        return mutated, f"turn {turn}: farmer -> {' '.join(op)}"
+        if unit == "farmer":
+            mutated[turn]["farmer"] = op
+            return mutated, f"turn {turn}: farmer -> {' '.join(op)}"
+        mutated[turn]["hands"][index] = op
+        return mutated, f"turn {turn}: hand {index} -> {' '.join(op)}"
 
     if choice == "retime":
         # A reorder within the turn, not a move to another turn. Moving an

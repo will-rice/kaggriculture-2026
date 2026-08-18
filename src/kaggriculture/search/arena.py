@@ -57,13 +57,13 @@ def play(
         return list(pool.map(_one, work))
 
 
-def evaluate(
+def outcomes(
     candidate: Route,
     league: Mapping[str, Opponent],
     seeds: Sequence[int],
     workers: int | None = None,
-) -> dict[str, float]:
-    """Return the candidate's win rate against each league member.
+) -> list[float]:
+    """Return one score per game the candidate plays against the league.
 
     Every seed is played twice, once with the candidate in each seat, because
     the seats are not symmetric: they hold different quadrants and their market
@@ -71,6 +71,67 @@ def evaluate(
     seat as much as the route.
 
     A tie counts as half a win, which is what the ladder's rating does with it.
+
+    This is the one place the win/tie/loss rule is applied; ``evaluate`` and
+    any caller that needs per-game scores (a paired comparison, for instance)
+    both read from here rather than from a second implementation of it.
+
+    Args:
+        candidate: The route being scored.
+        league: Opponents by name; each a route or a path to an agent file.
+        seeds: Episode seeds; each is played in both orderings.
+        workers: Processes to spread games over, or None for the default.
+
+    Returns:
+        ``1.0``/``0.5``/``0.0`` per game (win/tie/loss for the candidate), in
+        a fixed, deterministic order: league member (``league``'s own
+        iteration order), then seed, then seat ordering (candidate in seat
+        zero, then candidate in seat one). Each league member contributes
+        ``2 * len(seeds)`` consecutive entries.
+    """
+    scores: list[float] = []
+    for _, opponent in league.items():
+        first = play(candidate, opponent, seeds, workers)
+        second = play(opponent, candidate, seeds, workers)
+        for (ours_first, theirs_first), (theirs_second, ours_second) in zip(
+            first, second, strict=True
+        ):
+            scores.append(_win(ours_first, theirs_first))
+            scores.append(_win(ours_second, theirs_second))
+    return scores
+
+
+def summarize(
+    scores: Sequence[float], league: Mapping[str, Opponent], seeds: Sequence[int]
+) -> dict[str, float]:
+    """Group a flat ``outcomes`` list back into one win rate per league member.
+
+    Exposed separately from ``evaluate`` so a caller that already holds an
+    ``outcomes`` list -- a paired hill-climb comparison, for instance -- can
+    get the same per-member breakdown without replaying the games.
+
+    Args:
+        scores: An ``outcomes`` list, in that function's game order.
+        league: The same league ``outcomes`` was called with, same order.
+        seeds: The same seeds ``outcomes`` was called with.
+
+    Returns:
+        One win rate per league member, over ``2 * len(seeds)`` games each.
+    """
+    games = 2 * len(seeds)
+    return {
+        name: sum(scores[index * games : (index + 1) * games]) / games
+        for index, name in enumerate(league)
+    }
+
+
+def evaluate(
+    candidate: Route,
+    league: Mapping[str, Opponent],
+    seeds: Sequence[int],
+    workers: int | None = None,
+) -> dict[str, float]:
+    """Return the candidate's win rate against each league member.
 
     Args:
         candidate: The route being scored.
@@ -81,18 +142,12 @@ def evaluate(
     Returns:
         One win rate per league member, over ``2 * len(seeds)`` games each.
     """
-    scores = {}
-    for name, opponent in league.items():
-        first = play(candidate, opponent, seeds, workers)
-        second = play(opponent, candidate, seeds, workers)
-        ours = [a for a, _ in first] + [b for _, b in second]
-        theirs = [b for _, b in first] + [a for a, _ in second]
-        wins = sum(
-            1.0 if us > them else 0.5 if us == them else 0.0
-            for us, them in zip(ours, theirs, strict=True)
-        )
-        scores[name] = wins / len(ours)
-    return scores
+    return summarize(outcomes(candidate, league, seeds, workers), league, seeds)
+
+
+def _win(ours: int, theirs: int) -> float:
+    """Return the candidate's score for one game: 1.0/0.5/0.0 win/tie/loss."""
+    return 1.0 if ours > theirs else 0.5 if ours == theirs else 0.0
 
 
 def _side(opponent: Opponent) -> str | _Agent:

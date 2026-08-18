@@ -11,9 +11,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-Route = list[dict[str, Any]]
+from kaggriculture.constants import EPISODE_STEPS
 
-TURNS = 720
+Route = list[dict[str, Any]]
 
 
 def from_episode(episode: dict[str, Any], seat: int) -> Route:
@@ -32,8 +32,18 @@ def from_episode(episode: dict[str, Any], seat: int) -> Route:
 
 
 def load(path: Path) -> Route:
-    """Return the route stored at ``path``."""
-    return [_normalise(turn) for turn in json.loads(Path(path).read_text())]
+    """Return the route stored at ``path``.
+
+    Raises:
+        ValueError: If the stored route is not a full ``EPISODE_STEPS``-turn
+            season. Left unchecked, a short route surfaces later as an
+            ``IndexError`` inside a worker process, far from the file that
+            caused it.
+    """
+    route = [_normalise(turn) for turn in json.loads(Path(path).read_text())]
+    if len(route) != EPISODE_STEPS:
+        raise ValueError(f"{path}: expected {EPISODE_STEPS} turns, got {len(route)}")
+    return route
 
 
 def save(route: Route, path: Path) -> None:

@@ -33,3 +33,12 @@ def test_a_route_survives_a_round_trip(tmp_path: Path) -> None:
     route_module.save(original, tmp_path / "route.json")
 
     assert route_module.load(tmp_path / "route.json") == original
+
+
+def test_load_rejects_a_route_that_is_not_a_full_season(tmp_path: Path) -> None:
+    """A short route must fail loudly here, not as an IndexError in a worker."""
+    path = tmp_path / "short.json"
+    path.write_text(json.dumps([{"farmer": ["PASS"], "hands": [], "market": []}] * 10))
+
+    with pytest.raises(ValueError, match=r"10"):
+        route_module.load(path)
