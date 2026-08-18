@@ -4,6 +4,16 @@ Accepts a candidate only when its mean league win rate beats the incumbent's by
 more than the standard error of the comparison, so a run does not walk uphill on
 noise. Every accepted route is written out, because the interesting artefact is
 the sequence of edits that paid, not only the final tape.
+
+An accepted candidate is re-scored on a fresh seed stream before it becomes the
+incumbent's baseline for the *next* comparison. Carrying forward the accepted
+candidate's own selecting score would make the incumbent, over a run, the
+running maximum of a noisy process rather than an estimate of its true win
+rate -- every accepted route would be a high draw that happened to clear the
+threshold, and the trail of acceptances would read as steady progress that is
+partly survivorship bias. Re-scoring costs one extra evaluation per
+acceptance; acceptances are rare by design (the whole point of the threshold),
+so this is a small fraction of total compute and should not be optimised away.
 """
 
 import argparse
@@ -18,6 +28,11 @@ from kaggriculture.search.route import load, save
 
 LOGGER = logging.getLogger(__name__)
 SEEDS = tuple(range(500_000, 500_064))
+# A block disjoint from SEEDS, used only to re-score an accepted incumbent.
+# Re-scoring on the same seeds that selected the candidate would preserve
+# exactly the survivorship bias re-scoring exists to remove -- the candidate
+# would still be judged on the draw that favoured it.
+RESCORE_SEEDS = tuple(range(600_000, 600_064))
 
 
 def main() -> None:
@@ -52,9 +67,17 @@ def main() -> None:
         games = 2 * len(SEEDS) * len(league)
         threshold = 2 * (0.25 / games) ** 0.5
         if mean > best + threshold:
-            incumbent, best = mutated, mean
+            incumbent = mutated
+            rescored = evaluate(incumbent, league, RESCORE_SEEDS, arguments.workers)
+            best = sum(rescored.values()) / len(rescored)
             save(incumbent, arguments.output / f"accepted-{candidate:04d}.json")
-            LOGGER.info("accepted %.4f (%s) %s", mean, description, json.dumps(scores))
+            LOGGER.info(
+                "accepted selecting=%.4f baseline=%.4f (%s) %s",
+                mean,
+                best,
+                description,
+                json.dumps(rescored),
+            )
         else:
             LOGGER.info("rejected %.4f (%s)", mean, description)
 
