@@ -1,10 +1,20 @@
 """Single-edit mutations over a route.
 
-Five edits, each confined to one turn: replace a unit's op, insert a new
-market order, retime two of a turn's orders against each other, resize one,
-or retarget one. Compound edits are excluded deliberately -- the fitness is a
-win rate over a few hundred noisy games, and a candidate differing in several
-places tells us nothing about which edit paid.
+Four edits, each confined to one turn: replace a unit's op, retime two of a
+turn's orders against each other, resize one, or retarget one. Compound edits
+are excluded deliberately -- the fitness is a win rate over a few hundred
+noisy games, and a candidate differing in several places tells us nothing
+about which edit paid.
+
+Whole-order insertion was considered and left out on purpose. Every hinge
+product the search needs is already reachable by rewriting an order that
+exists: a harvested route carries roughly 92 BUY_SEED orders and 103 SELL
+orders, so retargeting one of those reaches BUY_SEED:TOMATO and SELL:TOMATO,
+and PLANT:TOMATO is already in the unit-op pool. Inserting a whole new order
+would only buy market activity on turns that currently have none -- and
+harvested routes already carry orders on 282 of 720 turns. Evaluation costs
+about a minute a candidate, so a move type with no identified use is not
+free; do not add it back without a hinge product it is the only way to reach.
 
 Legality is not checked here. The engine masks an op the board does not permit
 and partially fills an order larger than the shed holds, so an illegal edit
@@ -58,12 +68,11 @@ UNIT_OPS_POOL = (
     ("PLANT", "MELON"),
 )
 
-# Retargeting and inserting both cover BUY_SEED and BUY_ANIMAL as well as
-# SELL, for the same reason the PLANT ops are in the pool: buying tomato seed
-# and buying a goose are the two market edits that make the hinge products
-# reachable at all, and a SELL-only catalogue can never emit either.
+# Retargeting covers BUY_SEED and BUY_ANIMAL as well as SELL, for the same
+# reason the PLANT ops are in the pool: buying tomato seed and buying a goose
+# are the two market edits that make the hinge products reachable at all, and
+# a SELL-only catalogue can never emit either.
 MARKET_CATALOGUES = {"SELL": SELLABLE, "BUY_SEED": CROPS, "BUY_ANIMAL": ANIMALS}
-INSERT_QUANTITY = 4
 
 
 def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
@@ -78,24 +87,26 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     """
     mutated = copy.deepcopy(route)
 
-    # Order slots and multi-order turns are gathered from real market verbs
-    # only. A route with 100+ SELL orders and a single BUY_SEED order would
-    # otherwise drown a uniform-over-existing-orders retarget: the chance of
-    # landing on the one BUY_SEED slot, then re-choosing TOMATO from it, is
-    # too small to clear inside a hill-climb's budget. `insert` sidesteps
-    # that by landing on any of the 720 turns, independent of what is
-    # already there -- the same freedom the PLANT unit-ops already have.
-    order_slots = [
-        (turn, slot)
-        for turn, action in enumerate(route)
-        for slot, order in enumerate(action["market"])
-        if len(order) >= 3 and order[0] in MARKET_CATALOGUES
-    ]
+    # Order slots grouped by verb. A route typically carries far more SELL
+    # orders than BUY_SEED or BUY_ANIMAL ones, so retarget chooses a verb
+    # first, uniformly, and only then an order of that verb -- a buy-side
+    # retarget is exactly as likely as a sell-side one regardless of how
+    # lopsided the counts are. Choosing uniformly over every order instead
+    # would drown the one BUY_SEED order among a hundred SELL orders and
+    # make BUY_SEED:TOMATO unreachable inside a hill-climb's budget.
+    kind_slots: dict[str, list[tuple[int, int]]] = {
+        kind: [] for kind in MARKET_CATALOGUES
+    }
+    for turn, action in enumerate(route):
+        for slot, order in enumerate(action["market"]):
+            if len(order) >= 3 and order[0] in kind_slots:
+                kind_slots[order[0]].append((turn, slot))
+    order_slots = [pair for slots in kind_slots.values() for pair in slots]
     multi_order_turns = [
         turn for turn, action in enumerate(route) if len(action["market"]) >= 2
     ]
 
-    edits = ["unit", "insert"]
+    edits = ["unit"]
     if order_slots:
         edits += ["resize", "retarget"]
     if multi_order_turns:
@@ -110,13 +121,6 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         mutated[turn]["farmer"] = op
         return mutated, f"turn {turn}: farmer -> {' '.join(op)}"
 
-    if choice == "insert":
-        turn = rng.randrange(len(route))
-        verb = rng.choice(list(MARKET_CATALOGUES))
-        item = rng.choice(MARKET_CATALOGUES[verb])
-        mutated[turn]["market"].append([verb, item, INSERT_QUANTITY])
-        return mutated, f"turn {turn}: insert {verb} {item} {INSERT_QUANTITY}"
-
     if choice == "retime":
         # A reorder within the turn, not a move to another turn. Moving an
         # order across turns would change two turns at once, and then a
@@ -129,10 +133,9 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         slots[slot], slots[other] = slots[other], slots[slot]
         return mutated, f"turn {turn}: slots {slot} and {other} swapped"
 
-    turn, slot = rng.choice(order_slots)
-    order = list(mutated[turn]["market"][slot])
-
     if choice == "resize":
+        turn, slot = rng.choice(order_slots)
+        order = list(mutated[turn]["market"][slot])
         current_quantity = int(order[2])
         deltas = [
             d
@@ -144,8 +147,11 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         mutated[turn]["market"][slot] = order
         return mutated, f"turn {turn} slot {slot}: quantity -> {quantity}"
 
-    # retarget
-    choices = [item for item in MARKET_CATALOGUES[order[0]] if item != order[1]]
+    # retarget: verb first, then an order of that verb, then a new item.
+    kind = rng.choice([k for k, slots in kind_slots.items() if slots])
+    turn, slot = rng.choice(kind_slots[kind])
+    order = list(mutated[turn]["market"][slot])
+    choices = [item for item in MARKET_CATALOGUES[kind] if item != order[1]]
     item = rng.choice(choices)
     order[1] = item
     mutated[turn]["market"][slot] = order
