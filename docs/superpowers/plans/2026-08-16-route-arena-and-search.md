@@ -655,25 +655,26 @@ not mention Claude.
 
 **Interfaces:**
 
-- Consumes: `play` from Task 4.
-- Produces: `evaluate(candidate: Route, league: Mapping[str, Route],
-seeds: Sequence[int], device: torch.device | str = "cpu") -> dict[str, float]`
-  returning one win rate per league member, each over `2 * len(seeds)` games.
+- Consumes: `play(seat_zero, seat_one, seeds, workers=None) -> list[tuple[int, int]]`
+  from Task 4.
+- Produces: `evaluate(candidate: Route, league: Mapping[str, Opponent],
+seeds: Sequence[int], workers: int | None = None) -> dict[str, float]`,
+  returning one win rate per league member over `2 * len(seeds)` games.
+- Also produces: `Opponent = Route | str`, and `play` extended to accept a `str`
+  on either side.
 
-**What the league can and cannot contain.** Every member is a _route_, because
-that is what replays without host synchronisation. A _policy_ — Kaito v27,
-`economic_policy`, our own boatlee v14 — cannot be a faithful league member:
-recording one into a route freezes it against the seed it was recorded on and
-throws away the adaptivity that makes it worth playing. The spec's §3.B named
-those three and was wrong to.
+**Policy opponents, which the reference engine makes possible.** The earlier
+simulator design could only host routes, and the spec called that out as the
+arena's blind spot: it could never see an opponent that reacts to us. The
+reference engine runs _agents_, so an opponent may now be either a route or a
+path to an agent file — `src/kaggriculture/economic_policy.py`,
+`src/kaggriculture/boatlee_v14_policy.py`, or a decoded competitor kernel.
+`kaggle_environments`' `env.run` already accepts a file path in the same
+position as a callable, so this costs a type union and a branch.
 
-So the league is tapes: boatlee V16-RC5's decoded `_ACTIONS`, and routes
-harvested with `from_episode` from top-rated episodes across several days, which
-is where "several meta generations" comes from. Policy opponents are handled by
-the reference-engine gate after the search, not inside it. That is an acceptable
-split because the field is mostly tapes — but it does mean the arena cannot see
-an opponent that reacts to us, and gate 3 in the spec (self-play) is the only
-thing that probes adaptation.
+Keep both kinds. A tape is what most of the field actually submits; a policy is
+the only thing that can respond to what our candidate does, and a route that only
+beats frozen recordings is the overfitting the spec's gate 3 exists to catch.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -690,66 +691,101 @@ def test_a_route_against_itself_scores_exactly_half() -> None:
     scores = evaluate(route, {"mirror": route}, seeds=[1, 2, 3, 4])
 
     assert scores["mirror"] == pytest.approx(0.5)
+
+
+def test_a_policy_can_stand_in_for_a_route() -> None:
+    """An opponent may be an agent path, so the league can hold reacting play.
+
+    A route is a recording and cannot respond to us. `economic_policy` can, and
+    scoring against something that reacts is the only in-arena check on a
+    candidate that has merely learned to beat frozen tapes.
+    """
+    route = [{"farmer": ["PASS"], "hands": [], "market": []}] * 720
+
+    scores = evaluate(
+        route, {"econ": "src/kaggriculture/economic_policy.py"}, seeds=[7]
+    )
+
+    assert 0.0 <= scores["econ"] <= 1.0
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/search/test_arena.py::test_a_route_against_itself_scores_exactly_half -v`
+Run: `uv run pytest tests/search/test_arena.py -v`
 Expected: FAIL with `NameError: name 'evaluate' is not defined`
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append to `src/kaggriculture/search/arena.py`:
+Extend `play` so either side may be an agent path, and add `evaluate` beneath it:
 
 ```python
+Opponent = Route | str
+
+
+def _side(opponent: Opponent):
+    """Return what ``env.run`` should be handed for one seat.
+
+    A ``str`` is a path to an agent file, which the engine loads itself; a route
+    is replayed by our own closure. Both occupy the same position in ``run``.
+    """
+    return opponent if isinstance(opponent, str) else _replay(opponent)
+
+
 def evaluate(
     candidate: Route,
-    league: Mapping[str, Route],
+    league: Mapping[str, Opponent],
     seeds: Sequence[int],
-    device: torch.device | str = "cpu",
+    workers: int | None = None,
 ) -> dict[str, float]:
     """Return the candidate's win rate against each league member.
 
     Every seed is played twice, once with the candidate in each seat, because
-    the seats are not symmetric: they hold different quadrants and their orders
-    pair by queue position. Scoring one ordering only would measure the seat as
-    much as the route.
+    the seats are not symmetric: they hold different quadrants and their market
+    orders pair by queue position. Scoring one ordering only would measure the
+    seat as much as the route.
 
     A tie counts as half a win, which is what the ladder's rating does with it.
 
     Args:
         candidate: The route being scored.
-        league: Opponent routes by name.
+        league: Opponents by name; each a route or a path to an agent file.
         seeds: Episode seeds; each is played in both orderings.
-        device: Where to run.
+        workers: Processes to spread games over, or None for the default.
 
     Returns:
         One win rate per league member, over ``2 * len(seeds)`` games each.
     """
     scores = {}
     for name, opponent in league.items():
-        first = play(candidate, opponent, seeds, device)
-        second = play(opponent, candidate, seeds, device)
-        ours = torch.cat([first[:, 0], second[:, 1]])
-        theirs = torch.cat([first[:, 1], second[:, 0]])
-        wins = (ours > theirs).sum() + 0.5 * (ours == theirs).sum()
-        scores[name] = float(wins) / float(ours.numel())
+        first = play(candidate, opponent, seeds, workers)
+        second = play(opponent, candidate, seeds, workers)
+        ours = [a for a, _ in first] + [b for _, b in second]
+        theirs = [b for _, b in first] + [a for a, _ in second]
+        wins = sum(
+            1.0 if us > them else 0.5 if us == them else 0.0
+            for us, them in zip(ours, theirs, strict=True)
+        )
+        scores[name] = wins / len(ours)
     return scores
 ```
 
-Add `from collections.abc import Mapping, Sequence` to the imports.
+`play`'s signature widens to `seat_zero: Opponent, seat_one: Opponent`, and its
+worker builds each seat with `_side(...)`. Add
+`from collections.abc import Mapping, Sequence` to the imports.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/search/test_arena.py -v`
-Expected: PASS, both tests.
+Expected: PASS, all three tests including the Task 4 fidelity test.
+
+The mirror test must be **exactly** 0.5. If it is not, a seat is being favoured
+and the cause is in the swap, not in the tolerance — do not relax the assertion.
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add src/kaggriculture/search/arena.py tests/search/test_arena.py
-git commit -m "feat: score a route seat-swapped against a league"
-```
+Stage `src/kaggriculture/search/arena.py` and `tests/search/test_arena.py`.
+Commit with `git commit -F <file>`, explaining why seat-swapping is required and
+why the league holds both tapes and policies. Do not mention Claude.
 
 ---
 
