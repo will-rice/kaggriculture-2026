@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 
+import pytest
 import torch
 from kaggle_environments import make
 
@@ -179,3 +180,37 @@ def test_encode_turn_maps_the_action_grammar_to_simulator_codes() -> None:
     assert encoded.orders[1] == (5, -1, 1)
     # Unused slots are the "no order" code.
     assert encoded.orders[2] == (0, -1, 0)
+
+
+def test_unit_index_raises_on_a_pickup_quantity_outside_its_domain() -> None:
+    """A unit action has no quantity lane; a route that needs one is out of domain.
+
+    Silently collapsing ``["PICKUP", "FERTILIZER", 3]`` to a transfer of one is
+    what let a recorded route replay through the simulator and diverge from its
+    own recorded result without any error. The simulator must refuse instead.
+    """
+    from kaggriculture.sim.rollout import encode_turn
+
+    with pytest.raises(ValueError, match="PICKUP.*FERTILIZER.*3"):
+        encode_turn({"farmer": ["PICKUP", "FERTILIZER", 3], "hands": [], "market": []})
+
+
+def test_unit_index_raises_on_a_place_quantity_outside_its_domain() -> None:
+    """The same guard applies to PLACE, the other transfer verb."""
+    from kaggriculture.sim.rollout import encode_turn
+
+    with pytest.raises(ValueError, match="PLACE.*WHEAT.*2"):
+        encode_turn(
+            {"farmer": ["PASS"], "hands": [["PLACE", "WHEAT", 2]], "market": []}
+        )
+
+
+def test_unit_index_accepts_the_in_domain_quantity_of_one() -> None:
+    """Quantity 1 is the whole supported domain, and it still works."""
+    from kaggriculture.sim.rollout import encode_turn
+
+    encoded = encode_turn(
+        {"farmer": ["PICKUP", "FERTILIZER", 1], "hands": [], "market": []}
+    )
+
+    assert encoded.units[0] == UNIT_OPS.index("PICKUP:FERTILIZER")

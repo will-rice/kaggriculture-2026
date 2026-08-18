@@ -149,6 +149,12 @@ def _unit_index(action: object) -> int:
     if not isinstance(action, (list, tuple)) or not action:
         return UNIT_OPS.index("PASS")
     verb = str(action[0])
+    if verb in {"PICKUP", "PLACE"} and len(action) > 2 and action[2] != 1:
+        raise ValueError(
+            f"{verb} {action[1]!r} quantity {action[2]!r} is outside the "
+            "simulator's supported domain: PICKUP/PLACE unit actions carry "
+            "exactly one item, never an explicit quantity."
+        )
     name = (
         f"{verb}:{action[1]}"
         if verb in {"PLANT", "PICKUP", "PLACE"} and len(action) > 1
