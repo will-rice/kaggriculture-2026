@@ -442,30 +442,69 @@ git commit -m "feat: encode a route to simulator tensors once"
 
 ---
 
-### Task 4: Replay two routes, and prove it against the reference
+### Task 4: Replay two routes on the reference engine, and prove it
 
-**This is the linchpin task.** Everything downstream is unfalsifiable if the
-arena's replay does not reproduce the reference engine. The test is unusually
-strong and cheap: the engine is deterministic given a seed and both seats'
-actions, so replaying a real episode's own actions on its own seed must
-reproduce its recorded final banks exactly.
+**This task was rewritten after its first attempt returned BLOCKED.** The
+original built the arena on the batched simulator and its fidelity test refused
+to pass: replaying a recorded episode's own actions on its own seed banked
+`[13342, 13078]` against the recorded `[71961, 73382]`, matching turn by turn to
+turn 42 and diverging at a `PLACE FERTILIZER 3`.
 
-If that test fails, stop and fix it before Task 5. Do not weaken it to a
-tolerance.
+The cause is structural, not a bug. The simulator's `unit_actions` tensor holds
+one op index per unit and has **no quantity lane**; `learn/encoding.py:660` sets
+`TRANSFER_QUANTITY = 1` and its own docstring calls that lossy on purpose. It is
+the right call for the RL policy's action space, which never moves more than one
+item, and every `tests/sim` differential test passes because they all drive the
+simulator from exactly that subset. The reference engine reads
+`n = int(action[2])` for `PICKUP`/`PLACE`, and in top episode 93454366, **283 of
+362 PICKUP/PLACE actions (78%) carry a quantity other than 1**.
+
+So the simulator faithfully replays the RL action space, and a recorded route is
+not in it. Rather than add a quantity lane — which cascades through
+`sim/units.py`, `sim/rollout.py`, `step`'s signature, `learn/encoding.py`,
+`learn/mask.py` and every differential test — the arena moves to the reference
+engine. It costs throughput we do not need: a candidate scored against a
+five-route league over 64 seat-swapped seeds runs in about a minute across this
+machine's cores, while a single ladder verdict costs ~15 hours. And it removes
+fidelity risk entirely, because the arena then measures on the engine that
+scores the competition.
+
+**Two defects in the previous brief were found and are already corrected below.**
+The episode seed lives at `episode["info"]["seed"]`; `episode["configuration"]["seed"]`
+is null in the archives. And indexing is avoided altogether here by having the
+replay agent read `observation["step"]` rather than counting its own turns, which
+is self-aligning against the recorded route no matter which convention the engine
+uses.
 
 **Files:**
 
 - Create: `src/kaggriculture/search/arena.py`
-- Test: `tests/search/test_arena.py`
+- Modify: `src/kaggriculture/sim/rollout.py` (`_unit_index`)
+- Delete: `src/kaggriculture/search/encode.py`, `tests/search/test_encode.py`
+- Test: `tests/search/test_arena.py`, `tests/sim/test_rollout.py`
+
+**Also make the simulator's domain boundary loud.** The batched simulator's
+design spec §2.5 says it "raises on ... an input outside that domain", and it
+does not: `_unit_index` drops `action[2]`, so `PLACE FERTILIZER 3` is silently
+executed as a transfer of one. Silence there cost a full agent context on a
+turn-by-turn diff before the cause surfaced. `_unit_index` must raise
+`ValueError` naming the verb, item and quantity when a `PICKUP` or `PLACE`
+carries an explicit quantity other than 1, with a test that pins it. This is the
+project's stated rule — raise on unsupported cases rather than add fallback
+behaviour — and it costs nothing: `learn/encoding.py` emits
+`TRANSFER_QUANTITY = 1` and every in-domain caller already satisfies it.
+
+`encode_route` was written for the simulator arena and nothing calls it under
+this design. It goes rather than lingering as an unused path; git history keeps
+it if a quantity lane is ever built. `encode_turn` in `sim/rollout.py` stays —
+`scripted_actions` still uses it.
 
 **Interfaces:**
 
-- Consumes: `encode_route` / `EncodedRoute` from Task 3; `route.from_episode`
-  from Task 1; `sim.engine.reset`, `sim.engine.step`, `sim.engine.MarketActions`,
-  `sim.config.Config`.
+- Consumes: `route.Route` and `route.from_episode` from Task 1.
 - Produces: `play(seat_zero: Route, seat_one: Route, seeds: Sequence[int],
-device: torch.device | str = "cpu") -> torch.Tensor` returning an int64 tensor
-  of shape `(len(seeds), 2)` holding each game's final bank per seat.
+workers: int | None = None) -> list[tuple[int, int]]`, one `(bank_seat_zero,
+bank_seat_one)` per seed, in the order given.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -477,7 +516,6 @@ import zipfile
 from pathlib import Path
 
 import pytest
-import torch
 
 from kaggriculture.search.arena import play
 from kaggriculture.search.route import from_episode
@@ -489,21 +527,19 @@ ARCHIVE = Path("/data/kaggriculture/episodes/kaggriculture-episodes-2026-08-15.z
 def test_replaying_an_episode_reproduces_its_recorded_banks() -> None:
     """The engine is deterministic given seed and actions, so this is exact.
 
-    This is the whole warrant for the arena. A tape replayed on a board it was
-    not recorded on can misalign, and this test is what distinguishes "our
-    replay is faithful" from "our replay is plausible".
+    This is the whole warrant for the arena. It covers the action grammar, seat
+    assignment, market queue-position coupling and turn alignment in one
+    assertion, and it is the difference between an arena that is faithful and
+    one that is merely plausible. Do not weaken it to a tolerance.
     """
     with zipfile.ZipFile(ARCHIVE) as bundle:
         episode = json.loads(bundle.read("93454366.json"))
-    seed = int(episode["configuration"]["seed"])
-    expected = [int(reward) for reward in episode["rewards"]]
+    seed = int(episode["info"]["seed"])
+    expected = [(int(episode["rewards"][0]), int(episode["rewards"][1]))]
 
-    banks = play(
-        from_episode(episode, seat=0), from_episode(episode, seat=1), [seed]
-    )
+    banks = play(from_episode(episode, seat=0), from_episode(episode, seat=1), [seed])
 
-    assert banks.shape == (1, 2)
-    assert banks[0].tolist() == expected
+    assert banks == expected
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -514,93 +550,99 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'kaggriculture.search.
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-"""Replaying routes against each other on the batched simulator."""
+"""Replaying routes against each other on the reference engine.
+
+The engine is deterministic given a seed and both seats' actions, so a route
+replayed here reproduces the episode it was harvested from exactly. That is the
+property the arena rests on, and it is why the arena runs on the reference
+engine rather than on the batched simulator: the simulator's action encoding
+carries no quantity for PICKUP/PLACE, which 78% of a real route's transfers use.
+
+Episodes are independent, so seeds are played across a process pool. Each worker
+runs one whole episode; the routes are plain lists of dicts and pickle without
+help.
+"""
 
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 
-import torch
+from kaggle_environments import make
 
-from kaggriculture.search.encode import EncodedRoute, encode_route
+from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 from kaggriculture.search.route import Route
-from kaggriculture.sim.config import Config
-from kaggriculture.sim.engine import MarketActions, reset, step
 
 
 def play(
     seat_zero: Route,
     seat_one: Route,
     seeds: Sequence[int],
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
+    workers: int | None = None,
+) -> list[tuple[int, int]]:
     """Play two routes against each other across ``seeds``.
-
-    Both routes are encoded once and their per-turn rows broadcast across the
-    batch, so the loop holds no host synchronisation and every game in ``seeds``
-    advances together.
 
     Args:
         seat_zero: The route to play in seat 0.
         seat_one: The route to play in seat 1.
         seeds: One episode seed per game.
-        device: Where to run.
+        workers: Processes to spread the games over, or None for the default.
 
     Returns:
-        ``(games, 2)`` int64 final banks.
+        One ``(bank_seat_zero, bank_seat_one)`` per seed, in the order given.
     """
-    config = Config()
-    state = reset(
-        config, torch.tensor(list(seeds), dtype=torch.int64, device=device), device
+    work = [(seat_zero, seat_one, int(seed)) for seed in seeds]
+    if not work:
+        return []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_one, work))
+
+
+def _one(work: tuple[Route, Route, int]) -> tuple[int, int]:
+    """Play a single episode. Runs in a subprocess."""
+    seat_zero, seat_one, seed = work
+    environment = make(
+        ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed}
     )
-    encoded = (encode_route(seat_zero, device), encode_route(seat_one, device))
-    batch = len(seeds)
-    for turn in range(config.episode_steps - 1):
-        state = step(state, _units(encoded, turn, batch), _orders(encoded, turn, batch))
-    return state.money.to(torch.int64)
+    environment.run([_replay(seat_zero), _replay(seat_one)])
+    final = environment.steps[-1]
+    return (int(final[0].reward or 0), int(final[1].reward or 0))
 
 
-def _units(encoded: tuple[EncodedRoute, EncodedRoute], turn: int, batch: int) -> torch.Tensor:
-    """Return ``(batch, 2, MAX_UNITS)`` unit ops for one turn."""
-    return torch.stack(
-        [side.units[turn].expand(batch, -1) for side in encoded], dim=1
-    ).contiguous()
+def _replay(route: Route):
+    """Return an agent that plays ``route``, indexed by the engine's own clock.
 
+    Reading ``observation["step"]`` rather than counting turns internally is what
+    keeps the replay aligned with the recording: the route was harvested by step
+    index, so it is replayed by step index, and no assumption about whether an
+    action belongs to the state before or after it can creep in.
+    """
 
-def _orders(
-    encoded: tuple[EncodedRoute, EncodedRoute], turn: int, batch: int
-) -> MarketActions:
-    """Return one turn's market orders for both seats, batched."""
-    return MarketActions(
-        order_type=torch.stack(
-            [side.order_type[turn].expand(batch, -1) for side in encoded], dim=1
-        ).contiguous(),
-        order_item=torch.stack(
-            [side.order_item[turn].expand(batch, -1) for side in encoded], dim=1
-        ).contiguous(),
-        order_qty=torch.stack(
-            [side.order_qty[turn].expand(batch, -1) for side in encoded], dim=1
-        ).contiguous(),
-    ).compacted()
+    def agent(observation, configuration=None):
+        step = int(observation["step"])
+        return route[step] if step < len(route) else {"farmer": ["PASS"], "hands": [], "market": []}
+
+    return agent
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/search/test_arena.py -v`
-Expected: PASS, banks equal to the episode's own `rewards`.
+Expected: PASS — banks exactly equal to the episode's recorded `rewards`.
 
-If it fails, the likely causes in order: the turn loop runs one turn too many or
-too few (the engine records 720 steps but the last takes no action, so 719
-`step` calls); `compacted()` is not being applied and queue positions therefore
-do not pair the way the reference pairs them; or `order_item` is signed-8-bit
-and a catalogue index has overflowed. Diagnose against a single seed with
-`unpack(state, 0, 0)` and compare turn by turn with the replay — do not adjust
-the assertion.
+If it fails, diagnose against a single seed by comparing `environment.steps[t]`
+with the recorded episode's `steps[t]` and finding the first turn whose farm
+state differs. Do not weaken the assertion, and do not compare only one seat. If
+it cannot be made to pass, stop and report what diverged and when.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Delete the simulator encoder and commit**
 
 ```bash
+git rm src/kaggriculture/search/encode.py tests/search/test_encode.py
 git add src/kaggriculture/search/arena.py tests/search/test_arena.py
-git commit -m "feat: replay two routes, proven against a recorded episode"
 ```
+
+Commit with a message written to a file and `git commit -F`, explaining why the
+arena runs on the reference engine and what the fidelity test establishes. Do
+not mention Claude.
 
 ---
 
