@@ -22,6 +22,9 @@ ENGINE = "1.32.7"
 def harvest(archive: Path, count: int, output: Path) -> list[Path]:
     """Write the winning seats of the archive's best episodes as routes.
 
+    The winning seat is the one with strictly higher rewards; ties award to
+    seat 0 as a consistent break.
+
     Args:
         archive: A daily episode ``.zip``.
         count: How many opponents to write.
@@ -29,6 +32,9 @@ def harvest(archive: Path, count: int, output: Path) -> list[Path]:
 
     Returns:
         The paths written, best episode first.
+
+    Raises:
+        ValueError: If an episode lacks valid rewards.
     """
     output.mkdir(parents=True, exist_ok=True)
     rows = sorted(read_manifest(archive), key=lambda row: -row.avg_score)
@@ -38,9 +44,11 @@ def harvest(archive: Path, count: int, output: Path) -> list[Path]:
             if len(written) >= count:
                 break
             episode = json.loads(bundle.read(f"{row.episode_id}.json"))
-            if str(episode.get("module_version")) != ENGINE:
+            if episode.get("module_version") != ENGINE:
                 continue
-            rewards = episode.get("rewards") or [0, 0]
+            rewards = episode.get("rewards")
+            if not isinstance(rewards, list) or len(rewards) != 2:
+                raise ValueError(f"Episode {row.episode_id} missing or invalid rewards")
             seat = 0 if rewards[0] >= rewards[1] else 1
             path = output / f"{archive.stem}-{row.episode_id}-seat{seat}.json"
             save(from_episode(episode, seat), path)
