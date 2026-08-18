@@ -58,7 +58,14 @@ def _one(work: tuple[Route, Route, int]) -> tuple[int, int]:
     )
     environment.run([_replay(seat_zero), _replay(seat_one)])
     final = environment.steps[-1]
-    return (int(final[0].reward or 0), int(final[1].reward or 0))
+    if final[0].reward is None or final[1].reward is None:
+        statuses = (final[0].status, final[1].status)
+        raise RuntimeError(
+            f"seed {seed} finished with a missing reward (statuses={statuses}); "
+            "a route that no longer matches the episode it plays against, or a "
+            "run that timed out or errored, is not a 0-0 result."
+        )
+    return (int(final[0].reward), int(final[1].reward))
 
 
 def _replay(route: Route) -> _Agent:
@@ -76,16 +83,19 @@ def _replay(route: Route) -> _Agent:
     keeps that same indexing, since it reads straight from ``episode["steps"]``,
     so the action to submit when the engine hands this agent an observation at
     step ``k`` is ``route[k + 1]``, not ``route[k]``.
+
+    There is no PASS fallback for a step past the end of ``route``: ``play``
+    always configures ``episodeSteps`` to match ``constants.EPISODE_STEPS``,
+    which is exactly the length ``route.from_episode`` and ``route.load``
+    produce, so the engine never asks this agent for a step the route does not
+    cover. A shorter route is not a case to paper over -- it means the route
+    does not describe a full season, and indexing past its end raises
+    ``IndexError`` rather than silently padding it with PASS.
     """
 
     def agent(
         observation: _Observation, configuration: _Configuration = None
     ) -> _Action:
-        step = int(observation["step"]) + 1
-        return (
-            route[step]
-            if step < len(route)
-            else {"farmer": ["PASS"], "hands": [], "market": []}
-        )
+        return route[int(observation["step"]) + 1]
 
     return agent

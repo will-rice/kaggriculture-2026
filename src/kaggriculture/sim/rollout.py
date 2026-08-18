@@ -273,6 +273,15 @@ def collect_segment(
     Python function what to play. That is a synchronisation per row per turn,
     so a scripted segment cannot be captured and is not meant to be.
 
+    A scripted opponent is also bound by the simulator's action domain: a unit
+    action has no quantity lane, so an opponent that emits a bulk ``PICKUP`` or
+    ``PLACE`` (a quantity other than 1) is outside that domain and
+    ``encode_turn`` now raises rather than silently transferring one item.
+    ``economic_policy.agent`` is such an opponent -- it issues bulk transfers
+    once its shed and worker inventories are non-empty -- which is why the
+    bridge tests that drive it through this function use only a turn or two: a
+    longer segment would raise.
+
     Args:
         state: The batch to advance. Left untouched; the successor is returned.
         policy: The network, called once per turn with both seats batched.

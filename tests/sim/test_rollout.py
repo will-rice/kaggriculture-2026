@@ -117,6 +117,25 @@ def test_scripted_economic_policy_bridge_matches_reference_action() -> None:
     assert_identical(environment, actual, 0)
 
 
+def test_scripted_actions_raises_on_a_bulk_pickup_from_the_opponent() -> None:
+    """The scripted-opponent bridge is bound by the simulator's own domain.
+
+    It has no quantity lane, so a bulk PICKUP or PLACE is outside it.
+    ``economic_policy.agent`` issues exactly that once its shed and worker
+    inventories hold more than the simulator's supported quantity of one --
+    reproduced here directly, without needing to play the opponent out to the
+    turn where it first does so. Before the guard, this bulk PICKUP silently
+    executed as a transfer of one instead of raising.
+    """
+    state = reset(Config(), torch.tensor([223]))
+
+    def bulk_pickup(observation: object) -> dict[str, object]:
+        return {"farmer": ["PICKUP", "WHEAT", 2], "hands": [], "market": []}
+
+    with pytest.raises(ValueError, match="PICKUP.*WHEAT.*2"):
+        scripted_actions(state, bulk_pickup)
+
+
 def test_collect_segment_accepts_a_scripted_opponent() -> None:
     state = reset(Config(), torch.tensor([227]))
 
