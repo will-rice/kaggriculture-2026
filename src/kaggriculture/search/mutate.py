@@ -107,7 +107,11 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
     # verbatim, and the engine merely aborts a malformed one at execution
     # rather than rejecting it at parse time) is skipped here entirely, the
     # same tolerance `_parse_order` shows -- so one bad quantity cannot crash
-    # a multi-hour run inside `resize`'s `int(order[2])`.
+    # a multi-hour run inside `resize`'s `int(order[2])`. The skip gates
+    # `retarget` too, since both draw from this map: a malformed order can
+    # neither be resized nor retargeted. That is acceptable rather than
+    # accidental -- an order the engine will abort at execution is not worth
+    # an evaluation to rewrite.
     kind_slots: dict[str, list[tuple[int, int]]] = {
         kind: [] for kind in MARKET_CATALOGUES
     }
