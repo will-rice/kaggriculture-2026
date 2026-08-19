@@ -11,8 +11,8 @@ maximum rather than a measurement.** `hillclimb` now rotates its seed block per
 iteration, but every accepted route is still chosen by the same arena it is
 scored in, and the reference engine is deterministic given seed and actions. The
 design spec's §5 asks for **128 seat-swapped reference-engine games against the
-agent we currently serve, with the win rate's 95% interval excluding 0.5**, and
-no script implements it. Build that before spending the compute.
+agent we currently serve, with the win rate's 95% interval excluding 0.5**.
+`search/scripts/holdout.py` implements it.
 
 This is the same distinction that cost this project ten RL arms: a number that
 moves is not a number that means something.
