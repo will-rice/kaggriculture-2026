@@ -50,7 +50,7 @@ if any(seed in _SEARCH_SEED_POOL for seed in GATE_SEEDS):
 # because the exam this module runs is "does the candidate beat what we would
 # otherwise submit", not some other opponent. `test_holdout.py` parses
 # main.py's own import to check this stays true.
-SERVED = "src/kaggriculture/boatlee_v14_policy.py"
+SERVED = "src/kaggriculture/searched_route_policy.py"
 
 
 @dataclass(frozen=True)
