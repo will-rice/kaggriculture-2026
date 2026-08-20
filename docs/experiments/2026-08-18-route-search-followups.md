@@ -66,3 +66,31 @@ fine and the **fixture** was too simple to express the failure.
 
 The habit worth keeping is mechanical: before trusting a green test, mutate the
 behaviour it names and confirm it goes red.
+
+## First real run, 2026-08-19/20 — and the first gate PASS
+
+League: three fresh 08-18 tapes, one 08-16 tape, boatlee's public V16-RC5 tape,
+and the served `boatlee_v14_policy` as the one reacting opponent. Seed: the
+strongest 08-18 harvest (episode 94106275, seat 1). 200 candidates over ~14
+hours, ~22% behaviourally inert (textual edits the engine masks), paired SEs of
+0.002-0.018 — pairing cancelled the shared-market noise as designed.
+
+**One acceptance** (candidate 149): `SELL WOOL 3 -> 5` at turn 646, +1.95% ±
+0.50% paired. Everything else: large edits hurt (down to -49%), small ones did
+not clear 2·SE. The predicted fitness valley was confirmed in the log: a
+`SELL -> CARROT` retarget scored -6% because a route that grows no carrots
+aborts the order and forfeits the original revenue — the hinge strategy needs
+plant+sell as one move, which single-edit mutation cannot express. If a future
+run is wanted past this ceiling, a two-edit macro-mutation is the widening to
+try, not more candidates.
+
+**Gate: PASS.** `holdout` on the final incumbent, one pre-registered run (no
+gate-shopping): rate 0.7344, Wilson 95% [0.6518, 0.8032], 128 held-out games
+vs the served agent. Embedded as `searched_route_policy.py` and proven
+behaviourally identical to the gated route — same final banks (97711, 95180) on
+a gate seed via the real engine, with the off-by-one mutation flipping the
+result to (40244, 131100), so the fidelity test genuinely bites.
+
+The searched route is, honestly stated, a top player's play plus one wool order:
+the pipeline's contribution is not the edit but the measurement — a held-out,
+seat-swapped 73% edge over what we field, which no agent of ours has ever had.
