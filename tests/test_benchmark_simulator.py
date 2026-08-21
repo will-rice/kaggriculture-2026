@@ -99,13 +99,15 @@ def test_zero_policy_removes_the_network_and_nothing_else() -> None:
     """
     module = load_script()
     rows = 3
-    units, market, value = module.ZeroPolicy()(
+    units, quantities, market, value = module.ZeroPolicy()(
         torch.zeros(rows, 1, 10, 10), torch.zeros(rows, 1), torch.zeros(rows, MAX_UNITS)
     )
     assert units.shape == (rows, MAX_UNITS, len(UNIT_OPS))
+    assert quantities.shape == (rows, MAX_UNITS, len(QUANTITIES))
     assert market.shape == (rows, len(MARKET_SLOTS) + 2, len(QUANTITIES))
     assert value.shape == (rows, 1)
     assert not units.any()
+    assert not quantities.any()
     assert not market.any()
 
 

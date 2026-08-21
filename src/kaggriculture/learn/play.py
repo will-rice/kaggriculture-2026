@@ -39,7 +39,7 @@ from kaggriculture.learn.encoding import (
     unit_count,
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import Policy, load_policy_weights
 
 # The sandbox has two cores. Timing at 64 flatters it by an order of magnitude,
 # and a league evaluation fans episodes out one per core, so a policy that
@@ -56,35 +56,27 @@ def model() -> Policy:
     is a public, clearable one rather than a module global so a test can point
     ``CHECKPOINT`` at its own file and drop what a previous test loaded.
 
-    ``CHECKPOINT`` was behaviour-cloned before the value head existed, so it
-    carries every trunk and head key but no ``value.*``. Loading it strict
-    would refuse to load at all, so this loads non-strict instead -- but
-    ``strict=False`` alone proves nothing: it would load just as "successfully"
-    if a trunk key had also gone missing, or if a key had silently drifted
-    name, leaving that part of the network randomly initialised while every
-    other check keeps passing. So the missing keys are checked explicitly:
-    every one of them must belong to the value head, and any gap outside it
-    -- a missing trunk key, an unexpected one -- raises rather than playing
-    weights that loaded silently wrong.
+    ``load_policy_weights`` does the loading; see it for what non-strict means
+    here. It is not a promise that ``CHECKPOINT`` loads -- the quantity-lane
+    widening resized ``trade_head``, an existing key, and ``CHECKPOINT`` on
+    disk predates that widening, so this currently raises out of
+    ``load_state_dict`` before ``load_policy_weights``'s own check ever runs.
+    Retraining the clone is Phase 2's job; until then this loader's contract
+    is correctness, not availability.
 
     Returns:
         The policy in eval mode, on the CPU.
 
     Raises:
         ValueError: If the checkpoint is missing or renaming anything besides
-            the value head.
+            the quantity head.
+        RuntimeError: If a key present in both the checkpoint and the module
+            has a shape ``load_state_dict`` cannot reconcile -- the case
+            ``CHECKPOINT`` currently hits.
     """
     torch.set_num_threads(THREADS)
     policy = Policy()
-    result = policy.load_state_dict(
-        torch.load(CHECKPOINT, map_location="cpu"), strict=False
-    )
-    value_keys = {f"value.{name}" for name, _ in policy.value.named_parameters()}
-    if not set(result.missing_keys) <= value_keys or result.unexpected_keys:
-        raise ValueError(
-            f"{CHECKPOINT} does not match the current trunk: missing "
-            f"{result.missing_keys}, unexpected {result.unexpected_keys}"
-        )
+    load_policy_weights(policy, torch.load(CHECKPOINT, map_location="cpu"))
     return policy.eval()
 
 
@@ -129,7 +121,9 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     """
     seat = int(raw_obs["player"])
     with torch.no_grad():
-        unit_logits, market_logits, _value = model()(
+        # The quantity head is not decoded from yet -- PICKUP/PLACE still
+        # carry no explicit quantity, as before this head existed.
+        unit_logits, _unit_quantity_logits, market_logits, _value = model()(
             encode_board(raw_obs, seat),
             encode_scalars(raw_obs, seat),
             encode_positions(raw_obs, seat),

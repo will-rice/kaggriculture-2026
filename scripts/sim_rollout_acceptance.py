@@ -19,11 +19,12 @@ class _UniformPolicy(torch.nn.Module):
         board: torch.Tensor,
         scalars: torch.Tensor,
         positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = len(board)
         device = board.device
         return (
             torch.zeros(batch, MAX_UNITS, len(UNIT_OPS), device=device),
+            torch.zeros(batch, MAX_UNITS, len(QUANTITIES), device=device),
             torch.zeros(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES), device=device),
             torch.zeros(batch, 1, device=device),
         )

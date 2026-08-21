@@ -250,7 +250,7 @@ def test_the_stored_log_prob_is_the_masked_distribution_s(
     the crew has grown past one unit.
     """
     with torch.no_grad():
-        unit_logits, market_logits, value = _untrained()(
+        unit_logits, _quantity_logits, market_logits, value = _untrained()(
             trajectory.board[DIVERGED : DIVERGED + 1],
             trajectory.scalars[DIVERGED : DIVERGED + 1],
             trajectory.positions[DIVERGED : DIVERGED + 1],

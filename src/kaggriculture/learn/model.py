@@ -23,6 +23,8 @@ whole board and the whole market, not on any one cell. See ``Policy.forward``
 for the argument in full.
 """
 
+from typing import Mapping
+
 import torch
 
 from kaggriculture.learn.encoding import (
@@ -61,7 +63,7 @@ class Residual(torch.nn.Module):
 
 
 class Policy(torch.nn.Module):
-    """Board trunk with three heads: one op per unit, what the farm trades, and V(s)."""
+    """Board trunk with four heads: op & quantity per unit, what to trade, V(s)."""
 
     def __init__(
         self,
@@ -95,6 +97,7 @@ class Policy(torch.nn.Module):
         )
         self.blocks = torch.nn.ModuleList(Residual(channels) for _ in range(blocks))
         self.head = torch.nn.Linear(channels, len(UNIT_OPS))
+        self.quantity_head = torch.nn.Linear(channels, len(QUANTITIES))
         self.trade_head = torch.nn.Linear(
             channels, (len(MARKET_SLOTS) + 2) * len(QUANTITIES)
         )
@@ -102,8 +105,8 @@ class Policy(torch.nn.Module):
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return per-unit op logits, per-slot market logits, and V(s).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-unit op logits, per-unit quantity logits, market logits, and V(s).
 
         The market is projected and added to the spatial tensor rather than
         broadcast as constant planes: ``SCALARS`` numbers that decide the game
@@ -118,6 +121,14 @@ class Policy(torch.nn.Module):
         to; measured, perturbing one board cell moved all ``MAX_UNITS`` slots.
         Gathering per position also makes the readout weights shared across
         slots, so which unit a slot holds stops mattering.
+
+        The quantity head reads the same gathered column the op head does,
+        through its own ``Linear`` rather than a wider op head: how much a
+        ``PICKUP`` or ``PLACE`` moves is the op's own argument, not a separate
+        decision, and it depends on the same thing the op does -- what this
+        unit is standing next to and holding -- not on the farm or the market
+        as a whole, which is what makes it the op head's case and not the
+        trade head's.
 
         The trade head is the opposite case, and pools on purpose. A unit's op
         depends on what it is standing next to; what the farm can afford to
@@ -145,6 +156,7 @@ class Policy(torch.nn.Module):
 
         Returns:
             A tuple of ``(batch, MAX_UNITS, len(UNIT_OPS))`` unit logits,
+            ``(batch, MAX_UNITS, len(QUANTITIES))`` per-unit quantity logits,
             ``(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` market logits,
             and ``(batch,)`` state values.
         """
@@ -153,7 +165,9 @@ class Policy(torch.nn.Module):
             features = block(features)
         columns = features.flatten(2)
         wanted = positions[:, None, :].tile(1, columns.shape[1], 1)
-        units = self.head(columns.gather(2, wanted).transpose(1, 2))
+        gathered = columns.gather(2, wanted).transpose(1, 2)
+        units = self.head(gathered)
+        unit_quantities = self.quantity_head(gathered)
         pooled = features.mean(dim=(2, 3))
         market = self.trade_head(pooled).reshape(
             pooled.shape[0], len(MARKET_SLOTS) + 2, len(QUANTITIES)
@@ -164,4 +178,52 @@ class Policy(torch.nn.Module):
             # the reward space. Theirs is not zero-sum for the shaped phase, so
             # the activation is Sigmoid rather than Softmax.
             value = torch.sigmoid(value) * (2.0 * self.value_bound) - self.value_bound
-        return units, market, value
+        return units, unit_quantities, market, value
+
+
+def load_policy_weights(
+    policy: Policy, weights: Mapping[str, torch.Tensor]
+) -> list[str]:
+    """Load a checkpoint into ``policy``, non-strict only for the quantity head.
+
+    This is not a compatibility shim that keeps old checkpoints loading -- none
+    of them load any more, full stop. Task 3b widened ``QUANTITIES`` (17 to 21
+    buckets), which resized ``trade_head``, a key every prior checkpoint
+    already has. ``strict=False`` forgives a key that is missing outright; it
+    does not forgive a shape mismatch on a key present in both the checkpoint
+    and the module, so the behaviour-cloned clone and every RL arm's checkpoint
+    now raise a ``RuntimeError`` out of ``load_state_dict`` before this
+    function's own logic ever runs. Retraining them is Phase 2's job, not
+    this one's.
+
+    What this function does is narrower, and only matters once a checkpoint's
+    shapes agree with the current ``Policy``: it tolerates ``quantity_head.*``
+    being absent -- the one head this task adds, which no checkpoint written
+    before it can carry -- and raises on any other gap. A checkpoint missing,
+    say, a value-head key is corrupt or foreign, not merely old, and loading
+    it non-strict would leave that head randomly initialised while every
+    other check kept passing.
+
+    Args:
+        policy: The module to load into, mutated in place.
+        weights: The state dict to load, e.g. the result of ``torch.load``.
+
+    Returns:
+        The keys ``weights`` was missing (always a subset of
+        ``quantity_head``'s parameter names).
+
+    Raises:
+        ValueError: If ``weights`` is missing a key outside the quantity head,
+            or names a key ``policy`` does not have.
+        RuntimeError: If a key present in both ``weights`` and ``policy`` has
+            a shape ``load_state_dict`` cannot reconcile -- the case every
+            pre-widening checkpoint hits.
+    """
+    result = policy.load_state_dict(weights, strict=False)
+    stray = [key for key in result.missing_keys if not key.startswith("quantity_head.")]
+    if stray or result.unexpected_keys:
+        raise ValueError(
+            f"checkpoint does not match the current policy: missing {stray}, "
+            f"unexpected {result.unexpected_keys}"
+        )
+    return result.missing_keys

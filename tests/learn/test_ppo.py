@@ -554,7 +554,9 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
     market_masks = _mask(turns, len(MARKET_SLOTS) + 2, len(QUANTITIES))
 
     with torch.no_grad():
-        unit_logits, market_logits, values = policy(board, scalars, positions)
+        unit_logits, _quantity_logits, market_logits, values = policy(
+            board, scalars, positions
+        )
     units = torch.log_softmax(unit_logits.masked_fill(~unit_masks, -torch.inf), dim=-1)
     market = torch.log_softmax(
         market_logits.masked_fill(~market_masks, -torch.inf), dim=-1

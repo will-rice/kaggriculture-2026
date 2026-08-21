@@ -479,7 +479,10 @@ def collect_segment(
         market_masks = torch.stack([value[1] for value in masks], dim=1)
         batch = state.batch_size
         with torch.no_grad():
-            unit_logits, market_logits, values = policy(
+            # The quantity head's logits are not sampled from yet -- every
+            # transfer this collector plays still goes through
+            # `unit_quantity_ones` below, unchanged.
+            unit_logits, _unit_quantity_logits, market_logits, values = policy(
                 boards.flatten(0, 1),
                 scalars.flatten(0, 1),
                 positions.flatten(0, 1),

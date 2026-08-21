@@ -41,12 +41,12 @@ from importlib import metadata
 from pathlib import Path
 
 import torch
+import wandb
 from lightning import seed_everything
 
-import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.toad_loss import (
@@ -679,36 +679,30 @@ def _field(arguments: argparse.Namespace) -> str:
 
 
 def _warm_start(learner: Policy, device: str) -> None:
-    """Load the BC clone into the trunk and both heads, leaving the value head fresh.
+    """Load the BC clone into the trunk and every trained head.
 
-    The clone predates the value head, so it carries no ``value.*`` keys. That
-    makes a non-strict load necessary -- and dangerous, because ``strict=False``
-    would swallow a missing *trunk* key just as quietly and leave the arm
-    measuring a half-initialised network while looking fine. So the missing keys
-    are checked explicitly against the value head, and anything else raises. This
-    is the discipline ``learn/play.py`` already applies for the same reason.
+    ``load_policy_weights`` does the loading; see it for what non-strict means
+    here. It is not a promise that ``CHECKPOINT`` loads -- the quantity-lane
+    widening resized ``trade_head``, an existing key, and ``CHECKPOINT`` on
+    disk predates that widening, so this currently raises out of
+    ``load_state_dict`` before ``load_policy_weights``'s own check ever runs.
+    Retraining the clone is Phase 2's job, not this arm's.
 
     Args:
         learner: The network to warm-start, modified in place.
         device: Where to map the checkpoint.
 
     Raises:
-        ValueError: If the checkpoint is missing or renaming anything beyond the
-            value head.
+        ValueError: If the checkpoint is missing or renaming anything beyond
+            the quantity head.
+        RuntimeError: If a key present in both the checkpoint and the module
+            has a shape ``load_state_dict`` cannot reconcile -- the case
+            ``CHECKPOINT`` currently hits.
     """
     state = torch.load(CHECKPOINT, map_location=device, weights_only=True)
-    incompatible = learner.load_state_dict(state, strict=False)
-    unexpected = list(incompatible.unexpected_keys)
-    missing = [key for key in incompatible.missing_keys if not key.startswith("value.")]
-    if unexpected or missing:
-        raise ValueError(
-            f"clone checkpoint does not match the network: "
-            f"unexpected={unexpected}, missing-beyond-value-head={missing}"
-        )
+    missing = load_policy_weights(learner, state)
     LOGGER.info(
-        "warm started from %s; fresh value head (%s)",
-        CHECKPOINT,
-        ", ".join(incompatible.missing_keys),
+        "warm started from %s; fresh heads (%s)", CHECKPOINT, ", ".join(missing)
     )
 
 
@@ -813,7 +807,7 @@ def _restore(
         The ``(steps, update)`` the checkpoint was written at.
     """
     state = torch.load(path, map_location=device, weights_only=False)
-    learner.load_state_dict(state["learner"])
+    load_policy_weights(learner, state["learner"])
     optimizer.load_state_dict(state["optimizer"])
     schedule.load_state_dict(state["schedule"])
     return int(state["steps"]), int(state["update"])
@@ -1090,7 +1084,9 @@ def _step(
     # is wanted -- no action was taken there -- so its logits are sliced off
     # immediately and its value becomes the bootstrap. monobeast.py:292-296 does
     # exactly this split.
-    unit_logits, market_logits, values = learner(
+    # The quantity head is not trained here yet -- the teacher KL below covers
+    # the op and market heads only, same as this line.
+    unit_logits, _unit_quantity_logits, market_logits, values = learner(
         board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
     )
     values = values.view(turns + 1, width)
@@ -1120,7 +1116,9 @@ def _step(
     teacher_kl = None
     if teacher is not None:
         with torch.no_grad():
-            teacher_units, teacher_market, _ = teacher(
+            # Task 5 decides quantity-KL, once both the learner and the
+            # teacher carry the head; this KL stays op+market only for now.
+            teacher_units, _teacher_quantity, teacher_market, _ = teacher(
                 board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
             )
         teacher_kl = _kl(

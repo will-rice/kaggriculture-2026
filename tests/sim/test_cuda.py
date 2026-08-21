@@ -39,12 +39,13 @@ class _ZeroPolicy(torch.nn.Module):
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return zero unit logits, zero market logits and a zero value."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return zero unit, quantity and market logits, and a zero value."""
         rows = len(board)
         device = board.device
         return (
             torch.zeros(rows, MAX_UNITS, len(UNIT_OPS), device=device),
+            torch.zeros(rows, MAX_UNITS, len(QUANTITIES), device=device),
             torch.zeros(rows, len(MARKET_SLOTS) + 2, len(QUANTITIES), device=device),
             torch.zeros(rows, 1, device=device),
         )

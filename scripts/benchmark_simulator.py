@@ -298,12 +298,13 @@ class ZeroPolicy(torch.nn.Module):
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return zero unit logits, zero market logits and a zero value."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return zero unit, quantity and market logits, and a zero value."""
         rows = len(board)
         device = board.device
         return (
             torch.zeros(rows, MAX_UNITS, len(UNIT_OPS), device=device),
+            torch.zeros(rows, MAX_UNITS, len(QUANTITIES), device=device),
             torch.zeros(rows, len(MARKET_SLOTS) + 2, len(QUANTITIES), device=device),
             torch.zeros(rows, 1, device=device),
         )
@@ -324,11 +325,13 @@ class PeakedPolicy(ZeroPolicy):
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return logits that peak on one option per slot, and a zero value."""
-        units, market, value = super().forward(board, scalars, positions)
+        units, quantities, market, value = super().forward(board, scalars, positions)
+        qwidth = quantities.shape[-1]
         return (
             units + PEAK * torch.arange(units.shape[-1], device=units.device),
+            quantities + PEAK * torch.arange(qwidth, device=quantities.device),
             market + PEAK * torch.arange(market.shape[-1], device=market.device),
             value,
         )
@@ -568,7 +571,7 @@ def turn(state: SimState, policy: torch.nn.Module, *, sample: bool) -> SimState:
     market_masks = torch.stack([value[1] for value in masks], dim=1)
     batch = state.batch_size
     with torch.no_grad():
-        unit_logits, market_logits, _value = policy(
+        unit_logits, _unit_quantity_logits, market_logits, _value = policy(
             boards.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
         )
     unit_logits = unit_logits.reshape(batch, 2, *unit_logits.shape[1:])

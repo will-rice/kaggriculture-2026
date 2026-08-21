@@ -584,7 +584,11 @@ def update(
             unit_masks = rows.unit_masks[index].to(device)
             market_masks = rows.market_masks[index].to(device)
 
-            unit_logits, market_logits, values = policy(board, scalars, positions)
+            # The quantity head is not trained here yet; PPO's loss covers the
+            # op and market heads only, same as before this head existed.
+            unit_logits, _unit_quantity_logits, market_logits, values = policy(
+                board, scalars, positions
+            )
             units = torch.log_softmax(
                 unit_logits.masked_fill(~unit_masks, -torch.inf), dim=-1
             )
@@ -604,7 +608,10 @@ def update(
             )
 
             with torch.no_grad():
-                teacher_units, teacher_market, _value = teacher(
+                # The teacher KL covers the op and market heads only, for the
+                # same reason: quantity-KL waits for a task where both sides
+                # of it carry the head.
+                teacher_units, _teacher_quantity, teacher_market, _value = teacher(
                     board, scalars, positions
                 )
             divergence = (

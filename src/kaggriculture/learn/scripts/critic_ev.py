@@ -70,7 +70,7 @@ from pathlib import Path
 import torch
 
 from kaggriculture.learn.critic import explained_variance, monte_carlo
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.rollout import rollout_many
 from kaggriculture.learn.scripts.toad_phase1 import BATCH_SEGMENTS, OPPONENT
 from kaggriculture.learn.toad.core import td_lambda, vtrace
@@ -347,7 +347,7 @@ def load(arm: Arm) -> Policy:
     channels = int(weights["stem.weight"].shape[0])
     blocks = 1 + max(int(k.split(".")[1]) for k in weights if k.startswith("blocks."))
     policy = Policy(blocks=blocks, channels=channels, value_bound=arm.value_bound)
-    policy.load_state_dict(weights)
+    load_policy_weights(policy, weights)
     return policy.eval()
 
 

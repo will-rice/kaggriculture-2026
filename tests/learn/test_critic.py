@@ -192,13 +192,14 @@ class _Oracle(Policy):
 
     def forward(
         self, board: torch.Tensor, scalars: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return flat logits and the prescribed value for each row's turn."""
         rows = board.shape[0]
         slack = self.value.bias.sum() * 0.0
         turn = scalars[:, 0].to(torch.int64)
         return (
             torch.zeros(rows, MAX_UNITS, len(UNIT_OPS)) + slack,
+            torch.zeros(rows, MAX_UNITS, len(QUANTITIES)) + slack,
             torch.zeros(rows, SLOTS, len(QUANTITIES)) + slack,
             self.values[turn] + slack,
         )

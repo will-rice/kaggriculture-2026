@@ -18,11 +18,11 @@ import logging
 from pathlib import Path
 
 import torch
+import wandb
 from lightning import seed_everything
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.dataset import Shards
 from kaggriculture.learn.encoding import IGNORE, MARKET_SLOTS, UNIT_OPS
@@ -104,7 +104,7 @@ def main() -> None:
         ):
             labels = labels.to(device)
             market = market.to(device)
-            logits, market_logits, _value = model(
+            logits, _unit_quantity_logits, market_logits, _value = model(
                 board.to(device), scalars.to(device), positions.to(device)
             )
             units, trades = (
@@ -314,7 +314,7 @@ def evaluate(model: Policy, loader: DataLoader, device: str) -> dict[str, float]
         for board, scalars, positions, labels, market in loader:
             labels = labels.to(device)
             market = market.to(device)
-            logits, market_logits, _value = model(
+            logits, _unit_quantity_logits, market_logits, _value = model(
                 board.to(device), scalars.to(device), positions.to(device)
             )
             acting = int((labels != IGNORE).sum().item())

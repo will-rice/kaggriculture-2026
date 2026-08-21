@@ -684,7 +684,9 @@ def _decide(
 
     device = next(policy.parameters()).device
     with torch.no_grad():
-        unit_logits, market_logits, value = policy(
+        # The quantity head's logits are not sampled from here; `decode_units`
+        # below still emits no explicit transfer quantity, unchanged.
+        unit_logits, _unit_quantity_logits, market_logits, value = policy(
             board.to(device), scalars.to(device), positions.to(device)
         )
     unit_logits, market_logits, value = (

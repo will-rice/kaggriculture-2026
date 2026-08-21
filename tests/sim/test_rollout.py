@@ -67,6 +67,7 @@ class _UniformPolicy(torch.nn.Module):
         device = board.device
         return (
             torch.zeros(batch, 20, len(UNIT_OPS), device=device),
+            torch.zeros(batch, 20, len(QUANTITIES), device=device),
             torch.zeros(batch, len(MARKET_SLOTS) + 2, len(QUANTITIES), device=device),
             torch.zeros(batch, 1, device=device),
         )
@@ -74,9 +75,9 @@ class _UniformPolicy(torch.nn.Module):
 
 class _SellWheatPolicy(_UniformPolicy):
     def forward(self, board, scalars, positions):
-        units, markets, values = super().forward(board, scalars, positions)
+        units, quantities, markets, values = super().forward(board, scalars, positions)
         markets[:, 0, 1] = 100
-        return units, markets, values
+        return units, quantities, markets, values
 
 
 def test_collect_segment_keeps_actions_legal_and_tensors_on_device() -> None:

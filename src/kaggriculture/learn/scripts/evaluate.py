@@ -65,13 +65,13 @@ from typing import Any
 
 import numpy as np
 import torch
+import wandb
 from kaggle_environments import make
 from kaggle_environments.core import Environment
 
-import wandb
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 from kaggriculture.learn import corpus
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import Policy, load_policy_weights
 
 # The eval rollout drives the episode itself so that it can keep observations,
 # but it does not decide anything itself: the masked sampling and the opponent
@@ -675,7 +675,7 @@ def _load(checkpoint: Path) -> Policy:
     # choice either, which is why the arms and the unbounded PPO lineage can
     # share one constructor here.
     policy = Policy(blocks=blocks, channels=channels, value_bound=1.0)
-    policy.load_state_dict(weights)
+    load_policy_weights(policy, weights)
     return policy.eval()
 
 

@@ -61,11 +61,11 @@ def test_the_value_head_is_bounded_to_the_reward_range() -> None:
     board = torch.randn(4, TILE_PLANES, 10, 10) * 50.0
     scalars = torch.randn(4, SCALARS) * 50.0
     positions = torch.zeros(4, 20, dtype=torch.int64)
-    _, _, value = policy(board, scalars, positions)
+    _, _, _, value = policy(board, scalars, positions)
     assert bool((value.abs() <= 1.0).all())
     # And the default stays unbounded, so the PPO path is unchanged.
     plain = Policy(blocks=1, channels=16)
-    _, _, wide = plain(board, scalars, positions)
+    _, _, _, wide = plain(board, scalars, positions)
     assert plain.value_bound is None
     assert torch.isfinite(wide).all()
 
