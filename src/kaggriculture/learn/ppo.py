@@ -16,26 +16,30 @@ the fresh logits. It is structurally incapable of doing anything else: a
 ``Trajectory`` carries no observation, and ``mask.py`` is not imported here.
 
 **The ratio is joint over the whole turn, because that is what acted.** A turn's
-action is every real unit's op plus all ``len(MARKET_SLOTS) + 2`` market
-buckets, sampled together, and ``rollout`` stores one summed log-probability per
-turn for exactly that reason. Both heads therefore contribute to the policy
-loss through one ratio rather than through two -- there is no stored per-head
-``old`` to form a per-head ratio against, and inventing one by splitting the
-recomputed ``new`` against a fabricated ``old`` would be a ratio between a
-distribution and itself. The cost is variance: ``exp`` of a difference of two
-~25-term sums moves further per step than a single-factor ratio would, which is
-what the clip is there to bound.
+action is every real unit's op, the count each transferring unit asked for, and
+all ``len(MARKET_SLOTS) + 2`` market buckets, sampled together; ``rollout``
+stores one summed log-probability per turn for exactly that reason. All three
+heads therefore contribute to the policy loss through one ratio rather than
+through three -- there is no stored per-head ``old`` to form a per-head ratio
+against, and inventing one by splitting the recomputed ``new`` against a
+fabricated ``old`` would be a ratio between a distribution and itself. The cost
+is variance: ``exp`` of a difference of two ~25-term sums moves further per step
+than a single-factor ratio would, which is what the clip is there to bound.
 
-**The two heads are padded differently, and the difference is not cosmetic.**
+**The three heads are padded differently, and the difference is not cosmetic.**
 The unit head has a row for every one of ``MAX_UNITS`` slots and the crew is
 usually four, so most rows hold no decision; ``rollout`` marks them ``IGNORE``,
 the same sentinel ``encode_units`` writes and ``train.unit_loss`` masks on. They
 are excluded here from the joint log-probability, from the entropy bonus and
 from the teacher KL -- included, they would let the gradient shape a
 distribution over ops for hands the engine never asked about, and would make
-the entropy term a function of how many slots happen to be empty. The market
-head excludes nothing: all 21 slots are real decisions on every turn and bucket
-0 means "trade nothing", which the corpus chooses on about a third of rows.
+the entropy term a function of how many slots happen to be empty. The quantity
+head is narrower still: it is excluded on every slot whose sampled op was not a
+``PICKUP`` or a ``PLACE``, padded or not, because those are the only two ops
+whose ``action[2]`` the engine reads and a bucket it never read is not part of
+what acted. The market head excludes nothing: all 21 slots are real decisions on
+every turn and bucket 0 means "trade nothing", which the corpus chooses on about
+a third of rows.
 
 **GAE is taken inside an episode and never across one.** ``update`` takes
 trajectories rather than a pre-flattened block precisely so that the boundaries
@@ -80,7 +84,7 @@ from typing import Sequence
 import torch
 
 from kaggriculture.constants import STARTING_MONEY
-from kaggriculture.learn.encoding import IGNORE
+from kaggriculture.learn.encoding import IGNORE, transfer_slots
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.progress import progress_reward
 from kaggriculture.learn.rollout import Trajectory
@@ -268,9 +272,15 @@ class Rows:
         positions: ``(rows, MAX_UNITS)`` flattened tile indices per unit.
         unit_actions: ``(rows, MAX_UNITS)`` op indices, ``IGNORE`` where no unit
             stood.
+        unit_quantities: ``(rows, MAX_UNITS)`` the bucket each unit's quantity
+            head sampled. Never ``IGNORE``: padding is stated once, on
+            ``unit_actions``, and a slot whose op is not a transfer spends no
+            bucket whether or not a unit stood there.
         market_actions: ``(rows, len(MARKET_SLOTS) + 2)`` quantity buckets.
         unit_masks: ``(rows, MAX_UNITS, len(UNIT_OPS))`` bool, the mask that
             gated the logits when the action was sampled.
+        unit_quantity_masks: ``(rows, MAX_UNITS, len(QUANTITIES))`` bool,
+            likewise for the quantity head.
         market_masks: ``(rows, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` bool,
             likewise.
         log_probs: ``(rows,)`` the behaviour policy's joint log-probability of
@@ -285,8 +295,10 @@ class Rows:
     scalars: torch.Tensor
     positions: torch.Tensor
     unit_actions: torch.Tensor
+    unit_quantities: torch.Tensor
     market_actions: torch.Tensor
     unit_masks: torch.Tensor
+    unit_quantity_masks: torch.Tensor
     market_masks: torch.Tensor
     log_probs: torch.Tensor
     advantages: torch.Tensor
@@ -475,8 +487,12 @@ def flatten(batch: Sequence[Trajectory], config: PpoConfig) -> Rows:
         scalars=torch.cat([trajectory.scalars for trajectory in batch]),
         positions=torch.cat([trajectory.positions for trajectory in batch]),
         unit_actions=torch.cat([trajectory.unit_actions for trajectory in batch]),
+        unit_quantities=torch.cat([trajectory.unit_quantities for trajectory in batch]),
         market_actions=torch.cat([trajectory.market_actions for trajectory in batch]),
         unit_masks=torch.cat([trajectory.unit_masks for trajectory in batch]),
+        unit_quantity_masks=torch.cat(
+            [trajectory.unit_quantity_masks for trajectory in batch]
+        ),
         market_masks=torch.cat([trajectory.market_masks for trajectory in batch]),
         log_probs=torch.cat([trajectory.log_probs for trajectory in batch]),
         advantages=(stacked - stacked.mean()) / (stacked.std() + 1e-8),
@@ -580,37 +596,66 @@ def update(
             scalars = rows.scalars[index].to(device)
             positions = rows.positions[index].to(device)
             unit_actions = rows.unit_actions[index].to(device)
+            unit_quantity_actions = rows.unit_quantities[index].to(device)
             market_actions = rows.market_actions[index].to(device)
             unit_masks = rows.unit_masks[index].to(device)
+            unit_quantity_masks = rows.unit_quantity_masks[index].to(device)
             market_masks = rows.market_masks[index].to(device)
 
-            # The quantity head is not trained here yet; PPO's loss covers the
-            # op and market heads only, same as before this head existed.
-            unit_logits, _unit_quantity_logits, market_logits, values = policy(
+            unit_logits, unit_quantity_logits, market_logits, values = policy(
                 board, scalars, positions
             )
             units = torch.log_softmax(
                 unit_logits.masked_fill(~unit_masks, -torch.inf), dim=-1
             )
+            quantities = torch.log_softmax(
+                unit_quantity_logits.masked_fill(~unit_quantity_masks, -torch.inf),
+                dim=-1,
+            )
             market = torch.log_softmax(
                 market_logits.masked_fill(~market_masks, -torch.inf), dim=-1
             )
             real = unit_actions != IGNORE
-            log_probs = joint_log_prob(units, market, unit_actions, market_actions)
+            transferred = transfer_slots(unit_actions)
+            log_probs = joint_log_prob(
+                units,
+                quantities,
+                market,
+                unit_actions,
+                unit_quantity_actions,
+                market_actions,
+            )
             ratio = torch.exp(log_probs - rows.log_probs[index].to(device))
 
             advantage = rows.advantages[index].to(device)
             surrogate = policy_loss(ratio, advantage, config.clip)
             value = torch.nn.functional.mse_loss(values, rows.returns[index].to(device))
+            # The quantity head's entropy is averaged over the slots that
+            # actually spent a bucket, the same condition its log-probability
+            # is under. Rewarding entropy on a slot whose op ignored the
+            # bucket would pay the head to spread mass over a decision the
+            # engine never read. The denominator is a count of those slots and
+            # a minibatch can hold none of them, in which case the term is a
+            # sum of nothing over one, which is the zero contribution an empty
+            # mean should make.
             entropy = (
                 entropy_of(units, unit_masks)[real].mean()
+                + entropy_of(quantities, unit_quantity_masks)
+                .masked_fill(~transferred, 0.0)
+                .sum()
+                / transferred.sum().clamp(min=1)
                 + entropy_of(market, market_masks).mean()
             )
 
             with torch.no_grad():
-                # The teacher KL covers the op and market heads only, for the
-                # same reason: quantity-KL waits for a task where both sides
-                # of it carry the head.
+                # The teacher KL covers the op and market heads only. This
+                # loop's teacher is `selfplay.initialise`'s deep copy of the
+                # policy's own starting weights, so on a fresh or a
+                # behaviour-cloned start its quantity head is the learner's
+                # random initialisation -- anchoring the head to that is worse
+                # than not anchoring it. `toad_phase1` loads its teacher from a
+                # state dict, can therefore ask whether the head was ever
+                # trained, and includes the term when the answer is yes.
                 teacher_units, _teacher_quantity, teacher_market, _value = teacher(
                     board, scalars, positions
                 )
@@ -663,8 +708,10 @@ def update(
 
 def joint_log_prob(
     units: torch.Tensor,
+    unit_quantities: torch.Tensor,
     market: torch.Tensor,
     unit_actions: torch.Tensor,
+    unit_quantity_actions: torch.Tensor,
     market_actions: torch.Tensor,
 ) -> torch.Tensor:
     """Return the log-probability of each whole turn, summed over its decisions.
@@ -681,19 +728,40 @@ def joint_log_prob(
     sides of the behaviour-cloning-to-PPO handover. The market head drops
     nothing, because none of its slots is padding.
 
+    **The quantity term is conditional on the op that was sampled beside it.**
+    Every unit gets a bucket, because the head emits one per slot, but the
+    engine reads ``action[2]`` only for ``PICKUP`` and ``PLACE``
+    (``TRANSFER_OPS``). A bucket that was never executed is not part of the
+    action the episode took, and scoring it puts a variable the environment
+    ignored into the importance ratio -- where it produces a gradient, changes
+    no reward, and raises nothing. The condition comes from the sampled *op*
+    via ``transfer_slots`` and never from the bucket's value: an unspent bucket
+    and a genuine transfer of one item are the same number.
+
     Args:
         units: ``(rows, MAX_UNITS, len(UNIT_OPS))`` masked log-probabilities.
+        unit_quantities: ``(rows, MAX_UNITS, len(QUANTITIES))`` likewise, from
+            the per-unit quantity head.
         market: ``(rows, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` likewise.
         unit_actions: ``(rows, MAX_UNITS)`` op indices, ``IGNORE`` where padded.
+        unit_quantity_actions: ``(rows, MAX_UNITS)`` bucket indices, one per
+            slot and never ``IGNORE``. Padding is stated once, on
+            ``unit_actions``, and a padded slot is not a transfer, so its
+            bucket drops out through the same condition the unspent ones do.
         market_actions: ``(rows, len(MARKET_SLOTS) + 2)`` bucket indices.
 
     Returns:
         ``(rows,)`` joint log-probabilities.
     """
     chosen = units.gather(2, unit_actions.clamp(min=0)[:, :, None]).squeeze(-1)
-    return chosen.masked_fill(unit_actions == IGNORE, 0.0).sum(dim=1) + market.gather(
-        2, market_actions[:, :, None]
-    ).squeeze(-1).sum(dim=1)
+    transferred = unit_quantities.gather(2, unit_quantity_actions[:, :, None]).squeeze(
+        -1
+    )
+    return (
+        chosen.masked_fill(unit_actions == IGNORE, 0.0).sum(dim=1)
+        + transferred.masked_fill(~transfer_slots(unit_actions), 0.0).sum(dim=1)
+        + market.gather(2, market_actions[:, :, None]).squeeze(-1).sum(dim=1)
+    )
 
 
 def entropy_of(log_probs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

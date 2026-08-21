@@ -37,6 +37,7 @@ import os
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from lightning import seed_everything
 
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
+from kaggriculture.learn.encoding import transfer_slots
 from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
@@ -70,6 +72,33 @@ from kaggriculture.learn.toad_reward import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Teacher:
+    """The frozen clone the KL pulls toward, and what its checkpoint carried.
+
+    The second field is the whole reason this is a pair rather than a bare
+    ``Policy``. Every ``Policy`` object has a ``quantity_head``, freshly
+    initialised if nothing loaded into it, so the network cannot be asked
+    whether it was ever taught one -- only the state dict it came from can
+    answer, and that answer is known exactly once, at load time, where
+    ``load_policy_weights`` reports the keys it did not find. Carrying the two
+    together makes the pairing impossible to get wrong downstream: there is no
+    way to hand ``_step`` a teacher without also telling it which heads that
+    teacher is entitled to constrain.
+
+    Attributes:
+        policy: The frozen network, in eval mode with gradients off.
+        quantity: Whether the checkpoint it was loaded from carried the
+            quantity head. False means the head is a random initialisation and
+            a KL toward it would be a pull toward noise, so the divergence
+            covers the op and market heads alone.
+    """
+
+    policy: Policy
+    quantity: bool
+
 
 SEED = 0
 # conv_phase1_shaped_reward.yaml:36. Four unrolls per learner batch, so one
@@ -120,8 +149,10 @@ OPPONENT = "src/kaggriculture/economic_policy.py"
 # is the whole ballgame.
 ACTED_FIELDS = (
     "unit_actions",
+    "unit_quantities",
     "market_actions",
     "unit_masks",
+    "unit_quantity_masks",
     "market_masks",
     "log_probs",
     "shaped",
@@ -596,7 +627,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
     )
 
 
-def _teacher(arguments: argparse.Namespace, device: str) -> Policy | None:
+def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     """Return the frozen clone the learner is held near, or None.
 
     The same weights the run initialises from. Toad never continues from a
@@ -607,23 +638,36 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Policy | None:
     Their phase 3+ uses a SMALLER teacher; ours is the same size. Declared
     deviation.
 
+    Which heads the KL may cover is decided here and nowhere else, from the
+    keys the checkpoint was missing. A checkpoint written before the quantity
+    head existed leaves that head at its random initialisation, and anchoring
+    the learner to random weights is worse than not anchoring it at all -- so
+    the answer travels with the network, in ``Teacher``, rather than being
+    re-guessed at the loss.
+
     Args:
         arguments: The parsed command line.
         device: Where to place the teacher.
 
     Returns:
-        The frozen policy, or None when the arm runs teacher-free.
+        The frozen policy paired with whether its checkpoint taught the
+        quantity head, or None when the arm runs teacher-free.
     """
     if not arguments.teacher:
         return None
-    teacher = Policy(
+    policy = Policy(
         blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
     ).to(device)
-    _warm_start(teacher, device)
-    teacher.eval()
-    teacher.requires_grad_(False)
-    LOGGER.info("teacher: frozen clone, kl_cost %.4f", arguments.teacher_kl_cost)
-    return teacher
+    missing = _warm_start(policy, device)
+    policy.eval()
+    policy.requires_grad_(False)
+    quantity = not any(key.startswith("quantity_head.") for key in missing)
+    LOGGER.info(
+        "teacher: frozen clone, kl_cost %.4f, quantity head %s",
+        arguments.teacher_kl_cost,
+        "taught" if quantity else "absent from the checkpoint, excluded from the KL",
+    )
+    return Teacher(policy=policy, quantity=quantity)
 
 
 def _prefix(arguments: argparse.Namespace) -> str:
@@ -678,7 +722,7 @@ def _field(arguments: argparse.Namespace) -> str:
     return REWARD_FIELD
 
 
-def _warm_start(learner: Policy, device: str) -> None:
+def _warm_start(learner: Policy, device: str) -> list[str]:
     """Load the BC clone into the trunk and every trained head.
 
     ``load_policy_weights`` does the loading; see it for what non-strict means
@@ -692,6 +736,11 @@ def _warm_start(learner: Policy, device: str) -> None:
         learner: The network to warm-start, modified in place.
         device: Where to map the checkpoint.
 
+    Returns:
+        The keys the checkpoint did not carry, which ``load_policy_weights``
+        confines to the quantity head. ``_teacher`` reads that list to decide
+        whether the KL may cover that head.
+
     Raises:
         ValueError: If the checkpoint is missing or renaming anything beyond
             the quantity head.
@@ -704,6 +753,7 @@ def _warm_start(learner: Policy, device: str) -> None:
     LOGGER.info(
         "warm started from %s; fresh heads (%s)", CHECKPOINT, ", ".join(missing)
     )
+    return missing
 
 
 def _decay(econ_fraction: float) -> Callable[[int], float]:
@@ -921,7 +971,7 @@ def _update(
     device: str,
     field: str,
     warmup_left: int = 0,
-    teacher: Policy | None = None,
+    teacher: Teacher | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
     value_passes: int = 0,
 ) -> tuple[dict[str, float], int]:
@@ -952,7 +1002,8 @@ def _update(
         device: Where to run the learner.
         field: Which recorded reward series the learner reads.
         warmup_left: Batches still owed to the value head alone.
-        teacher: The frozen clone to stay near, or None.
+        teacher: The frozen clone to stay near and what it was taught, or
+            None.
         teacher_kl_cost: Coefficient on that KL.
         value_passes: Extra value-only passes over the same round, after the
             policy has taken its one. Zero reproduces every earlier arm exactly.
@@ -1040,7 +1091,7 @@ def _step(
     device: str,
     field: str,
     baseline_only: bool = False,
-    teacher: Policy | None = None,
+    teacher: Teacher | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
@@ -1057,7 +1108,8 @@ def _step(
         field: Which recorded reward series the learner reads.
         baseline_only: Train the value head alone, excluding the policy gradient
             and entropy terms from the total.
-        teacher: The frozen clone to stay near, or None.
+        teacher: The frozen clone to stay near and what it was taught, or
+            None.
         teacher_kl_cost: Coefficient on that KL.
 
     Returns:
@@ -1071,8 +1123,10 @@ def _step(
     scalars = stacked("scalars")
     positions = stacked("positions")
     unit_actions = stacked("unit_actions")
+    unit_quantity_actions = stacked("unit_quantities")
     market_actions = stacked("market_actions")
     unit_masks = stacked("unit_masks")
+    unit_quantity_masks = stacked("unit_quantity_masks")
     market_masks = stacked("market_masks")
     behaviour = stacked("log_probs")
     rewards = stacked(field)
@@ -1084,41 +1138,59 @@ def _step(
     # is wanted -- no action was taken there -- so its logits are sliced off
     # immediately and its value becomes the bootstrap. monobeast.py:292-296 does
     # exactly this split.
-    # The quantity head is not trained here yet -- the teacher KL below covers
-    # the op and market heads only, same as this line.
-    unit_logits, _unit_quantity_logits, market_logits, values = learner(
+    unit_logits, quantity_logits, market_logits, values = learner(
         board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
     )
     values = values.view(turns + 1, width)
     bootstrap_value = values[-1].detach()
     values = values[:-1]
     unit_logits = _acted(unit_logits, turns, width)
+    quantity_logits = _acted(quantity_logits, turns, width)
     market_logits = _acted(market_logits, turns, width)
+    flat_unit_actions = unit_actions.flatten(0, 1)
     flat_unit_masks = unit_masks.flatten(0, 1)
+    flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
     flat_market_masks = market_masks.flatten(0, 1)
     units = torch.log_softmax(
         unit_logits.masked_fill(~flat_unit_masks, -torch.inf), dim=-1
     )
+    quantities = torch.log_softmax(
+        quantity_logits.masked_fill(~flat_quantity_masks, -torch.inf), dim=-1
+    )
     market = torch.log_softmax(
         market_logits.masked_fill(~flat_market_masks, -torch.inf), dim=-1
     )
+    # Which slots spent the bucket they drew. The same rule the rollout stored
+    # its behaviour log-probability under, so the ratio these two form is a
+    # ratio over one action rather than over two different ones.
+    transferred = transfer_slots(flat_unit_actions)
     learner_log_probs = joint_log_prob(
-        units, market, unit_actions.flatten(0, 1), market_actions.flatten(0, 1)
+        units,
+        quantities,
+        market,
+        flat_unit_actions,
+        unit_quantity_actions.flatten(0, 1),
+        market_actions.flatten(0, 1),
     ).view(turns, width)
     # `entropy_of` returns positive entropy; Toad's `combine_policy_entropy`
     # returns sum p*log p, which is its negation. Feeding the wrong sign trains
     # the policy to collapse onto one action, which looks like fast progress.
+    #
+    # The quantity head's entropy is zeroed on the slots that spent no bucket,
+    # the same condition its log-probability is under: an entropy bonus there
+    # would pay the head to spread mass over a decision the engine never read.
     negative_entropy = -(
         entropy_of(units, flat_unit_masks).sum(dim=-1)
+        + entropy_of(quantities, flat_quantity_masks)
+        .masked_fill(~transferred, 0.0)
+        .sum(dim=-1)
         + entropy_of(market, flat_market_masks).sum(dim=-1)
     ).view(turns, width)
 
     teacher_kl = None
     if teacher is not None:
         with torch.no_grad():
-            # Task 5 decides quantity-KL, once both the learner and the
-            # teacher carry the head; this KL stays op+market only for now.
-            teacher_units, _teacher_quantity, teacher_market, _ = teacher(
+            teacher_units, teacher_quantity, teacher_market, _ = teacher.policy(
                 board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
             )
         teacher_kl = _kl(
@@ -1126,6 +1198,19 @@ def _step(
         ).view(turns, width) + _kl(
             market, _acted(teacher_market, turns, width), flat_market_masks
         ).view(turns, width)
+        # The quantity head joins the anchor only if the teacher's checkpoint
+        # carried one; otherwise its head is a random initialisation and this
+        # would pull the learner toward noise. Unlike the log-probability, this
+        # term is not conditioned on the sampled op: a KL is a distance between
+        # distributions rather than a score for an action, and holding the head
+        # near the teacher on a slot that happened not to transfer is exactly
+        # the drift the anchor exists to prevent.
+        if teacher.quantity:
+            teacher_kl = teacher_kl + _kl(
+                quantities,
+                _acted(teacher_quantity, turns, width),
+                flat_quantity_masks,
+            ).view(turns, width)
 
     terms = losses(
         behaviour_log_probs=behaviour,

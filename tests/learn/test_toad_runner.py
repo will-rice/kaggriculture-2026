@@ -25,22 +25,41 @@ from kaggriculture.learn.scripts import toad_phase1
 from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE, TEACHER_KL_COST
 
 
-def _segment(turns: int = 16) -> dict[str, torch.Tensor]:
+def _segment(turns: int = 16, transfers: bool = True) -> dict[str, torch.Tensor]:
     """Return one synthetic unroll shaped exactly as ``_segments`` produces.
 
     The observed fields carry one row more than the acted ones. That extra state
     is the one the value target bootstraps from -- it is deliberately outside the
     segment's own decisions -- so a stand-in built at equal lengths would not be
     the shape the runner is handed. See ``toad_phase1._segments``.
+
+    ``transfers`` decides whether any unit played a ``PICKUP``. The quantity
+    head is scored only on the slots that did, so a fixture that never
+    transfers and a fixture that does are the two halves of that condition,
+    and the runner tests below need both to say anything about it.
+
+    Args:
+        turns: Acted rows in the unroll.
+        transfers: Whether unit 0 spends its quantity bucket on every turn.
+
+    Returns:
+        One segment, keyed exactly as ``_segments`` keys them.
     """
     slots = len(MARKET_SLOTS) + 2
+    unit_actions = torch.zeros(turns, MAX_UNITS, dtype=torch.int64)
+    if transfers:
+        unit_actions[:, 0] = UNIT_OPS.index("PICKUP:WHEAT")
     return {
         "board": torch.randn(turns + 1, TILE_PLANES, 10, 10),
         "scalars": torch.randn(turns + 1, SCALARS),
         "positions": torch.zeros(turns + 1, MAX_UNITS, dtype=torch.int64),
-        "unit_actions": torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
+        "unit_actions": unit_actions,
+        "unit_quantities": torch.full((turns, MAX_UNITS), QUANTITIES.index(3)),
         "market_actions": torch.zeros(turns, slots, dtype=torch.int64),
         "unit_masks": torch.ones(turns, MAX_UNITS, len(UNIT_OPS), dtype=torch.bool),
+        "unit_quantity_masks": torch.ones(
+            turns, MAX_UNITS, len(QUANTITIES), dtype=torch.bool
+        ),
         "market_masks": torch.ones(turns, slots, len(QUANTITIES), dtype=torch.bool),
         "log_probs": torch.full((turns,), -1.0),
         "shaped": torch.randn(turns) * 0.01,
@@ -73,6 +92,77 @@ def test_the_runner_takes_a_full_step_after_warmup() -> None:
         policy, optimizer, segments, "cpu", "shaped_money", baseline_only=False
     )
     assert full["total"] != full["baseline"]
+
+
+def _moved(policy: Policy, before: torch.Tensor) -> bool:
+    """Return whether the quantity head's weights changed."""
+    return not torch.equal(policy.quantity_head.weight, before)
+
+
+def test_the_runner_trains_the_quantity_head_only_where_a_transfer_acted() -> None:
+    """The head has to get a gradient, and only from the slots that spent a bucket.
+
+    Three cases, because two of them can each be passed by a different broken
+    runner. A ``_step`` that never scores the quantity head leaves the weights
+    where they were on the first case; one that scores it unconditionally moves
+    them on the second, where no unit played a ``PICKUP`` at all and the
+    engine would have read no count; and one that folds the head into the value
+    warmup moves them on the third, which is meant to be the critic alone.
+    """
+    policy, optimizer = _policy()
+    acted = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    quiet = [_segment(transfers=False) for _ in range(toad_phase1.BATCH_SEGMENTS)]
+
+    before = policy.quantity_head.weight.detach().clone()
+    toad_phase1._step(policy, optimizer, acted, "cpu", "shaped_money")
+    trained = _moved(policy, before)
+
+    policy, optimizer = _policy()
+    before = policy.quantity_head.weight.detach().clone()
+    toad_phase1._step(policy, optimizer, quiet, "cpu", "shaped_money")
+    scored_nothing = not _moved(policy, before)
+
+    policy, optimizer = _policy()
+    before = policy.quantity_head.weight.detach().clone()
+    toad_phase1._step(
+        policy, optimizer, acted, "cpu", "shaped_money", baseline_only=True
+    )
+    warmup_left_it = not _moved(policy, before)
+
+    assert trained
+    assert scored_nothing
+    assert warmup_left_it
+
+
+def test_the_teacher_kl_covers_the_quantity_head_only_if_the_teacher_has_one() -> None:
+    """A teacher whose checkpoint predates the head has a random one, not a taught one.
+
+    ``Policy`` always *carries* a quantity head, so the object cannot answer
+    this question -- only the state dict it was loaded from can, which is why
+    ``_teacher`` records the answer beside the network instead of leaving the
+    caller to guess. Pulling the learner toward an untrained head is not a
+    weaker regulariser than leaving it alone; it is a pull toward noise.
+
+    Measured on the KL term itself rather than on the total, so a run that
+    happened to have a small teacher cost could not hide the difference.
+    """
+    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    frozen = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND).eval()
+
+    covered, uncovered = (
+        toad_phase1._step(
+            *_policy(),
+            segments,
+            "cpu",
+            "shaped_money",
+            teacher=toad_phase1.Teacher(policy=frozen, quantity=carries),
+            teacher_kl_cost=1.0,
+        )["teacher"]
+        for carries in (True, False)
+    )
+
+    assert uncovered > 0.0
+    assert covered > uncovered
 
 
 def test_the_warmup_budget_is_counted_down_in_batches(
@@ -225,7 +315,7 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
         device: str,
         field: str,
         baseline_only: bool = False,
-        teacher: Policy | None = None,
+        teacher: toad_phase1.Teacher | None = None,
         teacher_kl_cost: float = TEACHER_KL_COST,
     ) -> dict[str, float]:
         seen.append(baseline_only)

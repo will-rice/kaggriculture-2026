@@ -629,35 +629,39 @@ UNIT_OPS: tuple[str, ...] = (
 # because both lists come from here.
 ITEM_VERBS = frozenset({"PLANT", "PICKUP", "PLACE"})
 
-# How much one PICKUP or one item-carrying PLACE moves.
+# Which vocabulary indices spend a quantity, one flag per `UNIT_OPS` entry.
 #
-# The engine reads it from `action[2]` and defaults to 1 when the action is two
-# elements long. It is emitted explicitly rather than left to that default: a
-# default is the engine's to change, and an arity-2 action would silently mean
-# something else if it did.
+# The engine reads `action[2]` for PICKUP and for PLACE and for nothing else --
+# `_apply_unit_action` clamps a PICKUP to what the shed holds and a shed-bound
+# PLACE to what the unit carries and the shed has room for, while every other
+# verb ignores a third element entirely. So this is the whole set of ops a
+# sampled quantity may reach, and it is derived from the vocabulary rather than
+# written out, because the two lists drifting apart is silent in both
+# directions: an op wrongly flagged puts a count on an action the engine reads
+# as something else, and an op wrongly unflagged drops a decision the policy
+# was scored on.
 #
-# One, rather than the corpus mode or the shed's whole stock, because one is the
-# unit every consumer of a carried item is denominated in -- FEED takes exactly
-# 1 WHEAT, FERTILIZE exactly 1 FERTILIZER, and PLACE puts exactly 1 animal on a
-# structure regardless of what `action[2]` says. Larger counts are trip
-# planning, not a different decision, and a unit standing on a shed-access tile
-# may PICKUP again on the very next turn, so n=1 composes upward to any quantity
-# while a fixed n>1 does not decompose down to 1.
+# The consumers materialise this as a lookup tensor indexed by the sampled op.
+# `transfer_slots` does that for the learning path; the simulator's collection
+# loop does it through `sim.tensors.tensor_constant` instead, because a CUDA
+# graph capture refuses the per-call host-to-device copy this one costs.
+TRANSFER_OPS: tuple[bool, ...] = tuple(
+    name.startswith(("PICKUP:", "PLACE:")) for name in UNIT_OPS
+)
+
+# The largest transfer the quantity head may ask for.
 #
-# Measured across all seven archives (three episodes each, 11,721 PICKUPs), no
-# single count fits: the mode is item-dependent -- WHEAT 2 (78%), FERTILIZER 3
-# (59%), COW 1 (80%), SHEEP 1 (72%), GOOSE 1 (61%) -- so any fixed n>1 is wrong
-# for the animals, which are the case that matters, since PLACE consumes one and
-# a second cow in hand is a cow neither in the shed nor on a pasture. Taking the
-# available stock instead is refuted by the same sample: 10,660 of 11,721
-# PICKUPs took strictly less than the shed held, and the shed is the only place
-# SELL draws from, so emptying it to a unit's hands forfeits the sale.
-#
-# What this costs is trips: loading three wheat for three animals is three turns
-# rather than one. If a rollout ever measures that as material, the fix is a
-# per-unit quantity head gathered off the same trunk column the op head reads --
-# not a bigger constant.
-TRANSFER_QUANTITY = 1
+# Not a legality bound -- the engine clamps whatever it is given, so nothing
+# here can be *illegal* -- but a sampling range. `QUANTITIES` is exact up to 12
+# and coarse above it (16, 24, 40, 64, ...), and those tail buckets exist for
+# market orders, where a single SELL really does move eighty sacks. A unit's
+# hands are not that: measured across all seven archives (three episodes each,
+# 11,721 PICKUPs), 10,660 took strictly less than the shed held and the
+# item-dependent modes are 1 to 3 -- WHEAT 2 (78%), FERTILIZER 3 (59%), COW 1
+# (80%). Twelve is the top of the exact range and is already four times the
+# largest mode, so every bucket above it would be probability mass spent on a
+# request the engine would clamp back down.
+MAX_TRANSFER = 12
 
 # torch's cross entropy ignores this index, so padded units contribute no loss.
 IGNORE = -100
@@ -792,12 +796,25 @@ def _label(op: list[Any]) -> int:
     """Return the vocabulary index for one unit's recorded op.
 
     A recorded ``PICKUP`` or ``PLACE`` may carry a quantity as well as an item,
-    and the quantity is dropped: ``["PICKUP", "WHEAT", 2]`` and
-    ``["PICKUP", "WHEAT", 1]`` are the same label, because the vocabulary has no
-    slot for a count and ``_op`` emits ``TRANSFER_QUANTITY`` for both. That is
-    lossy on purpose and is the whole content of the ``TRANSFER_QUANTITY``
-    argument; it is not lossy about *which* item, which is what makes the op
-    land at all.
+    and this label drops it: ``["PICKUP", "WHEAT", 2]`` and
+    ``["PICKUP", "WHEAT", 1]`` are the same op index, because the op vocabulary
+    has no slot for a count. It is not lossy about *which* item, which is what
+    makes the op land at all.
+
+    **The count is no longer lost on the way back out.** It used to be: ``_op``
+    emitted a hard-coded 1 for every transfer, so a policy could pick up one
+    wheat per turn and no more, and loading three wheat for three animals cost
+    three turns instead of one. That constant existed because no head predicted
+    a count and a fixed n>1 fits nothing -- the corpus modes are item-dependent
+    (WHEAT 2, FERTILIZER 3, COW 1) and 10,660 of 11,721 recorded PICKUPs took
+    strictly less than the shed held. The per-unit quantity head replaces it:
+    ``decode_units`` reads a bucket per unit off the same trunk column the op
+    comes from and ``_op`` emits that.
+
+    What remains lossy is this direction alone, and only because the
+    behaviour-cloning target is an op label: the quantity head is trained by
+    the RL loop, which scores the bucket it sampled, and never by a corpus
+    count.
 
     Args:
         op: One unit's op, e.g. ``["WATER"]``, ``["PLANT", "MELON"]`` or
@@ -812,7 +829,11 @@ def _label(op: list[Any]) -> int:
 
 
 def decode_units(
-    logits: torch.Tensor, units: int, mask: torch.Tensor
+    logits: torch.Tensor,
+    quantity_logits: torch.Tensor,
+    units: int,
+    mask: torch.Tensor,
+    quantity_mask: torch.Tensor,
 ) -> dict[str, Any]:
     """Return the action dict implied by per-unit logits, under the legality mask.
 
@@ -835,14 +856,25 @@ def decode_units(
     ``rollout`` samples -- so the same observation and the same weights always
     produce the same turn.
 
+    The quantity is selected the same way, from its own head and under its own
+    mask, and is spent only where the chosen op is a transfer. Every unit gets
+    a bucket -- the head emits one per slot, transfer or not -- and ``_op``
+    discards the ones no verb can read, so a ``WATER`` stays arity 1 however
+    the quantity head scored that unit.
+
     Args:
         logits: A ``(1, MAX_UNITS, len(UNIT_OPS))`` tensor.
+        quantity_logits: A ``(1, MAX_UNITS, len(QUANTITIES))`` tensor, the
+            per-unit quantity head.
         units: How many units are actually on the board this turn.
         mask: A ``(1, MAX_UNITS, len(UNIT_OPS))`` bool tensor from
             ``learn.mask.unit_mask``, True where the engine would act on the
             op. No row may be entirely False, which ``unit_mask`` guarantees by
             keeping ``PASS`` alive on every slot -- an all-``-inf`` row has no
             meaningful ``argmax``.
+        quantity_mask: A ``(1, MAX_UNITS, len(QUANTITIES))`` bool tensor from
+            ``learn.mask.unit_quantity_mask``, under the same no-empty-row
+            rule.
 
     Returns:
         An action dict with ``farmer``, ``hands`` and an empty ``market``
@@ -854,24 +886,67 @@ def decode_units(
     if units > MAX_UNITS:
         raise TooManyUnitsError(f"{units} units exceeds MAX_UNITS={MAX_UNITS}")
     legal = logits[0, :units].masked_fill(~mask[0, :units], -torch.inf)
-    ops = [_op(int(index)) for index in legal.argmax(dim=-1)]
+    legal_quantity = quantity_logits[0, :units].masked_fill(
+        ~quantity_mask[0, :units], -torch.inf
+    )
+    ops = [
+        _op(int(label), quantity_of(int(bucket)))
+        for label, bucket in zip(
+            legal.argmax(dim=-1), legal_quantity.argmax(dim=-1), strict=True
+        )
+    ]
     return {"farmer": ops[0], "hands": ops[1:], "market": []}
 
 
-def _op(label: int) -> list[Any]:
-    """Return the op list for one vocabulary index.
+def _op(label: int, quantity: int) -> list[Any]:
+    """Return the op list for one vocabulary index and one sampled quantity.
 
     ``PLANT`` is emitted at arity 2 because ``_apply_unit_action`` never reads
-    ``action[2]`` for it -- a crop is planted one tile at a time. ``PICKUP`` and
-    ``PLACE`` are emitted at arity 3 carrying ``TRANSFER_QUANTITY``, which the
-    engine reads.
+    ``action[2]`` for it -- a crop is planted one tile at a time. ``PICKUP``
+    and ``PLACE`` are emitted at arity 3 carrying ``quantity``, the only two
+    verbs whose ``action[2]`` the engine reads (``TRANSFER_OPS``).
+
+    The quantity is emitted explicitly rather than left to the engine's own
+    two-element default of 1: a default is the engine's to change, and an
+    arity-2 action would silently mean something else if it did.
+
+    Args:
+        label: An index into ``UNIT_OPS``.
+        quantity: The count a transfer asks for, from ``quantity_of`` on the
+            sampled bucket. Ignored for every other verb.
+
+    Returns:
+        The op list, at the arity that verb's engine branch reads.
     """
     verb, _, item = UNIT_OPS[label].partition(":")
     if not item:
         return [verb]
     if verb == "PLANT":
         return [verb, item]
-    return [verb, item, TRANSFER_QUANTITY]
+    return [verb, item, quantity]
+
+
+def transfer_slots(op_indices: torch.Tensor) -> torch.Tensor:
+    """Return which sampled op slots hold a ``PICKUP`` or a ``PLACE``.
+
+    The one place the learning path turns sampled op *indices* into the
+    question "did this unit spend a quantity". It is a lookup into
+    ``TRANSFER_OPS`` and not a comparison against the value the quantity head
+    produced: a bucket of 1 is a real transfer of one item and an unspent
+    bucket is also 1, and telling them apart by the number would put a
+    never-executed decision into the importance ratio.
+
+    ``IGNORE`` clamps to 0, which is ``PASS`` and therefore not a transfer, so
+    a padded slot answers False without the caller masking it first.
+
+    Args:
+        op_indices: Any-shaped int64 op indices, possibly ``IGNORE``.
+
+    Returns:
+        A bool tensor of the same shape, True where the op reads a quantity.
+    """
+    table = torch.tensor(TRANSFER_OPS, dtype=torch.bool, device=op_indices.device)
+    return table[op_indices.clamp(min=0)]
 
 
 # Every (verb, item) pair the engine's `_process_market` will actually act on.

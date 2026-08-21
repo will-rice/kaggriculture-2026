@@ -35,6 +35,7 @@ from kaggriculture.learn.encoding import (
     LAND_SLOT,
     MARKET_SLOTS,
     MAX_ORDERS,
+    MAX_TRANSFER,
     MAX_UNITS,
     QUANTITIES,
     UNIT_OPS,
@@ -42,7 +43,7 @@ from kaggriculture.learn.encoding import (
     quantity_of,
     unit_count,
 )
-from kaggriculture.learn.mask import market_mask, unit_mask
+from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.observation import Tile
 
 
@@ -188,6 +189,60 @@ def test_no_row_of_either_mask_is_entirely_forbidden() -> None:
 
     assert unit_mask(observation, 0).any(dim=-1).all()
     assert market_mask(observation, 0).any(dim=-1).all()
+
+
+def test_a_live_unit_may_ask_for_one_to_twelve_items() -> None:
+    """The sampling range, read off the bucket *values* rather than their indices.
+
+    ``MAX_TRANSFER`` is a quantity, not a position in ``QUANTITIES``, and the
+    two coincide only while the first thirteen buckets are exact. Asserting on
+    the values is what makes this survive another widening of the tail.
+
+    Bucket 0 is excluded because a transfer of nothing is a turn spent on a
+    no-op, and everything above twelve is excluded because the tail buckets are
+    market-sized (16, 24, 40, ...) and the engine would clamp them straight
+    back down to what the shed holds.
+    """
+    observation = empty_observation()
+
+    mask = unit_quantity_mask(observation, 0)
+    live = {
+        quantity_of(bucket)
+        for bucket in range(len(QUANTITIES))
+        if bool(mask[0, 0, bucket])
+    }
+
+    assert live == set(range(1, MAX_TRANSFER + 1))
+
+
+def test_a_padded_slot_keeps_exactly_the_single_item_bucket() -> None:
+    """One legal bucket, not zero and not thirteen.
+
+    Zero is the bug this is here for: an all-False row becomes all ``-inf``,
+    softmaxes to NaN, and ``multinomial`` then draws from nothing -- and the
+    first symptom is a loss that went to NaN on a day nobody touched the loss.
+    Thirteen would be almost as bad in the other direction: the padded slots
+    outnumber the real ones on most turns, so a free distribution there is
+    entropy the head is rewarded for spreading over units that do not exist.
+    """
+    observation = empty_observation()
+    units = unit_count(observation, 0)
+
+    mask = unit_quantity_mask(observation, 0)
+    padded = mask[0, units:]
+
+    assert padded.any(dim=-1).all()
+    assert padded.sum() == padded.shape[0]
+    assert padded[:, QUANTITIES.index(1)].all()
+
+
+def test_the_quantity_mask_has_the_shape_of_the_head_it_gates() -> None:
+    """It is masked_fill-ed against the quantity logits, so a drift misgates."""
+    mask = unit_quantity_mask(empty_observation(), 0)
+
+    assert mask.shape == (1, MAX_UNITS, len(QUANTITIES))
+    assert mask.dtype == torch.bool
+    assert mask.any(dim=-1).all()
 
 
 def test_a_slot_with_no_unit_in_it_may_only_pass() -> None:
@@ -730,11 +785,17 @@ def _decoded_op(unit: int, op_index: int, units: int) -> list[Any]:
     """Return the op list the policy would actually emit for one (unit, op) pair.
 
     Routed through ``decode_units`` rather than rebuilt from ``UNIT_OPS`` so the
-    probe measures what the rollout emits -- ``TRANSFER_QUANTITY`` and all --
+    probe measures what the rollout emits -- the transfer count and all --
     instead of a more generous op the decoder cannot produce. That distinction
     is what made this probe agree with a mask that forbade ``PICKUP`` outright
     while the vocabulary carried no item: the decoder really could not express
     a landable one.
+
+    The transfer count is pinned to one here, which is the *smallest* thing a
+    ``PICKUP`` can ask for and therefore the one the engine is likeliest to
+    accept. This probe measures op legality; a larger count would let a
+    strict-looking disagreement mean "the shed held fewer than the probe asked
+    for" instead of "the mask was wrong about the op".
 
     The mask handed to ``decode_units`` is all-True on purpose, and this is the
     one place in the project that should hand it one. The probe exists to ask
@@ -746,7 +807,15 @@ def _decoded_op(unit: int, op_index: int, units: int) -> list[Any]:
     logits = torch.zeros(1, MAX_UNITS, len(UNIT_OPS))
     logits[0, :, UNIT_OPS.index("PASS")] = 1.0
     logits[0, unit, op_index] = 2.0
-    action = decode_units(logits, units, torch.ones_like(logits, dtype=torch.bool))
+    quantities = torch.zeros(1, MAX_UNITS, len(QUANTITIES))
+    quantities[0, :, QUANTITIES.index(1)] = 1.0
+    action = decode_units(
+        logits,
+        quantities,
+        units,
+        torch.ones_like(logits, dtype=torch.bool),
+        torch.ones_like(quantities, dtype=torch.bool),
+    )
     return [action["farmer"], *action["hands"]][unit]
 
 

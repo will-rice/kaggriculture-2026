@@ -38,7 +38,7 @@ from kaggriculture.learn.encoding import (
     encode_scalars,
     unit_count,
 )
-from kaggriculture.learn.mask import market_mask, unit_mask
+from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.learn.model import Policy, load_policy_weights
 
 # The sandbox has two cores. Timing at 64 flatters it by an order of magnitude,
@@ -89,14 +89,16 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     -- the observation, not the action, is what the engine walks -- so the
     decoded action names exactly the units standing on the farm.
 
-    Both heads are decoded. Decoding only the first is not a smaller version of
+    Every head is decoded. Decoding only the first is not a smaller version of
     this agent, it is a different one that cannot score: the engine increases a
     farm's money in exactly one place, crediting a completed ``SELL``, so an
     action with an empty market list banks the opening 3,000 and nothing more,
     whatever the unit head predicts. That was measured over 400 episodes before
-    the market head existed.
+    the market head existed. The quantity head is the same argument one lane
+    over: without it every ``PICKUP`` moves a single item, and a unit feeding
+    three animals spends three turns walking to the shed and back.
 
-    **Both heads are decoded under the same legality masks the policy was
+    **Every head is decoded under the same legality masks the policy was
     trained and gated under.** This path used to argmax the raw logits, which
     made the deployed agent a different agent than the measured one: it chose
     by a rule the training distribution never used, and it could name ops the
@@ -121,15 +123,17 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
     """
     seat = int(raw_obs["player"])
     with torch.no_grad():
-        # The quantity head is not decoded from yet -- PICKUP/PLACE still
-        # carry no explicit quantity, as before this head existed.
-        unit_logits, _unit_quantity_logits, market_logits, _value = model()(
+        unit_logits, quantity_logits, market_logits, _value = model()(
             encode_board(raw_obs, seat),
             encode_scalars(raw_obs, seat),
             encode_positions(raw_obs, seat),
         )
     action = decode_units(
-        unit_logits, unit_count(raw_obs, seat), unit_mask(raw_obs, seat)
+        unit_logits,
+        quantity_logits,
+        unit_count(raw_obs, seat),
+        unit_mask(raw_obs, seat),
+        unit_quantity_mask(raw_obs, seat),
     )
     action["market"] = decode_market(market_logits, market_mask(raw_obs, seat))
     return action

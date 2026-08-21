@@ -4,7 +4,7 @@
 import torch
 from kaggle_environments import make
 
-from kaggriculture.learn.mask import market_mask, unit_mask
+from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.state import pack
 
@@ -18,10 +18,13 @@ def test_legal_matches_reference_masks_for_both_seats_and_a_batch() -> None:
     state = pack(environments)
 
     for seat in range(2):
-        units, market = legal(state, seat)
+        units, quantities, market = legal(state, seat)
         for batch, environment in enumerate(environments):
             observation = environment.state[seat].observation
             assert torch.equal(units[batch : batch + 1], unit_mask(observation, seat))
+            assert torch.equal(
+                quantities[batch : batch + 1], unit_quantity_mask(observation, seat)
+            )
             assert torch.equal(
                 market[batch : batch + 1], market_mask(observation, seat)
             )
@@ -66,7 +69,10 @@ def test_legal_matches_reference_on_plant_animal_shed_and_market_branches() -> N
     farm.money = 4_321.0
     state = pack([environment])
 
-    units, market = legal(state, 0)
+    units, quantities, market = legal(state, 0)
 
     assert torch.equal(units, unit_mask(observation, 0))
+    # The crew here is three, so the quantity mask has both kinds of row in it
+    # and a mirror that got the live range or the dead one wrong fails.
+    assert torch.equal(quantities, unit_quantity_mask(observation, 0))
     assert torch.equal(market, market_mask(observation, 0))

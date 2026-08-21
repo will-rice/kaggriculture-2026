@@ -69,8 +69,12 @@ def _episode(turns: int = TURNS) -> Trajectory:
         scalars=scalars,
         positions=torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
         unit_actions=torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
+        unit_quantities=torch.ones(turns, MAX_UNITS, dtype=torch.int64),
         market_actions=torch.zeros(turns, SLOTS, dtype=torch.int64),
         unit_masks=torch.ones(turns, MAX_UNITS, len(UNIT_OPS), dtype=torch.bool),
+        unit_quantity_masks=torch.ones(
+            turns, MAX_UNITS, len(QUANTITIES), dtype=torch.bool
+        ),
         market_masks=torch.ones(turns, SLOTS, len(QUANTITIES), dtype=torch.bool),
         log_probs=torch.zeros(turns),
         values=torch.zeros(turns),

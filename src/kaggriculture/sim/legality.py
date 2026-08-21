@@ -14,6 +14,7 @@ from kaggriculture.learn.encoding import (
     LAND_SLOT,
     MARKET_SLOTS,
     MAX_ORDERS,
+    MAX_TRANSFER,
     MAX_UNITS,
     QUANTITIES,
     UNIT_OPS,
@@ -174,8 +175,55 @@ def _market_mask(state: SimState, seat: int) -> torch.Tensor:
     return mask
 
 
-def legal(state: SimState, seat: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return direct unit and market legality masks for one seat."""
+def _quantity_mask(state: SimState, seat: int) -> torch.Tensor:
+    """Return which quantity bucket each unit may ask a transfer for.
+
+    The tensor mirror of ``learn.mask.unit_quantity_mask``, and it carries that
+    function's caveat: the engine clamps an oversize transfer instead of
+    refusing it, so nothing here is illegal in the sense the other two masks
+    mean it. What this bounds is the range over which a bucket is a distinct
+    decision -- one to ``MAX_TRANSFER``, the exact end of ``QUANTITIES`` --
+    with bucket 0 excluded because a transfer of nothing is a turn spent on a
+    no-op.
+
+    A dead slot keeps the single-item bucket alone, the same trick the unit
+    mask plays with ``PASS``: an all-False row becomes all ``-inf`` and
+    ``multinomial`` then draws from a row of NaN.
+
+    Both rows are ``tensor_constant`` lookups rather than freshly built
+    tensors, because this runs inside the collection loop that
+    ``collect_segment`` captures as a CUDA graph and a host-to-device copy
+    there aborts the capture.
+
+    Args:
+        state: The batch to mask.
+        seat: Which seat's units to mask.
+
+    Returns:
+        A ``(batch, MAX_UNITS, len(QUANTITIES))`` bool tensor.
+    """
+    device = state.step.device
+    live = tensor_constant(
+        tuple(1 <= quantity <= MAX_TRANSFER for quantity in QUANTITIES),
+        dtype=torch.bool,
+        device=device,
+    )
+    dead = tensor_constant(
+        tuple(quantity == 1 for quantity in QUANTITIES),
+        dtype=torch.bool,
+        device=device,
+    )
+    return torch.where(state.alive[:, seat][..., None], live, dead)
+
+
+def legal(
+    state: SimState, seat: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return direct unit, quantity and market masks for one seat."""
     if seat not in (0, 1):
         raise ValueError(f"seat must be 0 or 1, got {seat}")
-    return _unit_mask(state, seat), _market_mask(state, seat)
+    return (
+        _unit_mask(state, seat),
+        _quantity_mask(state, seat),
+        _market_mask(state, seat),
+    )

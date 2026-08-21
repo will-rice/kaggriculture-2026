@@ -40,12 +40,17 @@ opponent's is hidden, so a mask can only ever be computed for our own seat and
 ``private`` is never indexed by seat. The shed, the seeds and the per-unit
 inventories are all read straight off it.
 
-Both masks are returned at the shape of the logits they gate, batch dimension
+Every mask is returned at the shape of the logits it gates, batch dimension
 included, so a rollout can set the masked positions to ``-inf`` before the
-softmax without reshaping anything. No row of either mask is ever entirely
+softmax without reshaping anything. No row of any mask is ever entirely
 False: an all-``-inf`` row softmaxes to NaN, so the padded unit slots keep
-``PASS`` and every market slot keeps bucket 0, "trade nothing", which the
-engine always permits because it emits no order at all.
+``PASS``, every market slot keeps bucket 0, "trade nothing", which the
+engine always permits because it emits no order at all, and every padded
+quantity row keeps the single-item bucket.
+
+``unit_quantity_mask`` is the odd one out and says so in its own docstring: the
+engine clamps an oversize transfer rather than refusing it, so that mask is
+about which counts are distinct decisions, not about which the engine accepts.
 
 What this cannot express is the handful of constraints that couple slots
 together, because the heads sample each slot independently:
@@ -85,6 +90,7 @@ from kaggriculture.learn.encoding import (
     LAND_SLOT,
     MARKET_SLOTS,
     MAX_ORDERS,
+    MAX_TRANSFER,
     MAX_UNITS,
     QUANTITIES,
     SHED_NAMES,
@@ -207,7 +213,9 @@ def _legal_ops(
             # to drop.
             legal.add("DROP")
         # PICKUP moves `min(n, shed[item])` and returns when that is zero, so
-        # one item in the shed is the whole guard at TRANSFER_QUANTITY of 1.
+        # one item in the shed is the whole guard whatever quantity the head
+        # asks for: the engine clamps down to what is there, and only an empty
+        # shelf makes the op itself a no-op.
         legal.update(
             f"PICKUP:{item}" for item in SHED_NAMES if private["shed"][item] > 0
         )
@@ -332,6 +340,59 @@ def _animal_ops(tile: Tile, inventory: Mapping[str, int]) -> set[str]:
     if tile["yield_units"] > 0:
         legal.add("HARVEST")
     return legal
+
+
+def unit_quantity_mask(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
+    """Return which quantity bucket each of ``seat``'s units may ask a transfer for.
+
+    **This one is not a legality mask, and the difference matters.** The engine
+    is the authority on what a transfer moves and it never refuses an oversize
+    request: ``_apply_unit_action`` takes ``min(n, shed[item])`` for a
+    ``PICKUP`` and clamps a shed-bound ``PLACE`` twice, to what the unit
+    carries and then to the shed's remaining room. So no bucket here is
+    *illegal* in the sense ``unit_mask`` and ``market_mask`` mean it -- there
+    is no over-permissive failure to count against the engine, because the
+    engine silently agrees with everything.
+
+    What this mask does is keep the head's probability mass in the range where
+    a bucket is a distinct decision. ``QUANTITIES`` is exact to 12 and coarse
+    above it, and the coarse part exists for market orders; a unit's hands are
+    not market-sized (see ``MAX_TRANSFER``). Everything above twelve would be
+    a request the engine clamps straight back to what the shed holds, which
+    makes those buckets spellings of each other rather than choices. Bucket 0
+    is excluded for the opposite reason: a transfer of nothing is a unit's
+    whole turn spent on a no-op, and ``PASS`` already says that.
+
+    A padded slot keeps the single-item bucket alone, the same trick
+    ``unit_mask`` plays with ``PASS``: an all-False row becomes all ``-inf``
+    and softmaxes to NaN, and one legal option is a well-defined distribution
+    whose log-probability the update can ignore. The slot is never decoded --
+    ``decode_units`` reads only the first ``unit_count`` -- and never scored:
+    its op is ``IGNORE``, which is not a transfer.
+
+    Args:
+        observation: One turn's observation, whose ``private`` mapping is
+            ``seat``'s own.
+        seat: Which player's units to mask.
+
+    Returns:
+        A ``(1, MAX_UNITS, len(QUANTITIES))`` bool tensor.
+
+    Raises:
+        TooManyUnitsError: If the crew exceeds ``MAX_UNITS``.
+    """
+    units = unit_count(observation, seat)
+    if units > MAX_UNITS:
+        raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
+    mask = torch.zeros(1, MAX_UNITS, len(QUANTITIES), dtype=torch.bool)
+    # Built from the bucket *values*, not from their positions: the two agree
+    # only while the first thirteen buckets are exact, and `QUANTITIES` has
+    # already been widened once under this code.
+    mask[0, :units] = torch.tensor(
+        [1 <= quantity <= MAX_TRANSFER for quantity in QUANTITIES], dtype=torch.bool
+    )
+    mask[0, units:, QUANTITIES.index(1)] = True
+    return mask
 
 
 def market_mask(observation: Mapping[str, Any], seat: int) -> torch.Tensor:

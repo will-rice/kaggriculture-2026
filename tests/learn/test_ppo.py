@@ -435,15 +435,95 @@ def test_a_padded_slot_survives_a_mask_that_forbids_its_clamped_option() -> None
     mask = torch.ones(1, 2, len(UNIT_OPS), dtype=torch.bool)
     mask[0, 1, 0] = False
     units = torch.log_softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
+    # The quantity head is given the same treatment on the same slot: its
+    # padded row forbids the bucket the stored action names, so a term that
+    # multiplied through a float mask instead of filling would meet
+    # ``0 * -inf`` here as well.
+    quantity_logits = torch.randn(1, 2, len(QUANTITIES), requires_grad=True)
+    quantity_mask = torch.ones(1, 2, len(QUANTITIES), dtype=torch.bool)
+    quantity_mask[0, 1, 0] = False
+    quantities = torch.log_softmax(
+        quantity_logits.masked_fill(~quantity_mask, -torch.inf), dim=-1
+    )
     market = torch.log_softmax(torch.zeros(1, 1, len(QUANTITIES)), dim=-1)
 
     joint = joint_log_prob(
-        units, market, torch.tensor([[0, IGNORE]]), torch.tensor([[0]])
+        units,
+        quantities,
+        market,
+        torch.tensor([[0, IGNORE]]),
+        torch.tensor([[0, 0]]),
+        torch.tensor([[0]]),
     )
-    gradient = torch.autograd.grad(joint.sum(), logits)[0]
+    gradient = torch.autograd.grad(joint.sum(), [logits, quantity_logits])
+    gradient = torch.cat([part.flatten() for part in gradient])
 
     assert torch.isfinite(joint).all()
     assert torch.isfinite(gradient).all()
+
+
+def test_the_quantity_term_counts_only_the_units_that_transferred() -> None:
+    """One turn, one transferring unit and one that did not -- both scored at once.
+
+    The quantity head emits a bucket for every unit whether or not the op that
+    unit played can spend one, and the engine reads ``action[2]`` for
+    ``PICKUP`` and ``PLACE`` alone. A bucket the engine never read is not part
+    of the action the episode took, so putting it in the joint log-probability
+    puts it in PPO's importance ratio, and the gradient then chases a variable
+    the environment ignored. Nothing raises when that happens: the ratio stays
+    finite, the loss stays finite, and the run simply learns slightly wrong for
+    as long as it lasts.
+
+    Both kinds of unit are in the *same* turn on purpose. A fixture with only
+    transfers would pass whether the condition were there or not, and one with
+    only non-transfers would pass on an implementation that never added the
+    term at all; this one fails for either.
+    """
+    torch.manual_seed(11)
+    slots = 1
+    unit_logits = torch.randn(1, 2, len(UNIT_OPS))
+    quantity_logits = torch.randn(1, 2, len(QUANTITIES))
+    market_logits = torch.randn(1, slots, len(QUANTITIES))
+    units = torch.log_softmax(unit_logits, dim=-1)
+    quantities = torch.log_softmax(quantity_logits, dim=-1)
+    market = torch.log_softmax(market_logits, dim=-1)
+
+    pickup = UNIT_OPS.index("PICKUP:WHEAT")
+    water = UNIT_OPS.index("WATER")
+    # Different buckets per unit, so a term taken from the wrong slot is
+    # visible rather than cancelling.
+    quantity_actions = torch.tensor([[5, 7]])
+    market_actions = torch.tensor([[3]])
+
+    mixed = joint_log_prob(
+        units,
+        quantities,
+        market,
+        torch.tensor([[pickup, water]]),
+        quantity_actions,
+        market_actions,
+    )
+    quiet = joint_log_prob(
+        units,
+        quantities,
+        market,
+        torch.tensor([[water, water]]),
+        quantity_actions,
+        market_actions,
+    )
+
+    order = float(market[0, 0, 3])
+    assert float(quiet) == pytest.approx(
+        float(units[0, 0, water] + units[0, 1, water]) + order, abs=1e-6
+    )
+    assert float(mixed) == pytest.approx(
+        float(units[0, 0, pickup] + units[0, 1, water] + quantities[0, 0, 5]) + order,
+        abs=1e-6,
+    )
+    # The term the two assertions differ by is large enough that dropping the
+    # condition cannot pass the first one by rounding.
+    assert abs(float(quantities[0, 0, 5])) > 0.1
+    assert abs(float(quantities[0, 1, 7])) > 0.1
 
 
 def test_gae_never_runs_across_an_episode_boundary() -> None:
@@ -551,16 +631,23 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
     scalars = torch.randn(turns, SCALARS)
     positions = torch.randint(0, BOARD * BOARD, (turns, MAX_UNITS))
     unit_masks = _mask(turns, MAX_UNITS, len(UNIT_OPS))
+    unit_quantity_masks = _mask(turns, MAX_UNITS, len(QUANTITIES))
     market_masks = _mask(turns, len(MARKET_SLOTS) + 2, len(QUANTITIES))
 
     with torch.no_grad():
-        unit_logits, _quantity_logits, market_logits, values = policy(
+        unit_logits, quantity_logits, market_logits, values = policy(
             board, scalars, positions
         )
     units = torch.log_softmax(unit_logits.masked_fill(~unit_masks, -torch.inf), dim=-1)
+    quantities = torch.log_softmax(
+        quantity_logits.masked_fill(~unit_quantity_masks, -torch.inf), dim=-1
+    )
     market = torch.log_softmax(
         market_logits.masked_fill(~market_masks, -torch.inf), dim=-1
     )
+    # The crew's ops are drawn from the whole vocabulary, so a synthetic
+    # episode holds both transfers and non-transfers and the conditional
+    # quantity term has both cases to be wrong about.
     unit_actions = torch.cat(
         [
             _draw(unit_masks[:, :CREW]),
@@ -568,6 +655,7 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         ],
         dim=1,
     )
+    unit_quantities = _draw(unit_quantity_masks)
     market_actions = _draw(market_masks)
 
     dones = torch.zeros(turns, dtype=torch.bool)
@@ -588,10 +676,19 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         scalars=scalars,
         positions=positions,
         unit_actions=unit_actions,
+        unit_quantities=unit_quantities,
         market_actions=market_actions,
         unit_masks=unit_masks,
+        unit_quantity_masks=unit_quantity_masks,
         market_masks=market_masks,
-        log_probs=joint_log_prob(units, market, unit_actions, market_actions),
+        log_probs=joint_log_prob(
+            units,
+            quantities,
+            market,
+            unit_actions,
+            unit_quantities,
+            market_actions,
+        ),
         values=values,
         rewards=rewards,
         own=own,

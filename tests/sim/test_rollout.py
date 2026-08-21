@@ -8,7 +8,13 @@ import torch
 from kaggle_environments import make
 
 from kaggriculture import economic_policy
-from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, UNIT_OPS
+from kaggriculture.learn.encoding import (
+    IGNORE,
+    MARKET_SLOTS,
+    MAX_TRANSFER,
+    QUANTITIES,
+    UNIT_OPS,
+)
 from kaggriculture.learn.progress import potential as reference_potential
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.engine import reset, step, unit_quantity_ones
@@ -386,3 +392,78 @@ def test_unit_index_folds_an_unparseable_pickup_quantity_to_pass() -> None:
 
     assert encoded.units[0] == UNIT_OPS.index("PASS")
     assert encoded.quantities[0] == 1
+
+
+class _BulkPickupPolicy(_UniformPolicy):
+    """A policy that picks up wheat three at a time and trades nothing.
+
+    The market is pinned to bucket 0 rather than left uniform: with wheat in
+    the shed a uniform market head sells some of it on the same turn, and the
+    shed count this fixture reads would then be measuring two lanes at once.
+    """
+
+    def forward(self, board, scalars, positions):
+        units, quantities, markets, values = super().forward(board, scalars, positions)
+        units[:, :, UNIT_OPS.index("PICKUP:WHEAT")] = 100
+        quantities[:, :, QUANTITIES.index(3)] = 100
+        markets[:, :, 0] = 100
+        return units, quantities, markets, values
+
+
+def test_collect_segment_records_a_quantity_for_every_unit_slot() -> None:
+    """The lane is sampled on-device, per unit, and stored beside the op.
+
+    Two properties, and the second is what a shape assertion would miss. The
+    buckets recorded for the units that exist have to land inside the range
+    ``legality.quantity_mask`` permits -- one to twelve, the exact end of
+    ``QUANTITIES`` -- and they have to *vary*, because a collector that quietly
+    kept handing the engine ``unit_quantity_ones`` records a legal-looking
+    column of ones and passes every range check ever written against it.
+
+    The dead slots are checked in the other direction: their row of the mask
+    holds the single-item bucket alone, so anything else there means the mask
+    and the sample have come apart.
+    """
+    state = reset(Config(), torch.tensor([241, 251]))
+
+    _next_state, trajectory = collect_segment(
+        state,
+        _UniformPolicy(),
+        turns=4,
+        generator=torch.Generator().manual_seed(257),
+    )
+
+    quantities = torch.tensor(QUANTITIES)[trajectory.unit_quantities]
+    alive = trajectory.unit_actions != IGNORE
+
+    assert trajectory.unit_quantities.shape == trajectory.unit_actions.shape
+    assert int(quantities[alive].min()) >= 1
+    assert int(quantities[alive].max()) <= MAX_TRANSFER
+    assert (quantities[~alive] == 1).all()
+    assert int(quantities[alive].max()) > 1
+
+
+def test_collect_segment_spends_the_sampled_quantity_in_the_engine() -> None:
+    """The sampled bucket has to reach ``step``, not just the trajectory.
+
+    Three wheat out of a shed of five, in one turn, by one farmer standing on
+    the shed-access tile the season opens on. A lane that recorded its samples
+    and still handed the engine a column of ones leaves four in the shed here
+    and one in the farmer's hands, which is the state this collector produced
+    before the quantity head reached it.
+    """
+    wheat = SHED_NAMES.index("WHEAT")
+    state = reset(Config(), torch.tensor([263]))
+    shed = state.shed.clone()
+    shed[:, :, wheat] = 5
+    state = replace(state, shed=shed)
+
+    next_state, _trajectory = collect_segment(
+        replace(state),
+        _BulkPickupPolicy(),
+        turns=1,
+        generator=torch.Generator().manual_seed(269),
+    )
+
+    assert int(next_state.shed[0, 0, wheat]) == 2
+    assert int(next_state.inv_count[0, 0, 0, wheat]) == 3

@@ -388,7 +388,7 @@ def test_the_agent_refuses_an_op_the_unmasked_argmax_would_have_thrown_away(
     state = observation([])
     seat = 0
     with torch.no_grad():
-        unit_logits, _quantity_logits, _market_logits, _value = play_module.model()(
+        unit_logits, quantity_logits, _market_logits, _value = play_module.model()(
             encode_board(state, seat),
             encode_scalars(state, seat),
             encode_positions(state, seat),
@@ -396,7 +396,11 @@ def test_the_agent_refuses_an_op_the_unmasked_argmax_would_have_thrown_away(
     units = unit_count(state, seat)
 
     unmasked = decode_units(
-        unit_logits, units, torch.ones_like(unit_logits, dtype=torch.bool)
+        unit_logits,
+        quantity_logits,
+        units,
+        torch.ones_like(unit_logits, dtype=torch.bool),
+        torch.ones_like(quantity_logits, dtype=torch.bool),
     )
     played = agent(state)
 

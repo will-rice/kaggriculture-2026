@@ -154,9 +154,10 @@ from kaggriculture.learn.encoding import (
     encode_board,
     encode_positions,
     encode_scalars,
+    transfer_slots,
     unit_count,
 )
-from kaggriculture.learn.mask import market_mask, unit_mask
+from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.progress import potential
 from kaggriculture.learn.sales import buy_units, sale_metrics
@@ -201,17 +202,26 @@ class Trajectory:
             only statement of which slots were real, and it is the same
             sentinel ``encode_units`` writes, so the behaviour-cloning loss and
             the PPO loss mask the same slots the same way.
+        unit_quantities: ``(turns, MAX_UNITS)`` the bucket each unit's quantity
+            head sampled, into ``QUANTITIES``. Every slot carries one, padded
+            slots included, because the head emits a row for every slot and a
+            masked-out row would softmax to NaN; the padding is stated once, on
+            ``unit_actions``, and a slot spends its bucket only where the op
+            beside it is a ``PICKUP`` or a ``PLACE``.
         market_actions: ``(turns, len(MARKET_SLOTS) + 2)`` sampled quantity
             buckets. No slot is ever padding here -- bucket 0 is "trade
             nothing", a decision the engine acts on by emitting no order.
         unit_masks: ``(turns, MAX_UNITS, len(UNIT_OPS))`` bool, the mask the
             unit logits were gated by.
+        unit_quantity_masks: ``(turns, MAX_UNITS, len(QUANTITIES))`` bool, the
+            mask the quantity logits were gated by.
         market_masks: ``(turns, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` bool.
         log_probs: ``(turns,)`` joint log-probability of the whole turn --
-            every real unit's op plus every market slot's bucket -- under the
-            masked distribution it was sampled from. Joint rather than
-            per-head because PPO's ratio is over the action the episode took,
-            and a turn's action is all of it at once.
+            every real unit's op, every transferring unit's bucket, and every
+            market slot's bucket -- under the masked distribution it was
+            sampled from. Joint rather than per-head because PPO's ratio is
+            over the action the episode took, and a turn's action is all of it
+            at once.
         values: ``(turns,)`` the value head's estimate at that state.
         rewards: ``(turns,)`` change in (our bank - their bank) across the
             turn. Sums to ``final_margin`` exactly.
@@ -274,8 +284,10 @@ class Trajectory:
     scalars: torch.Tensor
     positions: torch.Tensor
     unit_actions: torch.Tensor
+    unit_quantities: torch.Tensor
     market_actions: torch.Tensor
     unit_masks: torch.Tensor
+    unit_quantity_masks: torch.Tensor
     market_masks: torch.Tensor
     log_probs: torch.Tensor
     values: torch.Tensor
@@ -348,8 +360,10 @@ class Turn:
     scalars: torch.Tensor
     positions: torch.Tensor
     units: torch.Tensor
+    quantities: torch.Tensor
     market: torch.Tensor
     unit_mask: torch.Tensor
+    quantity_mask: torch.Tensor
     market_mask: torch.Tensor
     log_prob: torch.Tensor
     value: torch.Tensor
@@ -666,6 +680,12 @@ def _decide(
     only for the units on the board -- so an update that scored them would be
     fitting a choice that was never played.
 
+    The quantity head is sampled the same way and scored more narrowly still.
+    Every slot draws a bucket, but only the slots whose sampled op is a
+    ``PICKUP`` or a ``PLACE`` spend one, so only those enter the log-probability
+    -- the engine reads ``action[2]`` for those two verbs and no others, and a
+    bucket it never read is not part of the action this turn took.
+
     Args:
         policy: The network to sample from.
         requests: One ``(observation, seat)`` per row. The observation must be
@@ -680,22 +700,27 @@ def _decide(
     scalars = torch.cat([encode_scalars(*request) for request in requests])
     positions = torch.cat([encode_positions(*request) for request in requests])
     units = torch.cat([unit_mask(*request) for request in requests])
+    counts = torch.cat([unit_quantity_mask(*request) for request in requests])
     trades = torch.cat([market_mask(*request) for request in requests])
 
     device = next(policy.parameters()).device
     with torch.no_grad():
-        # The quantity head's logits are not sampled from here; `decode_units`
-        # below still emits no explicit transfer quantity, unchanged.
-        unit_logits, _unit_quantity_logits, market_logits, value = policy(
+        unit_logits, quantity_logits, market_logits, value = policy(
             board.to(device), scalars.to(device), positions.to(device)
         )
-    unit_logits, market_logits, value = (
+    unit_logits, quantity_logits, market_logits, value = (
         unit_logits.cpu(),
+        quantity_logits.cpu(),
         market_logits.cpu(),
         value.cpu(),
     )
     chosen_units, unit_log = _sample(unit_logits, units, generator)
+    chosen_quantities, quantity_log = _sample(quantity_logits, counts, generator)
     chosen_market, market_log = _sample(market_logits, trades, generator)
+    # Which slots spent the bucket they drew. Read off the sampled op, because
+    # the bucket's own value cannot say: an unspent 1 and a genuine transfer of
+    # one item are the same number, and only one of them acted.
+    transferred = transfer_slots(chosen_units)
 
     turns: list[Turn] = []
     for row, request in enumerate(requests):
@@ -703,8 +728,10 @@ def _decide(
         rows = slice(row, row + 1)
         action = decode_units(
             _one_hot(chosen_units[rows], unit_logits.shape[-1]),
+            _one_hot(chosen_quantities[rows], quantity_logits.shape[-1]),
             count,
             units[rows],
+            counts[rows],
         )
         action["market"] = decode_market(
             _one_hot(chosen_market[rows], market_logits.shape[-1]),
@@ -723,11 +750,17 @@ def _decide(
                     ],
                     dim=1,
                 ),
+                quantities=chosen_quantities[rows],
                 market=chosen_market[rows],
                 unit_mask=units[rows],
+                quantity_mask=counts[rows],
                 market_mask=trades[rows],
                 log_prob=(
-                    unit_log[rows, :count].sum(dim=1) + market_log[rows].sum(dim=1)
+                    unit_log[rows, :count].sum(dim=1)
+                    + quantity_log[rows, :count]
+                    .masked_fill(~transferred[rows, :count], 0.0)
+                    .sum(dim=1)
+                    + market_log[rows].sum(dim=1)
                 ),
                 value=value[rows],
             )
@@ -824,16 +857,20 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     dones = torch.zeros(len(turns), dtype=torch.bool)
     dones[-1] = True
     unit_actions = torch.cat([turn.units for turn in turns])
+    unit_quantities = torch.cat([turn.quantities for turn in turns])
     market_actions = torch.cat([turn.market for turn in turns])
     unit_masks = torch.cat([turn.unit_mask for turn in turns])
+    unit_quantity_masks = torch.cat([turn.quantity_mask for turn in turns])
     market_masks = torch.cat([turn.market_mask for turn in turns])
     return Trajectory(
         board=torch.cat([turn.board for turn in turns]),
         scalars=torch.cat([turn.scalars for turn in turns]),
         positions=torch.cat([turn.positions for turn in turns]),
         unit_actions=unit_actions,
+        unit_quantities=unit_quantities,
         market_actions=market_actions,
         unit_masks=unit_masks,
+        unit_quantity_masks=unit_quantity_masks,
         market_masks=market_masks,
         log_probs=torch.cat([turn.log_prob for turn in turns]),
         values=torch.cat([turn.value for turn in turns]),
@@ -853,7 +890,9 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         final_bank=_bank(terminal),
         final_capital=float(series[-1].capital),
         illegal=(
-            _illegal(unit_actions, unit_masks) + _illegal(market_actions, market_masks)
+            _illegal(unit_actions, unit_masks)
+            + _illegal(unit_quantities, unit_quantity_masks)
+            + _illegal(market_actions, market_masks)
         ),
         sales=sold["sales"],
         units_sold=sold["units"],

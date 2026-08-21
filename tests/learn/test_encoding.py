@@ -42,7 +42,6 @@ from kaggriculture.learn.encoding import (
     SEED_SCALE,
     SHED_NAMES,
     TILE_PLANES,
-    TRANSFER_QUANTITY,
     UNIT_CARRIED_SCALE,
     UNIT_OPS,
     bucket_of,
@@ -142,6 +141,19 @@ def _one_hot(op: int, units: int = 1) -> torch.Tensor:
     """
     logits = torch.full((1, MAX_UNITS, len(UNIT_OPS)), -10.0)
     logits[0, :units, op] = 10.0
+    return logits
+
+
+def _quantity_one_hot(*buckets: int) -> torch.Tensor:
+    """Return quantity logits ``decode_units`` resolves to one bucket per unit.
+
+    One bucket per unit rather than one for all of them, so a decoder that read
+    unit 0's quantity for every unit -- the obvious way to write this wrong --
+    is visible.
+    """
+    logits = torch.full((1, MAX_UNITS, len(QUANTITIES)), -10.0)
+    for unit, bucket in enumerate(buckets):
+        logits[0, unit, bucket] = 10.0
     return logits
 
 
@@ -1089,14 +1101,19 @@ def test_a_decoded_pickup_moves_state_in_the_engine() -> None:
     private = observation["private"]
 
     logits = _one_hot(UNIT_OPS.index("PICKUP:WHEAT"))
-    op = decode_units(logits, 1, _permit(logits))["farmer"]
+    quantities = _quantity_one_hot(QUANTITIES.index(3))
+    op = decode_units(logits, quantities, 1, _permit(logits), _permit(quantities))[
+        "farmer"
+    ]
     engine._apply_unit_action(
         farm, private, 0, op, BOARD, 0, TURNS_PER_DAY, SHED_CAPACITY
     )
 
-    assert op == ["PICKUP", "WHEAT", TRANSFER_QUANTITY]
-    assert private["shed"]["WHEAT"] == 5 - TRANSFER_QUANTITY
-    assert private["inventories"][0] == {"WHEAT": TRANSFER_QUANTITY}
+    # Three, not one: the sampled bucket is what the engine moves, so a decoder
+    # that emitted a constant would leave four wheat in the shed here.
+    assert op == ["PICKUP", "WHEAT", 3]
+    assert private["shed"]["WHEAT"] == 2
+    assert private["inventories"][0] == {"WHEAT": 3}
 
 
 def test_a_decoded_place_puts_a_bought_animal_onto_its_structure() -> None:
@@ -1114,11 +1131,20 @@ def test_a_decoded_place_puts_a_bought_animal_onto_its_structure() -> None:
     private["inventories"][0] = {"COW": 1}
 
     logits = _one_hot(UNIT_OPS.index("PLACE:COW"))
-    op = decode_units(logits, 1, _permit(logits))["farmer"]
+    quantities = _quantity_one_hot(QUANTITIES.index(4))
+    op = decode_units(logits, quantities, 1, _permit(logits), _permit(quantities))[
+        "farmer"
+    ]
     engine._apply_unit_action(
         farm, private, 0, op, BOARD, 0, TURNS_PER_DAY, SHED_CAPACITY
     )
 
+    # The animal branch places exactly one whatever the action asks for
+    # (``_inv_take(inv, item, 1)``), so a four here still puts one cow on the
+    # pasture and empties a one-cow inventory. The quantity is carried into the
+    # op regardless, because the same op is a shed drop when the tile is not a
+    # matching structure, and there the engine does read it.
+    assert op == ["PLACE", "COW", 4]
     assert farm["tiles"][y][x]["animal"] == "COW"
     assert private["inventories"][0] == {}
 
@@ -1243,10 +1269,42 @@ def test_labels_round_trip_back_to_a_legal_action() -> None:
     for unit in range(3):
         logits[0, unit, int(labels[0, unit].item())] = 10.0
 
-    decoded = decode_units(logits, 3, _permit(logits))
+    quantities = _quantity_one_hot(*([QUANTITIES.index(1)] * 3))
+    decoded = decode_units(logits, quantities, 3, _permit(logits), _permit(quantities))
 
     assert decoded["farmer"] == ["PLANT", "MELON"]
     assert decoded["hands"] == [["WATER"], ["DIG"]]
+
+
+def test_only_a_transfer_carries_the_sampled_quantity() -> None:
+    """One turn, three units, three arities -- and two different quantities.
+
+    The quantity head emits a bucket for *every* unit, transfer or not, because
+    it is one gathered column of the trunk per unit. Only ``PICKUP`` and
+    ``PLACE`` may spend it: the engine reads ``action[2]`` for those two and
+    for nothing else, and a ``PLANT`` at arity 3 or a ``WATER`` at arity 2 is a
+    different action list than the corpus and the mask were built around.
+
+    The two transfers carry *different* buckets, so a decoder that read one
+    unit's quantity for the whole turn fails here rather than passing on a
+    fixture that could not tell.
+    """
+    logits = torch.full((1, MAX_UNITS, len(UNIT_OPS)), -10.0)
+    logits[0, 0, UNIT_OPS.index("PICKUP:WHEAT")] = 10.0
+    logits[0, 1, UNIT_OPS.index("PLANT:MELON")] = 10.0
+    logits[0, 2, UNIT_OPS.index("PLACE:COW")] = 10.0
+    logits[0, 3, UNIT_OPS.index("WATER")] = 10.0
+    quantities = _quantity_one_hot(
+        QUANTITIES.index(6),
+        QUANTITIES.index(9),
+        QUANTITIES.index(2),
+        QUANTITIES.index(11),
+    )
+
+    decoded = decode_units(logits, quantities, 4, _permit(logits), _permit(quantities))
+
+    assert decoded["farmer"] == ["PICKUP", "WHEAT", 6]
+    assert decoded["hands"] == [["PLANT", "MELON"], ["PLACE", "COW", 2], ["WATER"]]
 
 
 def test_a_unit_count_beyond_max_units_raises() -> None:

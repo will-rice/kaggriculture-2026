@@ -31,6 +31,7 @@ from kaggriculture.learn import CHECKPOINT, toad_reward
 from kaggriculture.learn.encoding import (
     IGNORE,
     MARKET_SLOTS,
+    MAX_TRANSFER,
     MAX_UNITS,
     PRODUCT_NAMES,
     QUANTITIES,
@@ -40,6 +41,7 @@ from kaggriculture.learn.encoding import (
     encode_board,
     encode_positions,
     encode_scalars,
+    quantity_of,
     unit_count,
 )
 from kaggriculture.learn.mask import market_mask, unit_mask
@@ -307,16 +309,7 @@ def test_the_recorded_state_is_the_state_the_action_was_taken_from(
     environment.reset(2)
     starter = environment.agents["starter"]
     for turn in range(DIVERGED):
-        acted = trajectory.unit_actions[turn] != IGNORE
-        action = decode_units(
-            _one_hot(trajectory.unit_actions[turn].clamp(min=0), len(UNIT_OPS)),
-            int(acted.sum()),
-            trajectory.unit_masks[turn : turn + 1],
-        )
-        action["market"] = decode_market(
-            _one_hot(trajectory.market_actions[turn], len(QUANTITIES)),
-            trajectory.market_masks[turn : turn + 1],
-        )
+        action = _replayed(trajectory, turn)
         environment.step([action, starter(environment.state[1].observation)])
 
     observation = environment.state[0].observation
@@ -356,6 +349,66 @@ def test_the_recorded_state_is_the_state_the_action_was_taken_from(
 def _one_hot(chosen: torch.Tensor, options: int) -> torch.Tensor:
     """Return one turn's stored indices as logits the decoders can argmax."""
     return torch.nn.functional.one_hot(chosen[None], options).float()
+
+
+def _replayed(trajectory: Trajectory, turn: int) -> dict:
+    """Return the action one recorded turn decodes back to.
+
+    Every index the engine is handed comes out of the trajectory -- the op, the
+    transfer count and the market bucket -- so a replay that reaches the same
+    position is a statement that all three were recorded faithfully. Routed
+    through the real decoders rather than rebuilt here, because what is being
+    checked is the path the rollout itself plays through.
+    """
+    acted = trajectory.unit_actions[turn] != IGNORE
+    action = decode_units(
+        _one_hot(trajectory.unit_actions[turn].clamp(min=0), len(UNIT_OPS)),
+        _one_hot(trajectory.unit_quantities[turn], len(QUANTITIES)),
+        int(acted.sum()),
+        trajectory.unit_masks[turn : turn + 1],
+        trajectory.unit_quantity_masks[turn : turn + 1],
+    )
+    action["market"] = decode_market(
+        _one_hot(trajectory.market_actions[turn], len(QUANTITIES)),
+        trajectory.market_masks[turn : turn + 1],
+    )
+    return action
+
+
+def test_a_recorded_transfer_decodes_back_to_the_quantity_it_sampled(
+    trajectory: Trajectory,
+) -> None:
+    """The round trip for the quantity lane, on a real recorded episode.
+
+    Not a hand-built tensor: these buckets were sampled inside ``_decide``,
+    stored by ``_trajectory`` and are read back out here through the same
+    decoder the rollout plays through. A lane that recorded the mask's index
+    instead of the sample, or dropped the per-unit alignment, reaches this
+    with the wrong number in it.
+
+    The count of transfers is asserted before anything else. A season in which
+    no unit ever picked anything up would satisfy every assertion in the loop
+    vacuously, which is the shape the seven insensitive tests in this repo
+    took.
+    """
+    transfers = 0
+    varied = 0
+    for turn in range(DIVERGED):
+        action = _replayed(trajectory, turn)
+        for slot, op in enumerate([action["farmer"], *action["hands"]]):
+            if op[0] not in ("PICKUP", "PLACE"):
+                assert len(op) < 3
+                continue
+            transfers += 1
+            expected = quantity_of(int(trajectory.unit_quantities[turn, slot]))
+            assert op[2] == expected
+            assert 1 <= op[2] <= MAX_TRANSFER
+            varied += op[2] != 1
+
+    assert transfers
+    # A lane hard-wired to one -- the constant this task deleted -- passes
+    # every assertion above and fails this one.
+    assert varied
 
 
 def test_each_reward_lands_on_the_turn_that_earned_it(
@@ -523,16 +576,7 @@ def test_a_lockstep_group_keeps_each_environment_s_rows_apart(
     environment.reset(2)
     starter = environment.agents["starter"]
     for turn in range(DIVERGED):
-        acted = second.unit_actions[turn] != IGNORE
-        action = decode_units(
-            _one_hot(second.unit_actions[turn].clamp(min=0), len(UNIT_OPS)),
-            int(acted.sum()),
-            second.unit_masks[turn : turn + 1],
-        )
-        action["market"] = decode_market(
-            _one_hot(second.market_actions[turn], len(QUANTITIES)),
-            second.market_masks[turn : turn + 1],
-        )
+        action = _replayed(second, turn)
         environment.step([action, starter(environment.state[1].observation)])
 
     observation = environment.state[0].observation

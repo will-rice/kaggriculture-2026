@@ -115,11 +115,12 @@ from kaggriculture.learn.rollout import rollout_many
 from kaggriculture.learn.scripts.gate import DEVICE, GAMES, THREADS, WORKERS
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.decode import decode_market_buckets
-from kaggriculture.sim.engine import reset, step, unit_quantity_ones
+from kaggriculture.sim.engine import reset, step
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.rollout import Trajectory, collect_segment
 from kaggriculture.sim.state import SimState
+from kaggriculture.sim.tensors import tensor_constant
 
 LOGGER = logging.getLogger("benchmark_simulator")
 
@@ -568,21 +569,30 @@ def turn(state: SimState, policy: torch.nn.Module, *, sample: bool) -> SimState:
     positions = torch.stack([value[2] for value in observed], dim=1)
     masks = [legal(state, seat) for seat in range(2)]
     unit_masks = torch.stack([value[0] for value in masks], dim=1)
-    market_masks = torch.stack([value[1] for value in masks], dim=1)
+    quantity_masks = torch.stack([value[1] for value in masks], dim=1)
+    market_masks = torch.stack([value[2] for value in masks], dim=1)
     batch = state.batch_size
     with torch.no_grad():
-        unit_logits, _unit_quantity_logits, market_logits, _value = policy(
+        unit_logits, quantity_logits, market_logits, _value = policy(
             boards.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
         )
     unit_logits = unit_logits.reshape(batch, 2, *unit_logits.shape[1:])
+    quantity_logits = quantity_logits.reshape(batch, 2, *quantity_logits.shape[1:])
     market_logits = market_logits.reshape(batch, 2, *market_logits.shape[1:])
     chosen_units = _decide(unit_logits, unit_masks, sample=sample)
+    chosen_quantities = _decide(quantity_logits, quantity_masks, sample=sample)
     chosen_market = _decide(market_logits, market_masks, sample=sample)
+    # The timed turn plays the same three lanes the collector does. Handing
+    # `step` a column of ones here instead would time a turn the training loop
+    # no longer takes -- one masked softmax, one multinomial and one gather
+    # short of it, on a tensor of the crew's width.
     return step(
         state,
         chosen_units.to(torch.int16),
         decode_market_buckets(chosen_market),
-        unit_quantity_ones(state.batch_size, state.step.device),
+        tensor_constant(QUANTITIES, dtype=torch.int16, device=state.step.device)[
+            chosen_quantities
+        ],
     )
 
 
@@ -865,7 +875,7 @@ def verify_segment_graph(device: torch.device) -> None:
     The first check replays a captured segment under ``PeakedPolicy``, whose
     one-hot distributions make sampling deterministic, and compares the result
     against the same number of eager ``collect_segment`` calls from the same
-    seeds -- all 39 ``SimState`` fields and all 14 ``Trajectory`` fields,
+    seeds -- all 39 ``SimState`` fields and all 16 ``Trajectory`` fields,
     ``illegal`` included. A graph that replayed a frozen segment would sit at
     the first segment's clock; one that advanced but computed something else
     would differ in some plane or some recorded row.

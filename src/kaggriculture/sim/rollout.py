@@ -13,13 +13,18 @@ from kaggriculture.constants import (
     MARKET_PARAMS,
     SHED_CAPACITY,
 )
-from kaggriculture.learn.encoding import IGNORE, MAX_UNITS, UNIT_OPS
+from kaggriculture.learn.encoding import (
+    IGNORE,
+    MAX_UNITS,
+    QUANTITIES,
+    TRANSFER_OPS,
+    UNIT_OPS,
+)
 from kaggriculture.sim.decode import decode_market_buckets
 from kaggriculture.sim.engine import (
     MAX_MARKET_ORDERS_PER_TURN,
     MarketActions,
     step,
-    unit_quantity_ones,
 )
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.market import QUANTITY_AXIS
@@ -86,16 +91,26 @@ class Trajectory:
     which in practice means logging it or failing a run on it, call ``int()`` on
     it themselves, outside any captured region. What it counts is unchanged:
     sampled actions their own stored mask forbade, summed over the segment's
-    turns, its alive units and its market slots, for the learning seat alone
-    when a scripted opponent occupies seat 1 and for both seats otherwise.
+    turns, its alive units, its quantity buckets and its market slots, for the
+    learning seat alone when a scripted opponent occupies seat 1 and for both
+    seats otherwise.
+
+    ``unit_quantities`` holds bucket indices into ``QUANTITIES``, not the
+    counts themselves: it is an action the learner re-scores under the head
+    that produced it, the same way ``market_actions`` is. The count each one
+    stands for is what reached ``step``. Every slot carries a bucket, dead
+    ones included, and a slot spends it only where the op beside it is a
+    ``PICKUP`` or a ``PLACE``.
     """
 
     board: torch.Tensor
     scalars: torch.Tensor
     positions: torch.Tensor
     unit_actions: torch.Tensor
+    unit_quantities: torch.Tensor
     market_actions: torch.Tensor
     unit_masks: torch.Tensor
+    unit_quantity_masks: torch.Tensor
     market_masks: torch.Tensor
     log_probs: torch.Tensor
     values: torch.Tensor
@@ -428,6 +443,14 @@ def collect_segment(
     Python function what to play. That is a synchronisation per row per turn,
     so a scripted segment cannot be captured and is not meant to be.
 
+    The learning seat's transfers are sampled, not fixed. Every unit draws a
+    bucket from the quantity head beside its op, under a mask that mirrors
+    ``learn.mask.unit_quantity_mask``, and the count it stands for is what
+    ``step`` executes -- which is what lets self-play use the lane at
+    simulator speed rather than only replaying a corpus through it. The
+    sampling is a ``multinomial`` and a gather on tensors that never leave the
+    device, so the captured region gains no synchronisation.
+
     A scripted opponent's bulk transfers ride the same quantity lane the
     learning seat does. Before this, a unit action had no such lane and an
     opponent that emitted a bulk ``PICKUP`` or ``PLACE`` (a quantity other
@@ -457,8 +480,10 @@ def collect_segment(
             "scalars",
             "positions",
             "unit_actions",
+            "unit_quantities",
             "market_actions",
             "unit_masks",
+            "unit_quantity_masks",
             "market_masks",
             "log_probs",
             "values",
@@ -468,7 +493,8 @@ def collect_segment(
             "dones",
         )
     }
-    illegal_count = torch.zeros((), dtype=torch.int64, device=state.step.device)
+    device = state.step.device
+    illegal_count = torch.zeros((), dtype=torch.int64, device=device)
     for _ in range(turns):
         observed = [observe(state, seat) for seat in range(2)]
         boards = torch.stack([value[0] for value in observed], dim=1)
@@ -476,24 +502,32 @@ def collect_segment(
         positions = torch.stack([value[2] for value in observed], dim=1)
         masks = [legal(state, seat) for seat in range(2)]
         unit_masks = torch.stack([value[0] for value in masks], dim=1)
-        market_masks = torch.stack([value[1] for value in masks], dim=1)
+        quantity_masks = torch.stack([value[1] for value in masks], dim=1)
+        market_masks = torch.stack([value[2] for value in masks], dim=1)
         batch = state.batch_size
         with torch.no_grad():
-            # The quantity head's logits are not sampled from yet -- every
-            # transfer this collector plays still goes through
-            # `unit_quantity_ones` below, unchanged.
-            unit_logits, _unit_quantity_logits, market_logits, values = policy(
+            unit_logits, quantity_logits, market_logits, values = policy(
                 boards.flatten(0, 1),
                 scalars.flatten(0, 1),
                 positions.flatten(0, 1),
             )
         unit_logits = unit_logits.reshape(batch, 2, *unit_logits.shape[1:])
+        quantity_logits = quantity_logits.reshape(batch, 2, *quantity_logits.shape[1:])
         market_logits = market_logits.reshape(batch, 2, *market_logits.shape[1:])
         values = values.reshape(batch, 2, -1).squeeze(-1)
         chosen_units, unit_log = _sample(unit_logits, unit_masks, generator)
+        chosen_quantities, quantity_log = _sample(
+            quantity_logits, quantity_masks, generator
+        )
         chosen_market, market_log = _sample(market_logits, market_masks, generator)
         market_orders = decode_market_buckets(chosen_market)
-        unit_quantities = unit_quantity_ones(state.batch_size, state.step.device)
+        # Buckets are what the head sampled and what the trajectory stores; the
+        # engine is handed the quantities they stand for. The lookup is a
+        # `tensor_constant` gather rather than an indexing of `QUANTITIES` on
+        # the host, so nothing here reads a device tensor back.
+        unit_quantities = tensor_constant(QUANTITIES, dtype=torch.int16, device=device)[
+            chosen_quantities
+        ]
         if opponent is not None:
             opponent_units, opponent_quantities, opponent_market = scripted_actions(
                 state, opponent
@@ -505,7 +539,23 @@ def collect_segment(
             market_orders.order_qty[:, 1].copy_(opponent_market.order_qty[:, 1])
         alive = state.alive
         stored_units = torch.where(alive, chosen_units, IGNORE)
-        joint_log = (unit_log * alive).sum(dim=-1) + market_log.sum(dim=-1)
+        # Only a PICKUP or a PLACE spends the bucket beside it, so only those
+        # slots contribute to the log-probability of the turn -- the same rule
+        # `ppo.joint_log_prob` re-scores under, and for the same reason: a
+        # bucket the engine never read is not part of what acted. Read off the
+        # sampled op through a device-side table, never off the bucket's value,
+        # which cannot tell an unspent 1 from a transfer of one item.
+        transferred = (
+            alive
+            & tensor_constant(TRANSFER_OPS, dtype=torch.bool, device=device)[
+                chosen_units
+            ]
+        )
+        joint_log = (
+            (unit_log * alive).sum(dim=-1)
+            + (quantity_log * transferred).sum(dim=-1)
+            + market_log.sum(dim=-1)
+        )
         before_money = state.money.clone()
         before_margin = before_money - before_money.flip(1)
         before_potential = torch.stack(
@@ -523,8 +573,10 @@ def collect_segment(
         records["scalars"].append(scalars)
         records["positions"].append(positions)
         records["unit_actions"].append(stored_units)
+        records["unit_quantities"].append(chosen_quantities)
         records["market_actions"].append(chosen_market)
         records["unit_masks"].append(unit_masks)
+        records["unit_quantity_masks"].append(quantity_masks)
         records["market_masks"].append(market_masks)
         records["log_probs"].append(joint_log)
         records["values"].append(values)
@@ -539,6 +591,11 @@ def collect_segment(
                 .gather(-1, chosen_units[:, checked_seats, ..., None])
                 .squeeze(-1)
                 & alive[:, checked_seats]
+            ).sum()
+            + (
+                ~quantity_masks[:, checked_seats]
+                .gather(-1, chosen_quantities[:, checked_seats, ..., None])
+                .squeeze(-1)
             ).sum()
             + (
                 ~market_masks[:, checked_seats]
