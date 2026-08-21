@@ -42,9 +42,9 @@ from importlib import metadata
 from pathlib import Path
 
 import torch
-import wandb
 from lightning import seed_everything
 
+import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
 from kaggriculture.learn.encoding import transfer_slots
@@ -167,6 +167,170 @@ RUNS = Path("/data/kaggriculture/toad")
 CHECKPOINT_EVERY = 25
 WANDB_ENTITY = "will-rice"
 WANDB_PROJECT = "kaggriculture-2026"
+# wandb groups panels into dashboard sections by the text before the first
+# `/`, so every key `_record` returns must start with one of these. That is
+# the entire mechanism THE INCIDENT asks for: a reader sees which role a
+# number plays before they read its name. `objective/` is what we actually
+# want (margin and win rate against the scripted opponent); `proxy/` is what
+# the gradient reads (the shaped reward and its components); `critic/` is
+# value-head diagnostics; `diag/` is everything else -- population sizes,
+# loss terms, bank, sale mechanics -- none of which can indicate capability
+# on its own. See test_every_logged_metric_carries_a_role_prefix.
+OBJECTIVE = "objective/"
+PROXY = "proxy/"
+CRITIC = "critic/"
+DIAG = "diag/"
+METRIC_PREFIXES = (OBJECTIVE, PROXY, CRITIC, DIAG)
+# One line per logged key, shipped into every run (see `_log_definitions`) so
+# the meaning of a number sits beside the number instead of requiring someone
+# to open this file. Derived from the comments at each metric's definition
+# site in `_record`, `_population` and `_critic`; kept in sync with them by
+# `test_every_logged_metric_carries_a_role_prefix`, which asserts this dict's
+# keys are exactly the keys `_record` returns.
+METRIC_DEFINITIONS: dict[str, str] = {
+    "diag/update": "Optimizer rounds completed so far.",
+    "diag/steps": "Environment decisions collected so far.",
+    "diag/hours": "Wall-clock hours since the run started.",
+    "diag/bank_mean": (
+        "Mean terminal bank, both populations pooled. Corpus mining over "
+        "1,350 seats put bank against ladder rating at Pearson -0.043, so "
+        "this is a diagnostic, not a capability read."
+    ),
+    "diag/bank_max": (
+        "Max terminal bank, both populations pooled; same caveat as diag/bank_mean."
+    ),
+    "diag/bank_mirror": (
+        "Mean terminal bank, self-play seats only. Kept separate from "
+        "diag/bank_vs_econ on purpose -- conflating the two read as "
+        "capability for 209 updates on arm C''."
+    ),
+    "diag/bank_vs_econ": "Mean terminal bank, scripted-opponent seats only.",
+    "diag/n_econ_envs": "Scripted-opponent trajectories collected this round.",
+    "objective/win_rate_vs_econ": (
+        "Fraction of scripted-opponent games with final_margin > 0 -- the "
+        "competition's own statement of the win condition, undecomposed. "
+        "Falsified by staying 0.000 while proxy/ and diag/ metrics rise."
+    ),
+    "diag/mirror_decisive_rate": (
+        "2x the self-play win rate (final_margin > 0), rescaled from its "
+        "raw 0-0.5 range: both self-play seats are recorded and exactly one "
+        "wins, so the raw rate is 0.5 by construction and only rises when "
+        "the policy stops tying with itself. Reaches 1.0 regardless of "
+        "whether play is any good."
+    ),
+    "objective/margin_vs_econ": (
+        "Mean final_margin (our bank minus theirs) against the scripted "
+        "opponent -- the objective itself."
+    ),
+    "diag/margin_mean_mirror": (
+        "Mean final_margin in self-play; near-deterministic and not "
+        "comparable to objective/margin_vs_econ."
+    ),
+    "diag/mean_sale_price_vs_econ": (
+        "Coins per unit realised on sale, scripted-opponent seats. Corpus "
+        "mining says winners take +3.3% here at flat volume."
+    ),
+    "diag/realisation_vs_econ": (
+        "Realised price over the market book (1.0 = par), scripted-opponent seats."
+    ),
+    "diag/sales_vs_econ": (
+        "Completed clears per episode, scripted-opponent seats -- the "
+        "volume control on diag/mean_sale_price_vs_econ."
+    ),
+    "diag/units_sold_vs_econ": "Units moved by those clears, scripted-opponent seats.",
+    "diag/bought_vs_econ": "Units purchased, scripted-opponent seats.",
+    "diag/final_capital_vs_econ": (
+        "Producing animals owned at the horizon, scripted-opponent seats. "
+        "If margin improves while this and bank both collapse, the "
+        "absolute reward term is too weak."
+    ),
+    "diag/mean_sale_price_mirror": "Coins per unit realised on sale, self-play seats.",
+    "diag/realisation_mirror": (
+        "Realised price over the market book (1.0 = par), self-play seats."
+    ),
+    "diag/sales_mirror": "Completed clears per episode, self-play seats.",
+    "diag/units_sold_mirror": "Units moved by those clears, self-play seats.",
+    "diag/bought_mirror": "Units purchased, self-play seats.",
+    "diag/final_capital_mirror": (
+        "Producing animals owned at the horizon, self-play seats."
+    ),
+    "critic/ev_econ_games": (
+        "Pooled explained variance of the actor's value estimates against "
+        "the real discounted return, scripted-opponent seats. A critic "
+        "that has learned only the turn clock scores ~0.98 here."
+    ),
+    "critic/ev_within_turn_econ_games": (
+        "Explained variance after centring both series at each turn index, "
+        "scripted-opponent seats -- whether the critic tells two episodes "
+        "apart at the same point in the season, not just the calendar."
+    ),
+    "critic/ev_mirror_games": (
+        "Pooled explained variance against the real return, self-play "
+        "seats; a mirror seat's return is very nearly deterministic, so "
+        "this is not comparable to critic/ev_econ_games."
+    ),
+    "critic/ev_within_turn_mirror_games": (
+        "Within-turn explained variance, self-play seats; same "
+        "non-comparability to critic/ev_within_turn_econ_games."
+    ),
+    "proxy/shaped_mean": (
+        "Episode total of Toad's shaped reward, logged unconditionally as "
+        "the counterfactual -- not the objective, and not necessarily what "
+        "this arm trains on."
+    ),
+    "proxy/shaped_reward_mean": (
+        "Episode total of whichever reward field this arm actually trains "
+        "on (REWARD_FIELD, or --phase1b / --margin). Rising while "
+        "objective/win_rate_vs_econ stays flat is shaped credit, not "
+        "progress -- about three-quarters of a typical value here is "
+        "shaping, not coins."
+    ),
+    "diag/illegal": (
+        "Stored action indices the stored mask forbade. Nonzero means "
+        "sampling or storage is broken."
+    ),
+    "diag/gross_purchases": (
+        "Gross coins spent buying, mean per episode. Rising alongside "
+        "proxy/money_term without diag/bank_mean moving is the money-pump "
+        "signature: a clamped delta lets a losing round trip still earn "
+        "shaped reward."
+    ),
+    "proxy/money_term": (
+        "The money component's own realised contribution to the shaped "
+        "reward (shaped_money - shaped). Logged on both arms: the "
+        "counterfactual on the baseline, the thing being paid for on "
+        "phase-1b."
+    ),
+    "diag/lr": "Current learning rate off the LambdaLR schedule.",
+    "diag/warming": (
+        "True while the value head is training alone (--value-warmup), "
+        "before the policy gradient fires."
+    ),
+    "diag/warmup_left": "Batches still owed to that value-only warmup.",
+    "diag/vtrace_pg": (
+        "V-trace policy-gradient loss term. A loss term, not a capability signal."
+    ),
+    "diag/upgo_pg": "UPGO policy-gradient loss term.",
+    "critic/baseline_self_consistency": (
+        "Value loss against the round's own bootstrapped TD(lambda) "
+        "target -- distance from its OWN target, not from the real "
+        "return. A critic can sit at 0.998 explained variance against its "
+        "own target while explaining the real return twelvefold worse "
+        "than a constant; ten earlier arms read this falling as the "
+        "critic learning. See critic/ev_econ_games for the real accuracy."
+    ),
+    "diag/entropy": (
+        "Negative-entropy loss term; a falling value means the policy is "
+        "collapsing onto fewer actions, not necessarily better ones."
+    ),
+    "diag/teacher_kl": "Teacher KL loss term, zero unless --teacher is set.",
+    "diag/total_loss": "Sum of every loss term actually optimized this round.",
+    "critic/baseline_passes_self_consistency": (
+        "The same self-consistency loss as critic/baseline_self_consistency, "
+        "averaged over the extra --value-passes replays, or equal to it "
+        "when there are none."
+    ),
+}
 
 
 def main() -> None:
@@ -372,12 +536,12 @@ def main() -> None:
             "sale_price %.1f reward %.4f total_loss %.3f",
             update,
             steps,
-            record["win_rate_vs_econ"],
-            record["margin_mean_vs_econ"],
-            record["bank_mean"],
-            record["mean_sale_price_vs_econ"],
-            record["reward_mean"],
-            record["total"],
+            record["objective/win_rate_vs_econ"],
+            record["objective/margin_vs_econ"],
+            record["diag/bank_mean"],
+            record["diag/mean_sale_price_vs_econ"],
+            record["proxy/shaped_reward_mean"],
+            record["diag/total_loss"],
         )
     wandb.finish()
 
@@ -401,6 +565,15 @@ def _record(
     banking 8 against economic_policy, and the conflated number read as
     capability for 209 updates. So every population-dependent metric is
     suffixed, and the win rate that decides this arm is the scripted one alone.
+
+    Every key returned here starts with one of ``METRIC_PREFIXES`` --
+    ``objective/`` for margin and win rate against the scripted opponent,
+    ``proxy/`` for the shaped reward the gradient actually reads, ``critic/``
+    for value-head diagnostics, and ``diag/`` for everything else, which
+    cannot indicate capability on its own. That grouping is what lets wandb's
+    panel sections answer "what role does this number play" before its name is
+    read, which is the whole fix for THE INCIDENT this function's tests are
+    named after.
 
     Args:
         mirror_batch: This round's self-play trajectories, both seats.
@@ -437,45 +610,56 @@ def _record(
     mirror_banks = [t.final_bank for t in mirror_batch] or [float("nan")]
     econ_banks = [t.final_bank for t in econ_batch] or [float("nan")]
     record = {
-        "update": update,
-        "steps": steps,
-        "hours": hours,
-        "bank_mean": sum(banks) / len(banks),
-        "bank_max": max(banks),
-        "bank_mirror": sum(mirror_banks) / len(mirror_banks),
-        "bank_vs_econ": sum(econ_banks) / len(econ_banks),
-        "n_econ_envs": len(econ_batch),
-        "win_rate_vs_econ": _mean([float(t.final_margin > 0.0) for t in econ_batch]),
-        "win_rate_mirror": _mean([float(t.final_margin > 0.0) for t in mirror_batch]),
-        "margin_mean_vs_econ": _mean([t.final_margin for t in econ_batch]),
-        "margin_mean_mirror": _mean([t.final_margin for t in mirror_batch]),
+        "diag/update": update,
+        "diag/steps": steps,
+        "diag/hours": hours,
+        "diag/bank_mean": sum(banks) / len(banks),
+        "diag/bank_max": max(banks),
+        "diag/bank_mirror": sum(mirror_banks) / len(mirror_banks),
+        "diag/bank_vs_econ": sum(econ_banks) / len(econ_banks),
+        "diag/n_econ_envs": len(econ_batch),
+        "objective/win_rate_vs_econ": _mean(
+            [float(t.final_margin > 0.0) for t in econ_batch]
+        ),
+        # win_rate_mirror was 0.5 by construction -- both seats of a
+        # self-play episode are recorded and one of them wins -- so it rose
+        # 0.25 -> 0.50 purely from the policy no longer tying with itself at
+        # zero, then pinned at its ceiling for 300+ updates, and read as
+        # progress the whole time. Rescaled x2 here: 1.0 now means every
+        # mirror game was decisive, a real 0-1 scale instead of a 0-0.5 one.
+        # Still not capability -- see METRIC_DEFINITIONS.
+        "diag/mirror_decisive_rate": 2.0
+        * _mean([float(t.final_margin > 0.0) for t in mirror_batch]),
+        "objective/margin_vs_econ": _mean([t.final_margin for t in econ_batch]),
+        "diag/margin_mean_mirror": _mean([t.final_margin for t in mirror_batch]),
         # Where the corpus says the edge actually lives: winners in paired
         # same-episode comparisons take +3.3% on mean sale price at FLAT
         # volume. Volume is logged beside price so a price rise bought by
         # simply selling less is visible rather than inferred.
         **_population(econ_batch, "vs_econ"),
         **_population(mirror_batch, "mirror"),
-        # WHAT THE `baseline` TERM DOES NOT SAY. That term is the value head's
-        # distance from its OWN bootstrapped target, so it measures
-        # self-consistency; a critic can sit at 0.998 explained variance against
-        # its own target while explaining the real return twelvefold WORSE than
-        # a constant, and ten arms read the falling term as the critic learning.
-        # These are the accuracy, against the actual discounted return-to-go of
-        # the episodes just played, and a run whose `baseline` falls while these
-        # stay negative has not trained a critic. Split by population for the
-        # reason everything else here is: a mirror seat's return is very nearly
-        # deterministic, so the two are not comparable numbers.
+        # WHAT THE `critic/baseline_self_consistency` TERM DOES NOT SAY. That
+        # term is the value head's distance from its OWN bootstrapped target,
+        # so it measures self-consistency; a critic can sit at 0.998 explained
+        # variance against its own target while explaining the real return
+        # twelvefold WORSE than a constant, and ten arms read the falling term
+        # as the critic learning. The `critic/ev_*` keys are the accuracy,
+        # against the actual discounted return-to-go of the episodes just
+        # played, and a run whose baseline falls while these stay negative has
+        # not trained a critic. Split by population for the reason everything
+        # else here is: a mirror seat's return is very nearly deterministic,
+        # so the two are not comparable numbers.
         **_critic(econ_batch, field, "vs_econ"),
         **_critic(mirror_batch, field, "mirror"),
-        "shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
+        "proxy/shaped_mean": float(torch.stack([t.shaped.sum() for t in batch]).mean()),
         # The episode total of the series the learner is actually reading.
-        # `shaped_mean` is logged unconditionally and is the counterfactual
-        # on this arm, not the objective -- reading it as progress here
-        # would be watching the wrong curve entirely.
-        "reward_mean": float(
+        # `proxy/shaped_mean` is logged unconditionally and is the
+        # counterfactual on this arm, not the objective -- reading either of
+        # these as progress would be watching the wrong curve entirely.
+        "proxy/shaped_reward_mean": float(
             torch.stack([getattr(t, field).sum() for t in batch]).mean()
         ),
-        "illegal": sum(t.illegal for t in batch),
+        "diag/illegal": sum(t.illegal for t in batch),
         # The money component's own realised contribution, separable
         # because both rewards ride on every trajectory. Logged for BOTH
         # arms: on the baseline it is the counterfactual, on phase-1b it is
@@ -485,21 +669,21 @@ def _record(
         # this project has hit that failure three times. It must be visible
         # in the charts from update 1, not reconstructed afterwards.
         # Gross coins spent per episode. If the pump fires, buy volume
-        # rises alongside money_term -- the two together separate "learned
-        # to trade" from "learned to churn".
-        "gross_purchases": float(
+        # rises alongside proxy/money_term -- the two together separate
+        # "learned to trade" from "learned to churn".
+        "diag/gross_purchases": float(
             torch.stack([(-t.own.clamp(max=0.0)).sum() for t in batch]).mean()
         ),
-        "money_term": float(
+        "proxy/money_term": float(
             torch.stack([(t.shaped_money - t.shaped).sum() for t in batch]).mean()
         ),
-        "lr": lr,
+        "diag/lr": lr,
         # True while the value head is training alone, so the warmup
         # window is readable off the data rather than inferred from a
         # batch count.
-        "warming": warming,
-        "warmup_left": warmup_left,
-        **terms,
+        "diag/warming": warming,
+        "diag/warmup_left": warmup_left,
+        **_prefixed_terms(terms),
     }
     return record
 
@@ -528,6 +712,10 @@ def _population(batch: list[Trajectory], population: str) -> dict[str, float]:
     nobody can take is not pre-registered, so the number it needs is logged
     from update one rather than reconstructed afterwards.
 
+    None of these can indicate capability on their own -- price, volume and
+    capital are mechanics, not the win condition -- so every key returned here
+    carries ``DIAG``.
+
     Args:
         batch: That population's trajectories, possibly empty.
         population: ``"vs_econ"`` or ``"mirror"``, appended to every key.
@@ -537,7 +725,7 @@ def _population(batch: list[Trajectory], population: str) -> dict[str, float]:
         for the population, keyed so the two never merge.
     """
     return {
-        f"{name}_{population}": _mean([getattr(t, name) for t in batch])
+        f"{DIAG}{name}_{population}": _mean([getattr(t, name) for t in batch])
         for name in (
             "mean_sale_price",
             "realisation",
@@ -547,6 +735,17 @@ def _population(batch: list[Trajectory], population: str) -> dict[str, float]:
             "final_capital",
         )
     }
+
+
+# critic_scores' own key -> the short name it takes in the logged, prefixed
+# key. Kept distinct from `critic_scores`' names because `_POPULATION_GAMES`
+# below reads more naturally as "games" than as the "vs_econ"/"mirror" suffix
+# `_population` uses -- the two functions suffix independently on purpose.
+_CRITIC_SHORT_NAMES = {
+    "ev_vs_return": "ev",
+    "ev_vs_return_within_turn": "ev_within_turn",
+}
+_POPULATION_GAMES = {"vs_econ": "econ_games", "mirror": "mirror_games"}
 
 
 def _critic(batch: list[Trajectory], field: str, population: str) -> dict[str, float]:
@@ -565,32 +764,70 @@ def _critic(batch: list[Trajectory], field: str, population: str) -> dict[str, f
         population: ``"vs_econ"`` or ``"mirror"``, appended to every key.
 
     Returns:
-        Explained variance against the real return, pooled and within-turn.
+        Explained variance against the real return, pooled and within-turn,
+        keyed under ``CRITIC``.
     """
     scores = critic_scores(
         [t.values for t in batch],
         [getattr(t, field) for t in batch],
         [t.dones for t in batch],
     )
-    return {f"{name}_{population}": value for name, value in scores.items()}
+    games = _POPULATION_GAMES[population]
+    return {
+        f"{CRITIC}{_CRITIC_SHORT_NAMES[name]}_{games}": value
+        for name, value in scores.items()
+    }
+
+
+# The internal loss-term names `_step` returns -> their logged, prefixed key.
+# `_step` and `_update` keep the short names (tested directly by
+# test_toad_runner.py); this table is the one place those names become the
+# public, dashboard-grouped ones.
+_TERM_PREFIX = {
+    "vtrace_pg": f"{DIAG}vtrace_pg",
+    "upgo_pg": f"{DIAG}upgo_pg",
+    "entropy": f"{DIAG}entropy",
+    "teacher": f"{DIAG}teacher_kl",
+    "total": f"{DIAG}total_loss",
+    "baseline": f"{CRITIC}baseline_self_consistency",
+    "baseline_passes": f"{CRITIC}baseline_passes_self_consistency",
+}
+
+
+def _prefixed_terms(terms: dict[str, float]) -> dict[str, float]:
+    """Return ``_update``'s loss terms under their public, prefixed keys.
+
+    Args:
+        terms: The loss terms ``_update`` returned, by their internal names.
+
+    Returns:
+        The same values keyed by ``_TERM_PREFIX``.
+    """
+    return {_TERM_PREFIX[key]: value for key, value in terms.items()}
 
 
 def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_run.Run":
-    """Open the tracked wandb run for this arm.
+    """Open the tracked wandb run for this arm and ship every metric's meaning into it.
 
     Every knob that distinguishes one arm from another is recorded here, so a
     run's identity can be read off the dashboard rather than reconstructed from
     a shell command nobody kept. That includes the weights of whichever reward
     is live and zeroes for the ones that are not.
 
+    THE INCIDENT this exists to prevent read a dashboard and trusted two
+    numbers whose correct interpretation was sitting in this file's comments
+    the whole time, unreachable from wandb. ``METRIC_DEFINITIONS`` is those
+    comments, one line each; logging it as a table puts the run's own page one
+    click from the explanation instead of a source read.
+
     Args:
         arguments: The parsed command line.
         field: The reward series the learner will read.
 
     Returns:
-        The started run.
+        The started run, with its metric glossary already logged.
     """
-    return wandb.init(
+    run = wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
         name=arguments.name or _default_name(arguments),
@@ -624,6 +861,32 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "total_steps": TOTAL_STEPS,
             "engine": metadata.version("kaggle-environments"),
         },
+    )
+    _log_definitions(run)
+    return run
+
+
+def _log_definitions(run: "wandb.sdk.wandb_run.Run") -> None:
+    """Log ``METRIC_DEFINITIONS`` once, as a table, so it lives beside the run.
+
+    A ``wandb.Table`` logged once (the default ``log_mode="IMMUTABLE"``) is
+    stored as a single snapshot on the run and surfaces in its Tables tab and
+    summary -- the documented pattern for "one value that does not change over
+    the run" (see the Tables logging guide), as opposed to a metric logged
+    every step. A metric definition does not change during a run either, so
+    this is logged once here rather than folded into ``record`` and repeated
+    719 times.
+
+    Args:
+        run: The run just opened by ``wandb.init``.
+    """
+    run.log(
+        {
+            "metric_definitions": wandb.Table(
+                columns=["metric", "definition"],
+                data=[list(row) for row in sorted(METRIC_DEFINITIONS.items())],
+            )
+        }
     )
 
 

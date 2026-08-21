@@ -21,6 +21,7 @@ from kaggriculture.learn.encoding import (
     UNIT_OPS,
 )
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad_phase1
 from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE, TEACHER_KL_COST
 
@@ -66,6 +67,127 @@ def _segment(turns: int = 16, transfers: bool = True) -> dict[str, torch.Tensor]
         "shaped_money": torch.randn(turns) * 0.01,
         "dones": torch.zeros(turns, dtype=torch.bool),
     }
+
+
+def _trajectory(turns: int = 4, final_margin: float = 1.0) -> Trajectory:
+    """Return a minimal ``Trajectory``, shaped exactly as ``rollout_many`` builds one.
+
+    Only what ``_record``, ``_population`` and ``_critic`` read needs to vary
+    between calls, so every other field is a fixed, cheap stand-in; the point
+    of this fixture is the shape, not the values.
+
+    Args:
+        turns: Acted rows.
+        final_margin: This seat's terminal margin, so callers can build both a
+            decisive seat and a tied one.
+
+    Returns:
+        One synthetic recorded seat.
+    """
+    slots = len(MARKET_SLOTS) + 2
+    dones = torch.zeros(turns, dtype=torch.bool)
+    dones[-1] = True
+    rewards = torch.full((turns,), 0.1)
+    return Trajectory(
+        board=torch.zeros(turns, TILE_PLANES, 10, 10),
+        scalars=torch.zeros(turns, SCALARS),
+        positions=torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
+        unit_actions=torch.zeros(turns, MAX_UNITS, dtype=torch.int64),
+        unit_quantities=torch.ones(turns, MAX_UNITS, dtype=torch.int64),
+        market_actions=torch.zeros(turns, slots, dtype=torch.int64),
+        unit_masks=torch.ones(turns, MAX_UNITS, len(UNIT_OPS), dtype=torch.bool),
+        unit_quantity_masks=torch.ones(
+            turns, MAX_UNITS, len(QUANTITIES), dtype=torch.bool
+        ),
+        market_masks=torch.ones(turns, slots, len(QUANTITIES), dtype=torch.bool),
+        log_probs=torch.zeros(turns),
+        values=torch.zeros(turns),
+        rewards=rewards,
+        own=rewards,
+        shaped=rewards,
+        shaped_money=rewards,
+        margin=rewards,
+        potentials=torch.zeros(turns, 1),
+        dones=dones,
+        final_margin=final_margin,
+        final_bank=10.0,
+        final_capital=2.0,
+        illegal=0,
+        sales=1.0,
+        units_sold=1.0,
+        mean_sale_price=1.0,
+        realisation=1.0,
+        bought=1.0,
+    )
+
+
+def _record(
+    mirror_batch: list[Trajectory], econ_batch: list[Trajectory]
+) -> dict[str, object]:
+    """Call ``_record`` with the counters and loss terms it does not test."""
+    terms = {
+        "vtrace_pg": 0.0,
+        "upgo_pg": 0.0,
+        "baseline": 0.0,
+        "entropy": 0.0,
+        "teacher": 0.0,
+        "total": 0.0,
+        "baseline_passes": 0.0,
+    }
+    return toad_phase1._record(
+        mirror_batch,
+        econ_batch,
+        "shaped",
+        update=1,
+        steps=10,
+        hours=0.1,
+        lr=1e-4,
+        warming=False,
+        warmup_left=0,
+        terms=terms,
+    )
+
+
+def test_every_logged_metric_carries_a_role_prefix() -> None:
+    """Every key ``_record`` returns must be grouped under one of the four roles.
+
+    wandb sections a dashboard by the text before a key's first ``/``, which is
+    the entire mechanism that lets a reader see what role a number plays
+    before its name is read. A metric added without a prefix falls outside
+    every section and outside this guarantee, so this pins the invariant
+    structurally rather than trusting the next edit to remember it.
+
+    It also pins that every logged key has a one-line definition shipped into
+    the run (``_log_definitions``) -- the fix for THE INCIDENT, where the
+    correct reading of two metrics existed only in a source comment.
+    """
+    record = _record(
+        mirror_batch=[_trajectory(), _trajectory()], econ_batch=[_trajectory()]
+    )
+    assert record
+    assert all(key.startswith(toad_phase1.METRIC_PREFIXES) for key in record)
+    assert set(record) == set(toad_phase1.METRIC_DEFINITIONS)
+
+
+def test_mirror_decisive_rate_is_the_raw_win_rate_doubled() -> None:
+    """``win_rate_mirror`` was 0.5 by construction; the logged key must not be.
+
+    Self-play records both seats and exactly one wins, so the raw decisive
+    fraction has a hard 0.5 ceiling. Doubling it is what turns that into a
+    real 0-1 read -- "all decisive" rather than "as decisive as self-play can
+    ever look" -- and this pins the factor of two rather than trusting a
+    future edit not to drop it.
+    """
+    # One seat of every self-play episode wins (`final_margin > 0`) and the
+    # other loses, so the raw rate over both seats tops out at 0.5 -- exactly
+    # what "every game decisive, no ties" looks like. Doubled, that is 1.0.
+    decisive = [_trajectory(final_margin=1.0), _trajectory(final_margin=-1.0)]
+    record = _record(mirror_batch=decisive, econ_batch=[])
+    assert record["diag/mirror_decisive_rate"] == pytest.approx(1.0)
+
+    tied = [_trajectory(final_margin=0.0), _trajectory(final_margin=0.0)]
+    record = _record(mirror_batch=tied, econ_batch=[])
+    assert record["diag/mirror_decisive_rate"] == pytest.approx(0.0)
 
 
 def _policy() -> tuple[Policy, torch.optim.Optimizer]:
