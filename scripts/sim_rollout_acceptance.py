@@ -66,9 +66,13 @@ def economic_parity(device: torch.device, games: int) -> dict[str, object]:
         dtype=torch.int16,
         device=device,
     )
+    quantities = unit_quantity_ones(games, device)
     for _ in range(719):
-        opponent_units, markets = scripted_actions(state, economic_policy.agent)
+        opponent_units, opponent_quantities, markets = scripted_actions(
+            state, economic_policy.agent
+        )
         units[:, 1].copy_(opponent_units)
+        quantities[:, 1].copy_(opponent_quantities)
         for environment in environments:
             environment.step(
                 [
@@ -76,7 +80,7 @@ def economic_parity(device: torch.device, games: int) -> dict[str, object]:
                     economic_policy.agent(environment.state[1].observation),
                 ]
             )
-        state = step(state, units, markets, unit_quantity_ones(games, device))
+        state = step(state, units, markets, quantities)
     reference_banks = [
         int(environment.state[1].observation.farms[1].money)
         for environment in environments

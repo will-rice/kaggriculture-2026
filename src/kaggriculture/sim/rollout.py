@@ -150,22 +150,53 @@ def _sample(
     )
 
 
-def _unit_index(action: object) -> int:
+def _transfer_quantity(quantity: object) -> int | None:
+    """Return the int quantity a PICKUP/PLACE names, or ``None`` if out of domain.
+
+    Mirrors the tolerance ``_order_quantity`` applies to market orders: only
+    ``int | float | str`` coerces, exactly what the reference's own bare
+    ``int(action[2])`` accepts. Unlike ``_order_quantity`` there is no cap and
+    no floor here -- the value is encoded exactly as given, sign and all. The
+    engine clamps at execution (a non-positive amount is already a no-op
+    there), so encoding faithfully and letting it do so is the whole job.
+    """
+    if not isinstance(quantity, (int, float, str)):
+        return None
+    try:
+        return int(quantity)
+    except (TypeError, ValueError):
+        return None
+
+
+def _unit_index(action: object) -> tuple[int, int]:
+    """Return one unit action's ``(op index, quantity)``.
+
+    Quantity is 1 everywhere except a PICKUP/PLACE that names one explicitly,
+    where it is that quantity, encoded faithfully and unclamped -- the
+    simulator applies the engine's own clamp at execution. A quantity the
+    reference's bare ``int(action[2])`` could not itself parse (a list, a
+    non-numeric string) folds the whole unit action to PASS, exactly the way
+    an unparseable market order becomes the "aborted" code 7: the alternative
+    is claiming to execute an action the reference engine would instead raise
+    on.
+    """
     if not isinstance(action, (list, tuple)) or not action:
-        return UNIT_OPS.index("PASS")
+        return UNIT_OPS.index("PASS"), 1
     verb = str(action[0])
-    if verb in {"PICKUP", "PLACE"} and len(action) > 2 and action[2] != 1:
-        raise ValueError(
-            f"{verb} {action[1]!r} quantity {action[2]!r} is outside the "
-            "simulator's supported domain: PICKUP/PLACE unit actions carry "
-            "exactly one item, never an explicit quantity."
-        )
+    quantity = 1
+    if verb in {"PICKUP", "PLACE"} and len(action) > 2:
+        parsed = _transfer_quantity(action[2])
+        if parsed is None:
+            return UNIT_OPS.index("PASS"), 1
+        quantity = parsed
     name = (
         f"{verb}:{action[1]}"
         if verb in {"PLANT", "PICKUP", "PLACE"} and len(action) > 1
         else verb
     )
-    return UNIT_OPS.index(name) if name in UNIT_OPS else UNIT_OPS.index("PASS")
+    if name not in UNIT_OPS:
+        return UNIT_OPS.index("PASS"), 1
+    return UNIT_OPS.index(name), quantity
 
 
 @dataclass(frozen=True)
@@ -174,12 +205,17 @@ class TurnActions:
 
     Attributes:
         units: One op index per unit slot, ``PASS`` where the turn named none.
+        quantities: One transfer quantity per unit slot, aligned with
+            ``units``. 1 wherever the slot's op is not a ``PICKUP:*`` or
+            ``PLACE:*``; otherwise the quantity the turn named, faithfully and
+            unclamped.
         orders: ``(order_type, order_item, order_qty)`` per market slot, in the
             queue position the reference reads them in. Type 0 is "no order",
             and ``order_item`` is -1 wherever the verb carries no item.
     """
 
     units: tuple[int, ...]
+    quantities: tuple[int, ...]
     orders: tuple[tuple[int, int, int], ...]
 
 
@@ -190,27 +226,32 @@ def encode_turn(action: Mapping[str, Any]) -> TurnActions:
         action: A turn in the engine's action grammar.
 
     Returns:
-        The encoded turn. Malformed orders become the "aborted" code 7, which is
-        what the reference does with an order it cannot parse.
+        The encoded turn. Malformed orders become the "aborted" code 7, and a
+        PICKUP/PLACE naming a quantity the reference itself could not parse
+        becomes PASS -- both are what the reference does with an action it
+        cannot execute.
 
     Raises:
-        ValueError: If a unit action or market order names a quantity outside
-            the simulator's supported domain that the reference engine would
-            still execute. See ``_unit_index`` and ``_encode_order``.
+        ValueError: If a market order names a quantity outside the
+            simulator's supported domain that the reference engine would
+            still execute. See ``_encode_order``.
     """
     units = [UNIT_OPS.index("PASS")] * MAX_UNITS
-    units[0] = _unit_index(action.get("farmer", ["PASS"]))
+    quantities = [1] * MAX_UNITS
+    units[0], quantities[0] = _unit_index(action.get("farmer", ["PASS"]))
     hands = action.get("hands") or []
     if isinstance(hands, list):
         for unit, unit_action in enumerate(hands[: MAX_UNITS - 1], start=1):
-            units[unit] = _unit_index(unit_action)
+            units[unit], quantities[unit] = _unit_index(unit_action)
 
     orders: list[tuple[int, int, int]] = [(0, -1, 0)] * MAX_MARKET_ORDERS_PER_TURN
     given = action.get("market") or []
     if isinstance(given, list):
         for slot, order in enumerate(given[:MAX_MARKET_ORDERS_PER_TURN]):
             orders[slot] = _encode_order(order)
-    return TurnActions(units=tuple(units), orders=tuple(orders))
+    return TurnActions(
+        units=tuple(units), quantities=tuple(quantities), orders=tuple(orders)
+    )
 
 
 def _order_quantity(verb: str, item: str, quantity: object) -> int:
@@ -288,7 +329,7 @@ def _encode_order(order: object) -> tuple[int, int, int]:
 
 def scripted_actions(
     state: SimState, opponent: ScriptedOpponent, seat: int = 1
-) -> tuple[torch.Tensor, MarketActions]:
+) -> tuple[torch.Tensor, torch.Tensor, MarketActions]:
     """Bridge a dict-based scripted opponent into fixed simulator tensors."""
     if seat not in (0, 1):
         raise ValueError(f"seat must be 0 or 1, got {seat}")
@@ -299,16 +340,21 @@ def scripted_actions(
         dtype=torch.int16,
         device=device,
     )
+    quantities = torch.ones(
+        (state.batch_size, MAX_UNITS), dtype=torch.int16, device=device
+    )
     markets = MarketActions.empty(state.batch_size, device=device)
     for batch in range(state.batch_size):
         encoded = encode_turn(opponent(unpack(state, batch, seat)))
         for unit, op in enumerate(encoded.units):
             units[batch, unit] = op
+        for unit, quantity in enumerate(encoded.quantities):
+            quantities[batch, unit] = quantity
         for slot, (kind, item, quantity) in enumerate(encoded.orders):
             markets.order_type[batch, seat, slot] = kind
             markets.order_item[batch, seat, slot] = item
             markets.order_qty[batch, seat, slot] = quantity
-    return units, markets
+    return units, quantities, markets
 
 
 def collect_segment(
@@ -338,14 +384,16 @@ def collect_segment(
     Python function what to play. That is a synchronisation per row per turn,
     so a scripted segment cannot be captured and is not meant to be.
 
-    A scripted opponent is also bound by the simulator's action domain: a unit
-    action has no quantity lane, so an opponent that emits a bulk ``PICKUP`` or
-    ``PLACE`` (a quantity other than 1) is outside that domain and
-    ``encode_turn`` now raises rather than silently transferring one item.
-    ``economic_policy.agent`` is such an opponent -- it issues bulk transfers
-    once its shed and worker inventories are non-empty -- which is why the
-    bridge tests that drive it through this function use only a turn or two: a
-    longer segment would raise.
+    A scripted opponent's bulk transfers ride the same quantity lane the
+    learning seat does. Before this, a unit action had no such lane and an
+    opponent that emitted a bulk ``PICKUP`` or ``PLACE`` (a quantity other
+    than 1) was outside the simulator's domain, so ``encode_turn`` raised
+    rather than silently transferring one item -- which is why the bridge
+    tests that drove ``economic_policy.agent`` through this function once used
+    only a turn or two, since it issues exactly such a bulk transfer as soon
+    as its shed and worker inventories are non-empty. The domain grew to carry
+    quantities in full (2026-08-21); those tests now run the opponent past the
+    turn that used to raise.
 
     Args:
         state: The batch to advance. Left untouched; the successor is returned.
@@ -398,9 +446,13 @@ def collect_segment(
         chosen_units, unit_log = _sample(unit_logits, unit_masks, generator)
         chosen_market, market_log = _sample(market_logits, market_masks, generator)
         market_orders = decode_market_buckets(chosen_market)
+        unit_quantities = unit_quantity_ones(state.batch_size, state.step.device)
         if opponent is not None:
-            opponent_units, opponent_market = scripted_actions(state, opponent)
+            opponent_units, opponent_quantities, opponent_market = scripted_actions(
+                state, opponent
+            )
             chosen_units[:, 1].copy_(opponent_units)
+            unit_quantities[:, 1].copy_(opponent_quantities)
             market_orders.order_type[:, 1].copy_(opponent_market.order_type[:, 1])
             market_orders.order_item[:, 1].copy_(opponent_market.order_item[:, 1])
             market_orders.order_qty[:, 1].copy_(opponent_market.order_qty[:, 1])
@@ -416,7 +468,7 @@ def collect_segment(
             state,
             chosen_units.to(torch.int16),
             market_orders,
-            unit_quantity_ones(state.batch_size, state.step.device),
+            unit_quantities,
         )
         after_money = next_state.money
         after_margin = after_money - after_money.flip(1)
