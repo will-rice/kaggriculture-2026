@@ -188,6 +188,13 @@ def _routes(episode: dict) -> tuple[Route, Route, int]:
     )
 
 
+# Only the batched sweep stays in the default suite. It replays eight episodes
+# in ONE batched call, so it costs the same wall-clock as replaying one -- the
+# 719 sequential steps dominate, not the batch width -- and it is the broadest
+# of the three checks. The other two each pay for further full seasons and are
+# marked slow, which this project defines as "reads the replay corpus; minutes,
+# not seconds". They still run under `pytest -m slow` locally, where the corpus
+# lives; CI has no corpus and skips this module entirely either way.
 def test_recorded_top_episodes_replay_to_exact_banks() -> None:
     assert ARCHIVE is not None  # narrows the type; the module skips otherwise
     episodes = _top_episodes(ARCHIVE, EPISODE_COUNT)
@@ -217,6 +224,7 @@ def test_recorded_top_episodes_replay_to_exact_banks() -> None:
     )
 
 
+@pytest.mark.slow
 def test_batched_replay_matches_one_at_a_time() -> None:
     assert ARCHIVE is not None  # narrows the type; the module skips otherwise
     episodes = _top_episodes(ARCHIVE, EPISODE_COUNT)
@@ -239,6 +247,7 @@ def test_batched_replay_matches_one_at_a_time() -> None:
     assert torch.equal(looped, batched)
 
 
+@pytest.mark.slow
 def test_a_sell_everything_regression_episode_replays_to_the_exact_bank() -> None:
     """Pin the exact failure class fix round 1 found: a real ``SELL X 999`` episode.
 
