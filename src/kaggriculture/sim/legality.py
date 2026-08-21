@@ -18,6 +18,7 @@ from kaggriculture.learn.encoding import (
     QUANTITIES,
     UNIT_OPS,
 )
+from kaggriculture.sim.market import QUANTITY_AXIS
 from kaggriculture.sim.pricing import market_prices
 from kaggriculture.sim.state import (
     ANIMAL_NAMES,
@@ -131,7 +132,7 @@ def _market_mask(state: SimState, seat: int) -> torch.Tensor:
     room = SHED_CAPACITY - state.shed[:, seat].sum(dim=-1)
     fillable = []
     product_index = {name: index for index, name in enumerate(PRODUCT_NAMES)}
-    unit_offsets = torch.arange(1, 65, dtype=torch.int64, device=device)
+    unit_offsets = torch.arange(1, QUANTITY_AXIS + 1, dtype=torch.int64, device=device)
     for verb, item in MARKET_SLOTS:
         if verb == "SELL":
             value = state.shed[:, seat, _PRODUCT_SHED[item]].to(torch.int64)

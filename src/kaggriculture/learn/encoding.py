@@ -927,29 +927,65 @@ MAX_ORDERS = MAX_MARKET_ORDERS_PER_TURN
 
 # The first thirteen buckets are exact counts: 93.5% of orders in the corpus
 # are 12 or fewer, and lumping that dense range into ranges would blur most of
-# the distribution the model has to predict. The remaining four buckets
-# summarize the long tail -- 13-20, 21-32, 33-52, 53+ -- each labelled by one
-# representative quantity, so a big order is still distinguishable from no
-# order without one class per order size seen only a handful of times.
-QUANTITIES: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 24, 40, 64)
+# the distribution the model has to predict. The next four buckets summarize
+# 13-64 -- 13-20, 21-32, 33-52, 53-64 -- each labelled by one representative
+# quantity, so a big order is still distinguishable from no order without one
+# class per order size seen only a handful of times.
+#
+# The last four buckets (80, 100, 130, 165) are this task's addition, sized
+# from a market phase that could only ever fill 64 units of one order: 65 of
+# 150 of the newest corpus archive's top-rated, engine-matched episodes (43%)
+# had at least one market order the engine filled *above* 64 -- not merely
+# requested above it, but actually committed, unit by unit, past the old
+# axis. 80 covers the dense cluster the fills sit in (mostly WHEAT sales,
+# peaking at 77 -- 26 of the 89 over-64 fills measured); 100 matches
+# ``SHED_CAPACITY``, the structural ceiling for every shed-bound role (SELL,
+# BUY_PRODUCT, BUY_ANIMAL can never fill past what the shed can hold); 165 is
+# the ceiling, with real headroom past the measured max fill of 86 -- carried
+# up from the largest *requested* quantities seen in top play (BUY_SEED is not
+# shed-bound, so a request that large is not structurally impossible even
+# though this scan's fills never reached it).
+QUANTITIES: tuple[int, ...] = (
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    16,
+    24,
+    40,
+    64,
+    80,
+    100,
+    130,
+    165,
+)
 
-# The inclusive upper bound of each of the three bounded tail buckets (index
-# 13, 14, 15); the fourth tail bucket (index 16, representative 64) is
-# unbounded above. These are not derivable from QUANTITIES itself -- the
-# representative quantities step by a roughly-1.5x progression (12, 16, 24,
-# 40, 64) while the ranges they stand for widen faster (8, 12, 20, then
-# open-ended), so "the next representative minus one" is not this scheme;
-# the ranges are their own design choice and are written out accordingly.
-_TAIL_BUCKET_MAX = (20, 32, 52)
+# The inclusive upper bound of each bounded tail bucket (index 13 through 19);
+# the last tail bucket (index 20, representative 165) is unbounded above.
+# These are not derivable from QUANTITIES itself -- the representative
+# quantities step by a roughly-1.3x progression while the ranges they stand
+# for widen at their own rate (8, 12, 20, 12, 16, 20, 30, then open-ended), so
+# "the next representative minus one" is not this scheme; the ranges are
+# their own design choice and are written out accordingly.
+_TAIL_BUCKET_MAX = (20, 32, 52, 64, 80, 100, 130)
 
 
 def bucket_of(n: int) -> int:
     """Return the bucket index that quantity ``n`` falls into.
 
     The first thirteen buckets are exact: bucket ``k`` is quantity ``k``
-    itself, for ``k`` up to 12. Past that, a quantity falls into whichever of
-    the three bounded tail ranges (13-20, 21-32, 33-52) contains it, or the
-    open-ended 53+ bucket if it exceeds all of them.
+    itself, for ``k`` up to 12. Past that, a quantity falls into whichever
+    bounded tail range in ``_TAIL_BUCKET_MAX`` contains it, or the open-ended
+    166+ bucket if it exceeds all of them.
 
     Args:
         n: A non-negative quantity, possibly already summed across repeated

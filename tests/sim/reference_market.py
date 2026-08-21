@@ -32,6 +32,7 @@ import torch
 from kaggriculture.constants import ANIMALS, CROPS, LAND_PRICES, SHED_CAPACITY
 from kaggriculture.learn.encoding import MAX_UNITS
 from kaggriculture.sim.engine import MarketActions
+from kaggriculture.sim.market import QUANTITY_AXIS
 from kaggriculture.sim.pricing import market_prices, refresh_prices
 from kaggriculture.sim.state import (
     ANIMAL_NAMES,
@@ -211,14 +212,21 @@ def _compacted(actions: MarketActions) -> MarketActions:
 
 
 def apply_market_phase(original: SimState, actions: MarketActions) -> SimState:
-    """Apply ten order indices with a fixed 65-iteration quantity scan."""
+    """Apply ten order indices with a fixed ``QUANTITY_AXIS + 1``-round quantity scan.
+
+    The round count tracks ``QUANTITY_AXIS`` rather than restating it, so the
+    oracle keeps scanning at least as far as the tensor phase it validates:
+    a scan narrower than the axis it checks would silently pass a widening bug
+    by never walking far enough to see it.
+    """
     expected = (original.batch_size, 2, 10)
     if tuple(actions.order_type.shape) != expected:
         raise ValueError(
             f"expected market actions {expected}, got {tuple(actions.order_type.shape)}"
         )
     torch._assert(
-        (actions.order_qty <= 64).all(), "market order quantity exceeds fixed scan"
+        (actions.order_qty <= QUANTITY_AXIS).all(),
+        "market order quantity exceeds fixed scan",
     )
     actions = _compacted(actions)
     state = _clone(original)
@@ -232,7 +240,7 @@ def apply_market_phase(original: SimState, actions: MarketActions) -> SimState:
         _hire(state, atomic & (order_type == 5))
         _buy_land(state, atomic & (order_type == 6))
         active &= ~atomic
-        for _ in range(65):
+        for _ in range(QUANTITY_AXIS + 1):
             price, valid = _quote(state, order_type, item, active)
             committed = _commit(state, order_type, item, price, valid)
             remaining.sub_(committed.to(remaining.dtype))

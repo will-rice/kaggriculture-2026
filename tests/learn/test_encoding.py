@@ -1290,12 +1290,12 @@ def test_buckets_are_exact_where_the_corpus_is_dense() -> None:
     assert bucket_of(7) == 7
     assert bucket_of(12) == 12
     assert bucket_of(13) == bucket_of(16) > 12
-    assert bucket_of(85) == len(QUANTITIES) - 1
+    assert bucket_of(200) == len(QUANTITIES) - 1
 
 
 def test_a_bucket_round_trips_to_a_quantity_that_lands_in_it() -> None:
     """Decoding must not emit a count outside the bucket it came from."""
-    for n in (0, 1, 5, 12, 14, 20, 30, 85):
+    for n in (0, 1, 5, 12, 14, 20, 30, 85, 130, 200):
         assert bucket_of(quantity_of(bucket_of(n))) == bucket_of(n)
 
 

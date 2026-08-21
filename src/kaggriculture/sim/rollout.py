@@ -16,6 +16,7 @@ from kaggriculture.sim.engine import (
     unit_quantity_ones,
 )
 from kaggriculture.sim.legality import legal
+from kaggriculture.sim.market import QUANTITY_AXIS
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.state import (
     ANIMAL_NAMES,
@@ -272,12 +273,12 @@ def _order_quantity(verb: str, item: str, quantity: object) -> int:
     Raises:
         ValueError: If the quantity is outside the simulator's supported
             domain but the reference engine's ``_parse_order`` would still
-            accept it -- an int quantity over 64 (the reference has no cap),
-            or a non-int the reference would coerce via ``int()`` and execute
-            (a numeric string, say). Silently clamping the former or aborting
-            the latter would diverge from what the reference actually
-            replays; the RL action space only ever emits small int
-            quantities, so this never fires for it.
+            accept it -- an int quantity over ``QUANTITY_AXIS`` (the
+            reference has no cap), or a non-int the reference would coerce via
+            ``int()`` and execute (a numeric string, say). Silently clamping
+            the former or aborting the latter would diverge from what the
+            reference actually replays; the RL action space only ever emits
+            small int quantities, so this never fires for it.
     """
     if not isinstance(quantity, (int, float, str)):
         return -1
@@ -286,10 +287,11 @@ def _order_quantity(verb: str, item: str, quantity: object) -> int:
     except (TypeError, ValueError):
         return -1
     if isinstance(quantity, int):
-        if coerced > 64:
+        if coerced > QUANTITY_AXIS:
             raise ValueError(
                 f"{verb} {item!r} quantity {quantity!r} is outside the "
-                "simulator's supported domain: quantity must not exceed 64"
+                "simulator's supported domain: quantity must not exceed "
+                f"{QUANTITY_AXIS}"
             )
         return max(0, coerced)
     if coerced <= 0:

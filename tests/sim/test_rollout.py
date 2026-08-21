@@ -261,17 +261,24 @@ def test_unit_index_encodes_a_place_quantity_outside_the_old_domain() -> None:
     assert encoded.quantities[1] == 2
 
 
-def test_encode_order_raises_on_a_quantity_over_64() -> None:
-    """The reference has no cap; clamping to 64 would silently alter the order.
+def test_encode_order_raises_on_a_quantity_over_the_axis() -> None:
+    """The reference has no cap; clamping would silently alter the order.
 
-    The RL action space never emits a quantity this large, so this never
-    fires for it -- only for an order outside the simulator's domain.
+    1,000,000 is the engine's own "sell everything" sentinel -- always well
+    past whatever ``QUANTITY_AXIS`` is, so this stays a true over-cap case as
+    the axis widens rather than needing to be re-tuned alongside it. The RL
+    action space never emits a quantity this large, so this never fires for
+    it -- only for an order outside the simulator's domain.
     """
     from kaggriculture.sim.rollout import encode_turn
 
-    with pytest.raises(ValueError, match="SELL.*WHEAT.*100"):
+    with pytest.raises(ValueError, match="SELL.*WHEAT.*1000000"):
         encode_turn(
-            {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 100]]}
+            {
+                "farmer": ["PASS"],
+                "hands": [],
+                "market": [["SELL", "WHEAT", 1_000_000]],
+            }
         )
 
 

@@ -75,9 +75,9 @@ from tests.sim.reference_market import apply_market_phase as reference_market_ph
 DEVICE = torch.device("cpu")
 SLOTS = MAX_MARKET_ORDERS_PER_TURN
 
-# The oracle scans a fixed 65 unit-rounds and asserts nothing exceeds it, so the
-# campaign requests at most the largest decoder bucket -- which is also the
-# width of the tensor quantity axis that replaced the scan.
+# The oracle's scan width tracks `QUANTITY_AXIS` and asserts nothing exceeds
+# it, so the campaign requests at most the largest decoder bucket -- which is
+# also the width of the tensor quantity axis that replaced the scan.
 MAX_QUANTITY = max(QUANTITIES)
 
 # A seat below the cheapest quote in the game cannot fill anything it is

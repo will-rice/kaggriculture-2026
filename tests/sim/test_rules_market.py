@@ -8,6 +8,7 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as reference_en
 from kaggriculture.sim.day import apply_day_phases
 from kaggriculture.sim.engine import MarketActions
 from kaggriculture.sim.market import apply_market_phase
+from kaggriculture.sim.rollout import encode_turn
 from kaggriculture.sim.state import (
     CROP_NAMES,
     PRODUCT_NAMES,
@@ -18,6 +19,7 @@ from tests.sim.states import (
     book_at,
     hire_ladder,
     price_at_floor,
+    shed_at_capacity,
     shed_one_below_capacity,
 )
 
@@ -230,5 +232,34 @@ def test_market_phase_refreshes_stored_prices_before_the_day_phase() -> None:
     environment.state[1].observation.market = environment.state[0].observation.market
     environment.state[1].observation.farms = environment.state[0].observation.farms
     actual = apply_market_phase(state, actions)
+
+    _assert_observations(environment, actual)
+
+
+def test_sell_above_the_old_axis_cap_matches_the_reference() -> None:
+    """A fill above the pre-widening 64-unit axis resolves exactly like the reference.
+
+    77 sits in the 77-80 cluster where most of the corpus's over-cap sales
+    land (see ``sim.tape``'s module docstring for the measured incidence).
+    Stock of exactly 77 WHEAT makes the sale fully fillable and not
+    stock-limited, so the axis width is the only thing under test. Built
+    through ``encode_turn``, the same path a replayed route takes, rather than
+    ``MarketActions`` fields set by hand -- so this exercises the real cap,
+    not a hand-rolled stand-in for it.
+    """
+    environment = shed_at_capacity(holding={"WHEAT": 77})
+    state = pack([environment])
+    actions = MarketActions.empty(1)
+    kind, item, quantity = encode_turn({"market": [["SELL", "WHEAT", 77]]}).orders[0]
+    actions.order_type[0, 0, 0] = kind
+    actions.order_item[0, 0, 0] = item
+    actions.order_qty[0, 0, 0] = quantity
+    reference = [
+        {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 77]]},
+        {"farmer": ["PASS"], "hands": [], "market": []},
+    ]
+
+    environment.step(reference)
+    actual = apply_day_phases(apply_market_phase(state, actions))
 
     _assert_observations(environment, actual)

@@ -1,21 +1,23 @@
 """Recorded top episodes replay through the simulator to their exact banks.
 
-This is the differential proof of the quantity lane -- the *unit* transfer
-lane specifically. A recorded top episode exercises bulk transfers on most of
-its PICKUP/PLACE actions, branches the RL-action-space differential tests
-structurally never reach, and the engine is deterministic given seed and both
-seats' actions, so equality is exact or the lane is wrong. Do not weaken to a
-tolerance; a mismatch is a bug with a turn number, found by comparing money
-per turn.
+This is the differential proof of the quantity lane -- both lanes together now
+that the market lane's axis has been widened to cover ordinary top play (see
+``sim.tape``'s module docstring). A recorded top episode exercises bulk
+PICKUP/PLACE on most of its transfers and market orders past the market
+lane's old 64-unit cap on most of its turns, branches the RL-action-space
+differential tests structurally never reach, and the engine is deterministic
+given seed and both seats' actions, so equality is exact or the lane is
+wrong. Do not weaken to a tolerance; a mismatch is a bug with a turn number,
+found by comparing money per turn.
 
-Selection is restricted to episodes whose actions ``encode_turn`` can
-represent at all: a market order above ``sim.market.QUANTITY_AXIS`` is
-outside the simulator's domain today and raises at encode time (see
-``sim.tape``'s module docstring for the measured incidence). That restriction
-is applied openly here, not as a silent skip -- ``_top_episodes`` returns how
-many otherwise-eligible episodes it excluded and why, and both tests log that
-count, so a reader sees the proof's real scope rather than mistaking a lucky
-sample for full coverage of recorded top play.
+Selection is by rating and engine version alone -- no filtering on whether an
+episode's actions happen to stay inside the simulator's domain. A market
+order naming a quantity past even the widened axis (the engine's own "sell
+everything" sentinel is the one seen in practice) is still outside it, and
+``encode_turn`` still raises on it rather than silently clamping. If that
+happens to land inside the top-rated sample this test selects, the test below
+fails loudly, naming the episode and the reason -- it does not skip the
+episode and quietly report on a smaller, luckier sample.
 """
 # ruff: noqa: D103
 
@@ -30,7 +32,6 @@ import torch
 
 from kaggriculture.learn.corpus import CORPUS, read_manifest
 from kaggriculture.search.route import Route, from_episode
-from kaggriculture.sim.rollout import encode_turn
 from kaggriculture.sim.tape import replay
 
 LOGGER = logging.getLogger(__name__)
@@ -45,65 +46,42 @@ pytestmark = pytest.mark.skipif(
     ARCHIVE is None, reason="replay corpus not present on this machine"
 )
 
-
-def _quantity_cap_compliant(episode: dict) -> bool:
-    """Return whether both seats' whole routes stay inside the simulator's domain.
-
-    Tries the real ``encode_turn`` on every recorded action rather than
-    re-deriving the cap here, so this stays accurate as the domain widens (a
-    follow-up task raises ``QUANTITY_AXIS``) without needing to change in
-    lockstep with it. A ``ValueError`` is exactly what ``encode_turn`` raises
-    for a market order the reference engine would execute but the simulator
-    cannot yet, per ``sim.rollout._order_quantity``.
-    """
-    for seat in (0, 1):
-        for action in from_episode(episode, seat):
-            try:
-                encode_turn(action)
-            except ValueError:
-                return False
-    return True
+# The floor Step 6 of the market-lane task set: enough episodes that this is a
+# real sample of top play, not three that happened to be convenient.
+EPISODE_COUNT = 8
 
 
-def _top_episodes(archive: Path, count: int) -> tuple[list[dict], int]:
-    """Return the ``count`` strongest cap-compliant, ``ENGINE``-version episodes.
+def _top_episodes(archive: Path, count: int) -> list[dict]:
+    """Return the ``count`` strongest ``ENGINE``-version episodes, by ``min_score``.
 
     "Strongest" is by ``min_score``, the weaker seat's rating -- the same
     column ``learn.corpus.select`` ranks on -- so a chosen episode had two
     strong players in it, not one strong player against a pushover.
 
-    Cap-compliance is a real filter, not an artifact of luck: most top
-    episodes carry a market order above ``QUANTITY_AXIS`` (see ``sim.tape``'s
-    module docstring), so selecting on rating and engine version alone would
-    still, more often than not, hand back an episode ``replay`` cannot
-    encode. Filtering here keeps the proof honest about what it covers; the
-    exclusion count returned lets the caller say so out loud instead of
-    silently narrowing the sample.
+    No cap-compliance filtering: unlike the market lane's pre-widening state,
+    an ordinary top-rated episode is now expected to stay inside the
+    simulator's domain, and a selection that filtered on it anyway would risk
+    quietly narrowing the sample back down without saying so. If a selected
+    episode still cannot replay, the tests below say so loudly instead.
 
     Args:
         archive: Daily archive to select from.
-        count: How many cap-compliant episodes to return.
+        count: How many episodes to return.
 
     Returns:
-        The selected episodes, best-rated first, and how many otherwise
-        rating- and engine-eligible episodes were skipped for having a
-        market order outside the simulator's domain.
+        The ``count`` best-rated, engine-matched episodes, best first.
     """
     rows = sorted(read_manifest(archive), key=lambda row: -row.min_score)
     episodes: list[dict] = []
-    excluded = 0
     with zipfile.ZipFile(archive) as bundle:
         for row in rows:
             episode = json.loads(bundle.read(f"{row.episode_id}.json"))
             if episode.get("module_version") != ENGINE:
                 continue
-            if not _quantity_cap_compliant(episode):
-                excluded += 1
-                continue
             episodes.append(episode)
             if len(episodes) >= count:
                 break
-    return episodes, excluded
+    return episodes
 
 
 def _routes(episode: dict) -> tuple[Route, Route, int]:
@@ -115,39 +93,39 @@ def _routes(episode: dict) -> tuple[Route, Route, int]:
     )
 
 
-def test_recorded_top_cap_compliant_episodes_replay_to_exact_banks() -> None:
+def test_recorded_top_episodes_replay_to_exact_banks() -> None:
     assert ARCHIVE is not None  # narrows the type; the module skips otherwise
-    episodes, excluded = _top_episodes(ARCHIVE, 3)
-    LOGGER.info(
-        "selected %d cap-compliant episodes; excluded %d rating/engine-eligible "
-        "episodes for a market order above QUANTITY_AXIS",
-        len(episodes),
-        excluded,
-    )
-    assert len(episodes) == 3
+    episodes = _top_episodes(ARCHIVE, EPISODE_COUNT)
+    assert len(episodes) == EPISODE_COUNT
 
+    failures: list[str] = []
     for episode in episodes:
+        episode_id = episode["info"]["EpisodeId"]
         seat_zero, seat_one, seed = _routes(episode)
-
-        banks = replay([seat_zero], [seat_one], [seed])
-
+        try:
+            banks = replay([seat_zero], [seat_one], [seed])
+        except ValueError as error:
+            failures.append(f"episode {episode_id}: could not replay: {error}")
+            continue
         expected = torch.tensor([episode["rewards"]], dtype=torch.int64)
-        assert torch.equal(banks, expected), (
-            f"episode {episode['info']['EpisodeId']}: replayed {banks.tolist()} "
-            f"!= recorded {expected.tolist()}"
-        )
+        if not torch.equal(banks, expected):
+            failures.append(
+                f"episode {episode_id}: replayed {banks.tolist()} != recorded "
+                f"{expected.tolist()}"
+            )
+        else:
+            LOGGER.info("episode %d: replayed to the exact recorded bank", episode_id)
 
-
-def test_batched_cap_compliant_replay_matches_one_at_a_time() -> None:
-    assert ARCHIVE is not None  # narrows the type; the module skips otherwise
-    episodes, excluded = _top_episodes(ARCHIVE, 3)
-    LOGGER.info(
-        "selected %d cap-compliant episodes; excluded %d rating/engine-eligible "
-        "episodes for a market order above QUANTITY_AXIS",
-        len(episodes),
-        excluded,
+    assert not failures, (
+        f"{len(failures)}/{len(episodes)} top episodes did not replay to their "
+        "recorded bank:\n" + "\n".join(failures)
     )
-    assert len(episodes) == 3
+
+
+def test_batched_replay_matches_one_at_a_time() -> None:
+    assert ARCHIVE is not None  # narrows the type; the module skips otherwise
+    episodes = _top_episodes(ARCHIVE, EPISODE_COUNT)
+    assert len(episodes) == EPISODE_COUNT
     seat_zero, seat_one, seeds = [], [], []
     for episode in episodes:
         zero, one, seed = _routes(episode)

@@ -8,16 +8,21 @@ bank exactly, because the engine is deterministic given a seed and both
 seats' actions.
 
 That guarantee holds only for routes whose *market* orders stay inside the
-simulator's domain. A market fill above ``sim.market.QUANTITY_AXIS``
-(currently 64) is outside it, and ``encode_turn`` raises rather than
-silently clamping or truncating one -- see ``sim.rollout._order_quantity``.
-This is not an edge case: a scan of the current top-rated 1.32.7 episodes
-found 85% (128 of 150) carry at least one market order above the axis,
-typically in the 77-80 range. Widening the axis is a planned follow-up; until
-it lands, ``replay`` -- and anything that selects episodes to feed it --
-covers only the routes that stay inside the axis today, not "recorded top
-play" unqualified. A route that does stay inside it replays here to the
-exact bank it was harvested with, or the lane is wrong.
+simulator's domain. A market fill above ``sim.market.QUANTITY_AXIS`` is
+outside it, and ``encode_turn`` raises rather than silently clamping or
+truncating one -- see ``sim.rollout._order_quantity``. This was not an edge
+case at the axis's original width of 64: a scan of top-rated 1.32.7 episodes
+found the large majority carry at least one market order above it, typically
+in the 65-80 range, real fills the engine actually committed unit by unit --
+not merely requested and then clamped down by stock or shed room. The axis
+was widened to 165 for exactly that reason (see the comment beside
+``QUANTITIES`` in ``learn.encoding`` for the measured distribution behind the
+number), with real headroom above every fill measured. A request naming a
+quantity past even that -- the engine's own "sell everything" sentinel is the
+one seen in practice -- is still outside the domain, and ``encode_turn``
+still raises on it rather than silently clamping. A route that does stay
+inside the domain replays here to the exact bank it was harvested with, or
+the lane is wrong.
 """
 
 from collections.abc import Sequence
