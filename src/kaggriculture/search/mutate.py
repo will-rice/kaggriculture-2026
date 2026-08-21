@@ -36,6 +36,7 @@ from kaggriculture.constants import ANIMALS as _ENGINE_ANIMALS
 from kaggriculture.constants import CROPS as _ENGINE_CROPS
 from kaggriculture.constants import PRODUCTS as _ENGINE_PRODUCTS
 from kaggriculture.search.route import Route
+from kaggriculture.sim.market import QUANTITY_AXIS
 
 # Built from `kaggriculture.constants`, which itself imports live from the
 # installed engine, rather than hand-copied -- verified equal to the engine's
@@ -180,6 +181,12 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         # comment above for why. Sharing that stratification with `retarget`
         # is what keeps a buy-side resize from being drowned by a hundred
         # SELL orders.
+        #
+        # The ceiling is `QUANTITY_AXIS`, not a restated literal: this search
+        # is offline and never touches the simulator's tensor axis directly,
+        # but a route it produces still has to replay through it, so a
+        # ceiling narrower than the axis would make the search blind to the
+        # 65-165 range real top play actually uses.
         kind = rng.choice([k for k, slots in kind_slots.items() if slots])
         turn, slot = rng.choice(kind_slots[kind])
         order = list(mutated[turn]["market"][slot])
@@ -187,9 +194,9 @@ def mutate(route: Route, rng: random.Random) -> tuple[Route, str]:
         deltas = [
             d
             for d in (-4, -2, -1, 1, 2, 4)
-            if max(1, min(64, current_quantity + d)) != current_quantity
+            if max(1, min(QUANTITY_AXIS, current_quantity + d)) != current_quantity
         ]
-        quantity = max(1, min(64, current_quantity + rng.choice(deltas)))
+        quantity = max(1, min(QUANTITY_AXIS, current_quantity + rng.choice(deltas)))
         order[2] = quantity
         mutated[turn]["market"][slot] = order
         return mutated, f"turn {turn} slot {slot}: quantity -> {quantity}"

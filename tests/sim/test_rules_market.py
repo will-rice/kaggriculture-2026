@@ -263,3 +263,37 @@ def test_sell_above_the_old_axis_cap_matches_the_reference() -> None:
     actual = apply_day_phases(apply_market_phase(state, actions))
 
     _assert_observations(environment, actual)
+
+
+def test_sell_999_sentinel_clamps_to_the_axis_and_matches_the_reference() -> None:
+    """The "sell everything" idiom (``SELL X 999``) must replay exactly.
+
+    Top play spells "sell all my stock" as a market order naming some large,
+    round quantity -- 999 is the pattern an independent scan found in 4.75%
+    of a 400-episode sample, spread across the ranking, not a rare outlier.
+    999 exceeds ``QUANTITY_AXIS`` (165), but the reference's own
+    ``_commit_unit`` bounds a SELL at the shed's stock regardless of the
+    request, and the stock here (12 STRAWBERRY) is nowhere near either
+    number -- so the request-side clamp to 165 and the engine's own
+    stock-side clamp to 12 must produce the identical sale. See the comment
+    above ``SHED_BOUND_VERBS`` in ``sim.rollout`` for why that equivalence
+    holds for every request, not just this one.
+    """
+    environment = shed_at_capacity(holding={"STRAWBERRY": 12})
+    state = pack([environment])
+    actions = MarketActions.empty(1)
+    kind, item, quantity = encode_turn(
+        {"market": [["SELL", "STRAWBERRY", 999]]}
+    ).orders[0]
+    actions.order_type[0, 0, 0] = kind
+    actions.order_item[0, 0, 0] = item
+    actions.order_qty[0, 0, 0] = quantity
+    reference = [
+        {"farmer": ["PASS"], "hands": [], "market": [["SELL", "STRAWBERRY", 999]]},
+        {"farmer": ["PASS"], "hands": [], "market": []},
+    ]
+
+    environment.step(reference)
+    actual = apply_day_phases(apply_market_phase(state, actions))
+
+    _assert_observations(environment, actual)

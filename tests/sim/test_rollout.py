@@ -261,25 +261,48 @@ def test_unit_index_encodes_a_place_quantity_outside_the_old_domain() -> None:
     assert encoded.quantities[1] == 2
 
 
-def test_encode_order_raises_on_a_quantity_over_the_axis() -> None:
-    """The reference has no cap; clamping would silently alter the order.
+def test_encode_order_raises_on_a_buy_seed_quantity_over_the_axis() -> None:
+    """BUY_SEED has no shed to bound it, so an over-axis request still raises.
 
-    1,000,000 is the engine's own "sell everything" sentinel -- always well
-    past whatever ``QUANTITY_AXIS`` is, so this stays a true over-cap case as
-    the axis widens rather than needing to be re-tuned alongside it. The RL
-    action space never emits a quantity this large, so this never fires for
-    it -- only for an order outside the simulator's domain.
+    Seeds land in ``private["seeds"]``, never the shed, so unlike
+    SELL/BUY_PRODUCT/BUY_ANIMAL (bounded by ``SHED_CAPACITY`` and safe to
+    clamp -- see ``sim.rollout.SHED_BOUND_VERBS``), a BUY_SEED request this
+    large has no structural bound to appeal to. Clamping it would risk
+    silently truncating a genuinely large seed fill the reference would have
+    executed in full, which is exactly the divergence this guard exists to
+    prevent. 1,000,000 is the engine's own "sell everything" sentinel
+    magnitude, reused here as a quantity always well past whatever
+    ``QUANTITY_AXIS`` is. The RL action space never emits a quantity this
+    large, so this never fires for it -- only for an order outside the
+    simulator's domain.
     """
     from kaggriculture.sim.rollout import encode_turn
 
-    with pytest.raises(ValueError, match="SELL.*WHEAT.*1000000"):
+    with pytest.raises(ValueError, match="BUY_SEED.*WHEAT.*1000000"):
         encode_turn(
             {
                 "farmer": ["PASS"],
                 "hands": [],
-                "market": [["SELL", "WHEAT", 1_000_000]],
+                "market": [["BUY_SEED", "WHEAT", 1_000_000]],
             }
         )
+
+
+def test_encode_order_clamps_a_sell_quantity_over_the_axis() -> None:
+    """SELL is shed-bound, so an over-axis request clamps rather than raising.
+
+    See ``sim.rollout.SHED_BOUND_VERBS`` for the equivalence argument: the
+    engine can never sell more than the shed holds, which is always below
+    ``QUANTITY_AXIS``, so clamping the request here changes nothing about
+    what gets executed.
+    """
+    from kaggriculture.sim.rollout import QUANTITY_AXIS, encode_turn
+
+    encoded = encode_turn(
+        {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 999]]}
+    )
+
+    assert encoded.orders[0] == (1, PRODUCT_NAMES.index("WHEAT"), QUANTITY_AXIS)
 
 
 def test_encode_order_raises_on_a_numeric_string_quantity() -> None:

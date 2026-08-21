@@ -6,7 +6,13 @@ from typing import Any
 
 import torch
 
-from kaggriculture.constants import ANIMALS, CROPS, LAND_PRICES, MARKET_PARAMS
+from kaggriculture.constants import (
+    ANIMALS,
+    CROPS,
+    LAND_PRICES,
+    MARKET_PARAMS,
+    SHED_CAPACITY,
+)
 from kaggriculture.learn.encoding import IGNORE, MAX_UNITS, UNIT_OPS
 from kaggriculture.sim.decode import decode_market_buckets
 from kaggriculture.sim.engine import (
@@ -255,11 +261,36 @@ def encode_turn(action: Mapping[str, Any]) -> TurnActions:
     )
 
 
+# Verbs whose fill the reference's own ``_commit_unit`` bounds by
+# ``SHED_CAPACITY`` regardless of the requested quantity: SELL cannot sell
+# more than the shed holds, and BUY_PRODUCT/BUY_ANIMAL both refuse outright
+# once ``sum(shed.values()) >= shed_capacity``. Every one of those bounds is
+# therefore <= SHED_CAPACITY, which is < QUANTITY_AXIS today, so clamping the
+# request onto the axis before that bound is applied changes nothing the
+# engine would have done: min(request, engine_bound) ==
+# min(min(request, QUANTITY_AXIS), engine_bound) whenever engine_bound <=
+# SHED_CAPACITY < QUANTITY_AXIS, for any request. BUY_SEED is excluded on
+# purpose -- seeds land in ``private["seeds"]``, never the shed, so a
+# BUY_SEED fill has no such structural bound and a large request is not
+# provably safe to clamp.
+SHED_BOUND_VERBS = frozenset({"SELL", "BUY_PRODUCT", "BUY_ANIMAL"})
+
+if SHED_CAPACITY >= QUANTITY_AXIS:
+    raise AssertionError(
+        f"SHED_CAPACITY ({SHED_CAPACITY}) >= QUANTITY_AXIS ({QUANTITY_AXIS}): "
+        "_order_quantity's clamp for SELL/BUY_PRODUCT/BUY_ANIMAL is no longer "
+        "provably identical to the reference engine's own shed-capacity limit, "
+        "so it must go back to raising for those verbs too until this is "
+        "re-proven"
+    )
+
+
 def _order_quantity(verb: str, item: str, quantity: object) -> int:
     """Return the in-domain quantity for one market order, or ``-1`` to abort.
 
     Args:
-        verb: The order's verb, for the raised message only.
+        verb: The order's verb. Determines whether an over-axis quantity
+            clamps or raises -- see ``Raises``.
         item: The order's item, for the raised message only.
         quantity: The order's raw, unvalidated quantity.
 
@@ -268,17 +299,26 @@ def _order_quantity(verb: str, item: str, quantity: object) -> int:
         ``int(order[2])`` would raise and abort the order -- the same
         exclusion, reached without making the call. A route is parsed from
         JSON, so anything not ``int | float | str`` here (``None``, a list, a
-        dict) is exactly such a case.
+        dict) is exactly such a case. For ``verb in SHED_BOUND_VERBS``, a
+        quantity over ``QUANTITY_AXIS`` clamps to it rather than raising --
+        see the comment above ``SHED_BOUND_VERBS`` for why that is exact
+        rather than approximate. Top play uses a "sell everything" idiom
+        (``SELL X 999`` and the like) exactly to hit this case; refusing to
+        encode it at all was refusing to replay a large slice of ordinary
+        top play, not a genuine domain violation.
 
     Raises:
         ValueError: If the quantity is outside the simulator's supported
             domain but the reference engine's ``_parse_order`` would still
-            accept it -- an int quantity over ``QUANTITY_AXIS`` (the
-            reference has no cap), or a non-int the reference would coerce via
-            ``int()`` and execute (a numeric string, say). Silently clamping
-            the former or aborting the latter would diverge from what the
-            reference actually replays; the RL action space only ever emits
-            small int quantities, so this never fires for it.
+            accept it, and ``verb`` is not shed-bound -- ``BUY_SEED`` above
+            ``QUANTITY_AXIS`` has no structural bound to appeal to (seeds
+            never touch the shed), so a request that large is not provably
+            safe to clamp and this still raises for it. Also raised for a
+            non-int the reference would coerce via ``int()`` and execute (a
+            numeric string, say); clamping or aborting that would diverge
+            from what the reference actually replays. The RL action space
+            only ever emits small int quantities, so none of this ever fires
+            for it.
     """
     if not isinstance(quantity, (int, float, str)):
         return -1
@@ -288,6 +328,8 @@ def _order_quantity(verb: str, item: str, quantity: object) -> int:
         return -1
     if isinstance(quantity, int):
         if coerced > QUANTITY_AXIS:
+            if verb in SHED_BOUND_VERBS:
+                return QUANTITY_AXIS
             raise ValueError(
                 f"{verb} {item!r} quantity {quantity!r} is outside the "
                 "simulator's supported domain: quantity must not exceed "
