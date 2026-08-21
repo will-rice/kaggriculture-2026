@@ -1,12 +1,23 @@
 """Replaying recorded routes through the batched simulator, for exact banks.
 
-This is the quantity lane's fidelity proof: a recorded top episode exercises
-bulk PICKUP/PLACE on most of its transfers, a branch the RL action space
-structurally never reaches, so replaying its own two routes back through the
-simulator and comparing final banks is the one check that covers it. The
-engine is deterministic given a seed and both seats' actions, so a route
-replayed here reproduces the bank it was harvested with exactly, or the lane
-is wrong.
+This is the quantity lane's fidelity proof, and its scope is the *unit*
+transfer lane specifically: a recorded top episode exercises bulk
+PICKUP/PLACE on most of its transfers, a branch the RL action space
+structurally never reaches, and ``replay`` reproduces such a route's own
+bank exactly, because the engine is deterministic given a seed and both
+seats' actions.
+
+That guarantee holds only for routes whose *market* orders stay inside the
+simulator's domain. A market fill above ``sim.market.QUANTITY_AXIS``
+(currently 64) is outside it, and ``encode_turn`` raises rather than
+silently clamping or truncating one -- see ``sim.rollout._order_quantity``.
+This is not an edge case: a scan of the current top-rated 1.32.7 episodes
+found 85% (128 of 150) carry at least one market order above the axis,
+typically in the 77-80 range. Widening the axis is a planned follow-up; until
+it lands, ``replay`` -- and anything that selects episodes to feed it --
+covers only the routes that stay inside the axis today, not "recorded top
+play" unqualified. A route that does stay inside it replays here to the
+exact bank it was harvested with, or the lane is wrong.
 """
 
 from collections.abc import Sequence
