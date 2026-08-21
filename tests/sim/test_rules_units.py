@@ -6,6 +6,7 @@ from kaggle_environments import make
 
 from kaggriculture.learn.encoding import MAX_UNITS, UNIT_OPS
 from kaggriculture.sim.day import apply_day_phases
+from kaggriculture.sim.engine import unit_quantity_ones
 from kaggriculture.sim.state import pack, unpack
 from kaggriculture.sim.units import apply_unit_phases
 
@@ -50,7 +51,7 @@ def test_tensor_units_match_movement_build_and_atomic_plant_guard() -> None:
     )
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
 
     _assert_observations(environment, actual)
 
@@ -73,7 +74,7 @@ def test_tensor_units_match_locked_shed_transfers_and_inventory_order() -> None:
     actions = _unit_tensor([["DROP"], ["PICKUP:WOOL"]])
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
 
     _assert_observations(environment, actual)
 
@@ -125,7 +126,7 @@ def test_tensor_units_match_water_feed_care_and_fertilizer_collection() -> None:
     actions = _unit_tensor([["WATER", "WATER"], ["FEED", "CARE", "COLLECT_FERTILIZER"]])
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
 
     _assert_observations(environment, actual)
 
@@ -156,7 +157,7 @@ def test_tensor_units_match_animal_placement_and_mature_harvest() -> None:
     actions = _unit_tensor([["PLACE:COW"], ["HARVEST"]])
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
 
     _assert_observations(environment, actual)
 
@@ -187,7 +188,7 @@ def test_fertilizer_bonus_includes_its_final_day() -> None:
     actions = _unit_tensor([["WATER"], ["PASS"]])
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
 
     _assert_observations(environment, actual)
 
@@ -215,7 +216,7 @@ def test_harvest_refuses_a_crop_before_first_yield_day() -> None:
     actions = _unit_tensor([["HARVEST"], ["PASS"]])
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
 
     _assert_observations(environment, actual)
 
@@ -247,6 +248,72 @@ def test_dig_refuses_occupied_structure_and_place_requires_matching_kind() -> No
     actions = _unit_tensor([["DIG"], ["PLACE:COW"]])
 
     environment.step(reference)
-    actual = apply_day_phases(apply_unit_phases(state, actions))
+    actual = apply_day_phases(apply_unit_phases(state, actions, unit_quantity_ones(1)))
+
+    _assert_observations(environment, actual)
+
+
+def _quantity_tensor(overrides):
+    quantities = unit_quantity_ones(1)
+    for (seat, unit), amount in overrides.items():
+        quantities[0, seat, unit] = amount
+    return quantities
+
+
+def test_bulk_pickup_moves_the_requested_amount_and_clamps_to_whats_available() -> None:
+    """A quantity-6 PICKUP moves six; a quantity-99 PICKUP clamps to ten held.
+
+    The engine reads ``n = int(action[2])`` (kaggriculture.py:364) and clamps it to
+    ``available = private["shed"].get(item, 0)`` (kaggriculture.py:369-370): an
+    oversized request is legal-but-clamped, never an error. Until this task the
+    simulator silently moved one item regardless of the requested quantity.
+    """
+    environment = make("kaggriculture", configuration={"seed": 191}, debug=True)
+    environment.reset(2)
+    observation = environment.state[0].observation
+    observation.farms[0].farmer = [4, 4]
+    observation.farms[1].farmer = [5, 4]
+    environment.state[0].observation.private.shed["WHEAT"] = 10
+    environment.state[1].observation.private.shed["WHEAT"] = 10
+    state = pack([environment])
+    reference = [
+        {"farmer": ["PICKUP", "WHEAT", 6], "hands": [], "market": []},
+        {"farmer": ["PICKUP", "WHEAT", 99], "hands": [], "market": []},
+    ]
+    actions = _unit_tensor([["PICKUP:WHEAT"], ["PICKUP:WHEAT"]])
+    quantities = _quantity_tensor({(0, 0): 6, (1, 0): 99})
+
+    environment.step(reference)
+    actual = apply_day_phases(apply_unit_phases(state, actions, quantities))
+
+    _assert_observations(environment, actual)
+
+
+def test_bulk_place_clamps_to_the_shed_room_before_it_errors() -> None:
+    """A quantity-6 PLACE into a shed with room for four places four, not six or zero.
+
+    The engine reads ``n = int(action[2])`` (kaggriculture.py:395), clamps it to what
+    the farmer carries (:398), then clamps again to ``shedCapacity -
+    sum(private["shed"].values())`` (:401-406): an oversized request is
+    legal-but-clamped, never an error.
+    """
+    environment = make("kaggriculture", configuration={"seed": 193}, debug=True)
+    environment.reset(2)
+    observation = environment.state[0].observation
+    observation.farms[0].farmer = [4, 4]
+    observation.farms[1].farmer = [5, 4]
+    private0 = environment.state[0].observation.private
+    private0.shed["CARROT"] = 96
+    private0.inventories = [{"WHEAT": 6}]
+    state = pack([environment])
+    reference = [
+        {"farmer": ["PLACE", "WHEAT", 6], "hands": [], "market": []},
+        {"farmer": ["PASS"], "hands": [], "market": []},
+    ]
+    actions = _unit_tensor([["PLACE:WHEAT"], ["PASS"]])
+    quantities = _quantity_tensor({(0, 0): 6})
+
+    environment.step(reference)
+    actual = apply_day_phases(apply_unit_phases(state, actions, quantities))
 
     _assert_observations(environment, actual)

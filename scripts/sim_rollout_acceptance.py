@@ -9,7 +9,7 @@ from kaggle_environments import make
 from kaggriculture import economic_policy
 from kaggriculture.learn.encoding import MARKET_SLOTS, MAX_UNITS, QUANTITIES, UNIT_OPS
 from kaggriculture.sim.config import Config
-from kaggriculture.sim.engine import reset, step
+from kaggriculture.sim.engine import reset, step, unit_quantity_ones
 from kaggriculture.sim.rollout import collect_segment, scripted_actions
 
 
@@ -76,7 +76,7 @@ def economic_parity(device: torch.device, games: int) -> dict[str, object]:
                     economic_policy.agent(environment.state[1].observation),
                 ]
             )
-        state = step(state, units, markets)
+        state = step(state, units, markets, unit_quantity_ones(games, device))
     reference_banks = [
         int(environment.state[1].observation.farms[1].money)
         for environment in environments

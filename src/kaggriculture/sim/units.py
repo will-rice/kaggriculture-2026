@@ -158,14 +158,29 @@ def _inv_add(
 
 
 def _inv_take(
-    state: SimState, unit: int, item: torch.Tensor, amount: int, mask: torch.Tensor
+    state: SimState,
+    unit: int,
+    item: torch.Tensor,
+    amount: int | torch.Tensor,
+    mask: torch.Tensor,
 ) -> torch.Tensor:
+    """Take ``amount`` of ``item`` from ``unit``'s inventory where ``mask`` holds.
+
+    ``amount`` is an all-or-nothing request: it succeeds (and is fully
+    deducted) only where ``held >= amount``, otherwise nothing moves. Callers
+    that need a clamped bulk transfer -- taking up to what is held rather than
+    failing outright -- pre-clamp their tensor ``amount`` against ``held``
+    before calling, so the ``held >= amount`` check always passes by
+    construction. A scalar ``int`` (the FEED/FERTILIZE/single-animal callers)
+    broadcasts the same way it always has.
+    """
     count = state.inv_count.reshape(-1, MAX_UNITS, len(SHED_NAMES))[:, unit]
     sequence = state.inv_seq.reshape(-1, MAX_UNITS, len(SHED_NAMES))[:, unit]
     slot = item[:, None]
     held = count.gather(1, slot)
-    accepted = mask[:, None] & (held >= amount)
-    remaining = held - accepted.to(held.dtype) * amount
+    amt = amount[:, None].to(held.dtype) if isinstance(amount, torch.Tensor) else amount
+    accepted = mask[:, None] & (held >= amt)
+    remaining = held - accepted.to(held.dtype) * amt
     count.scatter_(1, slot, remaining)
     sequence.scatter_(
         1,
@@ -213,12 +228,18 @@ def _drop(state: SimState, unit: int, mask: torch.Tensor) -> None:
     sequence[:, unit].copy_(torch.where(mask[:, None], 0, sequence[:, unit]))
 
 
-def apply_unit_phases(original: SimState, unit_actions: torch.Tensor) -> SimState:
+def apply_unit_phases(
+    original: SimState, unit_actions: torch.Tensor, unit_quantities: torch.Tensor
+) -> SimState:
     """Apply the atomic PLANT guard and all twenty serialized unit slots."""
     expected = (original.batch_size, 2, MAX_UNITS)
     if tuple(unit_actions.shape) != expected:
         raise ValueError(
             f"expected unit actions {expected}, got {tuple(unit_actions.shape)}"
+        )
+    if tuple(unit_quantities.shape) != expected:
+        raise ValueError(
+            f"expected unit quantities {expected}, got {tuple(unit_quantities.shape)}"
         )
     state = _clone(original)
     device = state.step.device
@@ -229,6 +250,7 @@ def apply_unit_phases(original: SimState, unit_actions: torch.Tensor) -> SimStat
     x_all = state.unit_x.reshape(-1, MAX_UNITS)
     y_all = state.unit_y.reshape(-1, MAX_UNITS)
     alive_all = state.alive.reshape(-1, MAX_UNITS)
+    quantities = unit_quantities.reshape(-1, MAX_UNITS)
     day = state.day[:, None].expand(-1, 2).reshape(-1)
     seeds = state.seeds.reshape(-1, len(CROP_NAMES))
     shed = state.shed.reshape(-1, len(SHED_NAMES))
@@ -259,24 +281,49 @@ def apply_unit_phases(original: SimState, unit_actions: torch.Tensor) -> SimStat
         access = alive & (((x == 4) | (x == 5)) & ((y == 4) | (y == 5)))
         _drop(state, unit, access & (op == _OP["DROP"]))
 
+        # The engine reads n = int(action[2]) for PICKUP and clamps it to what
+        # the shed holds (kaggriculture.py:364-370): min(requested, available),
+        # never an error.
         carried = rule[:, UNIT_PICKUP]
         pickup_slot = carried.clamp_min(0)
-        pickup = (
-            access
-            & (carried >= 0)
-            & (shed.gather(1, pickup_slot[:, None]).squeeze(1) > 0)
+        pickup_requested = quantities[:, unit].to(shed.dtype).clamp_min(0)
+        pickup_available = shed.gather(1, pickup_slot[:, None]).squeeze(1)
+        pickup_amount = torch.minimum(pickup_requested, pickup_available)
+        pickup = access & (carried >= 0) & (pickup_amount > 0)
+        pickup_taken = torch.where(
+            pickup, pickup_amount, torch.zeros_like(pickup_amount)
         )
-        shed.scatter_add_(1, pickup_slot[:, None], -pickup[:, None].to(shed.dtype))
-        _inv_add(state, unit, pickup_slot, torch.ones_like(op), pickup)
+        shed.scatter_add_(1, pickup_slot[:, None], -pickup_taken[:, None])
+        _inv_add(state, unit, pickup_slot, pickup_amount, pickup)
 
+        # The engine reads n = int(action[2]) for a shed-bound PLACE and clamps
+        # it twice -- to what the farmer carries, then to the shed's remaining
+        # room (kaggriculture.py:395-406) -- never an error. An animal PLACE
+        # ignores the requested quantity and always transfers exactly one
+        # (kaggriculture.py:390, `_inv_take(inv, item, 1)`): an animal is one
+        # animal.
         offered = rule[:, UNIT_PLACE]
         place_slot = offered.clamp_min(0)
         place_op = alive & (offered >= 0)
         structure = rule[:, UNIT_PLACE_KIND]
         animal_condition = place_op & (kind == structure) & (occupant == 0)
-        room = shed.sum(dim=1) < SHED_CAPACITY
-        shed_place = access & place_op & ~animal_condition & room
-        taken = _inv_take(state, unit, place_slot, 1, animal_condition | shed_place)
+        shed_place = access & place_op & ~animal_condition
+        place_held = (
+            state.inv_count.reshape(-1, MAX_UNITS, len(SHED_NAMES))[:, unit]
+            .gather(1, place_slot[:, None])
+            .squeeze(1)
+        )
+        place_requested = quantities[:, unit].to(shed.dtype).clamp_min(0)
+        place_room = (SHED_CAPACITY - shed.sum(dim=1)).clamp_min(0).to(shed.dtype)
+        shed_amount = torch.minimum(
+            torch.minimum(place_requested, place_held), place_room
+        )
+        place_amount = torch.where(
+            animal_condition, torch.ones_like(shed_amount), shed_amount
+        )
+        taken = _inv_take(
+            state, unit, place_slot, place_amount, animal_condition | shed_place
+        )
         placed = taken & animal_condition
         settled = _selector(position, placed)
         _write(state, "occupant", settled, rule[:, UNIT_PLACE_OCCUPANT])
@@ -287,8 +334,13 @@ def apply_unit_phases(original: SimState, unit_actions: torch.Tensor) -> SimStat
         _write(state, "cared_today", settled, False)
         _write(state, "fertilizer_available", settled, False)
         _write(state, "pending_care_bonus", settled, 0)
+        shed_placed = taken & shed_place
         shed.scatter_add_(
-            1, place_slot[:, None], (taken & shed_place)[:, None].to(shed.dtype)
+            1,
+            place_slot[:, None],
+            torch.where(shed_placed, place_amount, torch.zeros_like(place_amount))[
+                :, None
+            ],
         )
 
         unlocked = alive & (kind != 1)

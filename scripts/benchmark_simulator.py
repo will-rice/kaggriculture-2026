@@ -115,7 +115,7 @@ from kaggriculture.learn.rollout import rollout_many
 from kaggriculture.learn.scripts.gate import DEVICE, GAMES, THREADS, WORKERS
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.decode import decode_market_buckets
-from kaggriculture.sim.engine import reset, step
+from kaggriculture.sim.engine import reset, step, unit_quantity_ones
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.rollout import Trajectory, collect_segment
@@ -576,7 +576,10 @@ def turn(state: SimState, policy: torch.nn.Module, *, sample: bool) -> SimState:
     chosen_units = _decide(unit_logits, unit_masks, sample=sample)
     chosen_market = _decide(market_logits, market_masks, sample=sample)
     return step(
-        state, chosen_units.to(torch.int16), decode_market_buckets(chosen_market)
+        state,
+        chosen_units.to(torch.int16),
+        decode_market_buckets(chosen_market),
+        unit_quantity_ones(state.batch_size, state.step.device),
     )
 
 

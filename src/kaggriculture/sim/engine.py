@@ -127,8 +127,20 @@ def reset(
     return state
 
 
+def unit_quantity_ones(batch: int, device: torch.device | str = "cpu") -> torch.Tensor:
+    """Return the all-ones unit-quantity tensor.
+
+    The many callers that mean "single-item transfers, exactly the old
+    behaviour" say so with this one word.
+    """
+    return torch.ones((batch, 2, MAX_UNITS), dtype=torch.int16, device=device)
+
+
 def step(
-    state: SimState, unit_actions: torch.Tensor, market_actions: MarketActions
+    state: SimState,
+    unit_actions: torch.Tensor,
+    market_actions: MarketActions,
+    unit_quantities: torch.Tensor,
 ) -> SimState:
     """Advance every environment through all seven pure-Torch phases."""
     expected_units = (state.batch_size, 2, MAX_UNITS)
@@ -136,10 +148,15 @@ def step(
         raise ValueError(
             f"unit_actions has {tuple(unit_actions.shape)}; expected {expected_units}"
         )
+    if tuple(unit_quantities.shape) != expected_units:
+        raise ValueError(
+            f"unit_quantities has {tuple(unit_quantities.shape)}; "
+            f"expected {expected_units}"
+        )
     from kaggriculture.sim.day import apply_day_phases  # noqa: PLC0415
     from kaggriculture.sim.market import apply_market_phase  # noqa: PLC0415
     from kaggriculture.sim.units import apply_unit_phases  # noqa: PLC0415
 
-    after_units = apply_unit_phases(state, unit_actions)
+    after_units = apply_unit_phases(state, unit_actions, unit_quantities)
     after_market = apply_market_phase(after_units, market_actions)
     return apply_day_phases(after_market)

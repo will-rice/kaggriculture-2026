@@ -5,7 +5,7 @@ import torch
 from kaggle_environments import make
 
 from kaggriculture.learn.encoding import MAX_UNITS, UNIT_OPS
-from kaggriculture.sim.engine import MarketActions, step
+from kaggriculture.sim.engine import MarketActions, step, unit_quantity_ones
 from kaggriculture.sim.state import pack, unpack
 
 
@@ -67,7 +67,7 @@ def test_step_matches_reference_for_unit_and_market_actions() -> None:
     )
 
     environment.step(reference_actions)
-    actual = step(state, units, market)
+    actual = step(state, units, market, unit_quantity_ones(1))
 
     for seat in range(2):
         expected = dict(environment.state[seat].observation)
@@ -85,7 +85,7 @@ def test_step_matches_reference_across_an_end_of_day() -> None:
     units, market = _actions([["PASS"], ["PASS"]], [[], []])
 
     environment.step(passes)
-    actual = step(state, units, market)
+    actual = step(state, units, market, unit_quantity_ones(1))
 
     for seat in range(2):
         expected = dict(environment.state[seat].observation)

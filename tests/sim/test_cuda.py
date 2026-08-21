@@ -9,7 +9,7 @@ import torch
 from kaggriculture.learn.encoding import MARKET_SLOTS, MAX_UNITS, QUANTITIES, UNIT_OPS
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.decode import decode_market_buckets
-from kaggriculture.sim.engine import reset, step
+from kaggriculture.sim.engine import reset, step, unit_quantity_ones
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.rng import select_day_words
@@ -54,7 +54,12 @@ def _iteration(state: SimState, units: torch.Tensor, buckets: torch.Tensor) -> S
     for seat in range(2):
         observe(state, seat)
         legal(state, seat)
-    return step(state, units, decode_market_buckets(buckets))
+    return step(
+        state,
+        units,
+        decode_market_buckets(buckets),
+        unit_quantity_ones(state.batch_size, state.step.device),
+    )
 
 
 def test_cuda_uint32_day_selection_preserves_bits() -> None:

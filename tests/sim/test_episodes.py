@@ -7,7 +7,7 @@ from kaggle_environments import make
 
 from kaggriculture.learn.encoding import MAX_UNITS, UNIT_OPS
 from kaggriculture.sim.config import Config
-from kaggriculture.sim.engine import MarketActions, reset, step
+from kaggriculture.sim.engine import MarketActions, reset, step, unit_quantity_ones
 from kaggriculture.sim.state import ANIMAL_NAMES, CROP_NAMES, PRODUCT_NAMES
 from tests.sim.conftest import assert_identical
 
@@ -104,6 +104,6 @@ def test_random_full_vocabulary_campaign_has_zero_divergences(
                     }
                 )
             environment.step(reference_actions)
-        state = step(state, units, markets)
+        state = step(state, units, markets, unit_quantity_ones(len(seeds)))
         for batch, environment in enumerate(environments):
             assert_identical(environment, state, batch)

@@ -9,7 +9,12 @@ import torch
 from kaggriculture.constants import ANIMALS, CROPS, LAND_PRICES, MARKET_PARAMS
 from kaggriculture.learn.encoding import IGNORE, MAX_UNITS, UNIT_OPS
 from kaggriculture.sim.decode import decode_market_buckets
-from kaggriculture.sim.engine import MAX_MARKET_ORDERS_PER_TURN, MarketActions, step
+from kaggriculture.sim.engine import (
+    MAX_MARKET_ORDERS_PER_TURN,
+    MarketActions,
+    step,
+    unit_quantity_ones,
+)
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.state import (
@@ -407,7 +412,12 @@ def collect_segment(
         before_potential = torch.stack(
             (potential(state, 0), potential(state, 1)), dim=1
         )
-        next_state = step(state, chosen_units.to(torch.int16), market_orders)
+        next_state = step(
+            state,
+            chosen_units.to(torch.int16),
+            market_orders,
+            unit_quantity_ones(state.batch_size, state.step.device),
+        )
         after_money = next_state.money
         after_margin = after_money - after_money.flip(1)
         records["board"].append(boards)

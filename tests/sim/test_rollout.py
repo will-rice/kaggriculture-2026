@@ -11,7 +11,7 @@ from kaggriculture import economic_policy
 from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, UNIT_OPS
 from kaggriculture.learn.progress import potential as reference_potential
 from kaggriculture.sim.config import Config
-from kaggriculture.sim.engine import reset, step
+from kaggriculture.sim.engine import reset, step, unit_quantity_ones
 from kaggriculture.sim.rollout import collect_segment, potential, scripted_actions
 from kaggriculture.sim.state import PRODUCT_NAMES, SHED_NAMES, pack
 from tests.sim.conftest import assert_identical
@@ -112,7 +112,7 @@ def test_scripted_economic_policy_bridge_matches_reference_action() -> None:
             reference_action,
         ]
     )
-    actual = step(state, units, markets)
+    actual = step(state, units, markets, unit_quantity_ones(1))
 
     assert_identical(environment, actual, 0)
 
