@@ -213,6 +213,71 @@ with a turn number, found by comparing money per turn.
 
 ---
 
+### Task 3b: The market lane carries what top play actually sells
+
+Added 2026-08-21 after Task 3's proof passed on three episodes and the
+controller replayed episodes the implementer had not selected. Those raise:
+`_order_quantity` (`sim/rollout.py:257`) rejects any market quantity above 64,
+and **85% of 1.32.7 top episodes (128 of 150 scanned) contain at least one** --
+real fills of 65-165, clustered at 77-80, plus a rare 1,000,000 "sell
+everything" sentinel the engine clamps to stock. The cap is a true execution
+limit: `QUANTITY_AXIS = max(QUANTITIES) = 64` (`sim/market.py:39`) is the width
+of the tensor axis that resolves a market slot, and requests are clamped onto
+it by construction because a host-synchronising assertion cannot run inside a
+captured CUDA graph.
+
+This matters beyond replay. Phase 2 clones this corpus and Phase 3 replays it
+as in-simulator opponents, so a lane that cannot express a 77-unit sale makes
+the dominant selling idiom of top play inexpressible -- the same defect as
+`TRANSFER_QUANTITY = 1`, in the other lane.
+
+**Files:**
+
+- Modify: `src/kaggriculture/learn/encoding.py` (`QUANTITIES`)
+- Modify: `src/kaggriculture/sim/market.py:39` (`QUANTITY_AXIS`) and the slot
+  resolution that sweeps it
+- Modify: `src/kaggriculture/sim/rollout.py:257` (`_order_quantity`'s cap and
+  its raised message)
+- Modify: `tests/sim/test_tape.py` (broaden the corpus selection, below)
+- Test: `tests/sim/test_rules_market.py`, `tests/learn/test_mask.py`
+
+**Interfaces:**
+
+- Produces: `QUANTITIES` extended above 64 to cover observed play with headroom,
+  and `QUANTITY_AXIS` following it. Choose the new bins from the measured
+  distribution, not from taste: 65-80 is where the mass sits, with a tail to
+  ~165. State the chosen ceiling and its justification in a comment beside the
+  constant. Bins stay the sampling vocabulary AND the execution axis width --
+  they are coupled today and this task keeps them coupled; decoupling is a
+  larger change nobody has asked for.
+
+- [ ] **Step 1: Measure before choosing.** Scan the newest archive for the
+      distribution of market order quantities and of realised fills (a request is
+      clamped by stock and shed room, so the fill is what the axis must span).
+      Record the numbers in your report; they justify the ceiling you pick.
+- [ ] **Step 2: Benchmark the cost first, so the choice is informed.** Run
+      `scripts/benchmark_simulator.py` at the current axis width and record
+      throughput. The market phase sweeps the axis, so widening it costs roughly
+      linearly there.
+- [ ] **Step 3: Write the failing test.** In `tests/sim/test_rules_market.py`,
+      a differential case: a `SELL WHEAT 77` against stock that can fill it must
+      match the reference exactly. It fails today by raising.
+- [ ] **Step 4: Widen** `QUANTITIES`, confirm `QUANTITY_AXIS` follows, and
+      relax `_order_quantity`'s cap to the new ceiling -- keeping the raise for
+      anything beyond it, because a silent clamp would diverge from the reference
+      and that is exactly what the guard exists to prevent.
+- [ ] **Step 5: Re-benchmark** and report throughput before and after. If the
+      simulator slows by more than half, say so plainly in the report rather than
+      absorbing it silently -- Phase 3 trains against this.
+- [ ] **Step 6: Broaden the proof.** Change `tests/sim/test_tape.py` to select
+      its episodes without needing them to dodge the cap, and raise the count from
+      3 to at least 8. If any episode still cannot replay, the test must fail
+      loudly naming it -- never skip it silently, and never select only episodes
+      that happen to pass.
+- [ ] **Step 7: Full suite, then commit.**
+
+---
+
 ### Task 4: The policy grows a quantity head
 
 **Files:**
