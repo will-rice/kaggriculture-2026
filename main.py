@@ -47,21 +47,18 @@ measured out of the built archive by ``kaggriculture.scripts.budget``. Nothing
 on this path imports torch.
 """
 
-# Serves `searched_route_policy`: the route search's first gate-passing output,
-# measured 2026-08-20 on kaggle-environments 1.32.7. A top-30 route harvested
-# from episode 94106275 (2026-08-18 archive) plus one accepted edit
-# (SELL WOOL 3 -> 5 at turn 646, +1.95% +/- 0.50% paired), embedded as a
-# standalone tape and proven bank-identical to the gated artifact.
+# Serves `boatlee_v14_policy`, restored 2026-08-21 after the ladder falsified
+# the serve decision of 2026-08-20. `searched_route_policy` passed the held-out
+# gate against this agent (0.734 [0.652, 0.803] over 128 games) and that result
+# was real on the ladder too -- doubled overall win rate, +10k median bank --
+# but rating is set at the frontier, and above 1400 the searched route loses to
+# the current meta 4-to-1 (4/19 and 1/9 across its two copies). It converged at
+# ~1370 against this agent's ~1500. The gate examined against what we served,
+# not against the frontier; until the gate's opponent set includes fresh
+# top-band tapes, "PASS" does not mean "worth fielding".
 #
-# The evidence is the held-out gate, one pre-registered run, no gate-shopping:
-#
-#   rate 0.7344  Wilson 95% [0.6518, 0.8032]  over 128 seat-swapped games
-#   vs boatlee_v14_policy (the previous serve) on seeds 700,000-700,063,
-#   disjoint from every seed the search ever saw.
-#
-# boatlee_v14 stays vendored below as the reference opponent; its own serve
-# block (0.960 league win rate on 1.32.6, 2026-08-08) is in git history at
-# 730d9e2 and before.
-from kaggriculture.searched_route_policy import agent
+# The searched route remains vendored as `searched_route_policy` -- it is a
+# gate opponent and a record, not a serve.
+from kaggriculture.boatlee_v14_policy import agent
 
 __all__ = ["agent"]
