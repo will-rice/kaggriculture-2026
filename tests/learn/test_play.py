@@ -446,11 +446,13 @@ def test_every_op_a_full_episode_emits_is_one_the_engine_acts_on() -> None:
     assumed, so this self-clears the moment Phase 2 writes a widened-head
     checkpoint and stops being an xfail.
 
-    Separately and pre-existing on ``main``: with a widened-head checkpoint in
-    place this same test has been observed to fail inside a full ``-m slow``
-    run while passing in isolation there -- state or ordering leaking between
-    slow tests, unrelated to the quantity lane and not addressed by the xfail
-    above. Left as a known gap rather than papered over.
+    A second cause was claimed here and was wrong: a full ``-m slow`` run was
+    reported to fail on ``main`` while passing in isolation, which would have
+    meant state leaking between slow tests. It came from misreading which
+    checkout a background run had used -- both runs were the branch, where the
+    checkpoint cause above already explains the failure. Re-measured at
+    ``76e9a18``, where checkpoint and ``Policy`` shapes agree: 49 passed, this
+    test among them. There is one cause, not two.
     """
     try:
         play_module.model()
