@@ -54,6 +54,7 @@ from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
+    ENTROPY_COST,
     LEARNING_RATE,
     MIN_LR_MOD,
     TEACHER_KL_COST,
@@ -333,9 +334,16 @@ METRIC_DEFINITIONS: dict[str, str] = {
 }
 
 
-def main() -> None:
-    """Run phase 1 to ``TOTAL_STEPS``, checkpointing and logging as it goes."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+def _parser() -> argparse.ArgumentParser:
+    """Return this arm's command line, pulled out of ``main`` so a test can parse it.
+
+    Every flag's default is the constant it overrides, never a literal, so an
+    invocation that passes none of them is byte-identical to one that predates
+    the flag existing.
+
+    Returns:
+        The argument parser ``main`` parses ``sys.argv`` with.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase1b",
@@ -387,6 +395,20 @@ def main() -> None:
         "where the policy should start out-earning its teacher.",
     )
     parser.add_argument(
+        "--lr",
+        type=float,
+        default=LEARNING_RATE,
+        help="Adam learning rate the schedule decays from. Sweep knob; "
+        "the default reproduces every earlier arm exactly.",
+    )
+    parser.add_argument(
+        "--entropy-cost",
+        type=float,
+        default=ENTROPY_COST,
+        help="coefficient on the entropy loss term. Sweep knob; the default "
+        "reproduces every earlier arm exactly.",
+    )
+    parser.add_argument(
         "--value-warmup",
         action="store_true",
         help="train the value head alone for VALUE_WARMUP_BATCHES before the "
@@ -427,7 +449,13 @@ def main() -> None:
         help="checkpoint to continue from, restoring weights, optimizer, "
         "schedule and counters",
     )
-    arguments = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    """Run phase 1 to ``TOTAL_STEPS``, checkpointing and logging as it goes."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    arguments = _parser().parse_args()
 
     seed_everything(SEED, workers=True)
     RUNS.mkdir(parents=True, exist_ok=True)
@@ -449,7 +477,7 @@ def main() -> None:
     ).to(device)
     if arguments.clone_init:
         _warm_start(learner, device)
-    optimizer = torch.optim.Adam(learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
+    optimizer = _optimizer(learner, arguments.lr)
     schedule = torch.optim.lr_scheduler.LambdaLR(
         optimizer, _decay(arguments.econ_fraction)
     )
@@ -502,6 +530,7 @@ def main() -> None:
             teacher,
             arguments.teacher_kl_cost,
             arguments.value_passes,
+            entropy_cost=arguments.entropy_cost,
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -544,6 +573,23 @@ def main() -> None:
             record["diag/total_loss"],
         )
     wandb.finish()
+
+
+def _optimizer(learner: Policy, lr: float) -> torch.optim.Optimizer:
+    """Return the Adam optimizer this arm trains with.
+
+    Pulled out of ``main`` so a test can construct one from a parsed ``--lr``
+    and read the rate back off its own ``param_groups`` -- the only way to
+    tell "parsed the flag" from "parsed the flag and never used it".
+
+    Args:
+        learner: The network whose parameters the optimizer will update.
+        lr: The learning rate, threaded from ``--lr`` (default ``LEARNING_RATE``).
+
+    Returns:
+        The constructed optimizer, before any schedule wraps it.
+    """
+    return torch.optim.Adam(learner.parameters(), lr=lr, eps=ADAM_EPS)
 
 
 def _record(
@@ -855,7 +901,8 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "batch_segments": BATCH_SEGMENTS,
             "unroll_length": UNROLL_LENGTH,
             "sync_every": SYNC_EVERY,
-            "lr": LEARNING_RATE,
+            "lr": arguments.lr,
+            "entropy_cost": arguments.entropy_cost,
             "adam_eps": ADAM_EPS,
             "clip_grads": CLIP_GRADS,
             "total_steps": TOTAL_STEPS,
@@ -1256,6 +1303,7 @@ def _update(
     teacher: Teacher | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
     value_passes: int = 0,
+    entropy_cost: float = ENTROPY_COST,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -1289,6 +1337,7 @@ def _update(
         teacher_kl_cost: Coefficient on that KL.
         value_passes: Extra value-only passes over the same round, after the
             policy has taken its one. Zero reproduces every earlier arm exactly.
+        entropy_cost: Coefficient on the entropy loss term.
 
     Returns:
         The loss terms averaged over the round's policy steps, plus
@@ -1311,6 +1360,7 @@ def _update(
             baseline_only=steps < warmup_left,
             teacher=teacher,
             teacher_kl_cost=teacher_kl_cost,
+            entropy_cost=entropy_cost,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -1375,6 +1425,7 @@ def _step(
     baseline_only: bool = False,
     teacher: Teacher | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
+    entropy_cost: float = ENTROPY_COST,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -1393,6 +1444,7 @@ def _step(
         teacher: The frozen clone to stay near and what it was taught, or
             None.
         teacher_kl_cost: Coefficient on that KL.
+        entropy_cost: Coefficient on the entropy loss term.
 
     Returns:
         The four loss terms and their total, as floats.
@@ -1508,6 +1560,7 @@ def _step(
         baseline_only=baseline_only,
         teacher_kl=teacher_kl,
         teacher_kl_cost=teacher_kl_cost,
+        entropy_cost=entropy_cost,
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()

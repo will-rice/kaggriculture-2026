@@ -7,7 +7,7 @@ its first batch, and burned the slot. These call what the runner calls.
 """
 
 import copy
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -23,7 +23,12 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad_phase1
-from kaggriculture.learn.toad_loss import ADAM_EPS, LEARNING_RATE, TEACHER_KL_COST
+from kaggriculture.learn.toad_loss import (
+    ADAM_EPS,
+    ENTROPY_COST,
+    LEARNING_RATE,
+    TEACHER_KL_COST,
+)
 
 
 def _segment(turns: int = 16, transfers: bool = True) -> dict[str, torch.Tensor]:
@@ -457,3 +462,108 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
         toad_phase1._value_passes(policy, optimizer, segments, "cpu", "shaped", 3)
     assert seen
     assert all(seen)
+
+
+def test_omitting_lr_and_entropy_cost_reproduces_todays_constants() -> None:
+    """Every existing invocation must behave identically once the flags exist.
+
+    A sweep is worthless if adding its own knobs quietly moved the arms that
+    do not pass them, so the flags' defaults must be the constants they
+    override -- not a copy of today's value that could drift from them.
+    """
+    arguments = toad_phase1._parser().parse_args([])
+    assert arguments.lr == LEARNING_RATE
+    assert arguments.entropy_cost == ENTROPY_COST
+
+
+def test_lr_flag_reaches_the_optimizer() -> None:
+    """``--lr`` must set the rate the optimizer actually steps with.
+
+    Asserted on the optimizer's own ``param_groups``, not on the parsed
+    namespace: a runner that parses ``--lr`` and builds the optimizer from
+    ``LEARNING_RATE`` regardless would still pass a namespace-only check.
+    """
+    policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
+    arguments = toad_phase1._parser().parse_args(["--lr", "3e-4"])
+    optimizer = toad_phase1._optimizer(policy, arguments.lr)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
+    assert optimizer.param_groups[0]["lr"] != LEARNING_RATE
+
+
+def test_lr_flag_moves_the_schedules_own_output() -> None:
+    """``--lr`` must set the base the ``LambdaLR`` schedule scales, not be shadowed.
+
+    ``_decay`` returns a multiplier relative to whatever base the optimizer
+    was built with, so a schedule that silently pinned its own base rate
+    would report the same current rate regardless of ``--lr``. Two policies,
+    two bases, the same schedule shape, and the ratio between the two must
+    survive the schedule's first step.
+    """
+    default_policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
+    swept_policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
+    default_optimizer = toad_phase1._optimizer(default_policy, LEARNING_RATE)
+    swept_optimizer = toad_phase1._optimizer(swept_policy, 3e-4)
+    default_schedule = torch.optim.lr_scheduler.LambdaLR(
+        default_optimizer, toad_phase1._decay(0.0)
+    )
+    swept_schedule = torch.optim.lr_scheduler.LambdaLR(
+        swept_optimizer, toad_phase1._decay(0.0)
+    )
+    default_schedule.step()
+    swept_schedule.step()
+    ratio = swept_schedule.get_last_lr()[0] / default_schedule.get_last_lr()[0]
+    assert ratio == pytest.approx(3e-4 / LEARNING_RATE)
+
+
+def test_entropy_cost_flag_reaches_the_loss() -> None:
+    """``--entropy-cost`` must reach ``losses``, not stop at the parsed namespace.
+
+    Zeroing the coefficient must zero the reported entropy term exactly; a
+    ``_step`` that parses the flag and keeps computing with ``ENTROPY_COST``
+    would report the same nonzero term either way.
+    """
+    torch.manual_seed(0)
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    default_terms = toad_phase1._step(
+        policy, optimizer, segments, "cpu", "shaped_money"
+    )
+    assert default_terms["entropy"] != 0.0
+
+    torch.manual_seed(0)
+    policy, optimizer = _policy()
+    zeroed_terms = toad_phase1._step(
+        policy, optimizer, segments, "cpu", "shaped_money", entropy_cost=0.0
+    )
+    assert zeroed_terms["entropy"] == 0.0
+
+
+def test_lr_and_entropy_cost_reach_the_recorded_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swept hyperparameter absent from the run's config is useless for analysis.
+
+    ``--teacher-kl-cost`` and ``--value-passes`` are recorded the same way;
+    this pins ``--lr`` and ``--entropy-cost`` alongside them without touching
+    the network by faking ``wandb.init`` and capturing what it was called with.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeRun:
+        url = "http://example.invalid/fake-run"
+
+        def log(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    def _fake_init(**kwargs: object) -> _FakeRun:
+        captured.update(kwargs)
+        return _FakeRun()
+
+    monkeypatch.setattr(toad_phase1.wandb, "init", _fake_init)
+    arguments = toad_phase1._parser().parse_args(
+        ["--lr", "3e-4", "--entropy-cost", "0.02"]
+    )
+    toad_phase1._start_run(arguments, "shaped")
+    config = cast(dict[str, object], captured["config"])
+    assert config["lr"] == pytest.approx(3e-4)
+    assert config["entropy_cost"] == pytest.approx(0.02)
