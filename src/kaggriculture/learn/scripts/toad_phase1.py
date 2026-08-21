@@ -846,6 +846,13 @@ def _restore(
     off-by-one would hide, and a schedule one step out changes the learning rate
     for the rest of the run.
 
+    ``load_policy_weights`` tolerates a checkpoint missing ``quantity_head.*``
+    because that gap is expected of a warm start from an older, pre-widening
+    clone. A resume checkpoint is not that -- it is this script's own prior
+    output, already written by a ``Policy`` that has every current head -- so
+    a gap here means the wrong file was pointed at, and loading it anyway
+    would silently continue training with that head randomly initialised.
+
     Args:
         path: The checkpoint.
         learner: Network to load into.
@@ -855,9 +862,21 @@ def _restore(
 
     Returns:
         The ``(steps, update)`` the checkpoint was written at.
+
+    Raises:
+        ValueError: If ``load_policy_weights`` reports any missing key, since
+            a resume checkpoint should never have one.
     """
     state = torch.load(path, map_location=device, weights_only=False)
-    load_policy_weights(learner, state["learner"])
+    missing = load_policy_weights(learner, state["learner"])
+    if missing:
+        raise ValueError(
+            f"{path} is missing {missing}: a resume checkpoint is this "
+            "script's own prior output, not a warm start from an older "
+            "clone, so it should already carry every current head, and "
+            "continuing would silently leave the missing head randomly "
+            "initialised for the rest of the run"
+        )
     optimizer.load_state_dict(state["optimizer"])
     schedule.load_state_dict(state["schedule"])
     return int(state["steps"]), int(state["update"])

@@ -57,7 +57,7 @@ from typing import Sequence
 import torch
 
 from kaggriculture.learn import CHECKPOINT
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.report import wilson_interval
 
@@ -309,10 +309,12 @@ def under_test(weights: Path) -> Policy:
 def frozen(weights: Path) -> Policy:
     """Return a network opponent, loaded once per worker.
 
-    Non-strict, unlike ``under_test``, and gated the same way ``learn.play``
-    gates it: the behaviour-cloned checkpoint predates the value head, so it
-    carries every trunk and head key and no ``value.*``. Any gap outside the
-    value head raises rather than playing weights that loaded quietly wrong.
+    Non-strict, unlike ``under_test``, and gated through ``load_policy_weights``
+    -- the same helper ``learn.play`` loads its checkpoint through, so there is
+    one contract for what "close enough to load" means. That contract
+    tolerates only ``quantity_head.*`` being absent (the one head this task
+    adds, which no checkpoint written before it can carry) and raises on any
+    other gap, including a missing value head.
 
     Args:
         weights: The checkpoint.
@@ -321,19 +323,14 @@ def frozen(weights: Path) -> Policy:
         The policy on ``DEVICE``, in eval mode.
 
     Raises:
-        ValueError: If anything but the value head is missing or unexpected.
+        ValueError: If anything but ``quantity_head.*`` is missing or
+            unexpected (see ``load_policy_weights``).
+        RuntimeError: If a key present in both the checkpoint and the policy
+            has a shape ``load_state_dict`` cannot reconcile.
     """
     torch.set_num_threads(THREADS)
     policy = Policy()
-    result = policy.load_state_dict(
-        torch.load(weights, map_location="cpu"), strict=False
-    )
-    allowed = {f"value.{name}" for name, _ in policy.value.named_parameters()}
-    if not set(result.missing_keys) <= allowed or result.unexpected_keys:
-        raise ValueError(
-            f"{weights} does not match the current trunk: missing "
-            f"{result.missing_keys}, unexpected {result.unexpected_keys}"
-        )
+    load_policy_weights(policy, torch.load(weights, map_location="cpu"))
     return policy.to(DEVICE).eval()
 
 

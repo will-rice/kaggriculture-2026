@@ -8,13 +8,16 @@ bank exactly, because the engine is deterministic given a seed and both
 seats' actions.
 
 That guarantee now covers ordinary top play's market orders, not just its
-unit transfers. A scan of top-rated 1.32.7 episodes found the large majority
-carry at least one market order above the axis's original width of 64,
-typically in the 65-80 range, real fills the engine actually committed unit
-by unit -- not merely requested and then clamped down by stock or shed room.
-The axis was widened to 165 for that (see the comment beside ``QUANTITIES``
-in ``learn.encoding`` for the measured fill distribution), but a follow-up
-scan found top play also spells "sell everything" as a large, round request
+unit transfers. A scan of top-rated 1.32.7 episodes found that 85% (128 of
+150) carry at least one market order *requesting* more than the axis's
+original width of 64 -- a request, which stock or shed room can still clamp
+down before anything is filled. A separate scan of what the engine actually
+committed found a smaller share still crossed that line: 43% (65 of 150) had
+at least one order the engine *filled* past 64, typically in the 65-80
+range -- real fills, unit by unit, not requests (see ``learn.encoding``,
+lines 1011-1014, for that count and the measured fill distribution). The
+axis was widened to 165 for that fill share, but a follow-up scan found top
+play also spells "sell everything" as a large, round request
 -- ``SELL X 999`` and the like, in 4.75% of a 400-episode sample -- that
 still named a quantity past even a 165-wide axis. For SELL, BUY_PRODUCT and
 BUY_ANIMAL such a request now *clamps* onto the axis at encode time rather

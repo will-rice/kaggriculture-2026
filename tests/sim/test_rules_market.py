@@ -239,8 +239,9 @@ def test_market_phase_refreshes_stored_prices_before_the_day_phase() -> None:
 def test_sell_above_the_old_axis_cap_matches_the_reference() -> None:
     """A fill above the pre-widening 64-unit axis resolves exactly like the reference.
 
-    77 sits in the 77-80 cluster where most of the corpus's over-cap sales
-    land (see ``sim.tape``'s module docstring for the measured incidence).
+    77 is the peak of the over-cap fill distribution: 26 of the 89 over-64
+    fills measured (29%) land there (see the comment beside ``QUANTITIES``
+    in ``learn.encoding`` for the measured fill distribution).
     Stock of exactly 77 WHEAT makes the sale fully fillable and not
     stock-limited, so the axis width is the only thing under test. Built
     through ``encode_turn``, the same path a replayed route takes, rather than

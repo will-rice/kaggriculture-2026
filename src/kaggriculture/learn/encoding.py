@@ -1053,6 +1053,25 @@ QUANTITIES: tuple[int, ...] = (
 # their own design choice and are written out accordingly.
 _TAIL_BUCKET_MAX = (20, 32, 52, 64, 80, 100, 130)
 
+if len(_TAIL_BUCKET_MAX) != len(QUANTITIES) - 14:
+    raise AssertionError(
+        f"len(_TAIL_BUCKET_MAX) ({len(_TAIL_BUCKET_MAX)}) != len(QUANTITIES) "
+        f"- 14 ({len(QUANTITIES) - 14}): bucket_of's tail loop falls back to "
+        "len(QUANTITIES) - 1 for anything past the last bound in "
+        "_TAIL_BUCKET_MAX, so an appended QUANTITIES bucket with no matching "
+        "entry here would silently reroute everything above 130 into it "
+        "instead of the bucket it was meant to distinguish"
+    )
+
+if MAX_TRANSFER not in QUANTITIES:
+    raise AssertionError(
+        f"MAX_TRANSFER ({MAX_TRANSFER}) is not a value in QUANTITIES: "
+        "learn.mask.unit_quantity_mask and sim.legality._quantity_mask both "
+        "gate on `1 <= quantity <= MAX_TRANSFER for quantity in QUANTITIES`, "
+        "so a MAX_TRANSFER that falls between two QUANTITIES entries changes "
+        "neither mask and would silently disagree with itself"
+    )
+
 
 def bucket_of(n: int) -> int:
     """Return the bucket index that quantity ``n`` falls into.

@@ -3,12 +3,15 @@
 This is the differential proof of the quantity lane -- both lanes together now
 that the market lane's axis has been widened to cover ordinary top play (see
 ``sim.tape``'s module docstring). A recorded top episode exercises bulk
-PICKUP/PLACE on most of its transfers and market orders past the market
-lane's old 64-unit cap on most of its turns, branches the RL-action-space
-differential tests structurally never reach, and the engine is deterministic
-given seed and both seats' actions, so equality is exact or the lane is
-wrong. Do not weaken to a tolerance; a mismatch is a bug with a turn number,
-found by comparing money per turn.
+PICKUP/PLACE on most of its transfers, a branch the RL-action-space
+differential tests structurally never reach. It typically also carries a
+market order past the market lane's old 64-unit cap: 85% of top episodes (128
+of 150) carry at least one order *requesting* more than 64, and a smaller
+share, 43% (65 of 150), have at least one order the engine actually *filled*
+past 64 (see ``sim.tape``'s module docstring for where each count is
+measured). The engine is deterministic given seed and both seats' actions, so
+equality is exact or the lane is wrong. Do not weaken to a tolerance; a
+mismatch is a bug with a turn number, found by comparing money per turn.
 
 Selection is by rating floor and engine version, sampled with a fixed seed
 across the whole eligible population -- not sorted by rating and truncated to
