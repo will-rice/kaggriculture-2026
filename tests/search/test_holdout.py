@@ -211,6 +211,29 @@ def test_run_raises_if_the_frontier_directory_is_empty(tmp_path: Path) -> None:
         run(candidate=[], against=SERVED, frontier=empty)
 
 
+def test_run_raises_if_the_frontier_pool_has_fewer_than_the_minimum_tapes(
+    tmp_path: Path,
+) -> None:
+    """Below `FRONTIER_MIN_TAPES` the 0.45 bar is unreachable by any candidate.
+
+    Two tapes pool to 256 games; even a perfect 0.500 rate over 256 games
+    caps the Wilson lower bound at ~0.439, below `FRONTIER_LOW_THRESHOLD`
+    (0.45) no matter how strong the candidate is. Silently grading against a
+    pool this size would produce a FAIL that reads as a weak candidate when
+    the real cause is a pool too thin for the bar to mean anything, so the
+    gate must raise instead -- and the message must name both the count found
+    and the count required so the cause is legible.
+    """
+    thin = _frontier_dir(tmp_path, count=2)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run(candidate=[], against=SERVED, frontier=thin)
+
+    message = str(excinfo.value)
+    assert "2" in message
+    assert str(holdout.FRONTIER_MIN_TAPES) in message
+
+
 def test_run_raises_if_the_frontier_s_newest_file_is_older_than_seven_days(
     tmp_path: Path,
 ) -> None:
@@ -221,13 +244,14 @@ def test_run_raises_if_the_frontier_s_newest_file_is_older_than_seven_days(
     candidate against it would silently repeat the exact failure this task
     exists to close, just with a frontier leg that looks present but is not
     current. The gate must raise rather than quietly grading against history.
+    Built at `FRONTIER_MIN_TAPES` files (all stale) so this pins the
+    staleness raise specifically, not the too-few-tapes one -- a pool this
+    size is otherwise large enough to pass.
     """
-    stale_dir = tmp_path / "frontier"
-    stale_dir.mkdir()
-    stale_file = stale_dir / "old-route.json"
-    stale_file.write_text("[]")
+    stale_dir = _frontier_dir(tmp_path, count=holdout.FRONTIER_MIN_TAPES)
     eight_days_ago = time.time() - 8 * 86400
-    os.utime(stale_file, (eight_days_ago, eight_days_ago))
+    for stale_file in stale_dir.iterdir():
+        os.utime(stale_file, (eight_days_ago, eight_days_ago))
 
     with pytest.raises(RuntimeError, match="days old"):
         run(candidate=[], against=SERVED, frontier=stale_dir)
@@ -236,13 +260,15 @@ def test_run_raises_if_the_frontier_s_newest_file_is_older_than_seven_days(
 def test_run_does_not_raise_when_the_newest_frontier_file_is_within_seven_days(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The boundary's mirror: a frontier refreshed recently must not raise."""
-    frontier = tmp_path / "frontier"
-    frontier.mkdir()
-    fresh_file = frontier / "fresh-route.json"
-    fresh_file.write_text("[]")
+    """The boundary's mirror: a frontier refreshed recently must not raise.
+
+    Built at `FRONTIER_MIN_TAPES` files so the too-few-tapes check does not
+    also fire here.
+    """
+    frontier = _frontier_dir(tmp_path, count=holdout.FRONTIER_MIN_TAPES)
     six_days_ago = time.time() - 6 * 86400
-    os.utime(fresh_file, (six_days_ago, six_days_ago))
+    for fresh_file in frontier.iterdir():
+        os.utime(fresh_file, (six_days_ago, six_days_ago))
 
     def recorder(
         candidate: object,

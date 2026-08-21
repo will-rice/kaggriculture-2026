@@ -74,16 +74,33 @@ FRONTIER_DIR = Path("/data/kaggriculture/search/frontier-league")
 # grading against a stale pool.
 FRONTIER_STALE_DAYS = 7
 
+# The frontier pool this gate expects, each tape seat-swapped over
+# GATE_SEEDS (128 games/tape). FRONTIER_LOW_THRESHOLD's derivation below
+# assumes at least this many tapes are pooled -- below it, the bar is not
+# just harder, it is unreachable (see the table below), so `_frontier_league`
+# raises rather than grading against a pool too thin for 0.45 to mean
+# anything. Not hardcoded a second time in that check: it reads this constant.
+FRONTIER_MIN_TAPES = 3
+
 # Derivation (fixed before any candidate is seen; do not retune after a
-# result comes in low): the frontier pool this gate expects is >= 3 harvested
-# tapes, each seat-swapped over GATE_SEEDS, i.e. >= 3 * 128 = 384 games. At
-# n = 384, z = 1.96 (report.wilson_interval's default), a pooled win rate of
+# result comes in low): at FRONTIER_MIN_TAPES tapes, i.e. >= 3 * 128 = 384
+# games, z = 1.96 (report.wilson_interval's default), a pooled win rate of
 # exactly 0.500 (192/384) gives a Wilson lower bound of 0.4502 -- just clears
 # 0.45. A rate of 0.499 gives ~0.4492 and fails. The bar is deliberately
 # knife-edged at "statistically indistinguishable from a coin flip against the
 # frontier", not "better than one": a candidate that is a true peer of the
 # newest top-band tapes passes; the 2026-08-20 route, which pooled to
 # 0.36-0.38 against them, fails by a wide margin.
+#
+# The knife-edge cuts the other way too, below FRONTIER_MIN_TAPES: a *perfect*
+# 0.500 pooled rate -- the best a true frontier peer can average -- cannot
+# clear 0.45 with too few tapes pooled, so a thin pool would silently reject
+# even a perfect peer and look exactly like a weak candidate:
+#
+#   1 tape,  n=128, a perfect 0.500 rate -> Wilson lower 0.4147  FAILS
+#   2 tapes, n=256, a perfect 0.500 rate -> Wilson lower 0.4392  FAILS
+#   3 tapes, n=384, a perfect 0.500 rate -> Wilson lower 0.4502  passes
+#   4 tapes, n=512, a perfect 0.500 rate -> Wilson lower 0.4569  passes
 FRONTIER_LOW_THRESHOLD = 0.45
 
 
@@ -185,16 +202,28 @@ def _frontier_league(frontier: Path) -> dict[str, Route]:
         One route per file, keyed by filename stem.
 
     Raises:
-        RuntimeError: If ``frontier`` holds no files, or its newest file is
-            older than ``FRONTIER_STALE_DAYS`` days -- a stale frontier is the
-            2026-08-20 failure with extra steps, so this fails loudly rather
-            than quietly grading a candidate against history.
+        RuntimeError: If ``frontier`` holds no files, holds fewer than
+            ``FRONTIER_MIN_TAPES`` files, or its newest file is older than
+            ``FRONTIER_STALE_DAYS`` days. A pool below ``FRONTIER_MIN_TAPES``
+            cannot clear ``FRONTIER_LOW_THRESHOLD`` even for a true frontier
+            peer (see that constant's derivation comment) -- silently grading
+            against it would produce a FAIL that reads as a weak candidate
+            when the real cause is a pool too thin for the bar to mean
+            anything, so this raises instead. A stale frontier is the
+            2026-08-20 failure with extra steps, so it too fails loudly
+            rather than quietly grading a candidate against history.
     """
     files = sorted(path for path in frontier.iterdir() if path.is_file())
     if not files:
         raise RuntimeError(
             f"{frontier}: frontier league is empty -- refresh it with "
             "build_league before gating"
+        )
+    if len(files) < FRONTIER_MIN_TAPES:
+        raise RuntimeError(
+            f"{frontier}: frontier pool has {len(files)} tape(s), need at "
+            f"least {FRONTIER_MIN_TAPES} for FRONTIER_LOW_THRESHOLD to be "
+            "meaningful -- refresh it with build_league before gating"
         )
     age_days = (time.time() - max(path.stat().st_mtime for path in files)) / 86400
     if age_days > FRONTIER_STALE_DAYS:
