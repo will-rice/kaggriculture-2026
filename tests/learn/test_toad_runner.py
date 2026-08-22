@@ -24,11 +24,13 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad_phase1
+from kaggriculture.learn.toad.core import vtrace
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     ENTROPY_COST,
     LEARNING_RATE,
     TEACHER_KL_COST,
+    Losses,
 )
 
 
@@ -71,6 +73,7 @@ def _segment(turns: int = 16, transfers: bool = True) -> dict[str, torch.Tensor]
         "log_probs": torch.full((turns,), -1.0),
         "shaped": torch.randn(turns) * 0.01,
         "shaped_money": torch.randn(turns) * 0.01,
+        "own": torch.randn(turns) * 0.01,
         "dones": torch.zeros(turns, dtype=torch.bool),
     }
 
@@ -494,6 +497,7 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
         baseline_only: bool = False,
         teacher: toad_phase1.Teacher | None = None,
         teacher_kl_cost: float = TEACHER_KL_COST,
+        discounting: float = toad_phase1.DISCOUNTING,
     ) -> dict[str, float]:
         seen.append(baseline_only)
         return real(
@@ -505,6 +509,7 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
             baseline_only,
             teacher,
             teacher_kl_cost,
+            discounting=discounting,
         )
 
     with pytest.MonkeyPatch.context() as patch:
@@ -617,3 +622,115 @@ def test_lr_and_entropy_cost_reach_the_recorded_config(
     config = cast(dict[str, object], captured["config"])
     assert config["lr"] == pytest.approx(3e-4)
     assert config["entropy_cost"] == pytest.approx(0.02)
+
+
+def test_own_flag_selects_the_series_the_loss_actually_trains_on() -> None:
+    """``--own`` must select the tensor the update differentiates, not just parse.
+
+    A ``_field`` that returns the right string while ``_step`` goes on feeding
+    the loss ``shaped`` regardless is invisible to a namespace-only check, and
+    that exact shape of bug is why this asserts on the ``rewards`` keyword
+    ``losses`` is actually called with, not on ``arguments.own``.
+    """
+    arguments = toad_phase1._parser().parse_args(["--own"])
+    field = toad_phase1._field(arguments)
+    assert field == "own"
+
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    expected = torch.stack([segment["own"] for segment in segments], dim=1)
+
+    seen: list[torch.Tensor] = []
+    real_losses = toad_phase1.losses
+
+    def _recording(
+        behaviour_log_probs: torch.Tensor,
+        learner_log_probs: torch.Tensor,
+        negative_entropy: torch.Tensor,
+        values: torch.Tensor,
+        bootstrap_value: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        discounting: float = toad_phase1.DISCOUNTING,
+        baseline_only: bool = False,
+        teacher_kl: torch.Tensor | None = None,
+        teacher_kl_cost: float = TEACHER_KL_COST,
+        entropy_cost: float = ENTROPY_COST,
+    ) -> Losses:
+        seen.append(rewards)
+        return real_losses(
+            behaviour_log_probs=behaviour_log_probs,
+            learner_log_probs=learner_log_probs,
+            negative_entropy=negative_entropy,
+            values=values,
+            bootstrap_value=bootstrap_value,
+            rewards=rewards,
+            dones=dones,
+            discounting=discounting,
+            baseline_only=baseline_only,
+            teacher_kl=teacher_kl,
+            teacher_kl_cost=teacher_kl_cost,
+            entropy_cost=entropy_cost,
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(toad_phase1, "losses", _recording)
+        toad_phase1._step(policy, optimizer, segments, "cpu", field)
+
+    assert len(seen) == 1
+    assert torch.equal(seen[0], expected)
+
+
+def test_gamma_flag_reaches_the_advantage_computation() -> None:
+    """``--gamma`` must change the discount the return computations actually use.
+
+    ``losses`` turns ``discounting`` into a ``discounts`` tensor and hands that
+    to ``vtrace.from_action_log_probs`` (and, identically built, to
+    ``td_lambda`` and ``upgo``). A ``_step`` that parses ``--gamma`` and keeps
+    building ``discounts`` at ``DISCOUNTING`` regardless would still report a
+    finite, plausible-looking loss, so this asserts on the tensor
+    ``from_action_log_probs`` is actually called with rather than on the
+    parsed namespace.
+    """
+    arguments = toad_phase1._parser().parse_args(["--gamma", "0.5"])
+    assert arguments.gamma == pytest.approx(0.5)
+
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    dones = torch.stack([segment["dones"] for segment in segments], dim=1)
+    expected = (~dones).float() * arguments.gamma
+
+    seen: list[torch.Tensor] = []
+    real_vtrace = vtrace.from_action_log_probs
+
+    def _recording(
+        behavior_action_log_probs: torch.Tensor,
+        target_action_log_probs: torch.Tensor,
+        discounts: torch.Tensor,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        bootstrap_value: torch.Tensor,
+    ) -> object:
+        seen.append(discounts)
+        return real_vtrace(
+            behavior_action_log_probs=behavior_action_log_probs,
+            target_action_log_probs=target_action_log_probs,
+            discounts=discounts,
+            rewards=rewards,
+            values=values,
+            bootstrap_value=bootstrap_value,
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(vtrace, "from_action_log_probs", _recording)
+        toad_phase1._step(
+            policy,
+            optimizer,
+            segments,
+            "cpu",
+            "shaped_money",
+            discounting=arguments.gamma,
+        )
+
+    assert len(seen) == 1
+    assert torch.equal(seen[0], expected)

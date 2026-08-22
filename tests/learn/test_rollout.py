@@ -48,6 +48,7 @@ from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import BLOCKS, CHANNELS, Policy
 from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, potential
 from kaggriculture.learn.rollout import Trajectory, rollout, rollout_many
+from kaggriculture.learn.scripts import toad_phase1
 
 # Far enough in that the two farms have diverged. The opening position is
 # identical for both seats -- same tiles, same money, same empty shed -- so a
@@ -153,6 +154,25 @@ def test_both_reward_series_telescope_to_their_own_outcome() -> None:
         trajectory.final_bank - STARTING_MONEY, abs=1.0
     )
     assert not torch.allclose(trajectory.rewards, trajectory.own, atol=1.0)
+
+
+def test_own_survives_the_learner_s_segment_batch_path() -> None:
+    """The ``own`` values a segment carries must be the trajectory's own, in order.
+
+    ``_segments`` slices ``ACTED_FIELDS`` off the trajectory by index rather
+    than re-deriving them; a wrong index or a re-computed series would still
+    produce a same-shaped tensor whose values have silently drifted from what
+    was recorded and played. Concatenating every segment's ``own`` back up and
+    comparing it to the trajectory's own, turn for turn, is what rules that out.
+    """
+    trajectory = rollout(_untrained(), "starter", seed=0)
+
+    segments = toad_phase1._segments(trajectory)
+    seen = torch.cat([segment["own"] for segment in segments])
+    turns = int(trajectory.dones.shape[0])
+    start = turns % toad_phase1.UNROLL_LENGTH
+
+    assert torch.equal(seen, trajectory.own[start:])
 
 
 def test_the_margin_reward_telescopes_on_a_real_episode() -> None:

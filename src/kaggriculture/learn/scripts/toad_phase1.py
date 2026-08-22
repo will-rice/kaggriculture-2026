@@ -54,6 +54,7 @@ from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
+    DISCOUNTING,
     ENTROPY_COST,
     LEARNING_RATE,
     MIN_LR_MOD,
@@ -159,6 +160,7 @@ ACTED_FIELDS = (
     "shaped",
     "shaped_money",
     "margin",
+    "own",
     "dones",
 )
 OBSERVED_FIELDS = ("board", "scalars", "positions")
@@ -359,6 +361,13 @@ def _parser() -> argparse.ArgumentParser:
         "with --phase1b.",
     )
     parser.add_argument(
+        "--own",
+        action="store_true",
+        help="train on this seat's own bank alone -- absolute rather than "
+        "relative, and the thinnest possible shaping. Mutually exclusive with "
+        "--phase1b and --margin.",
+    )
+    parser.add_argument(
         "--money-weight",
         type=float,
         default=None,
@@ -409,6 +418,14 @@ def _parser() -> argparse.ArgumentParser:
         default=ENTROPY_COST,
         help="coefficient on the entropy loss term. Sweep knob; the default "
         "reproduces every earlier arm exactly.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=DISCOUNTING,
+        help="discount the return and advantage targets are built at "
+        "(``losses``' ``discounting``). Sweep knob; the default reproduces "
+        "every earlier arm exactly.",
     )
     parser.add_argument(
         "--value-warmup",
@@ -533,6 +550,7 @@ def main() -> None:
             arguments.teacher_kl_cost,
             arguments.value_passes,
             entropy_cost=arguments.entropy_cost,
+            discounting=arguments.gamma,
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -908,6 +926,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "sync_every": SYNC_EVERY,
             "lr": arguments.lr,
             "entropy_cost": arguments.entropy_cost,
+            "gamma": arguments.gamma,
             "adam_eps": ADAM_EPS,
             "clip_grads": CLIP_GRADS,
             "total_steps": TOTAL_STEPS,
@@ -1027,17 +1046,19 @@ def _field(arguments: argparse.Namespace) -> str:
         The ``Trajectory`` attribute name the learner reads.
 
     Raises:
-        ValueError: If two rewards are asked for at once.
+        ValueError: If more than one reward is asked for at once.
     """
-    if arguments.margin and arguments.phase1b:
+    if sum((arguments.margin, arguments.phase1b, arguments.own)) > 1:
         raise ValueError(
-            "--margin and --phase1b name two different rewards; an arm trains "
-            "on one of them"
+            "--margin, --phase1b and --own name three different rewards; an "
+            "arm trains on one of them"
         )
     if arguments.margin:
         return "margin"
     if arguments.phase1b:
         return "shaped_money"
+    if arguments.own:
+        return "own"
     return REWARD_FIELD
 
 
@@ -1312,6 +1333,7 @@ def _update(
     teacher_kl_cost: float = TEACHER_KL_COST,
     value_passes: int = 0,
     entropy_cost: float = ENTROPY_COST,
+    discounting: float = DISCOUNTING,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -1346,6 +1368,9 @@ def _update(
         value_passes: Extra value-only passes over the same round, after the
             policy has taken its one. Zero reproduces every earlier arm exactly.
         entropy_cost: Coefficient on the entropy loss term.
+        discounting: Gamma the return and advantage targets are built at,
+            passed through to every ``_step`` and ``_value_passes`` call this
+            round makes.
 
     Returns:
         The loss terms averaged over the round's policy steps, plus
@@ -1369,13 +1394,14 @@ def _update(
             teacher=teacher,
             teacher_kl_cost=teacher_kl_cost,
             entropy_cost=entropy_cost,
+            discounting=discounting,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
         steps += 1
     means = {key: value / max(steps, 1) for key, value in totals.items()}
     means["baseline_passes"] = _value_passes(
-        learner, optimizer, segments, device, field, value_passes
+        learner, optimizer, segments, device, field, value_passes, discounting
     ) or means.get("baseline", 0.0)
     return means, steps
 
@@ -1387,6 +1413,7 @@ def _value_passes(
     device: str,
     field: str,
     passes: int,
+    discounting: float = DISCOUNTING,
 ) -> float:
     """Replay a round through the value head alone and return the mean loss.
 
@@ -1402,6 +1429,8 @@ def _value_passes(
         device: Where to run the learner.
         field: Which recorded reward series the learner reads.
         passes: How many times to replay. Zero returns 0.0 and touches nothing.
+        discounting: Gamma the value target is built at, same one the policy
+            pass used.
 
     Returns:
         The mean ``baseline`` loss across every extra batch, or 0.0 if there were
@@ -1418,6 +1447,7 @@ def _value_passes(
                 device,
                 field,
                 baseline_only=True,
+                discounting=discounting,
             )
             total += terms["baseline"]
             steps += 1
@@ -1434,6 +1464,7 @@ def _step(
     teacher: Teacher | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
     entropy_cost: float = ENTROPY_COST,
+    discounting: float = DISCOUNTING,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -1453,6 +1484,8 @@ def _step(
             or None.
         teacher_kl_cost: Coefficient on that KL.
         entropy_cost: Coefficient on the entropy loss term.
+        discounting: Gamma the return and advantage targets are built at.
+            ``losses``' own default, ``toad_loss.DISCOUNTING``.
 
     Returns:
         The four loss terms and their total, as floats.
@@ -1565,6 +1598,7 @@ def _step(
         bootstrap_value=bootstrap_value,
         rewards=rewards,
         dones=dones,
+        discounting=discounting,
         baseline_only=baseline_only,
         teacher_kl=teacher_kl,
         teacher_kl_cost=teacher_kl_cost,
