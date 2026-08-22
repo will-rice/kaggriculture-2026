@@ -486,13 +486,28 @@ def _parser() -> argparse.ArgumentParser:
         help="checkpoint to continue from, restoring weights, optimizer, "
         "schedule and counters",
     )
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=TOTAL_STEPS,
+        help="environment steps this arm trains for. The curriculum's five "
+        "phases each need a different budget (2e7-1e7) against this "
+        "constant's declared-deviation 1e8.",
+    )
     return parser
 
 
-def main() -> None:
-    """Run phase 1 to ``TOTAL_STEPS``, checkpointing and logging as it goes."""
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run one arm to ``--total-steps``, checkpointing and logging as it goes.
+
+    Args:
+        argv: Flags to parse, or None for ``sys.argv[1:]`` (the CLI's own
+            default). ``curriculum.py`` passes an explicit list here so it can
+            invoke this entry point directly rather than shelling out or
+            duplicating the training loop.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    arguments = _parser().parse_args()
+    arguments = _parser().parse_args(argv)
 
     seed_everything(SEED, workers=True)
     RUNS.mkdir(parents=True, exist_ok=True)
@@ -514,7 +529,7 @@ def main() -> None:
         _warm_start(learner, device)
     optimizer = _optimizer(learner, arguments.lr)
     schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, _decay(arguments.econ_fraction)
+        optimizer, _decay(arguments.econ_fraction, arguments.total_steps)
     )
 
     steps, update = 0, 0
@@ -547,7 +562,7 @@ def main() -> None:
         )
     started = time.monotonic()
     pool = ProcessPoolExecutor(max_workers=WORKERS)
-    while steps < TOTAL_STEPS:
+    while steps < arguments.total_steps:
         seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
         mirror_batch, econ_batch = _collect(
@@ -970,7 +985,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "lmb": arguments.lmb,
             "adam_eps": ADAM_EPS,
             "clip_grads": CLIP_GRADS,
-            "total_steps": TOTAL_STEPS,
+            "total_steps": arguments.total_steps,
             "engine": metadata.version("kaggle-environments"),
         },
     )
@@ -1147,7 +1162,9 @@ def _warm_start(learner: Policy, device: str) -> list[str]:
     return missing
 
 
-def _decay(econ_fraction: float) -> Callable[[int], float]:
+def _decay(
+    econ_fraction: float, total_steps: int = TOTAL_STEPS
+) -> Callable[[int], float]:
     """Return the LR multiplier function, floored at their ``min_lr_mod``.
 
     Toad's schedule reaches the floor exactly at ``total_steps``, so ours has to
@@ -1161,17 +1178,20 @@ def _decay(econ_fraction: float) -> Callable[[int], float]:
 
     A plain function rather than a lambda so a resume restores the same
     schedule: ``LambdaLR.state_dict`` stores ``None`` for a function and the
-    multiplier is rebuilt here from the current ``TOTAL_STEPS``, where a
-    schedule silently restarted from step zero would restore the initial rate
-    and quietly change the recipe partway through a run.
+    multiplier is rebuilt here from ``total_steps``, where a schedule silently
+    restarted from step zero would restore the initial rate and quietly change
+    the recipe partway through a run.
 
     Args:
         econ_fraction: Share of each round played against ``OPPONENT``.
+        total_steps: Environment steps this arm trains for, from ``--total-steps``
+            (default ``TOTAL_STEPS``). The curriculum's five phases each need a
+            different budget (2e7-1e7 against the constant's 1e8).
 
     Returns:
         The multiplier at a given schedule step.
     """
-    updates = max(TOTAL_STEPS // (_seats_per_update(econ_fraction) * TURNS), 1)
+    updates = max(total_steps // (_seats_per_update(econ_fraction) * TURNS), 1)
 
     def decay(step: int) -> float:
         return max(1.0 - step / updates, MIN_LR_MOD)
