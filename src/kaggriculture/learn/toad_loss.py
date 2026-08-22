@@ -31,7 +31,30 @@ from kaggriculture.learn.toad.core import td_lambda, upgo, vtrace
 # the pure baseline: it is the only phase with `teacher_kl_cost: 0.` (:66), so
 # it is genuinely teacher-free self-play from random initialisation, and none of
 # the teacher machinery in monobeast is needed to run it.
-DISCOUNTING = 0.999
+# THEIR DIGITS ARE 0.999 AND OUR SEASON IS TWICE THEIR GAME, so transcribing the
+# number does not transcribe what it meant. A discount says how much of a payoff
+# at the horizon is still visible from the first turn, and that quantity is
+# `gamma ** turns`, not `gamma`. Lux runs MAX_DAYS = 360 turns, where 0.999
+# leaves 0.999 ** 359 = 0.698 of the terminal result standing at turn 0. Our
+# season is 719 decisions, where the same digits leave 0.999 ** 718 = 0.488 --
+# the terminal objective damped 30% harder than the one they tuned, in a game
+# whose entire payoff is terminal and whose shaped reward carries that payoff at
+# 10x from turn one.
+#
+# Preserving their retention over our length is one equation:
+#
+#   gamma ** 719 = 0.999 ** 360   =>   gamma = 0.999 ** (360 / 719) = 0.9994992
+#
+# which is the same statement as holding the effective horizon at a fixed
+# multiple of the episode: 1 / (1 - 0.999) = 1,000 turns is 2.78 of their games,
+# and 1 / (1 - 0.9995) = 2,000 turns is 2.78 of ours. Rounded to 0.9995 in the
+# style of their own constants, the retention is 0.698 against their 0.698.
+#
+# Rejected alternative: keep 0.999, which the grounding note calls low-risk on
+# the grounding that the half-life (693 turns) is about our episode length. That
+# reasoning prices the *median* turn, not the horizon, and the horizon is where
+# this game's whole score is decided.
+DISCOUNTING = 0.9995
 LMB = 0.8
 ENTROPY_COST = 0.001
 LEARNING_RATE = 1e-4
@@ -204,7 +227,9 @@ def losses(
         bootstrap_value: ``(batch,)`` value of the state after the last one.
         rewards: ``(turns, batch)`` reward following each action.
         dones: ``(turns, batch)`` bool, True where the episode ended.
-        discounting: Gamma. Their 0.999 across all five phases.
+        discounting: Gamma. Their 0.999 over a 360-turn game, rescaled to
+            0.9995 so that our 719-turn season retains the same fraction of a
+            terminal payoff at turn 0; see ``DISCOUNTING``.
         lmb: Lambda for both TD(lambda) and UPGO. Their 0.8 for phases 1-4.
         entropy_cost: Coefficient on the entropy term.
         reduction: Passed to ``reduce``.

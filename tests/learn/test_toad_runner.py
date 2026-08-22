@@ -519,6 +519,47 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
     assert all(seen)
 
 
+def test_the_default_arm_trains_on_the_reward_that_prices_coins() -> None:
+    """The score constituent must be inside the dense reward the learner reads.
+
+    In Lux, ``city`` *is* the score -- ``GameResultReward.compute_player_reward``
+    ranks on ``city_tile_count * 10000 + unit_count`` -- so their heaviest
+    per-step component pays, densely, for the very quantity that decides their
+    game. Here the score is coins banked, and a default that omits the coin
+    delta leaves our shaped reward with no dense term on the score at all. That
+    is not a sparser reproduction of their recipe; it is a reproduction with
+    their largest component deleted.
+
+    Asserted through ``_step``, which is where a field name becomes the tensor
+    the loss regresses on. ``_field`` returning the right string while ``_step``
+    stacked another series would pass a namespace check.
+    """
+    segments = [_segment() for _ in range(2)]
+    policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
+
+    def run(field: str) -> dict[str, float]:
+        learner = copy.deepcopy(policy)
+        optimizer = torch.optim.Adam(
+            learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS
+        )
+        return toad_phase1._step(learner, optimizer, segments, "cpu", field)
+
+    default = run(toad_phase1._field(toad_phase1._parser().parse_args([])))
+    assert default == run("shaped_money")
+    assert default != run("shaped")
+
+
+def test_the_money_free_arm_is_still_one_flag_away() -> None:
+    """The ablation must remain runnable in the direction that omits the coins.
+
+    Toad's own component set, with nothing paying for the score, is the control
+    this reproduction is measured against; making it the default was the error,
+    making it unreachable would be a second one.
+    """
+    arguments = toad_phase1._parser().parse_args(["--no-money"])
+    assert toad_phase1._field(arguments) == "shaped"
+
+
 def test_omitting_lr_and_entropy_cost_reproduces_todays_constants() -> None:
     """Every existing invocation must behave identically once the flags exist.
 

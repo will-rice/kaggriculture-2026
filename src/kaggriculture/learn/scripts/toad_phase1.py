@@ -23,10 +23,15 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
 * **The market head is ours** (D8). Their actor is per-tile and has no analogue
   for a non-spatial trading decision; ours pools the trunk. The unit head keeps
   their structure -- a per-tile readout gathered at each unit's own square.
-* **719 decisions against their 360** (D2), at their gamma of 0.999.
-* **Nothing rewards selling well** (D1), because Toad had no such component.
-  This is the reproduction's central open question and is left standing so the
-  run measures it.
+* **719 decisions against their 360** (D2), which is why the discount is
+  0.9995 rather than their 0.999 -- the same retention of a terminal payoff at
+  turn 0 over twice the episode; see ``toad_loss.DISCOUNTING``.
+* **Nothing rewards selling well** (D1), because Toad had no component that
+  priced their transactions either. This is the reproduction's central open
+  question and is left standing so the run measures it. What is *not* left out
+  is the score itself: their `city` weight is Lux's win condition paid
+  incrementally, so ours pays for coins banked -- see `toad_reward.MONEY_WEIGHT`
+  and `--no-money`, the ablation that deletes it.
 """
 
 import argparse
@@ -68,7 +73,6 @@ from kaggriculture.learn.toad_reward import (
     ABSOLUTE_WEIGHT,
     CAPITAL_WEIGHT,
     MARGIN_WEIGHT,
-    MONEY_SIGNED_ENV,
     MONEY_WEIGHT_ENV,
     money_weight,
 )
@@ -117,12 +121,14 @@ CHANNELS = 128
 # by MAX_DAYS: the value head is confined to [-1, +1]. Ours was unbounded, and
 # that alone diverged the first run.
 VALUE_BOUND = 1.0
-# Which reward the learner trains on. "shaped" is Toad's five components exactly
-# and is the baseline. "shaped_money" is phase-1b: the same five plus our one
-# added component paying for coins banked, deviation D1 made explicit. Both are
-# recorded on every trajectory, so switching this constant is the entire diff
-# between the two arms and the ablation shares seeds, episodes and actions.
-REWARD_FIELD = "shaped"
+# Which reward the learner trains on. "shaped_money" is the faithful component
+# set: their five, with the score constituent in the slot their `city` weight
+# occupies -- in Lux `city` IS the score, and here the score is coins banked.
+# "shaped" is the same set with that component deleted, which is the ablation
+# (--no-money) rather than the baseline. Both are recorded on every trajectory,
+# so switching this constant is the entire diff between the two arms and they
+# share seeds, episodes and actions.
+REWARD_FIELD = "shaped_money"
 # Episodes per collection round. Their n_actor_envs is 16 across 2 actors; ours
 # is one synchronous group, and both seats of a self-play episode are recorded.
 ENVIRONMENTS = 24
@@ -283,7 +289,7 @@ METRIC_DEFINITIONS: dict[str, str] = {
     ),
     "proxy/shaped_reward_mean": (
         "Episode total of whichever reward field this arm actually trains "
-        "on (REWARD_FIELD, or --phase1b / --margin). Rising while "
+        "on (REWARD_FIELD, or --no-money / --margin). Rising while "
         "objective/win_rate_vs_econ stays flat is shaped credit, not "
         "progress -- about three-quarters of a typical value here is "
         "shaping, not coins."
@@ -295,14 +301,14 @@ METRIC_DEFINITIONS: dict[str, str] = {
     "diag/gross_purchases": (
         "Gross coins spent buying, mean per episode. Rising alongside "
         "proxy/money_term without diag/bank_mean moving is the money-pump "
-        "signature: a clamped delta lets a losing round trip still earn "
-        "shaped reward."
+        "signature. The delta is signed, so a losing round trip cannot earn "
+        "shaped reward; this watches for the clamp coming back."
     ),
     "proxy/money_term": (
         "The money component's own realised contribution to the shaped "
-        "reward (shaped_money - shaped). Logged on both arms: the "
-        "counterfactual on the baseline, the thing being paid for on "
-        "phase-1b."
+        "reward (shaped_money - shaped). Logged on both arms: the thing "
+        "being paid for on the faithful arm, the counterfactual on "
+        "--no-money."
     ),
     "diag/lr": "Current learning rate off the LambdaLR schedule.",
     "diag/warming": (
@@ -348,24 +354,25 @@ def _parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--phase1b",
+        "--no-money",
         action="store_true",
-        help="train on the money-augmented reward instead of Toad's five "
-        "components. The two arms must differ by this flag and nothing else.",
+        help="delete the score constituent from the shaped reward, leaving "
+        "Toad's Lux-specific five. The control this reproduction is measured "
+        "against; the two arms must differ by this flag and nothing else.",
     )
     parser.add_argument(
         "--margin",
         action="store_true",
         help="train on the margin reward -- the competition's actual win "
         "condition -- instead of Toad's shaped components. Mutually exclusive "
-        "with --phase1b.",
+        "with --no-money.",
     )
     parser.add_argument(
         "--own",
         action="store_true",
         help="train on this seat's own bank alone -- absolute rather than "
         "relative, and the thinnest possible shaping. Mutually exclusive with "
-        "--phase1b and --margin.",
+        "--no-money and --margin.",
     )
     parser.add_argument(
         "--money-weight",
@@ -445,12 +452,6 @@ def _parser() -> argparse.ArgumentParser:
         "Zero reproduces every earlier arm exactly.",
     )
     parser.add_argument(
-        "--money-signed",
-        action="store_true",
-        help="keep both signs on the money delta (arm W'). Makes the component "
-        "potential-based, so the pump is unprofitable by construction.",
-    )
-    parser.add_argument(
         "--clone-init",
         action="store_true",
         help="warm-start trunk and both heads from the BC clone instead of "
@@ -481,8 +482,6 @@ def main() -> None:
     # The single constant the ablation turns on. Everything downstream -- file
     # names, wandb run name, which reward the learner reads -- follows from it,
     # so the two arms cannot drift apart in any other respect.
-    if arguments.money_signed:
-        os.environ[MONEY_SIGNED_ENV] = "1"
     if arguments.money_weight is not None:
         # Into the environment before the worker pool forks, so every rollout
         # process computes `shaped_money` at this arm's weight.
@@ -902,7 +901,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "channels": arguments.channels,
             "value_bound": VALUE_BOUND,
             "reward_field": field,
-            "money_weight": money_weight() if arguments.phase1b else 0.0,
+            "money_weight": 0.0 if arguments.no_money else money_weight(),
             "margin_weight": MARGIN_WEIGHT if arguments.margin else 0.0,
             "absolute_weight": ABSOLUTE_WEIGHT if arguments.margin else 0.0,
             # Live on every arm that reads a `shaped` field and zero on the
@@ -919,7 +918,6 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             else None,
             "teacher_kl_cost": arguments.teacher_kl_cost,
             "clone_init": arguments.clone_init,
-            "money_signed": arguments.money_signed,
             "environments": ENVIRONMENTS,
             "batch_segments": BATCH_SEGMENTS,
             "unroll_length": UNROLL_LENGTH,
@@ -1018,8 +1016,8 @@ def _prefix(arguments: argparse.Namespace) -> str:
         return arguments.name
     if arguments.margin:
         return "phase1m"
-    if arguments.phase1b:
-        return "phase1b"
+    if arguments.no_money:
+        return "phase1-no-money"
     return "phase1"
 
 
@@ -1027,8 +1025,8 @@ def _default_name(arguments: argparse.Namespace) -> str:
     """Return the run name for an arm that did not pass ``--name``."""
     if arguments.margin:
         return "toad-phase1m-margin"
-    if arguments.phase1b:
-        return "toad-phase1b-money-component"
+    if arguments.no_money:
+        return "toad-phase1-no-money"
     return "toad-phase1-baseline"
 
 
@@ -1048,15 +1046,15 @@ def _field(arguments: argparse.Namespace) -> str:
     Raises:
         ValueError: If more than one reward is asked for at once.
     """
-    if sum((arguments.margin, arguments.phase1b, arguments.own)) > 1:
+    if sum((arguments.margin, arguments.no_money, arguments.own)) > 1:
         raise ValueError(
-            "--margin, --phase1b and --own name three different rewards; an "
+            "--margin, --no-money and --own name three different rewards; an "
             "arm trains on one of them"
         )
     if arguments.margin:
         return "margin"
-    if arguments.phase1b:
-        return "shaped_money"
+    if arguments.no_money:
+        return "shaped"
     if arguments.own:
         return "own"
     return REWARD_FIELD
@@ -1693,7 +1691,7 @@ def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
     segments are never coupled, and the horizon can never propagate backwards
     however long the run goes on. The fixed point of that sealed target is
     ``r / (1 - gamma)``, the local reward rate extrapolated to an *infinite*
-    horizon -- 1000x a turn's reward at their gamma of 0.999, regardless of how
+    horizon -- 2000x a turn's reward at our gamma of 0.9995, regardless of how
     many turns the season actually has left. That is precisely the critic the
     2026-08-09 measurement found: running to its -1 rail while the true
     return-to-go rose toward zero, at a predicted-over-actual ratio of 1.95

@@ -23,10 +23,19 @@ exactly:
 ``game_result`` rides inside the shaped reward at 10x from the first turn (:219),
 firing only on the last one. It is not a separate phase.
 
-Deliberately absent: anything that rewards selling *well*. Toad had no such
-component, and price x quantity is what decides our game. That gap is the
-reproduction's most important open question and is left standing so phase 1 can
-measure it rather than paper over it.
+Their ``city`` slot is the one mapping that has to be argued rather than
+transcribed. In Lux ``city`` is not a means to the score, it *is* the score --
+``GameResultReward`` ranks on city tiles with units as the tie-break -- so their
+heaviest per-step component is the win condition paid out incrementally. Ours is
+coins banked, and ``MONEY_WEIGHT`` is where it lives. Worked land and livestock
+keep terms of their own as the farm-specific means, which is the content
+deviation the grounding note already declares unavoidable.
+
+Deliberately absent: anything that rewards selling *well*. Toad had no component
+that priced their transactions, and a term paying for volume or realisation
+would be our guess about strategy rather than a statement of what winning is.
+That gap is the reproduction's most important open question and is left standing
+so the run can measure it rather than paper over it.
 """
 
 import dataclasses
@@ -54,26 +63,32 @@ STEP_WEIGHT = 0.005
 # at -0.01 (:172-174). Kept disabled, as the winning recipe had it.
 FULL_WORKERS_WEIGHT = 0.0
 
-# OURS, NOT THEIRS. Deviation D1 made explicit: Toad's component set pays for
-# every link of their chain, and ours is missing exactly one -- converting shed
-# stock into coins. Nothing in their five components rewards selling, and price
-# times quantity is what decides our game.
+# THEIR `city` SLOT, NOT A NEW COMPONENT. This was recorded as "deviation D1 --
+# ours, not theirs" and off by default, and that reading is backwards. In Lux
+# `city` *is* the score: `GameResultReward.compute_player_reward` ranks players
+# on `city_tile_count * 10000 + unit_count` (reward_spaces_lux.py:120-125), so
+# their heaviest per-step component is the win condition rewarded incrementally.
+# Here the score is coins banked. Mapping their 1.0 onto worked land and leaving
+# coins out leaves the shaped reward with NO dense term on the score at all --
+# which is not a sparser reproduction of their recipe, it is a reproduction with
+# their largest component deleted. The deviation was the omission.
 #
-# The weight is anchored on their own ratios rather than picked. Their
-# score-deciding component is `city` at 1.0, so one city tile is worth
-# 1.0 / 500 = 0.002. Measured over a real 719-turn episode (kaito vs kaito, seed
-# 7, banking 128,341 against the 125,773 corpus median): 129 of 719 turns bank
-# anything, the median sale is 648 coins and the season gains 155,526.
+# It is also the one addition the task's own rule permits: reward the score,
+# never the method. A coin banked is the score. "Sell more" or "trade more
+# volume" would be our guess about strategy and is not here.
 #
-#   one median sale  648 * 0.001 / 500 = 0.0013  = 0.65 city tiles
-#   season total  155,526 * 0.001 / 500 = 0.311  vs their ~0.2 for city
-#   ratio to game_result             = 15.6x     vs their ~10x
+# THE WEIGHT IS ANCHORED ON EPISODE CONTRIBUTION, not transcribed, because coins
+# and city tiles are not the same unit and 1.0 would mean nothing. Measured on
+# kaggle-environments 1.32.7 over an economic_policy mirror season banking
+# 99,169 coins:
 #
-# All three land within a small factor of theirs, and 0.001 is a round number in
-# the style of their 1.0 / 0.5 / 0.1 / 0.005. Erring slightly high is deliberate:
-# coins are our *sole* score-decider, where theirs splits between city and units.
+#   season total  99,169 * 0.001 / 500 = 0.198  vs their ~0.2 for city
+#   ratio to game_result                = 9.9x   vs their 10x
 #
-# Off by default. The baseline reward must stay exactly as it was measured.
+# Both land on theirs, and 0.001 is a round number in the style of their
+# 1.0 / 0.5 / 0.1 / 0.005. (An earlier 1.32.6 measurement put the season at
+# 155,526 coins and this ratio at 15.6x; the engine's pricing rewrite moved the
+# operating point, not the weight.)
 # A MAPPING CORRECTION, not a new component. Toad's `city` at 1.0 is their
 # COMPOUNDING, SCORE-DECIDING asset. We pointed that weight at our terrain --
 # unlocked tiles and plants -- and left our actual economic engine, the animals,
@@ -224,34 +239,6 @@ ABSOLUTE_WEIGHT = 0.05
 # alone would leave every worker silently on the default and the arm would
 # measure nothing.
 MONEY_WEIGHT_ENV = "TOAD_MONEY_WEIGHT"
-MONEY_SIGNED_ENV = "TOAD_MONEY_SIGNED"
-
-
-def money_signed() -> bool:
-    """Whether the money component keeps both signs.
-
-    Arm W clamped the delta at zero, mirroring their ``fuel`` term, and at a
-    weight of 0.01 that produced a money pump: buying in order to sell back
-    earns shaped reward because the clamp forgives the purchase while the spread
-    quietly eats the coins. Measured over updates 1-34, ``money_term`` climbed
-    0.0064 -> 0.028 with ``gross_purchases`` tracking it 3320 -> 4414 and
-    ``bank_mean`` pinned at zero.
-
-    Unclamped, the per-turn deltas telescope to exactly the net coins banked
-    over the episode, so a round trip that loses to the spread earns
-    net-negative reward and the pump is unprofitable by construction. Genuine
-    investment -- seeds, hires, land -- goes negative on the turn it is paid and
-    recoups at the sale, a gap gamma=0.999 comfortably spans.
-
-    This also makes the component potential-based with Phi = money (Ng, Harada
-    and Russell 1999): a potential-based shaping term cannot change the optimal
-    policy's ranking of whole episodes, only guide exploration toward it. That is
-    a strictly stronger safety property than the clamped version had.
-
-    Returns:
-        True when the environment asks for the signed form.
-    """
-    return os.environ.get(MONEY_SIGNED_ENV, "") == "1"
 
 
 def money_weight() -> float:
@@ -263,9 +250,28 @@ def money_weight() -> float:
     return float(os.environ.get(MONEY_WEIGHT_ENV, MONEY_WEIGHT))
 
 
-# reward_spaces_lux.py:227. Tuned against their 360-turn game; ours runs 719
-# decisions. Kept verbatim rather than rescaled, because faithfulness is the
-# point of this pass -- see the deviation list in the task report.
+# reward_spaces_lux.py:227, and NOT a horizon-scaled constant, which is the easy
+# mistake to make beside it. `reward_min/max = +/-1/MAX_DAYS` *is* horizon-scaled
+# -- it is the per-step bound that `BaselineLayer` multiplies back by MAX_DAYS to
+# confine the value head to [-1, +1], which is why our analogue of it is
+# `toad_phase1.VALUE_BOUND = 1.0` and needs no 360 or 719 in it at all. This 500
+# is separate and prices the components against each other.
+#
+# Rescaling it by 719/360 would be wrong, because every component here except
+# `step` is a DELTA, and deltas telescope: a season's contribution is the final
+# count less the opening one, which is a fact about how much farm got built and
+# not about how many turns it took. Measured on 1.32.7 over an
+# economic_policy mirror season (99,169 coins banked, 81 city, 9 units, 8 shops,
+# 15 animals): their five components total 0.138 of episode return here against
+# the ~0.2 their `city` alone contributes in Lux. Already their band. Divided by
+# 999 instead it would be 0.069, half of theirs -- less faithful, not more.
+#
+# `step` is the one term that does scale with the horizon: 0.005 * 719 / 500 =
+# 0.0072 against their 0.0036. It is left at their value because on a
+# fixed-length season it cannot change a policy -- with no early termination the
+# discounted sum of a constant from turn t is a function of t alone, so it
+# cancels out of every advantage. In Lux, where losing every unit ends the
+# episode, the same term pays for surviving.
 NORMALISER = 500.0
 
 
@@ -442,13 +448,14 @@ def shaped(series: list[Counts], won: float, money_weight: float = 0.0) -> torch
         won: The terminal result in {-1., 0., +1.}, added on the last turn at
             ``GAME_RESULT_WEIGHT`` exactly as their ``game_result`` component
             does.
-        money_weight: Weight on the per-turn coin delta. Zero -- the default --
-            reproduces Toad's component set exactly and is what the baseline
-            run measures. ``MONEY_WEIGHT`` enables phase-1b, the one deliberate
-            addition. Clamped non-negative like their ``fuel``, so that spending
-            coins on seeds, hands or land is not punished: investment is how the
-            chain advances, and the return on it is already paid when the goods
-            are sold.
+        money_weight: Weight on the per-turn coin delta -- their ``city`` slot,
+            which in Lux is the score itself. ``MONEY_WEIGHT`` is what the
+            runner supplies and what a faithful component set needs. Zero is
+            the ablation that deletes it, kept reachable so the run can measure
+            what the omission costs; it is not the faithful default. Signed,
+            unlike ``fuel``: coins leave a bank only when the agent spends
+            them, so the deltas telescope to net coins banked and a losing
+            round trip cannot pay.
 
     Returns:
         ``(turns,)`` float32 shaped rewards, already divided by ``NORMALISER``.
@@ -477,13 +484,17 @@ def shaped(series: list[Counts], won: float, money_weight: float = 0.0) -> torch
             # loss, because the sale is already paid for through game_result.
             + FUEL_WEIGHT * max(after.fuel - before.fuel, 0)
             + STEP_WEIGHT
-            # Ours. Zero unless phase-1b enables it; see MONEY_WEIGHT.
-            + money_weight
-            * (
-                (after.money - before.money)
-                if money_signed()
-                else max(after.money - before.money, 0.0)
-            )
+            # THE SCORE CONSTITUENT, in their `city` slot; see MONEY_WEIGHT.
+            # Deliberately unclamped, unlike `fuel` directly above: `city` is not
+            # clamped either, and coins leave a bank only when the agent chooses
+            # to spend them. Unclamped the deltas telescope to the net coins
+            # banked, which makes the term potential-based with Phi = money and
+            # a buy-to-sell round trip that loses to the spread unprofitable by
+            # construction. Clamped, at a weight of 0.01, it pumped: measured
+            # over arm W's updates 1-34 the money term climbed 0.0064 -> 0.028
+            # with gross purchases tracking it 3320 -> 4414 and the bank pinned
+            # at zero.
+            + money_weight * (after.money - before.money)
         )
         rewards.append(total / NORMALISER)
     rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER
