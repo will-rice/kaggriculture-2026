@@ -98,7 +98,7 @@ invalid-argument-type = "ignore"
 # their source.
 #
 # This is scoped to the vendored directory alone. Everything we wrote around it
-# -- `toad_loss.py`, `toad_reward.py`, `scripts/toad_phase1.py` and their tests
+# -- `toad_loss.py`, `toad_reward.py`, `scripts/toad.py` and their tests
 # -- is still checked in full.
 [[tool.ty.overrides]]
 include = ["src/kaggriculture/learn/toad/**"]

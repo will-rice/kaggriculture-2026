@@ -4,7 +4,7 @@ Every arm this project has run executed phase 1 with phase 2's teacher cost,
 against a behaviour clone the recipe uses nowhere, because those numbers lived
 in a command line nobody could check. This module is the fix: the five
 phases, transcribed verbatim from the recipe into ``PHASES``, and a runner
-that translates one row of that table into the flags ``toad_phase1`` already
+that translates one row of that table into the flags ``toad`` already
 exposes rather than a remembered invocation.
 
 ``PHASES`` is deliberately the only place these numbers are typed. A phase
@@ -21,7 +21,7 @@ phase 4); every other phase starts from its own fresh initialisation, guided
 toward its teacher by the KL term alone. This runner resolves each phase's
 teacher checkpoint and refuses to start without it; it does not attempt to
 resume phase 4's weights from phase 3 automatically -- see the module's task
-report for why, and pass ``--resume`` to ``toad_phase1`` by hand if that is
+report for why, and pass ``--resume`` to ``toad`` by hand if that is
 wanted.
 """
 
@@ -30,7 +30,7 @@ import dataclasses
 import logging
 from pathlib import Path
 
-from kaggriculture.learn.scripts import toad_phase1
+from kaggriculture.learn.scripts import toad
 
 LOGGER = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ def _teacher_blocks(phase: Phase) -> int:
 def _checkpoint(name: str) -> Path:
     """Return the newest checkpoint a phase has written, or raise.
 
-    ``toad_phase1`` writes ``RUNS/{name}_{update:06d}.pt`` every
+    ``toad`` writes ``RUNS/{name}_{update:06d}.pt`` every
     ``CHECKPOINT_EVERY`` updates and this runner always names a phase's run
     after the phase itself (``--name``), so ``{name}_*.pt`` is exactly that
     phase's checkpoint family. The zero-padded update number sorts
@@ -189,23 +189,23 @@ def _checkpoint(name: str) -> Path:
         FileNotFoundError: If ``name`` has no checkpoint on disk. A missing
             teacher must fail loudly, not train unanchored.
     """
-    checkpoints = sorted(toad_phase1.RUNS.glob(f"{name}_*.pt"))
+    checkpoints = sorted(toad.RUNS.glob(f"{name}_*.pt"))
     if not checkpoints:
         raise FileNotFoundError(
-            f"{name} has no checkpoint matching {toad_phase1.RUNS}/{name}_*.pt "
+            f"{name} has no checkpoint matching {toad.RUNS}/{name}_*.pt "
             f"-- run {name} to completion first"
         )
     return checkpoints[-1]
 
 
 def _flags(phase: Phase) -> list[str]:
-    """Translate one ``Phase`` into the flags ``toad_phase1`` exposes.
+    """Translate one ``Phase`` into the flags ``toad`` exposes.
 
     Args:
         phase: The phase to run.
 
     Returns:
-        The argument list ``toad_phase1.main`` should parse.
+        The argument list ``toad.main`` should parse.
 
     Raises:
         FileNotFoundError: If ``phase`` names a teacher whose checkpoint is
@@ -260,17 +260,17 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Resolve one phase's flags and hand them to ``toad_phase1``'s own entry point.
+    """Resolve one phase's flags and hand them to ``toad``'s own entry point.
 
     Does not duplicate the training loop: every phase runs through
-    ``toad_phase1.main``, which is the same code path Tasks 1-3 tested.
+    ``toad.main``, which is the same code path Tasks 1-3 tested.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     arguments = _parser().parse_args()
     phase = _phase(arguments.phase)
     flags = _flags(phase)
     LOGGER.info("curriculum: running %s as %s", phase.name, " ".join(flags))
-    toad_phase1.main(flags)
+    toad.main(flags)
 
 
 if __name__ == "__main__":

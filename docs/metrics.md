@@ -1,9 +1,9 @@
 # Toad phase 1 — metric reference
 
-One row per key `toad_phase1._record` logs, grouped the way wandb groups the
+One row per key `toad._record` logs, grouped the way wandb groups the
 dashboard: the text before the first `/` is the section. Every run also ships
 this table into wandb itself as a `metric_definitions` table (see
-`toad_phase1._log_definitions`), so the meaning of a number sits beside the
+`toad._log_definitions`), so the meaning of a number sits beside the
 number instead of requiring a source read.
 
 The last column is the one this project keeps needing and the one that would
@@ -94,7 +94,7 @@ going well, off two metrics that were both misleading:
 
 ## Consuming this file
 
-`toad_phase1.METRIC_PREFIXES` and `toad_phase1.METRIC_DEFINITIONS` are the
+`toad.METRIC_PREFIXES` and `toad.METRIC_DEFINITIONS` are the
 source of truth this table transcribes; `test_every_logged_metric_carries_a_role_prefix`
 in `tests/learn/test_toad_runner.py` pins that `_record` returns exactly the
 keys `METRIC_DEFINITIONS` has one-line entries for, and that every one of them

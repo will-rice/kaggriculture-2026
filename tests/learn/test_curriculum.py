@@ -3,7 +3,7 @@
 Every prior arm ran phase 1 with phase 2's teacher cost, and nothing caught
 it, because the numbers lived in a command line rather than in a table
 anything could check. These tests are that check: the table itself, pinned
-against the literal recipe, and the runner's wiring into ``toad_phase1``'s
+against the literal recipe, and the runner's wiring into ``toad``'s
 own flags -- proven against a real checkpoint and a real ``Policy``, not a
 namespace read back at itself.
 """
@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.scripts import curriculum, toad_phase1
+from kaggriculture.learn.scripts import curriculum, toad
 
 # Transcribed independently of curriculum.PHASES, from the literal recipe
 # table -- so this file fails if the module's own transcription drifts, not
@@ -105,7 +105,7 @@ def test_a_phase_refuses_to_start_without_its_teacher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A missing teacher checkpoint must fail loudly, not train unanchored."""
-    monkeypatch.setattr(toad_phase1, "RUNS", tmp_path)
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
 
     with pytest.raises(FileNotFoundError) as excinfo:
         curriculum._flags(curriculum._phase("phase2"))
@@ -131,7 +131,7 @@ def test_checkpoint_resolves_the_latest_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The newest checkpoint must win, not the first glob match or an alphabetic one."""
-    monkeypatch.setattr(toad_phase1, "RUNS", tmp_path)
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
     for update in (25, 100, 50, 75):
         (tmp_path / f"phase1_{update:06d}.pt").touch()
 
@@ -142,40 +142,40 @@ def test_phase_one_has_no_sparse_flag() -> None:
     """Phase 1 trains on the dense shaped reward, not the terminal sparse one."""
     flags = curriculum._flags(curriculum._phase("phase1"))
     assert "--sparse" not in flags
-    arguments = toad_phase1._parser().parse_args(flags)
-    assert toad_phase1._field(arguments) == "shaped"
+    arguments = toad._parser().parse_args(flags)
+    assert toad._field(arguments) == "shaped"
 
 
 def test_phase_two_reaches_sparse_through_the_real_parser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """--sparse must actually reach _field, not just appear in the flag list."""
-    monkeypatch.setattr(toad_phase1, "RUNS", tmp_path)
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
     (tmp_path / "phase1_000025.pt").touch()
 
     flags = curriculum._flags(curriculum._phase("phase2"))
-    arguments = toad_phase1._parser().parse_args(flags)
-    assert toad_phase1._field(arguments) == "sparse"
+    arguments = toad._parser().parse_args(flags)
+    assert toad._field(arguments) == "sparse"
 
 
-def test_flags_reach_a_real_teacher_through_toad_phase1_s_own_loader(
+def test_flags_reach_a_real_teacher_through_toad_s_own_loader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--teacher and --teacher-blocks must resolve to a checkpoint toad_phase1 can load.
+    """--teacher and --teacher-blocks must resolve to a checkpoint toad can load.
 
     Proven against a real ``Policy`` and a real state dict, not a namespace
     read back at itself: a runner that pointed ``--teacher`` at the right
     path but the wrong ``--teacher-blocks`` would fail here with a shape
     mismatch, exactly as it would training for real.
     """
-    monkeypatch.setattr(toad_phase1, "RUNS", tmp_path)
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
     torch.save(
         Policy(blocks=8, channels=16).state_dict(), tmp_path / "phase1_000025.pt"
     )
 
     flags = curriculum._flags(curriculum._phase("phase2"))
-    arguments = toad_phase1._parser().parse_args([*flags, "--channels", "16"])
-    teacher = toad_phase1._teacher(arguments, "cpu")
+    arguments = toad._parser().parse_args([*flags, "--channels", "16"])
+    teacher = toad._teacher(arguments, "cpu")
 
     assert teacher is not None
     assert len(teacher.policy.blocks) == 8
@@ -185,14 +185,14 @@ def test_phase_five_s_teacher_is_the_sixteen_block_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The one phase whose teacher is not the 8-block net -- proven, not just tabled."""
-    monkeypatch.setattr(toad_phase1, "RUNS", tmp_path)
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
     torch.save(
         Policy(blocks=16, channels=16).state_dict(), tmp_path / "phase3_000025.pt"
     )
 
     flags = curriculum._flags(curriculum._phase("phase5"))
-    arguments = toad_phase1._parser().parse_args([*flags, "--channels", "16"])
-    teacher = toad_phase1._teacher(arguments, "cpu")
+    arguments = toad._parser().parse_args([*flags, "--channels", "16"])
+    teacher = toad._teacher(arguments, "cpu")
 
     assert teacher is not None
     assert len(teacher.policy.blocks) == 16
