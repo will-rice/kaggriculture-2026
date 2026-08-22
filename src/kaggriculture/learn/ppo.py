@@ -57,10 +57,12 @@ it, and after ``KL_STEPS`` the teacher stops being a constraint entirely. The KL
 itself keeps being measured after that, because it is the diagnostic that says
 how far the policy has travelled from where it started.
 
-``GAMMA`` is 0.999. The season is 719 turns and the payoff is terminal, so the
-discount has to reach the end of it: 0.999 gives an effective horizon around
-1,000 turns, and a conventional 0.99 would have a horizon of 100 and blind the
-policy to five-sixths of the season.
+``GAMMA`` is 0.9995. The season is 719 turns and the payoff is terminal, so the
+discount has to reach the end of it: 0.9995 gives an effective horizon around
+2,000 turns and leaves 0.70 of a terminal payoff standing at turn 0, which is
+what Toad's 0.999 left standing across their 360-turn game. Their digits over
+our length would leave 0.49, and a conventional 0.99 would have a horizon of 100
+and blind the policy to five-sixths of the season.
 
 ``REWARD_SCALE`` is the one number here that was changed because a measurement
 demanded it rather than because a paper suggested it; the constant's comment
@@ -157,7 +159,14 @@ DIFFERENTIAL = 1.0
 # nearly absent from the total, which is what a curriculum term should be.
 PROGRESS = 1.0
 
-GAMMA = 0.999
+# Toad Brigade's 0.999, rescaled to our episode. Their game is 360 turns and
+# ours is 719 decisions, so the same digits retain 0.488 of a terminal payoff at
+# turn 0 where theirs retained 0.698. `0.999 ** (360 / 719)` restores the
+# retention; see `toad_loss.DISCOUNTING`, which carries the derivation and is
+# the value the Toad runner trains under. Kept equal to it on purpose: the two
+# loops read the same episodes and the same potential, and a discount that
+# differed between them would make their measurements incomparable.
+GAMMA = 0.9995
 LAM = 0.95
 CLIP = 0.2
 EPOCHS = 4

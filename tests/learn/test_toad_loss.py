@@ -8,6 +8,7 @@ off-policy correction actually engages when the actor lags.
 
 import dataclasses
 
+import pytest
 import torch
 
 from kaggriculture.learn import toad_loss
@@ -170,13 +171,25 @@ def test_the_phase_one_constants_are_the_published_ones() -> None:
     constant fails here instead of silently agreeing with itself. Read from
     conf/conv_phase1_shaped_reward.yaml.
     """
-    assert toad_loss.DISCOUNTING == 0.999
     assert toad_loss.LMB == 0.8
     assert toad_loss.ENTROPY_COST == 0.001
     assert toad_loss.LEARNING_RATE == 1e-4
     assert toad_loss.ADAM_EPS == 0.0003
     assert toad_loss.UNROLL_LENGTH == 16
     assert toad_loss.REDUCTION == "sum"
+
+
+def test_the_discount_is_rescaled_to_our_season_rather_than_transcribed() -> None:
+    """``DISCOUNTING`` is the other constant here that is NOT their literal value.
+
+    Their 0.999 was tuned against Lux's 360 turns. What it buys is the fraction
+    of a terminal payoff still visible at turn 0, and that fraction is
+    ``gamma ** turns``: transcribing the digits across an episode twice as long
+    keeps the number and loses the property. Pinned as the equation rather than
+    as a rounded literal, so the two can never drift apart.
+    """
+    assert toad_loss.DISCOUNTING == 0.9995
+    assert toad_loss.DISCOUNTING**719 == pytest.approx(0.999**360, abs=0.005)
 
 
 def test_the_budget_is_the_declared_deviation_from_their_phase_one() -> None:

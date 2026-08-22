@@ -64,8 +64,8 @@ append -- the other two series read their terminal value here, and a difference
 needs a state on each side of it -- and it is the one thing that must not
 happen. ``P`` at the state a trajectory stops in is the only endpoint of the
 telescoped shaping the agent can choose, so a non-zero one pays for ending the
-season holding stock: at ``gamma = 0.999`` over 719 turns, a unit held from turn
-700 to the horizon keeps 98% of its value, and refusing to sell into a market
+season holding stock: at ``gamma = 0.9995`` over 719 turns, a unit held from
+turn 700 to the horizon keeps 99% of its value, and refusing to sell into a market
 both farms have pushed below base would be shaped-optimal. So the terminal is a
 hard zero, and it lives in ``progress.progress_reward`` -- which takes the
 acting rows and appends the zero itself, so this module has nowhere to put a
@@ -225,9 +225,11 @@ class Trajectory:
         values: ``(turns,)`` the value head's estimate at that state.
         rewards: ``(turns,)`` change in (our bank - their bank) across the
             turn. Sums to ``final_margin`` exactly.
-        shaped: ``(turns,)`` Toad's phase-1 shaped reward for this seat --
-            their five weighted per-turn deltas plus the 10x terminal result,
-            all through their /500 normaliser. Recorded alongside ``rewards``
+        shaped: ``(turns,)`` Toad's phase-1 shaped reward for this seat with
+            the score constituent ablated -- their five Lux-specific weighted
+            per-turn deltas plus the 10x terminal result, all through their /500
+            normaliser. This is the ``--no-money`` control, not the faithful
+            component set; see ``shaped_money``. Recorded alongside ``rewards``
             and ``own`` rather than instead of them, for the same reason those
             two coexist: which one a gradient sees is the learner's choice, and
             a trajectory collected once is then usable under any of them.
@@ -237,11 +239,13 @@ class Trajectory:
             ``toad_reward.margin``. Recorded beside the others for the same
             reason they coexist: one episode, every reward, so an arm is a
             choice of field rather than a re-run.
-        shaped_money: ``(turns,)`` the same reward plus our one added component,
-            a clamped per-turn coin delta at ``MONEY_WEIGHT``. This is phase-1b,
-            and it is ours rather than Toad's -- see ``toad_reward.MONEY_WEIGHT``.
-            Carried beside ``shaped`` so the ablation reads the same episode
-            twice rather than playing it twice.
+        shaped_money: ``(turns,)`` the faithful component set: the same reward
+            with the signed per-turn coin delta at ``MONEY_WEIGHT`` in the slot
+            their ``city`` weight occupies. In Lux ``city`` *is* the score, so
+            omitting our equivalent deletes their largest component rather than
+            reproducing it -- see ``toad_reward.MONEY_WEIGHT``. Carried beside
+            ``shaped`` so the ablation reads the same episode twice rather than
+            playing it twice.
         own: ``(turns,)`` change in our own bank across the turn. Sums to
             ``final_bank - STARTING_MONEY`` exactly. Recorded alongside
             ``rewards`` rather than instead of it: which one a gradient sees is

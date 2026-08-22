@@ -39,12 +39,18 @@ from kaggriculture.learn.toad.core import td_lambda
 from kaggriculture.learn.toad_loss import ADAM_EPS, DISCOUNTING, LEARNING_RATE, LMB
 
 TURNS = 719
+# Lux's ``GAME_CONSTANTS["PARAMETERS"]["MAX_DAYS"]``, the episode length every
+# one of Toad's constants was tuned against.
+LUX_TURNS = 360
 REWARD = 1e-3
 SLOTS = len(MARKET_SLOTS) + 2
 # A correct critic against a correct target has a smooth-L1 distance of zero, so
 # the floor here is float noise over 64 elements of a quadratic; the mutations
 # these tests exist to catch land six orders of magnitude above it.
 EXACT = 1e-8
+# Float32 drift of a 719-term backward recurrence against the closed form it
+# sums to, measured at 3.3e-5. See the scan test for what it must not hide.
+SCAN_ATOL = 1e-4
 
 
 def _episode(turns: int = TURNS) -> Trajectory:
@@ -52,8 +58,9 @@ def _episode(turns: int = TURNS) -> Trajectory:
 
     A constant reward is what makes the arithmetic checkable by hand: the true
     finite-horizon return-to-go with ``n`` turns left is ``r (1 - g^n)/(1 - g)``
-    and the infinite-horizon extrapolation is ``r / (1 - g)``, which at Toad's
-    gamma of 0.999 differ about twofold at turn 0 and eightfold at turn 600.
+    and the infinite-horizon extrapolation is ``r / (1 - g)``, which at our
+    ``DISCOUNTING`` differ about threefold at turn 0 and seventeenfold at turn
+    600.
 
     Column 0 of ``scalars`` is the turn index, so a test can read which rows of
     the episode a segment was cut from without depending on how ``_segments``
@@ -148,13 +155,40 @@ def test_the_infinite_horizon_extrapolation_is_not_a_fixed_point() -> None:
     """The critic the arms actually learned must be visibly wrong to the target.
 
     ``r / (1 - gamma)`` is what a 16-turn window bootstrapped from itself
-    converges to, and it is 1.95x the true return at turn 0 rising to 8.91x at
-    turn 600. If the target cannot tell it apart from the truth, nothing in
-    training can.
+    converges to, and it is 3.3x the true return at turn 0 rising to 17x at
+    turn 600 -- the same defect the 2026-08-09 measurement caught at 1.95x and
+    8.91x under the discount in force then. If the target cannot tell it apart
+    from the truth, nothing in training can.
     """
     values = torch.full((TURNS,), REWARD / (1.0 - DISCOUNTING))
     moved = [float((target - held).abs().max()) for target, held in _targets(values)]
     assert max(moved) > 1e-3
+
+
+def test_the_terminal_payoff_reaches_turn_zero_with_their_retention() -> None:
+    """The discount must preserve Toad's *retention*, not their digits.
+
+    ``DISCOUNTING`` decides how much of a payoff at the horizon is still
+    visible from the first turn, and that quantity is ``gamma ** turns``, not
+    ``gamma``. Lux runs ``MAX_DAYS`` 360 turns, where 0.999 leaves 0.698 of the
+    terminal result standing at turn 0. Our season is 719 decisions, where the
+    same digits leave 0.487 -- a terminal objective damped 30% harder than the
+    one they tuned, in a game whose entire payoff is terminal and whose shaped
+    reward carries that payoff at 10x from turn one.
+
+    Asserted through ``monte_carlo`` rather than against the constant, because
+    it is the return every logged critic diagnostic is scored against and it
+    shares both the constant and the vendored ``td_lambda`` the learner's own
+    value target is built from. A discount that never reached either would pass
+    a namespace check and fail here.
+    """
+    rewards = torch.zeros(TURNS)
+    rewards[-1] = 1.0
+    dones = torch.zeros(TURNS, dtype=torch.bool)
+    dones[-1] = True
+    theirs = 0.999 ** (LUX_TURNS - 1)
+    assert theirs == pytest.approx(0.698, abs=0.001)
+    assert float(monte_carlo(rewards, dones)[0]) == pytest.approx(theirs, abs=0.005)
 
 
 def test_every_segment_covers_a_turn_and_the_last_one_ends_the_season() -> None:
@@ -257,7 +291,15 @@ def test_the_runner_rejects_the_infinite_horizon_critic() -> None:
 
 
 def test_monte_carlo_matches_a_hand_rolled_backward_scan() -> None:
-    """The ground truth must not disagree with a scan anyone can check by eye."""
+    """The ground truth must not disagree with a scan anyone can check by eye.
+
+    ``SCAN_ATOL`` is float32 noise, not slack: the vendored return is a 719-term
+    backward recurrence in float32 and at a discount of 0.9995 every one of
+    those terms is still contributing, so it drifts ~3e-5 from the closed form
+    the same series sums to. The defects this test exists to catch -- a dropped
+    discount, a ``done`` that never fires, a series read off by one -- move the
+    turn-0 return by 0.1 or more, four orders of magnitude above it.
+    """
     episode = _episode()
     scanned = torch.zeros(TURNS)
     running = 0.0
@@ -267,10 +309,10 @@ def test_monte_carlo_matches_a_hand_rolled_backward_scan() -> None:
         )
         scanned[turn] = running
     assert torch.allclose(
-        monte_carlo(episode.margin, episode.dones), scanned, atol=1e-5
+        monte_carlo(episode.margin, episode.dones), scanned, atol=SCAN_ATOL
     )
     assert torch.allclose(
-        monte_carlo(episode.margin, episode.dones), _finite_horizon(), atol=1e-5
+        monte_carlo(episode.margin, episode.dones), _finite_horizon(), atol=SCAN_ATOL
     )
 
 

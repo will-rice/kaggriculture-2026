@@ -38,6 +38,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import (
+    GAMMA,
     KL_STEPS,
     PROGRESS_HOLD,
     PROGRESS_STEPS,
@@ -200,7 +201,7 @@ def test_the_progress_term_cannot_be_farmed_by_any_cycle() -> None:
     ``gamma == 1`` both return exactly zero.
 
     The ``gamma < 1`` half is the other half of the property and is why the
-    checks are separate. The real discount is 0.999, and under it the *longer*
+    checks are separate. The real discount is ``GAMMA``, and under it the *longer*
     cycle pays strictly less than the shorter one: holding stock costs
     ``(1 - gamma)`` of its value every turn it is held, so churn is not merely
     unprofitable but charged rent. An implementation that dropped the ``gamma``
@@ -223,10 +224,10 @@ def test_the_progress_term_cannot_be_farmed_by_any_cycle() -> None:
 
     assert float(progress_reward(short, gamma=1.0).sum()) == pytest.approx(settled)
     assert float(progress_reward(long, gamma=1.0).sum()) == pytest.approx(settled)
-    assert float(progress_reward(long, gamma=0.999).sum()) < float(
-        progress_reward(short, gamma=0.999).sum()
+    assert float(progress_reward(long, gamma=GAMMA).sum()) < float(
+        progress_reward(short, gamma=GAMMA).sum()
     )
-    assert float(progress_reward(short, gamma=0.999).sum()) < settled
+    assert float(progress_reward(short, gamma=GAMMA).sum()) < settled
 
 
 def test_a_season_that_ends_holding_stock_does_not_out_score_one_that_sold_it() -> None:
@@ -241,8 +242,8 @@ def test_a_season_that_ends_holding_stock_does_not_out_score_one_that_sold_it() 
 
     Un-zeroed it modifies it in exactly the direction this project keeps
     failing in. A unit held to the horizon returns ``gamma ** (N - t)`` of its
-    base price, which at 0.999 over a 719-turn season is 90% from turn 619 and
-    98% from turn 700 -- so once both farms have pushed the market below base
+    base price, which at 0.9995 over a 719-turn season is 95% from turn 619 and
+    99% from turn 700 -- so once both farms have pushed the market below base
     by selling into it, *not selling* becomes the shaped-optimal play for the
     last quarter of every episode. The shed fills, the bank stays flat, and
     every chart looks like the shaping is working.
@@ -262,7 +263,7 @@ def test_a_season_that_ends_holding_stock_does_not_out_score_one_that_sold_it() 
     # worth less than that discount, or the agent is right to sit on the shed.
     takings = torch.tensor([0.0, 0.9 * sum(full), 0.0, 0.0])
 
-    for gamma in (1.0, 0.999):
+    for gamma in (1.0, GAMMA):
         selling = _discounted(takings + progress_reward(sold, gamma), gamma)
         hoarding = _discounted(progress_reward(held, gamma), gamma)
 

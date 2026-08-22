@@ -241,9 +241,9 @@ def progress_reward(potentials: torch.Tensor, gamma: float) -> torch.Tensor:
     unless the potential at a trajectory's stopping state is set to zero.
 
     Left un-zeroed here, that term would pay the agent to finish the season
-    holding stock. The arithmetic at our ``gamma`` of 0.999 and a 719-turn
-    season: a unit held to the horizon from turn 619 returns ``0.999 ** 100``,
-    or 90.5% of its base price, and from turn 700 it returns 98.1% -- so with
+    holding stock. The arithmetic at our ``gamma`` of 0.9995 and a 719-turn
+    season: a unit held to the horizon from turn 619 returns ``0.9995 ** 100``,
+    or 95.1% of its base price, and from turn 700 it returns 99.1% -- so with
     both farms pushing the market price below base by selling into it, refusing
     to sell would be the *shaped-optimal* play for the last quarter of every
     episode. "The shed fills and the bank stays flat" would be built into the

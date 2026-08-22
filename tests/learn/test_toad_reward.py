@@ -1,9 +1,10 @@
 """Tests for Toad's shaped reward mapped onto our farm economy.
 
-These guard the three transcription details that would corrupt a whole training
-run silently: the /500 normaliser the briefing analysis omitted, the
-non-negative clamp on the stock term, and the 10x terminal result riding inside
-the shaped reward rather than replacing it.
+These guard the transcription details that would corrupt a whole training run
+silently: the /500 normaliser the briefing analysis omitted, the non-negative
+clamp on the stock term, the 10x terminal result riding inside the shaped
+reward rather than replacing it, and the score constituent -- coins, in the slot
+their `city` weight occupies -- being present and signed.
 """
 
 import dataclasses
@@ -149,26 +150,28 @@ def _series(**deltas: float) -> list[toad_reward.Counts]:
     return [base, after]
 
 
-def test_the_money_component_is_off_by_default() -> None:
-    """The baseline reward must be exactly Toad's five components.
+def test_a_zero_money_weight_deletes_the_component_outright() -> None:
+    """The ablation must actually delete it, not merely shrink it.
 
-    The running baseline was measured under this default, and a money term
-    leaking into it would silently invalidate the comparison phase-1b exists to
-    make.
+    ``--no-money`` is the control this reproduction is measured against, and it
+    is only a control if the coin delta contributes nothing at all under it. A
+    term that leaked in at a small weight would make the comparison meaningless
+    in the direction that flatters the recipe.
     """
     # A pure sale: 648 coins in, 8 units of stock out, nothing else changed.
     series = _series(money=648.0, fuel=-8)
-    baseline = toad_reward.shaped(series, won=0.0)
+    ablated = toad_reward.shaped(series, won=0.0)
     # step alone: 0.005 / 500. The stock delta is clamped away and money is off.
-    assert float(baseline[0]) == pytest.approx(0.00001)
+    assert float(ablated[0]) == pytest.approx(0.00001)
 
 
-def test_a_sale_turn_scores_positive_under_phase_1b() -> None:
-    """Selling must pay, and pay distinguishably -- not merely fail to hurt.
+def test_banking_coins_pays_the_way_a_city_tile_does() -> None:
+    """The score must pay, and pay distinguishably -- not merely fail to hurt.
 
-    This is the whole point of phase-1b. Under the baseline the same turn is
-    worth 1e-05, which is the step reward and nothing else: Toad's components
-    are blind to the act that banks the coins.
+    This is what their ``city`` weight does in Lux, where a city tile *is* the
+    score. Ablate it and the same turn is worth 1e-05, the step reward and
+    nothing else: Toad's Lux-specific five are blind to the act that banks the
+    coins.
 
       money 648 * 0.001 = 0.648
       fuel  max(-8, 0)  = 0
@@ -176,24 +179,29 @@ def test_a_sale_turn_scores_positive_under_phase_1b() -> None:
       total 0.653 / 500 = 0.001306
     """
     series = _series(money=648.0, fuel=-8)
-    phase_1b = toad_reward.shaped(
+    faithful = toad_reward.shaped(
         series, won=0.0, money_weight=toad_reward.MONEY_WEIGHT
     )
-    assert float(phase_1b[0]) == pytest.approx(0.001306)
-    # Strictly greater than the baseline, by a hundredfold, on the same turn.
-    assert float(phase_1b[0]) > float(toad_reward.shaped(series, won=0.0)[0])
+    assert float(faithful[0]) == pytest.approx(0.001306)
+    # Strictly greater than the ablation, by a hundredfold, on the same turn.
+    assert float(faithful[0]) > float(toad_reward.shaped(series, won=0.0)[0])
 
 
-def test_spending_coins_is_not_punished() -> None:
-    """The money delta is clamped, as their fuel delta is.
+def test_spending_coins_is_charged_on_the_turn_it_happens() -> None:
+    """The money delta keeps both signs, as their ``city`` delta does.
 
-    Buying seeds, hands or land is how the chain advances, and the return on it
-    is already paid when the goods are sold. An unclamped term would make the
-    shaped reward fight investment.
+    The money term occupies their ``city`` slot -- the score constituent -- and
+    ``city`` is not clamped; only ``fuel`` is, and only because Lux takes fuel
+    back every night without the agent choosing it. Coins leave a bank only when
+    the agent spends them, so forgiving that leg pays for a round trip that
+    loses coins to the spread. Unclamped, the deltas telescope to the net coins
+    banked over the episode and the pump cannot be profitable.
+
+      money -500 * 0.001 = -0.5 | step 0.005 | -0.495 / 500 = -0.00099
     """
     series = _series(money=-500.0)
     reward = toad_reward.shaped(series, won=0.0, money_weight=toad_reward.MONEY_WEIGHT)
-    assert float(reward[0]) == pytest.approx(0.00001)
+    assert float(reward[0]) == pytest.approx(-0.00099)
 
 
 def test_the_money_weight_is_the_derived_one() -> None:
@@ -201,46 +209,17 @@ def test_the_money_weight_is_the_derived_one() -> None:
     assert toad_reward.MONEY_WEIGHT == 0.001
 
 
-def test_the_clamped_money_term_pays_for_a_losing_round_trip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The clamp is what made arm W pump, and this pins the mechanism.
+def test_the_money_term_punishes_a_losing_round_trip() -> None:
+    """The deltas telescope to net coins, so a buy-to-sell pump cannot pay.
 
-    Buy 648 coins of stock, sell it back for 600. The farm is 48 coins poorer,
-    but the clamp forgives the purchase and pays the sale, so the shaped reward
-    is positive. Arm W did exactly this: money_term rose 0.0064 -> 0.028 with
-    gross_purchases tracking it and bank_mean pinned at zero.
-    """
-    monkeypatch.delenv(toad_reward.MONEY_SIGNED_ENV, raising=False)
-    buy = toad_reward.Counts(
-        city=25, unit=1, research=0, fuel=18, capital=0, money=352.0, opponent=0.0
-    )
-    sell = toad_reward.Counts(
-        city=25, unit=1, research=0, fuel=10, capital=0, money=952.0, opponent=0.0
-    )
-    opening = toad_reward.Counts(
-        city=25, unit=1, research=0, fuel=10, capital=0, money=1000.0, opponent=0.0
-    )
-    total = float(
-        toad_reward.shaped([opening, buy, sell], won=0.0, money_weight=0.01).sum()
-    )
-    # Net -48 coins, yet the reward is positive:
-    #   sale 600 * 0.01 = 6.0 | stock +8 * 0.005 = 0.04 | 2 steps = 0.01
-    #   6.05 / 500 = 0.0121
-    assert total > 0.0
-    assert total == pytest.approx(0.0121)
-
-
-def test_the_signed_money_term_punishes_a_losing_round_trip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unclamped, the deltas telescope to net coins, so the pump cannot pay.
-
-    Same round trip, now worth the net -48 coins it actually cost:
+    Buy 648 coins of stock, sell it back for 600: the farm is 48 coins poorer.
+    A clamped delta would forgive the purchase and pay the sale, making the same
+    round trip worth +0.0121 -- which is what arm W measured, its money term
+    climbing 0.0064 -> 0.028 with gross purchases tracking it and the bank
+    pinned at zero. Signed, the trip is worth the net loss it actually was:
       net -48 * 0.01 = -0.48 | stock +8 * 0.005 = 0.04 | 2 steps = 0.01
       -0.43 / 500 = -0.00086
     """
-    monkeypatch.setenv(toad_reward.MONEY_SIGNED_ENV, "1")
     buy = toad_reward.Counts(
         city=25, unit=1, research=0, fuel=18, capital=0, money=352.0, opponent=0.0
     )
