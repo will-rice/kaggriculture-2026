@@ -171,6 +171,9 @@ from kaggriculture.learn.toad_reward import (
 from kaggriculture.learn.toad_reward import (
     margin as margin_reward,
 )
+from kaggriculture.learn.toad_reward import (
+    sparse as sparse_reward,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -237,6 +240,11 @@ class Trajectory:
             ``toad_reward.margin``. Recorded beside the others for the same
             reason they coexist: one episode, every reward, so an arm is a
             choice of field rather than a re-run.
+        sparse: ``(turns,)`` phases 2-5's ``GameResultReward`` -- +1 terminal
+            for a win, -1 for a loss, 0 for a draw, zero on every other turn.
+            Not a decomposition of the win condition the way ``margin`` is:
+            nothing rides on the turns that produced it. See
+            ``toad_reward.sparse``.
         shaped_money: ``(turns,)`` the same reward plus our one added component,
             a clamped per-turn coin delta at ``MONEY_WEIGHT``. This is phase-1b,
             and it is ours rather than Toad's -- see ``toad_reward.MONEY_WEIGHT``.
@@ -296,6 +304,7 @@ class Trajectory:
     shaped: torch.Tensor
     shaped_money: torch.Tensor
     margin: torch.Tensor
+    sparse: torch.Tensor
     potentials: torch.Tensor
     dones: torch.Tensor
     final_margin: float
@@ -884,6 +893,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         # is to play the season twice and hope it was deterministic.
         shaped_money=shaped(series, won, money_weight=money_weight()),
         margin=margin_reward(series, won),
+        sparse=sparse_reward(series, won),
         potentials=torch.tensor(stream.potentials, dtype=torch.float32),
         dones=dones,
         final_margin=margins[-1],

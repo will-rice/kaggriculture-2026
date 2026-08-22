@@ -83,6 +83,7 @@ def _episode(turns: int = TURNS) -> Trajectory:
         shaped=rewards,
         shaped_money=rewards,
         margin=rewards,
+        sparse=rewards,
         potentials=torch.zeros(turns, 1),
         dones=dones,
         final_margin=0.0,

@@ -113,6 +113,7 @@ def _trajectory(turns: int = 4, final_margin: float = 1.0) -> Trajectory:
         shaped=rewards,
         shaped_money=rewards,
         margin=rewards,
+        sparse=rewards,
         potentials=torch.zeros(turns, 1),
         dones=dones,
         final_margin=final_margin,

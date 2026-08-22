@@ -699,6 +699,7 @@ def _trajectory(policy: Policy, turns: int, seed: int) -> Trajectory:
         shaped=torch.randn(turns) * 0.01,
         shaped_money=torch.randn(turns) * 0.01,
         margin=torch.randn(turns) * 0.01,
+        sparse=torch.randn(turns) * 0.01,
         potentials=potentials,
         dones=dones,
         final_margin=float(rewards.sum()),

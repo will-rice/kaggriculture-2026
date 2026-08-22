@@ -474,6 +474,7 @@ def test_every_tensor_covers_the_same_turns(trajectory: Trajectory) -> None:
     assert trajectory.shaped.shape == (turns,)
     assert trajectory.shaped_money.shape == (turns,)
     assert trajectory.margin.shape == (turns,)
+    assert trajectory.sparse.shape == (turns,)
     # One row per acting turn and no terminal row. The natural thing here is
     # the shape `advantages` asks for -- one longer, holding the state after
     # the last action -- and it is the wrong one: the potential at the state a
