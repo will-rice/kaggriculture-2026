@@ -312,6 +312,13 @@ def test_teacher_loads_the_named_checkpoint(tmp_path: Path) -> None:
     ``Teacher`` came back: a ``_teacher`` still hardwired to
     ``kaggriculture.learn.CHECKPOINT`` also returns one, so only comparing
     values against the path actually named tells the two apart.
+
+    Also asserted frozen: a KL anchor that is not held fixed is not an
+    anchor. ``Policy`` has no BatchNorm or Dropout, so train/eval mode has no
+    numeric effect, and the teacher never enters the optimiser's param
+    groups -- so dropping either ``.eval()`` or ``.requires_grad_(False)``
+    inside ``_teacher`` would pass every check above while leaving the
+    teacher free to drift.
     """
     named = Policy(
         blocks=toad_phase1.BLOCKS, channels=16, value_bound=toad_phase1.VALUE_BOUND
@@ -330,6 +337,9 @@ def test_teacher_loads_the_named_checkpoint(tmp_path: Path) -> None:
     assert named_state.keys() == loaded_state.keys()
     for key, value in named_state.items():
         assert torch.equal(value, loaded_state[key]), key
+
+    assert not teacher.policy.training
+    assert not any(parameter.requires_grad for parameter in teacher.policy.parameters())
 
 
 def test_the_warmup_budget_is_counted_down_in_batches(

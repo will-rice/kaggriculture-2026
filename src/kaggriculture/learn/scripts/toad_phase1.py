@@ -77,7 +77,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Teacher:
-    """The frozen clone the KL pulls toward, and what its checkpoint carried.
+    """The frozen checkpoint the KL pulls toward, and what it carried.
 
     The second field is the whole reason this is a pair rather than a bare
     ``Policy``. Every ``Policy`` object has a ``quantity_head``, freshly
@@ -896,7 +896,9 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "econ_fraction": arguments.econ_fraction,
             "value_warmup": arguments.value_warmup,
             "value_passes": arguments.value_passes,
-            "teacher": str(arguments.teacher) if arguments.teacher else None,
+            "teacher": str(arguments.teacher)
+            if arguments.teacher is not None
+            else None,
             "teacher_kl_cost": arguments.teacher_kl_cost,
             "clone_init": arguments.clone_init,
             "money_signed": arguments.money_signed,
@@ -1338,8 +1340,8 @@ def _update(
         device: Where to run the learner.
         field: Which recorded reward series the learner reads.
         warmup_left: Batches still owed to the value head alone.
-        teacher: The frozen clone to stay near and what it was taught, or
-            None.
+        teacher: The frozen checkpoint to stay near and what it was taught,
+            or None.
         teacher_kl_cost: Coefficient on that KL.
         value_passes: Extra value-only passes over the same round, after the
             policy has taken its one. Zero reproduces every earlier arm exactly.
@@ -1447,8 +1449,8 @@ def _step(
         field: Which recorded reward series the learner reads.
         baseline_only: Train the value head alone, excluding the policy gradient
             and entropy terms from the total.
-        teacher: The frozen clone to stay near and what it was taught, or
-            None.
+        teacher: The frozen checkpoint to stay near and what it was taught,
+            or None.
         teacher_kl_cost: Coefficient on that KL.
         entropy_cost: Coefficient on the entropy loss term.
 
