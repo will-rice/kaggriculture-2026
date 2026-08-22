@@ -28,7 +28,10 @@ from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     ENTROPY_COST,
     LEARNING_RATE,
+    LMB,
     TEACHER_KL_COST,
+    VALUE_WARMUP_BATCHES,
+    Losses,
 )
 
 
@@ -495,6 +498,7 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
         baseline_only: bool = False,
         teacher: toad_phase1.Teacher | None = None,
         teacher_kl_cost: float = TEACHER_KL_COST,
+        lmb: float = LMB,
     ) -> dict[str, float]:
         seen.append(baseline_only)
         return real(
@@ -506,6 +510,7 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
             baseline_only,
             teacher,
             teacher_kl_cost,
+            lmb=lmb,
         )
 
     with pytest.MonkeyPatch.context() as patch:
@@ -618,3 +623,140 @@ def test_lr_and_entropy_cost_reach_the_recorded_config(
     config = cast(dict[str, object], captured["config"])
     assert config["lr"] == pytest.approx(3e-4)
     assert config["entropy_cost"] == pytest.approx(0.02)
+
+
+def test_omitting_blocks_reproduces_todays_constant() -> None:
+    """``--blocks`` must default to the constant it overrides, not a literal copy."""
+    arguments = toad_phase1._parser().parse_args([])
+    assert arguments.blocks == toad_phase1.BLOCKS
+
+
+def test_blocks_flag_reaches_the_constructed_policy() -> None:
+    """``--blocks`` must set the learner's own depth, not stop at the namespace.
+
+    Asserted by counting the network's own residual blocks, the way
+    ``test_lr_flag_reaches_the_optimizer`` reads the rate off the optimizer's
+    own ``param_groups`` rather than off the parsed namespace: a runner that
+    parses ``--blocks`` and builds the network from ``BLOCKS`` regardless
+    would still pass a namespace-only check.
+    """
+    arguments = toad_phase1._parser().parse_args(["--blocks", "16", "--channels", "16"])
+    learner = toad_phase1._learner(arguments, "cpu")
+    assert len(learner.blocks) == 16
+    assert len(learner.blocks) != toad_phase1.BLOCKS
+
+
+def test_lmb_flag_reaches_the_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--lmb`` must reach ``toad_loss.losses``, not stop at the parsed namespace.
+
+    Captured directly off the call, the same way the blocks and warmup tests
+    above pin their flag against the object that actually consumes it: a
+    ``_step`` that parses ``--lmb`` and keeps calling ``losses`` with ``LMB``
+    regardless would still pass a namespace-only check.
+    """
+    arguments = toad_phase1._parser().parse_args(["--lmb", "0.9"])
+    assert arguments.lmb == pytest.approx(0.9)
+    assert toad_phase1._parser().parse_args([]).lmb == LMB
+
+    captured: dict[str, float] = {}
+    real = toad_phase1.losses
+
+    def _recording(
+        behaviour_log_probs: torch.Tensor,
+        learner_log_probs: torch.Tensor,
+        negative_entropy: torch.Tensor,
+        values: torch.Tensor,
+        bootstrap_value: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        baseline_only: bool = False,
+        teacher_kl: torch.Tensor | None = None,
+        teacher_kl_cost: float = TEACHER_KL_COST,
+        entropy_cost: float = ENTROPY_COST,
+        lmb: float = LMB,
+    ) -> Losses:
+        captured["lmb"] = lmb
+        return real(
+            behaviour_log_probs=behaviour_log_probs,
+            learner_log_probs=learner_log_probs,
+            negative_entropy=negative_entropy,
+            values=values,
+            bootstrap_value=bootstrap_value,
+            rewards=rewards,
+            dones=dones,
+            baseline_only=baseline_only,
+            teacher_kl=teacher_kl,
+            teacher_kl_cost=teacher_kl_cost,
+            entropy_cost=entropy_cost,
+            lmb=lmb,
+        )
+
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    monkeypatch.setattr(toad_phase1, "losses", _recording)
+    toad_phase1._step(policy, optimizer, segments, "cpu", "shaped_money", lmb=0.9)
+    assert captured["lmb"] == pytest.approx(0.9)
+
+
+def test_value_warmup_batches_flag_runs_exactly_that_many_baseline_only_steps() -> None:
+    """``--value-warmup-batches`` must gate ``_step``'s count, not a bare bool.
+
+    ``--value-warmup`` used to be a boolean that always spent the whole
+    ``VALUE_WARMUP_BATCHES`` budget; the recipe wants the count itself
+    swept, and 0 must mean no warmup at all -- the random-init phases skip it
+    entirely.
+    """
+    arguments = toad_phase1._parser().parse_args(["--value-warmup-batches", "3"])
+    assert arguments.value_warmup_batches == 3
+    assert (
+        toad_phase1._parser().parse_args([]).value_warmup_batches
+        == VALUE_WARMUP_BATCHES
+    )
+
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(5 * toad_phase1.BATCH_SEGMENTS)]
+    seen: list[bool] = []
+    real = toad_phase1._step
+
+    def _recording(
+        learner: Policy,
+        optimizer: torch.optim.Optimizer,
+        batch: list[dict[str, torch.Tensor]],
+        device: str,
+        field: str,
+        baseline_only: bool = False,
+        teacher: toad_phase1.Teacher | None = None,
+        teacher_kl_cost: float = TEACHER_KL_COST,
+        entropy_cost: float = ENTROPY_COST,
+        lmb: float = LMB,
+    ) -> dict[str, float]:
+        seen.append(baseline_only)
+        return real(
+            learner,
+            optimizer,
+            batch,
+            device,
+            field,
+            baseline_only,
+            teacher,
+            teacher_kl_cost,
+            entropy_cost,
+            lmb,
+        )
+
+    class _Fake:
+        dones = torch.zeros(64, dtype=torch.bool)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(toad_phase1, "_segments", lambda trajectory: segments)  # noqa: ARG005
+        patch.setattr(toad_phase1, "_step", _recording)
+        batch: list[Any] = [_Fake()]
+        toad_phase1._update(
+            policy,
+            optimizer,
+            batch,
+            "cpu",
+            "shaped_money",
+            warmup_left=arguments.value_warmup_batches,
+        )
+    assert seen == [True, True, True, False, False]

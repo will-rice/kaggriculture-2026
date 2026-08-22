@@ -42,9 +42,9 @@ from importlib import metadata
 from pathlib import Path
 
 import torch
+import wandb
 from lightning import seed_everything
 
-import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
 from kaggriculture.learn.encoding import transfer_slots
@@ -56,6 +56,7 @@ from kaggriculture.learn.toad_loss import (
     CLIP_GRADS,
     ENTROPY_COST,
     LEARNING_RATE,
+    LMB,
     MIN_LR_MOD,
     TEACHER_KL_COST,
     TOTAL_STEPS,
@@ -159,6 +160,7 @@ ACTED_FIELDS = (
     "shaped",
     "shaped_money",
     "margin",
+    "sparse",
     "dones",
 )
 OBSERVED_FIELDS = ("board", "scalars", "positions")
@@ -356,7 +358,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="train on the margin reward -- the competition's actual win "
         "condition -- instead of Toad's shaped components. Mutually exclusive "
-        "with --phase1b.",
+        "with --phase1b and --sparse.",
+    )
+    parser.add_argument(
+        "--sparse",
+        action="store_true",
+        help="train on GameResultReward -- +1/-1/0 on the terminal turn alone, "
+        "nothing else. Phases 2-5 of the curriculum. Mutually exclusive with "
+        "--margin and --phase1b.",
     )
     parser.add_argument(
         "--money-weight",
@@ -364,6 +373,13 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="override the money component's weight (arm W uses 0.01). Set into "
         "the environment so the rollout workers see it too.",
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=BLOCKS,
+        help="residual blocks in the learner's (and rollout actor's) trunk. "
+        "Phases 3-5 of the curriculum need 16 and 24 against phase 1-2's 8.",
     )
     parser.add_argument(
         "--channels",
@@ -380,6 +396,16 @@ def _parser() -> argparse.ArgumentParser:
         "(--teacher-kl-cost). Unset by default: phase 1 is teacher-free "
         "self-play from scratch. The recipe's teachers are always an earlier, "
         "smaller checkpoint from this same pipeline, never a behaviour clone.",
+    )
+    parser.add_argument(
+        "--teacher-blocks",
+        type=int,
+        default=BLOCKS,
+        help="residual blocks in the frozen teacher's trunk -- the depth its "
+        "own checkpoint was written at, not this arm's --blocks. The recipe's "
+        "teachers are always smaller nets than the phase they teach (phase 5's "
+        "is the 16-block checkpoint against its own 24), so this cannot be "
+        "assumed equal to --blocks.",
     )
     parser.add_argument(
         "--econ-fraction",
@@ -411,11 +437,20 @@ def _parser() -> argparse.ArgumentParser:
         "reproduces every earlier arm exactly.",
     )
     parser.add_argument(
-        "--value-warmup",
-        action="store_true",
-        help="train the value head alone for VALUE_WARMUP_BATCHES before the "
+        "--lmb",
+        type=float,
+        default=LMB,
+        help="lambda for both TD(lambda) and UPGO, named to match "
+        "toad_loss.losses' own parameter rather than shadowing the Python "
+        "keyword. Their 0.8 for phases 1-4 and 0.9 for phase 5.",
+    )
+    parser.add_argument(
+        "--value-warmup-batches",
+        type=int,
+        default=VALUE_WARMUP_BATCHES,
+        help="train the value head alone for this many batches before the "
         "policy gradient fires (arm C'). Their phase-2 mechanism, for a "
-        "warm-started policy whose critic is untrained.",
+        "warm-started policy whose critic is untrained. 0 means no warmup.",
     )
     parser.add_argument(
         "--value-passes",
@@ -474,9 +509,7 @@ def main() -> None:
     prefix = _prefix(arguments)
 
     device = _device()
-    learner = Policy(
-        blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
-    ).to(device)
+    learner = _learner(arguments, device)
     if arguments.clone_init:
         _warm_start(learner, device)
     optimizer = _optimizer(learner, arguments.lr)
@@ -504,7 +537,7 @@ def main() -> None:
 
     teacher = _teacher(arguments, device)
     actor = copy.deepcopy(learner).eval()
-    warmup_left = VALUE_WARMUP_BATCHES if arguments.value_warmup else 0
+    warmup_left = arguments.value_warmup_batches
     if warmup_left:
         LOGGER.info(
             "value warmup: %d batches (~%.1f updates at %d batches/update)",
@@ -518,7 +551,12 @@ def main() -> None:
         seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
         mirror_batch, econ_batch = _collect(
-            pool, weights, seeds, arguments.channels, arguments.econ_fraction
+            pool,
+            weights,
+            seeds,
+            arguments.blocks,
+            arguments.channels,
+            arguments.econ_fraction,
         )
         batch = mirror_batch + econ_batch
         steps += sum(int(t.shaped.shape[0]) for t in batch)
@@ -533,6 +571,7 @@ def main() -> None:
             arguments.teacher_kl_cost,
             arguments.value_passes,
             entropy_cost=arguments.entropy_cost,
+            lmb=arguments.lmb,
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -575,6 +614,25 @@ def main() -> None:
             record["diag/total_loss"],
         )
     wandb.finish()
+
+
+def _learner(arguments: argparse.Namespace, device: str) -> Policy:
+    """Return the network being trained, built from the parsed command line.
+
+    Pulled out of ``main`` so a test can construct one from a parsed
+    ``--blocks`` and count its own residual blocks -- the only way to tell
+    "parsed the flag" from "parsed the flag and never used it".
+
+    Args:
+        arguments: The parsed command line.
+        device: Where to place the network.
+
+    Returns:
+        The learner, not yet warm-started or optimized.
+    """
+    return Policy(
+        blocks=arguments.blocks, channels=arguments.channels, value_bound=VALUE_BOUND
+    ).to(device)
 
 
 def _optimizer(learner: Policy, lr: float) -> torch.optim.Optimizer:
@@ -880,7 +938,8 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
         project=WANDB_PROJECT,
         name=arguments.name or _default_name(arguments),
         config={
-            "blocks": BLOCKS,
+            "blocks": arguments.blocks,
+            "teacher_blocks": arguments.teacher_blocks if arguments.teacher else None,
             "channels": arguments.channels,
             "value_bound": VALUE_BOUND,
             "reward_field": field,
@@ -894,7 +953,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             # without it.
             "capital_weight": 0.0 if arguments.margin else CAPITAL_WEIGHT,
             "econ_fraction": arguments.econ_fraction,
-            "value_warmup": arguments.value_warmup,
+            "value_warmup_batches": arguments.value_warmup_batches,
             "value_passes": arguments.value_passes,
             "teacher": str(arguments.teacher)
             if arguments.teacher is not None
@@ -908,6 +967,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "sync_every": SYNC_EVERY,
             "lr": arguments.lr,
             "entropy_cost": arguments.entropy_cost,
+            "lmb": arguments.lmb,
             "adam_eps": ADAM_EPS,
             "clip_grads": CLIP_GRADS,
             "total_steps": TOTAL_STEPS,
@@ -961,6 +1021,12 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     the answer travels with the network, in ``Teacher``, rather than being
     re-guessed at the loss.
 
+    The teacher's trunk is built at ``--teacher-blocks``, not ``--blocks``:
+    the recipe's teachers are smaller nets than the phase they teach (phase
+    5's is the 16-block checkpoint, taught against its own 24), so the two
+    cannot be assumed equal, and ``load_policy_weights`` raises rather than
+    silently reconciling a shape mismatch if they are.
+
     Args:
         arguments: The parsed command line.
         device: Where to place the teacher.
@@ -973,7 +1039,9 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     if arguments.teacher is None:
         return None
     policy = Policy(
-        blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
+        blocks=arguments.teacher_blocks,
+        channels=arguments.channels,
+        value_bound=VALUE_BOUND,
     ).to(device)
     state = torch.load(arguments.teacher, map_location=device, weights_only=True)
     missing = load_policy_weights(policy, state)
@@ -1027,18 +1095,23 @@ def _field(arguments: argparse.Namespace) -> str:
         The ``Trajectory`` attribute name the learner reads.
 
     Raises:
-        ValueError: If two rewards are asked for at once.
+        ValueError: If more than one reward is asked for at once.
     """
-    if arguments.margin and arguments.phase1b:
-        raise ValueError(
-            "--margin and --phase1b name two different rewards; an arm trains "
-            "on one of them"
+    chosen = [
+        field
+        for field, flag in (
+            ("margin", arguments.margin),
+            ("shaped_money", arguments.phase1b),
+            ("sparse", arguments.sparse),
         )
-    if arguments.margin:
-        return "margin"
-    if arguments.phase1b:
-        return "shaped_money"
-    return REWARD_FIELD
+        if flag
+    ]
+    if len(chosen) > 1:
+        raise ValueError(
+            f"--margin, --phase1b and --sparse name different rewards; an arm "
+            f"trains on one of them, not {chosen}"
+        )
+    return chosen[0] if chosen else REWARD_FIELD
 
 
 def _warm_start(learner: Policy, device: str) -> list[str]:
@@ -1219,6 +1292,7 @@ def _collect(
     pool: ProcessPoolExecutor,
     state: dict[str, torch.Tensor],
     seeds: Sequence[int],
+    blocks: int = BLOCKS,
     channels: int = CHANNELS,
     econ_fraction: float = 0.0,
 ) -> tuple[list[Trajectory], list[Trajectory]]:
@@ -1232,6 +1306,8 @@ def _collect(
         pool: The process pool to spread episodes over.
         state: The actor's weights, on CPU so they pickle to the workers.
         seeds: One seed per episode.
+        blocks: Residual blocks in the trunk, so the workers rebuild the actor
+            at this arm's depth rather than the module default.
         channels: Trunk width, so the workers rebuild the actor at this arm's
             size rather than the module default.
         econ_fraction: Share of the round played against ``OPPONENT`` instead of
@@ -1246,17 +1322,19 @@ def _collect(
     for group, versus in ((mirror_seeds, None), (econ_seeds, OPPONENT)):
         share = max(1, WORKERS // 2) if econ_seeds else WORKERS
         chunks = [group[index::share] for index in range(share)]
-        work.extend((state, chunk, channels, versus) for chunk in chunks if chunk)
+        work.extend(
+            (state, chunk, blocks, channels, versus) for chunk in chunks if chunk
+        )
     played = list(pool.map(_play, work))
     mirror: list[Trajectory] = []
     econ: list[Trajectory] = []
-    for (_, _, _, versus), batch in zip(work, played, strict=True):
+    for (_, _, _, _, versus), batch in zip(work, played, strict=True):
         (econ if versus else mirror).extend(batch)
     return mirror, econ
 
 
 def _play(
-    work: tuple[dict[str, torch.Tensor], list[int], int, str | None],
+    work: tuple[dict[str, torch.Tensor], list[int], int, int, str | None],
 ) -> list[Trajectory]:
     """Play one worker's share of a round. Runs in a subprocess.
 
@@ -1267,8 +1345,8 @@ def _play(
     past 230 and the round did not finish.
     """
     torch.set_num_threads(THREADS)
-    state, seeds, channels, versus = work
-    actor = Policy(blocks=BLOCKS, channels=channels, value_bound=VALUE_BOUND)
+    state, seeds, blocks, channels, versus = work
+    actor = Policy(blocks=blocks, channels=channels, value_bound=VALUE_BOUND)
     actor.load_state_dict(state)
     actor.eval()
     with torch.no_grad():
@@ -1312,6 +1390,7 @@ def _update(
     teacher_kl_cost: float = TEACHER_KL_COST,
     value_passes: int = 0,
     entropy_cost: float = ENTROPY_COST,
+    lmb: float = LMB,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -1346,6 +1425,8 @@ def _update(
         value_passes: Extra value-only passes over the same round, after the
             policy has taken its one. Zero reproduces every earlier arm exactly.
         entropy_cost: Coefficient on the entropy loss term.
+        lmb: Lambda for both TD(lambda) and UPGO. Their 0.8 for phases 1-4,
+            0.9 for phase 5.
 
     Returns:
         The loss terms averaged over the round's policy steps, plus
@@ -1369,13 +1450,14 @@ def _update(
             teacher=teacher,
             teacher_kl_cost=teacher_kl_cost,
             entropy_cost=entropy_cost,
+            lmb=lmb,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
         steps += 1
     means = {key: value / max(steps, 1) for key, value in totals.items()}
     means["baseline_passes"] = _value_passes(
-        learner, optimizer, segments, device, field, value_passes
+        learner, optimizer, segments, device, field, value_passes, lmb=lmb
     ) or means.get("baseline", 0.0)
     return means, steps
 
@@ -1387,6 +1469,7 @@ def _value_passes(
     device: str,
     field: str,
     passes: int,
+    lmb: float = LMB,
 ) -> float:
     """Replay a round through the value head alone and return the mean loss.
 
@@ -1402,6 +1485,7 @@ def _value_passes(
         device: Where to run the learner.
         field: Which recorded reward series the learner reads.
         passes: How many times to replay. Zero returns 0.0 and touches nothing.
+        lmb: Lambda for the TD(lambda) value target.
 
     Returns:
         The mean ``baseline`` loss across every extra batch, or 0.0 if there were
@@ -1418,6 +1502,7 @@ def _value_passes(
                 device,
                 field,
                 baseline_only=True,
+                lmb=lmb,
             )
             total += terms["baseline"]
             steps += 1
@@ -1434,6 +1519,7 @@ def _step(
     teacher: Teacher | None = None,
     teacher_kl_cost: float = TEACHER_KL_COST,
     entropy_cost: float = ENTROPY_COST,
+    lmb: float = LMB,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -1453,6 +1539,7 @@ def _step(
             or None.
         teacher_kl_cost: Coefficient on that KL.
         entropy_cost: Coefficient on the entropy loss term.
+        lmb: Lambda for both TD(lambda) and UPGO, passed to ``toad_loss.losses``.
 
     Returns:
         The four loss terms and their total, as floats.
@@ -1569,6 +1656,7 @@ def _step(
         teacher_kl=teacher_kl,
         teacher_kl_cost=teacher_kl_cost,
         entropy_cost=entropy_cost,
+        lmb=lmb,
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()
