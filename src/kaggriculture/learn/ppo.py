@@ -662,7 +662,7 @@ def update(
                 # policy's own starting weights, so on a fresh or a
                 # behaviour-cloned start its quantity head is the learner's
                 # random initialisation -- anchoring the head to that is worse
-                # than not anchoring it. `toad_phase1` loads its teacher from a
+                # than not anchoring it. `toad` loads its teacher from a
                 # state dict, can therefore ask whether the head was ever
                 # trained, and includes the term when the answer is yes.
                 teacher_units, _teacher_quantity, teacher_market, _value = teacher(

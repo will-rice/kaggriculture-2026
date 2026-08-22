@@ -48,7 +48,7 @@ from kaggriculture.learn.mask import market_mask, unit_mask
 from kaggriculture.learn.model import BLOCKS, CHANNELS, Policy
 from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, potential
 from kaggriculture.learn.rollout import Trajectory, rollout, rollout_many
-from kaggriculture.learn.scripts import toad_phase1
+from kaggriculture.learn.scripts import toad
 
 # Far enough in that the two farms have diverged. The opening position is
 # identical for both seats -- same tiles, same money, same empty shed -- so a
@@ -167,10 +167,10 @@ def test_own_survives_the_learner_s_segment_batch_path() -> None:
     """
     trajectory = rollout(_untrained(), "starter", seed=0)
 
-    segments = toad_phase1._segments(trajectory)
+    segments = toad._segments(trajectory)
     seen = torch.cat([segment["own"] for segment in segments])
     turns = int(trajectory.dones.shape[0])
-    start = turns % toad_phase1.UNROLL_LENGTH
+    start = turns % toad.UNROLL_LENGTH
 
     assert torch.equal(seen, trajectory.own[start:])
 
@@ -494,6 +494,7 @@ def test_every_tensor_covers_the_same_turns(trajectory: Trajectory) -> None:
     assert trajectory.shaped.shape == (turns,)
     assert trajectory.shaped_money.shape == (turns,)
     assert trajectory.margin.shape == (turns,)
+    assert trajectory.sparse.shape == (turns,)
     # One row per acting turn and no terminal row. The natural thing here is
     # the shape `advantages` asks for -- one longer, holding the state after
     # the last action -- and it is the wrong one: the potential at the state a

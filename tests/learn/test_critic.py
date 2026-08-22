@@ -7,7 +7,7 @@ rate was a fixed point of it. A critic can sit at 0.998 explained variance
 against such a target while explaining the real return twelvefold worse than a
 constant, and that is exactly what was measured on 2026-08-09.
 
-Two defects put it there, both in ``toad_phase1``'s segmentation rather than in
+Two defects put it there, both in ``toad``'s segmentation rather than in
 the vendored loss the ledger's faithfulness audit checked:
 
 * the ragged tail of every episode was dropped, taking the only ``done`` in the
@@ -34,7 +34,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
-from kaggriculture.learn.scripts import toad_phase1
+from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.core import td_lambda
 from kaggriculture.learn.toad_loss import ADAM_EPS, DISCOUNTING, LEARNING_RATE, LMB
 
@@ -90,6 +90,7 @@ def _episode(turns: int = TURNS) -> Trajectory:
         shaped=rewards,
         shaped_money=rewards,
         margin=rewards,
+        sparse=rewards,
         potentials=torch.zeros(turns, 1),
         dones=dones,
         final_margin=0.0,
@@ -118,14 +119,14 @@ def _finite_horizon(turns: int = TURNS) -> torch.Tensor:
 def _targets(values: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Return each segment's TD(lambda) target beside the values it was built from.
 
-    The segmentation and the bootstrap come from ``toad_phase1`` itself, so a
+    The segmentation and the bootstrap come from ``toad`` itself, so a
     change to either is a change to what these tests measure. The network is
     replaced by an oracle -- ``values`` indexed at each row -- because the
     question is about the target's fixed point and not about what a trunk can fit.
     """
     episode = _episode()
     pairs = []
-    for segment in toad_phase1._segments(episode):
+    for segment in toad._segments(episode):
         rows = _rows(segment)[: segment["dones"].shape[0]]
         bootstrap = values[int(_rows(segment)[-1])]
         target = td_lambda.td_lambda(
@@ -193,7 +194,7 @@ def test_the_terminal_payoff_reaches_turn_zero_with_their_retention() -> None:
 
 def test_every_segment_covers_a_turn_and_the_last_one_ends_the_season() -> None:
     """The terminal turn must be an acted row, or no target ever sees a done."""
-    segments = toad_phase1._segments(_episode())
+    segments = toad._segments(_episode())
     acted = torch.cat([_rows(segment)[:-1] for segment in segments])
     assert int(acted.max()) == TURNS - 1
     assert any(bool(segment["dones"].any()) for segment in segments)
@@ -201,7 +202,7 @@ def test_every_segment_covers_a_turn_and_the_last_one_ends_the_season() -> None:
 
 def test_a_segment_bootstraps_from_the_state_after_its_last_action() -> None:
     """The bootstrap state must be outside the segment, or nothing couples them."""
-    segments = toad_phase1._segments(_episode())
+    segments = toad._segments(_episode())
     for segment in segments[:-1]:
         rows = _rows(segment)
         assert int(rows[-1]) == int(rows[-2]) + 1
@@ -246,7 +247,7 @@ class _Oracle(Policy):
 def _baseline(values: torch.Tensor, last: bool = True) -> float:
     """Return the ``baseline`` term the runner's own ``_step`` builds for a critic.
 
-    This goes through ``toad_phase1._step``, not through a reconstruction of it,
+    This goes through ``toad._step``, not through a reconstruction of it,
     so it pins what the runner **consumes**. Asserting on what ``_segments``
     *produces* is not the same thing and does not catch a ``_step`` that ignores
     the state it is handed.
@@ -260,11 +261,11 @@ def _baseline(values: torch.Tensor, last: bool = True) -> float:
     Returns:
         The smooth-L1 value loss over one batch of segments.
     """
-    segments = toad_phase1._segments(_episode())
-    batch = segments[-toad_phase1.BATCH_SEGMENTS :] if last else segments[:4]
+    segments = toad._segments(_episode())
+    batch = segments[-toad.BATCH_SEGMENTS :] if last else segments[:4]
     oracle = _Oracle(values)
     optimizer = torch.optim.Adam(oracle.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
-    return toad_phase1._step(oracle, optimizer, batch, "cpu", "margin")["baseline"]
+    return toad._step(oracle, optimizer, batch, "cpu", "margin")["baseline"]
 
 
 def test_the_runner_leaves_a_correct_critic_alone() -> None:

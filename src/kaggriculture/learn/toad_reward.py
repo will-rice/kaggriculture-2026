@@ -254,7 +254,7 @@ def money_weight() -> float:
 # mistake to make beside it. `reward_min/max = +/-1/MAX_DAYS` *is* horizon-scaled
 # -- it is the per-step bound that `BaselineLayer` multiplies back by MAX_DAYS to
 # confine the value head to [-1, +1], which is why our analogue of it is
-# `toad_phase1.VALUE_BOUND = 1.0` and needs no 360 or 719 in it at all. This 500
+# `toad.VALUE_BOUND = 1.0` and needs no 360 or 719 in it at all. This 500
 # is separate and prices the components against each other.
 #
 # Rescaling it by 719/360 would be wrong, because every component here except
@@ -565,6 +565,41 @@ def margin(series: list[Counts], won: float) -> torch.Tensor:
     ]
     rewards[-1] += GAME_RESULT_WEIGHT * won / NORMALISER
     return torch.tensor(rewards, dtype=torch.float32)
+
+
+def sparse(series: list[Counts], won: float) -> torch.Tensor:
+    """Return the per-turn ``GameResultReward`` for a counts series.
+
+    Phases 2 onward train on this alone: +1 terminal for a win, -1 for a loss,
+    0 for a draw, and nothing else. Zero on every turn but the last is not an
+    approximation of sparse -- it is what sparse means. ``margin`` above
+    decomposes the same win condition onto the turns that produced it, plus a
+    small signed own-bank term; this reward decomposes it onto nothing, on
+    purpose, so the phase boundary that switches to it means what the recipe
+    says it means.
+
+    Args:
+        series: The counts at each state, terminal state included. The counts
+            themselves are unused -- only the length sets the turn count --
+            kept as the argument so this reward shares its call site with
+            ``shaped`` and ``margin`` and an arm remains a choice of field
+            rather than a re-run.
+        won: The terminal result in {-1., 0., +1.}, from ``rank``.
+
+    Returns:
+        ``(turns,)`` float32 rewards, zero everywhere but the last turn.
+
+    Raises:
+        ValueError: If ``series`` holds fewer than two states.
+    """
+    if len(series) < 2:
+        raise ValueError(
+            f"a sparse series needs one state per turn plus the terminal one, "
+            f"got {len(series)}"
+        )
+    rewards = torch.zeros(len(series) - 1, dtype=torch.float32)
+    rewards[-1] = won
+    return rewards
 
 
 def rank(ours: float, theirs: float) -> float:

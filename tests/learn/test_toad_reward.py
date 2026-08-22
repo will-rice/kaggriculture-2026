@@ -12,10 +12,13 @@ from collections.abc import Mapping
 from typing import Any
 
 import pytest
+import torch
 from kaggle_environments import make
 
 from kaggriculture.constants import ENVIRONMENT
 from kaggriculture.learn import toad_reward
+from kaggriculture.learn.model import Policy
+from kaggriculture.learn.rollout import rollout
 
 
 @pytest.fixture(name="observation")
@@ -353,3 +356,25 @@ def test_an_empty_structure_earns_nothing_under_the_shaped_reward() -> None:
     assert float(toad_reward.shaped([before, after], won=0.0).sum()) == pytest.approx(
         toad_reward.STEP_WEIGHT / toad_reward.NORMALISER
     )
+
+
+def test_sparse_is_zero_everywhere_but_the_final_turn() -> None:
+    """Phases 2+ train on the game result alone.
+
+    Sparse means sparse: a non-zero mid-episode entry would be a shaped
+    reward wearing the name, and the phase boundary would stop meaning what
+    the recipe says. Played through a real episode, via ``rollout``, rather
+    than a hand-built series -- ``toad_reward.sparse`` takes the same
+    ``series``/``won`` shape ``margin`` and ``shaped`` do, and the wiring that
+    hands it a real one is exactly what a hand-built series cannot exercise.
+    """
+    torch.manual_seed(0)
+    policy = Policy(blocks=1, channels=32).eval()
+    trajectory = rollout(policy, "starter", seed=0)
+
+    theirs = trajectory.final_bank - trajectory.final_margin
+    expected = toad_reward.rank(trajectory.final_bank, theirs)
+
+    assert torch.all(trajectory.sparse[:-1] == 0.0)
+    assert float(trajectory.sparse[-1]) == expected
+    assert float(trajectory.sparse.sum()) == expected

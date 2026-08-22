@@ -62,6 +62,7 @@ from kaggriculture.learn.toad_loss import (
     DISCOUNTING,
     ENTROPY_COST,
     LEARNING_RATE,
+    LMB,
     MIN_LR_MOD,
     TEACHER_KL_COST,
     TOTAL_STEPS,
@@ -167,6 +168,7 @@ ACTED_FIELDS = (
     "shaped_money",
     "margin",
     "own",
+    "sparse",
     "dones",
 )
 OBSERVED_FIELDS = ("board", "scalars", "positions")
@@ -365,14 +367,21 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="train on the margin reward -- the competition's actual win "
         "condition -- instead of Toad's shaped components. Mutually exclusive "
-        "with --no-money.",
+        "with --no-money, --own and --sparse.",
     )
     parser.add_argument(
         "--own",
         action="store_true",
         help="train on this seat's own bank alone -- absolute rather than "
         "relative, and the thinnest possible shaping. Mutually exclusive with "
-        "--no-money and --margin.",
+        "--no-money, --margin and --sparse.",
+    )
+    parser.add_argument(
+        "--sparse",
+        action="store_true",
+        help="train on GameResultReward -- +1/-1/0 on the terminal turn alone, "
+        "nothing else. Phases 2-5 of the curriculum. Mutually exclusive with "
+        "--no-money, --margin and --own.",
     )
     parser.add_argument(
         "--money-weight",
@@ -380,6 +389,13 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="override the money component's weight (arm W uses 0.01). Set into "
         "the environment so the rollout workers see it too.",
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=BLOCKS,
+        help="residual blocks in the learner's (and rollout actor's) trunk. "
+        "Phases 3-5 of the curriculum need 16 and 24 against phase 1-2's 8.",
     )
     parser.add_argument(
         "--channels",
@@ -396,6 +412,16 @@ def _parser() -> argparse.ArgumentParser:
         "(--teacher-kl-cost). Unset by default: phase 1 is teacher-free "
         "self-play from scratch. The recipe's teachers are always an earlier, "
         "smaller checkpoint from this same pipeline, never a behaviour clone.",
+    )
+    parser.add_argument(
+        "--teacher-blocks",
+        type=int,
+        default=BLOCKS,
+        help="residual blocks in the frozen teacher's trunk -- the depth its "
+        "own checkpoint was written at, not this arm's --blocks. The recipe's "
+        "teachers are always smaller nets than the phase they teach (phase 5's "
+        "is the 16-block checkpoint against its own 24), so this cannot be "
+        "assumed equal to --blocks.",
     )
     parser.add_argument(
         "--econ-fraction",
@@ -435,11 +461,20 @@ def _parser() -> argparse.ArgumentParser:
         "every earlier arm exactly.",
     )
     parser.add_argument(
-        "--value-warmup",
-        action="store_true",
-        help="train the value head alone for VALUE_WARMUP_BATCHES before the "
+        "--lmb",
+        type=float,
+        default=LMB,
+        help="lambda for both TD(lambda) and UPGO, named to match "
+        "toad_loss.losses' own parameter rather than shadowing the Python "
+        "keyword. Their 0.8 for phases 1-4 and 0.9 for phase 5.",
+    )
+    parser.add_argument(
+        "--value-warmup-batches",
+        type=int,
+        default=VALUE_WARMUP_BATCHES,
+        help="train the value head alone for this many batches before the "
         "policy gradient fires (arm C'). Their phase-2 mechanism, for a "
-        "warm-started policy whose critic is untrained.",
+        "warm-started policy whose critic is untrained. 0 means no warmup.",
     )
     parser.add_argument(
         "--value-passes",
@@ -469,13 +504,28 @@ def _parser() -> argparse.ArgumentParser:
         help="checkpoint to continue from, restoring weights, optimizer, "
         "schedule and counters",
     )
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=TOTAL_STEPS,
+        help="environment steps this arm trains for. The curriculum's five "
+        "phases each need a different budget (2e7-1e7) against this "
+        "constant's declared-deviation 1e8.",
+    )
     return parser
 
 
-def main() -> None:
-    """Run phase 1 to ``TOTAL_STEPS``, checkpointing and logging as it goes."""
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run one arm to ``--total-steps``, checkpointing and logging as it goes.
+
+    Args:
+        argv: Flags to parse, or None for ``sys.argv[1:]`` (the CLI's own
+            default). ``curriculum.py`` passes an explicit list here so it can
+            invoke this entry point directly rather than shelling out or
+            duplicating the training loop.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    arguments = _parser().parse_args()
+    arguments = _parser().parse_args(argv)
 
     seed_everything(SEED, workers=True)
     RUNS.mkdir(parents=True, exist_ok=True)
@@ -490,14 +540,12 @@ def main() -> None:
     prefix = _prefix(arguments)
 
     device = _device()
-    learner = Policy(
-        blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
-    ).to(device)
+    learner = _learner(arguments, device)
     if arguments.clone_init:
         _warm_start(learner, device)
     optimizer = _optimizer(learner, arguments.lr)
     schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, _decay(arguments.econ_fraction)
+        optimizer, _decay(arguments.econ_fraction, arguments.total_steps)
     )
 
     steps, update = 0, 0
@@ -520,7 +568,7 @@ def main() -> None:
 
     teacher = _teacher(arguments, device)
     actor = copy.deepcopy(learner).eval()
-    warmup_left = VALUE_WARMUP_BATCHES if arguments.value_warmup else 0
+    warmup_left = arguments.value_warmup_batches
     if warmup_left:
         LOGGER.info(
             "value warmup: %d batches (~%.1f updates at %d batches/update)",
@@ -530,11 +578,16 @@ def main() -> None:
         )
     started = time.monotonic()
     pool = ProcessPoolExecutor(max_workers=WORKERS)
-    while steps < TOTAL_STEPS:
+    while steps < arguments.total_steps:
         seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
         weights = {key: value.cpu() for key, value in actor.state_dict().items()}
         mirror_batch, econ_batch = _collect(
-            pool, weights, seeds, arguments.channels, arguments.econ_fraction
+            pool,
+            weights,
+            seeds,
+            arguments.blocks,
+            arguments.channels,
+            arguments.econ_fraction,
         )
         batch = mirror_batch + econ_batch
         steps += sum(int(t.shaped.shape[0]) for t in batch)
@@ -550,6 +603,7 @@ def main() -> None:
             arguments.value_passes,
             entropy_cost=arguments.entropy_cost,
             discounting=arguments.gamma,
+            lmb=arguments.lmb,
         )
         warming = warmup_left > 0
         warmup_left = max(0, warmup_left - consumed)
@@ -592,6 +646,25 @@ def main() -> None:
             record["diag/total_loss"],
         )
     wandb.finish()
+
+
+def _learner(arguments: argparse.Namespace, device: str) -> Policy:
+    """Return the network being trained, built from the parsed command line.
+
+    Pulled out of ``main`` so a test can construct one from a parsed
+    ``--blocks`` and count its own residual blocks -- the only way to tell
+    "parsed the flag" from "parsed the flag and never used it".
+
+    Args:
+        arguments: The parsed command line.
+        device: Where to place the network.
+
+    Returns:
+        The learner, not yet warm-started or optimized.
+    """
+    return Policy(
+        blocks=arguments.blocks, channels=arguments.channels, value_bound=VALUE_BOUND
+    ).to(device)
 
 
 def _optimizer(learner: Policy, lr: float) -> torch.optim.Optimizer:
@@ -897,7 +970,8 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
         project=WANDB_PROJECT,
         name=arguments.name or _default_name(arguments),
         config={
-            "blocks": BLOCKS,
+            "blocks": arguments.blocks,
+            "teacher_blocks": arguments.teacher_blocks if arguments.teacher else None,
             "channels": arguments.channels,
             "value_bound": VALUE_BOUND,
             "reward_field": field,
@@ -911,7 +985,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             # without it.
             "capital_weight": 0.0 if arguments.margin else CAPITAL_WEIGHT,
             "econ_fraction": arguments.econ_fraction,
-            "value_warmup": arguments.value_warmup,
+            "value_warmup_batches": arguments.value_warmup_batches,
             "value_passes": arguments.value_passes,
             "teacher": str(arguments.teacher)
             if arguments.teacher is not None
@@ -925,9 +999,10 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "lr": arguments.lr,
             "entropy_cost": arguments.entropy_cost,
             "gamma": arguments.gamma,
+            "lmb": arguments.lmb,
             "adam_eps": ADAM_EPS,
             "clip_grads": CLIP_GRADS,
-            "total_steps": TOTAL_STEPS,
+            "total_steps": arguments.total_steps,
             "engine": metadata.version("kaggle-environments"),
         },
     )
@@ -978,6 +1053,12 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     the answer travels with the network, in ``Teacher``, rather than being
     re-guessed at the loss.
 
+    The teacher's trunk is built at ``--teacher-blocks``, not ``--blocks``:
+    the recipe's teachers are smaller nets than the phase they teach (phase
+    5's is the 16-block checkpoint, taught against its own 24), so the two
+    cannot be assumed equal, and ``load_policy_weights`` raises rather than
+    silently reconciling a shape mismatch if they are.
+
     Args:
         arguments: The parsed command line.
         device: Where to place the teacher.
@@ -990,7 +1071,9 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     if arguments.teacher is None:
         return None
     policy = Policy(
-        blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
+        blocks=arguments.teacher_blocks,
+        channels=arguments.channels,
+        value_bound=VALUE_BOUND,
     ).to(device)
     state = torch.load(arguments.teacher, map_location=device, weights_only=True)
     missing = load_policy_weights(policy, state)
@@ -1046,18 +1129,22 @@ def _field(arguments: argparse.Namespace) -> str:
     Raises:
         ValueError: If more than one reward is asked for at once.
     """
-    if sum((arguments.margin, arguments.no_money, arguments.own)) > 1:
-        raise ValueError(
-            "--margin, --no-money and --own name three different rewards; an "
-            "arm trains on one of them"
+    chosen = [
+        field
+        for field, flag in (
+            ("shaped", arguments.no_money),
+            ("margin", arguments.margin),
+            ("own", arguments.own),
+            ("sparse", arguments.sparse),
         )
-    if arguments.margin:
-        return "margin"
-    if arguments.no_money:
-        return "shaped"
-    if arguments.own:
-        return "own"
-    return REWARD_FIELD
+        if flag
+    ]
+    if len(chosen) > 1:
+        raise ValueError(
+            f"--no-money, --margin, --own and --sparse name different rewards; "
+            f"an arm trains on one of them, not {chosen}"
+        )
+    return chosen[0] if chosen else REWARD_FIELD
 
 
 def _warm_start(learner: Policy, device: str) -> list[str]:
@@ -1093,7 +1180,9 @@ def _warm_start(learner: Policy, device: str) -> list[str]:
     return missing
 
 
-def _decay(econ_fraction: float) -> Callable[[int], float]:
+def _decay(
+    econ_fraction: float, total_steps: int = TOTAL_STEPS
+) -> Callable[[int], float]:
     """Return the LR multiplier function, floored at their ``min_lr_mod``.
 
     Toad's schedule reaches the floor exactly at ``total_steps``, so ours has to
@@ -1107,17 +1196,20 @@ def _decay(econ_fraction: float) -> Callable[[int], float]:
 
     A plain function rather than a lambda so a resume restores the same
     schedule: ``LambdaLR.state_dict`` stores ``None`` for a function and the
-    multiplier is rebuilt here from the current ``TOTAL_STEPS``, where a
-    schedule silently restarted from step zero would restore the initial rate
-    and quietly change the recipe partway through a run.
+    multiplier is rebuilt here from ``total_steps``, where a schedule silently
+    restarted from step zero would restore the initial rate and quietly change
+    the recipe partway through a run.
 
     Args:
         econ_fraction: Share of each round played against ``OPPONENT``.
+        total_steps: Environment steps this arm trains for, from ``--total-steps``
+            (default ``TOTAL_STEPS``). The curriculum's five phases each need a
+            different budget (2e7-1e7 against the constant's 1e8).
 
     Returns:
         The multiplier at a given schedule step.
     """
-    updates = max(TOTAL_STEPS // (_seats_per_update(econ_fraction) * TURNS), 1)
+    updates = max(total_steps // (_seats_per_update(econ_fraction) * TURNS), 1)
 
     def decay(step: int) -> float:
         return max(1.0 - step / updates, MIN_LR_MOD)
@@ -1238,6 +1330,7 @@ def _collect(
     pool: ProcessPoolExecutor,
     state: dict[str, torch.Tensor],
     seeds: Sequence[int],
+    blocks: int = BLOCKS,
     channels: int = CHANNELS,
     econ_fraction: float = 0.0,
 ) -> tuple[list[Trajectory], list[Trajectory]]:
@@ -1251,6 +1344,8 @@ def _collect(
         pool: The process pool to spread episodes over.
         state: The actor's weights, on CPU so they pickle to the workers.
         seeds: One seed per episode.
+        blocks: Residual blocks in the trunk, so the workers rebuild the actor
+            at this arm's depth rather than the module default.
         channels: Trunk width, so the workers rebuild the actor at this arm's
             size rather than the module default.
         econ_fraction: Share of the round played against ``OPPONENT`` instead of
@@ -1265,17 +1360,19 @@ def _collect(
     for group, versus in ((mirror_seeds, None), (econ_seeds, OPPONENT)):
         share = max(1, WORKERS // 2) if econ_seeds else WORKERS
         chunks = [group[index::share] for index in range(share)]
-        work.extend((state, chunk, channels, versus) for chunk in chunks if chunk)
+        work.extend(
+            (state, chunk, blocks, channels, versus) for chunk in chunks if chunk
+        )
     played = list(pool.map(_play, work))
     mirror: list[Trajectory] = []
     econ: list[Trajectory] = []
-    for (_, _, _, versus), batch in zip(work, played, strict=True):
+    for (_, _, _, _, versus), batch in zip(work, played, strict=True):
         (econ if versus else mirror).extend(batch)
     return mirror, econ
 
 
 def _play(
-    work: tuple[dict[str, torch.Tensor], list[int], int, str | None],
+    work: tuple[dict[str, torch.Tensor], list[int], int, int, str | None],
 ) -> list[Trajectory]:
     """Play one worker's share of a round. Runs in a subprocess.
 
@@ -1286,8 +1383,8 @@ def _play(
     past 230 and the round did not finish.
     """
     torch.set_num_threads(THREADS)
-    state, seeds, channels, versus = work
-    actor = Policy(blocks=BLOCKS, channels=channels, value_bound=VALUE_BOUND)
+    state, seeds, blocks, channels, versus = work
+    actor = Policy(blocks=blocks, channels=channels, value_bound=VALUE_BOUND)
     actor.load_state_dict(state)
     actor.eval()
     with torch.no_grad():
@@ -1332,6 +1429,7 @@ def _update(
     value_passes: int = 0,
     entropy_cost: float = ENTROPY_COST,
     discounting: float = DISCOUNTING,
+    lmb: float = LMB,
 ) -> tuple[dict[str, float], int]:
     """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
 
@@ -1369,6 +1467,8 @@ def _update(
         discounting: Gamma the return and advantage targets are built at,
             passed through to every ``_step`` and ``_value_passes`` call this
             round makes.
+        lmb: Lambda for both TD(lambda) and UPGO. Their 0.8 for phases 1-4,
+            0.9 for phase 5.
 
     Returns:
         The loss terms averaged over the round's policy steps, plus
@@ -1393,13 +1493,21 @@ def _update(
             teacher_kl_cost=teacher_kl_cost,
             entropy_cost=entropy_cost,
             discounting=discounting,
+            lmb=lmb,
         )
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + value
         steps += 1
     means = {key: value / max(steps, 1) for key, value in totals.items()}
     means["baseline_passes"] = _value_passes(
-        learner, optimizer, segments, device, field, value_passes, discounting
+        learner,
+        optimizer,
+        segments,
+        device,
+        field,
+        value_passes,
+        discounting=discounting,
+        lmb=lmb,
     ) or means.get("baseline", 0.0)
     return means, steps
 
@@ -1412,6 +1520,7 @@ def _value_passes(
     field: str,
     passes: int,
     discounting: float = DISCOUNTING,
+    lmb: float = LMB,
 ) -> float:
     """Replay a round through the value head alone and return the mean loss.
 
@@ -1429,6 +1538,7 @@ def _value_passes(
         passes: How many times to replay. Zero returns 0.0 and touches nothing.
         discounting: Gamma the value target is built at, same one the policy
             pass used.
+        lmb: Lambda for the TD(lambda) value target.
 
     Returns:
         The mean ``baseline`` loss across every extra batch, or 0.0 if there were
@@ -1446,6 +1556,7 @@ def _value_passes(
                 field,
                 baseline_only=True,
                 discounting=discounting,
+                lmb=lmb,
             )
             total += terms["baseline"]
             steps += 1
@@ -1463,6 +1574,7 @@ def _step(
     teacher_kl_cost: float = TEACHER_KL_COST,
     entropy_cost: float = ENTROPY_COST,
     discounting: float = DISCOUNTING,
+    lmb: float = LMB,
 ) -> dict[str, float]:
     """Take one gradient step on one batch of unrolls.
 
@@ -1484,6 +1596,7 @@ def _step(
         entropy_cost: Coefficient on the entropy loss term.
         discounting: Gamma the return and advantage targets are built at.
             ``losses``' own default, ``toad_loss.DISCOUNTING``.
+        lmb: Lambda for both TD(lambda) and UPGO, passed to ``toad_loss.losses``.
 
     Returns:
         The four loss terms and their total, as floats.
@@ -1601,6 +1714,7 @@ def _step(
         teacher_kl=teacher_kl,
         teacher_kl_cost=teacher_kl_cost,
         entropy_cost=entropy_cost,
+        lmb=lmb,
     )
     optimizer.zero_grad(set_to_none=True)
     terms.total.backward()

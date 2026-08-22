@@ -23,13 +23,15 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
-from kaggriculture.learn.scripts import toad_phase1
+from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.core import vtrace
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     ENTROPY_COST,
     LEARNING_RATE,
+    LMB,
     TEACHER_KL_COST,
+    VALUE_WARMUP_BATCHES,
     Losses,
 )
 
@@ -40,7 +42,7 @@ def _segment(turns: int = 16, transfers: bool = True) -> dict[str, torch.Tensor]
     The observed fields carry one row more than the acted ones. That extra state
     is the one the value target bootstraps from -- it is deliberately outside the
     segment's own decisions -- so a stand-in built at equal lengths would not be
-    the shape the runner is handed. See ``toad_phase1._segments``.
+    the shape the runner is handed. See ``toad._segments``.
 
     ``transfers`` decides whether any unit played a ``PICKUP``. The quantity
     head is scored only on the slots that did, so a fixture that never
@@ -116,6 +118,7 @@ def _trajectory(turns: int = 4, final_margin: float = 1.0) -> Trajectory:
         shaped=rewards,
         shaped_money=rewards,
         margin=rewards,
+        sparse=rewards,
         potentials=torch.zeros(turns, 1),
         dones=dones,
         final_margin=final_margin,
@@ -143,7 +146,7 @@ def _record(
         "total": 0.0,
         "baseline_passes": 0.0,
     }
-    return toad_phase1._record(
+    return toad._record(
         mirror_batch,
         econ_batch,
         "shaped",
@@ -174,8 +177,8 @@ def test_every_logged_metric_carries_a_role_prefix() -> None:
         mirror_batch=[_trajectory(), _trajectory()], econ_batch=[_trajectory()]
     )
     assert record
-    assert all(key.startswith(toad_phase1.METRIC_PREFIXES) for key in record)
-    assert set(record) == set(toad_phase1.METRIC_DEFINITIONS)
+    assert all(key.startswith(toad.METRIC_PREFIXES) for key in record)
+    assert set(record) == set(toad.METRIC_DEFINITIONS)
 
 
 def test_mirror_decisive_rate_is_the_raw_win_rate_doubled() -> None:
@@ -201,15 +204,15 @@ def test_mirror_decisive_rate_is_the_raw_win_rate_doubled() -> None:
 
 def _policy() -> tuple[Policy, torch.optim.Optimizer]:
     """Return a tiny policy and its optimizer."""
-    policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
+    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
     return policy, torch.optim.Adam(policy.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
 
 def test_the_runner_can_take_a_warmup_step() -> None:
     """During warmup the runner's own step must optimise the baseline alone."""
     policy, optimizer = _policy()
-    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
-    warm = toad_phase1._step(
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    warm = toad._step(
         policy, optimizer, segments, "cpu", "shaped_money", baseline_only=True
     )
     assert warm["total"] == warm["baseline"]
@@ -218,8 +221,8 @@ def test_the_runner_can_take_a_warmup_step() -> None:
 def test_the_runner_takes_a_full_step_after_warmup() -> None:
     """Outside warmup the policy terms must be back in the total."""
     policy, optimizer = _policy()
-    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
-    full = toad_phase1._step(
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    full = toad._step(
         policy, optimizer, segments, "cpu", "shaped_money", baseline_only=False
     )
     assert full["total"] != full["baseline"]
@@ -241,23 +244,21 @@ def test_the_runner_trains_the_quantity_head_only_where_a_transfer_acted() -> No
     warmup moves them on the third, which is meant to be the critic alone.
     """
     policy, optimizer = _policy()
-    acted = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
-    quiet = [_segment(transfers=False) for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    acted = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    quiet = [_segment(transfers=False) for _ in range(toad.BATCH_SEGMENTS)]
 
     before = policy.quantity_head.weight.detach().clone()
-    toad_phase1._step(policy, optimizer, acted, "cpu", "shaped_money")
+    toad._step(policy, optimizer, acted, "cpu", "shaped_money")
     trained = _moved(policy, before)
 
     policy, optimizer = _policy()
     before = policy.quantity_head.weight.detach().clone()
-    toad_phase1._step(policy, optimizer, quiet, "cpu", "shaped_money")
+    toad._step(policy, optimizer, quiet, "cpu", "shaped_money")
     scored_nothing = not _moved(policy, before)
 
     policy, optimizer = _policy()
     before = policy.quantity_head.weight.detach().clone()
-    toad_phase1._step(
-        policy, optimizer, acted, "cpu", "shaped_money", baseline_only=True
-    )
+    toad._step(policy, optimizer, acted, "cpu", "shaped_money", baseline_only=True)
     warmup_left_it = not _moved(policy, before)
 
     assert trained
@@ -277,16 +278,16 @@ def test_the_teacher_kl_covers_the_quantity_head_only_if_the_teacher_has_one() -
     Measured on the KL term itself rather than on the total, so a run that
     happened to have a small teacher cost could not hide the difference.
     """
-    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
-    frozen = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND).eval()
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    frozen = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND).eval()
 
     covered, uncovered = (
-        toad_phase1._step(
+        toad._step(
             *_policy(),
             segments,
             "cpu",
             "shaped_money",
-            teacher=toad_phase1.Teacher(policy=frozen, quantity=carries),
+            teacher=toad.Teacher(policy=frozen, quantity=carries),
             teacher_kl_cost=1.0,
         )["teacher"]
         for carries in (True, False)
@@ -303,9 +304,9 @@ def test_no_teacher_flag_means_no_teacher() -> None:
     from-random policy to a behaviour clone the recipe uses nowhere. The
     default must be no teacher at all, not a clone.
     """
-    arguments = toad_phase1._parser().parse_args([])
+    arguments = toad._parser().parse_args([])
     assert arguments.teacher is None
-    assert toad_phase1._teacher(arguments, "cpu") is None
+    assert toad._teacher(arguments, "cpu") is None
 
 
 def test_teacher_loads_the_named_checkpoint(tmp_path: Path) -> None:
@@ -323,16 +324,14 @@ def test_teacher_loads_the_named_checkpoint(tmp_path: Path) -> None:
     inside ``_teacher`` would pass every check above while leaving the
     teacher free to drift.
     """
-    named = Policy(
-        blocks=toad_phase1.BLOCKS, channels=16, value_bound=toad_phase1.VALUE_BOUND
-    )
+    named = Policy(blocks=toad.BLOCKS, channels=16, value_bound=toad.VALUE_BOUND)
     checkpoint = tmp_path / "phase1_final.pt"
     torch.save(named.state_dict(), checkpoint)
 
-    arguments = toad_phase1._parser().parse_args(
+    arguments = toad._parser().parse_args(
         ["--channels", "16", "--teacher", str(checkpoint)]
     )
-    teacher = toad_phase1._teacher(arguments, "cpu")
+    teacher = toad._teacher(arguments, "cpu")
 
     assert teacher is not None
     named_state = named.state_dict()
@@ -358,14 +357,14 @@ def test_the_warmup_budget_is_counted_down_in_batches(
     # `monkeypatch` rather than assign-and-restore: it undoes the patch even if
     # the assertions below raise, which the hand-rolled `try/finally` did too but
     # only as long as nobody edited it.
-    monkeypatch.setattr(toad_phase1, "_segments", lambda trajectory: segments)  # noqa: ARG005
+    monkeypatch.setattr(toad, "_segments", lambda trajectory: segments)  # noqa: ARG005
     # `_update` reads only `dones` off each trajectory, which is the whole point
     # of the stand-in; it is not a `Trajectory` and does not need to be.
     batch: list[Any] = [_Fake()]
-    terms, consumed = toad_phase1._update(
+    terms, consumed = toad._update(
         policy, optimizer, batch, "cpu", "shaped_money", warmup_left=10**9
     )
-    assert consumed == len(segments) // toad_phase1.BATCH_SEGMENTS
+    assert consumed == len(segments) // toad.BATCH_SEGMENTS
     # Every batch was inside the warmup budget, so the mean total is the mean baseline.
     assert terms["total"] == terms["baseline"]
 
@@ -391,23 +390,23 @@ def _fitted(segments: list[dict[str, torch.Tensor]], value_passes: int) -> float
         dones = torch.zeros(64, dtype=torch.bool)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(toad_phase1, "_segments", lambda trajectory: segments)  # noqa: ARG005
+        patch.setattr(toad, "_segments", lambda trajectory: segments)  # noqa: ARG005
         batch: list[Any] = [_Fake()]
-        toad_phase1._update(
+        toad._update(
             policy, optimizer, batch, "cpu", "shaped", value_passes=value_passes
         )
     probe = copy.deepcopy(policy)
     spare = torch.optim.Adam(probe.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
     losses = [
-        toad_phase1._step(
+        toad._step(
             probe,
             spare,
-            segments[start : start + toad_phase1.BATCH_SEGMENTS],
+            segments[start : start + toad.BATCH_SEGMENTS],
             "cpu",
             "shaped",
             baseline_only=True,
         )["baseline"]
-        for start in range(0, len(segments), toad_phase1.BATCH_SEGMENTS)
+        for start in range(0, len(segments), toad.BATCH_SEGMENTS)
     ]
     return sum(losses) / len(losses)
 
@@ -445,14 +444,14 @@ def test_no_value_passes_reproduces_the_earlier_arms() -> None:
     torch.manual_seed(0)
     policy, optimizer = _policy()
     reference = [
-        toad_phase1._step(
+        toad._step(
             policy,
             optimizer,
-            segments[start : start + toad_phase1.BATCH_SEGMENTS],
+            segments[start : start + toad.BATCH_SEGMENTS],
             "cpu",
             "shaped",
         )
-        for start in range(0, len(segments), toad_phase1.BATCH_SEGMENTS)
+        for start in range(0, len(segments), toad.BATCH_SEGMENTS)
     ]
     expected = sum(terms["baseline"] for terms in reference) / len(reference)
     torch.manual_seed(0)
@@ -462,9 +461,9 @@ def test_no_value_passes_reproduces_the_earlier_arms() -> None:
         dones = torch.zeros(64, dtype=torch.bool)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(toad_phase1, "_segments", lambda trajectory: segments)  # noqa: ARG005
+        patch.setattr(toad, "_segments", lambda trajectory: segments)  # noqa: ARG005
         batch: list[Any] = [_Fake()]
-        terms, _ = toad_phase1._update(fresh, fresh_optimizer, batch, "cpu", "shaped")
+        terms, _ = toad._update(fresh, fresh_optimizer, batch, "cpu", "shaped")
     assert terms["baseline"] == pytest.approx(expected)
     # With no extra passes there is nothing else to report, so the new term must
     # fall back to the round's own baseline rather than to a misleading zero.
@@ -486,7 +485,7 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
     segments = [_segment() for _ in range(8)]
     policy, optimizer = _policy()
     seen: list[bool] = []
-    real = toad_phase1._step
+    real = toad._step
 
     def _recording(
         learner: Policy,
@@ -495,9 +494,10 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
         device: str,
         field: str,
         baseline_only: bool = False,
-        teacher: toad_phase1.Teacher | None = None,
+        teacher: toad.Teacher | None = None,
         teacher_kl_cost: float = TEACHER_KL_COST,
-        discounting: float = toad_phase1.DISCOUNTING,
+        discounting: float = toad.DISCOUNTING,
+        lmb: float = LMB,
     ) -> dict[str, float]:
         seen.append(baseline_only)
         return real(
@@ -510,11 +510,12 @@ def test_the_extra_passes_never_replay_the_policy_gradient() -> None:
             teacher,
             teacher_kl_cost,
             discounting=discounting,
+            lmb=lmb,
         )
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(toad_phase1, "_step", _recording)
-        toad_phase1._value_passes(policy, optimizer, segments, "cpu", "shaped", 3)
+        patch.setattr(toad, "_step", _recording)
+        toad._value_passes(policy, optimizer, segments, "cpu", "shaped", 3)
     assert seen
     assert all(seen)
 
@@ -535,16 +536,16 @@ def test_the_default_arm_trains_on_the_reward_that_prices_coins() -> None:
     stacked another series would pass a namespace check.
     """
     segments = [_segment() for _ in range(2)]
-    policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
+    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
 
     def run(field: str) -> dict[str, float]:
         learner = copy.deepcopy(policy)
         optimizer = torch.optim.Adam(
             learner.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS
         )
-        return toad_phase1._step(learner, optimizer, segments, "cpu", field)
+        return toad._step(learner, optimizer, segments, "cpu", field)
 
-    default = run(toad_phase1._field(toad_phase1._parser().parse_args([])))
+    default = run(toad._field(toad._parser().parse_args([])))
     assert default == run("shaped_money")
     assert default != run("shaped")
 
@@ -556,8 +557,8 @@ def test_the_money_free_arm_is_still_one_flag_away() -> None:
     this reproduction is measured against; making it the default was the error,
     making it unreachable would be a second one.
     """
-    arguments = toad_phase1._parser().parse_args(["--no-money"])
-    assert toad_phase1._field(arguments) == "shaped"
+    arguments = toad._parser().parse_args(["--no-money"])
+    assert toad._field(arguments) == "shaped"
 
 
 def test_omitting_lr_and_entropy_cost_reproduces_todays_constants() -> None:
@@ -567,7 +568,7 @@ def test_omitting_lr_and_entropy_cost_reproduces_todays_constants() -> None:
     do not pass them, so the flags' defaults must be the constants they
     override -- not a copy of today's value that could drift from them.
     """
-    arguments = toad_phase1._parser().parse_args([])
+    arguments = toad._parser().parse_args([])
     assert arguments.lr == LEARNING_RATE
     assert arguments.entropy_cost == ENTROPY_COST
 
@@ -579,9 +580,9 @@ def test_lr_flag_reaches_the_optimizer() -> None:
     namespace: a runner that parses ``--lr`` and builds the optimizer from
     ``LEARNING_RATE`` regardless would still pass a namespace-only check.
     """
-    policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
-    arguments = toad_phase1._parser().parse_args(["--lr", "3e-4"])
-    optimizer = toad_phase1._optimizer(policy, arguments.lr)
+    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    arguments = toad._parser().parse_args(["--lr", "3e-4"])
+    optimizer = toad._optimizer(policy, arguments.lr)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
     assert optimizer.param_groups[0]["lr"] != LEARNING_RATE
 
@@ -595,15 +596,15 @@ def test_lr_flag_moves_the_schedules_own_output() -> None:
     two bases, the same schedule shape, and the ratio between the two must
     survive the schedule's first step.
     """
-    default_policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
-    swept_policy = Policy(blocks=1, channels=16, value_bound=toad_phase1.VALUE_BOUND)
-    default_optimizer = toad_phase1._optimizer(default_policy, LEARNING_RATE)
-    swept_optimizer = toad_phase1._optimizer(swept_policy, 3e-4)
+    default_policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    swept_policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    default_optimizer = toad._optimizer(default_policy, LEARNING_RATE)
+    swept_optimizer = toad._optimizer(swept_policy, 3e-4)
     default_schedule = torch.optim.lr_scheduler.LambdaLR(
-        default_optimizer, toad_phase1._decay(0.0)
+        default_optimizer, toad._decay(0.0)
     )
     swept_schedule = torch.optim.lr_scheduler.LambdaLR(
-        swept_optimizer, toad_phase1._decay(0.0)
+        swept_optimizer, toad._decay(0.0)
     )
     default_schedule.step()
     swept_schedule.step()
@@ -620,15 +621,13 @@ def test_entropy_cost_flag_reaches_the_loss() -> None:
     """
     torch.manual_seed(0)
     policy, optimizer = _policy()
-    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
-    default_terms = toad_phase1._step(
-        policy, optimizer, segments, "cpu", "shaped_money"
-    )
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    default_terms = toad._step(policy, optimizer, segments, "cpu", "shaped_money")
     assert default_terms["entropy"] != 0.0
 
     torch.manual_seed(0)
     policy, optimizer = _policy()
-    zeroed_terms = toad_phase1._step(
+    zeroed_terms = toad._step(
         policy, optimizer, segments, "cpu", "shaped_money", entropy_cost=0.0
     )
     assert zeroed_terms["entropy"] == 0.0
@@ -655,14 +654,150 @@ def test_lr_and_entropy_cost_reach_the_recorded_config(
         captured.update(kwargs)
         return _FakeRun()
 
-    monkeypatch.setattr(toad_phase1.wandb, "init", _fake_init)
-    arguments = toad_phase1._parser().parse_args(
-        ["--lr", "3e-4", "--entropy-cost", "0.02"]
-    )
-    toad_phase1._start_run(arguments, "shaped")
+    monkeypatch.setattr(toad.wandb, "init", _fake_init)
+    arguments = toad._parser().parse_args(["--lr", "3e-4", "--entropy-cost", "0.02"])
+    toad._start_run(arguments, "shaped")
     config = cast(dict[str, object], captured["config"])
     assert config["lr"] == pytest.approx(3e-4)
     assert config["entropy_cost"] == pytest.approx(0.02)
+
+
+def test_omitting_blocks_reproduces_todays_constant() -> None:
+    """``--blocks`` must default to the constant it overrides, not a literal copy."""
+    arguments = toad._parser().parse_args([])
+    assert arguments.blocks == toad.BLOCKS
+
+
+def test_blocks_flag_reaches_the_constructed_policy() -> None:
+    """``--blocks`` must set the learner's own depth, not stop at the namespace.
+
+    Asserted by counting the network's own residual blocks, the way
+    ``test_lr_flag_reaches_the_optimizer`` reads the rate off the optimizer's
+    own ``param_groups`` rather than off the parsed namespace: a runner that
+    parses ``--blocks`` and builds the network from ``BLOCKS`` regardless
+    would still pass a namespace-only check.
+    """
+    arguments = toad._parser().parse_args(["--blocks", "16", "--channels", "16"])
+    learner = toad._learner(arguments, "cpu")
+    assert len(learner.blocks) == 16
+    assert len(learner.blocks) != toad.BLOCKS
+
+
+def test_lmb_flag_reaches_the_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--lmb`` must reach ``toad_loss.losses``, not stop at the parsed namespace.
+
+    Captured directly off the call, the same way the blocks and warmup tests
+    above pin their flag against the object that actually consumes it: a
+    ``_step`` that parses ``--lmb`` and keeps calling ``losses`` with ``LMB``
+    regardless would still pass a namespace-only check.
+    """
+    arguments = toad._parser().parse_args(["--lmb", "0.9"])
+    assert arguments.lmb == pytest.approx(0.9)
+    assert toad._parser().parse_args([]).lmb == LMB
+
+    captured: dict[str, float] = {}
+    real = toad.losses
+
+    def _recording(
+        behaviour_log_probs: torch.Tensor,
+        learner_log_probs: torch.Tensor,
+        negative_entropy: torch.Tensor,
+        values: torch.Tensor,
+        bootstrap_value: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        baseline_only: bool = False,
+        teacher_kl: torch.Tensor | None = None,
+        teacher_kl_cost: float = TEACHER_KL_COST,
+        entropy_cost: float = ENTROPY_COST,
+        discounting: float = toad.DISCOUNTING,
+        lmb: float = LMB,
+    ) -> Losses:
+        captured["lmb"] = lmb
+        return real(
+            behaviour_log_probs=behaviour_log_probs,
+            learner_log_probs=learner_log_probs,
+            negative_entropy=negative_entropy,
+            values=values,
+            bootstrap_value=bootstrap_value,
+            rewards=rewards,
+            dones=dones,
+            baseline_only=baseline_only,
+            teacher_kl=teacher_kl,
+            teacher_kl_cost=teacher_kl_cost,
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            lmb=lmb,
+        )
+
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    monkeypatch.setattr(toad, "losses", _recording)
+    toad._step(policy, optimizer, segments, "cpu", "shaped_money", lmb=0.9)
+    assert captured["lmb"] == pytest.approx(0.9)
+
+
+def test_value_warmup_batches_flag_runs_exactly_that_many_baseline_only_steps() -> None:
+    """``--value-warmup-batches`` must gate ``_step``'s count, not a bare bool.
+
+    ``--value-warmup`` used to be a boolean that always spent the whole
+    ``VALUE_WARMUP_BATCHES`` budget; the recipe wants the count itself
+    swept, and 0 must mean no warmup at all -- the random-init phases skip it
+    entirely.
+    """
+    arguments = toad._parser().parse_args(["--value-warmup-batches", "3"])
+    assert arguments.value_warmup_batches == 3
+    assert toad._parser().parse_args([]).value_warmup_batches == VALUE_WARMUP_BATCHES
+
+    policy, optimizer = _policy()
+    segments = [_segment() for _ in range(5 * toad.BATCH_SEGMENTS)]
+    seen: list[bool] = []
+    real = toad._step
+
+    def _recording(
+        learner: Policy,
+        optimizer: torch.optim.Optimizer,
+        batch: list[dict[str, torch.Tensor]],
+        device: str,
+        field: str,
+        baseline_only: bool = False,
+        teacher: toad.Teacher | None = None,
+        teacher_kl_cost: float = TEACHER_KL_COST,
+        entropy_cost: float = ENTROPY_COST,
+        discounting: float = toad.DISCOUNTING,
+        lmb: float = LMB,
+    ) -> dict[str, float]:
+        seen.append(baseline_only)
+        return real(
+            learner,
+            optimizer,
+            batch,
+            device,
+            field,
+            baseline_only,
+            teacher,
+            teacher_kl_cost,
+            entropy_cost,
+            discounting=discounting,
+            lmb=lmb,
+        )
+
+    class _Fake:
+        dones = torch.zeros(64, dtype=torch.bool)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(toad, "_segments", lambda trajectory: segments)  # noqa: ARG005
+        patch.setattr(toad, "_step", _recording)
+        batch: list[Any] = [_Fake()]
+        toad._update(
+            policy,
+            optimizer,
+            batch,
+            "cpu",
+            "shaped_money",
+            warmup_left=arguments.value_warmup_batches,
+        )
+    assert seen == [True, True, True, False, False]
 
 
 def test_own_flag_selects_the_series_the_loss_actually_trains_on() -> None:
@@ -673,16 +808,16 @@ def test_own_flag_selects_the_series_the_loss_actually_trains_on() -> None:
     that exact shape of bug is why this asserts on the ``rewards`` keyword
     ``losses`` is actually called with, not on ``arguments.own``.
     """
-    arguments = toad_phase1._parser().parse_args(["--own"])
-    field = toad_phase1._field(arguments)
+    arguments = toad._parser().parse_args(["--own"])
+    field = toad._field(arguments)
     assert field == "own"
 
     policy, optimizer = _policy()
-    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
     expected = torch.stack([segment["own"] for segment in segments], dim=1)
 
     seen: list[torch.Tensor] = []
-    real_losses = toad_phase1.losses
+    real_losses = toad.losses
 
     def _recording(
         behaviour_log_probs: torch.Tensor,
@@ -692,11 +827,12 @@ def test_own_flag_selects_the_series_the_loss_actually_trains_on() -> None:
         bootstrap_value: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
-        discounting: float = toad_phase1.DISCOUNTING,
+        discounting: float = toad.DISCOUNTING,
         baseline_only: bool = False,
         teacher_kl: torch.Tensor | None = None,
         teacher_kl_cost: float = TEACHER_KL_COST,
         entropy_cost: float = ENTROPY_COST,
+        lmb: float = LMB,
     ) -> Losses:
         seen.append(rewards)
         return real_losses(
@@ -712,11 +848,12 @@ def test_own_flag_selects_the_series_the_loss_actually_trains_on() -> None:
             teacher_kl=teacher_kl,
             teacher_kl_cost=teacher_kl_cost,
             entropy_cost=entropy_cost,
+            lmb=lmb,
         )
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(toad_phase1, "losses", _recording)
-        toad_phase1._step(policy, optimizer, segments, "cpu", field)
+        patch.setattr(toad, "losses", _recording)
+        toad._step(policy, optimizer, segments, "cpu", field)
 
     assert len(seen) == 1
     assert torch.equal(seen[0], expected)
@@ -733,11 +870,11 @@ def test_gamma_flag_reaches_the_advantage_computation() -> None:
     ``from_action_log_probs`` is actually called with rather than on the
     parsed namespace.
     """
-    arguments = toad_phase1._parser().parse_args(["--gamma", "0.5"])
+    arguments = toad._parser().parse_args(["--gamma", "0.5"])
     assert arguments.gamma == pytest.approx(0.5)
 
     policy, optimizer = _policy()
-    segments = [_segment() for _ in range(toad_phase1.BATCH_SEGMENTS)]
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
     dones = torch.stack([segment["dones"] for segment in segments], dim=1)
     expected = (~dones).float() * arguments.gamma
 
@@ -764,7 +901,7 @@ def test_gamma_flag_reaches_the_advantage_computation() -> None:
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(vtrace, "from_action_log_probs", _recording)
-        toad_phase1._step(
+        toad._step(
             policy,
             optimizer,
             segments,
