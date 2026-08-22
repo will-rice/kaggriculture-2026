@@ -7,6 +7,7 @@ its first batch, and burned the slot. These call what the runner calls.
 """
 
 import copy
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -290,6 +291,45 @@ def test_the_teacher_kl_covers_the_quantity_head_only_if_the_teacher_has_one() -
 
     assert uncovered > 0.0
     assert covered > uncovered
+
+
+def test_no_teacher_flag_means_no_teacher() -> None:
+    """Phase 1 runs teacher-free; the recipe sets teacher_kl_cost to 0.
+
+    Every prior arm passed --teacher in phase 1 at phase 2's cost, anchoring a
+    from-random policy to a behaviour clone the recipe uses nowhere. The
+    default must be no teacher at all, not a clone.
+    """
+    arguments = toad_phase1._parser().parse_args([])
+    assert arguments.teacher is None
+    assert toad_phase1._teacher(arguments, "cpu") is None
+
+
+def test_teacher_loads_the_named_checkpoint(tmp_path: Path) -> None:
+    """A phase names its teacher; phases 2+ each anchor to a different one.
+
+    Asserted on the loaded parameters themselves, not on whether a
+    ``Teacher`` came back: a ``_teacher`` still hardwired to
+    ``kaggriculture.learn.CHECKPOINT`` also returns one, so only comparing
+    values against the path actually named tells the two apart.
+    """
+    named = Policy(
+        blocks=toad_phase1.BLOCKS, channels=16, value_bound=toad_phase1.VALUE_BOUND
+    )
+    checkpoint = tmp_path / "phase1_final.pt"
+    torch.save(named.state_dict(), checkpoint)
+
+    arguments = toad_phase1._parser().parse_args(
+        ["--channels", "16", "--teacher", str(checkpoint)]
+    )
+    teacher = toad_phase1._teacher(arguments, "cpu")
+
+    assert teacher is not None
+    named_state = named.state_dict()
+    loaded_state = teacher.policy.state_dict()
+    assert named_state.keys() == loaded_state.keys()
+    for key, value in named_state.items():
+        assert torch.equal(value, loaded_state[key]), key
 
 
 def test_the_warmup_budget_is_counted_down_in_batches(

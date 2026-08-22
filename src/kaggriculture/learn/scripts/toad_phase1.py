@@ -374,10 +374,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--teacher",
-        action="store_true",
-        help="hold the policy near the clone with monobeast's teacher KL at "
-        "their phase-2 cost (arm C''). Toad never continues from a competent "
-        "policy without one.",
+        type=Path,
+        default=None,
+        help="checkpoint to hold the policy near with monobeast's teacher KL "
+        "(--teacher-kl-cost). Unset by default: phase 1 is teacher-free "
+        "self-play from scratch. The recipe's teachers are always an earlier, "
+        "smaller checkpoint from this same pipeline, never a behaviour clone.",
     )
     parser.add_argument(
         "--econ-fraction",
@@ -894,6 +896,7 @@ def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_ru
             "econ_fraction": arguments.econ_fraction,
             "value_warmup": arguments.value_warmup,
             "value_passes": arguments.value_passes,
+            "teacher": str(arguments.teacher) if arguments.teacher else None,
             "teacher_kl_cost": arguments.teacher_kl_cost,
             "clone_init": arguments.clone_init,
             "money_signed": arguments.money_signed,
@@ -938,15 +941,16 @@ def _log_definitions(run: "wandb.sdk.wandb_run.Run") -> None:
 
 
 def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
-    """Return the frozen clone the learner is held near, or None.
+    """Return the frozen checkpoint the learner is held near, or None.
 
-    The same weights the run initialises from. Toad never continues from a
-    competent policy without one, and this project has measured both sides of
-    that: removing the penalty took the bank from 17,675 to 9 in five updates,
-    and dropping the cost to 0.001 cliffed within a single sync cycle.
-
-    Their phase 3+ uses a SMALLER teacher; ours is the same size. Declared
-    deviation.
+    The recipe's teachers are "always the pipeline's own earlier, smaller
+    checkpoints" -- never a behaviour clone and never a replay. ``--teacher``
+    names one such checkpoint per phase; phase 1 passes none, because its
+    ``teacher_kl_cost`` is 0 and it is genuinely teacher-free self-play from
+    random initialisation. This project has measured what anchoring to the
+    wrong thing costs: removing the penalty took the bank from 17,675 to 9 in
+    five updates, and dropping the cost to 0.001 cliffed within a single sync
+    cycle -- both true of *a* teacher, not of any one checkpoint being right.
 
     Which heads the KL may cover is decided here and nowhere else, from the
     keys the checkpoint was missing. A checkpoint written before the quantity
@@ -960,20 +964,23 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
         device: Where to place the teacher.
 
     Returns:
-        The frozen policy paired with whether its checkpoint taught the
-        quantity head, or None when the arm runs teacher-free.
+        The frozen policy loaded from ``arguments.teacher``, paired with
+        whether its checkpoint taught the quantity head, or None when the
+        arm runs teacher-free (``arguments.teacher is None``).
     """
-    if not arguments.teacher:
+    if arguments.teacher is None:
         return None
     policy = Policy(
         blocks=BLOCKS, channels=arguments.channels, value_bound=VALUE_BOUND
     ).to(device)
-    missing = _warm_start(policy, device)
+    state = torch.load(arguments.teacher, map_location=device, weights_only=True)
+    missing = load_policy_weights(policy, state)
     policy.eval()
     policy.requires_grad_(False)
     quantity = not any(key.startswith("quantity_head.") for key in missing)
     LOGGER.info(
-        "teacher: frozen clone, kl_cost %.4f, quantity head %s",
+        "teacher: %s, kl_cost %.4f, quantity head %s",
+        arguments.teacher,
         arguments.teacher_kl_cost,
         "taught" if quantity else "absent from the checkpoint, excluded from the KL",
     )
@@ -1048,8 +1055,7 @@ def _warm_start(learner: Policy, device: str) -> list[str]:
 
     Returns:
         The keys the checkpoint did not carry, which ``load_policy_weights``
-        confines to the quantity head. ``_teacher`` reads that list to decide
-        whether the KL may cover that head.
+        confines to the quantity head.
 
     Raises:
         ValueError: If the checkpoint is missing or renaming anything beyond
