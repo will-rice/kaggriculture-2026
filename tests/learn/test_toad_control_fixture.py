@@ -1,5 +1,7 @@
 """Frozen control for Toad's pre-Lightning optimizer boundary."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -9,13 +11,28 @@ import torch
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
+from kaggriculture.learn.toad.lightning import compute_loss
 
 CONTROL_FIXTURE = Path(__file__).parent / "fixtures" / "toad_control_batch.pt"
+CONTROL_THREADS = 32
 
 
 def load_control_fixture() -> dict[str, object]:
     """Return the checked-in, one-step control batch without regenerating it."""
     return torch.load(CONTROL_FIXTURE, map_location="cpu", weights_only=False)
+
+
+@contextmanager
+def control_fixture_threads() -> Iterator[None]:
+    """Use and then restore the CPU thread count that produced exact tensors."""
+    previous = torch.get_num_threads()
+    torch.set_num_threads(CONTROL_THREADS)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _assert_state_equal(actual: object, expected: object) -> None:
@@ -25,9 +42,10 @@ def _assert_state_equal(actual: object, expected: object) -> None:
         assert torch.equal(actual, expected)
     elif isinstance(expected, dict):
         assert isinstance(actual, dict)
-        assert actual.keys() == expected.keys()
+        actual_dict = cast(dict[object, object], actual)
+        assert actual_dict.keys() == expected.keys()
         for key, value in expected.items():
-            _assert_state_equal(actual[key], value)
+            _assert_state_equal(actual_dict[key], value)
     elif isinstance(expected, (list, tuple)):
         assert isinstance(actual, type(expected))
         assert len(actual) == len(expected)
@@ -35,6 +53,39 @@ def _assert_state_equal(actual: object, expected: object) -> None:
             _assert_state_equal(actual_item, expected_item)
     else:
         assert actual == expected
+
+
+def control_fixture_config() -> ToadConfig:
+    """Return a frozen control config matching the fixture's small topology."""
+    control = ToadConfig.control()
+    return control.model_copy(
+        update={
+            "model": control.model.model_copy(
+                update={"blocks": 1, "channels": 16}
+            ),
+            "optimizer": control.optimizer.model_copy(
+                update={"value_warmup_batches": 0, "value_passes": 1}
+            ),
+        }
+    )
+
+
+def control_fixture_batch(fixture: dict[str, object]) -> LearnerBatch:
+    """Wrap the checked-in segments in the immutable native batch contract."""
+    return LearnerBatch(
+        segments=tuple(
+            cast(list[dict[str, torch.Tensor]], fixture["segments"])
+        ),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=cast(int, fixture["collected_steps"]),
+        round_id=0,
+        actor_version=0,
+        game_ids=(0,),
+        opponent_ids=("self",),
+    )
 
 
 def test_control_fixture_pins_one_optimizer_step() -> None:
@@ -50,21 +101,42 @@ def test_control_fixture_pins_one_optimizer_step() -> None:
     optimizer = toad._optimizer(policy, cast(float, fixture["lr"]))
     optimizer.load_state_dict(initial_optimizer)
 
-    terms = toad._step(
+    with control_fixture_threads():
+        terms = toad._step(
+            policy,
+            optimizer,
+            segments,
+            "cpu",
+            "shaped_money",
+            entropy_cost=cast(float, fixture["entropy_cost"]),
+            discounting=cast(float, fixture["gamma"]),
+            lmb=cast(float, fixture["lmb"]),
+        )
+
+        assert terms == pytest.approx(fixture["terms"], rel=1e-6, abs=1e-7)
+        for name, value in policy.state_dict().items():
+            assert torch.equal(value, updated_model[name])
+        _assert_state_equal(optimizer.state_dict(), updated_optimizer)
+
+
+def test_control_fixture_pins_pure_loss_without_optimizer_side_effects() -> None:
+    """The adapter must return fixture tensors without changing policy state."""
+    fixture = load_control_fixture()
+    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    policy.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    initial = {name: value.clone() for name, value in policy.state_dict().items()}
+
+    report = compute_loss(
         policy,
-        optimizer,
-        segments,
-        "cpu",
-        "shaped_money",
-        entropy_cost=cast(float, fixture["entropy_cost"]),
-        discounting=cast(float, fixture["gamma"]),
-        lmb=cast(float, fixture["lmb"]),
+        control_fixture_batch(fixture),
+        control_fixture_config(),
     )
 
-    assert terms == pytest.approx(fixture["terms"], rel=1e-6, abs=1e-7)
+    actual = {name: value.item() for name, value in report.terms.items()}
+    assert actual == pytest.approx(fixture["terms"], rel=1e-6, abs=1e-7)
+    assert all(parameter.grad is None for parameter in policy.parameters())
     for name, value in policy.state_dict().items():
-        assert torch.equal(value, updated_model[name])
-    _assert_state_equal(optimizer.state_dict(), updated_optimizer)
+        assert torch.equal(value, initial[name])
 
 
 def test_control_fixture_preserves_tensor_layout_and_fp32() -> None:

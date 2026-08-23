@@ -1,0 +1,248 @@
+"""Lightning's automatic-optimization boundary for the native Toad learner."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+import lightning
+import torch
+from lightning.pytorch.utilities.types import OptimizerLRScheduler
+from torch.optim.lr_scheduler import LRScheduler
+
+from kaggriculture.learn import toad_loss
+from kaggriculture.learn.encoding import transfer_slots
+from kaggriculture.learn.model import Policy
+from kaggriculture.learn.ppo import entropy_of, joint_log_prob
+from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.data import LearnerBatch
+
+if TYPE_CHECKING:
+    from kaggriculture.learn.scripts.toad import Teacher
+
+
+@dataclass(frozen=True)
+class LossReport:
+    """Differentiable total and detached-by-caller diagnostic loss terms."""
+
+    total: torch.Tensor
+    terms: Mapping[str, torch.Tensor]
+
+
+def compute_loss(
+    policy: Policy,
+    batch: LearnerBatch,
+    config: ToadConfig,
+    teacher: Teacher | None = None,
+    *,
+    baseline_only: bool | None = None,
+    _losses: Callable[..., toad_loss.Losses] = toad_loss.losses,
+) -> LossReport:
+    """Return Toad's loss tensors without mutating optimizer or gradients."""
+    # Imported lazily so the legacy runner can delegate here without creating a
+    # module-import cycle. These are the runner's existing, numerically pinned
+    # layout and teacher-divergence helpers.
+    from kaggriculture.learn.scripts.toad import _acted, _kl
+
+    segments = batch.segments
+
+    def stacked(name: str) -> torch.Tensor:
+        return torch.stack([segment[name] for segment in segments], dim=1)
+
+    board = stacked("board")
+    scalars = stacked("scalars")
+    positions = stacked("positions")
+    unit_actions = stacked("unit_actions")
+    unit_quantity_actions = stacked("unit_quantities")
+    market_actions = stacked("market_actions")
+    unit_masks = stacked("unit_masks")
+    unit_quantity_masks = stacked("unit_quantity_masks")
+    market_masks = stacked("market_masks")
+    behaviour = stacked("log_probs")
+    rewards = stacked(config.curriculum.reward_field)
+    dones = stacked("dones")
+
+    turns, width = behaviour.shape
+    unit_logits, quantity_logits, market_logits, values = policy(
+        board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
+    )
+    values = values.view(turns + 1, width)
+    bootstrap_value = values[-1].detach()
+    values = values[:-1]
+    unit_logits = _acted(unit_logits, turns, width)
+    quantity_logits = _acted(quantity_logits, turns, width)
+    market_logits = _acted(market_logits, turns, width)
+    flat_unit_actions = unit_actions.flatten(0, 1)
+    flat_unit_masks = unit_masks.flatten(0, 1)
+    flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
+    flat_market_masks = market_masks.flatten(0, 1)
+    units = torch.log_softmax(
+        unit_logits.masked_fill(~flat_unit_masks, -torch.inf), dim=-1
+    )
+    quantities = torch.log_softmax(
+        quantity_logits.masked_fill(~flat_quantity_masks, -torch.inf), dim=-1
+    )
+    market = torch.log_softmax(
+        market_logits.masked_fill(~flat_market_masks, -torch.inf), dim=-1
+    )
+    transferred = transfer_slots(flat_unit_actions)
+    learner_log_probs = joint_log_prob(
+        units,
+        quantities,
+        market,
+        flat_unit_actions,
+        unit_quantity_actions.flatten(0, 1),
+        market_actions.flatten(0, 1),
+    ).view(turns, width)
+    negative_entropy = -(
+        entropy_of(units, flat_unit_masks).sum(dim=-1)
+        + entropy_of(quantities, flat_quantity_masks)
+        .masked_fill(~transferred, 0.0)
+        .sum(dim=-1)
+        + entropy_of(market, flat_market_masks).sum(dim=-1)
+    ).view(turns, width)
+
+    teacher_kl = None
+    if teacher is not None:
+        with torch.no_grad():
+            teacher_units, teacher_quantity, teacher_market, _ = teacher.policy(
+                board.flatten(0, 1),
+                scalars.flatten(0, 1),
+                positions.flatten(0, 1),
+            )
+        teacher_kl = _kl(
+            units, _acted(teacher_units, turns, width), flat_unit_masks
+        ).view(turns, width) + _kl(
+            market, _acted(teacher_market, turns, width), flat_market_masks
+        ).view(turns, width)
+        if teacher.quantity:
+            teacher_kl = teacher_kl + _kl(
+                quantities,
+                _acted(teacher_quantity, turns, width),
+                flat_quantity_masks,
+            ).view(turns, width)
+
+    loss = _losses(
+        behaviour_log_probs=behaviour,
+        learner_log_probs=learner_log_probs,
+        negative_entropy=negative_entropy,
+        values=values,
+        bootstrap_value=bootstrap_value,
+        rewards=rewards,
+        dones=dones,
+        discounting=config.optimizer.gamma,
+        baseline_only=batch.baseline_only
+        if baseline_only is None
+        else baseline_only,
+        teacher_kl=teacher_kl,
+        teacher_kl_cost=config.optimizer.teacher_kl_cost,
+        entropy_cost=config.optimizer.entropy_cost,
+        lmb=config.optimizer.lmb,
+    )
+    return LossReport(
+        total=loss.total,
+        terms={
+            "vtrace_pg": loss.vtrace_pg,
+            "upgo_pg": loss.upgo_pg,
+            "baseline": loss.baseline,
+            "entropy": loss.entropy,
+            "teacher": loss.teacher,
+            "total": loss.total,
+        },
+    )
+
+
+def round_decay(config: ToadConfig) -> Callable[[int], float]:
+    """Return the control schedule keyed to one step per collection round."""
+    from kaggriculture.learn.scripts.toad import _decay
+
+    return _decay(
+        config.population.scripted,
+        total_steps=config.runtime.total_environment_steps,
+    )
+
+
+class ToadLightningModule(lightning.LightningModule):
+    """Native Toad policy trained through Lightning automatic optimization."""
+
+    def __init__(self, config: ToadConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.policy = Policy(
+            blocks=config.model.blocks,
+            channels=config.model.channels,
+            value_bound=config.model.value_bound,
+        )
+        self.environment_steps = 0
+        self.collection_round = 0
+        self.actor_version = 0
+        self.actor_source_global_step = 0
+        self.warmup_remaining = config.optimizer.value_warmup_batches
+        self._round_ended = False
+        self._round_started_warming = False
+        self.save_hyperparameters(config.model_dump(mode="json"))
+
+    def transfer_batch_to_device(
+        self,
+        batch: LearnerBatch,
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> LearnerBatch:
+        """Move tensors while preserving the immutable learner-batch contract."""
+        return replace(
+            batch,
+            segments=tuple(
+                {
+                    name: tensor.to(device)
+                    for name, tensor in segment.items()
+                }
+                for segment in batch.segments
+            ),
+        )
+
+    def training_step(self, batch: LearnerBatch, batch_idx: int) -> torch.Tensor:
+        """Compute one optimizer-sized batch and advance logical round clocks."""
+        if batch.first_of_round:
+            self._round_started_warming = self.warmup_remaining > 0
+        baseline_only = batch.baseline_only or self.warmup_remaining > 0
+        report = compute_loss(
+            self.policy, batch, self.config, baseline_only=baseline_only
+        )
+        self._round_ended = batch.end_of_round
+        if not batch.baseline_only and self.warmup_remaining:
+            self.warmup_remaining -= 1
+        self.environment_steps += batch.collected_steps
+        if batch.end_of_round:
+            self.collection_round += 1
+        self.log_dict(
+            {f"loss/{name}": value.detach() for name, value in report.terms.items()}
+        )
+        return report.total
+
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        """Construct the pinned Adam optimizer and round-stepped LR schedule."""
+        optimizer = torch.optim.Adam(
+            self.policy.parameters(),
+            lr=self.config.optimizer.lr,
+            eps=self.config.optimizer.adam_eps,
+        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            round_decay(self.config),
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+    def lr_scheduler_step(
+        self, scheduler: LRScheduler, metric: object | None
+    ) -> None:
+        """Advance LR exactly once when an optimizer step closes a round."""
+        if self._round_ended:
+            scheduler.step()

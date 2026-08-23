@@ -52,9 +52,7 @@ from lightning import seed_everything
 
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
-from kaggriculture.learn.encoding import transfer_slots
 from kaggriculture.learn.model import Policy, load_policy_weights
-from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.toad.data import (
     ACTED_FIELDS as _ACTED_FIELDS,
@@ -1599,135 +1597,56 @@ def _step(
     Returns:
         The four loss terms and their total, as floats.
     """
+    from kaggriculture.learn.toad.config import ToadConfig
+    from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
+    from kaggriculture.learn.toad.lightning import compute_loss
 
-    def stacked(name: str) -> torch.Tensor:
-        return torch.stack([s[name] for s in segments], dim=1).to(device)
-
-    board = stacked("board")
-    scalars = stacked("scalars")
-    positions = stacked("positions")
-    unit_actions = stacked("unit_actions")
-    unit_quantity_actions = stacked("unit_quantities")
-    market_actions = stacked("market_actions")
-    unit_masks = stacked("unit_masks")
-    unit_quantity_masks = stacked("unit_quantity_masks")
-    market_masks = stacked("market_masks")
-    behaviour = stacked("log_probs")
-    rewards = stacked(field)
-    dones = stacked("dones")
-
-    turns, width = behaviour.shape
-    # The observed fields are one row longer than the acted ones, so this
-    # forwards `turns + 1` states per segment. Only the trailing state's *value*
-    # is wanted -- no action was taken there -- so its logits are sliced off
-    # immediately and its value becomes the bootstrap. monobeast.py:292-296 does
-    # exactly this split.
-    unit_logits, quantity_logits, market_logits, values = learner(
-        board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
+    control = ToadConfig.control()
+    config = control.model_copy(
+        update={
+            "optimizer": control.optimizer.model_copy(
+                update={
+                    "teacher_kl_cost": teacher_kl_cost,
+                    "entropy_cost": entropy_cost,
+                    "gamma": discounting,
+                    "lmb": lmb,
+                }
+            ),
+            "curriculum": control.curriculum.model_copy(
+                update={"reward_field": field}
+            ),
+        }
     )
-    values = values.view(turns + 1, width)
-    bootstrap_value = values[-1].detach()
-    values = values[:-1]
-    unit_logits = _acted(unit_logits, turns, width)
-    quantity_logits = _acted(quantity_logits, turns, width)
-    market_logits = _acted(market_logits, turns, width)
-    flat_unit_actions = unit_actions.flatten(0, 1)
-    flat_unit_masks = unit_masks.flatten(0, 1)
-    flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
-    flat_market_masks = market_masks.flatten(0, 1)
-    units = torch.log_softmax(
-        unit_logits.masked_fill(~flat_unit_masks, -torch.inf), dim=-1
-    )
-    quantities = torch.log_softmax(
-        quantity_logits.masked_fill(~flat_quantity_masks, -torch.inf), dim=-1
-    )
-    market = torch.log_softmax(
-        market_logits.masked_fill(~flat_market_masks, -torch.inf), dim=-1
-    )
-    # Which slots spent the bucket they drew. The same rule the rollout stored
-    # its behaviour log-probability under, so the ratio these two form is a
-    # ratio over one action rather than over two different ones.
-    transferred = transfer_slots(flat_unit_actions)
-    learner_log_probs = joint_log_prob(
-        units,
-        quantities,
-        market,
-        flat_unit_actions,
-        unit_quantity_actions.flatten(0, 1),
-        market_actions.flatten(0, 1),
-    ).view(turns, width)
-    # `entropy_of` returns positive entropy; Toad's `combine_policy_entropy`
-    # returns sum p*log p, which is its negation. Feeding the wrong sign trains
-    # the policy to collapse onto one action, which looks like fast progress.
-    #
-    # The quantity head's entropy is zeroed on the slots that spent no bucket,
-    # the same condition its log-probability is under: an entropy bonus there
-    # would pay the head to spread mass over a decision the engine never read.
-    negative_entropy = -(
-        entropy_of(units, flat_unit_masks).sum(dim=-1)
-        + entropy_of(quantities, flat_quantity_masks)
-        .masked_fill(~transferred, 0.0)
-        .sum(dim=-1)
-        + entropy_of(market, flat_market_masks).sum(dim=-1)
-    ).view(turns, width)
-
-    teacher_kl = None
-    if teacher is not None:
-        with torch.no_grad():
-            teacher_units, teacher_quantity, teacher_market, _ = teacher.policy(
-                board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
-            )
-        teacher_kl = _kl(
-            units, _acted(teacher_units, turns, width), flat_unit_masks
-        ).view(turns, width) + _kl(
-            market, _acted(teacher_market, turns, width), flat_market_masks
-        ).view(turns, width)
-        # The quantity head joins the anchor only if the teacher's checkpoint
-        # carried one; otherwise its head is a random initialisation and this
-        # would pull the learner toward noise. Unlike the log-probability, this
-        # term is not conditioned on the sampled op: a KL is a distance between
-        # distributions rather than a score for an action, and holding the head
-        # near the teacher on a slot that happened not to transfer is exactly
-        # the drift the anchor exists to prevent.
-        if teacher.quantity:
-            teacher_kl = teacher_kl + _kl(
-                quantities,
-                _acted(teacher_quantity, turns, width),
-                flat_quantity_masks,
-            ).view(turns, width)
-
-    terms = losses(
-        behaviour_log_probs=behaviour,
-        learner_log_probs=learner_log_probs,
-        negative_entropy=negative_entropy,
-        values=values,
-        # The value of the state *after* the segment's last action, which is
-        # what couples one segment to the next and is the only route by which
-        # the end of the season reaches a target built in the middle of it.
-        bootstrap_value=bootstrap_value,
-        rewards=rewards,
-        dones=dones,
-        discounting=discounting,
+    batch = LearnerBatch(
+        segments=tuple(
+            {name: tensor.to(device) for name, tensor in segment.items()}
+            for segment in segments
+        ),
+        kind=BatchKind.SELFPLAY,
         baseline_only=baseline_only,
-        teacher_kl=teacher_kl,
-        teacher_kl_cost=teacher_kl_cost,
-        entropy_cost=entropy_cost,
-        lmb=lmb,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=0,
+        round_id=0,
+        actor_version=0,
+        game_ids=(),
+        opponent_ids=(),
+    )
+    report = compute_loss(
+        learner,
+        batch,
+        config,
+        teacher,
+        baseline_only=baseline_only,
+        _losses=losses,
     )
     optimizer.zero_grad(set_to_none=True)
-    terms.total.backward()
+    report.total.backward()
     # monobeast.py:502-505, with their saved runs' clip_grads of 10.0. Without
     # it this diverges to a loss of 6e20 inside two updates.
     torch.nn.utils.clip_grad_norm_(learner.parameters(), CLIP_GRADS)
     optimizer.step()
-    return {
-        "vtrace_pg": terms.vtrace_pg.item(),
-        "upgo_pg": terms.upgo_pg.item(),
-        "baseline": terms.baseline.item(),
-        "entropy": terms.entropy.item(),
-        "teacher": terms.teacher.item(),
-        "total": terms.total.item(),
-    }
+    return {name: value.item() for name, value in report.terms.items()}
 
 
 def _acted(logits: torch.Tensor, turns: int, width: int) -> torch.Tensor:
