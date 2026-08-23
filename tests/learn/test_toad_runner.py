@@ -27,6 +27,7 @@ from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.core import vtrace
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
+    DISCOUNTING,
     ENTROPY_COST,
     LEARNING_RATE,
     LMB,
@@ -78,6 +79,45 @@ def _segment(turns: int = 16, transfers: bool = True) -> dict[str, torch.Tensor]
         "own": torch.randn(turns) * 0.01,
         "dones": torch.zeros(turns, dtype=torch.bool),
     }
+
+
+def write_control_fixture(path: Path) -> None:
+    """Write the one-time control for the pre-Lightning optimizer boundary.
+
+    This is deliberately not called by a test. The checked-in result is the
+    control: regenerating it would make a changed optimizer appear correct.
+    """
+    torch.manual_seed(20260823)
+    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    optimizer = toad._optimizer(policy, LEARNING_RATE)
+    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    initial_model = copy.deepcopy(policy.state_dict())
+    initial_optimizer = copy.deepcopy(optimizer.state_dict())
+    terms = toad._step(policy, optimizer, segments, "cpu", "shaped_money")
+    econ_fraction = 0.5
+    collected_steps = toad._seats_per_update(econ_fraction) * toad.TURNS
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "segments": segments,
+            "initial_model": initial_model,
+            "initial_optimizer": initial_optimizer,
+            "updated_model": copy.deepcopy(policy.state_dict()),
+            "updated_optimizer": copy.deepcopy(optimizer.state_dict()),
+            "terms": terms,
+            "lr": LEARNING_RATE,
+            "entropy_cost": ENTROPY_COST,
+            "gamma": DISCOUNTING,
+            "lmb": LMB,
+            "segment_keys": tuple(segments[0]),
+            "policy_batches": toad._batches_per_update(econ_fraction),
+            "collected_steps": collected_steps,
+            "collected_steps_with_value_passes": collected_steps,
+            "scheduler_steps": 1,
+            "collection_rounds": 1,
+        },
+        path,
+    )
 
 
 def _trajectory(turns: int = 4, final_margin: float = 1.0) -> Trajectory:
