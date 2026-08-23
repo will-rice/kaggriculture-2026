@@ -122,6 +122,8 @@ class RuntimeConfig(BaseModel):
 class EvaluationGate(BaseModel):
     """An evaluation threshold for curriculum progression."""
 
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     metric: str
     minimum: float
     opponent: str
@@ -176,14 +178,20 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "teacher checkpoint is required by teacher loss or batches"
             )
-        if (
-            self.population.teacher_checkpoint is not None
-            and not self.population.teacher_checkpoint.is_file()
-        ):
-            raise ValueError(
-                "teacher checkpoint is not readable: "
-                f"{self.population.teacher_checkpoint}"
-            )
+        if self.population.teacher_checkpoint is not None:
+            if not self.population.teacher_checkpoint.is_file():
+                raise ValueError(
+                    "teacher checkpoint is not readable: "
+                    f"{self.population.teacher_checkpoint}"
+                )
+            try:
+                with self.population.teacher_checkpoint.open("rb"):
+                    pass
+            except OSError as error:
+                raise ValueError(
+                    "teacher checkpoint is not readable: "
+                    f"{self.population.teacher_checkpoint}"
+                ) from error
         if self.population.frozen_opponent and not (
             self.population.initial_snapshots
             or (

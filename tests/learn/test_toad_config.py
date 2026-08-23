@@ -53,6 +53,59 @@ def test_teacher_checkpoint_must_be_a_readable_file(tmp_path: Path) -> None:
     assert config.population.teacher_checkpoint == checkpoint
 
 
+def test_teacher_checkpoint_must_open_for_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regular file that cannot be opened is not a usable teacher checkpoint."""
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.touch()
+
+    def fail_to_open(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated unreadable checkpoint")
+
+    monkeypatch.setattr(Path, "open", fail_to_open)
+
+    with pytest.raises(ValidationError, match="teacher checkpoint is not readable"):
+        ToadConfig(
+            population={"teacher_checkpoint": checkpoint},
+            optimizer={"teacher_kl_cost": 0.1},
+        )
+
+
+def test_evaluation_gate_rejects_unknown_fields() -> None:
+    """Evaluation gates cannot silently discard misspelled configuration."""
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        ToadConfig(
+            curriculum={
+                "gate": {
+                    "metric": "win_rate",
+                    "minimum": 0.5,
+                    "opponent": "economic",
+                    "seeds": 1,
+                    "unexpected": True,
+                }
+            }
+        )
+
+
+def test_evaluation_gate_is_frozen() -> None:
+    """A validated gate remains immutable with the rest of the experiment."""
+    config = ToadConfig(
+        curriculum={
+            "gate": {
+                "metric": "win_rate",
+                "minimum": 0.5,
+                "opponent": "economic",
+                "seeds": 1,
+            }
+        }
+    )
+    assert config.curriculum.gate is not None
+
+    with pytest.raises(ValidationError, match="frozen"):
+        config.curriculum.gate.metric = "loss"  # ty: ignore[invalid-assignment]
+
+
 def test_load_config_applies_json_typed_overrides(tmp_path: Path) -> None:
     """JSON files and overrides reconstruct one fully validated config."""
     path = tmp_path / "toad.json"
