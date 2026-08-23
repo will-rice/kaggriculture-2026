@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any, cast
 
 import lightning
 import torch
@@ -214,6 +216,8 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         self._collector = collect_assignment or self.collect_assignment
         self.actor_state: dict[str, torch.Tensor] = {}
         self.actor_version = 0
+        self.next_game_id = 0
+        self.rng = random.Random(config.runtime.seed)
         self._next_round_id = 0
 
     def publish_actor(
@@ -249,6 +253,8 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         """Collect one assignment set, then expose it as one logical round."""
         assignments = self._assignments
         if assignments is None:
+            first_game_id = self.next_game_id
+            self.next_game_id += self.config.population.environments_per_rank
             assignments = tuple(
                 CollectionAssignment(
                     game_id=game_id,
@@ -256,7 +262,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                     opponent_id="self",
                     kind=BatchKind.SELFPLAY,
                 )
-                for game_id in range(self.config.population.environments_per_rank)
+                for game_id in range(first_game_id, self.next_game_id)
             )
         if not assignments:
             return
@@ -332,3 +338,20 @@ class ToadDataModule(lightning.LightningDataModule):
             batch_size=None,
             num_workers=0,
         )
+
+    def state_dict(self) -> dict[str, object]:
+        """Serialize the stream position needed for the next collection."""
+        return {
+            "next_game_id": self.source.next_game_id,
+            "collector_rng": self.source.rng.getstate(),
+            "published_actor_version": self.source.actor_version,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore the collector stream without retaining stale actor weights."""
+        self.source.next_game_id = cast(int, state_dict["next_game_id"])
+        self.source._next_round_id = (
+            self.source.next_game_id // self.config.population.environments_per_rank
+        )
+        self.source.rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))
+        self.source.actor_version = cast(int, state_dict["published_actor_version"])

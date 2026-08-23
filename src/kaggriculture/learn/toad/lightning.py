@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import lightning
 import torch
@@ -15,7 +15,11 @@ from kaggriculture.learn import toad_loss
 from kaggriculture.learn.encoding import transfer_slots
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.config import (
+    STRUCTURAL_FIELDS,
+    ToadConfig,
+    structural_fingerprint,
+)
 from kaggriculture.learn.toad.data import LearnerBatch
 
 if TYPE_CHECKING:
@@ -28,6 +32,33 @@ class LossReport:
 
     total: torch.Tensor
     terms: Mapping[str, torch.Tensor]
+
+
+class ResumeConfigError(ValueError):
+    """The effective config cannot safely consume the stored trainer state."""
+
+
+def read_path(config: ToadConfig, path: str) -> object:
+    """Read one declared dotted configuration path."""
+    value: object = config
+    for part in path.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def assert_resume_compatible(effective: ToadConfig, stored: ToadConfig) -> None:
+    """Reject only declared structural differences on resume."""
+    differences = {
+        path: (read_path(stored, path), read_path(effective, path))
+        for path in STRUCTURAL_FIELDS
+        if read_path(stored, path) != read_path(effective, path)
+    }
+    if differences:
+        rendered = ", ".join(
+            f"{path}: stored={before!r}, effective={after!r}"
+            for path, (before, after) in differences.items()
+        )
+        raise ResumeConfigError(f"structural config mismatch: {rendered}")
 
 
 def compute_loss(
@@ -132,9 +163,7 @@ def compute_loss(
         rewards=rewards,
         dones=dones,
         discounting=config.optimizer.gamma,
-        baseline_only=batch.baseline_only
-        if baseline_only is None
-        else baseline_only,
+        baseline_only=batch.baseline_only if baseline_only is None else baseline_only,
         teacher_kl=teacher_kl,
         teacher_kl_cost=config.optimizer.teacher_kl_cost,
         entropy_cost=config.optimizer.entropy_cost,
@@ -193,10 +222,7 @@ class ToadLightningModule(lightning.LightningModule):
         return replace(
             batch,
             segments=tuple(
-                {
-                    name: tensor.to(device)
-                    for name, tensor in segment.items()
-                }
+                {name: tensor.to(device) for name, tensor in segment.items()}
                 for segment in batch.segments
             ),
         )
@@ -240,9 +266,30 @@ class ToadLightningModule(lightning.LightningModule):
             },
         }
 
-    def lr_scheduler_step(
-        self, scheduler: LRScheduler, metric: object | None
-    ) -> None:
+    def lr_scheduler_step(self, scheduler: LRScheduler, metric: object | None) -> None:
         """Advance LR exactly once when an optimizer step closes a round."""
         if self._round_ended:
             scheduler.step()
+
+    def on_save_checkpoint(self, checkpoint: dict[str, object]) -> None:
+        """Extend Lightning's authoritative state with Toad's logical clocks."""
+        checkpoint["toad"] = {
+            "config": self.config.model_dump(mode="json"),
+            "fingerprint": structural_fingerprint(self.config),
+            "environment_steps": self.environment_steps,
+            "collection_round": self.collection_round,
+            "actor_version": self.actor_version,
+            "actor_source_global_step": self.actor_source_global_step,
+            "warmup_remaining": self.warmup_remaining,
+        }
+
+    def on_load_checkpoint(self, checkpoint: dict[str, object]) -> None:
+        """Validate structure and restore Toad's logical clocks."""
+        state = cast(dict[str, object], checkpoint["toad"])
+        stored_config = ToadConfig.model_validate(state["config"])
+        assert_resume_compatible(self.config, stored_config)
+        self.environment_steps = cast(int, state["environment_steps"])
+        self.collection_round = cast(int, state["collection_round"])
+        self.actor_version = cast(int, state["actor_version"])
+        self.actor_source_global_step = cast(int, state["actor_source_global_step"])
+        self.warmup_remaining = cast(int, state["warmup_remaining"])
