@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
 
 CONTROL_FIXTURE = Path(__file__).parent / "fixtures" / "toad_control_batch.pt"
@@ -71,9 +72,25 @@ def test_control_fixture_preserves_tensor_layout_and_fp32() -> None:
     fixture = load_control_fixture()
     segments = cast(list[dict[str, torch.Tensor]], fixture["segments"])
     initial_model = cast(dict[str, torch.Tensor], fixture["initial_model"])
+    trajectory = cast(Trajectory, fixture["trajectory"])
+    unroll_length = cast(int, fixture["unroll_length"])
+    regenerated = toad._segments(trajectory)
 
     assert len(segments) == toad.BATCH_SEGMENTS
+    assert len(segments) == cast(int, fixture["segment_count"])
+    assert unroll_length == toad.UNROLL_LENGTH
+    assert int(trajectory.dones.shape[0]) == cast(int, fixture["trajectory_turns"])
+    assert int(trajectory.dones.shape[0]) == toad.BATCH_SEGMENTS * unroll_length
     assert tuple(segments[0]) == cast(tuple[str, ...], fixture["segment_keys"])
+    assert len(regenerated) == len(segments)
+    for captured, current in zip(segments, regenerated, strict=True):
+        assert captured.keys() == current.keys()
+        for name in toad.ACTED_FIELDS:
+            assert captured[name].shape[0] == unroll_length
+            assert torch.equal(captured[name], current[name])
+        for name in toad.OBSERVED_FIELDS:
+            assert captured[name].shape[0] == unroll_length + 1
+            assert torch.equal(captured[name], current[name])
     assert all(
         value.dtype == torch.float32
         for segment in segments
@@ -89,6 +106,42 @@ def test_control_fixture_preserves_tensor_layout_and_fp32() -> None:
 def test_control_fixture_pins_round_clocks() -> None:
     """Value replays must not advance collection or scheduler clocks."""
     fixture = load_control_fixture()
-    assert fixture["policy_batches"] == toad._batches_per_update(0.5)
-    assert fixture["collected_steps_with_value_passes"] == fixture["collected_steps"]
+    trajectory = cast(Trajectory, fixture["trajectory"])
+    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    policy.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    optimizer = toad._optimizer(policy, cast(float, fixture["lr"]))
+    optimizer.load_state_dict(cast(dict[str, object], fixture["initial_optimizer"]))
+    schedule = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, toad._decay(cast(float, fixture["econ_fraction"]))
+    )
+    collected_steps = sum(int(item.shaped.shape[0]) for item in [trajectory])
+    torch.manual_seed(cast(int, fixture["round_seed"]))
+    terms, consumed = toad._update(
+        policy,
+        optimizer,
+        [trajectory],
+        "cpu",
+        "shaped_money",
+        value_passes=cast(int, fixture["value_passes"]),
+    )
+    collected_steps_with_value_passes = sum(
+        int(item.shaped.shape[0]) for item in [trajectory]
+    )
+    schedule.step()
+
+    assert terms == pytest.approx(fixture["round_terms"], rel=1e-6, abs=1e-7)
+    assert consumed == fixture["consumed_policy_batches"]
+    assert consumed == len(toad._segments(trajectory)) // toad.BATCH_SEGMENTS
+    assert fixture["policy_batches"] == toad._batches_per_update(
+        cast(float, fixture["econ_fraction"])
+    )
+    assert collected_steps == fixture["collected_steps"]
+    assert (
+        collected_steps_with_value_passes
+        == fixture["collected_steps_with_value_passes"]
+    )
+    assert collected_steps_with_value_passes == collected_steps
+    assert schedule.state_dict() == fixture["scheduler_state"]
+    assert schedule.get_last_lr() == pytest.approx(fixture["scheduler_last_lr"])
+    assert schedule.last_epoch == fixture["scheduler_steps"]
     assert fixture["scheduler_steps"] == fixture["collection_rounds"]

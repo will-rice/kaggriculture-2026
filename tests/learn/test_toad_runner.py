@@ -90,15 +90,41 @@ def write_control_fixture(path: Path) -> None:
     torch.manual_seed(20260823)
     policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
     optimizer = toad._optimizer(policy, LEARNING_RATE)
-    segments = [_segment() for _ in range(toad.BATCH_SEGMENTS)]
+    trajectory = _control_trajectory()
+    segments = toad._segments(trajectory)
     initial_model = copy.deepcopy(policy.state_dict())
     initial_optimizer = copy.deepcopy(optimizer.state_dict())
     terms = toad._step(policy, optimizer, segments, "cpu", "shaped_money")
     econ_fraction = 0.5
-    collected_steps = toad._seats_per_update(econ_fraction) * toad.TURNS
+    round_policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    round_policy.load_state_dict(initial_model)
+    round_optimizer = toad._optimizer(round_policy, LEARNING_RATE)
+    round_optimizer.load_state_dict(initial_optimizer)
+    schedule = torch.optim.lr_scheduler.LambdaLR(
+        round_optimizer, toad._decay(econ_fraction)
+    )
+    round_batch = [trajectory]
+    collected_steps = sum(int(item.shaped.shape[0]) for item in round_batch)
+    round_seed = 20260824
+    value_passes = 1
+    torch.manual_seed(round_seed)
+    round_terms, consumed_policy_batches = toad._update(
+        round_policy,
+        round_optimizer,
+        round_batch,
+        "cpu",
+        "shaped_money",
+        value_passes=value_passes,
+    )
+    collected_steps_with_value_passes = sum(
+        int(item.shaped.shape[0]) for item in round_batch
+    )
+    collection_rounds = 1
+    schedule.step()
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "trajectory": trajectory,
             "segments": segments,
             "initial_model": initial_model,
             "initial_optimizer": initial_optimizer,
@@ -110,11 +136,21 @@ def write_control_fixture(path: Path) -> None:
             "gamma": DISCOUNTING,
             "lmb": LMB,
             "segment_keys": tuple(segments[0]),
+            "unroll_length": toad.UNROLL_LENGTH,
+            "trajectory_turns": int(trajectory.dones.shape[0]),
+            "segment_count": len(segments),
+            "econ_fraction": econ_fraction,
             "policy_batches": toad._batches_per_update(econ_fraction),
             "collected_steps": collected_steps,
-            "collected_steps_with_value_passes": collected_steps,
-            "scheduler_steps": 1,
-            "collection_rounds": 1,
+            "collected_steps_with_value_passes": collected_steps_with_value_passes,
+            "round_seed": round_seed,
+            "value_passes": value_passes,
+            "round_terms": round_terms,
+            "consumed_policy_batches": consumed_policy_batches,
+            "scheduler_state": schedule.state_dict(),
+            "scheduler_last_lr": schedule.get_last_lr(),
+            "scheduler_steps": schedule.last_epoch,
+            "collection_rounds": collection_rounds,
         },
         path,
     )
@@ -171,6 +207,13 @@ def _trajectory(turns: int = 4, final_margin: float = 1.0) -> Trajectory:
         realisation=1.0,
         bought=1.0,
     )
+
+
+def _control_trajectory() -> Trajectory:
+    """Return four exact unrolls whose quantity head has an acted transfer."""
+    trajectory = _trajectory(turns=toad.UNROLL_LENGTH * toad.BATCH_SEGMENTS)
+    trajectory.unit_actions[:, 0] = UNIT_OPS.index("PICKUP:WHEAT")
+    return trajectory
 
 
 def _record(
