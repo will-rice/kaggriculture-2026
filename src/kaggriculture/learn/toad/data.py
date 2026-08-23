@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, cast
 
@@ -34,6 +35,7 @@ ACTED_FIELDS = (
     "dones",
 )
 OBSERVED_FIELDS = ("board", "scalars", "positions")
+WorkerInput = tuple[dict[str, torch.Tensor], list[int], int, int, str | None, float]
 
 
 class BatchKind(StrEnum):
@@ -213,7 +215,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
     ) -> None:
         self.config = config
         self._assignments = tuple(assignments) if assignments is not None else None
-        self._collector = collect_assignment or self.collect_assignment
+        self._collector = collect_assignment
         self.actor_state: dict[str, torch.Tensor] = {}
         self.actor_version = 0
         self.next_game_id = 0
@@ -233,70 +235,136 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         """Collect one assigned game through the existing reference collector."""
         if not self.actor_state:
             raise RuntimeError("reference collection needs a published actor state")
-        from concurrent.futures import ProcessPoolExecutor
+        from kaggriculture.learn.scripts.toad import _play
 
-        from kaggriculture.learn.scripts.toad import _collect
+        return _play(self._worker_input(assignment))
 
-        econ_fraction = 0.0 if assignment.kind is BatchKind.SELFPLAY else 1.0
-        with ProcessPoolExecutor(max_workers=1) as pool:
-            mirror, scripted = _collect(
-                pool,
-                self.actor_state,
-                (assignment.seed,),
-                self.config.model.blocks,
-                self.config.model.channels,
-                econ_fraction,
-                self.config.curriculum.money_weight,
-            )
-        return mirror + scripted
+    def _worker_input(self, assignment: CollectionAssignment) -> WorkerInput:
+        """Return the legacy worker tuple for one provenance-bearing game."""
+        versus = (
+            assignment.opponent_id if assignment.kind is BatchKind.SCRIPTED else None
+        )
+        return (
+            self.actor_state,
+            [assignment.seed],
+            self.config.model.blocks,
+            self.config.model.channels,
+            versus,
+            self.config.curriculum.money_weight,
+        )
+
+    def _collect_round(
+        self, assignments: Sequence[CollectionAssignment]
+    ) -> list[tuple[CollectionAssignment, Sequence[Trajectory]]]:
+        """Collect all assignments through one typed, round-scoped pool."""
+        if self._collector is not None:
+            collected = []
+            for assignment in assignments:
+                try:
+                    collected.append((assignment, self._collector(assignment)))
+                except Exception as error:
+                    raise self._collection_error(assignment) from error
+            return collected
+
+        if not self.actor_state:
+            raise RuntimeError("reference collection needs a published actor state")
+        from kaggriculture.learn.scripts.toad import _play
+
+        with ProcessPoolExecutor(
+            max_workers=self.config.population.collection_processes
+        ) as pool:
+            results = iter(pool.map(_play, map(self._worker_input, assignments)))
+            collected = []
+            for assignment in assignments:
+                try:
+                    collected.append((assignment, next(results)))
+                except Exception as error:
+                    raise self._collection_error(assignment) from error
+        return collected
+
+    @staticmethod
+    def _collection_error(assignment: CollectionAssignment) -> CollectionError:
+        """Build the stable error that identifies one failed worker input."""
+        return CollectionError(
+            "collection failed for "
+            f"game_id={assignment.game_id} seed={assignment.seed} "
+            f"opponent={assignment.opponent_id}"
+        )
 
     def __iter__(self) -> Iterator[LearnerBatch]:
         """Collect one assignment set, then expose it as one logical round."""
         assignments = self._assignments
         if assignments is None:
             first_game_id = self.next_game_id
-            self.next_game_id += self.config.population.environments_per_rank
+            environments = self.config.population.environments_per_rank
+            self.next_game_id += environments
+            scripted = int(environments * self.config.population.scripted)
             assignments = tuple(
                 CollectionAssignment(
                     game_id=game_id,
                     seed=game_id + self.config.runtime.seed,
-                    opponent_id="self",
-                    kind=BatchKind.SELFPLAY,
+                    opponent_id=(
+                        self.config.population.scripted_opponent
+                        if game_id - first_game_id < scripted
+                        else "self"
+                    ),
+                    kind=(
+                        BatchKind.SCRIPTED
+                        if game_id - first_game_id < scripted
+                        else BatchKind.SELFPLAY
+                    ),
                 )
                 for game_id in range(first_game_id, self.next_game_id)
             )
         if not assignments:
             return
-        if any(
-            assignment.kind is not assignments[0].kind for assignment in assignments
-        ):
-            raise ValueError("one collection round must contain one batch kind")
+        collected = self._collect_round(assignments)
+        grouped: dict[
+            BatchKind, list[tuple[CollectionAssignment, Sequence[Trajectory]]]
+        ] = {
+            BatchKind.SCRIPTED: [],
+            BatchKind.SELFPLAY: [],
+        }
+        for assignment, trajectories in collected:
+            grouped[assignment.kind].append((assignment, trajectories))
 
-        trajectories: list[Trajectory] = []
-        for assignment in assignments:
-            try:
-                trajectories.extend(self._collector(assignment))
-            except Exception as error:
-                raise CollectionError(
-                    "collection failed for "
-                    f"game_id={assignment.game_id} seed={assignment.seed} "
-                    f"opponent={assignment.opponent_id}"
-                ) from error
-        meta = RoundMeta(
-            round_id=self._next_round_id,
-            actor_version=self.actor_version,
-            game_ids=tuple(assignment.game_id for assignment in assignments),
-            seeds=tuple(assignment.seed for assignment in assignments),
-            opponent_ids=tuple(assignment.opponent_id for assignment in assignments),
-            kind=assignments[0].kind,
-        )
+        round_id = self._next_round_id
         self._next_round_id += 1
-        yield from RoundBatchExpander(
+        expander = RoundBatchExpander(
             batch_segments=self.config.optimizer.batch_segments,
             unroll_length=self.config.optimizer.unroll_length,
             value_passes=self.config.optimizer.value_passes,
             seed=self.config.runtime.seed,
-        ).expand(trajectories, meta)
+        )
+        batches: list[LearnerBatch] = []
+        total_steps = 0
+        for kind in (BatchKind.SCRIPTED, BatchKind.SELFPLAY):
+            entries = grouped[kind]
+            if not entries:
+                continue
+            kind_assignments = tuple(entry[0] for entry in entries)
+            trajectories = [
+                trajectory for _, assigned in entries for trajectory in assigned
+            ]
+            total_steps += sum(
+                int(trajectory.dones.shape[0]) for trajectory in trajectories
+            )
+            meta = RoundMeta(
+                round_id=round_id,
+                actor_version=self.actor_version,
+                game_ids=tuple(item.game_id for item in kind_assignments),
+                seeds=tuple(item.seed for item in kind_assignments),
+                opponent_ids=tuple(item.opponent_id for item in kind_assignments),
+                kind=kind,
+            )
+            batches.extend(expander.expand(trajectories, meta))
+        for index, batch in enumerate(batches):
+            yield replace(
+                batch,
+                first_of_round=index == 0,
+                end_of_round=index == len(batches) - 1,
+                collected_steps=total_steps if index == 0 else 0,
+            )
 
 
 class RoundIterableDataset(IterableDataset[LearnerBatch]):

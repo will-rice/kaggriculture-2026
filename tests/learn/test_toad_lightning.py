@@ -11,7 +11,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.data import LearnerBatch
-from kaggriculture.learn.toad.lightning import ToadLightningModule, compute_loss
+from kaggriculture.learn.toad.lightning import (
+    ToadLightningModule,
+    compute_loss,
+    round_decay,
+)
 from tests.learn.test_toad_control_fixture import (
     _assert_state_equal,
     control_fixture_batch,
@@ -110,7 +114,7 @@ def test_module_loads_warm_start_before_training(tmp_path: Path) -> None:
     torch.save(source.state_dict(), checkpoint)
     config = control_fixture_config().model_copy(
         update={
-            "model": control_fixture_config().model.model_copy(
+            "curriculum": control_fixture_config().curriculum.model_copy(
                 update={"warm_start_checkpoint": checkpoint}
             )
         }
@@ -164,6 +168,101 @@ def test_module_loads_frozen_typed_teacher_and_uses_it(
         parameter.requires_grad for parameter in module.teacher.policy.parameters()
     )
     assert not torch.equal(with_teacher, without_teacher)
+
+
+def test_module_loads_policy_from_lightning_checkpoint_envelopes(
+    tmp_path: Path,
+) -> None:
+    """Native phase checkpoints initialize both warm starts and teachers."""
+    source = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    checkpoint = tmp_path / "phase1.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                **{
+                    f"policy.{name}": value
+                    for name, value in source.state_dict().items()
+                },
+                "teacher_policy.ignored": torch.ones(1),
+            }
+        },
+        checkpoint,
+    )
+    base = control_fixture_config()
+    warm = base.model_copy(
+        update={
+            "curriculum": base.curriculum.model_copy(
+                update={"warm_start_checkpoint": checkpoint}
+            )
+        }
+    )
+    teacher = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"teacher_checkpoint": checkpoint, "teacher_blocks": 1}
+            ),
+            "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0}),
+        }
+    )
+
+    warm_module = ToadLightningModule(warm)
+    teacher_module = ToadLightningModule(teacher)
+
+    for name, value in source.state_dict().items():
+        assert torch.equal(warm_module.policy.state_dict()[name], value), name
+        assert teacher_module.teacher_policy is not None
+        assert torch.equal(teacher_module.teacher_policy.state_dict()[name], value), (
+            name
+        )
+
+
+def test_module_loads_policy_from_legacy_runner_envelope(tmp_path: Path) -> None:
+    """The one-release migration path accepts the old learner envelope."""
+    source = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save({"learner": source.state_dict(), "steps": 1}, checkpoint)
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "curriculum": base.curriculum.model_copy(
+                update={"warm_start_checkpoint": checkpoint}
+            )
+        }
+    )
+
+    module = ToadLightningModule(config)
+
+    for name, value in source.state_dict().items():
+        assert torch.equal(module.policy.state_dict()[name], value), name
+
+
+def test_round_decay_uses_typed_mixture_and_environment_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scheduler round sizing must describe the games collection actually runs."""
+    seen: list[tuple[float, int, int]] = []
+
+    def fake_decay(fraction: float, total_steps: int, environments: int) -> object:
+        seen.append((fraction, total_steps, environments))
+        return lambda _: 1.0
+
+    monkeypatch.setattr(toad, "_decay", fake_decay)
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={
+                    "selfplay": 0.75,
+                    "scripted": 0.25,
+                    "environments_per_rank": 4,
+                }
+            )
+        }
+    )
+
+    round_decay(config)
+
+    assert seen == [(0.25, config.runtime.total_environment_steps, 4)]
 
 
 def test_scheduler_steps_only_after_the_batch_that_closes_a_round(

@@ -145,6 +145,7 @@ PHASES: tuple[Phase, ...] = (
 )
 
 _BY_NAME = {phase.name: phase for phase in PHASES}
+OUTPUT_ROOT = RuntimeConfig().output_dir
 
 # Every reward the table may name, and the flags that select it. Total rather
 # than a test against ``"sparse"`` alone, because an unlisted reward must raise
@@ -201,12 +202,11 @@ def _teacher_blocks(phase: Phase) -> int:
 def _checkpoint(name: str) -> Path:
     """Return the newest checkpoint a phase has written, or raise.
 
-    ``toad`` writes ``RUNS/{name}_{update:06d}.pt`` every
-    ``CHECKPOINT_EVERY`` updates and this runner always names a phase's run
-    after the phase itself (``--name``), so ``{name}_*.pt`` is exactly that
-    phase's checkpoint family. The zero-padded update number sorts
-    lexicographically the same as numerically, so the last glob match is the
-    latest one -- no separate "final" marker is needed.
+    Native Lightning runs write ``OUTPUT_ROOT/{name}/step-N.ckpt``. The
+    phase-specific directory prevents collisions, and the numeric suffix
+    selects the latest environment boundary. The old
+    ``RUNS/{name}_{update:06d}.pt`` family remains a one-release migration
+    fallback for curricula started by the legacy runner.
 
     Args:
         name: A phase's ``name`` field.
@@ -218,13 +218,16 @@ def _checkpoint(name: str) -> Path:
         FileNotFoundError: If ``name`` has no checkpoint on disk. A missing
             teacher must fail loudly, not train unanchored.
     """
-    checkpoints = sorted(toad.RUNS.glob(f"{name}_*.pt"))
-    if not checkpoints:
-        raise FileNotFoundError(
-            f"{name} has no checkpoint matching {toad.RUNS}/{name}_*.pt "
-            f"-- run {name} to completion first"
-        )
-    return checkpoints[-1]
+    native = list((OUTPUT_ROOT / name).glob("step-*.ckpt"))
+    if native:
+        return max(native, key=lambda path: int(path.stem.removeprefix("step-")))
+    legacy = list(toad.RUNS.glob(f"{name}_*.pt"))
+    if legacy:
+        return max(legacy, key=lambda path: int(path.stem.rsplit("_", 1)[1]))
+    raise FileNotFoundError(
+        f"{name} has no checkpoint matching {OUTPUT_ROOT / name}/step-*.ckpt "
+        f"or {toad.RUNS}/{name}_*.pt -- run {name} to completion first"
+    )
 
 
 def _flags(phase: Phase) -> list[str]:
@@ -287,7 +290,10 @@ def phase_config(phase: Phase) -> ToadConfig:
             teacher_checkpoint=teacher,
             teacher_blocks=_teacher_blocks(phase) if teacher is not None else None,
         ),
-        runtime=RuntimeConfig(total_environment_steps=phase.steps),
+        runtime=RuntimeConfig(
+            total_environment_steps=phase.steps,
+            output_dir=OUTPUT_ROOT / phase.name,
+        ),
         curriculum=CurriculumConfig(
             phase=phase.name,
             reward_field=phase.reward,

@@ -200,6 +200,54 @@ def test_checkpoint_resolves_the_latest_update(
     assert curriculum._checkpoint("phase1") == tmp_path / "phase1_000100.pt"
 
 
+def test_lightning_checkpoints_are_numeric_and_phase_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native phase outputs cannot collide and step 10 must beat step 9."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    phase1_dir = tmp_path / "phase1"
+    phase1_dir.mkdir()
+    (phase1_dir / "step-9.ckpt").touch()
+    (phase1_dir / "step-10.ckpt").touch()
+
+    assert curriculum._checkpoint("phase1") == phase1_dir / "step-10.ckpt"
+    assert curriculum.phase_config(curriculum._phase("phase1")).runtime.output_dir == (
+        tmp_path / "phase1"
+    )
+    assert curriculum.phase_config(curriculum._phase("phase3")).runtime.output_dir == (
+        tmp_path / "phase3"
+    )
+
+
+def test_phase_one_lightning_output_becomes_phase_two_teacher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native checkpoint writer's envelope is readable by the next phase."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    phase1_dir = tmp_path / "phase1"
+    phase1_dir.mkdir()
+    source = Policy(blocks=8, channels=toad.CHANNELS, value_bound=toad.VALUE_BOUND)
+    checkpoint = phase1_dir / "step-200.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                f"policy.{name}": value for name, value in source.state_dict().items()
+            }
+        },
+        checkpoint,
+    )
+
+    config = curriculum.phase_config(curriculum._phase("phase2"))
+    module = toad.ToadLightningModule(config)
+
+    assert config.population.teacher_checkpoint == checkpoint
+    assert module.teacher_policy is not None
+    assert torch.equal(
+        module.teacher_policy.state_dict()["stem.weight"],
+        source.state_dict()["stem.weight"],
+    )
+
+
 def test_phase_one_has_no_sparse_flag() -> None:
     """Phase 1 trains on the dense shaped reward, not the terminal sparse one.
 

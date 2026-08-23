@@ -49,7 +49,6 @@ class ModelConfig(BaseModel):
     local_patch: bool = False
     belief: bool = False
     interaction_value: bool = False
-    warm_start_checkpoint: Path | None = None
 
 
 class PopulationConfig(BaseModel):
@@ -143,6 +142,7 @@ class CurriculumConfig(BaseModel):
         "shaped_money"
     )
     money_weight: NonNegativeFloat = MONEY_WEIGHT
+    warm_start_checkpoint: Path | None = None
     gate: EvaluationGate | None = None
     on_gate_failure: Literal["stop"] = "stop"
 
@@ -189,13 +189,13 @@ class ToadConfig(BaseModel):
                 self.population.teacher_checkpoint,
                 label="teacher checkpoint",
             )
-        if self.model.warm_start_checkpoint is not None:
+        if self.curriculum.warm_start_checkpoint is not None:
             _require_readable(
-                self.model.warm_start_checkpoint,
+                self.curriculum.warm_start_checkpoint,
                 label="warm-start checkpoint",
             )
         if (
-            self.model.warm_start_checkpoint is not None
+            self.curriculum.warm_start_checkpoint is not None
             and self.runtime.resume is not None
         ):
             raise ValueError("warm start and resume are mutually exclusive")

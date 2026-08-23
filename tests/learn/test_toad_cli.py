@@ -106,7 +106,7 @@ def test_all_active_legacy_semantics_reach_typed_config(
 
     assert config.curriculum.reward_field == "margin"
     assert config.curriculum.money_weight == pytest.approx(0.01)
-    assert config.model.warm_start_checkpoint == warm_start
+    assert config.curriculum.warm_start_checkpoint == warm_start
     assert config.population.teacher_checkpoint == teacher
     assert config.population.teacher_blocks == 1
 

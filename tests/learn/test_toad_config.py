@@ -13,6 +13,7 @@ from kaggriculture.learn.toad.config import (
     load_config,
     structural_fingerprint,
 )
+from kaggriculture.learn.toad.lightning import assert_resume_compatible
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
 
 
@@ -58,12 +59,12 @@ def test_warm_start_checkpoint_is_readable_and_excludes_resume(tmp_path: Path) -
     checkpoint = tmp_path / "warm.pt"
     checkpoint.touch()
 
-    config = ToadConfig(model={"warm_start_checkpoint": checkpoint})
-    assert config.model.warm_start_checkpoint == checkpoint
+    config = ToadConfig(curriculum={"warm_start_checkpoint": checkpoint})
+    assert config.curriculum.warm_start_checkpoint == checkpoint
 
     with pytest.raises(ValidationError, match="warm start and resume"):
         ToadConfig(
-            model={"warm_start_checkpoint": checkpoint},
+            curriculum={"warm_start_checkpoint": checkpoint},
             runtime={"resume": tmp_path / "resume.ckpt"},
         )
 
@@ -71,7 +72,19 @@ def test_warm_start_checkpoint_is_readable_and_excludes_resume(tmp_path: Path) -
 def test_warm_start_checkpoint_must_be_a_readable_file(tmp_path: Path) -> None:
     """An invalid warm start fails during config validation, before runtime."""
     with pytest.raises(ValidationError, match="warm-start checkpoint is not readable"):
-        ToadConfig(model={"warm_start_checkpoint": tmp_path / "missing.pt"})
+        ToadConfig(curriculum={"warm_start_checkpoint": tmp_path / "missing.pt"})
+
+
+def test_warm_start_provenance_does_not_make_resume_structurally_incompatible(
+    tmp_path: Path,
+) -> None:
+    """A stored initialization source is provenance, not model structure."""
+    warm = tmp_path / "warm.pt"
+    warm.touch()
+    stored = ToadConfig(curriculum={"warm_start_checkpoint": warm})
+    effective = ToadConfig(runtime={"resume": tmp_path / "resume.ckpt"})
+
+    assert_resume_compatible(effective, stored)
 
 
 def test_teacher_checkpoint_must_open_for_read(

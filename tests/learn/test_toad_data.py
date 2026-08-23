@@ -1,6 +1,6 @@
 """Typed optimizer-boundary batches for the native Toad collector."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 import pytest
 import torch
@@ -125,6 +125,111 @@ def test_source_aggregates_assignments_into_one_logical_round() -> None:
     assert batches[0].game_ids == (7, 8)
     assert batches[0].opponent_ids == ("self", "self")
     assert sum(batch.collected_steps for batch in batches) == 128
+
+
+def test_default_round_honors_typed_population_quotas_and_one_clock() -> None:
+    """Mixed opponent kinds remain one collection and scheduler boundary."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={
+                    "selfplay": 0.75,
+                    "scripted": 0.25,
+                    "environments_per_rank": 4,
+                }
+            )
+        }
+    )
+    seen: list[CollectionAssignment] = []
+
+    def collect(assignment: CollectionAssignment) -> Sequence[Trajectory]:
+        seen.append(assignment)
+        return (_trajectory(64),)
+
+    source = ReferenceRoundSource(config, collect_assignment=collect)
+
+    batches = list(source)
+
+    assert [assignment.kind for assignment in seen].count(BatchKind.SCRIPTED) == 1
+    assert [assignment.kind for assignment in seen].count(BatchKind.SELFPLAY) == 3
+    assert [assignment.opponent_id for assignment in seen] == [
+        "economic",
+        "self",
+        "self",
+        "self",
+    ]
+    assert {batch.round_id for batch in batches} == {0}
+    assert sum(batch.first_of_round for batch in batches) == 1
+    assert sum(batch.end_of_round for batch in batches) == 1
+    assert batches[0].first_of_round
+    assert batches[-1].end_of_round
+    assert batches[0].collected_steps == 256
+    assert all(batch.collected_steps == 0 for batch in batches[1:])
+    scripted = [batch for batch in batches if batch.kind is BatchKind.SCRIPTED]
+    selfplay = [batch for batch in batches if batch.kind is BatchKind.SELFPLAY]
+    assert scripted[0].game_ids == (0,)
+    assert scripted[0].opponent_ids == ("economic",)
+    assert selfplay[0].game_ids == (1, 2, 3)
+    assert selfplay[0].opponent_ids == ("self", "self", "self")
+
+    next_round = list(source)
+    assert {batch.round_id for batch in next_round} == {1}
+    assert next_round[0].game_ids == (4,)
+
+
+def test_default_collection_uses_one_typed_round_pool_and_fans_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collection-process width applies once to every assignment in a round."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={
+                    "selfplay": 0.5,
+                    "scripted": 0.5,
+                    "environments_per_rank": 4,
+                    "collection_processes": 3,
+                }
+            ),
+            "curriculum": base.curriculum.model_copy(update={"money_weight": 0.01}),
+        }
+    )
+    pool_widths: list[int] = []
+    work: list[tuple[object, ...]] = []
+
+    class FakePool:
+        def __init__(self, max_workers: int) -> None:
+            pool_widths.append(max_workers)
+
+        def __enter__(self) -> "FakePool":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def map(
+            self,
+            function: Callable[[tuple[object, ...]], object],
+            assignments: Iterable[tuple[object, ...]],
+        ) -> Iterable[object]:
+            assigned = list(assignments)
+            work.extend(assigned)
+            return map(function, assigned)
+
+    monkeypatch.setattr("kaggriculture.learn.toad.data.ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(toad, "_play", lambda _: [_trajectory(64)])
+    source = ReferenceRoundSource(config)
+    source.publish_actor({"weight": torch.ones(1)}, version=7)
+
+    list(source)
+
+    assert pool_widths == [3]
+    assert len(work) == 4
+    assert all(item[0] == source.actor_state for item in work)
+    assert [item[4] for item in work] == ["economic", "economic", None, None]
+    assert all(item[5] == 0.01 for item in work)
 
 
 def test_data_module_detaches_actor_before_publication() -> None:

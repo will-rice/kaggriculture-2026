@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 
 import lightning
@@ -36,6 +37,31 @@ class LossReport:
 
 class ResumeConfigError(ValueError):
     """The effective config cannot safely consume the stored trainer state."""
+
+
+def load_checkpoint_policy(policy: Policy, path: Path) -> list[str]:
+    """Load policy weights from bare, legacy-runner, or Lightning checkpoints."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("policy checkpoint must contain a mapping")
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+        if not isinstance(state_dict, Mapping):
+            raise ValueError("Lightning checkpoint state_dict must be a mapping")
+        weights = {
+            name.removeprefix("policy."): value
+            for name, value in state_dict.items()
+            if isinstance(name, str) and name.startswith("policy.")
+        }
+        if not weights:
+            raise ValueError("Lightning checkpoint has no policy.* weights")
+    elif "learner" in checkpoint:
+        weights = checkpoint["learner"]
+        if not isinstance(weights, Mapping):
+            raise ValueError("legacy checkpoint learner must be a mapping")
+    else:
+        weights = checkpoint
+    return load_policy_weights(policy, cast(Mapping[str, torch.Tensor], weights))
 
 
 def read_path(config: ToadConfig, path: str) -> object:
@@ -189,6 +215,7 @@ def round_decay(config: ToadConfig) -> Callable[[int], float]:
     return _decay(
         config.population.scripted,
         total_steps=config.runtime.total_environment_steps,
+        environments=config.population.environments_per_rank,
     )
 
 
@@ -203,13 +230,8 @@ class ToadLightningModule(lightning.LightningModule):
             channels=config.model.channels,
             value_bound=config.model.value_bound,
         )
-        if config.model.warm_start_checkpoint is not None:
-            state = torch.load(
-                config.model.warm_start_checkpoint,
-                map_location="cpu",
-                weights_only=True,
-            )
-            load_policy_weights(self.policy, state)
+        if config.curriculum.warm_start_checkpoint is not None:
+            load_checkpoint_policy(self.policy, config.curriculum.warm_start_checkpoint)
         self.teacher_policy: Policy | None = None
         self.teacher: Teacher | None = None
         if config.population.teacher_checkpoint is not None:
@@ -220,12 +242,9 @@ class ToadLightningModule(lightning.LightningModule):
                 channels=config.model.channels,
                 value_bound=config.model.value_bound,
             )
-            state = torch.load(
-                config.population.teacher_checkpoint,
-                map_location="cpu",
-                weights_only=True,
+            missing = load_checkpoint_policy(
+                self.teacher_policy, config.population.teacher_checkpoint
             )
-            missing = load_policy_weights(self.teacher_policy, state)
             self.teacher_policy.eval()
             self.teacher_policy.requires_grad_(False)
             self.teacher = Teacher(

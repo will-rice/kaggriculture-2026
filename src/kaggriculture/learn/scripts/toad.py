@@ -550,11 +550,7 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
 
     control = ToadConfig.control()
     payload = control.model_dump(mode="python")
-    payload["model"].update(
-        blocks=arguments.blocks,
-        channels=arguments.channels,
-        warm_start_checkpoint=CHECKPOINT if arguments.clone_init else None,
-    )
+    payload["model"].update(blocks=arguments.blocks, channels=arguments.channels)
     payload["population"].update(
         selfplay=1.0 - arguments.econ_fraction,
         scripted=arguments.econ_fraction,
@@ -579,6 +575,7 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
     payload["curriculum"].update(
         phase=arguments.name or control.curriculum.phase,
         reward_field=reward_field,
+        warm_start_checkpoint=CHECKPOINT if arguments.clone_init else None,
         money_weight=arguments.money_weight
         if arguments.money_weight is not None
         else control.curriculum.money_weight,
@@ -1214,7 +1211,9 @@ def _warm_start(learner: Policy, device: str) -> list[str]:
 
 
 def _decay(
-    econ_fraction: float, total_steps: int = TOTAL_STEPS
+    econ_fraction: float,
+    total_steps: int = TOTAL_STEPS,
+    environments: int = ENVIRONMENTS,
 ) -> Callable[[int], float]:
     """Return the LR multiplier function, floored at their ``min_lr_mod``.
 
@@ -1238,11 +1237,14 @@ def _decay(
         total_steps: Environment steps this arm trains for, from ``--total-steps``
             (default ``TOTAL_STEPS``). The curriculum's five phases each need a
             different budget (2e7-1e7 against the constant's 1e8).
+        environments: Games collected in each logical round.
 
     Returns:
         The multiplier at a given schedule step.
     """
-    updates = max(total_steps // (_seats_per_update(econ_fraction) * TURNS), 1)
+    updates = max(
+        total_steps // (_seats_per_update(econ_fraction, environments) * TURNS), 1
+    )
 
     def decay(step: int) -> float:
         return max(1.0 - step / updates, MIN_LR_MOD)
@@ -1440,7 +1442,7 @@ def _play(
             os.environ[MONEY_WEIGHT_ENV] = previous_money_weight
 
 
-def _seats_per_update(econ_fraction: float) -> int:
+def _seats_per_update(econ_fraction: float, environments: int = ENVIRONMENTS) -> int:
     """Return how many recorded seats one collection round yields.
 
     ``rollout_many`` records both seats of a mirror episode and ours alone
@@ -1449,12 +1451,13 @@ def _seats_per_update(econ_fraction: float) -> int:
 
     Args:
         econ_fraction: Share of each round played against ``OPPONENT``.
+        environments: Games collected in each logical round.
 
     Returns:
         Trajectories, and so ``TURNS`` times this many environment steps.
     """
-    econ = int(ENVIRONMENTS * econ_fraction)
-    return 2 * (ENVIRONMENTS - econ) + econ
+    econ = int(environments * econ_fraction)
+    return 2 * (environments - econ) + econ
 
 
 def _batches_per_update(econ_fraction: float) -> int:
