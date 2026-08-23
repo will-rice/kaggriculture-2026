@@ -355,7 +355,7 @@ def main() -> None:
             )
 
             banked.append(measured["bank/mean"])
-            pipeline.append(measured["potential/total"])
+            pipeline.append(measured["potential/pipeline"])
             refuse_collapse(banked)
             refuse_farming(banked, pipeline)
 
@@ -662,11 +662,24 @@ def played(batch: Sequence[Trajectory], config: PpoConfig) -> dict[str, float]:
     a terminal potential is near zero for a farm that sold everything on the
     last day and says nothing about what the farm was doing for 700 turns.
 
+    ``potential/total`` is the mean net worth, ``money`` included, because that
+    is the potential the reward is built from and a total that omitted a
+    component would not be the number ``progress/return`` came from.
+    ``potential/pipeline`` is the same sum with the bank taken back out, and it
+    is the one ``refuse_farming`` is given: the failure that guard exists for is
+    stock accumulating while the bank does not move, and a total containing the
+    bank cannot express it -- it would rise *because* the bank rose.
+
     ``progress/return`` is what the shaped term actually contributed to an
-    episode's reward, at the weight this iteration used. It should stay small
-    against the bank: the term telescopes, so its whole-season total is the
-    terminal pipeline less the carrying cost, and a large one means the reward
-    has stopped being mostly about money.
+    episode's reward, at the weight this iteration used. It is large and
+    negative and that is expected rather than alarming: the potential is net
+    worth, so the horizon hands the whole bank back on the last turn and the
+    undiscounted season total is roughly ``-P(s_0)`` less the ``(1 - gamma)``
+    carrying cost on everything owned -- about -19,000 on a measured
+    ``economic_policy`` season. What it is worth watching for is the *shape*:
+    it should track the bank, since it is mostly the bank being handed back, and
+    a run where it grows while ``bank/mean`` does not is the same failure
+    ``refuse_farming`` names.
 
     Args:
         batch: The iteration's trajectories.
@@ -678,8 +691,8 @@ def played(batch: Sequence[Trajectory], config: PpoConfig) -> dict[str, float]:
 
     Returns:
         ``trajectories``, ``decisions``, ``bank/mean``, ``bank/max``,
-        ``margin/mean``, ``illegal``, ``progress/return``,
-        ``potential/total``, and ``potential/<component>`` for each name in
+        ``margin/mean``, ``illegal``, ``progress/return``, ``potential/total``,
+        ``potential/pipeline``, and ``potential/<component>`` for each name in
         ``POTENTIAL_COMPONENTS``.
     """
     components = {
@@ -702,6 +715,7 @@ def played(batch: Sequence[Trajectory], config: PpoConfig) -> dict[str, float]:
         ),
         **components,
         "potential/total": sum(components.values()),
+        "potential/pipeline": sum(components.values()) - components["potential/money"],
     }
 
 
@@ -729,8 +743,11 @@ def refuse_farming(banked: Sequence[float], pipeline: Sequence[float]) -> None:
 
     Args:
         banked: Mean bank per iteration, oldest first.
-        pipeline: Mean total potential per iteration, oldest first, on the same
-            iterations and in the same order.
+        pipeline: Mean potential per iteration **with the bank excluded** --
+            ``played``'s ``potential/pipeline`` and not its ``potential/total``,
+            which since the potential became net worth contains the bank and
+            would rise with it. Oldest first, on the same iterations and in the
+            same order as ``banked``.
 
     Raises:
         ValueError: If the pipeline has grown by ``FARMING_PIPELINE_RISE`` while

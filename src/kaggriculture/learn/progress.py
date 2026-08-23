@@ -9,12 +9,13 @@ chain approximately never -- a freshly initialised policy reached a state where
 gradient never pointed at production. That is the measured barrier this module
 exists to remove.
 
-**It removes it by paying for the pipeline, not by paying for the actions.**
-Every sub-goal reward here is the change in one number, ``potential``: what the
-farm is holding that is on its way to becoming money. A seed in the store, a
-quadrant that has been unlocked, a plant standing in the ground with three units
-of yield on it, a cow in a pasture, a crate of wheat in a farmer's arms, a shed
-with produce in it. The reward for a transition is how much that number moved.
+**It removes it by paying for the balance sheet, not by paying for the
+actions.** Every sub-goal reward here is the change in one number,
+``potential``: what this seat is worth. A seed in the store, a quadrant that has
+been unlocked, a plant standing in the ground with three units of yield on it, a
+cow in a pasture, a crate of wheat in a farmer's arms, a shed with produce in
+it -- and the coins in the bank, which are worth their face value like
+everything else here. The reward for a transition is how much that number moved.
 
 That formulation is chosen over a list of "+3 for planting, +5 for harvesting"
 because of a theorem rather than a taste. Ng, Harada and Russell prove that
@@ -44,6 +45,43 @@ question does not arise: a link pays for the state it leaves behind. Planting
 pays once because the tile is only planted once; watering pays every day
 *because the engine adds a yield unit every day*, and pays nothing on a day
 outside the crop's bonus window because nothing was added.
+
+## Why the bank is one of the components
+
+This potential used to be the pipeline alone -- "what the farm is holding on its
+way to the bank", with the bank itself deliberately outside it. The consequence
+is that arriving at the destination is unrewarded: a sale converts stock into
+coins, so it *lowers* a pipeline-only potential by everything sold, and a
+purchase raises it by everything bought. The shaped gradient a fresh seat sees
+therefore points at buying and away from selling, which is the reverse of the
+season it has to play.
+
+That was measured, not predicted. A seat opens with 3,000 coins, an empty shed,
+no seeds and no hands; over a full 719-turn season against a passive opponent,
+buying ten wheat and selling it every other turn all season ends on 2,728 coins
+(-272), doing nothing at all ends on 3,000, and ``economic_policy`` ends on
+151,035. Every short loop available to a fresh agent loses money -- round trips
+pay the spread -- so inaction strictly dominates all of them, and the only
+profitable path is the seven linked actions with a 120-turn delay in the middle.
+The local gradient points at inaction, and thirteen RL arms converged there:
+about four sales a season, capital zero, bank one.
+
+With ``money`` in it, the potential is the seat's **net worth**, and every one
+of those transitions is priced the way the game prices it. Buying at a fair
+price is neutral, because the coins that leave and the goods that arrive are the
+same number -- ``BUY_SEED`` is quoted at ``CROPS[crop]["seed"]`` and
+``BUY_ANIMAL`` at ``ANIMALS[animal]["cost"]``, which are the literal constants
+priced below, so those two are neutral to the coin. Selling at a fair price is
+neutral for the same reason and in the same direction. Churning is negative by
+exactly the spread it pays. A growing crop is positive on every turn the engine
+adds yield to it. And doing nothing is flat, rather than being the best of the
+short options.
+
+None of that changes which policy is optimal -- the shaping is still Ng, Harada
+and Russell's ``gamma * P(s') - P(s)``, and a potential may be any function of
+the state -- it changes which policy is *findable*. What it does change is the
+size of the terminal correction, which now hands back the whole bank as well as
+the pipeline; ``progress_reward`` carries that arithmetic.
 
 ## The valuations, and why each is what it is
 
@@ -121,11 +159,19 @@ VALUE = {
 # tile gives back.
 GROWING = 0.4
 
-# The order every potential array in this module uses. Six numbers rather than
+# The order every potential array in this module uses. Seven numbers rather than
 # one, because the sum is what the reward needs and the split is what a human
 # needs: `growing` rising while `stored` stays flat is a farm that plants and
-# never harvests, and `stored` rising while the bank stays flat is a farm that
+# never harvests, and `stored` rising while `money` stays flat is a farm that
 # harvests and never sells. Both look identical in the total.
+#
+# `money` is appended rather than inserted, for two reasons. The first six are
+# in the pipeline's own order -- seed, land, field, animal, arms, shed -- and the
+# bank is where that pipeline ends, so last is where it reads. And every consumer
+# indexes this tuple *positionally*: `sim.rollout.potential` stacks its columns
+# in this order, `selfplay.played` enumerates it into metric names, and a
+# `Trajectory.potentials` column is identified by nothing but its index.
+# Appending leaves all six existing indices meaning exactly what they meant.
 POTENTIAL_COMPONENTS = (
     "seeds",
     "land",
@@ -133,11 +179,17 @@ POTENTIAL_COMPONENTS = (
     "livestock",
     "carried",
     "stored",
+    "money",
 )
 
 
 def potential(observation: Mapping[str, Any]) -> list[float]:
-    """Return what this seat's farm is holding on its way to the bank, by component.
+    """Return this seat's net worth, by component.
+
+    Net worth and not pipeline value: the coins in the bank are one of the
+    components, at face value, so that arriving is worth what being on the way
+    was worth and a fair trade in either direction is neutral. See the module
+    docstring for the measurement that put them there.
 
     The seat is read from the observation rather than passed, exactly as
     ``rollout._bank`` reads it: the engine stamps each seat's own index into the
@@ -151,7 +203,8 @@ def potential(observation: Mapping[str, Any]) -> list[float]:
 
     Returns:
         One coin figure per name in ``POTENTIAL_COMPONENTS``, in that order.
-        Sums to the whole farm's pipeline value; never negative.
+        Sums to the seat's whole net worth; never negative, because the engine
+        refuses any purchase the bank cannot cover.
     """
     seat = int(observation["player"])
     farm = observation["farms"][seat]
@@ -166,7 +219,16 @@ def potential(observation: Mapping[str, Any]) -> list[float]:
         for item, count in held.items()
     )
     stored = sum(count * VALUE[item] for item, count in private["shed"].items())
-    return [float(seeds), float(land), growing, livestock, float(carried), stored]
+    money = float(farm["money"])
+    return [
+        float(seeds),
+        float(land),
+        growing,
+        livestock,
+        float(carried),
+        stored,
+        money,
+    ]
 
 
 def _standing(tiles: Sequence[Sequence[Any]]) -> tuple[float, float]:
@@ -255,6 +317,19 @@ def progress_reward(potentials: torch.Tensor, gamma: float) -> torch.Tensor:
     the season by setting each seat's reward to its ``money``, and a shed full
     of melons is worth nothing at that moment.
 
+    **Since the potential became net worth, that correction hands back the bank
+    too, and it is an order of magnitude larger.** Measured over one 719-turn
+    season of ``economic_policy`` against itself (seed 3): the last acting state
+    is worth 111,312, of which 100,572 is banked, so the last turn's shaped
+    reward is -111,312 where a pipeline-only potential made it -10,740. It
+    remains a constant and still cannot move the optimum -- the same episode's
+    shaped return, discounted at ``gamma``, is -3,000.55 against ``-P(s_0)`` of
+    exactly -3,000, the residual being float32 -- but it is a single-turn reward
+    two orders of magnitude larger than any other in the season, and the critic
+    has to fit it. What it buys, on the same episode: the mean absolute shaped
+    reward over the other 718 turns *fell*, from 380 to 237, because a sale is
+    now nearly neutral instead of handing back everything sold.
+
     That is why this function takes the *acting* states and appends the
     terminal zero itself, rather than accepting a state-major array with the
     terminal row already in it. The caller cannot supply a non-zero terminal
@@ -265,8 +340,11 @@ def progress_reward(potentials: torch.Tensor, gamma: float) -> torch.Tensor:
 
     What remains true after the zeroing is what the term was introduced for:
     the shaped return over any *cycle* of states still depends only on its
-    endpoints, so no reversible loop pays anything, and holding stock still
-    costs ``(1 - gamma)`` of its value per turn.
+    endpoints, so no reversible loop pays anything. The ``(1 - gamma)`` carrying
+    cost per turn is now charged on the whole net worth rather than on held
+    stock alone -- 16,086 coins of it over the season above, against a 3,000
+    opening potential -- which is a drag on the *undiscounted* sum and exactly
+    nothing under the objective, since that is what discounting it recovers.
 
     Args:
         potentials: ``(turns, len(POTENTIAL_COMPONENTS))`` potentials, one row
@@ -276,8 +354,8 @@ def progress_reward(potentials: torch.Tensor, gamma: float) -> torch.Tensor:
 
     Returns:
         ``(turns,)`` shaped reward in coins. The last entry is
-        ``-P(s_last_acting)``: everything still in the pipeline at the horizon
-        is handed back.
+        ``-P(s_last_acting)``: everything the seat is worth at the horizon, the
+        bank included, is handed back.
 
     Raises:
         ValueError: If ``potentials`` is not turn-major over the components --

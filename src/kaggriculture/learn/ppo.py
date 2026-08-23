@@ -152,11 +152,15 @@ DIFFERENTIAL = 1.0
 # wheat is worth some other number of banked coins, and there is nothing to base
 # that on.
 #
-# The total it contributes to an episode is bounded and small: the series
-# telescopes, so a whole season's shaped return is `P(terminal)` less the
-# carrying cost, and a farm cannot hold more than a shed's worth plus its fields
-# and its livestock. It is dense where the money reward is sparse and it is
-# nearly absent from the total, which is what a curriculum term should be.
+# The total it contributes to an episode is a constant, and since `P` became net
+# worth it is no longer a small one: the series telescopes to `-P(s_0)` under
+# the discount, which is the 3,000 both seats open on, but the *undiscounted*
+# sum is that plus the `(1 - gamma)` carrying cost on everything owned -- 19,086
+# coins over one measured `economic_policy` season, of which 111,312 arrives on
+# the last turn alone. It is dense where the money reward is sparse, it does not
+# move the optimum, and it does put one reward two orders of magnitude larger
+# than its neighbours at the horizon. `progress.progress_reward` carries the
+# arithmetic and the measurement.
 PROGRESS = 1.0
 
 # Toad Brigade's 0.999, rescaled to our episode. Their game is 360 turns and
@@ -207,9 +211,13 @@ KL_STEPS = 100
 # Unlike the teacher penalty, nothing depends on this decay: a potential-based
 # term does not move the optimum, so it can be left on forever without changing
 # what is being optimised. It decays anyway for the one effect it does have --
-# the `(1 - gamma)` carrying cost on held stock, which is a real if small
-# preference for selling early that we would rather not pay once the chain is
-# routine -- and because a reward that is still being shaped at the end of a run
+# the `(1 - gamma)` carrying cost, which since the potential became net worth is
+# charged on the bank as well as on held stock, so it is a per-turn drag
+# proportional to everything the seat owns rather than the small preference for
+# selling early it was when only the pipeline was in the potential. Exactly
+# cancelled under the discounted objective, and something we would rather not
+# carry through a whole run regardless -- and because a reward that is still
+# being shaped at the end of a run
 # has not been shown to work without the shaping.
 #
 # At ~55 iterations an hour a workstation day ends inside the hold, so a run of
@@ -523,9 +531,10 @@ def reward_of(trajectory: Trajectory, config: PpoConfig) -> torch.Tensor:
     Harada and Russell leaves the optimal policy unchanged whatever the money
     reward beneath it is. Blending it in would make the money reward smaller
     when shaping was strong, which is the opposite of what shaping is for. It
-    does not move the scale either: the term telescopes, so its contribution to
-    an episode's total is the terminal pipeline value, a few hundred coins
-    against a season's tens of thousands.
+    telescopes to a constant and so cannot move the objective; it does move the
+    *scale*, because the potential is net worth and the horizon hands all of it
+    back on one turn. See the ``PROGRESS`` comment for what that is worth in
+    coins.
 
     Args:
         trajectory: The episode, carrying all three recorded series.

@@ -122,7 +122,12 @@ class Trajectory:
 
 
 def potential(state: SimState, seat: int) -> torch.Tensor:
-    """Return the six potential components directly from tensor state."""
+    """Return the seat's net worth by component, directly from tensor state.
+
+    Column for column ``learn.progress.potential``, in the order
+    ``POTENTIAL_COMPONENTS`` names -- ``money`` last, and read straight off
+    ``state.money`` rather than priced, because a coin is worth a coin.
+    """
     if seat not in (0, 1):
         raise ValueError(f"seat must be 0 or 1, got {seat}")
     device = state.step.device
@@ -157,7 +162,10 @@ def potential(state: SimState, seat: int) -> torch.Tensor:
         dim=(1, 2)
     )
     stored = (state.shed[:, seat].to(torch.float32) * values).sum(dim=-1)
-    return torch.stack((seeds, land, growing, livestock, carried, stored), dim=-1)
+    money = state.money[:, seat].to(torch.float32)
+    return torch.stack(
+        (seeds, land, growing, livestock, carried, stored, money), dim=-1
+    )
 
 
 def _sample(

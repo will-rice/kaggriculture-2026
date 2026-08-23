@@ -45,8 +45,9 @@ all.
 
 **Three series are recorded, and this module does not choose between them.**
 ``rewards`` is the per-turn change in (our bank - their bank), ``own`` is the
-per-turn change in our own bank alone, and ``potentials`` is what the farm was
-holding on its way to the bank at each state, by component. All three are stored
+per-turn change in our own bank alone, and ``potentials`` is what the seat was
+worth at each state -- its stock priced in coins *plus* its bank -- by
+component. All three are stored
 on every trajectory; how they are mixed is a set of weights in ``PpoConfig`` and
 a schedule in the training loop, because it is a property of *where a run is*
 rather than of what an episode was.
@@ -66,7 +67,9 @@ happen. ``P`` at the state a trajectory stops in is the only endpoint of the
 telescoped shaping the agent can choose, so a non-zero one pays for ending the
 season holding stock: at ``gamma = 0.9995`` over 719 turns, a unit held from
 turn 700 to the horizon keeps 99% of its value, and refusing to sell into a market
-both farms have pushed below base would be shaped-optimal. So the terminal is a
+both farms have pushed below base would be shaped-optimal. Since the potential
+became net worth the same row would also carry the bank, which is the larger
+half of it -- 100,572 of 111,312 on one measured season. So the terminal is a
 hard zero, and it lives in ``progress.progress_reward`` -- which takes the
 acting rows and appends the zero itself, so this module has nowhere to put a
 terminal row even by accident.
@@ -260,8 +263,8 @@ class Trajectory:
             ``PpoConfig.differential``, and a trajectory collected under one
             setting is usable under the other because both were kept.
         potentials: ``(turns, len(POTENTIAL_COMPONENTS))`` coin value of
-            everything the farm held on its way to the bank, one row per turn
-            the policy acted from. Undifferenced, because the ``gamma`` in the
+            everything the seat owned, its bank included, one row per turn the
+            policy acted from. Undifferenced, because the ``gamma`` in the
             shaped reward belongs to the update; and with **no terminal row**,
             because a non-zero potential at the state a season stops in pays
             the agent to end it holding stock. See this module's docstring and
@@ -344,8 +347,8 @@ class Stream:
             same turns as ``margins``. See ``toad_reward.counts``.
         snapshots: The three things ``sales`` reads, copied out of each
             observation as it is seen. See ``_snapshot``.
-        potentials: What its farm held on its way to the bank before each
-            decision, by component, read on the same turns as the other two.
+        potentials: What the seat was worth before each decision -- stock plus
+            bank -- by component, read on the same turns as the other two.
     """
 
     environment: int
@@ -848,9 +851,10 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
 
     The potentials do *not* get that treatment and are stored one row per turn,
     undifferenced and terminal-free. The season's score is each seat's ``money``
-    and nothing else, so whatever is still in the shed at the horizon is worth
-    zero -- and a potential that said otherwise would be paying for the one
-    endpoint the agent controls. See the module docstring.
+    and nothing else, so whatever the seat is worth at the horizon -- shed,
+    fields and bank alike -- is handed back there, and a potential that said
+    otherwise would be paying for the one endpoint the agent controls. See the
+    module docstring.
 
     Args:
         stream: One seat's decisions and the two money series it saw.

@@ -1,12 +1,17 @@
-"""Tests for the self-play loop's run-control guards."""
+"""Tests for the self-play loop's run-control guards and its episode metrics."""
 
 import pytest
+import torch
 
 from kaggriculture.constants import STARTING_MONEY
+from kaggriculture.learn.ppo import PpoConfig
+from kaggriculture.learn.progress import POTENTIAL_COMPONENTS
+from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts.selfplay import (
     COLLAPSE_FRACTION,
     COLLAPSE_PATIENCE,
     FARMING_PATIENCE,
+    played,
     refuse_collapse,
     refuse_farming,
 )
@@ -128,3 +133,74 @@ def test_a_short_run_is_never_judged_for_farming() -> None:
 def test_a_run_with_no_pipeline_to_grow_is_not_judged_for_farming() -> None:
     """A ratio against zero is not a measurement, and a fresh start opens there."""
     refuse_farming([0.0] * (2 * FARMING_PATIENCE), [0.0] * (2 * FARMING_PATIENCE))
+
+
+def test_the_farming_guard_is_offered_the_pipeline_and_not_the_bank() -> None:
+    """The one metric the guard reads has to exclude the bank, and now must.
+
+    ``refuse_farming`` fires when stock piles up while the bank stays flat.
+    Since the potential became net worth its total *contains* the bank, so a
+    guard handed ``potential/total`` would watch a number that rises precisely
+    when the run is going well -- and the failure it exists for, a pipeline
+    growing against a flat bank, would no longer be expressible in it. Hence
+    ``potential/pipeline``, which is what the loop passes.
+
+    Each component is given a different value so that a total, a pipeline and a
+    single column cannot be confused for one another; a potential of all ones
+    would let any two of the three swap.
+    """
+    turns = 4
+    money = POTENTIAL_COMPONENTS.index("money")
+    components = torch.arange(1, len(POTENTIAL_COMPONENTS) + 1, dtype=torch.float32)
+    trajectory = _trajectory(components.tile((turns, 1)))
+
+    measured = played([trajectory], PpoConfig())
+
+    assert measured["potential/money"] == pytest.approx(float(components[money]))
+    assert measured["potential/total"] == pytest.approx(float(components.sum()))
+    assert measured["potential/pipeline"] == pytest.approx(
+        float(components.sum()) - float(components[money])
+    )
+    assert measured["potential/pipeline"] < measured["potential/total"]
+
+
+def _trajectory(potentials: torch.Tensor) -> Trajectory:
+    """Return a trajectory carrying these potentials and nothing else of interest.
+
+    ``played`` reads five of the twenty-odd fields, so the rest are single-element
+    placeholders rather than correctly shaped tensors: a metrics test that had to
+    be updated whenever the board's plane count changed would be a test of the
+    encoding, which is tested where the encoding is.
+    """
+    turns = potentials.shape[0]
+    empty = torch.zeros(1)
+    return Trajectory(
+        board=empty,
+        scalars=empty,
+        positions=empty,
+        unit_actions=empty,
+        unit_quantities=empty,
+        market_actions=empty,
+        unit_masks=empty,
+        unit_quantity_masks=empty,
+        market_masks=empty,
+        log_probs=empty,
+        values=empty,
+        rewards=torch.zeros(turns),
+        own=torch.zeros(turns),
+        shaped=torch.zeros(turns),
+        shaped_money=torch.zeros(turns),
+        margin=torch.zeros(turns),
+        sparse=torch.zeros(turns),
+        potentials=potentials,
+        dones=torch.zeros(turns, dtype=torch.bool),
+        final_margin=0.0,
+        final_bank=float(STARTING_MONEY),
+        final_capital=0.0,
+        illegal=0,
+        sales=0.0,
+        units_sold=0.0,
+        mean_sale_price=0.0,
+        realisation=0.0,
+        bought=0.0,
+    )
