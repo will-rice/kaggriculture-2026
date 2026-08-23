@@ -47,15 +47,24 @@ from importlib import metadata
 from pathlib import Path
 
 import torch
+import wandb
 from lightning import seed_everything
 
-import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
 from kaggriculture.learn.encoding import transfer_slots
 from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.rollout import Trajectory, rollout_many
+from kaggriculture.learn.toad.data import (
+    ACTED_FIELDS as _ACTED_FIELDS,
+)
+from kaggriculture.learn.toad.data import (
+    OBSERVED_FIELDS as _OBSERVED_FIELDS,
+)
+from kaggriculture.learn.toad.data import (
+    segments,
+)
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -79,6 +88,11 @@ from kaggriculture.learn.toad_reward import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# Temporary aliases preserve the runner's original segmentation surface while
+# callers move to ``kaggriculture.learn.toad.data.segments``.
+ACTED_FIELDS = _ACTED_FIELDS
+OBSERVED_FIELDS = _OBSERVED_FIELDS
 
 
 @dataclass(frozen=True)
@@ -156,22 +170,6 @@ OPPONENT = "src/kaggriculture/economic_policy.py"
 # the value target bootstraps from the state *after* the segment's last action
 # and not from that action's own state; see `_segments` for why the difference
 # is the whole ballgame.
-ACTED_FIELDS = (
-    "unit_actions",
-    "unit_quantities",
-    "market_actions",
-    "unit_masks",
-    "unit_quantity_masks",
-    "market_masks",
-    "log_probs",
-    "shaped",
-    "shaped_money",
-    "margin",
-    "own",
-    "sparse",
-    "dones",
-)
-OBSERVED_FIELDS = ("board", "scalars", "positions")
 RUNS = Path("/data/kaggriculture/toad")
 # Every 25 updates is ~13 minutes of work at the measured 3.97M steps/hour.
 # Attempt one had none, and an external kill at update 253 cost 2.3 hours.
@@ -1819,22 +1817,7 @@ def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
         One dict per segment, ``ACTED_FIELDS`` carrying ``UNROLL_LENGTH`` rows
         and ``OBSERVED_FIELDS`` carrying one more.
     """
-    turns = int(trajectory.dones.shape[0])
-    return [
-        {
-            **{
-                name: getattr(trajectory, name)[start : start + UNROLL_LENGTH]
-                for name in ACTED_FIELDS
-            },
-            **{
-                name: getattr(trajectory, name)[_observed(turns, start)]
-                for name in OBSERVED_FIELDS
-            },
-        }
-        for start in range(
-            turns % UNROLL_LENGTH, turns - UNROLL_LENGTH + 1, UNROLL_LENGTH
-        )
-    ]
+    return segments(trajectory, UNROLL_LENGTH)
 
 
 def _observed(turns: int, start: int) -> torch.Tensor:
