@@ -246,7 +246,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         return mirror + scripted
 
     def __iter__(self) -> Iterator[LearnerBatch]:
-        """Collect each assignment, then expose its optimizer-sized batches."""
+        """Collect one assignment set, then expose it as one logical round."""
         assignments = self._assignments
         if assignments is None:
             assignments = tuple(
@@ -258,30 +258,38 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 )
                 for game_id in range(self.config.population.environments_per_rank)
             )
+        if not assignments:
+            return
+        if any(
+            assignment.kind is not assignments[0].kind for assignment in assignments
+        ):
+            raise ValueError("one collection round must contain one batch kind")
+
+        trajectories: list[Trajectory] = []
         for assignment in assignments:
             try:
-                trajectories = self._collector(assignment)
+                trajectories.extend(self._collector(assignment))
             except Exception as error:
                 raise CollectionError(
                     "collection failed for "
                     f"game_id={assignment.game_id} seed={assignment.seed} "
                     f"opponent={assignment.opponent_id}"
                 ) from error
-            meta = RoundMeta(
-                round_id=self._next_round_id,
-                actor_version=self.actor_version,
-                game_ids=(assignment.game_id,),
-                seeds=(assignment.seed,),
-                opponent_ids=(assignment.opponent_id,),
-                kind=assignment.kind,
-            )
-            self._next_round_id += 1
-            yield from RoundBatchExpander(
-                batch_segments=self.config.optimizer.batch_segments,
-                unroll_length=self.config.optimizer.unroll_length,
-                value_passes=self.config.optimizer.value_passes,
-                seed=self.config.runtime.seed,
-            ).expand(trajectories, meta)
+        meta = RoundMeta(
+            round_id=self._next_round_id,
+            actor_version=self.actor_version,
+            game_ids=tuple(assignment.game_id for assignment in assignments),
+            seeds=tuple(assignment.seed for assignment in assignments),
+            opponent_ids=tuple(assignment.opponent_id for assignment in assignments),
+            kind=assignments[0].kind,
+        )
+        self._next_round_id += 1
+        yield from RoundBatchExpander(
+            batch_segments=self.config.optimizer.batch_segments,
+            unroll_length=self.config.optimizer.unroll_length,
+            value_passes=self.config.optimizer.value_passes,
+            seed=self.config.runtime.seed,
+        ).expand(trajectories, meta)
 
 
 class RoundIterableDataset(IterableDataset[LearnerBatch]):
@@ -310,7 +318,10 @@ class ToadDataModule(lightning.LightningDataModule):
     ) -> None:
         """Detach learner weights before making them available to collection."""
         self.source.publish_actor(
-            {name: tensor.detach().cpu() for name, tensor in state_dict.items()},
+            {
+                name: tensor.detach().to("cpu", copy=True)
+                for name, tensor in state_dict.items()
+            },
             version,
         )
 

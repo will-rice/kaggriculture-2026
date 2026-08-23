@@ -104,6 +104,28 @@ def test_collection_error_names_the_failed_game() -> None:
         next(iter(source))
 
 
+def test_source_aggregates_assignments_into_one_logical_round() -> None:
+    """Per-game boundaries would advance the scheduler and actor too often."""
+    assignments = (
+        CollectionAssignment(7, 17, "self", BatchKind.SELFPLAY),
+        CollectionAssignment(8, 18, "self", BatchKind.SELFPLAY),
+    )
+    source = ReferenceRoundSource(
+        ToadConfig.control(),
+        assignments=assignments,
+        collect_assignment=lambda _: (_trajectory(64),),
+    )
+
+    batches = list(source)
+
+    assert {batch.round_id for batch in batches} == {0}
+    assert sum(batch.end_of_round for batch in batches) == 1
+    assert batches[-1].end_of_round
+    assert batches[0].game_ids == (7, 8)
+    assert batches[0].opponent_ids == ("self", "self")
+    assert sum(batch.collected_steps for batch in batches) == 128
+
+
 def test_data_module_detaches_actor_before_publication() -> None:
     """Collector publication must never retain a gradient-bearing learner tensor."""
     source = ReferenceRoundSource(
@@ -117,6 +139,10 @@ def test_data_module_detaches_actor_before_publication() -> None:
     assert source.actor_version == 4
     assert source.actor_state["weight"].device.type == "cpu"
     assert not source.actor_state["weight"].requires_grad
+    with torch.no_grad():
+        weight.zero_()
+    assert source.actor_state["weight"].tolist() == [1.0, 1.0]
+    assert source.actor_state["weight"].data_ptr() != weight.data_ptr()
     loader = module.train_dataloader()
     assert loader.batch_size is None
     assert loader.num_workers == 0
