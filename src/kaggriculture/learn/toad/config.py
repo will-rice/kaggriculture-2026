@@ -1,0 +1,257 @@
+"""Validated, serializable configuration for the native Toad trainer."""
+
+import hashlib
+import json
+import math
+from pathlib import Path
+from typing import Literal, Self, Sequence, cast
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
+
+from kaggriculture.learn.toad_loss import (
+    ADAM_EPS,
+    CLIP_GRADS,
+    DISCOUNTING,
+    ENTROPY_COST,
+    LEARNING_RATE,
+    LMB,
+    MIN_LR_MOD,
+    TOTAL_STEPS,
+    UNROLL_LENGTH,
+    VALUE_WARMUP_BATCHES,
+)
+
+Precision = Literal["32-true", "bf16-mixed"]
+
+
+class ModelConfig(BaseModel):
+    """Policy architecture settings."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    blocks: PositiveInt = 8
+    channels: PositiveInt = 128
+    kernel_size: Literal[3, 5] = 3
+    activation: Literal["relu", "leaky_relu"] = "relu"
+    value_bound: PositiveFloat | None = 1.0
+    recurrent: bool = False
+    transformer: bool = False
+    local_patch: bool = False
+    belief: bool = False
+    interaction_value: bool = False
+
+
+class PopulationConfig(BaseModel):
+    """Actor population and opponent-pool settings."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    selfplay: float = 0.5
+    scripted: float = 0.5
+    frozen_opponent: float = 0.0
+    teacher_distill: float = 0.0
+    scripted_opponent: str = "economic"
+    teacher_checkpoint: Path | None = None
+    actor_sync_every_rounds: PositiveInt = 4
+    environments_per_rank: PositiveInt = 24
+    collection_processes: PositiveInt = 24
+    pool_capacity: PositiveInt = 8
+    initial_snapshots: tuple[Path, ...] = ()
+    snapshot_every_environment_steps: PositiveInt | None = None
+    snapshot_at_start: bool = False
+    pool_sampling: Literal["uniform"] = "uniform"
+    pool_replacement: Literal["oldest"] = "oldest"
+    population_seed: int = 0
+
+
+class OptimizerConfig(BaseModel):
+    """Loss coefficients and optimizer schedule settings."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lr: PositiveFloat = LEARNING_RATE
+    adam_eps: PositiveFloat = ADAM_EPS
+    gamma: float = DISCOUNTING
+    lmb: float = LMB
+    entropy_cost: float = ENTROPY_COST
+    teacher_kl_cost: float = 0.0
+    teacher_baseline_cost: NonNegativeFloat = 0.0
+    vtrace_pg_cost: NonNegativeFloat = 1.0
+    upgo_pg_cost: NonNegativeFloat = 1.0
+    baseline_cost: NonNegativeFloat = 1.0
+    clip_grad_norm: PositiveFloat = CLIP_GRADS
+    final_lr_multiplier: float = Field(default=MIN_LR_MOD, ge=0.0, le=1.0)
+    unroll_length: PositiveInt = UNROLL_LENGTH
+    batch_segments: PositiveInt = 4
+    value_warmup_batches: NonNegativeInt = VALUE_WARMUP_BATCHES
+    value_passes: NonNegativeInt = 0
+
+
+class RuntimeConfig(BaseModel):
+    """Single-device execution settings supported by the native trainer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    seed: int = 0
+    accelerator: str = "auto"
+    devices: Literal[1] = 1
+    num_nodes: Literal[1] = 1
+    strategy: Literal["auto"] = "auto"
+    precision: Literal["32-true"] = "32-true"
+    deterministic: bool = False
+    benchmark: bool | None = None
+    total_environment_steps: PositiveInt = TOTAL_STEPS
+    log_every_n_steps: PositiveInt = 1
+    checkpoint_every_environment_steps: PositiveInt = 1_000_000
+    profiler: Literal["simple", "advanced"] | None = None
+    output_dir: Path = Path("run/toad")
+    resume: Path | None = None
+    compile: Literal[False] = False
+    rollout_backend: Literal["reference"] = "reference"
+
+
+class EvaluationGate(BaseModel):
+    """An evaluation threshold for curriculum progression."""
+
+    metric: str
+    minimum: float
+    opponent: str
+    seeds: PositiveInt
+
+
+class CurriculumConfig(BaseModel):
+    """Curriculum state and failure behavior."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: str = "phase1"
+    reward_field: Literal["shaped_money", "shaped", "sparse", "own"] = "shaped_money"
+    gate: EvaluationGate | None = None
+    on_gate_failure: Literal["stop"] = "stop"
+
+
+class ToadConfig(BaseModel):
+    """The complete serializable native Toad experiment contract."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    population: PopulationConfig = Field(default_factory=PopulationConfig)
+    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    curriculum: CurriculumConfig = Field(default_factory=CurriculumConfig)
+
+    @classmethod
+    def control(cls) -> Self:
+        """Return the control configuration reproducing the current recipe."""
+        return cls()
+
+    @model_validator(mode="after")
+    def validate_relationships(self) -> Self:
+        """Reject combinations unsupported by the native trainer."""
+        probabilities = (
+            self.population.selfplay,
+            self.population.scripted,
+            self.population.frozen_opponent,
+            self.population.teacher_distill,
+        )
+        if any(value < 0 for value in probabilities) or not math.isclose(
+            sum(probabilities), 1.0
+        ):
+            raise ValueError(
+                "population probabilities must be nonnegative and sum to one"
+            )
+        if (
+            self.optimizer.teacher_kl_cost or self.population.teacher_distill
+        ) and self.population.teacher_checkpoint is None:
+            raise ValueError(
+                "teacher checkpoint is required by teacher loss or batches"
+            )
+        if (
+            self.population.teacher_checkpoint is not None
+            and not self.population.teacher_checkpoint.is_file()
+        ):
+            raise ValueError(
+                "teacher checkpoint is not readable: "
+                f"{self.population.teacher_checkpoint}"
+            )
+        if self.population.frozen_opponent and not (
+            self.population.initial_snapshots
+            or (
+                self.population.snapshot_at_start
+                and self.population.snapshot_every_environment_steps
+            )
+        ):
+            raise ValueError(
+                "frozen opponent batches require initial snapshots "
+                "or a snapshot schedule"
+            )
+        return self
+
+
+def load_config(path: Path | None, overrides: Sequence[str] = ()) -> ToadConfig:
+    """Load a JSON configuration and apply validated dotted overrides."""
+    payload = {} if path is None else json.loads(path.read_text())
+    return apply_overrides(ToadConfig.model_validate(payload), overrides)
+
+
+def apply_overrides(config: ToadConfig, overrides: Sequence[str]) -> ToadConfig:
+    """Apply JSON-typed dotted overrides by reconstructing ``ToadConfig``."""
+    payload = config.model_dump(mode="python")
+    for override in overrides:
+        path, raw = override.split("=", 1)
+        cursor = payload
+        parts = path.split(".")
+        for part in parts[:-1]:
+            if part not in cursor or not isinstance(cursor[part], dict):
+                raise ValueError(f"unknown override path {path!r}")
+            cursor = cursor[part]
+        if parts[-1] not in cursor:
+            raise ValueError(f"unknown override path {path!r}")
+        cursor[parts[-1]] = json.loads(raw)
+    return ToadConfig.model_validate(payload)
+
+
+STRUCTURAL_FIELDS = (
+    "model",
+    "optimizer.unroll_length",
+    "optimizer.batch_segments",
+)
+
+
+def select_paths(payload: dict[str, object], paths: Sequence[str]) -> dict[str, object]:
+    """Select dotted paths while preserving their nesting in ``payload``."""
+    selected: dict[str, object] = {}
+    for path in paths:
+        source = payload
+        target = selected
+        parts = path.split(".")
+        for part in parts[:-1]:
+            source_value = source[part]
+            if not isinstance(source_value, dict):
+                raise ValueError(f"path {path!r} does not contain a mapping")
+            source = cast(dict[str, object], source_value)
+            if part not in target:
+                target[part] = {}
+            target_value = target[part]
+            if not isinstance(target_value, dict):
+                raise ValueError(f"path {path!r} conflicts with an earlier selection")
+            target = cast(dict[str, object], target_value)
+        target[parts[-1]] = source[parts[-1]]
+    return selected
+
+
+def structural_fingerprint(config: ToadConfig) -> str:
+    """Hash settings that determine checkpoint and batch compatibility."""
+    payload = select_paths(config.model_dump(mode="json"), STRUCTURAL_FIELDS)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()

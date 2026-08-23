@@ -101,7 +101,12 @@ invalid-argument-type = "ignore"
 # -- `toad_loss.py`, `toad_reward.py`, `scripts/toad.py` and their tests
 # -- is still checked in full.
 [[tool.ty.overrides]]
-include = ["src/kaggriculture/learn/toad/**"]
+include = [
+  "src/kaggriculture/learn/toad/core/**",
+  "src/kaggriculture/learn/toad/nns/**",
+  "src/kaggriculture/learn/toad/monobeast.py",
+  "src/kaggriculture/learn/toad/reward_spaces_lux.py",
+]
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"

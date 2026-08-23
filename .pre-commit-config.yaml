@@ -1,7 +1,7 @@
 # Vendored verbatim from github.com/IsaiahPressman/Kaggle_Lux_AI_2021. Reformatting
 # it would make our copy diverge from the artifact we are reproducing, and we would
 # no longer be able to tell a bad result in their recipe from a bad transcription.
-exclude: ^src/kaggriculture/learn/toad/
+exclude: ^src/kaggriculture/learn/toad/(conf/|core/|nns/|monobeast\.py$|reward_spaces_lux\.py$)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
