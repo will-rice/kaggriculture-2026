@@ -35,25 +35,32 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
 """
 
 import argparse
-import copy
-import json
 import logging
 import os
-import time
+import sys
+import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
+import lightning
 import torch
 import wandb
 from lightning import seed_everything
+from lightning.pytorch.loggers import WandbLogger
 
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
 from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.rollout import Trajectory, rollout_many
+from kaggriculture.learn.toad.callbacks import (
+    ActorSyncCallback,
+    BoundaryCheckpoint,
+    EnvironmentStepStop,
+)
+from kaggriculture.learn.toad.config import ToadConfig, load_config
 from kaggriculture.learn.toad.data import (
     ACTED_FIELDS as _ACTED_FIELDS,
 )
@@ -61,26 +68,28 @@ from kaggriculture.learn.toad.data import (
     OBSERVED_FIELDS as _OBSERVED_FIELDS,
 )
 from kaggriculture.learn.toad.data import (
+    ReferenceRoundSource,
+    ToadDataModule,
     segments,
 )
+from kaggriculture.learn.toad.lightning import ToadLightningModule
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
     DISCOUNTING,
     ENTROPY_COST,
-    LEARNING_RATE,
     LMB,
     MIN_LR_MOD,
     TEACHER_KL_COST,
     TOTAL_STEPS,
     UNROLL_LENGTH,
-    VALUE_WARMUP_BATCHES,
     losses,
 )
 from kaggriculture.learn.toad_reward import (
     ABSOLUTE_WEIGHT,
     CAPITAL_WEIGHT,
     MARGIN_WEIGHT,
+    MONEY_WEIGHT,
     MONEY_WEIGHT_ENV,
     money_weight,
 )
@@ -341,15 +350,18 @@ METRIC_DEFINITIONS: dict[str, str] = {
 
 
 def _parser() -> argparse.ArgumentParser:
-    """Return this arm's command line, pulled out of ``main`` so a test can parse it.
+    """Return the one-release legacy command line translator's parser.
 
-    Every flag's default is the constant it overrides, never a literal, so an
-    invocation that passes none of them is byte-identical to one that predates
-    the flag existing.
+    Production execution uses :func:`parse_config`. This parser remains for one
+    release so existing invocations and helper-level tests can resolve their
+    old flags into the same immutable :class:`ToadConfig` passed to
+    :func:`run`. Defaults come from the control config or the current constants
+    rather than a separately authoritative table.
 
     Returns:
         The argument parser ``main`` parses ``sys.argv`` with.
     """
+    control = ToadConfig.control()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--no-money",
@@ -389,14 +401,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--blocks",
         type=int,
-        default=BLOCKS,
+        default=control.model.blocks,
         help="residual blocks in the learner's (and rollout actor's) trunk. "
         "Phases 3-5 of the curriculum need 16 and 24 against phase 1-2's 8.",
     )
     parser.add_argument(
         "--channels",
         type=int,
-        default=CHANNELS,
+        default=control.model.channels,
         help="trunk width. Arm C needs 256 to match the BC clone, against "
         "Toad's hidden_dim of 128 -- a declared deviation, not a tuning knob.",
     )
@@ -412,7 +424,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher-blocks",
         type=int,
-        default=BLOCKS,
+        default=control.model.blocks,
         help="residual blocks in the frozen teacher's trunk -- the depth its "
         "own checkpoint was written at, not this arm's --blocks. The recipe's "
         "teachers are always smaller nets than the phase they teach (phase 5's "
@@ -422,7 +434,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--econ-fraction",
         type=float,
-        default=0.0,
+        default=control.population.scripted,
         help="fraction of each round's environments played against "
         "economic_policy instead of the mirror. Only our seat trains from "
         "those: the scripted agent is market pressure, not a tape to clone.",
@@ -430,28 +442,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher-kl-cost",
         type=float,
-        default=TEACHER_KL_COST,
+        default=control.optimizer.teacher_kl_cost,
         help="teacher KL weight. Their cascade drops it to 0.001 at phase 3, "
         "where the policy should start out-earning its teacher.",
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=LEARNING_RATE,
+        default=control.optimizer.lr,
         help="Adam learning rate the schedule decays from. Sweep knob; "
         "the default reproduces every earlier arm exactly.",
     )
     parser.add_argument(
         "--entropy-cost",
         type=float,
-        default=ENTROPY_COST,
+        default=control.optimizer.entropy_cost,
         help="coefficient on the entropy loss term. Sweep knob; the default "
         "reproduces every earlier arm exactly.",
     )
     parser.add_argument(
         "--gamma",
         type=float,
-        default=DISCOUNTING,
+        default=control.optimizer.gamma,
         help="discount the return and advantage targets are built at "
         "(``losses``' ``discounting``). Sweep knob; the default reproduces "
         "every earlier arm exactly.",
@@ -459,7 +471,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lmb",
         type=float,
-        default=LMB,
+        default=control.optimizer.lmb,
         help="lambda for both TD(lambda) and UPGO, named to match "
         "toad_loss.losses' own parameter rather than shadowing the Python "
         "keyword. Their 0.8 for phases 1-4 and 0.9 for phase 5.",
@@ -467,7 +479,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--value-warmup-batches",
         type=int,
-        default=VALUE_WARMUP_BATCHES,
+        default=control.optimizer.value_warmup_batches,
         help="train the value head alone for this many batches before the "
         "policy gradient fires (arm C'). Their phase-2 mechanism, for a "
         "warm-started policy whose critic is untrained. 0 means no warmup.",
@@ -475,7 +487,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--value-passes",
         type=int,
-        default=0,
+        default=control.optimizer.value_passes,
         help="extra value-only passes over each round after the policy's one "
         "(arm S uses 4). A round is otherwise seen once and discarded, and the "
         "ceiling experiment put a critic trained 150 times over the same data at "
@@ -503,7 +515,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--total-steps",
         type=int,
-        default=TOTAL_STEPS,
+        default=control.runtime.total_environment_steps,
         help="environment steps this arm trains for. The curriculum's five "
         "phases each need a different budget (2e7-1e7) against this "
         "constant's declared-deviation 1e8.",
@@ -511,137 +523,162 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _config_parser() -> argparse.ArgumentParser:
+    """Return the primary typed-config command line parser."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=JSON_VALUE",
+    )
+    return parser
+
+
+def parse_config(argv: Sequence[str] | None = None) -> ToadConfig:
+    """Resolve and validate the primary config CLI without runtime side effects."""
+    arguments = _config_parser().parse_args(argv)
+    return load_config(arguments.config, arguments.overrides)
+
+
+def _legacy_config(argv: Sequence[str]) -> ToadConfig:
+    """Translate the former flags into the native immutable config contract."""
+    arguments = _parser().parse_args(argv)
+    reward_field = _field(arguments)
+
+    control = ToadConfig.control()
+    payload = control.model_dump(mode="python")
+    payload["model"].update(
+        blocks=arguments.blocks,
+        channels=arguments.channels,
+        warm_start_checkpoint=CHECKPOINT if arguments.clone_init else None,
+    )
+    payload["population"].update(
+        selfplay=1.0 - arguments.econ_fraction,
+        scripted=arguments.econ_fraction,
+        teacher_checkpoint=arguments.teacher,
+        teacher_blocks=arguments.teacher_blocks
+        if arguments.teacher is not None
+        else None,
+    )
+    payload["optimizer"].update(
+        lr=arguments.lr,
+        gamma=arguments.gamma,
+        lmb=arguments.lmb,
+        entropy_cost=arguments.entropy_cost,
+        teacher_kl_cost=arguments.teacher_kl_cost,
+        value_warmup_batches=arguments.value_warmup_batches,
+        value_passes=arguments.value_passes,
+    )
+    payload["runtime"].update(
+        total_environment_steps=arguments.total_steps,
+        resume=arguments.resume,
+    )
+    payload["curriculum"].update(
+        phase=arguments.name or control.curriculum.phase,
+        reward_field=reward_field,
+        money_weight=arguments.money_weight
+        if arguments.money_weight is not None
+        else control.curriculum.money_weight,
+    )
+    return ToadConfig.model_validate(payload)
+
+
+def _uses_legacy_cli(argv: Sequence[str]) -> bool:
+    """Return whether ``argv`` contains a flag outside the primary surface."""
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument.startswith("--config=") or argument.startswith("--set="):
+            index += 1
+            continue
+        if argument in {"-h", "--help"}:
+            index += 1
+            continue
+        if argument in {"--config", "--set"}:
+            index += 2
+            continue
+        return True
+    return False
+
+
+def build_wandb_logger(config: ToadConfig) -> WandbLogger:
+    """Build the sole tracking surface from the complete resolved config."""
+    return WandbLogger(
+        project=WANDB_PROJECT,
+        name=config.curriculum.phase,
+        save_dir=str(config.runtime.output_dir),
+        config=config.model_dump(mode="json"),
+    )
+
+
+def build_reference_data_module(config: ToadConfig) -> ToadDataModule:
+    """Build the synchronous reference collector bridge."""
+    source = ReferenceRoundSource(config)
+    return ToadDataModule(config, source)
+
+
+def build_trainer(config: ToadConfig) -> lightning.Trainer:
+    """Build the one-device control Trainer with round-boundary ownership."""
+    return lightning.Trainer(
+        accelerator=config.runtime.accelerator,
+        devices=config.runtime.devices,
+        num_nodes=config.runtime.num_nodes,
+        strategy=config.runtime.strategy,
+        precision=config.runtime.precision,
+        deterministic=config.runtime.deterministic,
+        benchmark=config.runtime.benchmark,
+        profiler=config.runtime.profiler,
+        log_every_n_steps=config.runtime.log_every_n_steps,
+        gradient_clip_val=config.optimizer.clip_grad_norm,
+        gradient_clip_algorithm="norm",
+        max_steps=-1,
+        max_epochs=-1,
+        use_distributed_sampler=False,
+        enable_checkpointing=False,
+        callbacks=[
+            ActorSyncCallback(config.population.actor_sync_every_rounds),
+            EnvironmentStepStop(config.runtime.total_environment_steps),
+            BoundaryCheckpoint(config.runtime.output_dir),
+        ],
+        logger=build_wandb_logger(config),
+    )
+
+
+def run(config: ToadConfig) -> None:
+    """Seed once and hand the complete native control path to Lightning."""
+    seed_everything(config.runtime.seed, workers=True)
+    module = ToadLightningModule(config)
+    data = build_reference_data_module(config)
+    build_trainer(config).fit(
+        module,
+        datamodule=data,
+        ckpt_path=config.runtime.resume,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
-    """Run one arm to ``--total-steps``, checkpointing and logging as it goes.
+    """Validate one config, then run it exclusively through Lightning.
 
     Args:
-        argv: Flags to parse, or None for ``sys.argv[1:]`` (the CLI's own
-            default). ``curriculum.py`` passes an explicit list here so it can
-            invoke this entry point directly rather than shelling out or
-            duplicating the training loop.
+        argv: Primary ``--config``/``--set`` arguments or one-release legacy
+            flags. ``None`` reads ``sys.argv[1:]``.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    arguments = _parser().parse_args(argv)
-
-    seed_everything(SEED, workers=True)
-    RUNS.mkdir(parents=True, exist_ok=True)
-    # The single constant the ablation turns on. Everything downstream -- file
-    # names, wandb run name, which reward the learner reads -- follows from it,
-    # so the two arms cannot drift apart in any other respect.
-    if arguments.money_weight is not None:
-        # Into the environment before the worker pool forks, so every rollout
-        # process computes `shaped_money` at this arm's weight.
-        os.environ[MONEY_WEIGHT_ENV] = repr(arguments.money_weight)
-    field = _field(arguments)
-    prefix = _prefix(arguments)
-
-    device = _device()
-    learner = _learner(arguments, device)
-    if arguments.clone_init:
-        _warm_start(learner, device)
-    optimizer = _optimizer(learner, arguments.lr)
-    schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, _decay(arguments.econ_fraction, arguments.total_steps)
-    )
-
-    steps, update = 0, 0
-    if arguments.resume is not None:
-        steps, update = _restore(arguments.resume, learner, optimizer, schedule, device)
-        LOGGER.info(
-            "resumed from %s at update %d, step %d", arguments.resume, update, steps
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if _uses_legacy_cli(arguments):
+        message = (
+            "legacy Toad flags are deprecated for one release; use --config "
+            "PATH plus repeatable --set PATH=JSON_VALUE"
         )
-
-    log = RUNS / f"{prefix}_{int(time.time())}.jsonl"
-    run = _start_run(arguments, field)
-    parameters = sum(p.numel() for p in learner.parameters())
-    LOGGER.info(
-        "phase 1: %d params, device %s, log %s, wandb %s",
-        parameters,
-        device,
-        log,
-        run.url,
-    )
-
-    teacher = _teacher(arguments, device)
-    actor = copy.deepcopy(learner).eval()
-    warmup_left = arguments.value_warmup_batches
-    if warmup_left:
-        LOGGER.info(
-            "value warmup: %d batches (~%.1f updates at %d batches/update)",
-            warmup_left,
-            warmup_left / _batches_per_update(arguments.econ_fraction),
-            _batches_per_update(arguments.econ_fraction),
-        )
-    started = time.monotonic()
-    pool = ProcessPoolExecutor(max_workers=WORKERS)
-    while steps < arguments.total_steps:
-        seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
-        weights = {key: value.cpu() for key, value in actor.state_dict().items()}
-        mirror_batch, econ_batch = _collect(
-            pool,
-            weights,
-            seeds,
-            arguments.blocks,
-            arguments.channels,
-            arguments.econ_fraction,
-        )
-        batch = mirror_batch + econ_batch
-        steps += sum(int(t.shaped.shape[0]) for t in batch)
-        terms, consumed = _update(
-            learner,
-            optimizer,
-            batch,
-            device,
-            field,
-            warmup_left,
-            teacher,
-            arguments.teacher_kl_cost,
-            arguments.value_passes,
-            entropy_cost=arguments.entropy_cost,
-            discounting=arguments.gamma,
-            lmb=arguments.lmb,
-        )
-        warming = warmup_left > 0
-        warmup_left = max(0, warmup_left - consumed)
-        schedule.step()
-        update += 1
-        # No sync while the value head warms up: the actor must keep rolling
-        # out the warm-started policy so the critic learns on the distribution
-        # it will actually have to evaluate. Syncing here is precisely what
-        # destroyed arm C at update 5.
-        if not warming and update % SYNC_EVERY == 0:
-            actor.load_state_dict(learner.state_dict())
-        if update % CHECKPOINT_EVERY == 0:
-            _checkpoint(learner, optimizer, schedule, steps, update, prefix)
-
-        record = _record(
-            mirror_batch,
-            econ_batch,
-            field,
-            update=update,
-            steps=steps,
-            hours=round((time.monotonic() - started) / 3600.0, 4),
-            lr=float(schedule.get_last_lr()[0]),
-            warming=warming,
-            warmup_left=warmup_left,
-            terms=terms,
-        )
-        with log.open("a") as handle:
-            handle.write(json.dumps(record) + "\n")
-        wandb.log(record, step=steps)
-        LOGGER.info(
-            "update %d steps %d win_vs_econ %.3f margin %.1f bank %.1f "
-            "sale_price %.1f reward %.4f total_loss %.3f",
-            update,
-            steps,
-            record["objective/win_rate_vs_econ"],
-            record["objective/margin_vs_econ"],
-            record["diag/bank_mean"],
-            record["diag/mean_sale_price_vs_econ"],
-            record["proxy/shaped_reward_mean"],
-            record["diag/total_loss"],
-        )
-    wandb.finish()
+        warnings.warn(message, DeprecationWarning, stacklevel=2)
+        LOGGER.warning(message)
+        config = _legacy_config(arguments)
+    else:
+        config = parse_config(arguments)
+    run(config)
 
 
 def _learner(arguments: argparse.Namespace, device: str) -> Policy:
@@ -1329,6 +1366,7 @@ def _collect(
     blocks: int = BLOCKS,
     channels: int = CHANNELS,
     econ_fraction: float = 0.0,
+    money_weight_value: float = MONEY_WEIGHT,
 ) -> tuple[list[Trajectory], list[Trajectory]]:
     """Play ``seeds`` across worker processes and return every trajectory.
 
@@ -1346,6 +1384,8 @@ def _collect(
             size rather than the module default.
         econ_fraction: Share of the round played against ``OPPONENT`` instead of
             the mirror. Those episodes record our seat only.
+        money_weight_value: Typed reward coefficient installed inside every
+            worker while it collects this round.
 
     Returns:
         Every recorded trajectory: two per mirror seed and one per scripted one.
@@ -1357,18 +1397,20 @@ def _collect(
         share = max(1, WORKERS // 2) if econ_seeds else WORKERS
         chunks = [group[index::share] for index in range(share)]
         work.extend(
-            (state, chunk, blocks, channels, versus) for chunk in chunks if chunk
+            (state, chunk, blocks, channels, versus, money_weight_value)
+            for chunk in chunks
+            if chunk
         )
     played = list(pool.map(_play, work))
     mirror: list[Trajectory] = []
     econ: list[Trajectory] = []
-    for (_, _, _, _, versus), batch in zip(work, played, strict=True):
+    for (_, _, _, _, versus, _), batch in zip(work, played, strict=True):
         (econ if versus else mirror).extend(batch)
     return mirror, econ
 
 
 def _play(
-    work: tuple[dict[str, torch.Tensor], list[int], int, int, str | None],
+    work: tuple[dict[str, torch.Tensor], list[int], int, int, str | None, float],
 ) -> list[Trajectory]:
     """Play one worker's share of a round. Runs in a subprocess.
 
@@ -1379,15 +1421,23 @@ def _play(
     past 230 and the round did not finish.
     """
     torch.set_num_threads(THREADS)
-    state, seeds, blocks, channels, versus = work
+    state, seeds, blocks, channels, versus, reward_money_weight = work
     actor = Policy(blocks=blocks, channels=channels, value_bound=VALUE_BOUND)
     actor.load_state_dict(state)
     actor.eval()
-    with torch.no_grad():
-        # A mirror records both seats; against a named agent `rollout_many`
-        # records seat 0 alone, which is exactly what we want -- we never train
-        # on the scripted agent's actions.
-        return rollout_many(actor, versus if versus else actor, seeds)
+    previous_money_weight = os.environ.get(MONEY_WEIGHT_ENV)
+    os.environ[MONEY_WEIGHT_ENV] = repr(reward_money_weight)
+    try:
+        with torch.no_grad():
+            # A mirror records both seats; against a named agent `rollout_many`
+            # records seat 0 alone, which is exactly what we want -- we never train
+            # on the scripted agent's actions.
+            return rollout_many(actor, versus if versus else actor, seeds)
+    finally:
+        if previous_money_weight is None:
+            os.environ.pop(MONEY_WEIGHT_ENV, None)
+        else:
+            os.environ[MONEY_WEIGHT_ENV] = previous_money_weight
 
 
 def _seats_per_update(econ_fraction: float) -> int:
@@ -1612,9 +1662,7 @@ def _step(
                     "lmb": lmb,
                 }
             ),
-            "curriculum": control.curriculum.model_copy(
-                update={"reward_field": field}
-            ),
+            "curriculum": control.curriculum.model_copy(update={"reward_field": field}),
         }
     )
     batch = LearnerBatch(

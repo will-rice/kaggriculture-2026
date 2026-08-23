@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Self, cast
 
 import lightning
 import torch
@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.encoding import transfer_slots
-from kaggriculture.learn.model import Policy
+from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.toad.config import (
     STRUCTURAL_FIELDS,
@@ -203,6 +203,35 @@ class ToadLightningModule(lightning.LightningModule):
             channels=config.model.channels,
             value_bound=config.model.value_bound,
         )
+        if config.model.warm_start_checkpoint is not None:
+            state = torch.load(
+                config.model.warm_start_checkpoint,
+                map_location="cpu",
+                weights_only=True,
+            )
+            load_policy_weights(self.policy, state)
+        self.teacher_policy: Policy | None = None
+        self.teacher: Teacher | None = None
+        if config.population.teacher_checkpoint is not None:
+            from kaggriculture.learn.scripts.toad import Teacher
+
+            self.teacher_policy = Policy(
+                blocks=config.population.teacher_blocks or config.model.blocks,
+                channels=config.model.channels,
+                value_bound=config.model.value_bound,
+            )
+            state = torch.load(
+                config.population.teacher_checkpoint,
+                map_location="cpu",
+                weights_only=True,
+            )
+            missing = load_policy_weights(self.teacher_policy, state)
+            self.teacher_policy.eval()
+            self.teacher_policy.requires_grad_(False)
+            self.teacher = Teacher(
+                policy=self.teacher_policy,
+                quantity=not any(name.startswith("quantity_head.") for name in missing),
+            )
         self.environment_steps = 0
         self.collection_round = 0
         self.actor_version = 0
@@ -211,6 +240,13 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_ended = False
         self._round_started_warming = False
         self.save_hyperparameters(config.model_dump(mode="json"))
+
+    def train(self, mode: bool = True) -> Self:
+        """Change learner mode while keeping the frozen teacher in evaluation."""
+        super().train(mode)
+        if self.teacher_policy is not None:
+            self.teacher_policy.eval()
+        return self
 
     def transfer_batch_to_device(
         self,
@@ -233,7 +269,11 @@ class ToadLightningModule(lightning.LightningModule):
             self._round_started_warming = self.warmup_remaining > 0
         baseline_only = batch.baseline_only or self.warmup_remaining > 0
         report = compute_loss(
-            self.policy, batch, self.config, baseline_only=baseline_only
+            self.policy,
+            batch,
+            self.config,
+            teacher=self.teacher,
+            baseline_only=baseline_only,
         )
         self._round_ended = batch.end_of_round
         if not batch.baseline_only and self.warmup_remaining:

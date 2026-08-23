@@ -14,6 +14,7 @@ from kaggriculture.learn.encoding import (
     UNIT_OPS,
 )
 from kaggriculture.learn.rollout import Trajectory
+from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.config import ToadConfig
 from kaggriculture.learn.toad.data import (
     BatchKind,
@@ -146,3 +147,21 @@ def test_data_module_detaches_actor_before_publication() -> None:
     loader = module.train_dataloader()
     assert loader.batch_size is None
     assert loader.num_workers == 0
+
+
+def test_reference_worker_uses_the_typed_money_weight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker must not fall back to an inherited or process-local reward default."""
+    seen: list[float] = []
+    policy = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+
+    def fake_rollout(*args: object, **kwargs: object) -> list[Trajectory]:
+        seen.append(toad.money_weight())
+        return []
+
+    monkeypatch.setattr(toad, "rollout_many", fake_rollout)
+
+    toad._play((policy.state_dict(), [0], 1, 16, None, 0.01))
+
+    assert seen == [0.01]

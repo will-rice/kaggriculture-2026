@@ -53,6 +53,27 @@ def test_teacher_checkpoint_must_be_a_readable_file(tmp_path: Path) -> None:
     assert config.population.teacher_checkpoint == checkpoint
 
 
+def test_warm_start_checkpoint_is_readable_and_excludes_resume(tmp_path: Path) -> None:
+    """Warm-start weights are validated input and cannot masquerade as resume."""
+    checkpoint = tmp_path / "warm.pt"
+    checkpoint.touch()
+
+    config = ToadConfig(model={"warm_start_checkpoint": checkpoint})
+    assert config.model.warm_start_checkpoint == checkpoint
+
+    with pytest.raises(ValidationError, match="warm start and resume"):
+        ToadConfig(
+            model={"warm_start_checkpoint": checkpoint},
+            runtime={"resume": tmp_path / "resume.ckpt"},
+        )
+
+
+def test_warm_start_checkpoint_must_be_a_readable_file(tmp_path: Path) -> None:
+    """An invalid warm start fails during config validation, before runtime."""
+    with pytest.raises(ValidationError, match="warm-start checkpoint is not readable"):
+        ToadConfig(model={"warm_start_checkpoint": tmp_path / "missing.pt"})
+
+
 def test_teacher_checkpoint_must_open_for_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

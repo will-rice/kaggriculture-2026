@@ -246,6 +246,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 self.config.model.blocks,
                 self.config.model.channels,
                 econ_fraction,
+                self.config.curriculum.money_weight,
             )
         return mirror + scripted
 

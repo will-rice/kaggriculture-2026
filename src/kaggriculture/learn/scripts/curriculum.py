@@ -4,8 +4,8 @@ Every arm this project has run executed phase 1 with phase 2's teacher cost,
 against a behaviour clone the recipe uses nowhere, because those numbers lived
 in a command line nobody could check. This module is the fix: the five
 phases, transcribed verbatim from the recipe into ``PHASES``, and a runner
-that translates one row of that table into the flags ``toad`` already
-exposes rather than a remembered invocation.
+that translates one row into the validated ``ToadConfig`` consumed by the
+native Lightning entry point rather than a remembered invocation.
 
 ``PHASES`` is deliberately the only place these numbers are typed. A phase
 boundary is now a dataclass field a test can assert against, not a line in a
@@ -21,18 +21,31 @@ phase 4); every other phase starts from its own fresh initialisation, guided
 toward its teacher by the KL term alone. This runner resolves each phase's
 teacher checkpoint and refuses to start without it; it does not attempt to
 resume phase 4's weights from phase 3 automatically -- see the module's task
-report for why, and pass ``--resume`` to ``toad`` by hand if that is
-wanted.
+report for why, and pass an explicit ``--set runtime.resume="..."`` if that
+is wanted.
 """
 
 import argparse
 import dataclasses
 import logging
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.toad.config import (
+    CurriculumConfig,
+    ModelConfig,
+    OptimizerConfig,
+    PopulationConfig,
+    RuntimeConfig,
+    ToadConfig,
+    apply_overrides,
+)
 
 LOGGER = logging.getLogger(__name__)
+
+RewardField = Literal["shaped_money", "shaped", "sparse", "own"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,7 +75,7 @@ class Phase:
     name: str
     blocks: int
     steps: int
-    reward: str
+    reward: RewardField
     teacher_kl_cost: float
     lr: float
     entropy_cost: float
@@ -215,7 +228,11 @@ def _checkpoint(name: str) -> Path:
 
 
 def _flags(phase: Phase) -> list[str]:
-    """Translate one ``Phase`` into the flags ``toad`` exposes.
+    """Translate one ``Phase`` into the deprecated flags ``toad`` exposed.
+
+    Kept for one release so helper imports and compatibility tests can inspect
+    the former CLI mapping. Production curriculum execution uses
+    :func:`phase_config` and :func:`toad.run` directly.
 
     Args:
         phase: The phase to run.
@@ -255,6 +272,29 @@ def _flags(phase: Phase) -> list[str]:
     return flags
 
 
+def phase_config(phase: Phase) -> ToadConfig:
+    """Resolve one declared curriculum phase into nested Pydantic models."""
+    teacher = _checkpoint(phase.teacher_from) if phase.teacher_from else None
+    return ToadConfig(
+        model=ModelConfig(blocks=phase.blocks, channels=toad.CHANNELS),
+        optimizer=OptimizerConfig(
+            lr=phase.lr,
+            lmb=phase.lmb,
+            entropy_cost=phase.entropy_cost,
+            teacher_kl_cost=phase.teacher_kl_cost,
+        ),
+        population=PopulationConfig(
+            teacher_checkpoint=teacher,
+            teacher_blocks=_teacher_blocks(phase) if teacher is not None else None,
+        ),
+        runtime=RuntimeConfig(total_environment_steps=phase.steps),
+        curriculum=CurriculumConfig(
+            phase=phase.name,
+            reward_field=phase.reward,
+        ),
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     """Return this runner's command line.
 
@@ -267,21 +307,29 @@ def _parser() -> argparse.ArgumentParser:
         choices=tuple(_BY_NAME),
         help="which phase of the curriculum to run",
     )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=JSON_VALUE",
+        help="validated dotted override applied after the declared phase",
+    )
     return parser
 
 
-def main() -> None:
-    """Resolve one phase's flags and hand them to ``toad``'s own entry point.
+def main(argv: Sequence[str] | None = None) -> None:
+    r"""Resolve one phase config and run the native Lightning entry point.
 
-    Does not duplicate the training loop: every phase runs through
-    ``toad.main``, which is the same code path Tasks 1-3 tested.
+    No phase resumes another implicitly. Operational resume remains an explicit
+    ``--set runtime.resume=\"...\"`` override.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    arguments = _parser().parse_args()
+    arguments = _parser().parse_args(argv)
     phase = _phase(arguments.phase)
-    flags = _flags(phase)
-    LOGGER.info("curriculum: running %s as %s", phase.name, " ".join(flags))
-    toad.main(flags)
+    config = apply_overrides(phase_config(phase), arguments.overrides)
+    LOGGER.info("curriculum: running %s", phase.name)
+    toad.run(config)
 
 
 if __name__ == "__main__":

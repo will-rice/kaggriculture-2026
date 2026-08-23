@@ -29,6 +29,7 @@ from kaggriculture.learn.toad_loss import (
     UNROLL_LENGTH,
     VALUE_WARMUP_BATCHES,
 )
+from kaggriculture.learn.toad_reward import MONEY_WEIGHT
 
 Precision = Literal["32-true", "bf16-mixed"]
 
@@ -48,6 +49,7 @@ class ModelConfig(BaseModel):
     local_patch: bool = False
     belief: bool = False
     interaction_value: bool = False
+    warm_start_checkpoint: Path | None = None
 
 
 class PopulationConfig(BaseModel):
@@ -61,6 +63,7 @@ class PopulationConfig(BaseModel):
     teacher_distill: float = 0.0
     scripted_opponent: str = "economic"
     teacher_checkpoint: Path | None = None
+    teacher_blocks: PositiveInt | None = None
     actor_sync_every_rounds: PositiveInt = 4
     environments_per_rank: PositiveInt = 24
     collection_processes: PositiveInt = 24
@@ -136,7 +139,10 @@ class CurriculumConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     phase: str = "phase1"
-    reward_field: Literal["shaped_money", "shaped", "sparse", "own"] = "shaped_money"
+    reward_field: Literal["shaped_money", "shaped", "sparse", "own", "margin"] = (
+        "shaped_money"
+    )
+    money_weight: NonNegativeFloat = MONEY_WEIGHT
     gate: EvaluationGate | None = None
     on_gate_failure: Literal["stop"] = "stop"
 
@@ -179,19 +185,20 @@ class ToadConfig(BaseModel):
                 "teacher checkpoint is required by teacher loss or batches"
             )
         if self.population.teacher_checkpoint is not None:
-            if not self.population.teacher_checkpoint.is_file():
-                raise ValueError(
-                    "teacher checkpoint is not readable: "
-                    f"{self.population.teacher_checkpoint}"
-                )
-            try:
-                with self.population.teacher_checkpoint.open("rb"):
-                    pass
-            except OSError as error:
-                raise ValueError(
-                    "teacher checkpoint is not readable: "
-                    f"{self.population.teacher_checkpoint}"
-                ) from error
+            _require_readable(
+                self.population.teacher_checkpoint,
+                label="teacher checkpoint",
+            )
+        if self.model.warm_start_checkpoint is not None:
+            _require_readable(
+                self.model.warm_start_checkpoint,
+                label="warm-start checkpoint",
+            )
+        if (
+            self.model.warm_start_checkpoint is not None
+            and self.runtime.resume is not None
+        ):
+            raise ValueError("warm start and resume are mutually exclusive")
         if self.population.frozen_opponent and not (
             self.population.initial_snapshots
             or (
@@ -204,6 +211,17 @@ class ToadConfig(BaseModel):
                 "or a snapshot schedule"
             )
         return self
+
+
+def _require_readable(path: Path, *, label: str) -> None:
+    """Reject a missing, non-file, or unreadable checkpoint path."""
+    if not path.is_file():
+        raise ValueError(f"{label} is not readable: {path}")
+    try:
+        with path.open("rb"):
+            pass
+    except OSError as error:
+        raise ValueError(f"{label} is not readable: {path}") from error
 
 
 def load_config(path: Path | None, overrides: Sequence[str] = ()) -> ToadConfig:

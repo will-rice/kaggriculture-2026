@@ -15,6 +15,14 @@ import torch
 
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts import curriculum, toad
+from kaggriculture.learn.toad.config import (
+    CurriculumConfig,
+    ModelConfig,
+    OptimizerConfig,
+    PopulationConfig,
+    RuntimeConfig,
+    ToadConfig,
+)
 
 # Transcribed independently of curriculum.PHASES, from the literal recipe
 # table -- so this file fails if the module's own transcription drifts, not
@@ -99,6 +107,60 @@ def test_phase_one_has_no_teacher() -> None:
     """The single most consequential number in this plan."""
     assert curriculum.PHASES[0].teacher_kl_cost == 0.0
     assert curriculum.PHASES[0].teacher_from is None
+
+
+def test_every_curriculum_phase_is_a_valid_toad_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each table row must become the complete typed experiment contract."""
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
+    phase1 = tmp_path / "phase1_000025.pt"
+    phase3 = tmp_path / "phase3_000025.pt"
+    phase1.touch()
+    phase3.touch()
+
+    for phase in curriculum.PHASES:
+        config = curriculum.phase_config(phase)
+        assert isinstance(config, ToadConfig)
+        assert isinstance(config.model, ModelConfig)
+        assert isinstance(config.optimizer, OptimizerConfig)
+        assert isinstance(config.population, PopulationConfig)
+        assert isinstance(config.runtime, RuntimeConfig)
+        assert isinstance(config.curriculum, CurriculumConfig)
+        assert config.curriculum.phase == phase.name
+        assert config.curriculum.reward_field == phase.reward
+        assert config.model.blocks == phase.blocks
+        assert config.model.channels == toad.CHANNELS
+        assert config.optimizer.lr == pytest.approx(phase.lr)
+        assert config.optimizer.lmb == pytest.approx(phase.lmb)
+        assert config.optimizer.entropy_cost == pytest.approx(phase.entropy_cost)
+        assert config.optimizer.teacher_kl_cost == pytest.approx(phase.teacher_kl_cost)
+        assert config.runtime.total_environment_steps == phase.steps
+        expected_teacher = (
+            None
+            if phase.teacher_from is None
+            else curriculum._checkpoint(phase.teacher_from)
+        )
+        assert config.population.teacher_checkpoint == expected_teacher
+        expected_teacher_blocks = (
+            None if phase.teacher_from is None else curriculum._teacher_blocks(phase)
+        )
+        assert config.population.teacher_blocks == expected_teacher_blocks
+
+
+def test_curriculum_runtime_resume_override_reaches_native_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume stays explicit and never becomes an implicit phase-4 transition."""
+    resume = tmp_path / "phase3.ckpt"
+    resume.touch()
+    seen: list[ToadConfig] = []
+    monkeypatch.setattr(toad, "run", seen.append)
+
+    curriculum.main(["phase1", "--set", f'runtime.resume="{resume}"'])
+
+    assert len(seen) == 1
+    assert seen[0].runtime.resume == resume
 
 
 def test_a_phase_refuses_to_start_without_its_teacher(

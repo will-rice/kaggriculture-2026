@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 
 import lightning
+import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -86,9 +87,7 @@ def test_compute_loss_honors_baseline_only_and_optional_teacher() -> None:
     ).eval()
     teacher_config = config.model_copy(
         update={
-            "optimizer": config.optimizer.model_copy(
-                update={"teacher_kl_cost": 1.0}
-            )
+            "optimizer": config.optimizer.model_copy(update={"teacher_kl_cost": 1.0})
         }
     )
 
@@ -102,6 +101,69 @@ def test_compute_loss_honors_baseline_only_and_optional_teacher() -> None:
 
     assert torch.equal(report.total, report.terms["baseline"])
     assert report.terms["teacher"].item() > 0.0
+
+
+def test_module_loads_warm_start_before_training(tmp_path: Path) -> None:
+    """The typed warm-start field initializes policy weights without resume state."""
+    source = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    checkpoint = tmp_path / "warm.pt"
+    torch.save(source.state_dict(), checkpoint)
+    config = control_fixture_config().model_copy(
+        update={
+            "model": control_fixture_config().model.model_copy(
+                update={"warm_start_checkpoint": checkpoint}
+            )
+        }
+    )
+
+    module = ToadLightningModule(config)
+
+    for name, value in source.state_dict().items():
+        assert torch.equal(module.policy.state_dict()[name], value), name
+
+
+def test_module_loads_frozen_typed_teacher_and_uses_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teacher topology and missing-head compatibility reach the native loss."""
+    fixture = load_control_fixture()
+    teacher_policy = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    teacher_state = {
+        name: value
+        for name, value in teacher_policy.state_dict().items()
+        if not name.startswith("quantity_head.")
+    }
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(teacher_state, checkpoint)
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"teacher_checkpoint": checkpoint, "teacher_blocks": 1}
+            ),
+            "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0}),
+        }
+    )
+    module = ToadLightningModule(config)
+    module.train()
+    monkeypatch.setattr(module, "log_dict", lambda *args, **kwargs: None)
+    module.policy.load_state_dict(
+        cast(dict[str, torch.Tensor], fixture["initial_model"])
+    )
+    batch = control_fixture_batch(fixture)
+
+    with_teacher = module.training_step(batch, 0)
+    without_teacher = compute_loss(module.policy, batch, config).total
+
+    assert module.teacher is not None
+    assert len(module.teacher.policy.blocks) == 1
+    assert not module.teacher.quantity
+    assert not module.teacher.policy.training
+    assert not any(
+        parameter.requires_grad for parameter in module.teacher.policy.parameters()
+    )
+    assert not torch.equal(with_teacher, without_teacher)
 
 
 def test_scheduler_steps_only_after_the_batch_that_closes_a_round(
