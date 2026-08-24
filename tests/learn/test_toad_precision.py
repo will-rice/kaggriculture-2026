@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -35,12 +40,45 @@ def test_bf16_is_rejected_when_accelerator_has_no_support(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A requested CUDA BF16 run must never silently fall back to FP32."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    from kaggriculture.learn.scripts import toad
+
+    monkeypatch.setattr(toad, "_cuda_available", lambda: True)
+    monkeypatch.setattr(toad, "_cuda_device_count", lambda: 1)
+    monkeypatch.setattr(toad, "_cuda_bf16_supported", lambda: False)
 
     with pytest.raises(RuntimePreflightError, match="bf16-mixed"):
         runtime_preflight(_bf16_config("gpu"))
+
+
+def test_gpu_bf16_preflight_never_initializes_cuda_in_the_parent() -> None:
+    """The capability probe may isolate CUDA work, but the parent stays clean."""
+    source = """
+import torch
+from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.toad.config import ToadConfig
+
+toad._cuda_available = lambda: True
+toad._cuda_device_count = lambda: 1
+toad._cuda_bf16_supported = lambda: False
+try:
+    toad.runtime_preflight(
+        ToadConfig(runtime={"accelerator": "gpu", "precision": "bf16-mixed"})
+    )
+except toad.RuntimePreflightError:
+    pass
+else:
+    raise AssertionError("expected BF16 preflight rejection")
+assert not torch.cuda.is_initialized()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_sensitive_policy_math_is_fp32_under_autocast() -> None:
@@ -87,6 +125,119 @@ def test_nonfinite_error_keeps_batch_provenance() -> None:
     assert error.opponent_digests == ()
     assert error.actor_version == 0
     assert error.precision == "32-true"
+
+
+def test_importance_ratio_overflow_is_not_hidden_by_vtrace_clipping() -> None:
+    """Finite clipped returns cannot conceal an infinite raw importance ratio."""
+    module = ToadLightningModule(control_fixture_config())
+    batch = control_fixture_batch(load_control_fixture())
+    overflowed = tuple(
+        {**segment, "log_probs": torch.full_like(segment["log_probs"], -1000.0)}
+        for segment in batch.segments
+    )
+
+    with pytest.raises(NonFiniteTrainingError) as raised:
+        module.compute_report(replace(batch, segments=overflowed))
+
+    assert "importance_ratios" in raised.value.tensor_names
+
+
+def test_auto_cpu_rejects_explicit_device_topology_before_trainer_build() -> None:
+    """CPU cannot reinterpret a GPU-index device tuple as a Lightning count."""
+    config = ToadConfig.model_validate(
+        control_fixture_config().model_dump(mode="json")
+        | {"runtime": {"accelerator": "auto", "devices": [0]}}
+    )
+
+    with pytest.raises(RuntimePreflightError, match="CPU.*explicit device"):
+        runtime_preflight(config)
+
+
+def test_cpu_explicit_device_topology_is_rejected_by_config() -> None:
+    """An explicitly CPU-bound device-index list fails during validation."""
+    with pytest.raises(ValueError, match="CPU.*explicit device"):
+        ToadConfig.model_validate(
+            control_fixture_config().model_dump(mode="json")
+            | {"runtime": {"accelerator": "cpu", "devices": [0]}}
+        )
+
+
+def test_nonfinite_initial_state_is_checked_before_recurrent_reset() -> None:
+    """A reset mask cannot erase invalid recurrent input provenance."""
+    from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, segments
+    from tests.learn.test_toad_data import _recurrent_trajectory
+
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 16,
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+            }
+        }
+    )
+    recurrent_segments = segments(_recurrent_trajectory(), 16)
+    invalid = dict(recurrent_segments[0])
+    invalid["initial_hidden"] = torch.full_like(invalid["initial_hidden"], torch.nan)
+    invalid["dones"] = torch.ones_like(invalid["dones"], dtype=torch.bool)
+    batch = LearnerBatch(
+        segments=(invalid,),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=16,
+        round_id=0,
+        actor_version=3,
+        game_ids=(91,),
+        opponent_ids=("self",),
+    )
+
+    with pytest.raises(NonFiniteTrainingError) as raised:
+        ToadLightningModule(config).compute_report(batch)
+
+    assert "input/initial_hidden" in raised.value.tensor_names
+    assert raised.value.game_ids == (91,)
+
+
+def test_after_backward_rejects_nonfinite_gradients_with_batch_provenance() -> None:
+    """Finite losses cannot commit an optimizer step with infinite gradients."""
+
+    class InfiniteGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: object, value: torch.Tensor) -> torch.Tensor:
+            return value
+
+        @staticmethod
+        def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor]:
+            return (torch.full_like(gradient, torch.inf),)
+
+    class InfiniteGradientPolicy(Policy):
+        def forward(
+            self,
+            board: torch.Tensor,
+            scalars: torch.Tensor,
+            positions: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            unit, quantity, market, values = super().forward(board, scalars, positions)
+            return InfiniteGradient.apply(unit), quantity, market, values
+
+    config = control_fixture_config()
+    module = ToadLightningModule(config)
+    module.policy = InfiniteGradientPolicy(
+        blocks=1, channels=16, value_bound=config.model.value_bound
+    )
+    batch = control_fixture_batch(load_control_fixture())
+    loss = module.training_step(batch, 0)
+    loss.backward()
+
+    with pytest.raises(NonFiniteTrainingError) as raised:
+        module.on_after_backward()
+
+    assert any(name.startswith("grad/") for name in raised.value.tensor_names)
+    assert raised.value.game_ids == batch.game_ids
 
 
 def test_runtime_preflight_precedes_seed_and_trainer_construction(

@@ -303,6 +303,7 @@ class LossReport:
     terms: Mapping[str, torch.Tensor]
     entropy: HeadEntropy
     debug_dtypes: Mapping[str, torch.dtype]
+    provenance: NonFiniteProvenance
 
 
 @dataclass(frozen=True)
@@ -333,12 +334,11 @@ def fp32_policy_terms(output: PolicyOutput, batch: LearnerBatch) -> FP32PolicyTe
     )
 
 
-class NonFiniteTrainingError(RuntimeError):
-    """A finite-check failure with collection provenance for recovery and triage."""
+class NonFiniteProvenance:
+    """Detached batch identity kept after forward for finite-gradient checks."""
 
     def __init__(
         self,
-        tensor_names: tuple[str, ...],
         *,
         batch_kind: str,
         game_ids: tuple[int, ...],
@@ -347,18 +347,58 @@ class NonFiniteTrainingError(RuntimeError):
         precision: str,
         state_norms: Mapping[str, float],
     ) -> None:
-        self.tensor_names = tensor_names
         self.batch_kind = batch_kind
         self.game_ids = game_ids
         self.opponent_digests = opponent_digests
         self.actor_version = actor_version
         self.precision = precision
         self.state_norms = dict(state_norms)
+
+    @classmethod
+    def from_batch(
+        cls, batch: LearnerBatch, state: PolicyState | None, precision: str
+    ) -> Self:
+        """Capture only primitive diagnostics, never a batch tensor or graph."""
+        state_norms = {
+            name: float(value.detach().float().norm())
+            for name, value in (
+                ("hidden", None if state is None else state.hidden),
+                ("cell", None if state is None else state.cell),
+            )
+            if value is not None
+        }
+        return cls(
+            batch_kind=batch.kind.value,
+            game_ids=batch.game_ids,
+            opponent_digests=batch.opponent_digests,
+            actor_version=batch.actor_version,
+            precision=precision,
+            state_norms=state_norms,
+        )
+
+
+class NonFiniteTrainingError(RuntimeError):
+    """A finite-check failure with collection provenance for recovery and triage."""
+
+    def __init__(
+        self,
+        tensor_names: tuple[str, ...],
+        *,
+        provenance: NonFiniteProvenance,
+    ) -> None:
+        self.tensor_names = tensor_names
+        self.batch_kind = provenance.batch_kind
+        self.game_ids = provenance.game_ids
+        self.opponent_digests = provenance.opponent_digests
+        self.actor_version = provenance.actor_version
+        self.precision = provenance.precision
+        self.state_norms = provenance.state_norms
         super().__init__(
             "non-finite training tensors "
-            f"{tensor_names}; kind={batch_kind}; game_ids={game_ids}; "
-            f"opponent_digests={opponent_digests}; actor_version={actor_version}; "
-            f"precision={precision}; state_norms={self.state_norms}"
+            f"{tensor_names}; kind={self.batch_kind}; game_ids={self.game_ids}; "
+            f"opponent_digests={self.opponent_digests}; "
+            f"actor_version={self.actor_version}; precision={self.precision}; "
+            f"state_norms={self.state_norms}"
         )
 
     @classmethod
@@ -370,23 +410,17 @@ class NonFiniteTrainingError(RuntimeError):
         precision: str,
     ) -> Self:
         """Create a structured local finite failure without distributed collectives."""
-        state_norms = {
-            name: float(value.detach().float().norm())
-            for name, value in (
-                ("hidden", None if state is None else state.hidden),
-                ("cell", None if state is None else state.cell),
-            )
-            if value is not None
-        }
-        return cls(
-            tuple(tensor_names),
-            batch_kind=batch.kind.value,
-            game_ids=batch.game_ids,
-            opponent_digests=batch.opponent_digests,
-            actor_version=batch.actor_version,
-            precision=precision,
-            state_norms=state_norms,
+        return cls.from_provenance(
+            tensor_names,
+            NonFiniteProvenance.from_batch(batch, state, precision),
         )
+
+    @classmethod
+    def from_provenance(
+        cls, tensor_names: list[str], provenance: NonFiniteProvenance
+    ) -> Self:
+        """Create an error from detached data; Task 3 can synchronize this seam."""
+        return cls(tuple(tensor_names), provenance=provenance)
 
 
 def _nonfinite_tensor_names(tensors: Mapping[str, torch.Tensor]) -> list[str]:
@@ -860,6 +894,20 @@ def compute_loss(  # noqa: C901
         else:
             initial = None
             replay_dones = None
+        initial_inputs = (
+            {
+                "input/initial_hidden": initial.hidden.float(),
+                "input/initial_cell": initial.cell.float(),
+                "input/initial_belief": initial.prior_belief.float(),
+            }
+            if initial is not None
+            else {}
+        )
+        initial_nonfinite = _nonfinite_tensor_names(initial_inputs)
+        if initial_nonfinite:
+            raise NonFiniteTrainingError.from_batch(
+                initial_nonfinite, batch, initial, config.runtime.precision
+            )
         output = policy(
             board,
             scalars,
@@ -974,6 +1022,10 @@ def compute_loss(  # noqa: C901
                     positions.flatten(0, 1),
                 )
             )
+        teacher_units = teacher_units.float()
+        teacher_quantity = teacher_quantity.float()
+        teacher_market = teacher_market.float()
+        teacher_values = teacher_values.float()
         teacher_outputs = {
             "teacher/unit_logits": teacher_units,
             "teacher/quantity_logits": teacher_quantity,
@@ -1110,6 +1162,7 @@ def compute_loss(  # noqa: C901
         "market_logits": policy_terms.market_logits,
         "values": policy_terms.values,
         **teacher_outputs,
+        **loss.intermediates,
         **(
             {"belief_logits": policy_terms.belief_logits}
             if policy_terms.belief_logits is not None
@@ -1131,17 +1184,23 @@ def compute_loss(  # noqa: C901
         raise NonFiniteTrainingError.from_batch(
             nonfinite, batch, state, config.runtime.precision
         )
+    provenance = NonFiniteProvenance.from_batch(batch, state, config.runtime.precision)
     return LossReport(
         total=total,
         terms=terms,
         entropy=head_entropy,
         debug_dtypes={
             "learner_log_probs": learner_log_probs.dtype,
-            "importance_ratios": (learner_log_probs - behaviour).exp().dtype,
-            "value_targets": values.dtype,
+            "importance_ratios": loss.intermediates.get(
+                "importance_ratios", learner_log_probs
+            ).dtype,
+            "value_targets": loss.intermediates.get(
+                "td_lambda/value_targets", values
+            ).dtype,
             "entropy": entropy_term.dtype,
             "teacher": loss.teacher.dtype,
         },
+        provenance=provenance,
     )
 
 
@@ -1215,6 +1274,7 @@ class ToadLightningModule(lightning.LightningModule):
         self.round_metrics = RoundMetricAccumulator()
         self._learner_started: float | None = None
         self._pending_round_flush = False
+        self._last_finite_provenance: NonFiniteProvenance | None = None
         self.save_hyperparameters(self.config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
@@ -1259,6 +1319,7 @@ class ToadLightningModule(lightning.LightningModule):
             baseline_only=baseline_only,
             entropy_state=self.entropy_state,
         )
+        self._last_finite_provenance = report.provenance
         self.round_metrics.update(batch, report)
         self._round_ended = batch.end_of_round
         self._round_baselines.append(report.terms["baseline"].detach())
@@ -1316,7 +1377,26 @@ class ToadLightningModule(lightning.LightningModule):
     ) -> None:
         """Close learner timing after backward, clipping, sync, and optimizer."""
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        self._last_finite_provenance = None
         self._finish_learner_batch()
+
+    def on_after_backward(self) -> None:
+        """Fail before an optimizer step when otherwise-finite gradients overflow.
+
+        The stored provenance contains only detached primitives.  A later DDP
+        boundary can all-reduce this local flag and render the same structured
+        error on every rank before any rank enters its optimizer step.
+        """
+        nonfinite = [
+            f"grad/{name}"
+            for name, parameter in self.policy.named_parameters()
+            if parameter.grad is not None
+            and not bool(torch.isfinite(parameter.grad).all())
+        ]
+        if nonfinite and self._last_finite_provenance is not None:
+            raise NonFiniteTrainingError.from_provenance(
+                nonfinite, self._last_finite_provenance
+            )
 
     def _finish_learner_batch(self) -> None:
         """Record one full optimization interval and flush a due round once."""

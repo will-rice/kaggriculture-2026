@@ -38,6 +38,7 @@ import argparse
 import logging
 import os
 import re
+import subprocess
 import sys
 import warnings
 from collections.abc import Callable, Sequence
@@ -111,17 +112,46 @@ class RuntimePreflightError(RuntimeError):
     """A requested runtime cannot be honored without changing the experiment."""
 
 
+def _cuda_available() -> bool:
+    """Inspect CUDA availability without selecting a device or creating a context."""
+    return torch.cuda.is_available()
+
+
+def _cuda_device_count() -> int:
+    """Inspect CUDA topology without selecting a device or creating a context."""
+    return torch.cuda.device_count()
+
+
+def _cuda_bf16_supported() -> bool:
+    """Probe BF16 in a disposable process so the trainer parent stays context-free."""
+    try:
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import torch; print(int(torch.cuda.is_bf16_supported()))",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and probe.stdout.strip() == "1"
+
+
 def _effective_accelerator(runtime: RuntimeConfig) -> Literal["cpu", "gpu"]:
     """Resolve Lightning's ``auto`` selection without constructing a Trainer."""
     if runtime.accelerator == "auto":
-        return "gpu" if torch.cuda.is_available() else "cpu"
+        return "gpu" if _cuda_available() else "cpu"
     return runtime.accelerator
 
 
 def _requested_gpu_count(runtime: RuntimeConfig) -> int:
     """Return the requested CUDA device count without selecting a CUDA device."""
     if runtime.devices == "auto":
-        return torch.cuda.device_count()
+        return _cuda_device_count()
     if isinstance(runtime.devices, tuple):
         return len(runtime.devices)
     return runtime.devices
@@ -130,7 +160,7 @@ def _requested_gpu_count(runtime: RuntimeConfig) -> int:
 def _requested_device_count(runtime: RuntimeConfig, accelerator: str) -> int:
     """Resolve the single-process topology without constructing a strategy."""
     if runtime.devices == "auto":
-        return torch.cuda.device_count() if accelerator == "gpu" else 1
+        return _cuda_device_count() if accelerator == "gpu" else 1
     if isinstance(runtime.devices, tuple):
         return len(runtime.devices)
     return runtime.devices
@@ -156,13 +186,17 @@ def runtime_preflight(config: ToadConfig) -> None:
     """
     runtime = config.runtime
     accelerator = _effective_accelerator(runtime)
+    if accelerator == "cpu" and isinstance(runtime.devices, tuple):
+        raise RuntimePreflightError(
+            "CPU accelerator does not accept explicit device indexes"
+        )
     world_size = runtime.num_nodes * _requested_device_count(runtime, accelerator)
     if world_size > 1:
         raise RuntimePreflightError(
             "multi-device topology requires DDP support, which is not enabled"
         )
     if accelerator == "gpu":
-        available = torch.cuda.is_available()
+        available = _cuda_available()
         if not available:
             if runtime.precision == "bf16-mixed":
                 raise RuntimePreflightError(
@@ -172,7 +206,7 @@ def runtime_preflight(config: ToadConfig) -> None:
                 "GPU accelerator requested but CUDA is unavailable"
             )
         requested = _requested_gpu_count(runtime)
-        available_devices = torch.cuda.device_count()
+        available_devices = _cuda_device_count()
         if requested < 1 or requested > available_devices:
             raise RuntimePreflightError(
                 "requested GPU devices are unavailable: "
@@ -185,7 +219,7 @@ def runtime_preflight(config: ToadConfig) -> None:
                 "requested GPU device index is unavailable: "
                 f"available={available_devices}, devices={runtime.devices}"
             )
-        if runtime.precision == "bf16-mixed" and not torch.cuda.is_bf16_supported():
+        if runtime.precision == "bf16-mixed" and not _cuda_bf16_supported():
             raise RuntimePreflightError(
                 "bf16-mixed requested but CUDA BF16 is unavailable"
             )

@@ -273,6 +273,13 @@ class RuntimeConfig(BaseModel):
     compile: Literal[False] = False
     rollout_backend: Literal["reference"] = "reference"
 
+    @model_validator(mode="after")
+    def validate_device_topology(self) -> Self:
+        """Reject CPU device indexes before any Trainer can reinterpret them."""
+        if self.accelerator == "cpu" and isinstance(self.devices, tuple):
+            raise ValueError("CPU accelerator does not accept explicit device indexes")
+        return self
+
 
 class EvaluationGate(BaseModel):
     """An evaluation threshold for curriculum progression."""

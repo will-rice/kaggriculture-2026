@@ -112,6 +112,7 @@ class Losses:
     entropy: torch.Tensor
     teacher: torch.Tensor
     total: torch.Tensor
+    intermediates: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
 
 
 def reduce(losses: torch.Tensor, reduction: str = REDUCTION) -> torch.Tensor:
@@ -283,8 +284,9 @@ def losses(
     # monobeast.py:386-394. UPGO's advantages carry the clipped V-trace
     # importance weight, so a stale actor damps the UPGO term the same way it
     # damps the V-trace one.
+    importance_ratios = vtrace_returns.log_rhos.exp()
     upgo_clipped_importance = torch.minimum(
-        vtrace_returns.log_rhos.exp(), torch.ones_like(vtrace_returns.log_rhos)
+        importance_ratios, torch.ones_like(vtrace_returns.log_rhos)
     ).detach()
     upgo_pg = policy_gradient(
         learner_log_probs, upgo_clipped_importance * upgo_returns.advantages, reduction
@@ -312,4 +314,17 @@ def losses(
         total=baseline
         if baseline_only
         else vtrace_pg + upgo_pg + baseline + entropy + teacher,
+        intermediates={
+            "importance_ratios": importance_ratios,
+            "vtrace/log_rhos": vtrace_returns.log_rhos,
+            "vtrace/values": vtrace_returns.vs,
+            "vtrace/pg_advantages": vtrace_returns.pg_advantages,
+            "vtrace/behaviour_log_probs": vtrace_returns.behavior_action_log_probs,
+            "vtrace/learner_log_probs": vtrace_returns.target_action_log_probs,
+            "upgo/clipped_importance": upgo_clipped_importance,
+            "upgo/values": upgo_returns.vs,
+            "upgo/advantages": upgo_returns.advantages,
+            "td_lambda/value_targets": td_lambda_returns.vs,
+            "td_lambda/advantages": td_lambda_returns.advantages,
+        },
     )
