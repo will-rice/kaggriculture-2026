@@ -142,8 +142,13 @@ def test_importance_ratio_overflow_is_not_hidden_by_vtrace_clipping() -> None:
     assert "importance_ratios" in raised.value.tensor_names
 
 
-def test_auto_cpu_rejects_explicit_device_topology_before_trainer_build() -> None:
+def test_auto_cpu_rejects_explicit_device_topology_before_trainer_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """CPU cannot reinterpret a GPU-index device tuple as a Lightning count."""
+    from kaggriculture.learn.scripts import toad
+
+    monkeypatch.setattr(toad, "_cuda_available", lambda: False)
     config = ToadConfig.model_validate(
         control_fixture_config().model_dump(mode="json")
         | {"runtime": {"accelerator": "auto", "devices": [0]}}
