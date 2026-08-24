@@ -64,6 +64,7 @@ from kaggriculture.learn.toad.callbacks import (
     EnvironmentStepStop,
     PopulationSnapshotCallback,
 )
+from kaggriculture.learn.toad.compile import maybe_compile
 from kaggriculture.learn.toad.config import (
     ModelConfig,
     RuntimeConfig,
@@ -818,6 +819,7 @@ def run(config: ToadConfig) -> None:
     seed_everything(config.runtime.seed, workers=True)
     module = ToadLightningModule(config)
     effective = module.config
+    module.policy = maybe_compile(module.policy, effective)
     data = build_reference_data_module(effective)
     build_trainer(effective).fit(
         module,

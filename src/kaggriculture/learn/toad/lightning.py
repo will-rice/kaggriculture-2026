@@ -27,6 +27,11 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
+from kaggriculture.learn.toad.compile import (
+    canonicalize_policy_state_keys,
+    prepare_policy_state_keys_for_load,
+    unwrap_compiled,
+)
 from kaggriculture.learn.toad.config import (
     EntropyControllerConfig,
     ToadConfig,
@@ -836,7 +841,7 @@ def assert_resume_compatible(effective: ToadConfig, stored: ToadConfig) -> None:
 
 
 def compute_loss(  # noqa: C901
-    policy: PolicyLike,
+    policy: PolicyLike | torch.nn.Module,
     batch: LearnerBatch,
     config: ToadConfig,
     teacher: LoadedTeacher | Teacher | None = None,
@@ -871,8 +876,10 @@ def compute_loss(  # noqa: C901
     dones = stacked("dones")
 
     turns, width = behaviour.shape
-    if isinstance(policy, StatefulPolicy):
-        if policy.config.recurrent or policy.config.belief:
+    eager_policy = unwrap_compiled(policy)
+    stateful_policy = eager_policy if isinstance(eager_policy, StatefulPolicy) else None
+    if stateful_policy is not None:
+        if stateful_policy.config.recurrent or stateful_policy.config.belief:
             required = {"initial_hidden", "initial_cell", "initial_belief"}
             missing = required.difference(segments[0])
             if missing or any(required.difference(segment) for segment in segments):
@@ -936,7 +943,7 @@ def compute_loss(  # noqa: C901
     values = values.view(turns + 1, width)
     bootstrap_value = values[-1].detach()
     values = values[:-1]
-    if isinstance(policy, StatefulPolicy):
+    if stateful_policy is not None:
         unit_logits = unit_logits[:-1].flatten(0, 1)
         quantity_logits = quantity_logits[:-1].flatten(0, 1)
         market_logits = market_logits[:-1].flatten(0, 1)
@@ -945,7 +952,7 @@ def compute_loss(  # noqa: C901
         quantity_logits = _acted(quantity_logits, turns, width)
         market_logits = _acted(market_logits, turns, width)
 
-    belief_enabled = isinstance(policy, StatefulPolicy) and policy.config.belief
+    belief_enabled = stateful_policy is not None and stateful_policy.config.belief
     belief_terms: dict[str, torch.Tensor] = {}
     if belief_enabled:
         belief_terms = _belief_loss_terms(loss_output, segments)
@@ -1216,13 +1223,39 @@ def round_decay(config: ToadConfig) -> Callable[[int], float]:
     )
 
 
+def _canonicalize_policy_checkpoint(
+    module: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    local_metadata: dict[str, object],
+) -> None:
+    """Save compiled policy weights under the eager portable key layout."""
+    del module, local_metadata
+    canonicalize_policy_state_keys(state_dict, prefix=prefix)
+
+
+def _prepare_policy_checkpoint_load(
+    module: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    local_metadata: dict[str, object],
+    strict: bool,
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+    error_messages: list[str],
+) -> None:
+    """Load canonical checkpoints into the current eager or compiled policy."""
+    del local_metadata, strict, missing_keys, unexpected_keys, error_messages
+    prepare_policy_state_keys_for_load(module, state_dict, prefix=prefix)
+
+
 class ToadLightningModule(lightning.LightningModule):
     """Native Toad policy trained through Lightning automatic optimization."""
 
     def __init__(self, config: ToadConfig) -> None:
         super().__init__()
         self.config = config
-        self.policy: PolicyLike = (
+        initial_policy: PolicyLike = (
             StatefulPolicy(config.model)
             if uses_stateful_policy(config.model)
             else Policy(
@@ -1233,10 +1266,11 @@ class ToadLightningModule(lightning.LightningModule):
                 activation=config.model.activation,
             )
         )
+        self.policy: torch.nn.Module = initial_policy
         self.warm_start_migration: WarmStartMigration | None = None
         if config.curriculum.warm_start_checkpoint is not None:
             self.warm_start_migration = initialize_policy_from_checkpoint(
-                self.policy, config.curriculum.warm_start_checkpoint
+                initial_policy, config.curriculum.warm_start_checkpoint
             )
         self.teacher_policy: Policy | None = None
         self.teacher: LoadedTeacher | None = None
@@ -1275,6 +1309,8 @@ class ToadLightningModule(lightning.LightningModule):
         self._learner_started: float | None = None
         self._pending_round_flush = False
         self._last_finite_provenance: NonFiniteProvenance | None = None
+        self.register_state_dict_post_hook(_canonicalize_policy_checkpoint)
+        self.register_load_state_dict_pre_hook(_prepare_policy_checkpoint_load)
         self.save_hyperparameters(self.config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
@@ -1389,7 +1425,7 @@ class ToadLightningModule(lightning.LightningModule):
         """
         nonfinite = [
             f"grad/{name}"
-            for name, parameter in self.policy.named_parameters()
+            for name, parameter in unwrap_compiled(self.policy).named_parameters()
             if parameter.grad is not None
             and not bool(torch.isfinite(parameter.grad).all())
         ]

@@ -9,6 +9,7 @@ from typing import cast
 import lightning
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 
+from kaggriculture.learn.toad.compile import policy_state_dict
 from kaggriculture.learn.toad.config import structural_fingerprint
 from kaggriculture.learn.toad.data import LearnerBatch, ToadDataModule
 from kaggriculture.learn.toad.lightning import ToadLightningModule
@@ -63,7 +64,7 @@ class ActorSyncCallback(lightning.Callback):
         consume_restored = getattr(data, "consume_restored_actor", None)
         if consume_restored is not None and consume_restored():
             return
-        data.publish_actor(module.policy.state_dict(), module.actor_version)
+        data.publish_actor(policy_state_dict(module), module.actor_version)
 
     def on_train_batch_end(
         self,
@@ -83,7 +84,7 @@ class ActorSyncCallback(lightning.Callback):
         module.actor_version += 1
         module.actor_source_global_step = int(module.global_step)
         _data_module(trainer).publish_actor(
-            module.policy.state_dict(), module.actor_version
+            policy_state_dict(module), module.actor_version
         )
 
 
@@ -221,7 +222,7 @@ class PopulationSnapshotCallback(lightning.Callback):
         if self.store is None:
             raise RuntimeError("population snapshot store is not initialized")
         self.store.add(
-            module.policy.state_dict(),
+            policy_state_dict(module),
             environment_steps=module.environment_steps,
             round_id=module.collection_round,
             run_id=module.config.curriculum.phase,

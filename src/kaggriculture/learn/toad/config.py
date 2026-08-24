@@ -36,6 +36,7 @@ from kaggriculture.learn.toad_reward import MONEY_WEIGHT
 from kaggriculture.sim.state import CROP_NAMES, PRODUCT_NAMES, SHED_NAMES
 
 Precision = Literal["32-true", "bf16-mixed"]
+CompileMode = Literal["default", "reduce-overhead", "max-autotune"]
 # The largest centered odd window no wider than the board declares the amount
 # of edge padding this implementation supports; the 7x7 default remains inside it.
 MAX_LOCAL_PATCH_SIZE = BOARD_SIZE - 1 if BOARD_SIZE % 2 == 0 else BOARD_SIZE
@@ -251,6 +252,17 @@ class OptimizerConfig(BaseModel):
     value_passes: NonNegativeInt = 0
 
 
+class CompileConfig(BaseModel):
+    """Immutable optional ``torch.compile`` identity for one Toad run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    mode: CompileMode = "default"
+    fullgraph: bool = False
+    dynamic: bool = False
+
+
 class RuntimeConfig(BaseModel):
     """Resolved Lightning execution settings for the native trainer."""
 
@@ -270,7 +282,7 @@ class RuntimeConfig(BaseModel):
     profiler: Literal["simple", "advanced"] | None = None
     output_dir: Path = Path("run/toad")
     resume: Path | None = None
-    compile: Literal[False] = False
+    compile: CompileConfig = Field(default_factory=CompileConfig)
     rollout_backend: Literal["reference"] = "reference"
 
     @model_validator(mode="after")
@@ -487,6 +499,7 @@ STRUCTURAL_FIELDS = (
     "optimizer.entropy",
     "optimizer.unroll_length",
     "optimizer.batch_segments",
+    "runtime.compile",
 )
 
 
