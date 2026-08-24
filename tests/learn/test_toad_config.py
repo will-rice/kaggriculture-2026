@@ -239,6 +239,9 @@ def test_warm_start_provenance_does_not_make_resume_structurally_incompatible(
         ("curriculum.reward_field", "own"),
         ("curriculum.money_weight", 0.5),
         ("model.blocks", 4),
+        ("runtime.precision", "bf16-mixed"),
+        ("runtime.compile.enabled", True),
+        ("runtime.rollout_backend", "native"),
     ],
 )
 def test_resume_rejects_every_behavior_changing_config_drift(
@@ -261,7 +264,9 @@ def test_resume_allows_only_explicit_operational_overrides(tmp_path: Path) -> No
             "runtime": stored.runtime.model_copy(
                 update={
                     "accelerator": "cpu",
-                    "strategy": "auto",
+                    "devices": 2,
+                    "num_nodes": 2,
+                    "strategy": "ddp",
                     "log_every_n_steps": 9,
                     "profiler": "simple",
                     "output_dir": tmp_path / "resumed",

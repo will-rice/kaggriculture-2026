@@ -991,10 +991,18 @@ def _parameter_digest(module: ToadLightningModule) -> str:
 class _DdpProbe(lightning.Callback):
     """Persist rank-local evidence after a real subprocess DDP run."""
 
-    def __init__(self, output_dir: Path, phase: str, seen_game_ids: list[int]) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        phase: str,
+        seen_game_ids: list[int],
+        seen_opponent_ids: list[str],
+    ) -> None:
         self.output_dir = output_dir
         self.phase = phase
         self.seen_game_ids = seen_game_ids
+        self.seen_opponent_ids = seen_opponent_ids
+        self.scripted_win_rates: list[float] = []
         self.batch_count = 0
         self.first_markers = 0
         self.end_markers = 0
@@ -1024,6 +1032,10 @@ class _DdpProbe(lightning.Callback):
         self.batch_count += 1
         self.first_markers += int(learner_batch.first_of_round)
         self.end_markers += int(learner_batch.end_of_round)
+        if learner_batch.first_of_round:
+            self.scripted_win_rates.append(
+                float(learner_batch.round_metrics["objective/win_rate_vs_econ"])
+            )
 
     def on_fit_end(
         self,
@@ -1036,6 +1048,8 @@ class _DdpProbe(lightning.Callback):
         payload = {
             "rank": trainer.global_rank,
             "game_ids": self.seen_game_ids,
+            "opponent_ids": self.seen_opponent_ids,
+            "scripted_win_rates": self.scripted_win_rates,
             "batch_count": self.batch_count,
             "first_markers": self.first_markers,
             "end_markers": self.end_markers,
@@ -1151,9 +1165,11 @@ def _run_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
     data.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
     config = _ddp_fixture_config(output_dir, resume)
     seen_game_ids: list[int] = []
+    seen_opponent_ids: list[str] = []
 
     def collect(assignment: data.CollectionAssignment) -> tuple[Trajectory]:
         seen_game_ids.append(assignment.game_id)
+        seen_opponent_ids.append(assignment.opponent_id)
         return (_ddp_fixture_trajectory(assignment.game_id),)
 
     source = data.ReferenceRoundSource(config, collect_assignment=collect)
@@ -1163,7 +1179,7 @@ def _run_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
         EnvironmentStepStop(config.runtime.total_environment_steps),
         PopulationSnapshotCallback(),
         BoundaryCheckpoint(config.runtime.output_dir),
-        _DdpProbe(output_dir, phase, seen_game_ids),
+        _DdpProbe(output_dir, phase, seen_game_ids, seen_opponent_ids),
     ]
     if phase == "initial":
         callbacks.append(_StopAfterOneRound())
@@ -1245,6 +1261,11 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
     first = _probe_payloads(tmp_path, "initial")
 
     assert [payload["game_ids"] for payload in first] == [[0], [1]]
+    assert [payload["opponent_ids"] for payload in first] == [
+        ["economic"],
+        ["economic"],
+    ]
+    assert [payload["scripted_win_rates"] for payload in first] == [[1.0], [1.0]]
     assert [payload["batch_count"] for payload in first] == [2, 2]
     assert [payload["first_markers"] for payload in first] == [1, 1]
     assert [payload["end_markers"] for payload in first] == [1, 1]
@@ -1264,6 +1285,11 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
     second = _probe_payloads(tmp_path, "resume")
 
     assert [payload["game_ids"] for payload in second] == [[2], [3]]
+    assert [payload["opponent_ids"] for payload in second] == [
+        ["economic"],
+        ["economic"],
+    ]
+    assert [payload["scripted_win_rates"] for payload in second] == [[1.0], [1.0]]
     assert [payload["batch_count"] for payload in second] == [2, 2]
     assert len({payload["parameter_digest"] for payload in second}) == 1
     assert [payload["environment_steps"] for payload in second] == [16, 16]
@@ -1277,6 +1303,14 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
     full = _probe_payloads(uninterrupted_dir, "uninterrupted")
 
     assert [payload["game_ids"] for payload in full] == [[0, 2], [1, 3]]
+    assert [payload["opponent_ids"] for payload in full] == [
+        ["economic", "economic"],
+        ["economic", "economic"],
+    ]
+    assert [payload["scripted_win_rates"] for payload in full] == [
+        [1.0, 1.0],
+        [1.0, 1.0],
+    ]
     assert [payload["batch_count"] for payload in full] == [4, 4]
     assert [payload["first_markers"] for payload in full] == [2, 2]
     assert [payload["end_markers"] for payload in full] == [2, 2]

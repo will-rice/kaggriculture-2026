@@ -543,7 +543,7 @@ def test_lightning_training_step_matches_control_fixture(tmp_path: Path) -> None
         enable_checkpointing=False,
         enable_model_summary=False,
         default_root_dir=tmp_path,
-        gradient_clip_val=toad.CLIP_GRADS,
+        gradient_clip_val=module.config.optimizer.clip_grad_norm,
         gradient_clip_algorithm="norm",
     )
 

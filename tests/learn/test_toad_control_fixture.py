@@ -1,4 +1,4 @@
-"""Frozen control for Toad's pre-Lightning optimizer boundary."""
+"""Frozen numerical control for Toad's Lightning optimizer boundary."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -90,26 +90,32 @@ def test_control_fixture_pins_one_optimizer_step() -> None:
     fixture = load_control_fixture()
     initial_model = cast(dict[str, torch.Tensor], fixture["initial_model"])
     initial_optimizer = cast(dict[str, object], fixture["initial_optimizer"])
-    segments = cast(list[dict[str, torch.Tensor]], fixture["segments"])
     updated_model = cast(dict[str, torch.Tensor], fixture["updated_model"])
     updated_optimizer = cast(dict[str, object], fixture["updated_optimizer"])
     policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
     policy.load_state_dict(initial_model)
-    optimizer = toad._optimizer(policy, cast(float, fixture["lr"]))
+    config = control_fixture_config()
+    optimizer = torch.optim.Adam(
+        policy.parameters(),
+        lr=cast(float, fixture["lr"]),
+        eps=config.optimizer.adam_eps,
+    )
     optimizer.load_state_dict(initial_optimizer)
 
     with control_fixture_threads():
-        terms = toad._step(
+        report = compute_loss(
             policy,
-            optimizer,
-            segments,
-            "cpu",
-            "shaped_money",
-            entropy_cost=cast(float, fixture["entropy_cost"]),
-            discounting=cast(float, fixture["gamma"]),
-            lmb=cast(float, fixture["lmb"]),
+            control_fixture_batch(fixture),
+            config,
         )
+        optimizer.zero_grad(set_to_none=True)
+        report.total.backward()
+        torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), config.optimizer.clip_grad_norm
+        )
+        optimizer.step()
 
+        terms = {name: value.item() for name, value in report.terms.items()}
         assert terms == pytest.approx(fixture["terms"], rel=1e-6, abs=1e-7)
         for name, value in policy.state_dict().items():
             assert torch.equal(value, updated_model[name])
@@ -172,47 +178,3 @@ def test_control_fixture_preserves_tensor_layout_and_fp32() -> None:
     assert tuple(initial_model) == tuple(
         Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND).state_dict()
     )
-
-
-def test_control_fixture_pins_round_clocks() -> None:
-    """Value replays must not advance collection or scheduler clocks."""
-    fixture = load_control_fixture()
-    trajectory = cast(Trajectory, fixture["trajectory"])
-    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
-    policy.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
-    optimizer = toad._optimizer(policy, cast(float, fixture["lr"]))
-    optimizer.load_state_dict(cast(dict[str, object], fixture["initial_optimizer"]))
-    schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, toad._decay(cast(float, fixture["econ_fraction"]))
-    )
-    collected_steps = sum(int(item.shaped.shape[0]) for item in [trajectory])
-    torch.manual_seed(cast(int, fixture["round_seed"]))
-    terms, consumed = toad._update(
-        policy,
-        optimizer,
-        [trajectory],
-        "cpu",
-        "shaped_money",
-        value_passes=cast(int, fixture["value_passes"]),
-    )
-    collected_steps_with_value_passes = sum(
-        int(item.shaped.shape[0]) for item in [trajectory]
-    )
-    schedule.step()
-
-    assert terms == pytest.approx(fixture["round_terms"], rel=1e-6, abs=1e-7)
-    assert consumed == fixture["consumed_policy_batches"]
-    assert consumed == len(toad._segments(trajectory)) // toad.BATCH_SEGMENTS
-    assert fixture["policy_batches"] == toad._batches_per_update(
-        cast(float, fixture["econ_fraction"])
-    )
-    assert collected_steps == fixture["collected_steps"]
-    assert (
-        collected_steps_with_value_passes
-        == fixture["collected_steps_with_value_passes"]
-    )
-    assert collected_steps_with_value_passes == collected_steps
-    assert schedule.state_dict() == fixture["scheduler_state"]
-    assert schedule.get_last_lr() == pytest.approx(fixture["scheduler_last_lr"])
-    assert schedule.last_epoch == fixture["scheduler_steps"]
-    assert fixture["scheduler_steps"] == fixture["collection_rounds"]

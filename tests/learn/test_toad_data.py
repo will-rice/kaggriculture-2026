@@ -1932,6 +1932,15 @@ def test_reference_worker_uses_the_typed_money_weight(
 
     monkeypatch.setattr(toad, "rollout_many", fake_rollout)
 
-    toad._play((policy.state_dict(), [0], 1, 16, None, 0.01))
+    model = ToadConfig.control().model.model_copy(update={"blocks": 1, "channels": 16})
+    toad._play_reference(
+        ReferenceWorkerInput(
+            actor_state=dict(policy.state_dict()),
+            seeds=[0],
+            model=model,
+            versus=None,
+            money_weight=0.01,
+        )
+    )
 
     assert seen == [0.01]

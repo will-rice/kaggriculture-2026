@@ -709,3 +709,28 @@ Original Kaggriculture glue, Lightning integration, Pydantic schema, market and
 quantity heads, belief target translation, and tests remain under this
 repository's license. The implementation plan must include the notice change
 in the first commit that adds derived source, not as cleanup after the port.
+
+## 18. Implementation amendment — 2026-08-24
+
+The completed runtime preflight establishes the following selectable boundary:
+
+- reference rollout supports eager FP32 CPU, capability-checked BF16, compile,
+  and explicit DDP; native rollout supports eager execution and explicit DDP;
+- native rollout combined with compile is rejected until that joint path has a
+  proof, and CUDA-graph round collection remains unselectable. Scripted native
+  graph capture is rejected specifically because the opponent consumes host
+  simulator rows;
+- the verified native scripted opponent is `economic`; other scripted
+  opponents fail before Trainer construction. Native CUDA requests and all
+  explicit accelerator/BF16 requests also fail when the required hardware
+  capability is unavailable; and
+- an explicit GPU device tuple is ordered, range checked, and duplicate-free.
+  Any resolved world size above one requires `strategy="ddp"`.
+
+Each logger config now includes a frozen resolved runtime record containing
+precision, the complete compile configuration, world size, and rollout
+backend. Resume treats precision, compile configuration, and rollout backend
+as immutable experiment identity. Only the proven operational placement and
+diagnostic fields (`accelerator`, `devices`, `num_nodes`, `strategy`, logging
+frequency, profiler, output directory, and resume path), plus consumed
+warm-start provenance, may differ from the stored config.

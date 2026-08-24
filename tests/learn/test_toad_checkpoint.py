@@ -18,7 +18,6 @@ import pytest
 import torch
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 
-from kaggriculture.learn.encoding import SCALARS, TILE_PLANES
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
@@ -43,8 +42,6 @@ from kaggriculture.learn.toad.lightning import (
 )
 from kaggriculture.learn.toad.model import StatefulPolicy
 from kaggriculture.learn.toad_loss import (
-    ADAM_EPS,
-    LEARNING_RATE,
     MIN_LR_MOD,
     TOTAL_STEPS,
 )
@@ -62,16 +59,6 @@ from tests.learn.test_toad_model_integration import (
 
 # The arm's own mix, so the schedule under test is the one that runs.
 ECON_FRACTION = 0.5
-
-
-def _fresh() -> tuple[
-    Policy, torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler
-]:
-    """Return a policy, optimizer and schedule as `main` builds them."""
-    policy = Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
-    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, toad._decay(ECON_FRACTION))
-    return policy, optimizer, schedule
 
 
 @pytest.mark.parametrize(("econ_fraction", "seats"), [(0.0, 48), (0.5, 36), (0.25, 42)])
@@ -97,84 +84,6 @@ def test_the_schedule_reaches_its_floor_no_earlier_than_the_budget(
 
     assert decay(0) == 1.0
     assert floor / update > 0.98
-
-
-def test_resuming_continues_the_schedule_rather_than_restarting_it(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The LR after a resume must equal the uninterrupted run's LR.
-
-    Broken by restarting the schedule, which is the natural way to get this
-    wrong and is invisible except in this number.
-    """
-    monkeypatch.setattr(toad, "RUNS", tmp_path)
-
-    # An uninterrupted run: 40 schedule steps.
-    _, _, uninterrupted = _fresh()
-    for _ in range(40):
-        uninterrupted.step()
-    expected = uninterrupted.get_last_lr()[0]
-
-    # A run that stops at 25 and resumes.
-    policy, optimizer, schedule = _fresh()
-    for _ in range(25):
-        schedule.step()
-    path = toad._checkpoint(
-        policy, optimizer, schedule, steps=863_000, update=25, prefix="phase1"
-    )
-    assert path.is_file()
-
-    restored_policy, restored_optimizer, restored_schedule = _fresh()
-    steps, update = toad._restore(
-        path, restored_policy, restored_optimizer, restored_schedule, "cpu"
-    )
-    assert (steps, update) == (863_000, 25)
-    for _ in range(15):
-        restored_schedule.step()
-
-    assert restored_schedule.get_last_lr()[0] == expected
-
-
-def test_the_checkpoint_carries_weights_and_adam_moments(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Weights and optimizer state must both survive, not just weights.
-
-    Adam's moments are as much of the training state as the parameters; dropping
-    them restarts the optimizer cold and loses the run's accumulated scaling.
-    """
-    monkeypatch.setattr(toad, "RUNS", tmp_path)
-    policy, optimizer, schedule = _fresh()
-    # Take a real step so the moments are populated.
-    policy(
-        torch.randn(2, TILE_PLANES, 10, 10),
-        torch.randn(2, SCALARS),
-        torch.zeros(2, 20, dtype=torch.int64),
-    )[2].sum().backward()
-    optimizer.step()
-
-    path = toad._checkpoint(
-        policy, optimizer, schedule, steps=1, update=25, prefix="phase1"
-    )
-    restored_policy, restored_optimizer, restored_schedule = _fresh()
-    toad._restore(path, restored_policy, restored_optimizer, restored_schedule, "cpu")
-
-    for before, after in zip(
-        policy.state_dict().values(), restored_policy.state_dict().values(), strict=True
-    ):
-        assert torch.equal(before, after)
-    assert restored_optimizer.state_dict()["state"], "Adam moments were not restored"
-
-
-def test_the_checkpoint_write_is_atomic(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No temporary file may survive, or a kill mid-write leaves a torn checkpoint."""
-    monkeypatch.setattr(toad, "RUNS", tmp_path)
-    policy, optimizer, schedule = _fresh()
-    toad._checkpoint(policy, optimizer, schedule, steps=1, update=50, prefix="phase1b")
-    assert list(tmp_path.glob("*.pt"))
-    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> None:

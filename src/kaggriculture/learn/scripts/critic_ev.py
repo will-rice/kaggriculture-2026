@@ -21,7 +21,7 @@ This measures that rather than arguing it.
 * ``ev_start`` -- ``1 - Var(G_0 - V_0) / Var(G_0)`` across episodes, i.e. does the
   critic call the season from the opening position.
 * ``ev_td_segment`` -- against the learner's own TD(lambda) targets, in the exact
-  16-step segments ``toad._step`` builds, bootstrapped from the value of
+  16-step segments the native loss boundary consumes, bootstrapped from the value of
   the segment's own last state. This is what the ``baseline`` loss term measures
   and it is reported for continuity with the training logs, but it is partly
   circular by construction: the target is built out of the values being scored.
@@ -300,7 +300,7 @@ class Episode:
 def _worker(work: tuple[Arm, list[int]]) -> list[Episode]:
     """Play one worker's share. Runs in a subprocess.
 
-    Torch is pinned to one thread for the reason ``toad._play`` pins it:
+    Torch is pinned to one thread for the reason the reference collector pins it:
     every worker otherwise claims the whole machine, and there is a training run
     on this box that must not be starved.
     """
@@ -424,8 +424,8 @@ def segment_terms(
     batch's own last row -- because the value loss and the advantage both scale
     with that shape, and a segment of a different length is a different number.
 
-    That is deliberately **no longer** what ``toad._segments`` and
-    ``_step`` do. Both defects this reconstruction faithfully reproduces -- the
+    That is deliberately **no longer** what ``toad._segments`` and the active
+    loss boundary do. Both defects this reconstruction faithfully reproduces -- the
     ragged tail that dropped the season's only ``done``, and the bootstrap taken
     from inside the segment rather than from the state after it -- were fixed on
     2026-08-11, and fixing them took a fresh critic's explained variance against

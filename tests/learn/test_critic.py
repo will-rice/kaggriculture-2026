@@ -35,8 +35,11 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.toad.config import ToadConfig
 from kaggriculture.learn.toad.core import td_lambda
-from kaggriculture.learn.toad_loss import ADAM_EPS, DISCOUNTING, LEARNING_RATE, LMB
+from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
+from kaggriculture.learn.toad.lightning import compute_loss
+from kaggriculture.learn.toad_loss import DISCOUNTING, LMB
 
 TURNS = 719
 # Lux's ``GAME_CONSTANTS["PARAMETERS"]["MAX_DAYS"]``, the episode length every
@@ -215,13 +218,11 @@ def test_a_segment_bootstraps_from_the_state_after_its_last_action() -> None:
 class _Oracle(Policy):
     """A critic whose value head emits a prescribed number for each turn.
 
-    ``_step`` gives nothing back about the target it built except the
-    ``baseline`` term, and that is enough to pin it: smooth L1 between a critic
-    and a target is zero exactly when the two agree, so feeding a critic we
-    already know the right answer for turns the loss into a readout of the
-    target. It subclasses ``Policy`` because that is what the runner is typed to
-    take, and it keeps a real gradient path so the runner's backward pass,
-    gradient clipping and optimizer step all run exactly as they do in training.
+    ``compute_loss`` exposes the target only through the ``baseline`` term, and
+    that is enough to pin it: smooth L1 between a critic and a target is zero
+    exactly when the two agree, so feeding a critic we already know the right
+    answer for turns the loss into a readout of the target. It subclasses
+    ``Policy`` because that is what the active loss boundary accepts.
     """
 
     def __init__(self, values: torch.Tensor) -> None:
@@ -245,12 +246,12 @@ class _Oracle(Policy):
 
 
 def _baseline(values: torch.Tensor, last: bool = True) -> float:
-    """Return the ``baseline`` term the runner's own ``_step`` builds for a critic.
+    """Return the native loss boundary's ``baseline`` term for a critic.
 
-    This goes through ``toad._step``, not through a reconstruction of it,
-    so it pins what the runner **consumes**. Asserting on what ``_segments``
-    *produces* is not the same thing and does not catch a ``_step`` that ignores
-    the state it is handed.
+    This goes through ``compute_loss``, not through a reconstruction of it, so it
+    pins what the active Lightning trainer **consumes**. Asserting on what
+    ``_segments`` *produces* is not the same thing and does not catch a loss
+    boundary that ignores the state it is handed.
 
     Args:
         values: One value per turn of the season, the critic's output.
@@ -262,14 +263,33 @@ def _baseline(values: torch.Tensor, last: bool = True) -> float:
         The smooth-L1 value loss over one batch of segments.
     """
     segments = toad._segments(_episode())
-    batch = segments[-toad.BATCH_SEGMENTS :] if last else segments[:4]
+    selected = segments[-toad.BATCH_SEGMENTS :] if last else segments[:4]
     oracle = _Oracle(values)
-    optimizer = torch.optim.Adam(oracle.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
-    return toad._step(oracle, optimizer, batch, "cpu", "margin")["baseline"]
+    control = ToadConfig.control()
+    config = control.model_copy(
+        update={
+            "curriculum": control.curriculum.model_copy(
+                update={"reward_field": "margin"}
+            )
+        }
+    )
+    batch = LearnerBatch(
+        segments=tuple(selected),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=0,
+        round_id=0,
+        actor_version=0,
+        game_ids=(),
+        opponent_ids=(),
+    )
+    return compute_loss(oracle, batch, config).terms["baseline"].item()
 
 
 def test_the_runner_leaves_a_correct_critic_alone() -> None:
-    """A critic that is exactly right must have nothing to learn *through _step*.
+    """A correct critic must have nothing to learn through the active loss boundary.
 
     This is the end-to-end form of the fixed-point property, and it is the one
     that catches a bootstrap taken from inside the segment: discarding the
@@ -281,7 +301,7 @@ def test_the_runner_leaves_a_correct_critic_alone() -> None:
 
 
 def test_the_runner_rejects_the_infinite_horizon_critic() -> None:
-    """The critic the arms actually learned must be visibly wrong *through _step*.
+    """The critic the arms actually learned is wrong through the active boundary.
 
     ``r / (1 - gamma)`` is a zero-error fixed point of a target that never sees
     a ``done``, so this is the assertion that goes red if the season's terminal

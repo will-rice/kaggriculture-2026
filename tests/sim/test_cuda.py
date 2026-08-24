@@ -125,7 +125,9 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
     because ``collect_segment`` is functional. Without that, every replay would
     re-collect the season's first segment from unchanged inputs and the clock
     would never leave the first segment -- which is how a previous benchmark
-    came to quote the cost of a computation that never advanced.
+    came to quote the cost of a computation that never advanced. Capture records
+    kernels but does not execute them, so the first explicit replay is the graph
+    counterpart of the first eager segment below.
     """
     device = torch.device("cuda")
     length = 2
@@ -181,6 +183,7 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
             getattr(state, field.name).copy_(getattr(successor, field.name))
         assert isinstance(successor_policy_state, PolicyState)
         copy_policy_state_(policy_state, successor_policy_state)
+    graph.replay()
     eager_state, eager_policy_state, eager_trajectory = collect_segment(
         eager_state,
         eager_policy,
@@ -189,8 +192,15 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
         generator=eager_generator,
     )
     assert isinstance(eager_policy_state, PolicyState)
+    assert int(state.step[0]) == int(eager_state.step[0]), "capture did not advance"
+    for field in fields(SimState):
+        torch.testing.assert_close(
+            getattr(state, field.name),
+            getattr(eager_state, field.name),
+            msg=lambda message, name=field.name: f"capture {name}: {message}",
+        )
     started = int(state.step[0])
-    for _ in range(replays):
+    for replay in range(replays):
         graph.replay()
         eager_state, eager_policy_state, eager_trajectory = collect_segment(
             eager_state,
@@ -200,6 +210,14 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
             generator=eager_generator,
         )
         assert isinstance(eager_policy_state, PolicyState)
+        for field in fields(SimState):
+            torch.testing.assert_close(
+                getattr(state, field.name),
+                getattr(eager_state, field.name),
+                msg=lambda message, name=field.name, iteration=replay: (
+                    f"replay {iteration + 1} {name}: {message}"
+                ),
+            )
     torch.cuda.synchronize()
 
     assert int(state.step[0]) == started + replays * length

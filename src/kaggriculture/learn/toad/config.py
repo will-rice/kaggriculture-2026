@@ -295,6 +295,17 @@ class RuntimeConfig(BaseModel):
         return self
 
 
+class RuntimeMetadata(BaseModel):
+    """Frozen resolved execution identity recorded once for a trainer run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    precision: Precision
+    compile: CompileConfig
+    world_size: PositiveInt
+    rollout_backend: Literal["reference", "native"]
+
+
 class EvaluationGate(BaseModel):
     """An evaluation threshold for curriculum progression."""
 

@@ -307,28 +307,28 @@ def test_phase_two_reaches_sparse_through_the_real_parser(
     assert toad._field(arguments) == "sparse"
 
 
-def test_flags_reach_a_real_teacher_through_toad_s_own_loader(
+def test_typed_phase_reaches_a_real_teacher_through_lightning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--teacher and --teacher-blocks must resolve to a checkpoint toad can load.
+    """Typed teacher identity must resolve to a checkpoint Lightning can load.
 
     Proven against a real ``Policy`` and a real state dict, not a namespace
-    read back at itself: a runner that pointed ``--teacher`` at the right
-    path but the wrong ``--teacher-blocks`` would fail here with a shape
-    mismatch, exactly as it would training for real.
+    read back at itself: a config with the right checkpoint but the wrong
+    teacher topology would fail here with a shape mismatch.
     """
     monkeypatch.setattr(toad, "RUNS", tmp_path)
     torch.save(
-        Policy(blocks=8, channels=16).state_dict(), tmp_path / "phase1_000025.pt"
+        Policy(blocks=8, channels=toad.CHANNELS).state_dict(),
+        tmp_path / "phase1_000025.pt",
     )
 
-    flags = curriculum._flags(curriculum._phase("phase2"))
-    arguments = toad._parser().parse_args([*flags, "--channels", "16"])
-    teacher = toad._teacher(arguments, "cpu")
+    config = curriculum.phase_config(curriculum._phase("phase2"))
+    module = toad.ToadLightningModule(config)
 
-    assert teacher is not None
-    assert arguments.teacher_quantity is True
-    assert len(teacher.policy.blocks) == 8
+    assert config.population.teacher is not None
+    assert config.population.teacher.quantity is True
+    assert module.teacher_policy is not None
+    assert len(module.teacher_policy.blocks) == 8
 
 
 def test_phase_five_s_teacher_is_the_sixteen_block_checkpoint(
@@ -337,15 +337,15 @@ def test_phase_five_s_teacher_is_the_sixteen_block_checkpoint(
     """The one phase whose teacher is not the 8-block net -- proven, not just tabled."""
     monkeypatch.setattr(toad, "RUNS", tmp_path)
     torch.save(
-        Policy(blocks=16, channels=16).state_dict(), tmp_path / "phase3_000025.pt"
+        Policy(blocks=16, channels=toad.CHANNELS).state_dict(),
+        tmp_path / "phase3_000025.pt",
     )
 
-    flags = curriculum._flags(curriculum._phase("phase5"))
-    arguments = toad._parser().parse_args([*flags, "--channels", "16"])
-    teacher = toad._teacher(arguments, "cpu")
+    config = curriculum.phase_config(curriculum._phase("phase5"))
+    module = toad.ToadLightningModule(config)
 
-    assert teacher is not None
-    assert len(teacher.policy.blocks) == 16
+    assert module.teacher_policy is not None
+    assert len(module.teacher_policy.blocks) == 16
 
 
 def test_the_cli_names_every_phase() -> None:

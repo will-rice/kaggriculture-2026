@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.callbacks import (
@@ -22,6 +23,305 @@ from tests.learn.test_toad_control_fixture import (
     control_fixture_batch,
     load_control_fixture,
 )
+
+
+def _runtime_config(
+    *,
+    accelerator: str = "cpu",
+    devices: int | str | list[int] = 1,
+    num_nodes: int = 1,
+    strategy: str = "auto",
+    precision: str = "32-true",
+    compile_enabled: bool = False,
+    rollout_backend: str = "reference",
+    rollout_device: str = "cpu",
+    rollout_cuda_graph: bool = False,
+    scripted: float = 0.5,
+    scripted_opponent: str = "economic",
+) -> ToadConfig:
+    """Build one literal runtime-matrix row from the typed control contract."""
+    payload = ToadConfig.control().model_dump(mode="python")
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    runtime.update(
+        accelerator=accelerator,
+        devices=devices,
+        num_nodes=num_nodes,
+        strategy=strategy,
+        precision=precision,
+        compile={"enabled": compile_enabled},
+        rollout_backend=rollout_backend,
+        rollout_device=rollout_device,
+        rollout_cuda_graph=rollout_cuda_graph,
+    )
+    population = payload["population"]
+    assert isinstance(population, dict)
+    population.update(
+        selfplay=1.0 - scripted,
+        scripted=scripted,
+        scripted_opponent=scripted_opponent,
+    )
+    return ToadConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _runtime_config(),
+        _runtime_config(accelerator="gpu", precision="bf16-mixed"),
+        _runtime_config(
+            accelerator="gpu", precision="bf16-mixed", compile_enabled=True
+        ),
+        _runtime_config(
+            accelerator="gpu", precision="bf16-mixed", rollout_backend="native"
+        ),
+        _runtime_config(devices=2, strategy="ddp"),
+        _runtime_config(devices=2, strategy="ddp", rollout_backend="native"),
+        _runtime_config(num_nodes=2, strategy="ddp"),
+    ],
+    ids=(
+        "reference-eager-fp32-cpu",
+        "reference-eager-bf16-gpu",
+        "reference-compile-bf16-gpu",
+        "native-eager-bf16-gpu",
+        "reference-ddp",
+        "native-ddp",
+        "reference-multinode-ddp",
+    ),
+)
+def test_supported_runtime_matrix(
+    config: ToadConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every proved eager, BF16, compile, native, and DDP row is explicit."""
+    monkeypatch.setattr(toad, "_cuda_available", lambda: True)
+    monkeypatch.setattr(toad, "_cuda_device_count", lambda: 4)
+    monkeypatch.setattr(toad, "_cuda_bf16_supported", lambda: True)
+    monkeypatch.setattr(toad, "_cpu_bf16_supported", lambda: True)
+
+    assert toad.runtime_preflight(config) is None
+
+
+@pytest.mark.parametrize(
+    ("config", "cuda_available", "cuda_devices", "cuda_bf16", "cpu_bf16", "error"),
+    [
+        (
+            _runtime_config(accelerator="gpu"),
+            False,
+            0,
+            False,
+            True,
+            "GPU accelerator requested but CUDA is unavailable",
+        ),
+        (
+            _runtime_config(accelerator="gpu", precision="bf16-mixed"),
+            True,
+            1,
+            False,
+            True,
+            "bf16-mixed requested but CUDA BF16 is unavailable",
+        ),
+        (
+            _runtime_config(accelerator="gpu", devices=2, strategy="ddp"),
+            True,
+            1,
+            True,
+            True,
+            "requested GPU devices are unavailable: requested=2, available=1",
+        ),
+        (
+            _runtime_config(accelerator="gpu", devices=[0, 2], strategy="ddp"),
+            True,
+            2,
+            True,
+            True,
+            "requested GPU device index is unavailable: available=2, devices=(0, 2)",
+        ),
+        (
+            _runtime_config(accelerator="gpu", devices=[0, 0], strategy="ddp"),
+            True,
+            2,
+            True,
+            True,
+            "requested GPU device indexes must be unique: devices=(0, 0)",
+        ),
+        (
+            _runtime_config(devices=2),
+            True,
+            2,
+            True,
+            True,
+            "resolved world size above one requires DDP strategy='ddp': "
+            "world_size=2, strategy='auto'",
+        ),
+        (
+            _runtime_config(num_nodes=2),
+            True,
+            2,
+            True,
+            True,
+            "resolved world size above one requires DDP strategy='ddp': "
+            "world_size=2, strategy='auto'",
+        ),
+        (
+            _runtime_config(precision="bf16-mixed"),
+            False,
+            0,
+            False,
+            False,
+            "bf16-mixed requested but CPU BF16 autocast is unavailable",
+        ),
+        (
+            _runtime_config(compile_enabled=True, rollout_backend="native"),
+            True,
+            1,
+            True,
+            True,
+            "native rollout with torch.compile is not proved; refusing eager fallback",
+        ),
+        (
+            _runtime_config(rollout_cuda_graph=True),
+            True,
+            1,
+            True,
+            True,
+            "CUDA-graph rollout requires rollout_backend='native'",
+        ),
+        (
+            _runtime_config(rollout_backend="native", rollout_cuda_graph=True),
+            True,
+            1,
+            True,
+            True,
+            "scripted CUDA-graph rollout is unsupported because the scripted "
+            "opponent reads simulator rows on the host",
+        ),
+        (
+            _runtime_config(
+                rollout_backend="native", rollout_cuda_graph=True, scripted=0.0
+            ),
+            True,
+            1,
+            True,
+            True,
+            "CUDA-graph round collection is not yet selectable; refusing eager "
+            "fallback",
+        ),
+        (
+            _runtime_config(rollout_backend="native", scripted_opponent="starter"),
+            True,
+            1,
+            True,
+            True,
+            "native scripted rollout supports only the verified 'economic' opponent",
+        ),
+        (
+            _runtime_config(rollout_device="cuda"),
+            True,
+            1,
+            True,
+            True,
+            "reference rollout does not consume rollout_device; refusing an ignored "
+            "'cuda' request",
+        ),
+        (
+            _runtime_config(rollout_backend="native", rollout_device="cuda"),
+            False,
+            0,
+            False,
+            True,
+            "native CUDA rollout requested but CUDA is unavailable",
+        ),
+    ],
+    ids=(
+        "gpu-unavailable",
+        "cuda-bf16-unavailable",
+        "gpu-count-unavailable",
+        "gpu-index-unavailable",
+        "gpu-index-duplicate",
+        "devices-require-ddp",
+        "nodes-require-ddp",
+        "cpu-bf16-unavailable",
+        "native-compile-unproved",
+        "reference-graph",
+        "scripted-native-graph",
+        "native-graph-unproved",
+        "native-opponent-unproved",
+        "reference-device-ignored",
+        "native-device-unavailable",
+    ),
+)
+def test_rejected_runtime_matrix_has_exact_preflight_errors(
+    config: ToadConfig,
+    cuda_available: bool,
+    cuda_devices: int,
+    cuda_bf16: bool,
+    cpu_bf16: bool,
+    error: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsupported runtime requests fail closed before Trainer construction."""
+    monkeypatch.setattr(toad, "_cuda_available", lambda: cuda_available)
+    monkeypatch.setattr(toad, "_cuda_device_count", lambda: cuda_devices)
+    monkeypatch.setattr(toad, "_cuda_bf16_supported", lambda: cuda_bf16)
+    monkeypatch.setattr(toad, "_cpu_bf16_supported", lambda: cpu_bf16)
+
+    with pytest.raises(toad.RuntimePreflightError) as raised:
+        toad.runtime_preflight(config)
+
+    assert str(raised.value) == error
+
+
+def test_runtime_metadata_is_frozen_and_records_resolved_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One run records precision, compiler, world size, and rollout backend."""
+    monkeypatch.setattr(toad, "_cuda_available", lambda: False)
+    config = _runtime_config(
+        devices=2,
+        strategy="ddp",
+        precision="bf16-mixed",
+        compile_enabled=True,
+    )
+
+    metadata = toad.runtime_metadata(config)
+
+    assert metadata.model_dump(mode="json") == {
+        "precision": "bf16-mixed",
+        "compile": {
+            "enabled": True,
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": False,
+        },
+        "world_size": 2,
+        "rollout_backend": "reference",
+    }
+    with pytest.raises(ValidationError, match="frozen"):
+        metadata.world_size = 1  # ty: ignore[invalid-assignment]
+
+
+def test_only_lightning_orchestration_remains_callable() -> None:
+    """The retired learner/device/checkpoint/update path cannot be selected."""
+    retired = {
+        "_learner",
+        "_optimizer",
+        "_start_run",
+        "_log_definitions",
+        "_teacher",
+        "_prefix",
+        "_default_name",
+        "_warm_start",
+        "_checkpoint",
+        "_restore",
+        "_device",
+        "_collect",
+        "_play",
+        "_update",
+        "_value_passes",
+        "_step",
+    }
+
+    assert not retired.intersection(vars(toad))
 
 
 def test_cli_resolves_config_and_json_overrides(tmp_path: Path) -> None:
@@ -253,7 +553,16 @@ def test_wandb_logger_receives_the_complete_resolved_config(
 
     toad.build_wandb_logger(config)
 
-    assert captured["config"] == config.model_dump(mode="json")
+    logged = cast(dict[str, object], captured["config"])
+    resolved = config.model_dump(mode="json")
+    assert {key: logged[key] for key in resolved} == resolved
+    assert logged["runtime_metadata"] == {
+        "precision": "32-true",
+        "compile": config.runtime.compile.model_dump(mode="json"),
+        "world_size": 1,
+        "rollout_backend": "reference",
+    }
+    assert logged["metric_definitions"] == toad.METRIC_DEFINITIONS
 
 
 def test_run_seeds_builds_native_components_and_passes_resume(
