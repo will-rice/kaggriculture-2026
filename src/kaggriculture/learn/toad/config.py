@@ -19,7 +19,7 @@ from pydantic import (
     model_validator,
 )
 
-from kaggriculture.constants import BOARD_SIZE
+from kaggriculture.constants import BOARD_SIZE, EPISODE_STEPS
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -169,6 +169,63 @@ class PopulationConfig(BaseModel):
         return migrated
 
 
+class EntropyControllerConfig(BaseModel):
+    """Immutable target schedule and multiplicative update bounds for one head."""
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        allow_inf_nan=False,
+    )
+
+    initial_target: NonNegativeFloat
+    target_change_per_step: float = 0.0
+    target_floor: NonNegativeFloat = 0.0
+    initial_multiplier: NonNegativeFloat
+    multiplier_change_per_step: NonNegativeFloat
+    minimum: NonNegativeFloat = 0.0
+    maximum: PositiveFloat
+
+    @model_validator(mode="after")
+    def validate_multiplier_bounds(self) -> Self:
+        """Keep the initial multiplier inside its declared closed interval."""
+        if not self.minimum <= self.initial_multiplier <= self.maximum:
+            raise ValueError("initial_multiplier must be between minimum and maximum")
+        return self
+
+
+def _default_entropy_controller() -> EntropyControllerConfig:
+    """Return inert defaults used only after adaptive entropy is enabled."""
+    return EntropyControllerConfig(
+        initial_target=0.0,
+        initial_multiplier=ENTROPY_COST,
+        multiplier_change_per_step=0.0,
+        maximum=1.0,
+    )
+
+
+class EntropyControllersConfig(BaseModel):
+    """Typed target-entropy controller settings for each action head."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    operation: EntropyControllerConfig = Field(
+        default_factory=_default_entropy_controller
+    )
+    quantity: EntropyControllerConfig = Field(
+        default_factory=_default_entropy_controller
+    )
+    market: EntropyControllerConfig = Field(default_factory=_default_entropy_controller)
+
+    def items(self) -> tuple[tuple[str, EntropyControllerConfig], ...]:
+        """Return named controller configs in stable action order."""
+        return (
+            ("operation", self.operation),
+            ("quantity", self.quantity),
+            ("market", self.market),
+        )
+
+
 class OptimizerConfig(BaseModel):
     """Loss coefficients and optimizer schedule settings."""
 
@@ -179,6 +236,8 @@ class OptimizerConfig(BaseModel):
     gamma: float = DISCOUNTING
     lmb: float = LMB
     entropy_cost: float = ENTROPY_COST
+    adaptive_entropy: bool = False
+    entropy: EntropyControllersConfig = Field(default_factory=EntropyControllersConfig)
     teacher_kl_cost: float = 0.0
     teacher_baseline_cost: NonNegativeFloat = 0.0
     vtrace_pg_cost: NonNegativeFloat = 1.0
@@ -273,6 +332,15 @@ class ToadConfig(BaseModel):
                 "population probabilities must be nonnegative and sum to one"
             )
         _validate_foundation_optimizer(self.optimizer)
+        max_steps_per_round = (
+            2 * self.population.environments_per_rank * (EPISODE_STEPS - 1)
+        )
+        for name, controller in self.optimizer.entropy.items():
+            if controller.multiplier_change_per_step * max_steps_per_round >= 1:
+                raise ValueError(
+                    f"optimizer.entropy.{name} multiplier change across the "
+                    "largest actual round must be less than 1"
+                )
         if (
             self.optimizer.teacher_kl_cost
             or self.optimizer.teacher_baseline_cost
@@ -399,6 +467,8 @@ def apply_overrides(config: ToadConfig, overrides: Sequence[str]) -> ToadConfig:
 
 STRUCTURAL_FIELDS = (
     "model",
+    "optimizer.adaptive_entropy",
+    "optimizer.entropy",
     "optimizer.unroll_length",
     "optimizer.batch_segments",
 )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -24,6 +25,7 @@ from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.toad.config import (
     STRUCTURAL_FIELDS,
+    EntropyControllerConfig,
     ToadConfig,
     structural_fingerprint,
     validate_stored_config,
@@ -39,6 +41,71 @@ from kaggriculture.learn.toad.population import LoadedTeacher, load_teacher
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
+
+
+@dataclass(frozen=True)
+class EntropyControllerState:
+    """Checkpointable target and multiplier after one completed round."""
+
+    target: float
+    multiplier: float
+    last_steps: int
+
+
+def update_entropy_controller(
+    state: EntropyControllerState,
+    observed: float | None,
+    steps: int,
+    config: EntropyControllerConfig,
+) -> EntropyControllerState:
+    """Advance one controller using FP32 multiplicative target feedback."""
+    if state.last_steps < 0 or steps < 0 or steps < state.last_steps:
+        raise ValueError("controller steps must be nonnegative and nondecreasing")
+    finite_values = (state.target, state.multiplier)
+    if observed is not None:
+        finite_values = (*finite_values, observed)
+    if not all(math.isfinite(value) for value in finite_values):
+        raise ValueError("controller state and observation must be finite")
+
+    delta = steps - state.last_steps
+    values = torch.tensor(
+        [
+            state.target,
+            state.multiplier,
+            state.target if observed is None else observed,
+            config.target_change_per_step,
+            config.target_floor,
+            config.multiplier_change_per_step,
+            config.minimum,
+            config.maximum,
+        ],
+        dtype=torch.float32,
+    )
+    target = torch.maximum(values[4], values[0] + values[3] * delta)
+    if observed is None:
+        return EntropyControllerState(
+            target=float(target),
+            multiplier=state.multiplier,
+            last_steps=steps,
+        )
+    change = values[5] * delta
+    multiplier = values[1]
+    if values[2] > target:
+        multiplier = multiplier * (1.0 - change)
+    elif values[2] < target:
+        multiplier = multiplier * (1.0 + change)
+    elif config.minimum <= state.multiplier <= config.maximum:
+        return EntropyControllerState(
+            target=float(target),
+            multiplier=state.multiplier,
+            last_steps=steps,
+        )
+    multiplier = multiplier.clamp(min=values[6], max=values[7])
+    return EntropyControllerState(
+        target=float(target),
+        multiplier=float(multiplier),
+        last_steps=steps,
+    )
 
 
 @dataclass(frozen=True)
@@ -381,6 +448,7 @@ def compute_loss(  # noqa: C901
     teacher: LoadedTeacher | Teacher | None = None,
     *,
     baseline_only: bool | None = None,
+    entropy_state: Mapping[str, EntropyControllerState] | None = None,
     _losses: Callable[..., toad_loss.Losses] = toad_loss.losses,
 ) -> LossReport:
     """Return Toad's loss tensors without mutating optimizer or gradients."""
@@ -593,6 +661,9 @@ def compute_loss(  # noqa: C901
             ).masked_fill(~teacher_columns.unsqueeze(0), 0.0)
             teacher_raw["value"] = toad_loss.reduce(value_error)
 
+    effective_baseline_only = (
+        batch.baseline_only if baseline_only is None else baseline_only
+    )
     loss = _losses(
         behaviour_log_probs=behaviour,
         learner_log_probs=learner_log_probs,
@@ -602,13 +673,36 @@ def compute_loss(  # noqa: C901
         rewards=rewards,
         dones=dones,
         discounting=config.optimizer.gamma,
-        baseline_only=batch.baseline_only if baseline_only is None else baseline_only,
+        baseline_only=effective_baseline_only,
         teacher_kl=teacher_kl,
         teacher_kl_cost=config.optimizer.teacher_kl_cost,
-        entropy_cost=config.optimizer.entropy_cost,
+        entropy_cost=(
+            0.0 if config.optimizer.adaptive_entropy else config.optimizer.entropy_cost
+        ),
         lmb=config.optimizer.lmb,
     )
     total = loss.total
+    adaptive_entropy_terms: dict[str, torch.Tensor] = {}
+    entropy_term = loss.entropy
+    if config.optimizer.adaptive_entropy:
+        expected_heads = {name for name, _stat in head_entropy.items()}
+        if entropy_state is None or set(entropy_state) != expected_heads:
+            raise ValueError(
+                "adaptive entropy requires operation, quantity, and market state"
+            )
+        weighted_terms = []
+        for name, stat in head_entropy.items():
+            state = entropy_state[name]
+            if not math.isfinite(state.multiplier):
+                raise ValueError("entropy multipliers must be finite")
+            raw = -(stat.sum.float() / stat.valid.float().clamp_min(1.0))
+            weighted = raw * state.multiplier
+            adaptive_entropy_terms[f"entropy/{name}_raw"] = raw
+            adaptive_entropy_terms[f"entropy/{name}_weighted"] = weighted
+            weighted_terms.append(weighted)
+        entropy_term = torch.stack(weighted_terms).sum()
+        if not effective_baseline_only:
+            total = total + entropy_term
     teacher_weighted = {
         "operation_kl": config.optimizer.teacher_kl_cost * teacher_raw["operation_kl"],
         "quantity_kl": config.optimizer.teacher_kl_cost * teacher_raw["quantity_kl"],
@@ -622,9 +716,10 @@ def compute_loss(  # noqa: C901
         "vtrace_pg": loss.vtrace_pg,
         "upgo_pg": loss.upgo_pg,
         "baseline": loss.baseline,
-        "entropy": loss.entropy,
+        "entropy": entropy_term,
         "teacher": loss.teacher,
         **belief_terms,
+        **adaptive_entropy_terms,
         "total": total,
     }
     if teacher is not None:
@@ -694,6 +789,14 @@ class ToadLightningModule(lightning.LightningModule):
         self.actor_version = 0
         self.actor_source_global_step = 0
         self.warmup_remaining = config.optimizer.value_warmup_batches
+        self.entropy_state = {
+            name: EntropyControllerState(
+                target=controller.initial_target,
+                multiplier=controller.initial_multiplier,
+                last_steps=0,
+            )
+            for name, controller in self.config.optimizer.entropy.items()
+        }
         self._round_ended = False
         self._round_started_warming = False
         self._round_fresh_terms: list[Mapping[str, torch.Tensor]] = []
@@ -741,6 +844,7 @@ class ToadLightningModule(lightning.LightningModule):
             self.config,
             teacher=self.teacher,
             baseline_only=baseline_only,
+            entropy_state=self.entropy_state,
         )
         self._round_ended = batch.end_of_round
         self._round_baselines.append(report.terms["baseline"].detach())
@@ -751,16 +855,16 @@ class ToadLightningModule(lightning.LightningModule):
             self._round_fresh_entropy.append(
                 HeadEntropy(
                     operation=EntropyStat(
-                        sum=report.entropy.operation.sum.detach(),
-                        valid=report.entropy.operation.valid.detach(),
+                        sum=report.entropy.operation.sum.detach().float(),
+                        valid=report.entropy.operation.valid.detach().to(torch.int64),
                     ),
                     quantity=EntropyStat(
-                        sum=report.entropy.quantity.sum.detach(),
-                        valid=report.entropy.quantity.valid.detach(),
+                        sum=report.entropy.quantity.sum.detach().float(),
+                        valid=report.entropy.quantity.valid.detach().to(torch.int64),
                     ),
                     market=EntropyStat(
-                        sum=report.entropy.market.sum.detach(),
-                        valid=report.entropy.market.valid.detach(),
+                        sum=report.entropy.market.sum.detach().float(),
+                        valid=report.entropy.market.valid.detach().to(torch.int64),
                     ),
                 )
             )
@@ -773,8 +877,37 @@ class ToadLightningModule(lightning.LightningModule):
         if batch.end_of_round:
             self.collection_round += 1
         if batch.end_of_round:
+            self._update_entropy_controllers()
             self.log_dict(self._round_log_record())
+            self._round_fresh_entropy = []
         return report.total
+
+    def _aggregate_round_entropy(self, name: str) -> EntropyStat:
+        """Reduce detached fresh-batch statistics for one completed round."""
+        values = [getattr(item, name) for item in self._round_fresh_entropy]
+        if not values:
+            return EntropyStat(
+                sum=torch.tensor(0.0, device=self.device),
+                valid=torch.tensor(0, dtype=torch.int64, device=self.device),
+            )
+        return EntropyStat(
+            sum=torch.stack([stat.sum.float() for stat in values]).sum(),
+            valid=torch.stack([stat.valid.to(torch.int64) for stat in values]).sum(),
+        )
+
+    def _update_entropy_controllers(self) -> None:
+        """Apply one fresh-round observation after the global step clock advances."""
+        if not self.config.optimizer.adaptive_entropy:
+            return
+        for name, controller in self.config.optimizer.entropy.items():
+            stat = self._aggregate_round_entropy(name)
+            observed = float(stat.mean) if bool(stat.valid > 0) else None
+            self.entropy_state[name] = update_entropy_controller(
+                self.entropy_state[name],
+                observed,
+                self.environment_steps,
+                controller,
+            )
 
     def _round_log_record(self) -> dict[str, torch.Tensor | int | float]:
         """Return one stable dashboard record for the completed logical round."""
@@ -783,17 +916,6 @@ class ToadLightningModule(lightning.LightningModule):
         def mean_term(name: str) -> torch.Tensor:
             values = [terms[name] for terms in fresh if name in terms]
             return torch.stack(values).mean() if values else torch.tensor(float("nan"))
-
-        def aggregate_entropy(name: str) -> EntropyStat:
-            values = [getattr(item, name) for item in self._round_fresh_entropy]
-            if not values:
-                return EntropyStat(
-                    sum=torch.tensor(0.0), valid=torch.tensor(0, dtype=torch.int64)
-                )
-            return EntropyStat(
-                sum=torch.stack([stat.sum for stat in values]).sum(),
-                valid=torch.stack([stat.valid for stat in values]).sum(),
-            )
 
         optimizer_steps = int(self.global_step) + 1
         try:
@@ -845,10 +967,23 @@ class ToadLightningModule(lightning.LightningModule):
             "diag/total_loss": mean_term("total"),
         }
         for name in ("operation", "quantity", "market"):
-            stat = aggregate_entropy(name)
+            stat = self._aggregate_round_entropy(name)
+            observed = (
+                stat.mean
+                if bool(stat.valid > 0)
+                else torch.full_like(stat.sum, float("nan"))
+            )
+            state = self.entropy_state[name]
             record[f"entropy/{name}_sum"] = stat.sum
             record[f"entropy/{name}_valid"] = stat.valid.float()
-            record[f"entropy/{name}_mean"] = stat.mean
+            record[f"entropy/{name}_mean"] = observed
+            record[f"entropy/{name}_observed"] = observed
+            record[f"entropy/{name}_target"] = state.target
+            record[f"entropy/{name}_multiplier"] = state.multiplier
+            record[f"entropy/{name}_raw_loss"] = mean_term(f"entropy/{name}_raw")
+            record[f"entropy/{name}_weighted_loss"] = mean_term(
+                f"entropy/{name}_weighted"
+            )
         return record
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
@@ -886,6 +1021,14 @@ class ToadLightningModule(lightning.LightningModule):
             "actor_version": self.actor_version,
             "actor_source_global_step": self.actor_source_global_step,
             "warmup_remaining": self.warmup_remaining,
+            "entropy_state": {
+                name: {
+                    "target": state.target,
+                    "multiplier": state.multiplier,
+                    "last_steps": state.last_steps,
+                }
+                for name, state in self.entropy_state.items()
+            },
             "teacher": self._teacher_metadata(),
         }
 
@@ -910,3 +1053,28 @@ class ToadLightningModule(lightning.LightningModule):
         self.actor_version = cast(int, state["actor_version"])
         self.actor_source_global_step = cast(int, state["actor_source_global_step"])
         self.warmup_remaining = cast(int, state["warmup_remaining"])
+        stored_entropy = cast(dict[str, object], state["entropy_state"])
+        expected_heads = {name for name, _ in self.config.optimizer.entropy.items()}
+        if set(stored_entropy) != expected_heads:
+            raise ResumeConfigError(
+                "entropy controller state must contain operation, quantity, and market"
+            )
+        restored_entropy: dict[str, EntropyControllerState] = {}
+        for name, controller in self.config.optimizer.entropy.items():
+            payload = cast(dict[str, object], stored_entropy[name])
+            restored = EntropyControllerState(
+                target=float(cast(float, payload["target"])),
+                multiplier=float(cast(float, payload["multiplier"])),
+                last_steps=int(cast(int, payload["last_steps"])),
+            )
+            if (
+                restored.target < 0
+                or not math.isfinite(restored.target)
+                or not math.isfinite(restored.multiplier)
+                or not controller.minimum <= restored.multiplier <= controller.maximum
+                or restored.last_steps < 0
+                or restored.last_steps > self.environment_steps
+            ):
+                raise ResumeConfigError(f"invalid entropy controller state for {name}")
+            restored_entropy[name] = restored
+        self.entropy_state = restored_entropy

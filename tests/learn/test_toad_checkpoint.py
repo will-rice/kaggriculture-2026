@@ -23,7 +23,12 @@ from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.callbacks import ActorSyncCallback, BoundaryCheckpoint
-from kaggriculture.learn.toad.config import ToadConfig, structural_fingerprint
+from kaggriculture.learn.toad.config import (
+    EntropyControllerConfig,
+    EntropyControllersConfig,
+    ToadConfig,
+    structural_fingerprint,
+)
 from kaggriculture.learn.toad.data import (
     CollectionAssignment,
     LearnerBatch,
@@ -31,6 +36,7 @@ from kaggriculture.learn.toad.data import (
     ToadDataModule,
 )
 from kaggriculture.learn.toad.lightning import (
+    EntropyControllerState,
     ResumeConfigError,
     ToadLightningModule,
     load_checkpoint_policy,
@@ -192,8 +198,34 @@ def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> N
         "actor_version": 3,
         "actor_source_global_step": 17,
         "warmup_remaining": 8,
+        "entropy_state": {
+            name: {
+                "target": controller.initial_target,
+                "multiplier": controller.initial_multiplier,
+                "last_steps": 0,
+            }
+            for name, controller in module.config.optimizer.entropy.items()
+        },
         "teacher": {"present": False},
     }
+
+
+def test_entropy_controller_round_trips_in_checkpoint() -> None:
+    """All per-head targets, multipliers, and step clocks restore exactly."""
+    stored = ToadLightningModule(ToadConfig.control())
+    stored.environment_steps = 320
+    stored.entropy_state = {
+        "operation": EntropyControllerState(0.9, 0.01, 320),
+        "quantity": EntropyControllerState(0.8, 0.02, 320),
+        "market": EntropyControllerState(0.7, 0.03, 320),
+    }
+    checkpoint: dict[str, object] = {}
+
+    stored.on_save_checkpoint(checkpoint)
+    resumed = ToadLightningModule(ToadConfig.control())
+    resumed.on_load_checkpoint(checkpoint)
+
+    assert resumed.entropy_state == stored.entropy_state
 
 
 def test_full_enabled_lightning_policy_extraction_is_structurally_strict(
@@ -365,7 +397,26 @@ def _native_resume_config(output_dir: pathlib.Path) -> ToadConfig:
                     "environments_per_rank": 1,
                 }
             ),
-            "optimizer": config.optimizer.model_copy(update={"value_passes": 0}),
+            "optimizer": config.optimizer.model_copy(
+                update={
+                    "value_passes": 0,
+                    "adaptive_entropy": True,
+                    "entropy": EntropyControllersConfig(
+                        **{
+                            name: EntropyControllerConfig(
+                                initial_target=10.0,
+                                target_change_per_step=-0.001,
+                                target_floor=0.5,
+                                initial_multiplier=0.1,
+                                multiplier_change_per_step=1e-6,
+                                minimum=0.0,
+                                maximum=1.0,
+                            )
+                            for name in ("operation", "quantity", "market")
+                        }
+                    ),
+                }
+            ),
             "runtime": config.runtime.model_copy(
                 update={
                     "checkpoint_every_environment_steps": 64,
@@ -444,6 +495,15 @@ def test_lightning_resume_matches_uninterrupted_full_state(
     assert checkpoint["global_step"] == 1
     assert checkpoint["optimizer_states"]
     assert checkpoint["lr_schedulers"]
+    checkpoint_toad = cast(dict[str, object], checkpoint["toad"])
+    assert checkpoint_toad["entropy_state"] == {
+        name: {
+            "target": state.target,
+            "multiplier": state.multiplier,
+            "last_steps": state.last_steps,
+        }
+        for name, state in split_module.entropy_state.items()
+    }
 
     collected: list[tuple[int, int, bool]] = []
     resumed_source: ReferenceRoundSource
@@ -478,6 +538,7 @@ def test_lightning_resume_matches_uninterrupted_full_state(
     assert resumed_trainer.global_step == uninterrupted_trainer.global_step == 2
     assert resumed_module.environment_steps == 128
     assert resumed_module.collection_round == 2
+    assert resumed_module.entropy_state == uninterrupted_module.entropy_state
     assert resumed_source.next_game_id == 2
     for name, value in resumed_module.policy.state_dict().items():
         assert torch.equal(value, uninterrupted_module.policy.state_dict()[name])
