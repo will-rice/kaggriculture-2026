@@ -34,8 +34,8 @@ ACTED_FIELDS = (
     "sparse",
     "dones",
 )
+BELIEF_FIELDS = ("belief_targets", "belief_valid")
 OBSERVED_FIELDS = ("board", "scalars", "positions")
-WorkerInput = tuple[dict[str, torch.Tensor], list[int], int, int, str | None, float]
 
 
 @dataclass(frozen=True)
@@ -124,6 +124,13 @@ def segments(
     mask removes it from every return target.
     """
     turns = int(trajectory.dones.shape[0])
+    belief_fields = (trajectory.belief_targets, trajectory.belief_valid)
+    if any(field is not None for field in belief_fields) and not all(
+        field is not None for field in belief_fields
+    ):
+        raise ValueError("belief trajectories require targets and validity")
+    if any(field is not None and field.shape[0] != turns for field in belief_fields):
+        raise ValueError("belief trajectories require one target and validity per turn")
     recurrent_fields = (
         trajectory.hidden,
         trajectory.cell,
@@ -146,6 +153,11 @@ def segments(
             **{
                 name: getattr(trajectory, name)[start : start + unroll_length]
                 for name in ACTED_FIELDS
+            },
+            **{
+                name: getattr(trajectory, name)[start : start + unroll_length]
+                for name in BELIEF_FIELDS
+                if getattr(trajectory, name) is not None
             },
             **{
                 name: getattr(trajectory, name)[

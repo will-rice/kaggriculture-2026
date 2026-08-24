@@ -151,11 +151,13 @@ from kaggle_environments.core import Environment
 
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 from kaggriculture.learn.encoding import (
+    BELIEF_TARGET_SIZE,
     IGNORE,
     decode_market,
     decode_units,
     encode_board,
     encode_positions,
+    encode_private_belief_target,
     encode_scalars,
     transfer_slots,
     unit_count,
@@ -354,6 +356,8 @@ class Trajectory:
     hidden: torch.Tensor | None = None
     cell: torch.Tensor | None = None
     prior_belief: torch.Tensor | None = None
+    belief_targets: torch.Tensor | None = None
+    belief_valid: torch.Tensor | None = None
 
 
 @dataclass
@@ -392,6 +396,8 @@ class Stream:
     potentials: list[list[float]] = field(default_factory=list)
     policy_state: PolicyState | None = None
     states: list[RecordedPolicyState] = field(default_factory=list)
+    belief_targets: list[torch.Tensor] = field(default_factory=list)
+    belief_valid: list[bool] = field(default_factory=list)
     done: bool = False
 
 
@@ -505,6 +511,9 @@ def rollout_many(
             stream.counts.append(counts(seen, stream.seat))
             stream.snapshots.append(_snapshot(seen))
             stream.potentials.append(potential(seen))
+            opposing = _observation(environments, stream.environment, 1 - stream.seat)
+            stream.belief_targets.append(encode_private_belief_target(opposing).tensor)
+            stream.belief_valid.append(True)
         turns, next_states = _decide(
             policy,
             [
@@ -879,23 +888,27 @@ def _actor_forward(
         state = _batch_policy_state(states)
         if state is None:
             state = policy.initial_state(len(states), like=board)
-        used_state = state.reset_rows(dones) if state is not None else None
-        used = _unbatch_policy_state(used_state)
         output = policy(
             board.unsqueeze(0),
             scalars.unsqueeze(0),
             positions.unsqueeze(0),
-            state=used_state,
+            state=state,
             dones=dones.unsqueeze(0),
         )
+        used = _unbatch_policy_state(output.input_state)
         return (
             PolicyOutput(
                 output.unit_logits.squeeze(0),
                 output.quantity_logits.squeeze(0),
                 output.market_logits.squeeze(0),
                 output.values.squeeze(0),
-                output.belief_logits,
+                (
+                    output.belief_logits.squeeze(0)
+                    if output.belief_logits is not None
+                    else None
+                ),
                 output.state,
+                output.input_state,
             ),
             used,
         )
@@ -1082,6 +1095,12 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
             if recurrent
             else None
         ),
+        belief_targets=(
+            torch.stack(stream.belief_targets)
+            if stream.belief_targets
+            else torch.empty((0, BELIEF_TARGET_SIZE), dtype=torch.float32)
+        ),
+        belief_valid=torch.tensor(stream.belief_valid, dtype=torch.bool),
     )
 
 

@@ -9,11 +9,17 @@ from typing import TYPE_CHECKING, Self, cast
 
 import lightning
 import torch
+import torch.nn.functional as functional
 from lightning.pytorch.utilities.types import OptimizerLRScheduler
 from torch.optim.lr_scheduler import LRScheduler
 
 from kaggriculture.learn import toad_loss
-from kaggriculture.learn.encoding import transfer_slots
+from kaggriculture.learn.encoding import (
+    CROP_NAMES,
+    PRODUCT_NAMES,
+    SHED_NAMES,
+    transfer_slots,
+)
 from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.toad.config import (
@@ -23,7 +29,7 @@ from kaggriculture.learn.toad.config import (
     validate_stored_config,
 )
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
-from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
+from kaggriculture.learn.toad.model import PolicyOutput, PolicyState, StatefulPolicy
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
@@ -42,6 +48,53 @@ class ResumeConfigError(ValueError):
 
 
 PolicyLike = Policy | StatefulPolicy
+
+
+def _belief_loss_terms(
+    output: PolicyOutput,
+    segments: tuple[dict[str, torch.Tensor], ...],
+) -> dict[str, torch.Tensor]:
+    """Return safely masked belief loss, family errors, and valid-row count."""
+    required = {"belief_targets", "belief_valid"}
+    if any(required.difference(segment) for segment in segments):
+        raise ValueError(
+            "belief learner batches require belief_targets and belief_valid"
+        )
+    if output.belief_logits is None:
+        raise ValueError("belief-enabled policy did not emit belief logits")
+    belief_targets = torch.stack(
+        [segment["belief_targets"] for segment in segments], dim=1
+    )
+    valid_rows = torch.stack([segment["belief_valid"] for segment in segments], dim=1)
+    if valid_rows.dtype is not torch.bool:
+        raise ValueError("belief_valid must be boolean")
+    acted_beliefs = output.belief_logits[:-1]
+    if acted_beliefs.shape != belief_targets.shape:
+        raise ValueError(
+            "belief target shape does not match acted belief logits: "
+            f"{tuple(belief_targets.shape)} != {tuple(acted_beliefs.shape)}"
+        )
+    target_mask = valid_rows.unsqueeze(-1)
+    safe_targets = belief_targets.masked_fill(~target_mask, 0.0)
+    error = functional.smooth_l1_loss(acted_beliefs, safe_targets, reduction="none")
+    error = error.masked_fill(~target_mask, 0.0)
+    valid_count = valid_rows.sum().to(dtype=error.dtype)
+
+    def family_error(start: int, stop: int) -> torch.Tensor:
+        family = error[..., start:stop]
+        denominator = (valid_count * (stop - start)).clamp_min(1.0)
+        return family.sum() / denominator
+
+    shed_stop = len(SHED_NAMES)
+    seed_stop = shed_stop + len(CROP_NAMES)
+    carried_stop = seed_stop + len(PRODUCT_NAMES)
+    return {
+        "belief": family_error(0, carried_stop),
+        "belief_shed": family_error(0, shed_stop),
+        "belief_seeds": family_error(shed_stop, seed_stop),
+        "belief_carried": family_error(seed_stop, carried_stop),
+        "belief_valid": valid_count,
+    }
 
 
 def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
@@ -68,7 +121,7 @@ def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
         weights = checkpoint
     typed_weights = cast(Mapping[str, torch.Tensor], weights)
     if isinstance(policy, StatefulPolicy):
-        if policy.config.recurrent:
+        if policy.config.recurrent or policy.config.belief:
             policy.load_state_dict(typed_weights, strict=True)
         else:
             policy.load_control_state_dict(typed_weights)
@@ -134,12 +187,12 @@ def compute_loss(
 
     turns, width = behaviour.shape
     if isinstance(policy, StatefulPolicy):
-        if policy.config.recurrent:
+        if policy.config.recurrent or policy.config.belief:
             required = {"initial_hidden", "initial_cell", "initial_belief"}
             missing = required.difference(segments[0])
             if missing or any(required.difference(segment) for segment in segments):
                 raise ValueError(
-                    "recurrent learner batches require initial_hidden, "
+                    "stateful learner batches require initial_hidden, "
                     "initial_cell, and initial_belief"
                 )
             hidden_rows = [segment["initial_hidden"] for segment in segments]
@@ -183,6 +236,11 @@ def compute_loss(
         unit_logits = _acted(unit_logits, turns, width)
         quantity_logits = _acted(quantity_logits, turns, width)
         market_logits = _acted(market_logits, turns, width)
+
+    belief_enabled = isinstance(policy, StatefulPolicy) and policy.config.belief
+    belief_terms: dict[str, torch.Tensor] = {}
+    if belief_enabled:
+        belief_terms = _belief_loss_terms(output, segments)
     flat_unit_actions = unit_actions.flatten(0, 1)
     flat_unit_masks = unit_masks.flatten(0, 1)
     flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
@@ -248,15 +306,19 @@ def compute_loss(
         entropy_cost=config.optimizer.entropy_cost,
         lmb=config.optimizer.lmb,
     )
+    total = loss.total
+    if belief_enabled:
+        total = total + config.model.belief_loss_weight * belief_terms["belief"]
     return LossReport(
-        total=loss.total,
+        total=total,
         terms={
             "vtrace_pg": loss.vtrace_pg,
             "upgo_pg": loss.upgo_pg,
             "baseline": loss.baseline,
             "entropy": loss.entropy,
             "teacher": loss.teacher,
-            "total": loss.total,
+            **belief_terms,
+            "total": total,
         },
     )
 
@@ -281,7 +343,7 @@ class ToadLightningModule(lightning.LightningModule):
         self.config = config
         self.policy: PolicyLike = (
             StatefulPolicy(config.model)
-            if config.model.recurrent
+            if config.model.recurrent or config.model.belief
             else Policy(
                 blocks=config.model.blocks,
                 channels=config.model.channels,
@@ -383,7 +445,7 @@ class ToadLightningModule(lightning.LightningModule):
         fresh = self._round_fresh_terms
 
         def mean_term(name: str) -> torch.Tensor:
-            values = [terms[name] for terms in fresh]
+            values = [terms[name] for terms in fresh if name in terms]
             return torch.stack(values).mean() if values else torch.tensor(float("nan"))
 
         optimizer_steps = int(self.global_step) + 1
@@ -414,6 +476,11 @@ class ToadLightningModule(lightning.LightningModule):
             "critic/baseline_passes_self_consistency": baseline_passes,
             "diag/entropy": mean_term("entropy"),
             "diag/teacher_kl": mean_term("teacher"),
+            "loss/belief": mean_term("belief"),
+            "belief/shed_error": mean_term("belief_shed"),
+            "belief/seeds_error": mean_term("belief_seeds"),
+            "belief/carried_error": mean_term("belief_carried"),
+            "belief/valid_count": mean_term("belief_valid"),
             "diag/total_loss": mean_term("total"),
         }
         return record

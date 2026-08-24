@@ -344,6 +344,10 @@ def test_policy_state_reset_clears_all_terminal_components_before_a_step() -> No
         ),
         ({"local_patch": True, "local_patch_size": 6}, "must be odd"),
         ({"recurrent_layers": 0}, "greater than 0"),
+        (
+            {"belief": True, "belief_size": 9},
+            "fixed private-state target schema",
+        ),
     ],
 )
 def test_optional_model_dimensions_are_validated(
@@ -359,9 +363,6 @@ def test_optional_model_dimensions_are_validated(
     [
         {"transformer": True},
         {"local_patch": True},
-        {"belief": True},
-        {"belief": True, "belief_loss_weight": 0.5},
-        {"belief": True, "belief_feedback": True},
         {"interaction_value": True},
     ],
 )
@@ -373,10 +374,15 @@ def test_active_trainer_rejects_unimplemented_optional_model_paths(
         ToadConfig.model_validate({"model": model})
 
 
-def test_active_trainer_accepts_recurrent_but_keeps_later_paths_gated() -> None:
-    """Task 3 relaxes recurrence only; later architecture stages remain errors."""
-    config = ToadConfig.model_validate({"model": {"recurrent": True}})
+def test_active_trainer_accepts_recurrent_and_belief_but_keeps_later_paths_gated() -> (
+    None
+):
+    """Task 4 relaxes belief only; later architecture stages remain errors."""
+    config = ToadConfig.model_validate(
+        {"model": {"recurrent": True, "belief": True, "belief_feedback": True}}
+    )
 
     assert config.model.recurrent
+    assert config.model.belief
     with pytest.raises(ValidationError, match="not implemented in the active trainer"):
         ToadConfig.model_validate({"model": {"recurrent": True, "transformer": True}})

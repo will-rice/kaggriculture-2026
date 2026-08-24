@@ -60,7 +60,9 @@ in ``encode_board`` -- which walk ``farm["tiles"]`` directly and so are already
 in ``(y, x)`` -- are the one place that is not.
 """
 
-from typing import Any, Mapping
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Mapping, cast
 
 import torch
 
@@ -223,6 +225,46 @@ SCALARS = (
 # training rows and carries nothing to say whether that was ever intended.
 SEED_SCALE = 32.0
 CARRIED_SCALE = 32.0
+
+
+@dataclass(frozen=True)
+class BeliefTarget:
+    """Normalized opponent-private labels kept outside policy observations."""
+
+    shed: torch.Tensor
+    seeds: torch.Tensor
+    carried: torch.Tensor
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        """Return the fixed shed, seed, carried target schema as one vector."""
+        return torch.cat((self.shed, self.seeds, self.carried))
+
+
+BELIEF_TARGET_SIZE = len(SHED_NAMES) + len(CROP_NAMES) + len(PRODUCT_NAMES)
+
+
+def encode_private_belief_target(observation: Mapping[str, Any]) -> BeliefTarget:
+    """Encode one seat's own simulator-private state as normalized labels."""
+    private = cast(Mapping[str, Any], observation["private"])
+    shed = cast(Mapping[str, float], private["shed"])
+    seeds = cast(Mapping[str, float], private["seeds"])
+    carried: Counter[str] = Counter()
+    for inventory in cast(list[Mapping[str, int]], private["inventories"]):
+        carried.update(inventory)
+    return BeliefTarget(
+        shed=torch.tensor(
+            [shed[name] / SHED_CAPACITY for name in SHED_NAMES], dtype=torch.float32
+        ),
+        seeds=torch.tensor(
+            [seeds[name] / SEED_SCALE for name in CROP_NAMES], dtype=torch.float32
+        ),
+        carried=torch.tensor(
+            [carried[name] / CARRIED_SCALE for name in PRODUCT_NAMES],
+            dtype=torch.float32,
+        ),
+    )
+
 
 _MAX_QUADRANTS = 1 + len(LAND_ORDER)
 

@@ -63,7 +63,7 @@ def test_scripted_assignment_resolves_the_real_economic_agent() -> None:
     source = ReferenceRoundSource(_mixed_config(), assignments=())
     assignment = CollectionAssignment(0, 0, "economic", BatchKind.SCRIPTED)
 
-    assert source._worker_input(assignment)[4] == toad.OPPONENT
+    assert source._worker_input(assignment).versus == toad.OPPONENT
 
 
 @pytest.mark.slow

@@ -81,6 +81,12 @@ class ModelConfig(BaseModel):
         """Reject inconsistent dimensions before torch modules are created."""
         if (self.belief_feedback or self.belief_loss_weight > 0) and not self.belief:
             raise ValueError("belief feedback/loss requires the belief head")
+        expected_belief_size = len(SHED_NAMES) + len(CROP_NAMES) + len(PRODUCT_NAMES)
+        if self.belief and self.belief_size != expected_belief_size:
+            raise ValueError(
+                "belief_size must match the fixed private-state target schema "
+                f"({expected_belief_size})"
+            )
         if self.local_patch and self.local_patch_size % 2 == 0:
             raise ValueError("local patch size must be odd")
         if self.transformer and self.channels % self.transformer_heads:
@@ -253,9 +259,6 @@ def _validate_active_model(model: ModelConfig) -> None:
     unsupported = {
         "transformer": model.transformer,
         "local_patch": model.local_patch,
-        "belief": model.belief,
-        "belief_loss_weight": model.belief_loss_weight > 0,
-        "belief_feedback": model.belief_feedback,
         "interaction_value": model.interaction_value,
     }
     for name, enabled in unsupported.items():

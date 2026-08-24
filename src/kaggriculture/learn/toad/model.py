@@ -197,6 +197,7 @@ class PolicyOutput:
     values: torch.Tensor
     belief_logits: torch.Tensor | None
     state: PolicyState | None
+    input_state: PolicyState | None = None
 
 
 class StatefulPolicy(torch.nn.Module):
@@ -219,6 +220,10 @@ class StatefulPolicy(torch.nn.Module):
                 config.channels,
                 kernel_size=1,
             )
+        if config.belief:
+            self.belief_head = torch.nn.Linear(config.channels, config.belief_size)
+        if config.belief_feedback:
+            self.feedback = torch.nn.Linear(config.belief_size, config.channels)
 
     def _has_optional_components(self) -> bool:
         return any(
@@ -284,6 +289,51 @@ class StatefulPolicy(torch.nn.Module):
             prior_belief=like.new_zeros(batch, self.config.belief_size),
         )
 
+    def _stateful_step(
+        self,
+        board: torch.Tensor,
+        scalars: torch.Tensor,
+        state: PolicyState,
+    ) -> tuple[torch.Tensor, PolicyState, torch.Tensor | None]:
+        """Advance optional recurrence and belief feedback for one time row."""
+        scalar_features = self.control.market(scalars)
+        if self.config.belief_feedback:
+            scalar_features = scalar_features + self.feedback(state.prior_belief)
+        features = self.control.stem(board) + scalar_features[:, :, None, None]
+        for block in self.control.blocks:
+            features = block(features)
+        if self.config.recurrent:
+            recurrent_state = self.recurrent.step(
+                features, ConvLSTMState(hidden=state.hidden, cell=state.cell)
+            )
+            features = self.merge(
+                torch.cat(
+                    (
+                        features,
+                        recurrent_state.hidden[-1],
+                        recurrent_state.cell[-1],
+                    ),
+                    dim=1,
+                )
+            )
+            hidden = recurrent_state.hidden
+            cell = recurrent_state.cell
+        else:
+            hidden = state.hidden
+            cell = state.cell
+        belief = (
+            self.belief_head(features.mean(dim=(2, 3))) if self.config.belief else None
+        )
+        return (
+            features,
+            PolicyState(
+                hidden,
+                cell,
+                belief if belief is not None else state.prior_belief,
+            ),
+            belief,
+        )
+
     def forward(
         self,
         board: torch.Tensor,
@@ -293,52 +343,30 @@ class StatefulPolicy(torch.nn.Module):
         dones: torch.Tensor | None = None,
     ) -> PolicyOutput:
         """Run exact control delegation or the enabled time-major recurrence."""
-        if not self.config.recurrent:
+        if not (self.config.recurrent or self.config.belief):
             unit, quantity, market, values = self.control(board, scalars, positions)
             return PolicyOutput(unit, quantity, market, values, None, None)
 
         time, batch = board.shape[:2]
-        flat_board = board.flatten(0, 1)
-        flat_scalars = scalars.flatten(0, 1)
-        features = (
-            self.control.stem(flat_board)
-            + self.control.market(flat_scalars)[:, :, None, None]
-        )
-        for block in self.control.blocks:
-            features = block(features)
-        features = features.view(
-            time, batch, self.config.channels, BOARD_SIZE, BOARD_SIZE
-        )
         if dones is None:
             dones = torch.zeros(time, batch, dtype=torch.bool, device=board.device)
         state = self.initial_state(batch, like=board) if state is None else state
         assert state is not None
-        hidden_steps: list[torch.Tensor] = []
-        cell_steps: list[torch.Tensor] = []
+        feature_steps: list[torch.Tensor] = []
+        belief_steps: list[torch.Tensor] = []
+        input_state: PolicyState | None = None
         for step in range(time):
             state = state.reset_rows(dones[step])
-            recurrent_state = self.recurrent.step(
-                features[step], ConvLSTMState(hidden=state.hidden, cell=state.cell)
+            if step == 0:
+                input_state = state
+            features, state, belief = self._stateful_step(
+                board[step], scalars[step], state
             )
-            state = PolicyState(
-                recurrent_state.hidden,
-                recurrent_state.cell,
-                state.prior_belief,
-            )
-            hidden_steps.append(recurrent_state.hidden[-1])
-            cell_steps.append(recurrent_state.cell[-1])
-        recurrent = ConvLSTMOutput(
-            hidden_sequence=torch.stack(hidden_steps),
-            cell_sequence=torch.stack(cell_steps),
-            state=recurrent_state,
-        )
-        merged = self.merge(
-            torch.cat(
-                (features, recurrent.hidden_sequence, recurrent.cell_sequence), dim=2
-            ).flatten(0, 1)
-        ).view(time, batch, self.config.channels, BOARD_SIZE, BOARD_SIZE)
+            feature_steps.append(features)
+            if belief is not None:
+                belief_steps.append(belief)
 
-        flat_features = merged.flatten(0, 1)
+        flat_features = torch.stack(feature_steps).flatten(0, 1)
         flat_positions = positions.flatten(0, 1)
         columns = flat_features.flatten(2)
         wanted = flat_positions[:, None, :].tile(1, columns.shape[1], 1)
@@ -357,8 +385,8 @@ class StatefulPolicy(torch.nn.Module):
                 torch.sigmoid(values) * (2.0 * self.control.value_bound)
                 - self.control.value_bound
             )
-        hidden, cell = recurrent.state.hidden, recurrent.state.cell
-        if self.config.recurrent_layers == 1:
+        hidden, cell = state.hidden, state.cell
+        if self.config.recurrent and self.config.recurrent_layers == 1:
             hidden = hidden.squeeze(0)
             cell = cell.squeeze(0)
         return PolicyOutput(
@@ -366,6 +394,7 @@ class StatefulPolicy(torch.nn.Module):
             quantities,
             market,
             values.view(time, batch),
-            None,
+            torch.stack(belief_steps) if belief_steps else None,
             PolicyState(hidden, cell, state.prior_belief),
+            input_state,
         )

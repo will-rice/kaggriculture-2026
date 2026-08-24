@@ -1502,7 +1502,7 @@ def _play(
 def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
     """Play one typed native-worker request with its resolved architecture."""
     torch.set_num_threads(THREADS)
-    if work.model.recurrent:
+    if work.model.recurrent or work.model.belief:
         actor: Policy | StatefulPolicy = StatefulPolicy(work.model)
         actor.load_state_dict(work.actor_state, strict=True)
     else:
