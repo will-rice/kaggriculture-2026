@@ -493,7 +493,32 @@ def allocate_round(
 
 
 class CollectionError(RuntimeError):
-    """Collection failed while retaining the exact assigned game provenance."""
+    """Collection failed while retaining exact affected-game provenance."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        game_ids: Sequence[int] = (),
+        seeds: Sequence[int] = (),
+    ) -> None:
+        self.game_ids = tuple(game_ids)
+        self.seeds = tuple(seeds)
+        super().__init__(message)
+
+
+class CollectionRowError(RuntimeError):
+    """A grouped collector failure attributable to one vector row."""
+
+    def __init__(self, row: int, error_type: str, message: str) -> None:
+        self.row = row
+        self.error_type = error_type
+        self.original_message = message
+        super().__init__(row, error_type, message)
+
+    def __str__(self) -> str:
+        """Render the stable worker-side row and original exception."""
+        return f"row={self.row} {self.error_type}: {self.original_message}"
 
 
 class PopulationResumeMigrationError(RuntimeError):
@@ -1317,7 +1342,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 try:
                     trajectories = tuple(next(results))
                 except Exception as error:
-                    raise self._collection_error(chunk[0]) from error
+                    raise self._collection_error(chunk, error) from error
                 if len(chunk) == 1:
                     collected.append((chunk[0], trajectories))
                     continue
@@ -1333,12 +1358,43 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         return collected
 
     @staticmethod
-    def _collection_error(assignment: CollectionAssignment) -> CollectionError:
-        """Build the stable error that identifies one failed worker input."""
-        return CollectionError(
+    def _collection_error(
+        assignments: CollectionAssignment | Sequence[CollectionAssignment],
+        error: Exception | None = None,
+    ) -> CollectionError:
+        """Build a stable row-local or vector-wide grouped collection error."""
+        singular = isinstance(assignments, CollectionAssignment)
+        group = (assignments,) if singular else tuple(assignments)
+        if not group:
+            raise ValueError("collection failure requires an affected assignment")
+        affected = group
+        detail = ""
+        if isinstance(error, CollectionRowError):
+            if error.row < 0 or error.row >= len(group):
+                raise CollectionError(
+                    "collection worker returned an invalid failing row: "
+                    f"row={error.row} rows={len(group)}",
+                    game_ids=tuple(item.game_id for item in group),
+                    seeds=tuple(item.seed for item in group),
+                ) from error
+            affected = (group[error.row],)
+            detail = f" cause={error.error_type}: {error.original_message}"
+        elif error is not None:
+            detail = f" cause={type(error).__name__}: {error}"
+        rendered = (
             "collection failed for "
-            f"game_id={assignment.game_id} seed={assignment.seed} "
-            f"opponent={assignment.opponent_id}"
+            f"game_id={affected[0].game_id} seed={affected[0].seed} "
+            f"opponent={affected[0].opponent_id}{detail}"
+            if singular
+            else "collection failed for "
+            f"game_ids={tuple(item.game_id for item in affected)} "
+            f"seeds={tuple(item.seed for item in affected)} "
+            f"opponents={tuple(item.opponent_id for item in affected)}{detail}"
+        )
+        return CollectionError(
+            rendered,
+            game_ids=tuple(item.game_id for item in affected),
+            seeds=tuple(item.seed for item in affected),
         )
 
     def _iter_local_round(self) -> Iterator[LearnerBatch]:
@@ -1678,8 +1734,9 @@ class NativeRoundSource(ReferenceRoundSource):
                     SimConfig(),
                     torch.tensor([item.seed for item in chunk], device=self.device),
                 )
-                generator = torch.Generator(device=self.device).manual_seed(
-                    assignment.seed
+                generators = tuple(
+                    torch.Generator(device=self.device).manual_seed(item.seed)
+                    for item in chunk
                 )
                 unroll = self.config.optimizer.unroll_length
                 turns = EPISODE_STEPS - 1
@@ -1697,7 +1754,7 @@ class NativeRoundSource(ReferenceRoundSource):
                         turns=length,
                         state_unroll_length=unroll,
                         money_weight=self.config.curriculum.money_weight,
-                        generator=generator,
+                        generator=generators,
                         opponent=scripted,
                         opponent_policy=opponent_policy,
                     )
@@ -1711,7 +1768,7 @@ class NativeRoundSource(ReferenceRoundSource):
                     )
                 )
             except Exception as error:
-                raise self._collection_error(assignment) from error
+                raise self._collection_error(chunk, error) from error
         return collected
 
     def _native_metrics(  # noqa: C901 - one direct mirror of the public metric map

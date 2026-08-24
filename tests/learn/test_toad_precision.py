@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
 
+import lightning
 import pytest
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts.toad import (
@@ -16,6 +19,7 @@ from kaggriculture.learn.scripts.toad import (
     runtime_preflight,
 )
 from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.data import LearnerBatch
 from kaggriculture.learn.toad.lightning import (
     NonFiniteTrainingError,
     ToadLightningModule,
@@ -42,9 +46,11 @@ def test_bf16_is_rejected_when_accelerator_has_no_support(
     """A requested CUDA BF16 run must never silently fall back to FP32."""
     from kaggriculture.learn.scripts import toad
 
-    monkeypatch.setattr(toad, "_cuda_available", lambda: True)
-    monkeypatch.setattr(toad, "_cuda_device_count", lambda: 1)
-    monkeypatch.setattr(toad, "_cuda_bf16_supported", lambda: False)
+    monkeypatch.setattr(
+        toad,
+        "_cuda_capabilities",
+        lambda: toad.CudaCapabilities(available=True, device_count=1, bf16=False),
+    )
 
     with pytest.raises(RuntimePreflightError, match="bf16-mixed"):
         runtime_preflight(_bf16_config("gpu"))
@@ -57,9 +63,7 @@ import torch
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.config import ToadConfig
 
-toad._cuda_available = lambda: True
-toad._cuda_device_count = lambda: 1
-toad._cuda_bf16_supported = lambda: False
+toad._cuda_capabilities = lambda: toad.CudaCapabilities(True, 1, False)
 try:
     toad.runtime_preflight(
         ToadConfig(runtime={"accelerator": "gpu", "precision": "bf16-mixed"})
@@ -79,6 +83,131 @@ assert not torch.cuda.is_initialized()
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_cuda_preflight_uses_one_disposable_capability_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Availability, count, and BF16 checks must never inspect parent CUDA."""
+    from subprocess import CompletedProcess
+
+    from kaggriculture.learn.scripts import toad
+
+    calls: list[list[str]] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("parent CUDA runtime inspection is forbidden")
+
+    def probe(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        calls.append(command)
+        return CompletedProcess(
+            command, 0, '{"available":true,"device_count":2,"bf16":true}\n', ""
+        )
+
+    monkeypatch.setattr(torch.cuda, "is_available", forbidden)
+    monkeypatch.setattr(torch.cuda, "device_count", forbidden)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", forbidden)
+    monkeypatch.setattr(toad.subprocess, "run", probe)
+
+    config = ToadConfig.model_validate(
+        control_fixture_config().model_dump(mode="python")
+        | {
+            "runtime": {
+                "accelerator": "gpu",
+                "devices": [1],
+                "precision": "bf16-mixed",
+            }
+        }
+    )
+    runtime_preflight(config)
+
+    assert len(calls) == 1
+
+
+def test_finite_provenance_defers_recurrent_norm_scalar_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Healthy forward provenance keeps state diagnostics device-resident."""
+    from kaggriculture.learn.toad.lightning import NonFiniteProvenance
+    from kaggriculture.learn.toad.model import PolicyState
+
+    batch = control_fixture_batch(load_control_fixture())
+    state = PolicyState(
+        hidden=torch.ones(1, 2, 2),
+        cell=torch.ones(1, 2, 2),
+        prior_belief=torch.empty(1, 0),
+    )
+
+    def forbidden(_value: torch.Tensor) -> float:
+        raise AssertionError("healthy provenance converted a tensor scalar")
+
+    monkeypatch.setattr(torch.Tensor, "__float__", forbidden)
+
+    provenance = NonFiniteProvenance.from_batch(batch, state, "32-true")
+
+    assert provenance.game_ids == batch.game_ids
+
+
+def test_healthy_finite_scan_materializes_one_scalar_for_the_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finite phase synchronizes once, independent of its tensor count."""
+    from kaggriculture.learn.toad import lightning as toad_lightning
+
+    original = torch.Tensor.__bool__
+    scalar_reads: list[int] = []
+
+    def counted(value: torch.Tensor) -> bool:
+        scalar_reads.append(value.numel())
+        return original(value)
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", counted)
+
+    assert (
+        toad_lightning._nonfinite_tensor_names(
+            {
+                "first": torch.ones(2),
+                "second": torch.ones(3),
+                "third": torch.ones(4),
+            }
+        )
+        == []
+    )
+    assert scalar_reads == [1]
+
+
+def test_healthy_gradient_phase_materializes_only_the_aggregate_scalar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gradient diagnostics defer local names until the synchronized flag fails."""
+    from kaggriculture.learn.toad.lightning import NonFiniteProvenance
+
+    module = ToadLightningModule(control_fixture_config())
+    batch = control_fixture_batch(load_control_fixture())
+    module._last_finite_provenance = NonFiniteProvenance.from_batch(
+        batch, None, "32-true"
+    )
+    for parameter in module.policy.parameters():
+        parameter.grad = torch.ones_like(parameter)
+
+    original_bool = torch.Tensor.__bool__
+    original_item = torch.Tensor.item
+    scalar_reads: list[str] = []
+
+    def counted_bool(value: torch.Tensor) -> bool:
+        scalar_reads.append("bool")
+        return original_bool(value)
+
+    def counted_item(value: torch.Tensor, *args: object) -> object:
+        scalar_reads.append("item")
+        return original_item(value, *args)
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", counted_bool)
+    monkeypatch.setattr(torch.Tensor, "item", counted_item)
+
+    module.on_after_backward()
+
+    assert scalar_reads == ["item"]
 
 
 def test_sensitive_policy_math_is_fp32_under_autocast() -> None:
@@ -148,7 +277,11 @@ def test_auto_cpu_rejects_explicit_device_topology_before_trainer_build(
     """CPU cannot reinterpret a GPU-index device tuple as a Lightning count."""
     from kaggriculture.learn.scripts import toad
 
-    monkeypatch.setattr(toad, "_cuda_available", lambda: False)
+    monkeypatch.setattr(
+        toad,
+        "_cuda_capabilities",
+        lambda: toad.CudaCapabilities(False, 0, False),
+    )
     config = ToadConfig.model_validate(
         control_fixture_config().model_dump(mode="json")
         | {"runtime": {"accelerator": "auto", "devices": [0]}}
@@ -332,3 +465,102 @@ def test_cuda_bf16_update_has_finite_loss_gradients_and_parameters() -> None:
     assert all(
         torch.isfinite(parameter).all() for parameter in module.policy.parameters()
     )
+
+
+@pytest.mark.cuda
+def test_cuda_lightning_bf16_matches_fp32_automatic_optimization() -> None:
+    """The production Trainer precision plugin keeps a short update near FP32."""
+    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA BF16 is unavailable")
+
+    class CaptureLoss(lightning.Callback):
+        def __init__(self) -> None:
+            self.loss: float | None = None
+
+        def on_train_batch_end(
+            self,
+            trainer: lightning.Trainer,
+            pl_module: lightning.LightningModule,
+            outputs: object,
+            batch: object,
+            batch_idx: int,
+        ) -> None:
+            del trainer, pl_module, batch, batch_idx
+            loss = outputs.get("loss") if isinstance(outputs, Mapping) else outputs
+            if not isinstance(loss, torch.Tensor):
+                raise TypeError("Toad automatic optimization must return its loss")
+            self.loss = float(loss.detach().float().cpu())
+
+    fp32_config = control_fixture_config().model_copy(
+        update={
+            "runtime": control_fixture_config().runtime.model_copy(
+                update={"accelerator": "gpu", "precision": "32-true"}
+            )
+        }
+    )
+    bf16_config = fp32_config.model_copy(
+        update={
+            "runtime": fp32_config.runtime.model_copy(
+                update={"precision": "bf16-mixed"}
+            )
+        }
+    )
+    torch.manual_seed(1701)
+    initial_module = ToadLightningModule(fp32_config)
+    initial = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in initial_module.policy.state_dict().items()
+    }
+    batch = control_fixture_batch(load_control_fixture())
+
+    class OneBatch(Dataset[LearnerBatch]):
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int) -> LearnerBatch:
+            if index != 0:
+                raise IndexError(index)
+            return batch
+
+    def fit(config: ToadConfig) -> tuple[float, dict[str, torch.Tensor]]:
+        module = ToadLightningModule(config)
+        module.policy.load_state_dict(initial, strict=True)
+        capture = CaptureLoss()
+        trainer = lightning.Trainer(
+            accelerator="gpu",
+            devices=1,
+            precision=config.runtime.precision,
+            max_steps=1,
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            deterministic=True,
+            gradient_clip_val=config.optimizer.clip_grad_norm,
+            gradient_clip_algorithm="norm",
+            callbacks=[capture],
+            use_distributed_sampler=False,
+        )
+        trainer.fit(module, train_dataloaders=DataLoader(OneBatch(), batch_size=None))
+        assert capture.loss is not None
+        return capture.loss, {
+            name: tensor.detach().cpu().float().clone()
+            for name, tensor in module.policy.state_dict().items()
+        }
+
+    fp32_loss, fp32_state = fit(fp32_config)
+    bf16_loss, bf16_state = fit(bf16_config)
+
+    assert torch.isfinite(torch.tensor([fp32_loss, bf16_loss])).all()
+    assert bf16_loss == pytest.approx(fp32_loss, rel=0.05, abs=0.02)
+    fp32_delta = torch.cat(
+        [(fp32_state[name] - initial[name].float()).flatten() for name in initial]
+    )
+    bf16_delta = torch.cat(
+        [(bf16_state[name] - initial[name].float()).flatten() for name in initial]
+    )
+    assert torch.isfinite(fp32_delta).all() and torch.isfinite(bf16_delta).all()
+    relative_update_drift = float(
+        (bf16_delta - fp32_delta).norm() / fp32_delta.norm().clamp_min(1e-12)
+    )
+    assert relative_update_drift <= 0.15

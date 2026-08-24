@@ -93,9 +93,11 @@ def test_supported_runtime_matrix(
     config: ToadConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every proved eager, BF16, compile, native, and DDP row is explicit."""
-    monkeypatch.setattr(toad, "_cuda_available", lambda: True)
-    monkeypatch.setattr(toad, "_cuda_device_count", lambda: 4)
-    monkeypatch.setattr(toad, "_cuda_bf16_supported", lambda: True)
+    monkeypatch.setattr(
+        toad,
+        "_cuda_capabilities",
+        lambda: toad.CudaCapabilities(available=True, device_count=4, bf16=True),
+    )
     monkeypatch.setattr(toad, "_cpu_bf16_supported", lambda: True)
 
     assert toad.runtime_preflight(config) is None
@@ -260,9 +262,15 @@ def test_rejected_runtime_matrix_has_exact_preflight_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Unsupported runtime requests fail closed before Trainer construction."""
-    monkeypatch.setattr(toad, "_cuda_available", lambda: cuda_available)
-    monkeypatch.setattr(toad, "_cuda_device_count", lambda: cuda_devices)
-    monkeypatch.setattr(toad, "_cuda_bf16_supported", lambda: cuda_bf16)
+    monkeypatch.setattr(
+        toad,
+        "_cuda_capabilities",
+        lambda: toad.CudaCapabilities(
+            available=cuda_available,
+            device_count=cuda_devices,
+            bf16=cuda_bf16,
+        ),
+    )
     monkeypatch.setattr(toad, "_cpu_bf16_supported", lambda: cpu_bf16)
 
     with pytest.raises(toad.RuntimePreflightError) as raised:
@@ -271,11 +279,42 @@ def test_rejected_runtime_matrix_has_exact_preflight_errors(
     assert str(raised.value) == error
 
 
+def test_cpu_ddp_rejects_unmapped_native_cuda_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU ranks cannot all target the same native CUDA device implicitly."""
+    config = _runtime_config(
+        devices=2,
+        strategy="ddp",
+        rollout_backend="native",
+        rollout_device="cuda",
+        scripted=0.0,
+    )
+    monkeypatch.setattr(
+        toad,
+        "_cuda_capabilities",
+        lambda: toad.CudaCapabilities(available=True, device_count=2, bf16=True),
+        raising=False,
+    )
+
+    with pytest.raises(toad.RuntimePreflightError) as raised:
+        toad.runtime_preflight(config)
+
+    assert str(raised.value) == (
+        "native CUDA rollout with a CPU DDP learner has no explicit rank-local "
+        "device mapping"
+    )
+
+
 def test_runtime_metadata_is_frozen_and_records_resolved_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One run records precision, compiler, world size, and rollout backend."""
-    monkeypatch.setattr(toad, "_cuda_available", lambda: False)
+    monkeypatch.setattr(
+        toad,
+        "_cuda_capabilities",
+        lambda: toad.CudaCapabilities(False, 0, False),
+    )
     config = _runtime_config(
         devices=2,
         strategy="ddp",

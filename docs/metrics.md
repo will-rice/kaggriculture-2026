@@ -1,5 +1,11 @@
 # Toad phase 1 — metric reference
 
+The fixed-budget shipping gate is explicit and included in the default suite:
+`pytest tests/learn/test_toad_ddp.py -m economic_acceptance -v`. It runs the
+production Lightning Trainer, boundary checkpoint/resume, and eight held-out
+games against the real economic opponent; it is not covered by the repository's
+default `not slow` exclusion.
+
 One row per key `toad._record` logs, grouped the way wandb groups the
 dashboard: the text before the first `/` is the section. Every run also ships
 this table into the logger config as `metric_definitions` (see

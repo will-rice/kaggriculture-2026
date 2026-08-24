@@ -191,6 +191,7 @@ LOGGER = logging.getLogger(__name__)
 # an observation happens to carry.
 LEARNER, OPPONENT = 0, 1
 PolicyLike = Policy | StatefulPolicy
+SamplingGenerator = torch.Generator | Sequence[torch.Generator]
 
 
 @dataclass(frozen=True)
@@ -503,7 +504,8 @@ def rollout_many(
         policy: The network being trained.
         opponent: Another ``Policy``, or a spec the environment can build.
         seeds: One seed per environment in the group. Each seeds its own
-            episode; the first also seeds the group's shared sampling stream.
+            episode and its own sampling stream, so regrouping environments
+            cannot change a game's actions.
         state_unroll_length: When set, retain recurrent state only at the
             end-anchored segment starts consumed by the learner.
 
@@ -515,7 +517,7 @@ def rollout_many(
         ValueError: If the group's episodes do not all end on the same turn,
             which would leave the recorded streams ragged.
     """
-    generator = torch.Generator().manual_seed(int(seeds[0]))
+    generators = tuple(torch.Generator().manual_seed(int(seed)) for seed in seeds)
     environments = [
         make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed})
         for seed in seeds
@@ -562,7 +564,7 @@ def rollout_many(
                 )
                 for stream in streams
             ],
-            generator,
+            tuple(generators[stream.environment] for stream in streams),
             states=[stream.policy_state for stream in streams],
             dones=[stream.done for stream in streams],
             belief_observations=_belief_observations(policy, environments, streams),
@@ -578,7 +580,7 @@ def rollout_many(
             opponent,
             actors,
             environments,
-            generator,
+            generators,
             states=opponent_states,
         )
         for index, action in enumerate(opponent_actions):
@@ -678,7 +680,7 @@ def _opponent_actions(
     opponent: PolicyLike | str,
     actors: Sequence[Callable[[Mapping[str, Any]], Any]],
     environments: list[Environment],
-    generator: torch.Generator,
+    generator: SamplingGenerator,
     *,
     states: Sequence[PolicyState | None],
 ) -> tuple[list[Any], list[PolicyState | None]]:
@@ -696,7 +698,8 @@ def _opponent_actions(
         opponent: What seat 1 is.
         actors: One built agent per environment, empty for a ``Policy``.
         environments: The group.
-        generator: The sampling stream.
+        generator: One sampling stream per environment, or one shared stream
+            for a single-game caller.
         states: One opponent state per environment, in environment order.
 
     Returns:
@@ -799,7 +802,7 @@ def _opponent_actor(
 def _decide(
     policy: PolicyLike,
     requests: Sequence[tuple[Mapping[str, Any], int]],
-    generator: torch.Generator,
+    generator: SamplingGenerator,
     *,
     states: Sequence[PolicyState | None] | None = None,
     dones: Sequence[bool] | None = None,
@@ -818,8 +821,8 @@ def _decide(
     The forward runs on whatever device the policy is on and the logits come
     straight back to the CPU. Sampling, masking and storage stay on the CPU
     deliberately: the masks are built there by pure Python, the trajectory is
-    consumed there, and one ``torch.Generator`` then seeds the whole run rather
-    than one per device.
+    consumed there. Each environment retains its seed-keyed sampling stream, so
+    changing the vector group affects neither seat's stochastic trajectory.
 
     Ops for slots past the crew are sampled anyway, because a row of the unit
     head exists for every slot and ``masked_fill`` would leave an all-``-inf``
@@ -840,7 +843,8 @@ def _decide(
         requests: One ``(observation, seat)`` per row. The observation must be
             that seat's own, whose ``private`` mapping is the only one legible
             to it.
-        generator: The sampling stream.
+        generator: One sampling stream per environment. The same stream object
+            is repeated for both seats of a self-play environment.
         states: One prior state per request, or all ``None`` at episode start.
         dones: Whether each request follows a terminal action.
         belief_observations: Optional opposing-seat private observations used
@@ -1042,7 +1046,7 @@ def _unbatch_policy_state(state: PolicyState | None) -> list[PolicyState | None]
 
 
 def _sample(
-    logits: torch.Tensor, mask: torch.Tensor, generator: torch.Generator
+    logits: torch.Tensor, mask: torch.Tensor, generator: SamplingGenerator
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return one index per row and its log-probability, sampled under the mask.
 
@@ -1060,14 +1064,34 @@ def _sample(
     Args:
         logits: ``(1, slots, options)`` head output.
         mask: ``(1, slots, options)`` bool, True where the option is legal.
-        generator: The sampling stream.
+        generator: One sampling stream per environment, or one shared stream.
 
     Returns:
         ``(1, slots)`` int64 indices and ``(1, slots)`` float log-probabilities.
     """
     log_probs = torch.log_softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
     rows = log_probs.flatten(0, -2)
-    chosen = torch.multinomial(rows.exp(), 1, generator=generator)
+    if isinstance(generator, torch.Generator):
+        chosen = torch.multinomial(rows.exp(), 1, generator=generator)
+    else:
+        if len(generator) != logits.shape[0]:
+            raise ValueError("one sampling generator is required per environment")
+        sampled = []
+        start = 0
+        while start < len(generator):
+            row_generator = generator[start]
+            end = start + 1
+            while end < len(generator) and generator[end] is row_generator:
+                end += 1
+            sampled.append(
+                torch.multinomial(
+                    log_probs[start:end].flatten(0, -2).exp(),
+                    1,
+                    generator=row_generator,
+                )
+            )
+            start = end
+        chosen = torch.cat(sampled)
     return (
         chosen.reshape(logits.shape[:-1]),
         rows.gather(1, chosen).reshape(logits.shape[:-1]),

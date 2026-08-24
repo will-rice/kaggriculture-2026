@@ -301,6 +301,46 @@ def compute_head_entropy(
 
 
 @dataclass(frozen=True)
+class _FiniteTensorCheck:
+    """Device-resident per-tensor flags with lazy failure-name diagnostics."""
+
+    names: tuple[str, ...]
+    flags: tuple[torch.Tensor, ...]
+
+    @classmethod
+    def from_tensors(cls, tensors: Mapping[str, torch.Tensor]) -> Self:
+        """Build scalar device flags without reading any of them on the host."""
+        return cls(
+            names=tuple(tensors),
+            flags=tuple(torch.isfinite(tensor).all() for tensor in tensors.values()),
+        )
+
+    def merged(self, other: Self) -> Self:
+        """Combine phase checks while retaining stable diagnostic order."""
+        return type(self)(self.names + other.names, self.flags + other.flags)
+
+    def local_bad(self, *, device: torch.device | None = None) -> torch.Tensor:
+        """Return one device scalar representing every tensor in this phase."""
+        if not self.flags:
+            return torch.tensor(False, device=device)
+        return ~torch.stack(self.flags).all()
+
+    def nonfinite_names(self) -> list[str]:
+        """Read individual flags only after the aggregate reports a failure."""
+        if not self.flags or not bool(self.local_bad()):
+            return []
+        return [
+            name
+            for name, finite in zip(self.names, self.flags, strict=True)
+            if not bool(finite)
+        ]
+
+    def __iter__(self) -> Iterable[str]:
+        """Retain the existing diagnostic seam for tests and integrations."""
+        return iter(self.nonfinite_names())
+
+
+@dataclass(frozen=True)
 class LossReport:
     """Differentiable total, head entropy, and detached-by-caller diagnostics."""
 
@@ -309,7 +349,12 @@ class LossReport:
     entropy: HeadEntropy
     debug_dtypes: Mapping[str, torch.dtype]
     provenance: NonFiniteProvenance
-    nonfinite_names: tuple[str, ...] = ()
+    finite_check: _FiniteTensorCheck
+
+    @property
+    def nonfinite_names(self) -> tuple[str, ...]:
+        """Materialize names only when a caller explicitly asks for diagnostics."""
+        return tuple(self.finite_check.nonfinite_names())
 
 
 @dataclass(frozen=True)
@@ -351,22 +396,34 @@ class NonFiniteProvenance:
         opponent_digests: tuple[str | None, ...],
         actor_version: int,
         precision: str,
-        state_norms: Mapping[str, float],
+        state_norms: Mapping[str, float] | None = None,
+        state_norm_tensors: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         self.batch_kind = batch_kind
         self.game_ids = game_ids
         self.opponent_digests = opponent_digests
         self.actor_version = actor_version
         self.precision = precision
-        self.state_norms = dict(state_norms)
+        self._state_norms = dict(state_norms or {})
+        self._state_norm_tensors = dict(state_norm_tensors or {})
+
+    @property
+    def state_norms(self) -> dict[str, float]:
+        """Materialize recurrent diagnostics only after a finite failure."""
+        if self._state_norm_tensors:
+            self._state_norms.update(
+                {name: float(value) for name, value in self._state_norm_tensors.items()}
+            )
+            self._state_norm_tensors = {}
+        return dict(self._state_norms)
 
     @classmethod
     def from_batch(
         cls, batch: LearnerBatch, state: PolicyState | None, precision: str
     ) -> Self:
-        """Capture only primitive diagnostics, never a batch tensor or graph."""
-        state_norms = {
-            name: float(value.detach().float().norm())
+        """Capture detached device diagnostics without healthy-path host reads."""
+        state_norm_tensors = {
+            name: value.detach().float().norm()
             for name, value in (
                 ("hidden", None if state is None else state.hidden),
                 ("cell", None if state is None else state.cell),
@@ -379,7 +436,7 @@ class NonFiniteProvenance:
             opponent_digests=batch.opponent_digests,
             actor_version=batch.actor_version,
             precision=precision,
-            state_norms=state_norms,
+            state_norm_tensors=state_norm_tensors,
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -509,12 +566,8 @@ class NonFiniteTrainingError(RuntimeError):
 
 
 def _nonfinite_tensor_names(tensors: Mapping[str, torch.Tensor]) -> list[str]:
-    """Return stable names for every finite-check failure in one loss report."""
-    return [
-        name
-        for name, tensor in tensors.items()
-        if not bool(torch.isfinite(tensor).all())
-    ]
+    """Synchronize once on a healthy phase and diagnose names only on failure."""
+    return _FiniteTensorCheck.from_tensors(tensors).nonfinite_names()
 
 
 class ResumeConfigError(ValueError):
@@ -1068,7 +1121,7 @@ def compute_loss(  # noqa: C901
     turns, width = behaviour.shape
     eager_policy = unwrap_compiled(policy)
     stateful_policy = eager_policy if isinstance(eager_policy, StatefulPolicy) else None
-    initial_nonfinite: list[str] = []
+    initial_check = _FiniteTensorCheck((), ())
     if stateful_policy is not None:
         if stateful_policy.config.recurrent or stateful_policy.config.belief:
             required = {"initial_hidden", "initial_cell", "initial_belief"}
@@ -1101,7 +1154,10 @@ def compute_loss(  # noqa: C901
             if initial is not None
             else {}
         )
-        initial_nonfinite = _nonfinite_tensor_names(initial_inputs)
+        initial_check = _FiniteTensorCheck.from_tensors(initial_inputs)
+        initial_nonfinite = (
+            initial_check.nonfinite_names() if _raise_on_nonfinite else []
+        )
         if initial_nonfinite and _raise_on_nonfinite:
             raise NonFiniteTrainingError.from_batch(
                 initial_nonfinite, batch, initial, config.runtime.precision
@@ -1377,9 +1433,8 @@ def compute_loss(  # noqa: C901
                 "output/state_prior_belief": state.prior_belief.float(),
             }
         )
-    nonfinite = list(
-        dict.fromkeys((*initial_nonfinite, *_nonfinite_tensor_names(checked)))
-    )
+    finite_check = initial_check.merged(_FiniteTensorCheck.from_tensors(checked))
+    nonfinite = finite_check.nonfinite_names() if _raise_on_nonfinite else []
     if nonfinite and _raise_on_nonfinite:
         raise NonFiniteTrainingError.from_batch(
             nonfinite, batch, state, config.runtime.precision
@@ -1401,7 +1456,7 @@ def compute_loss(  # noqa: C901
             "teacher": loss.teacher.dtype,
         },
         provenance=provenance,
-        nonfinite_names=tuple(nonfinite),
+        finite_check=finite_check,
     )
 
 
@@ -1573,7 +1628,7 @@ class ToadLightningModule(lightning.LightningModule):
             _raise_on_nonfinite=False,
         )
         self._last_finite_provenance = report.provenance
-        self._synchronize_nonfinite(list(report.nonfinite_names), report.provenance)
+        self._synchronize_nonfinite(report.finite_check, report.provenance)
         self.round_metrics.update(batch, report)
         self._round_ended = batch.end_of_round
         self._round_baselines.append(report.terms["baseline"].detach())
@@ -1638,14 +1693,14 @@ class ToadLightningModule(lightning.LightningModule):
         boundary can all-reduce this local flag and render the same structured
         error on every rank before any rank enters its optimizer step.
         """
-        nonfinite = [
-            f"grad/{name}"
+        gradients = {
+            f"grad/{name}": parameter.grad
             for name, parameter in unwrap_compiled(self.policy).named_parameters()
             if parameter.grad is not None
-            and not bool(torch.isfinite(parameter.grad).all())
-        ]
+        }
+        finite_check = _FiniteTensorCheck.from_tensors(gradients)
         if self._last_finite_provenance is not None:
-            self._synchronize_nonfinite(nonfinite, self._last_finite_provenance)
+            self._synchronize_nonfinite(finite_check, self._last_finite_provenance)
 
     def _reduce_tensor(
         self, value: torch.Tensor, reduce_op: Literal["sum", "max"] = "sum"
@@ -1660,18 +1715,23 @@ class ToadLightningModule(lightning.LightningModule):
 
     def _synchronize_nonfinite(
         self,
-        tensor_names: list[str],
+        check: _FiniteTensorCheck | list[str],
         provenance: NonFiniteProvenance,
     ) -> None:
         """Make every rank gather and raise the same finite-check failure."""
-        local_bad = torch.tensor(
-            int(bool(tensor_names)),
+        local_bad = (
+            check.local_bad(device=self.device)
+            if isinstance(check, _FiniteTensorCheck)
+            else torch.tensor(bool(check), device=self.device)
+        ).to(
             dtype=torch.int32,
-            device=self.device,
         )
         any_bad = self._reduce_tensor(local_bad, reduce_op="max")
         if not bool(any_bad.item()):
             return
+        tensor_names = (
+            check.nonfinite_names() if isinstance(check, _FiniteTensorCheck) else check
+        )
         rank = (
             0 if self._trainer is None else int(getattr(self.trainer, "global_rank", 0))
         )

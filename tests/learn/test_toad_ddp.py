@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 import kaggriculture.learn.toad.callbacks as toad_callbacks
 import kaggriculture.learn.toad.lightning as toad_lightning
+import kaggriculture.sim.day as sim_day
 from kaggriculture.learn.encoding import (
     MARKET_SLOTS,
     MAX_UNITS,
@@ -1032,6 +1033,12 @@ class _DdpProbe(lightning.Callback):
     ) -> None:
         del trainer, pl_module, outputs, batch_idx
         learner_batch = cast(data.LearnerBatch, batch)
+        for game_id in learner_batch.game_ids:
+            if game_id not in self.seen_game_ids:
+                self.seen_game_ids.append(game_id)
+        for opponent_id in learner_batch.opponent_ids:
+            if opponent_id not in self.seen_opponent_ids:
+                self.seen_opponent_ids.append(opponent_id)
         self.batch_count += 1
         self.first_markers += int(learner_batch.first_of_round)
         self.end_markers += int(learner_batch.end_of_round)
@@ -1101,7 +1108,12 @@ def _data_module_for_probe(trainer: lightning.Trainer) -> data.ToadDataModule:
     return module
 
 
-def _ddp_fixture_config(output_dir: Path, resume: Path | None) -> ToadConfig:
+def _ddp_fixture_config(
+    output_dir: Path,
+    resume: Path | None,
+    *,
+    native: bool = False,
+) -> ToadConfig:
     """Return the tiny, fully offline two-rank integration configuration."""
     return ToadConfig.model_validate(
         {
@@ -1130,6 +1142,8 @@ def _ddp_fixture_config(output_dir: Path, resume: Path | None) -> ToadConfig:
                 "checkpoint_every_environment_steps": 8,
                 "output_dir": output_dir,
                 "resume": resume,
+                "rollout_backend": "native" if native else "reference",
+                "rollout_device": "cpu",
             },
         }
     )
@@ -1179,7 +1193,48 @@ def _run_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
         BoundaryCheckpoint(config.runtime.output_dir),
         _DdpProbe(output_dir, phase, seen_game_ids, seen_opponent_ids),
     ]
-    if phase == "initial":
+    if phase.endswith("initial"):
+        callbacks.append(_StopAfterOneRound())
+    trainer = lightning.Trainer(
+        accelerator="cpu",
+        devices=2,
+        strategy="ddp",
+        precision="32-true",
+        max_steps=-1,
+        max_epochs=-1,
+        use_distributed_sampler=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        logger=False,
+        callbacks=callbacks,
+    )
+    trainer.fit(
+        ToadLightningModule(config),
+        datamodule=data_module,
+        ckpt_path=resume,
+    )
+
+
+def _run_native_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
+    """Run the real tensor simulator and NativeRoundSource under CPU Gloo."""
+    torch.set_num_threads(1)
+    lightning.seed_everything(117, workers=True)
+    data.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
+    sim_day.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
+    config = _ddp_fixture_config(output_dir, resume, native=True)
+    source = data.NativeRoundSource(config)
+    data_module = data.ToadDataModule(config, source)
+    seen_game_ids: list[int] = []
+    seen_opponent_ids: list[str] = []
+    callbacks: list[lightning.Callback] = [
+        ActorSyncCallback(1),
+        EnvironmentStepStop(config.runtime.total_environment_steps),
+        PopulationSnapshotCallback(),
+        BoundaryCheckpoint(config.runtime.output_dir),
+        _DdpProbe(output_dir, phase, seen_game_ids, seen_opponent_ids),
+    ]
+    if phase.endswith("initial"):
         callbacks.append(_StopAfterOneRound())
     trainer = lightning.Trainer(
         accelerator="cpu",
@@ -1218,6 +1273,46 @@ def _launch_ddp_fixture(
         sys.executable,
         str(Path(__file__).resolve()),
         "--ddp-fixture",
+        str(output_dir),
+        phase,
+    ]
+    if resume is not None:
+        command.append(str(resume))
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+            "WANDB_MODE": "disabled",
+            "OMP_NUM_THREADS": "1",
+        }
+    )
+    return subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+
+def _launch_native_ddp_fixture(
+    output_dir: Path, phase: str, resume: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Launch a clean two-rank native-source acceptance process."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bootstrap = output_dir / "bootstrap.pt"
+    if not bootstrap.exists():
+        torch.manual_seed(314)
+        bootstrap_config = ToadConfig.model_validate(
+            {"model": {"blocks": 1, "channels": 4}}
+        )
+        torch.save(ToadLightningModule(bootstrap_config).policy.state_dict(), bootstrap)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--native-ddp-fixture",
         str(output_dir),
         phase,
     ]
@@ -1331,6 +1426,67 @@ def test_real_two_process_cpu_ddp_synchronizes_synthetic_split_and_resume(
         assert resumed_rank["lr"] == uninterrupted_rank["lr"]
 
 
+def test_real_two_process_cpu_ddp_native_source_split_and_resume(
+    tmp_path: Path,
+) -> None:
+    """NativeRoundSource trains through the tensor simulator on both Gloo ranks."""
+    initial = _launch_native_ddp_fixture(tmp_path, "native-initial")
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    first = _probe_payloads(tmp_path, "native-initial")
+
+    assert [payload["game_ids"] for payload in first] == [[0], [1]]
+    assert set(cast(list[int], first[0]["game_ids"])).isdisjoint(
+        cast(list[int], first[1]["game_ids"])
+    )
+    assert [payload["opponent_ids"] for payload in first] == [
+        ["economic"],
+        ["economic"],
+    ]
+    assert [payload["batch_count"] for payload in first] == [2, 2]
+    assert [payload["first_markers"] for payload in first] == [1, 1]
+    assert [payload["end_markers"] for payload in first] == [1, 1]
+    assert len({payload["parameter_digest"] for payload in first}) == 1
+    assert first[0]["parameter_digest"] != first[0]["initial_parameter_digest"]
+    assert [payload["environment_steps"] for payload in first] == [8, 8]
+    assert [payload["next_game_id"] for payload in first] == [2, 2]
+    checkpoints = sorted(tmp_path.glob("step-*.ckpt"))
+    snapshots = sorted((tmp_path / "population").glob("snapshot-*.pt"))
+    assert [path.name for path in checkpoints] == ["step-0.ckpt", "step-8.ckpt"]
+    assert len(snapshots) == 2
+
+    resumed = _launch_native_ddp_fixture(tmp_path, "native-resume", checkpoints[-1])
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    second = _probe_payloads(tmp_path, "native-resume")
+    assert [payload["game_ids"] for payload in second] == [[2], [3]]
+    assert [payload["batch_count"] for payload in second] == [2, 2]
+    assert len({payload["parameter_digest"] for payload in second}) == 1
+    assert [payload["environment_steps"] for payload in second] == [16, 16]
+    assert [payload["next_game_id"] for payload in second] == [4, 4]
+
+    uninterrupted_dir = tmp_path / "native-uninterrupted"
+    uninterrupted = _launch_native_ddp_fixture(
+        uninterrupted_dir, "native-uninterrupted"
+    )
+    assert uninterrupted.returncode == 0, uninterrupted.stdout + uninterrupted.stderr
+    full = _probe_payloads(uninterrupted_dir, "native-uninterrupted")
+    assert [payload["game_ids"] for payload in full] == [[0, 2], [1, 3]]
+    assert [payload["batch_count"] for payload in full] == [4, 4]
+    for resumed_rank, uninterrupted_rank in zip(second, full, strict=True):
+        for name in (
+            "parameter_digest",
+            "environment_steps",
+            "collection_round",
+            "next_game_id",
+            "next_round_id",
+            "manifest",
+            "actor_version",
+            "actor_source_global_step",
+            "entropy_state",
+            "lr",
+        ):
+            assert resumed_rank[name] == uninterrupted_rank[name]
+
+
 @pytest.mark.slow
 def test_fixed_seed_economic_reference_collection_resumes_within_interval() -> None:
     """Real economic rollouts retain their characterized result after resume."""
@@ -1401,9 +1557,160 @@ def test_fixed_seed_economic_reference_collection_resumes_within_interval() -> N
     assert resumed_source._next_round_id == uninterrupted_source._next_round_id == 2
 
 
-if __name__ == "__main__" and len(sys.argv) >= 4 and sys.argv[1] == "--ddp-fixture":
-    _run_ddp_fixture(
-        Path(sys.argv[2]),
-        sys.argv[3],
-        Path(sys.argv[4]) if len(sys.argv) == 5 else None,
+@pytest.mark.economic_acceptance
+def test_production_trainer_resume_retains_heldout_economic_result(
+    tmp_path: Path,
+) -> None:
+    """Train, checkpoint, resume, and evaluate a fixed real economic budget."""
+    games_per_round = 2
+    round_steps = games_per_round * 719
+    total_steps = round_steps * 2
+
+    def config(output_dir: Path) -> ToadConfig:
+        return ToadConfig.model_validate(
+            {
+                "model": {"blocks": 1, "channels": 4},
+                "population": {
+                    "selfplay": 0.0,
+                    "scripted": 1.0,
+                    "environments_per_rank": games_per_round,
+                    "collection_processes": games_per_round,
+                    "actor_sync_every_rounds": 1,
+                },
+                "optimizer": {
+                    "unroll_length": 719,
+                    "batch_segments": games_per_round,
+                    "value_warmup_batches": 0,
+                    "value_passes": 0,
+                },
+                "runtime": {
+                    "seed": 117,
+                    "accelerator": "cpu",
+                    "devices": 1,
+                    "precision": "32-true",
+                    "total_environment_steps": total_steps,
+                    "checkpoint_every_environment_steps": round_steps,
+                    "output_dir": output_dir,
+                },
+            }
+        )
+
+    torch.manual_seed(314)
+    seed_module = ToadLightningModule(config(tmp_path / "seed"))
+    initial = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in seed_module.policy.state_dict().items()
+    }
+
+    def fit(
+        resolved: ToadConfig,
+        *,
+        checkpoint: Path | None = None,
+        stop_after_one: bool = False,
+    ) -> tuple[ToadLightningModule, data.ReferenceRoundSource]:
+        lightning.seed_everything(117, workers=True)
+        source = data.ReferenceRoundSource(resolved)
+        data_module = data.ToadDataModule(resolved, source)
+        module = ToadLightningModule(resolved)
+        if checkpoint is None:
+            module.policy.load_state_dict(initial, strict=True)
+        callbacks: list[lightning.Callback] = [
+            ActorSyncCallback(1),
+            EnvironmentStepStop(total_steps),
+            BoundaryCheckpoint(resolved.runtime.output_dir),
+        ]
+        if stop_after_one:
+            callbacks.append(_StopAfterOneRound())
+        trainer = lightning.Trainer(
+            accelerator="cpu",
+            devices=1,
+            precision="32-true",
+            max_steps=-1,
+            max_epochs=-1,
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            deterministic=True,
+            gradient_clip_val=resolved.optimizer.clip_grad_norm,
+            gradient_clip_algorithm="norm",
+            callbacks=callbacks,
+            use_distributed_sampler=False,
+        )
+        trainer.fit(module, datamodule=data_module, ckpt_path=checkpoint)
+        return module, source
+
+    full_config = config(tmp_path / "full")
+    full_module, full_source = fit(full_config)
+    split_config = config(tmp_path / "split")
+    split_module, _split_source = fit(split_config, stop_after_one=True)
+    boundary = split_config.runtime.output_dir / f"step-{round_steps}.ckpt"
+    assert boundary.is_file()
+    resumed_module, resumed_source = fit(split_config, checkpoint=boundary)
+
+    assert split_module.environment_steps == round_steps
+    assert (
+        full_module.environment_steps == resumed_module.environment_steps == total_steps
     )
+    assert full_source.next_game_id == resumed_source.next_game_id == 4
+    for name, tensor in full_module.policy.state_dict().items():
+        torch.testing.assert_close(
+            tensor,
+            resumed_module.policy.state_dict()[name],
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    heldout_seeds = (911, 919, 929, 937, 947, 953, 967, 977)
+    heldout = tuple(
+        data.CollectionAssignment(
+            game_id=10_000 + index,
+            seed=seed,
+            kind=data.BatchKind.SCRIPTED,
+            opponent_id="economic",
+        )
+        for index, seed in enumerate(heldout_seeds)
+    )
+
+    def evaluate(module: ToadLightningModule) -> tuple[float, ...]:
+        evaluation = data.ReferenceRoundSource(
+            config(tmp_path / "evaluation"), assignments=heldout
+        )
+        evaluation.publish_actor(module.policy.state_dict(), module.actor_version)
+        collected = evaluation._collect_round(heldout)
+        return tuple(
+            float(trajectory.final_margin)
+            for _assignment, trajectories in collected
+            for trajectory in trajectories
+        )
+
+    full_margins = evaluate(full_module)
+    resumed_margins = evaluate(resumed_module)
+    assert resumed_margins == pytest.approx(full_margins, rel=0.0, abs=0.0)
+    expected_margins = (
+        -169_549.0,
+        -72_036.0,
+        -113_768.0,
+        -147_151.0,
+        -131_777.0,
+        -107_019.0,
+        -128_220.0,
+        -156_478.0,
+    )
+    assert full_margins == pytest.approx(expected_margins, rel=0.0, abs=0.0)
+    assert sum(margin > 0.0 for margin in full_margins) / len(full_margins) == 0.0
+
+
+if __name__ == "__main__" and len(sys.argv) >= 4:
+    if sys.argv[1] == "--ddp-fixture":
+        _run_ddp_fixture(
+            Path(sys.argv[2]),
+            sys.argv[3],
+            Path(sys.argv[4]) if len(sys.argv) == 5 else None,
+        )
+    elif sys.argv[1] == "--native-ddp-fixture":
+        _run_native_ddp_fixture(
+            Path(sys.argv[2]),
+            sys.argv[3],
+            Path(sys.argv[4]) if len(sys.argv) == 5 else None,
+        )

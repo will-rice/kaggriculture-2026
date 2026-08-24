@@ -546,6 +546,209 @@ def test_native_source_emits_common_batches_with_exact_selfplay_provenance(
     assert all(required <= segment.keys() for segment in batches[0].segments)
 
 
+def test_stochastic_reference_sampling_is_invariant_to_regrouping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each game's action stream is keyed by its seed, not its vector peers."""
+    monkeypatch.setattr(reference_rollout, "EPISODE_STEPS", 5)
+    torch.manual_seed(991)
+    policy = Policy(blocks=1, channels=4).eval()
+    seeds = (401, 409)
+
+    grouped = reference_rollout.rollout_many(policy, policy, seeds)
+    separate = [
+        trajectory
+        for seed in seeds
+        for trajectory in reference_rollout.rollout_many(policy, policy, (seed,))
+    ]
+
+    assert len(grouped) == len(separate) == 4
+    for together, alone in zip(grouped, separate, strict=True):
+        torch.testing.assert_close(together.unit_actions, alone.unit_actions)
+        torch.testing.assert_close(together.unit_quantities, alone.unit_quantities)
+        torch.testing.assert_close(together.market_actions, alone.market_actions)
+        torch.testing.assert_close(together.log_probs, alone.log_probs)
+
+
+def test_stochastic_native_sampling_is_invariant_to_regrouping_and_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vectorized native rows retain each game's reference stochastic stream."""
+    monkeypatch.setattr(reference_rollout, "EPISODE_STEPS", 5)
+    monkeypatch.setattr(data_module, "EPISODE_STEPS", 5)
+    monkeypatch.setattr(sim_day, "EPISODE_STEPS", 5)
+
+    class FixedStochasticPolicy(Policy):
+        def forward(
+            self,
+            board: torch.Tensor,
+            scalars: torch.Tensor,
+            positions: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            units, quantities, markets, values = super().forward(
+                board, scalars, positions
+            )
+
+            def fixed(logits: torch.Tensor) -> torch.Tensor:
+                axis = torch.linspace(
+                    -0.7,
+                    0.9,
+                    logits.shape[-1],
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+                return axis.expand_as(logits)
+
+            return fixed(units), fixed(quantities), fixed(markets), values
+
+    torch.manual_seed(997)
+    policy = FixedStochasticPolicy(blocks=1, channels=4).eval()
+    seeds = (421, 431)
+    assignments = tuple(
+        CollectionAssignment(
+            game_id=91 + index,
+            seed=seed,
+            kind=BatchKind.SELFPLAY,
+            opponent_id="self",
+        )
+        for index, seed in enumerate(seeds)
+    )
+
+    grouped_source = NativeRoundSource(_native_config(), assignments=assignments)
+    grouped_source.publish_actor(policy.state_dict(), version=0)
+    monkeypatch.setattr(grouped_source, "_native_policy", lambda _model, _state: policy)
+    grouped = grouped_source._collect_native_round(assignments)[0]
+    separate = []
+    for assignment in assignments:
+        source = NativeRoundSource(_native_config(), assignments=(assignment,))
+        source.publish_actor(policy.state_dict(), version=0)
+        monkeypatch.setattr(source, "_native_policy", lambda _model, _state: policy)
+        separate.append(source._collect_native_round((assignment,))[0])
+    reference = reference_rollout.rollout_many(policy, policy, seeds)
+
+    for environment, collection in enumerate(separate):
+        for seat in range(2):
+            grouped_actions = torch.cat(
+                [
+                    chunk.unit_actions[:, environment, seat]
+                    for chunk in grouped.trajectories
+                ]
+            )
+            separate_actions = torch.cat(
+                [chunk.unit_actions[:, 0, seat] for chunk in collection.trajectories]
+            )
+            separate_quantities = torch.cat(
+                [chunk.unit_quantities[:, 0, seat] for chunk in collection.trajectories]
+            )
+            separate_market = torch.cat(
+                [chunk.market_actions[:, 0, seat] for chunk in collection.trajectories]
+            )
+            grouped_quantities = torch.cat(
+                [
+                    chunk.unit_quantities[:, environment, seat]
+                    for chunk in grouped.trajectories
+                ]
+            )
+            grouped_market = torch.cat(
+                [
+                    chunk.market_actions[:, environment, seat]
+                    for chunk in grouped.trajectories
+                ]
+            )
+            row = environment * 2 + seat
+            torch.testing.assert_close(grouped_actions, separate_actions)
+            torch.testing.assert_close(grouped_actions, reference[row].unit_actions)
+            torch.testing.assert_close(grouped_quantities, separate_quantities)
+            torch.testing.assert_close(
+                grouped_quantities, reference[row].unit_quantities
+            )
+            torch.testing.assert_close(grouped_market, separate_market)
+            torch.testing.assert_close(grouped_market, reference[row].market_actions)
+
+
+def test_native_grouped_row_failure_identifies_the_second_game(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row-addressable vector failure must not be attributed to chunk row zero."""
+    assignments = (
+        CollectionAssignment(71, 501, BatchKind.SELFPLAY, "self"),
+        CollectionAssignment(72, 503, BatchKind.SELFPLAY, "self"),
+    )
+    source = NativeRoundSource(_native_config(), assignments=assignments)
+    actor = Policy(blocks=1, channels=4)
+    source.publish_actor(actor.state_dict(), version=0)
+
+    def fail_second(*_args: object, **_kwargs: object) -> object:
+        raise data_module.CollectionRowError(
+            row=1,
+            error_type="ValueError",
+            message="second row failed",
+        )
+
+    monkeypatch.setattr("kaggriculture.sim.rollout.collect_segment", fail_second)
+
+    with pytest.raises(data_module.CollectionError) as raised:
+        source._collect_native_round(assignments)
+
+    assert raised.value.game_ids == (72,)
+    assert raised.value.seeds == (503,)
+    assert "second row failed" in str(raised.value)
+
+
+def test_native_group_failure_reports_every_affected_game(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely vector-wide failure names the full affected assignment set."""
+    assignments = (
+        CollectionAssignment(81, 601, BatchKind.SELFPLAY, "self"),
+        CollectionAssignment(82, 607, BatchKind.SELFPLAY, "self"),
+    )
+    source = NativeRoundSource(_native_config(), assignments=assignments)
+    actor = Policy(blocks=1, channels=4)
+    source.publish_actor(actor.state_dict(), version=0)
+    monkeypatch.setattr(
+        "kaggriculture.sim.rollout.collect_segment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("vector failed")),
+    )
+
+    with pytest.raises(data_module.CollectionError) as raised:
+        source._collect_native_round(assignments)
+
+    assert raised.value.game_ids == (81, 82)
+    assert raised.value.seeds == (601, 607)
+
+
+def test_native_second_row_failure_survives_distributed_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every DDP peer receives the second grouped game's exact provenance."""
+    assignments = (
+        CollectionAssignment(101, 701, BatchKind.SELFPLAY, "self"),
+        CollectionAssignment(102, 709, BatchKind.SELFPLAY, "self"),
+    )
+    source = NativeRoundSource(_native_config(), assignments=assignments)
+    source.configure_distributed(rank=0, world_size=2)
+    actor = Policy(blocks=1, channels=4)
+    source.publish_actor(actor.state_dict(), version=0)
+
+    def fail_second(*_args: object, **_kwargs: object) -> object:
+        raise data_module.CollectionRowError(1, "ValueError", "rank row sentinel")
+
+    monkeypatch.setattr("kaggriculture.sim.rollout.collect_segment", fail_second)
+    monkeypatch.setattr(
+        data_module,
+        "_all_gather_objects",
+        lambda local, world_size, **_kwargs: (local,) * world_size,
+    )
+
+    with pytest.raises(data_module.DistributedCollectionError) as raised:
+        list(source)
+
+    assert "game_ids=(102,)" in str(raised.value)
+    assert "seeds=(709,)" in str(raised.value)
+    assert "game_ids=(101,)" not in str(raised.value)
+
+
 def test_native_source_preserves_sparse_recurrent_and_belief_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

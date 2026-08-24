@@ -128,6 +128,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
   "cuda: requires a CUDA device supporting BF16",
   "compile: requires torch.compile support",
+  "economic_acceptance: production Trainer and real economic-opponent gate",
   "slow: reads the replay corpus; minutes, not seconds",
 ]
 addopts = "-m 'not slow'"

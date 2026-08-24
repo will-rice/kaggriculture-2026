@@ -1,6 +1,6 @@
 """On-device rollout utilities for the batched simulator."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +63,7 @@ from kaggriculture.sim.tensors import tensor_constant
 
 GROWING = 0.4
 ScriptedOpponent = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+SamplingGenerator = torch.Generator | Sequence[torch.Generator]
 
 _MARKET_TYPES = {
     "SELL": (1, PRODUCT_NAMES),
@@ -228,11 +229,33 @@ def potential(state: SimState, seat: int) -> torch.Tensor:
 
 
 def _sample(
-    logits: torch.Tensor, mask: torch.Tensor, generator: torch.Generator | None
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    generator: SamplingGenerator | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     log_prob = torch.log_softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
     flat = log_prob.flatten(0, -2)
-    chosen = torch.multinomial(flat.exp(), 1, generator=generator)
+    if generator is None or isinstance(generator, torch.Generator):
+        chosen = torch.multinomial(flat.exp(), 1, generator=generator)
+    else:
+        if len(generator) != logits.shape[0]:
+            raise ValueError("one sampling generator is required per environment")
+        sampled = []
+        start = 0
+        while start < len(generator):
+            row_generator = generator[start]
+            end = start + 1
+            while end < len(generator) and generator[end] is row_generator:
+                end += 1
+            sampled.append(
+                torch.multinomial(
+                    log_prob[start:end].flatten(0, -2).exp(),
+                    1,
+                    generator=row_generator,
+                )
+            )
+            start = end
+        chosen = torch.cat(sampled)
     return (
         chosen.reshape(logits.shape[:-1]),
         flat.gather(1, chosen).reshape(logits.shape[:-1]),
@@ -471,7 +494,16 @@ def scripted_actions(
     )
     markets = MarketActions.empty(state.batch_size, device=device)
     for batch in range(state.batch_size):
-        encoded = encode_turn(opponent(unpack(state, batch, seat)))
+        try:
+            encoded = encode_turn(opponent(unpack(state, batch, seat)))
+        except Exception as error:
+            from kaggriculture.learn.toad.data import CollectionRowError
+
+            raise CollectionRowError(
+                row=batch,
+                error_type=type(error).__name__,
+                message=str(error),
+            ) from error
         for unit, op in enumerate(encoded.units):
             units[batch, unit] = op
         for unit, quantity in enumerate(encoded.quantities):
@@ -653,7 +685,7 @@ def collect_segment(
     turns: int = 32,
     state_unroll_length: int | None = None,
     money_weight: float = MONEY_WEIGHT,
-    generator: torch.Generator | None = None,
+    generator: SamplingGenerator | None = None,
     opponent: ScriptedOpponent | None = None,
     opponent_policy: torch.nn.Module | None = None,
 ) -> tuple[SimState, PolicyState | RolloutPolicyState | None, Trajectory]:
@@ -668,8 +700,9 @@ def collect_segment(
     buffers inside the captured region, otherwise every replay recomputes the
     same turn from unchanged inputs; and ``generator`` must either be ``None``,
     for the default CUDA generator that ``torch.cuda.graph`` registers itself,
-    or a CUDA generator the caller registered with the graph. A CPU generator
-    never reaches these tensors.
+    or a CUDA generator the caller registered with the graph. Per-environment
+    generators preserve game-keyed eager sampling but are not a graph-capture
+    mode. A CPU generator never reaches these tensors.
 
     A scripted ``opponent`` is the exception, and it is not one that can be
     removed: ``scripted_actions`` reads each row's state on the host and asks a
@@ -705,7 +738,8 @@ def collect_segment(
         state_unroll_length: Learner unroll length whose exact segment starts
             determine the sparse entry-state rows retained in the trajectory.
         money_weight: Curriculum coefficient for the faithful shaped reward.
-        generator: The sampling stream, or ``None`` for the device default.
+        generator: One sampling stream per environment, one shared stream, or
+            ``None`` for the device default.
         opponent: A scripted seat 1, or ``None`` for a neural seat.
         opponent_policy: A distinct frozen/teacher seat 1 policy. Mutually
             exclusive with ``opponent``; when both are absent, self-play uses

@@ -734,3 +734,31 @@ as immutable experiment identity. Only the proven operational placement and
 diagnostic fields (`accelerator`, `devices`, `num_nodes`, `strategy`, logging
 frequency, profiler, output directory, and resume path), plus consumed
 warm-start provenance, may differ from the stored config.
+
+The final performance integration review fixes four additional runtime
+contracts:
+
+- CUDA availability, device count, and BF16 support are resolved together in
+  one disposable subprocess. The parent process performs no CUDA runtime
+  inspection before Lightning creates its workers. CPU learner DDP combined
+  with native CUDA rollout is rejected because the port has no explicit
+  rank-local rollout-device mapping.
+- Stochastic rollout is keyed by game seed. A vector group owns one generator
+  per environment, shared by that environment's two self-play seats, so
+  regrouping games changes neither actions nor simulator trajectories while
+  model forward and simulator stepping remain vectorized.
+- A row-addressable grouped collector exception carries its row to the owning
+  game and seed. Failures without a trustworthy row are reported against the
+  complete affected group; distributed envelopes preserve the same identity
+  on every rank.
+- Finite checks keep per-tensor flags and recurrent-state norms on device.
+  Healthy forward and gradient phases expose only one aggregate scalar (and
+  one all-rank reduction under DDP); tensor names and state norms are
+  materialized only after that aggregate reports a failure.
+
+The fixed-budget acceptance is the production Lightning path: train through
+two collection boundaries, checkpoint after the first, resume through the
+second, require exact resumed/uninterrupted policy and clock parity, then run
+eight fixed held-out economic games. The explicit gate is
+`pytest tests/learn/test_toad_ddp.py -m economic_acceptance -v`; it is not
+excluded by the default `not slow` selection.
