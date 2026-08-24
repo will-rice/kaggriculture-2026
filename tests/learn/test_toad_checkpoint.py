@@ -380,6 +380,61 @@ def test_disabled_checkpoint_allows_initial_controller_clocks() -> None:
     assert {state.last_steps for state in resumed.entropy_state.values()} == {0}
 
 
+def _disabled_below_floor_config() -> ToadConfig:
+    """Return a fully validated disabled config whose targets begin below floors."""
+    payload = ToadConfig.control().model_dump(mode="python")
+    optimizer = cast(dict[str, object], payload["optimizer"])
+    entropy = cast(dict[str, object], optimizer["entropy"])
+    targets = {"operation": 0.1, "quantity": 0.2, "market": 0.3}
+    for name, target in targets.items():
+        controller = cast(dict[str, object], entropy[name])
+        controller["initial_target"] = target
+        controller["target_floor"] = 0.5
+    return ToadConfig.model_validate(payload)
+
+
+def test_disabled_checkpoint_restores_initial_target_below_floor() -> None:
+    """An inert controller can retain its validated pre-first-update target."""
+    config = _disabled_below_floor_config()
+    stored = ToadLightningModule(config)
+    stored.environment_steps = 320
+    checkpoint: dict[str, object] = {}
+    stored.on_save_checkpoint(checkpoint)
+    resumed = ToadLightningModule(config)
+
+    resumed.on_load_checkpoint(checkpoint)
+
+    assert config.optimizer.adaptive_entropy is False
+    assert {
+        name: (state.target, state.last_steps)
+        for name, state in resumed.entropy_state.items()
+    } == {
+        "operation": (0.1, 0),
+        "quantity": (0.2, 0),
+        "market": (0.3, 0),
+    }
+
+
+@pytest.mark.parametrize(("field", "value"), [("target", 0.4), ("last_steps", 1)])
+def test_disabled_checkpoint_rejects_advanced_target_below_floor(
+    field: str,
+    value: float | int,
+) -> None:
+    """The below-floor exception is exact and only precedes any controller step."""
+    config = _disabled_below_floor_config()
+    stored = ToadLightningModule(config)
+    stored.environment_steps = 320
+    checkpoint: dict[str, object] = {}
+    stored.on_save_checkpoint(checkpoint)
+    state = cast(dict[str, object], checkpoint["toad"])
+    entropy = cast(dict[str, object], state["entropy_state"])
+    operation = cast(dict[str, object], entropy["operation"])
+    operation[field] = value
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        ToadLightningModule(config).on_load_checkpoint(checkpoint)
+
+
 def test_invalid_checkpoint_restore_is_atomic() -> None:
     """A late validation failure cannot partially replace live module clocks."""
     config, checkpoint = _adaptive_entropy_checkpoint()

@@ -1132,8 +1132,16 @@ class ToadLightningModule(lightning.LightningModule):
                 target = _checkpoint_finite_float(payload["target"])
                 multiplier = _checkpoint_finite_float(payload["multiplier"])
                 last_steps = _checkpoint_nonnegative_int(payload["last_steps"])
+                is_disabled_initial_target = (
+                    not self.config.optimizer.adaptive_entropy
+                    and last_steps == 0
+                    and target == controller.initial_target
+                )
                 if (
-                    target < controller.target_floor
+                    (
+                        target < controller.target_floor
+                        and not is_disabled_initial_target
+                    )
                     or not controller.minimum <= multiplier <= controller.maximum
                     or last_steps > environment_steps
                     or (
