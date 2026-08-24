@@ -61,6 +61,7 @@ from kaggriculture.learn.toad.callbacks import (
     ActorSyncCallback,
     BoundaryCheckpoint,
     EnvironmentStepStop,
+    PopulationSnapshotCallback,
 )
 from kaggriculture.learn.toad.config import ModelConfig, ToadConfig, load_config
 from kaggriculture.learn.toad.data import (
@@ -670,6 +671,7 @@ def build_trainer(config: ToadConfig) -> lightning.Trainer:
         callbacks=[
             ActorSyncCallback(config.population.actor_sync_every_rounds),
             EnvironmentStepStop(config.runtime.total_environment_steps),
+            PopulationSnapshotCallback(),
             BoundaryCheckpoint(config.runtime.output_dir),
         ],
         logger=build_wandb_logger(config),

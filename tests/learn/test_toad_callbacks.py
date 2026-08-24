@@ -11,8 +11,11 @@ from kaggriculture.learn.toad.callbacks import (
     ActorSyncCallback,
     BoundaryCheckpoint,
     EnvironmentStepStop,
+    PopulationSnapshotCallback,
 )
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.config import ToadConfig, structural_fingerprint
+from kaggriculture.learn.toad.lightning import ToadLightningModule
+from kaggriculture.learn.toad.population import SnapshotManifest, SnapshotStore
 
 
 class _DataModule:
@@ -20,9 +23,13 @@ class _DataModule:
 
     def __init__(self) -> None:
         self.published: list[tuple[dict[str, torch.Tensor], int]] = []
+        self.manifests: list[SnapshotManifest] = []
 
     def publish_actor(self, state_dict: dict[str, torch.Tensor], version: int) -> None:
         self.published.append((dict(state_dict), version))
+
+    def publish_manifest(self, manifest: SnapshotManifest) -> None:
+        self.manifests.append(manifest)
 
 
 class _Trainer:
@@ -233,3 +240,138 @@ def test_boundary_checkpoint_resume_waits_for_the_next_global_threshold(
         1,
     )
     assert (tmp_path / "step-205.ckpt").is_file()
+
+
+def test_population_snapshot_is_boundary_only_and_resume_stable(
+    tmp_path: Path,
+) -> None:
+    """A crossed cadence publishes once and resume schedules strictly ahead."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"snapshot_every_environment_steps": 100}
+            ),
+            "runtime": base.runtime.model_copy(update={"output_dir": tmp_path}),
+        }
+    )
+    module = ToadLightningModule(config)
+    data = _DataModule()
+    trainer = _Trainer(data)
+    callback = PopulationSnapshotCallback()
+    callback.on_fit_start(
+        _lightning_trainer(trainer), cast(lightning.LightningModule, module)
+    )
+
+    module.environment_steps = 100
+    callback.on_train_batch_end(
+        _lightning_trainer(trainer),
+        cast(lightning.LightningModule, module),
+        None,
+        _batch(end_of_round=False),
+        0,
+    )
+    assert not list((tmp_path / "population").glob("snapshot-*.pt"))
+
+    callback.on_train_batch_end(
+        _lightning_trainer(trainer),
+        cast(lightning.LightningModule, module),
+        None,
+        _batch(end_of_round=True),
+        1,
+    )
+    snapshots = list((tmp_path / "population").glob("snapshot-*.pt"))
+    assert len(snapshots) == 1
+    assert data.manifests[-1] == module.population_manifest
+
+    checkpoint: dict[str, object] = {}
+    module.on_save_checkpoint(checkpoint)
+    stored = cast(dict[str, object], checkpoint["toad"])
+    assert stored["population_manifest"] == module.population_manifest.model_dump(
+        mode="json"
+    )
+
+    resumed = ToadLightningModule(config)
+    resumed.on_load_checkpoint(checkpoint)
+    resumed_data = _DataModule()
+    resumed_trainer = _Trainer(resumed_data)
+    resumed_callback = PopulationSnapshotCallback()
+    resumed_callback.on_fit_start(
+        _lightning_trainer(resumed_trainer),
+        cast(lightning.LightningModule, resumed),
+    )
+    resumed.environment_steps = 205
+    resumed_callback.on_train_batch_end(
+        _lightning_trainer(resumed_trainer),
+        cast(lightning.LightningModule, resumed),
+        None,
+        _batch(end_of_round=True),
+        2,
+    )
+
+    assert len(list((tmp_path / "population").glob("snapshot-*.pt"))) == 2
+    assert resumed.population_manifest.entries[-1].environment_steps == 205
+
+
+def test_population_snapshot_at_start_is_published_before_collection(
+    tmp_path: Path,
+) -> None:
+    """A configured bootstrap snapshot must be selectable in the first round."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"snapshot_at_start": True}
+            ),
+            "runtime": base.runtime.model_copy(update={"output_dir": tmp_path}),
+        }
+    )
+    module = ToadLightningModule(config)
+    data = _DataModule()
+    trainer = _Trainer(data)
+
+    PopulationSnapshotCallback().on_fit_start(
+        _lightning_trainer(trainer), cast(lightning.LightningModule, module)
+    )
+
+    assert len(module.population_manifest.entries) == 1
+    assert data.manifests == [module.population_manifest]
+
+
+def test_collection_bootstrap_manifest_is_captured_at_first_boundary(
+    tmp_path: Path,
+) -> None:
+    """Initial snapshots materialized by collection must enter the checkpoint."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={"runtime": base.runtime.model_copy(update={"output_dir": tmp_path})}
+    )
+    module = ToadLightningModule(config)
+    data = _DataModule()
+    trainer = _Trainer(data)
+    callback = PopulationSnapshotCallback()
+    callback.on_fit_start(
+        _lightning_trainer(trainer), cast(lightning.LightningModule, module)
+    )
+    store = SnapshotStore(
+        tmp_path / "population",
+        capacity=config.population.pool_capacity,
+        structure=structural_fingerprint(config),
+    )
+    store.add(
+        module.policy.state_dict(),
+        environment_steps=0,
+        round_id=0,
+        run_id="initial",
+    )
+
+    callback.on_train_batch_end(
+        _lightning_trainer(trainer),
+        cast(lightning.LightningModule, module),
+        None,
+        _batch(end_of_round=True),
+        0,
+    )
+
+    assert module.population_manifest == store.manifest
+    assert data.manifests[-1] == store.manifest

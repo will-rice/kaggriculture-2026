@@ -14,6 +14,7 @@ from kaggriculture.learn.toad.callbacks import (
     ActorSyncCallback,
     BoundaryCheckpoint,
     EnvironmentStepStop,
+    PopulationSnapshotCallback,
 )
 from kaggriculture.learn.toad.config import ToadConfig
 from kaggriculture.learn.toad.lightning import compute_loss
@@ -224,12 +225,15 @@ def test_build_trainer_uses_environment_budget_and_boundary_callbacks(
     assert [type(callback) for callback in callbacks] == [
         ActorSyncCallback,
         EnvironmentStepStop,
+        PopulationSnapshotCallback,
         BoundaryCheckpoint,
     ]
     stop = callbacks[1]
-    checkpoint = callbacks[2]
+    snapshot = callbacks[2]
+    checkpoint = callbacks[3]
     assert isinstance(stop, EnvironmentStepStop)
     assert stop.total_environment_steps == 321
+    assert isinstance(snapshot, PopulationSnapshotCallback)
     assert isinstance(checkpoint, BoundaryCheckpoint)
     assert checkpoint.output_dir == tmp_path
 

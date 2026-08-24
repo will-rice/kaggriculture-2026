@@ -567,7 +567,9 @@ def test_frozen_opponent_training_step_logs_all_population_kinds(
     """A frozen-only fresh batch cannot index a two-kind metrics table."""
     module = ToadLightningModule(control_fixture_config())
     records: list[dict[str, object]] = []
-    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
     batch = control_fixture_batch(load_control_fixture())
     frozen = replace(
         batch,
@@ -627,7 +629,9 @@ def test_teacher_distill_training_step_logs_all_population_kinds(
     )
     module = ToadLightningModule(config)
     records: list[dict[str, object]] = []
-    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
     batch = control_fixture_batch(load_control_fixture())
     distill = replace(
         batch,

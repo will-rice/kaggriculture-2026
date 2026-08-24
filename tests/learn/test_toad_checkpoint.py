@@ -206,6 +206,7 @@ def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> N
             }
             for name, controller in module.config.optimizer.entropy.items()
         },
+        "population_manifest": {"entries": []},
         "teacher": {"present": False},
     }
 

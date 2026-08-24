@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from kaggriculture.learn.toad.population import (
     EmptySnapshotPoolError,
     SnapshotEntry,
     SnapshotIntegrityError,
+    SnapshotManifest,
     SnapshotPool,
     SnapshotPoolIdentity,
     SnapshotStore,
@@ -939,7 +941,9 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             )
         if not assignments:
             return
+        collection_started = time.perf_counter()
         collected = self._collect_round(assignments)
+        collection_seconds = time.perf_counter() - collection_started
         ordered = sorted(
             collected,
             key=lambda entry: _ONLINE_KINDS.index(entry[0].kind),
@@ -1013,6 +1017,51 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         ]
         from kaggriculture.learn.scripts.toad import _collection_metrics
 
+        collection_metrics = _collection_metrics(
+            mirror, opponents, self.config.curriculum.reward_field
+        )
+        collection_metrics["throughput/collection_seconds"] = collection_seconds
+        for kind in _ONLINE_KINDS:
+            kind_rows = [
+                trajectory
+                for assignment, assigned in ordered
+                if assignment.kind is kind
+                for trajectory in assigned
+            ]
+            collection_metrics[f"collection/games/{kind.value}"] = len(kind_rows)
+            collection_metrics[f"collection/return/{kind.value}"] = (
+                float(
+                    torch.stack(
+                        [
+                            getattr(trajectory, self.config.curriculum.reward_field)
+                            .float()
+                            .sum()
+                            for trajectory in kind_rows
+                        ]
+                    ).mean()
+                )
+                if kind_rows
+                else float("nan")
+            )
+        opponent_groups: dict[str, list[Trajectory]] = {}
+        for assignment, assigned in ordered:
+            opponent_groups.setdefault(assignment.opponent_id, []).extend(assigned)
+        for opponent_id, opponent_rows in opponent_groups.items():
+            safe_id = opponent_id.replace("/", "_")
+            collection_metrics[f"collection/games_by_opponent/{safe_id}"] = len(
+                opponent_rows
+            )
+            collection_metrics[f"collection/return_by_opponent/{safe_id}"] = float(
+                torch.stack(
+                    [
+                        getattr(trajectory, self.config.curriculum.reward_field)
+                        .float()
+                        .sum()
+                        for trajectory in opponent_rows
+                    ]
+                ).mean()
+            )
+
         batches = tuple(
             expander.expand(
                 trajectories,
@@ -1020,9 +1069,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 trajectory_kinds=trajectory_kinds,
                 trajectory_assignments=trajectory_assignments,
                 kind_metas=kind_metas,
-                round_metrics=_collection_metrics(
-                    mirror, opponents, self.config.curriculum.reward_field
-                ),
+                round_metrics=collection_metrics,
             )
         )
         if not batches:
@@ -1069,6 +1116,23 @@ class ToadDataModule(lightning.LightningDataModule):
             },
             version,
         )
+
+    def publish_manifest(self, manifest: SnapshotManifest) -> None:
+        """Bind collection to the callback's exact durable population view."""
+        store = SnapshotStore(
+            self.config.runtime.output_dir / "population",
+            capacity=self.config.population.pool_capacity,
+            structure=structural_fingerprint(self.config),
+        )
+        if store.manifest != manifest:
+            raise SnapshotIntegrityError(
+                "published population manifest does not match durable store"
+            )
+        pool = SnapshotPool.from_store(
+            store,
+            seed=self.config.population.population_seed,
+        )
+        self.source.pool = pool
 
     def train_dataloader(self) -> DataLoader[LearnerBatch]:
         """Return the intentionally single-process iterable loader."""

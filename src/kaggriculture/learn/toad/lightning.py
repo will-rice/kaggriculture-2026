@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import time
+from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -37,7 +39,11 @@ from kaggriculture.learn.toad.model import (
     StatefulPolicy,
     uses_stateful_policy,
 )
-from kaggriculture.learn.toad.population import LoadedTeacher, load_teacher
+from kaggriculture.learn.toad.population import (
+    LoadedTeacher,
+    SnapshotManifest,
+    load_teacher,
+)
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
@@ -343,6 +349,172 @@ _ONLINE_BATCH_KINDS = (
 def _empty_population_counts() -> dict[str, int]:
     """Return the stable online-kind metric schema for one logical round."""
     return {kind.value: 0 for kind in _ONLINE_BATCH_KINDS}
+
+
+class RoundMetricAccumulator:
+    """Accumulate detached diagnostics and emit one completed-round record."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, initial: Mapping[str, float | int] | None = None) -> None:
+        """Begin an empty round while preserving collection-owned metrics."""
+        self.initial = dict(initial or {})
+        self.collected_steps = 0
+        self.learner_seconds = 0.0
+        self.learner_batches = 0
+        self.games: dict[str, set[int]] = {
+            kind.value: set() for kind in _ONLINE_BATCH_KINDS
+        }
+        self.opponents: dict[str, set[tuple[int, str, str | None]]] = defaultdict(set)
+        self.losses: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self.mask_sums: dict[str, torch.Tensor] = {}
+        self.mask_counts: dict[str, torch.Tensor] = {}
+        self.state_norms: dict[str, list[torch.Tensor]] = {
+            "hidden": [],
+            "cell": [],
+        }
+        self.terminal_resets: list[torch.Tensor] = []
+
+    def update(
+        self,
+        batch: LearnerBatch,
+        report: LossReport,
+        *,
+        learner_seconds: float,
+    ) -> None:
+        """Add one trained batch without performing distributed logging."""
+        self.collected_steps += batch.collected_steps
+        self.learner_seconds += learner_seconds
+        self.learner_batches += 1
+        if not batch.baseline_only:
+            kind_name = batch.kind.value
+            self.losses[f"loss/by_kind/{kind_name}"].append(
+                report.total.detach().float()
+            )
+            self._record_selections(batch)
+            for opponent_id in set(batch.segment_opponent_ids or batch.opponent_ids):
+                safe_id = opponent_id.replace("/", "_")
+                self.losses[f"loss/by_opponent/{safe_id}"].append(
+                    report.total.detach().float()
+                )
+            self._record_masks(batch)
+            self._record_state(batch)
+
+    def _record_selections(self, batch: LearnerBatch) -> None:
+        """Count each collected game once despite its repeated learner segments."""
+        segment_row_count = len(batch.segment_game_ids)
+        if segment_row_count and all(
+            len(values) == segment_row_count
+            for values in (
+                batch.segment_kinds,
+                batch.segment_opponent_ids,
+                batch.segment_opponent_digests,
+            )
+        ):
+            rows = zip(
+                batch.segment_game_ids,
+                batch.segment_kinds,
+                batch.segment_opponent_ids,
+                batch.segment_opponent_digests,
+                strict=True,
+            )
+        else:
+            rows = (
+                (game_id, batch.kind, opponent_id, digest)
+                for game_id, opponent_id, digest in zip(
+                    batch.game_ids,
+                    batch.opponent_ids,
+                    batch.opponent_digests or (None,) * len(batch.game_ids),
+                    strict=True,
+                )
+            )
+        for game_id, kind, opponent_id, digest in rows:
+            if kind is BatchKind.MIXED:
+                continue
+            self.games[kind.value].add(game_id)
+            self.opponents[opponent_id].add((game_id, kind.value, digest))
+
+    def _record_masks(self, batch: LearnerBatch) -> None:
+        """Accumulate legal-action density only across valid decision slots."""
+        for segment in batch.segments:
+            unit_valid = segment["unit_valid"].bool()
+            quantity_valid = transfer_slots(segment["unit_actions"]) & unit_valid
+            masks = {
+                "operation": (segment["unit_masks"], unit_valid),
+                "quantity": (segment["unit_quantity_masks"], quantity_valid),
+                "market": (
+                    segment["market_masks"],
+                    torch.ones_like(segment["market_masks"][..., 0], dtype=torch.bool),
+                ),
+            }
+            for name, (mask, valid) in masks.items():
+                selected = mask[valid]
+                mask_sum = selected.detach().float().sum()
+                mask_count = torch.tensor(
+                    selected.numel(), dtype=torch.int64, device=mask.device
+                )
+                self.mask_sums[name] = (
+                    self.mask_sums.get(name, mask_sum.new_zeros(())) + mask_sum
+                )
+                self.mask_counts[name] = (
+                    self.mask_counts.get(name, mask_count.new_zeros(())) + mask_count
+                )
+
+    def _record_state(self, batch: LearnerBatch) -> None:
+        """Capture recurrent boundary magnitudes and actual terminal resets."""
+        for segment in batch.segments:
+            for name, field in (("hidden", "initial_hidden"), ("cell", "initial_cell")):
+                state = segment.get(field)
+                if state is not None:
+                    self.state_norms[name].append(state.detach().float().norm())
+            self.terminal_resets.append(segment["dones"].detach().to(torch.int64).sum())
+
+    def compute(self) -> dict[str, torch.Tensor | float | int]:
+        """Return the stable metric schema for the current completed round."""
+        record: dict[str, torch.Tensor | float | int] = dict(self.initial)
+        collection_seconds = float(
+            self.initial.get("throughput/collection_seconds", float("nan"))
+        )
+        record["throughput/collection_seconds"] = collection_seconds
+        record["throughput/collection_wait_seconds"] = collection_seconds
+        record["throughput/collection_steps_per_second"] = (
+            self.collected_steps / collection_seconds
+            if math.isfinite(collection_seconds) and collection_seconds > 0
+            else float("nan")
+        )
+        record["throughput/learner_seconds"] = self.learner_seconds
+        record["throughput/learner_steps_per_second"] = (
+            self.collected_steps / self.learner_seconds
+            if self.learner_seconds > 0
+            else float("nan")
+        )
+        record["throughput/learner_batches"] = self.learner_batches
+        for kind in _ONLINE_BATCH_KINDS:
+            count = len(self.games[kind.value])
+            record[f"collection/games/{kind.value}"] = count
+            record[f"population/selections/{kind.value}"] = count
+        for opponent_id, selections in self.opponents.items():
+            safe_id = opponent_id.replace("/", "_")
+            record[f"population/opponent/{safe_id}"] = len(selections)
+        for name, values in self.losses.items():
+            record[name] = torch.stack(values).mean()
+        for name in ("operation", "quantity", "market"):
+            mask_sum = self.mask_sums.get(name)
+            mask_count = self.mask_counts.get(name)
+            if mask_sum is None or mask_count is None or not bool(mask_count > 0):
+                record[f"mask/{name}_density"] = float("nan")
+            else:
+                record[f"mask/{name}_density"] = mask_sum / mask_count.float()
+        for name in ("hidden", "cell"):
+            values = self.state_norms[name]
+            record[f"state/{name}_norm"] = torch.stack(values).mean() if values else 0.0
+        record["state/terminal_resets"] = (
+            torch.stack(self.terminal_resets).sum().float()
+            if self.terminal_resets
+            else 0.0
+        )
+        return record
 
 
 @dataclass(frozen=True)
@@ -851,6 +1023,7 @@ class ToadLightningModule(lightning.LightningModule):
         self.collection_round = 0
         self.actor_version = 0
         self.actor_source_global_step = 0
+        self.population_manifest = SnapshotManifest()
         self.warmup_remaining = config.optimizer.value_warmup_batches
         self.entropy_state = {
             name: EntropyControllerState(
@@ -867,6 +1040,7 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_baselines: list[torch.Tensor] = []
         self._round_metrics: dict[str, float | int] = {}
         self._round_population = _empty_population_counts()
+        self.round_metrics = RoundMetricAccumulator()
         self.save_hyperparameters(self.config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
@@ -900,7 +1074,9 @@ class ToadLightningModule(lightning.LightningModule):
             self._round_baselines = []
             self._round_metrics = dict(batch.round_metrics)
             self._round_population = _empty_population_counts()
+            self.round_metrics.reset(batch.round_metrics)
         baseline_only = batch.baseline_only or self.warmup_remaining > 0
+        learner_started = time.perf_counter()
         report = compute_loss(
             self.policy,
             batch,
@@ -908,6 +1084,11 @@ class ToadLightningModule(lightning.LightningModule):
             teacher=self.teacher,
             baseline_only=baseline_only,
             entropy_state=self.entropy_state,
+        )
+        self.round_metrics.update(
+            batch,
+            report,
+            learner_seconds=time.perf_counter() - learner_started,
         )
         self._round_ended = batch.end_of_round
         self._round_baselines.append(report.terms["baseline"].detach())
@@ -941,9 +1122,19 @@ class ToadLightningModule(lightning.LightningModule):
             self.collection_round += 1
         if batch.end_of_round:
             self._update_entropy_controllers()
-            self.log_dict(self._round_log_record())
+            self.flush_round_metrics()
             self._round_fresh_entropy = []
         return report.total
+
+    def flush_round_metrics(self) -> None:
+        """Log and clear the sole completed-round accumulator without DDP sync."""
+        self.log_dict(
+            self._round_log_record(),
+            on_step=True,
+            on_epoch=False,
+            sync_dist=False,
+        )
+        self.round_metrics.reset()
 
     def _aggregate_round_entropy(self, name: str) -> EntropyStat:
         """Reduce detached fresh-batch statistics for one completed round."""
@@ -987,6 +1178,7 @@ class ToadLightningModule(lightning.LightningModule):
             lr = float(self.config.optimizer.lr)
         baseline_passes = torch.stack(self._round_baselines).mean()
         record: dict[str, torch.Tensor | int | float] = {
+            **self.round_metrics.compute(),
             **self._round_metrics,
             "diag/update": self.collection_round,
             "diag/steps": self.environment_steps,
@@ -1028,6 +1220,13 @@ class ToadLightningModule(lightning.LightningModule):
             "belief/carried_error": mean_term("belief_carried"),
             "belief/valid_count": mean_term("belief_valid"),
             "diag/total_loss": mean_term("total"),
+            "belief/loss": mean_term("belief"),
+            "progress/environment_steps": float(self.environment_steps),
+            "progress/optimizer_steps": float(optimizer_steps),
+            "actor/version": float(self.actor_version),
+            "actor/lag_optimizer_steps": float(
+                optimizer_steps - self.actor_source_global_step
+            ),
         }
         for name in ("operation", "quantity", "market"):
             stat = self._aggregate_round_entropy(name)
@@ -1092,6 +1291,7 @@ class ToadLightningModule(lightning.LightningModule):
                 }
                 for name, state in self.entropy_state.items()
             },
+            "population_manifest": self.population_manifest.model_dump(mode="json"),
             "teacher": self._teacher_metadata(),
         }
 
@@ -1120,6 +1320,9 @@ class ToadLightningModule(lightning.LightningModule):
                 state["actor_source_global_step"]
             )
             warmup_remaining = _checkpoint_nonnegative_int(state["warmup_remaining"])
+            population_manifest = SnapshotManifest.model_validate(
+                state.get("population_manifest", {})
+            )
             stored_entropy = _checkpoint_mapping(state["entropy_state"])
             if set(stored_entropy) != _ENTROPY_HEADS:
                 raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
@@ -1165,4 +1368,5 @@ class ToadLightningModule(lightning.LightningModule):
         self.actor_version = actor_version
         self.actor_source_global_step = actor_source_global_step
         self.warmup_remaining = warmup_remaining
+        self.population_manifest = population_manifest
         self.entropy_state = restored_entropy

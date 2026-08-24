@@ -9,8 +9,13 @@ from typing import cast
 import lightning
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 
+from kaggriculture.learn.toad.config import structural_fingerprint
 from kaggriculture.learn.toad.data import LearnerBatch, ToadDataModule
 from kaggriculture.learn.toad.lightning import ToadLightningModule
+from kaggriculture.learn.toad.population import (
+    SnapshotIntegrityError,
+    SnapshotStore,
+)
 
 
 def _data_module(trainer: lightning.Trainer) -> ToadDataModule:
@@ -84,6 +89,101 @@ class EnvironmentStepStop(lightning.Callback):
             and module.environment_steps >= self.total_environment_steps
         ):
             trainer.should_stop = True
+
+
+class PopulationSnapshotCallback(lightning.Callback):
+    """Publish verified policy snapshots only at completed round boundaries."""
+
+    def __init__(self) -> None:
+        self.store: SnapshotStore | None = None
+        self.next_snapshot_steps: int | None = None
+
+    def on_fit_start(
+        self,
+        trainer: lightning.Trainer,
+        pl_module: lightning.LightningModule,
+    ) -> None:
+        """Open the durable pool and schedule strictly after restored progress."""
+        module = cast(ToadLightningModule, pl_module)
+        population = module.config.population
+        self._reopen_store(module)
+        assert self.store is not None
+        if population.snapshot_at_start and not self.store.manifest.entries:
+            self._add_snapshot(module)
+        self._publish(trainer, module)
+        interval = population.snapshot_every_environment_steps
+        self.next_snapshot_steps = (
+            None
+            if interval is None
+            else (module.environment_steps // interval + 1) * interval
+        )
+
+    def on_train_batch_end(
+        self,
+        trainer: lightning.Trainer,
+        pl_module: lightning.LightningModule,
+        outputs: STEP_OUTPUT,
+        batch: object,
+        batch_idx: int,
+    ) -> None:
+        """Write at most one snapshot when a completed round crosses cadence."""
+        module = cast(ToadLightningModule, pl_module)
+        learner_batch = cast(LearnerBatch, batch)
+        if not learner_batch.end_of_round:
+            return
+        self._reopen_store(module)
+        interval = module.config.population.snapshot_every_environment_steps
+        if interval is None:
+            self._publish(trainer, module)
+            return
+        if (
+            self.next_snapshot_steps is None
+            or module.environment_steps < self.next_snapshot_steps
+        ):
+            self._publish(trainer, module)
+            return
+        self._add_snapshot(module)
+        self._publish(trainer, module)
+        self.next_snapshot_steps = (module.environment_steps // interval + 1) * interval
+
+    def _reopen_store(self, module: ToadLightningModule) -> None:
+        """Refresh collection-created bootstrap entries without accepting drift."""
+        store = SnapshotStore(
+            module.config.runtime.output_dir / "population",
+            capacity=module.config.population.pool_capacity,
+            structure=structural_fingerprint(module.config),
+        )
+        if (
+            module.population_manifest.entries
+            and module.population_manifest != store.manifest
+        ):
+            raise SnapshotIntegrityError(
+                "checkpoint population manifest does not match durable store"
+            )
+        self.store = store
+
+    def _add_snapshot(self, module: ToadLightningModule) -> None:
+        """Add the current policy to the opened verified store."""
+        if self.store is None:
+            raise RuntimeError("population snapshot store is not initialized")
+        self.store.add(
+            module.policy.state_dict(),
+            environment_steps=module.environment_steps,
+            round_id=module.collection_round,
+            run_id=module.config.curriculum.phase,
+        )
+        module.population_manifest = self.store.manifest
+
+    def _publish(self, trainer: lightning.Trainer, module: ToadLightningModule) -> None:
+        """Publish the durable manifest before later boundary callbacks run."""
+        if self.store is None:
+            raise RuntimeError("population snapshot store is not initialized")
+        module.population_manifest = self.store.manifest
+        data = _data_module(trainer)
+        publish_manifest = getattr(data, "publish_manifest", None)
+        if publish_manifest is None:
+            raise RuntimeError("ToadDataModule does not support population manifests")
+        publish_manifest(self.store.manifest)
 
 
 class BoundaryCheckpoint(lightning.Callback):

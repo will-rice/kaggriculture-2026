@@ -427,7 +427,9 @@ def test_training_step_updates_once_after_value_replay_from_fresh_entropy(
         cast(dict[str, torch.Tensor], fixture["initial_model"])
     )
     records: list[dict[str, object]] = []
-    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
     batch = control_fixture_batch(fixture)
     fresh = replace(batch, end_of_round=False)
     replay = replace(
@@ -479,7 +481,9 @@ def test_warmup_still_observes_each_fresh_distribution(
         cast(dict[str, torch.Tensor], fixture["initial_model"])
     )
     records: list[dict[str, object]] = []
-    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
     batch = control_fixture_batch(fixture)
 
     total = module.training_step(batch, 0)
@@ -519,7 +523,7 @@ def test_completed_round_controller_applies_to_the_next_loss(
     module.policy.load_state_dict(
         cast(dict[str, torch.Tensor], fixture["initial_model"])
     )
-    monkeypatch.setattr(module, "log_dict", lambda _record: None)
+    monkeypatch.setattr(module, "log_dict", lambda _record, **_: None)
     batch = control_fixture_batch(fixture)
 
     first = module.training_step(batch, 0)
@@ -549,7 +553,9 @@ def test_zero_valid_quantity_advances_target_without_changing_multiplier(
         cast(dict[str, torch.Tensor], fixture["initial_model"])
     )
     records: list[dict[str, object]] = []
-    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
     batch = control_fixture_batch(fixture)
     no_transfers = replace(
         batch,
