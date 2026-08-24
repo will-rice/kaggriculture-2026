@@ -299,6 +299,10 @@ class CollectionError(RuntimeError):
     """Collection failed while retaining the exact assigned game provenance."""
 
 
+class PopulationResumeMigrationError(RuntimeError):
+    """A legacy checkpoint cannot identify its required durable population."""
+
+
 def _checkpoint_policy_state(path: Path) -> dict[str, torch.Tensor]:
     """Extract exact policy tensors from a bare, legacy, or Lightning checkpoint."""
     loaded = torch.load(path, map_location="cpu", weights_only=True)
@@ -617,7 +621,14 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         self.config = config
         self._assignments = tuple(assignments) if assignments is not None else None
         self._collector = collect_assignment
-        self.pool = pool
+        self.pool = (
+            pool.rebind(
+                structure=structural_fingerprint(config),
+                seed=config.population.population_seed,
+            )
+            if pool is not None
+            else None
+        )
         self.teacher = teacher
         self.actor_state: dict[str, torch.Tensor] = {}
         self.actor_version = 0
@@ -1051,6 +1062,19 @@ class ToadDataModule(lightning.LightningDataModule):
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
         """Restore the collector stream without retaining stale actor weights."""
+        population = self.config.population
+        durable_pool_required = bool(
+            population.frozen_opponent
+            or population.initial_snapshots
+            or population.snapshot_at_start
+            or population.snapshot_every_environment_steps is not None
+            or (self.source.pool is not None and self.source.pool.manifest.entries)
+        )
+        if "population_pool" not in state_dict and durable_pool_required:
+            raise PopulationResumeMigrationError(
+                "checkpoint is missing population_pool identity for active frozen "
+                "population; checkpoint migration is required"
+            )
         next_game_id = cast(int, state_dict["next_game_id"])
         next_round_id = cast(
             int,

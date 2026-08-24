@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
@@ -236,21 +237,17 @@ def test_supplied_pool_semantic_structure_mismatch_fails_before_sampling(
         return real_sample(game_id)
 
     monkeypatch.setattr(pool, "sample", sample)
-    source = ReferenceRoundSource(
-        config,
-        pool=pool,
-        collect_assignment=lambda assignment: (
-            collected.append(assignment.game_id) or (_trajectory(64),)
-        ),
-    )
-
     with pytest.raises(SnapshotIntegrityError, match="structure.*config"):
-        list(source)
+        ReferenceRoundSource(
+            config,
+            pool=pool,
+            collect_assignment=lambda assignment: (
+                collected.append(assignment.game_id) or (_trajectory(64),)
+            ),
+        )
 
     assert sampled == []
     assert collected == []
-    assert source.next_game_id == 0
-    assert source._next_round_id == 0
     assert manifest_path.read_bytes() == manifest_before
 
 
@@ -694,6 +691,136 @@ def test_snapshot_bootstrap_resume_reopens_exact_pool_without_republication(
     assert manifest_path.read_bytes() == manifest_before
     assert resumed_source.pool is not None
     assert len(resumed_source.pool.manifest.entries) == 1
+
+
+@pytest.mark.parametrize("bootstrap", ["snapshot_at_start", "initial_snapshot"])
+def test_legacy_frozen_resume_requires_population_identity_before_mutation(
+    tmp_path: Path, bootstrap: str
+) -> None:
+    """A legacy payload cannot guess which durable bootstrap manifest it owned."""
+    actor = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    initial = tmp_path / "initial.pt"
+    torch.save(actor.state_dict(), initial)
+    bootstrap_config = (
+        {"snapshot_at_start": True}
+        if bootstrap == "snapshot_at_start"
+        else {"initial_snapshots": [initial]}
+    )
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 1,
+                "pool_capacity": 2,
+                **bootstrap_config,
+            },
+            "runtime": {"output_dir": tmp_path / "run"},
+        }
+    )
+    original_source = ReferenceRoundSource(config, assignments=())
+    original = ToadDataModule(config, original_source)
+    original.publish_actor(actor.state_dict(), version=4)
+    original_source._ensure_initial_pool()
+    legacy_state = original.state_dict()
+    legacy_state.pop("population_pool")
+    manifest_path = tmp_path / "run" / "population" / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    directory_before = {
+        path: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in (tmp_path / "run" / "population").iterdir()
+    }
+
+    resumed_source = ReferenceRoundSource(config, assignments=())
+    resumed_source.next_game_id = 73
+    resumed_source._next_round_id = 9
+    resumed_source.actor_version = 11
+    resumed = ToadDataModule(config, resumed_source)
+
+    with pytest.raises(RuntimeError, match="population_pool.*migration.*required"):
+        resumed.load_state_dict(legacy_state)
+
+    assert resumed_source.next_game_id == 73
+    assert resumed_source._next_round_id == 9
+    assert resumed_source.actor_version == 11
+    assert resumed_source.pool is None
+    assert manifest_path.read_bytes() == manifest_before
+    assert {
+        path: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in (tmp_path / "run" / "population").iterdir()
+    } == directory_before
+
+
+def test_legacy_control_resume_without_population_identity_remains_compatible() -> None:
+    """Pool-free control checkpoints retain their historical state seam."""
+    config = ToadConfig.control()
+    source = ReferenceRoundSource(config, assignments=())
+    data = ToadDataModule(config, source)
+    source.next_game_id = 41
+    source._next_round_id = 3
+    source.actor_version = 6
+    state = data.state_dict()
+    state.pop("population_pool")
+
+    resumed_source = ReferenceRoundSource(config, assignments=())
+    ToadDataModule(config, resumed_source).load_state_dict(state)
+
+    assert resumed_source.next_game_id == 41
+    assert resumed_source._next_round_id == 3
+    assert resumed_source.actor_version == 6
+    assert resumed_source.pool is None
+
+
+def test_external_pool_seed_is_normalized_before_precollection_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Checkpoint identity never persists a supplied pool's construction seed."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 4,
+                "population_seed": 29,
+                "pool_capacity": 2,
+            },
+        }
+    )
+    actor = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=2,
+        structure=structural_fingerprint(config),
+    )
+    for index in range(2):
+        state = {name: value.clone() for name, value in actor.state_dict().items()}
+        next(iter(state.values())).view(-1)[0] = index
+        store.add(
+            state,
+            environment_steps=index,
+            round_id=0,
+            run_id=f"run-{index}",
+        )
+    external = SnapshotPool.from_store(store, seed=999)
+    source = ReferenceRoundSource(config, assignments=(), pool=external)
+    data = ToadDataModule(config, source)
+
+    checkpoint = data.state_dict()
+    identity = cast(dict[str, object], checkpoint["population_pool"])
+    assert identity["seed"] == config.population.population_seed
+
+    resumed_source = ReferenceRoundSource(config, assignments=())
+    ToadDataModule(config, resumed_source).load_state_dict(checkpoint)
+    assert source.pool is not None
+    assert resumed_source.pool is not None
+    assert source.pool.identity() == resumed_source.pool.identity()
+    assert allocate_round(config, 80, 7, source.pool) == allocate_round(
+        config, 80, 7, resumed_source.pool
+    )
 
 
 def test_inconsistent_same_digest_binding_fails_before_materialization(
