@@ -11,7 +11,8 @@ import hashlib
 import itertools
 import pathlib
 import random
-from typing import cast
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
 import lightning
 import pytest
@@ -19,7 +20,7 @@ import torch
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.rollout import Trajectory
+from kaggriculture.learn.rollout import Trajectory, Turn
 from kaggriculture.learn.scripts import critic_ev, evaluate, gate, toad
 from kaggriculture.learn.toad.callbacks import ActorSyncCallback, BoundaryCheckpoint
 from kaggriculture.learn.toad.config import (
@@ -36,12 +37,13 @@ from kaggriculture.learn.toad.data import (
 )
 from kaggriculture.learn.toad.lightning import (
     EntropyControllerState,
+    PolicyLike,
     ResumeConfigError,
     ToadLightningModule,
     load_checkpoint_policy,
     policy_from_checkpoint,
 )
-from kaggriculture.learn.toad.model import StatefulPolicy
+from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
 from kaggriculture.learn.toad_loss import (
     MIN_LR_MOD,
     TOTAL_STEPS,
@@ -167,10 +169,27 @@ def test_evaluator_carries_recurrent_state_between_environment_turns(
     supplied_states: list[object] = []
     supplied_dones: list[object] = []
 
-    def recording_decide(*args: object, **kwargs: object) -> tuple[object, object]:
-        supplied_states.append(kwargs.get("states"))
-        supplied_dones.append(kwargs.get("dones"))
-        return decide(*args, **kwargs)
+    def recording_decide(
+        received_policy: PolicyLike,
+        requests: Sequence[tuple[Mapping[str, Any], int]],
+        generator: torch.Generator | Sequence[torch.Generator],
+        *,
+        states: Sequence[PolicyState | None] | None = None,
+        dones: Sequence[bool] | None = None,
+        belief_observations: Sequence[Mapping[str, Any]] | None = None,
+        record_states: Sequence[bool] | None = None,
+    ) -> tuple[list[Turn], list[PolicyState | None]]:
+        supplied_states.append(states)
+        supplied_dones.append(dones)
+        return decide(
+            received_policy,
+            requests,
+            generator,
+            states=states,
+            dones=dones,
+            belief_observations=belief_observations,
+            record_states=record_states,
+        )
 
     monkeypatch.setattr(evaluate, "EPISODE_STEPS", 3)
     monkeypatch.setattr(evaluate, "_decide", recording_decide)

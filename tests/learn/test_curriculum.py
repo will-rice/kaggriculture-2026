@@ -9,6 +9,7 @@ namespace read back at itself.
 """
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +26,7 @@ from kaggriculture.learn.toad.config import (
     RuntimeConfig,
     ToadConfig,
 )
-from kaggriculture.learn.toad.lightning import ToadLightningModule
+from kaggriculture.learn.toad.lightning import PolicyLike, ToadLightningModule
 
 # Transcribed independently of curriculum.PHASES, from the literal recipe
 # table -- so this file fails if the module's own transcription drifts, not
@@ -200,7 +201,9 @@ def test_failing_phase_gate_records_result_and_stops_production_path(
         )
 
     def fail_rollout(
-        policy: object, opponent: object, seeds: object
+        policy: PolicyLike,
+        opponent: PolicyLike | str,
+        seeds: Sequence[int],
     ) -> list[SimpleNamespace]:
         events.append("gate")
         assert opponent == toad.OPPONENT
