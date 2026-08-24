@@ -22,7 +22,7 @@ from pydantic import (
 )
 
 _EVALUATION = TypeAdapter(dict[str, FiniteFloat])
-_SNAPSHOT_NAME = re.compile(r"^snapshot-(\d{12})-([0-9a-f]{12})\.pt$")
+_SNAPSHOT_NAME = re.compile(r"^snapshot-(\d{12,})-([0-9a-f]{12})\.pt$")
 
 
 class SnapshotIntegrityError(RuntimeError):
@@ -206,10 +206,12 @@ class SnapshotPool:
         *,
         seed: int,
         structure: str | None = None,
+        store: SnapshotStore | None = None,
     ) -> None:
         self.manifest = manifest
         self.seed = seed
         self.structure = structure
+        self._store = store
 
     @classmethod
     def empty(cls, *, seed: int = 0, structure: str | None = None) -> SnapshotPool:
@@ -219,7 +221,12 @@ class SnapshotPool:
     @classmethod
     def from_store(cls, store: SnapshotStore, *, seed: int) -> SnapshotPool:
         """Bind deterministic sampling to a store's structural fingerprint."""
-        return cls(store.manifest, seed=seed, structure=store.structure)
+        return cls(
+            store.manifest,
+            seed=seed,
+            structure=store.structure,
+            store=store,
+        )
 
     def sample(self, game_id: int) -> SnapshotEntry:
         """Select one entry solely from the configured seed and global game ID."""
@@ -236,8 +243,12 @@ class SnapshotPool:
             raise SnapshotIntegrityError(
                 "snapshot pool has no structural fingerprint for validation"
             )
-        _verify_entry(entry, self.structure)
-        return _load_state_dict(entry)
+        if self._store is None:
+            raise SnapshotIntegrityError(
+                "snapshot pool has no store directory for path validation"
+            )
+        self._store._validate_existing_members()
+        return self._store.load(entry)
 
 
 def _verify_entry(entry: SnapshotEntry, expected_structure: str) -> None:

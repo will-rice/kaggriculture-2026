@@ -192,6 +192,87 @@ def test_nonfinite_evaluation_is_rejected_before_snapshot_mutation(
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize(
+    "kind",
+    ["absolute", "traversal", "nested", "wrong_steps", "wrong_digest"],
+)
+def test_pool_load_refuses_malformed_reloaded_manifest_members(
+    tmp_path: Path, kind: str
+) -> None:
+    """Pool sampling cannot turn a reloaded manifest path into a torch load."""
+    pool_directory = tmp_path / "pool"
+    pool_directory.mkdir()
+    source = tmp_path / "source.pt"
+    torch.save(state_dict(), source)
+    digest = sha256_file(source)
+    name = f"snapshot-000000000001-{digest[:12]}.pt"
+    if kind == "absolute":
+        candidate = tmp_path / "outside" / name
+    elif kind == "traversal":
+        candidate = pool_directory / ".." / "outside" / name
+    elif kind == "nested":
+        candidate = pool_directory / "nested" / name
+    elif kind == "wrong_steps":
+        candidate = pool_directory / f"snapshot-000000000002-{digest[:12]}.pt"
+    else:
+        wrong_prefix = "0" if digest[0] != "0" else "1"
+        candidate = pool_directory / (
+            f"snapshot-000000000001-{wrong_prefix}{digest[1:12]}.pt"
+        )
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(candidate)
+    entry = manifest_entry(candidate, digest=digest)
+    (pool_directory / "manifest.json").write_text(
+        SnapshotManifest(entries=(entry,)).model_dump_json()
+    )
+
+    reloaded = SnapshotStore(pool_directory, capacity=1, structure="model-v1")
+    pool = SnapshotPool.from_store(reloaded, seed=17)
+    selected = pool.sample(game_id=91)
+    with pytest.raises(SnapshotIntegrityError, match="manifest snapshot path"):
+        pool.load(selected)
+
+    assert candidate.is_file()
+
+
+def test_store_round_trips_and_revalidates_large_environment_step_names(
+    tmp_path: Path,
+) -> None:
+    """Nonnegative steps above twelve digits keep their exact canonical spelling."""
+    steps = 1_000_000_000_000
+    store = SnapshotStore(tmp_path, capacity=2, structure="model-v1")
+    entry = store.add(state_dict(), environment_steps=steps, round_id=0, run_id="run")
+    reloaded = SnapshotStore(tmp_path, capacity=2, structure="model-v1")
+
+    assert entry.path.name == f"snapshot-{steps:012d}-{entry.sha256[:12]}.pt"
+    loaded = reloaded.load(reloaded.manifest.entries[0])
+    assert torch.equal(loaded["weight"], torch.tensor([1.0]))
+    reloaded.add(state_dict(2.0), environment_steps=steps + 1, round_id=1, run_id="run")
+
+
+def test_store_rejects_an_alternate_large_step_filename_spelling(
+    tmp_path: Path,
+) -> None:
+    """Equivalent-looking leading-zero step spellings cannot name pool members."""
+    steps = 1_000_000_000_000
+    store = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
+    entry = store.add(state_dict(), environment_steps=steps, round_id=0, run_id="run")
+    alternate = entry.path.with_name(
+        f"snapshot-0{steps:012d}-{entry.sha256[:12]}.pt"
+    )
+    entry.path.rename(alternate)
+    malformed = entry.model_copy(update={"path": alternate})
+    (tmp_path / "manifest.json").write_text(
+        SnapshotManifest(entries=(malformed,)).model_dump_json()
+    )
+    reloaded = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
+
+    with pytest.raises(SnapshotIntegrityError, match="manifest snapshot path"):
+        reloaded.add(
+            state_dict(2.0), environment_steps=steps + 1, round_id=1, run_id="run"
+        )
+
+
 def test_population_sampling_is_deterministic_by_game_id(tmp_path: Path) -> None:
     """A game ID selects the same member independently of call ordering."""
     pool = populated_pool(tmp_path, count=3, seed=17)
@@ -213,7 +294,7 @@ def test_corrupt_snapshot_is_never_substituted(tmp_path: Path) -> None:
     """A selected member with a changed digest fails closed before unpickling."""
     store = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
     selected = store.add(state_dict(), environment_steps=1, round_id=0, run_id="run")
-    pool = SnapshotPool(store.manifest, seed=17, structure="model-v1")
+    pool = SnapshotPool.from_store(store, seed=17)
     selected.path.write_bytes(b"corrupt")
 
     with pytest.raises(SnapshotIntegrityError, match=selected.sha256):
@@ -224,7 +305,9 @@ def test_structure_mismatch_is_rejected_before_loading(tmp_path: Path) -> None:
     """A valid foreign snapshot cannot cross model-shape compatibility boundaries."""
     store = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
     selected = store.add(state_dict(), environment_steps=1, round_id=0, run_id="run")
-    pool = SnapshotPool(store.manifest, seed=17, structure="model-v2")
+    pool = SnapshotPool.from_store(
+        SnapshotStore(tmp_path, capacity=1, structure="model-v2"), seed=17
+    )
 
     with pytest.raises(SnapshotIntegrityError, match="model-v2"):
         pool.load(selected)
