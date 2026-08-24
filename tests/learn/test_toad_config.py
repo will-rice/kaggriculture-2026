@@ -36,6 +36,18 @@ def test_batch_probabilities_must_sum_to_one() -> None:
         ToadConfig(population={"selfplay": 0.8, "scripted": 0.8})
 
 
+def test_frozen_population_requires_a_first_round_snapshot_source() -> None:
+    """A validated run cannot request frozen opponents from an empty first pool."""
+    with pytest.raises(ValidationError, match="frozen_opponent.*first-round"):
+        ToadConfig(
+            population={
+                "selfplay": 0.5,
+                "scripted": 0.0,
+                "frozen_opponent": 0.5,
+            }
+        )
+
+
 def test_teacher_loss_requires_a_teacher() -> None:
     """A teacher loss cannot silently run without a teacher checkpoint."""
     with pytest.raises(ValidationError, match="teacher checkpoint"):

@@ -106,7 +106,7 @@ class PopulationSnapshotCallback(lightning.Callback):
         """Open the durable pool and schedule strictly after restored progress."""
         module = cast(ToadLightningModule, pl_module)
         population = module.config.population
-        self._reopen_store(module)
+        self._reopen_store(trainer, module)
         assert self.store is not None
         if population.snapshot_at_start and not self.store.manifest.entries:
             self._add_snapshot(module)
@@ -131,7 +131,7 @@ class PopulationSnapshotCallback(lightning.Callback):
         learner_batch = cast(LearnerBatch, batch)
         if not learner_batch.end_of_round:
             return
-        self._reopen_store(module)
+        self._reopen_store(trainer, module)
         interval = module.config.population.snapshot_every_environment_steps
         if interval is None:
             self._publish(trainer, module)
@@ -146,10 +146,19 @@ class PopulationSnapshotCallback(lightning.Callback):
         self._publish(trainer, module)
         self.next_snapshot_steps = (module.environment_steps // interval + 1) * interval
 
-    def _reopen_store(self, module: ToadLightningModule) -> None:
+    def _reopen_store(
+        self, trainer: lightning.Trainer, module: ToadLightningModule
+    ) -> None:
         """Refresh collection-created bootstrap entries without accepting drift."""
+        data = _data_module(trainer)
+        population_directory = getattr(data, "population_directory", None)
+        directory = (
+            population_directory()
+            if population_directory is not None
+            else (module.config.runtime.output_dir / "population").resolve()
+        )
         store = SnapshotStore(
-            module.config.runtime.output_dir / "population",
+            directory,
             capacity=module.config.population.pool_capacity,
             structure=structural_fingerprint(module.config),
         )
@@ -172,18 +181,17 @@ class PopulationSnapshotCallback(lightning.Callback):
             round_id=module.collection_round,
             run_id=module.config.curriculum.phase,
         )
-        module.population_manifest = self.store.manifest
 
     def _publish(self, trainer: lightning.Trainer, module: ToadLightningModule) -> None:
         """Publish the durable manifest before later boundary callbacks run."""
         if self.store is None:
             raise RuntimeError("population snapshot store is not initialized")
-        module.population_manifest = self.store.manifest
         data = _data_module(trainer)
         publish_manifest = getattr(data, "publish_manifest", None)
         if publish_manifest is None:
             raise RuntimeError("ToadDataModule does not support population manifests")
         publish_manifest(self.store.manifest)
+        module.population_manifest = self.store.manifest
 
 
 class BoundaryCheckpoint(lightning.Callback):

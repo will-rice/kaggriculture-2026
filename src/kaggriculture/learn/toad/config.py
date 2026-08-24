@@ -331,6 +331,15 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "population probabilities must be nonnegative and sum to one"
             )
+        if (
+            self.population.frozen_opponent > 0
+            and not self.population.initial_snapshots
+            and not self.population.snapshot_at_start
+        ):
+            raise ValueError(
+                "frozen_opponent requires a first-round source: initial_snapshots "
+                "or snapshot_at_start"
+            )
         _validate_foundation_optimizer(self.optimizer)
         max_steps_per_round = (
             2 * self.population.environments_per_rank * (EPISODE_STEPS - 1)

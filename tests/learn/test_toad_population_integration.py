@@ -1,16 +1,19 @@
 """End-to-end contracts for checkpointed Toad population training."""
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import lightning
 import pytest
 import torch
 
+import kaggriculture.learn.rollout as rollout_module
 from kaggriculture.learn.model import Policy
+from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.callbacks import PopulationSnapshotCallback
 from kaggriculture.learn.toad.config import ToadConfig, structural_fingerprint
 from kaggriculture.learn.toad.data import (
@@ -43,6 +46,85 @@ def _metric_float(value: object) -> float:
     return float(value)
 
 
+def test_all_population_kinds_cross_the_real_worker_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each population kind reconstructs and runs through the production worker."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 3)
+    teacher_path = tmp_path / "teacher.pt"
+    teacher_policy = Policy(blocks=1, channels=4, value_bound=1.0)
+    torch.save(teacher_policy.state_dict(), teacher_path)
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4, "value_bound": 1.0},
+            "population": {
+                "selfplay": 0.25,
+                "scripted": 0.25,
+                "frozen_opponent": 0.25,
+                "teacher_distill": 0.25,
+                "teacher": {
+                    "checkpoint": teacher_path,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                },
+                "environments_per_rank": 4,
+                "collection_processes": 1,
+                "snapshot_at_start": True,
+            },
+            "optimizer": {"unroll_length": 2},
+            "runtime": {"output_dir": tmp_path},
+        }
+    )
+    actor = Policy(blocks=1, channels=4, value_bound=1.0)
+    store = SnapshotStore(
+        tmp_path / "population",
+        capacity=config.population.pool_capacity,
+        structure=structural_fingerprint(config),
+    )
+    frozen = store.add(
+        actor.state_dict(), environment_steps=0, round_id=0, run_id="worker-smoke"
+    )
+    pool = SnapshotPool.from_store(store, seed=config.population.population_seed)
+    source = ReferenceRoundSource(config, assignments=(), pool=pool)
+    source.publish_actor(actor.state_dict(), version=0)
+    assignments = allocate_round(config, 0, 0, pool)
+    opponents = source._materialize_opponents(assignments)
+
+    results = {
+        assignment.kind: toad._play_reference(
+            source._worker_input(assignment, opponents)
+        )
+        for assignment in assignments
+    }
+
+    assert set(results) == {
+        BatchKind.SELFPLAY,
+        BatchKind.SCRIPTED,
+        BatchKind.FROZEN_OPPONENT,
+        BatchKind.TEACHER_DISTILL,
+    }
+    assert len(results[BatchKind.SELFPLAY]) == 2
+    assert all(
+        len(trajectories) == 1
+        for kind, trajectories in results.items()
+        if kind is not BatchKind.SELFPLAY
+    )
+    assert all(
+        len(trajectory.dones) == 2
+        for trajectories in results.values()
+        for trajectory in trajectories
+    )
+    neural = {
+        assignment.kind: assignment.checkpoint_sha256
+        for assignment in assignments
+        if assignment.checkpoint_sha256 is not None
+    }
+    assert neural[BatchKind.FROZEN_OPPONENT] == frozen.sha256
+    assert len(neural[BatchKind.TEACHER_DISTILL] or "") == 64
+
+
 def test_publish_manifest_binds_only_the_verified_durable_store(
     tmp_path: Path,
 ) -> None:
@@ -71,6 +153,99 @@ def test_publish_manifest_binds_only_the_verified_durable_store(
     with pytest.raises(SnapshotIntegrityError, match="published population manifest"):
         data.publish_manifest(SnapshotManifest())
     assert source.pool is original_pool
+
+
+def test_corrupt_manifest_publication_is_failure_atomic(tmp_path: Path) -> None:
+    """Digest failure cannot mutate either the collector or checkpoint manifest."""
+    config = _population_config(tmp_path)
+    module = ToadLightningModule(config)
+    store = SnapshotStore(
+        tmp_path / "population",
+        capacity=config.population.pool_capacity,
+        structure=structural_fingerprint(config),
+    )
+    store.add(
+        module.policy.state_dict(),
+        environment_steps=0,
+        round_id=0,
+        run_id="valid",
+    )
+    entry = store.add(
+        module.policy.state_dict(),
+        environment_steps=1,
+        round_id=0,
+        run_id="corrupt",
+    )
+    entry.path.write_bytes(b"corrupt")
+    source = ReferenceRoundSource(config, assignments=())
+    data = ToadDataModule(config, source)
+    callback = PopulationSnapshotCallback()
+
+    with pytest.raises(SnapshotIntegrityError, match="digest"):
+        callback.on_fit_start(
+            cast(lightning.Trainer, SimpleNamespace(datamodule=data)), module
+        )
+
+    assert source.pool is None
+    assert module.population_manifest == SnapshotManifest()
+
+
+def test_population_resume_keeps_checkpointed_pool_after_output_override(
+    tmp_path: Path,
+) -> None:
+    """An operational output change cannot silently migrate population identity."""
+    original_root = tmp_path / "original"
+    resumed_root = tmp_path / "resumed"
+    base = _population_config(original_root)
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={
+                    "snapshot_at_start": True,
+                    "snapshot_every_environment_steps": 100,
+                }
+            )
+        }
+    )
+    module = ToadLightningModule(config)
+    source = ReferenceRoundSource(config, assignments=())
+    data = ToadDataModule(config, source)
+    callback = PopulationSnapshotCallback()
+    callback.on_fit_start(
+        cast(lightning.Trainer, SimpleNamespace(datamodule=data)), module
+    )
+    checkpoint: dict[str, object] = {}
+    module.on_save_checkpoint(checkpoint)
+    data_state = data.state_dict()
+
+    resumed_config = config.model_copy(
+        update={
+            "runtime": config.runtime.model_copy(update={"output_dir": resumed_root})
+        }
+    )
+    resumed_module = ToadLightningModule(resumed_config)
+    resumed_module.on_load_checkpoint(checkpoint)
+    resumed_source = ReferenceRoundSource(resumed_config, assignments=())
+    resumed_data = ToadDataModule(resumed_config, resumed_source)
+    resumed_data.load_state_dict(data_state)
+    resumed_callback = PopulationSnapshotCallback()
+    resumed_trainer = cast(lightning.Trainer, SimpleNamespace(datamodule=resumed_data))
+
+    resumed_callback.on_fit_start(resumed_trainer, resumed_module)
+    resumed_module.environment_steps = 100
+    resumed_module.collection_round = 1
+    resumed_callback.on_train_batch_end(
+        resumed_trainer,
+        resumed_module,
+        None,
+        SimpleNamespace(end_of_round=True),
+        0,
+    )
+
+    assert resumed_callback.store is not None
+    assert resumed_callback.store.directory == (original_root / "population").resolve()
+    assert len(resumed_module.population_manifest.entries) == 2
+    assert not (resumed_root / "population").exists()
 
 
 def test_round_metrics_flush_once_with_stable_population_series(
@@ -115,6 +290,130 @@ def test_round_metrics_flush_once_with_stable_population_series(
     assert "population/selections/selfplay" in record
 
 
+def test_population_game_counts_are_unique_and_source_metrics_cannot_overwrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two self-play seats from one game remain one population selection."""
+    from tests.learn.test_toad_control_fixture import (
+        control_fixture_batch,
+        control_fixture_config,
+        load_control_fixture,
+    )
+
+    module = ToadLightningModule(control_fixture_config())
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
+    batch = control_fixture_batch(load_control_fixture())
+    duplicated_seats = replace(
+        batch,
+        game_ids=(7,),
+        opponent_ids=("self",),
+        opponent_digests=(None,),
+        segment_game_ids=(7,) * len(batch.segments),
+        segment_kinds=(BatchKind.SELFPLAY,) * len(batch.segments),
+        segment_opponent_ids=("self",) * len(batch.segments),
+        segment_opponent_digests=(None,) * len(batch.segments),
+        round_metrics={"collection/games/selfplay": 2},
+    )
+
+    module.training_step(duplicated_seats, 0)
+
+    assert records[0]["collection/games/selfplay"] == 1
+    assert records[0]["population/selections/selfplay"] == 1
+
+
+def test_mixed_batch_loss_is_not_duplicated_under_each_population(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One aggregate mixed loss has one honest mixed denominator and label."""
+    from tests.learn.test_toad_control_fixture import (
+        control_fixture_batch,
+        control_fixture_config,
+        load_control_fixture,
+    )
+
+    module = ToadLightningModule(control_fixture_config())
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
+    batch = control_fixture_batch(load_control_fixture())
+    count = len(batch.segments)
+    kinds = tuple(
+        BatchKind.SELFPLAY if index % 2 == 0 else BatchKind.SCRIPTED
+        for index in range(count)
+    )
+    mixed = replace(
+        batch,
+        kind=BatchKind.MIXED,
+        segment_kinds=kinds,
+        segment_game_ids=tuple(range(count)),
+        segment_opponent_ids=tuple(
+            "self" if kind is BatchKind.SELFPLAY else "economic" for kind in kinds
+        ),
+        segment_opponent_digests=(None,) * count,
+    )
+
+    module.training_step(mixed, 0)
+
+    record = records[0]
+    assert "loss/by_kind/mixed" in record
+    assert "loss/by_opponent/mixed" in record
+    assert "loss/by_opponent/self" not in record
+    assert "loss/by_opponent/economic" not in record
+
+
+def test_learner_timing_finishes_after_optimizer_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timing endpoint must follow closure backward/clipping/optimizer work."""
+    from tests.learn.test_toad_control_fixture import (
+        control_fixture_batch,
+        control_fixture_config,
+        load_control_fixture,
+    )
+
+    module = ToadLightningModule(control_fixture_config())
+    batch = control_fixture_batch(load_control_fixture())
+    records: list[dict[str, object]] = []
+    events: list[str] = []
+
+    class _Optimizer:
+        param_groups = [{"lr": module.config.optimizer.lr}]
+
+        def step(self, closure: Callable[[], object]) -> None:
+            closure()
+            assert records == []
+            events.append("optimizer")
+
+    optimizer = _Optimizer()
+    trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(global_step=0, optimizers=[optimizer]),
+    )
+    module.trainer = trainer
+    monkeypatch.setattr(
+        module, "log_dict", lambda record, **_: records.append(dict(record))
+    )
+    monkeypatch.setattr(
+        "kaggriculture.learn.toad.lightning.time.perf_counter",
+        lambda: 15.0 if events else 10.0,
+    )
+
+    module.optimizer_step(
+        0,
+        0,
+        cast(Any, optimizer),
+        lambda: module.training_step(batch, 0),
+    )
+
+    assert events == ["optimizer"]
+    assert len(records) == 1
+    assert records[0]["throughput/learner_seconds"] == 5.0
+
+
 def test_four_kind_round_trains_and_reports_actual_mix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -143,6 +442,7 @@ def test_four_kind_round_trains_and_reports_actual_mix(
                 "collection_processes": 1,
                 "population_seed": 17,
                 "snapshot_every_environment_steps": 256,
+                "snapshot_at_start": True,
             },
             "optimizer": {
                 "adaptive_entropy": True,
@@ -238,6 +538,11 @@ def test_four_kind_round_trains_and_reports_actual_mix(
     assert "belief/loss" in record
     assert record["progress/environment_steps"] == 256.0
 
+    # Manual ``training_step`` calls do not run an optimizer. Represent the
+    # parameter update that precedes a real boundary snapshot so the next
+    # population round contains two distinct policies.
+    with torch.no_grad():
+        next(module.policy.parameters()).add_(1e-4)
     snapshot_callback.on_train_batch_end(
         trainer,
         module,
@@ -251,6 +556,8 @@ def test_four_kind_round_trains_and_reports_actual_mix(
     assert len(module.population_manifest.entries) == 2
 
     resumed_module = ToadLightningModule(config)
+    # Lightning restores module weights before invoking ``on_load_checkpoint``.
+    resumed_module.load_state_dict(module.state_dict())
     resumed_module.on_load_checkpoint(checkpoint)
     resumed_source = ReferenceRoundSource(
         config,
@@ -278,4 +585,36 @@ def test_four_kind_round_trains_and_reports_actual_mix(
         resumed_source.next_game_id,
         resumed_source._next_round_id,
         resumed_source.pool,
+    )
+
+    uninterrupted_next = list(source)
+    resumed_next = list(resumed_source)
+    assert [
+        (
+            batch.segment_game_ids,
+            batch.segment_kinds,
+            batch.segment_opponent_ids,
+            batch.segment_opponent_digests,
+        )
+        for batch in resumed_next
+    ] == [
+        (
+            batch.segment_game_ids,
+            batch.segment_kinds,
+            batch.segment_opponent_ids,
+            batch.segment_opponent_digests,
+        )
+        for batch in uninterrupted_next
+    ]
+    monkeypatch.setattr(resumed_module, "log_dict", lambda _record, **_: None)
+    for index, (uninterrupted_batch, resumed_batch) in enumerate(
+        zip(uninterrupted_next, resumed_next, strict=True)
+    ):
+        uninterrupted_loss = module.training_step(uninterrupted_batch, index)
+        resumed_loss = resumed_module.training_step(resumed_batch, index)
+        torch.testing.assert_close(resumed_loss, uninterrupted_loss)
+
+    assert resumed_module.entropy_state == module.entropy_state
+    assert all(
+        state.last_steps == 512 for state in resumed_module.entropy_state.values()
     )

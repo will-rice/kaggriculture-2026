@@ -8,12 +8,14 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import lightning
 import torch
 import torch.nn.functional as functional
+from lightning.pytorch.core.optimizer import LightningOptimizer
 from lightning.pytorch.utilities.types import OptimizerLRScheduler
+from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from kaggriculture.learn import toad_loss
@@ -380,26 +382,33 @@ class RoundMetricAccumulator:
         self,
         batch: LearnerBatch,
         report: LossReport,
-        *,
-        learner_seconds: float,
     ) -> None:
         """Add one trained batch without performing distributed logging."""
         self.collected_steps += batch.collected_steps
-        self.learner_seconds += learner_seconds
-        self.learner_batches += 1
         if not batch.baseline_only:
-            kind_name = batch.kind.value
+            kinds = set(batch.segment_kinds or (batch.kind,))
+            kind_name = (
+                next(iter(kinds)).value
+                if len(kinds) == 1 and BatchKind.MIXED not in kinds
+                else BatchKind.MIXED.value
+            )
             self.losses[f"loss/by_kind/{kind_name}"].append(
                 report.total.detach().float()
             )
             self._record_selections(batch)
-            for opponent_id in set(batch.segment_opponent_ids or batch.opponent_ids):
-                safe_id = opponent_id.replace("/", "_")
-                self.losses[f"loss/by_opponent/{safe_id}"].append(
-                    report.total.detach().float()
-                )
+            opponents = set(batch.segment_opponent_ids or batch.opponent_ids)
+            opponent_id = next(iter(opponents)) if len(opponents) == 1 else "mixed"
+            safe_id = opponent_id.replace("/", "_")
+            self.losses[f"loss/by_opponent/{safe_id}"].append(
+                report.total.detach().float()
+            )
             self._record_masks(batch)
             self._record_state(batch)
+
+    def finish_learner_batch(self, learner_seconds: float) -> None:
+        """Close timing only after Lightning completes the optimizer step."""
+        self.learner_seconds += learner_seconds
+        self.learner_batches += 1
 
     def _record_selections(self, batch: LearnerBatch) -> None:
         """Count each collected game once despite its repeated learner segments."""
@@ -1038,9 +1047,10 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_fresh_terms: list[Mapping[str, torch.Tensor]] = []
         self._round_fresh_entropy: list[HeadEntropy] = []
         self._round_baselines: list[torch.Tensor] = []
-        self._round_metrics: dict[str, float | int] = {}
         self._round_population = _empty_population_counts()
         self.round_metrics = RoundMetricAccumulator()
+        self._learner_started: float | None = None
+        self._pending_round_flush = False
         self.save_hyperparameters(self.config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
@@ -1072,11 +1082,11 @@ class ToadLightningModule(lightning.LightningModule):
             self._round_fresh_terms = []
             self._round_fresh_entropy = []
             self._round_baselines = []
-            self._round_metrics = dict(batch.round_metrics)
             self._round_population = _empty_population_counts()
             self.round_metrics.reset(batch.round_metrics)
         baseline_only = batch.baseline_only or self.warmup_remaining > 0
-        learner_started = time.perf_counter()
+        if self._learner_started is None:
+            self._learner_started = time.perf_counter()
         report = compute_loss(
             self.policy,
             batch,
@@ -1085,11 +1095,7 @@ class ToadLightningModule(lightning.LightningModule):
             baseline_only=baseline_only,
             entropy_state=self.entropy_state,
         )
-        self.round_metrics.update(
-            batch,
-            report,
-            learner_seconds=time.perf_counter() - learner_started,
-        )
+        self.round_metrics.update(batch, report)
         self._round_ended = batch.end_of_round
         self._round_baselines.append(report.terms["baseline"].detach())
         if not batch.baseline_only:
@@ -1122,9 +1128,32 @@ class ToadLightningModule(lightning.LightningModule):
             self.collection_round += 1
         if batch.end_of_round:
             self._update_entropy_controllers()
-            self.flush_round_metrics()
-            self._round_fresh_entropy = []
+            self._pending_round_flush = True
+        if self._trainer is None:
+            self._finish_learner_batch()
         return report.total
+
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: Optimizer | LightningOptimizer,
+        optimizer_closure: Callable[[], Any] | None = None,
+    ) -> None:
+        """Close learner timing after backward, clipping, sync, and optimizer."""
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        self._finish_learner_batch()
+
+    def _finish_learner_batch(self) -> None:
+        """Record one full optimization interval and flush a due round once."""
+        if self._learner_started is None:
+            raise RuntimeError("learner timing finished without a started batch")
+        self.round_metrics.finish_learner_batch(
+            time.perf_counter() - self._learner_started
+        )
+        self._learner_started = None
+        if self._pending_round_flush:
+            self.flush_round_metrics()
 
     def flush_round_metrics(self) -> None:
         """Log and clear the sole completed-round accumulator without DDP sync."""
@@ -1134,6 +1163,8 @@ class ToadLightningModule(lightning.LightningModule):
             on_epoch=False,
             sync_dist=False,
         )
+        self._pending_round_flush = False
+        self._round_fresh_entropy = []
         self.round_metrics.reset()
 
     def _aggregate_round_entropy(self, name: str) -> EntropyStat:
@@ -1179,7 +1210,6 @@ class ToadLightningModule(lightning.LightningModule):
         baseline_passes = torch.stack(self._round_baselines).mean()
         record: dict[str, torch.Tensor | int | float] = {
             **self.round_metrics.compute(),
-            **self._round_metrics,
             "diag/update": self.collection_round,
             "diag/steps": self.environment_steps,
             "diag/environment_steps": self.environment_steps,

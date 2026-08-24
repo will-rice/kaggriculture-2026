@@ -231,6 +231,7 @@ def test_supplied_pool_semantic_structure_mismatch_fails_before_sampling(
                 "scripted": 0.0,
                 "frozen_opponent": 1.0,
                 "environments_per_rank": 1,
+                "snapshot_at_start": True,
             },
         }
     )
@@ -288,6 +289,7 @@ def test_allocator_rebinds_external_pool_seed_to_population_seed(
                 "frozen_opponent": 1.0,
                 "environments_per_rank": 8,
                 "population_seed": 17,
+                "snapshot_at_start": True,
             },
         }
     )
@@ -373,6 +375,7 @@ def test_empty_pool_failure_does_not_consume_round_identity(tmp_path: Path) -> N
                 "scripted": 0.0,
                 "frozen_opponent": 1.0,
                 "environments_per_rank": 1,
+                "snapshot_at_start": True,
             }
         }
     )
@@ -389,7 +392,12 @@ def test_empty_pool_failure_does_not_consume_round_identity(tmp_path: Path) -> N
     )
 
     with pytest.raises(EmptySnapshotPoolError):
-        list(source)
+        allocate_round(
+            config,
+            source.next_game_id,
+            source._next_round_id,
+            source.pool,
+        )
 
     assert source.next_game_id == 0
     assert source._next_round_id == 0
@@ -476,6 +484,7 @@ def test_round_source_loads_one_selected_frozen_digest_once(
                 "scripted": 0.0,
                 "frozen_opponent": 1.0,
                 "environments_per_rank": 2,
+                "snapshot_at_start": True,
             },
         }
     )
@@ -540,6 +549,7 @@ def test_selected_corrupt_frozen_member_aborts_before_collection(
                 "scripted": 0.0,
                 "frozen_opponent": 1.0,
                 "environments_per_rank": 1,
+                "snapshot_at_start": True,
             }
         }
     )
@@ -811,6 +821,7 @@ def test_external_pool_seed_is_normalized_before_precollection_checkpoint(
                 "environments_per_rank": 4,
                 "population_seed": 29,
                 "pool_capacity": 2,
+                "snapshot_at_start": True,
             },
         }
     )
@@ -1562,6 +1573,47 @@ def test_default_round_honors_typed_population_quotas_and_one_clock() -> None:
     next_round = list(source)
     assert {batch.round_id for batch in next_round} == {1}
     assert next_round[0].game_ids == (5, 6, 7)
+
+
+def test_legacy_vs_econ_metrics_exclude_neural_opponents() -> None:
+    """Frozen and teacher outcomes cannot contaminate the scripted control curve."""
+    scripted = replace(_trajectory(32), final_margin=-1.0)
+    frozen = replace(_trajectory(32), final_margin=1.0)
+    teacher = replace(_trajectory(32), final_margin=1.0)
+    assignments = (
+        CollectionAssignment(0, 0, "economic", BatchKind.SCRIPTED),
+        CollectionAssignment(1, 1, "frozen", BatchKind.FROZEN_OPPONENT),
+        CollectionAssignment(2, 2, "teacher", BatchKind.TEACHER_DISTILL),
+    )
+    by_kind = {
+        BatchKind.SCRIPTED: scripted,
+        BatchKind.FROZEN_OPPONENT: frozen,
+        BatchKind.TEACHER_DISTILL: teacher,
+    }
+    source = ReferenceRoundSource(
+        ToadConfig.control(),
+        assignments=assignments,
+        collect_assignment=lambda assignment: (by_kind[assignment.kind],),
+    )
+
+    first = next(iter(source))
+
+    assert first.round_metrics["diag/n_econ_envs"] == 1
+    assert first.round_metrics["objective/win_rate_vs_econ"] == 0.0
+
+
+def test_collection_game_metrics_count_ids_not_selfplay_seats() -> None:
+    """A mirrored game produces two trajectories but only one selected game ID."""
+    assignment = CollectionAssignment(7, 7, "self", BatchKind.SELFPLAY)
+    source = ReferenceRoundSource(
+        ToadConfig.control(),
+        assignments=(assignment,),
+        collect_assignment=lambda _assignment: (_trajectory(32), _trajectory(32)),
+    )
+
+    first = next(iter(source))
+
+    assert first.round_metrics["collection/games/selfplay"] == 1
 
 
 def test_default_collection_uses_one_typed_round_pool_and_fans_out(

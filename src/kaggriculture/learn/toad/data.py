@@ -1009,16 +1009,18 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             if assignment.kind is BatchKind.SELFPLAY
             for trajectory in assigned
         ]
-        opponents = [
+        scripted = [
             trajectory
             for assignment, assigned in ordered
-            if assignment.kind is not BatchKind.SELFPLAY
+            if assignment.kind is BatchKind.SCRIPTED
             for trajectory in assigned
         ]
         from kaggriculture.learn.scripts.toad import _collection_metrics
 
-        collection_metrics = _collection_metrics(
-            mirror, opponents, self.config.curriculum.reward_field
+        collection_metrics = (
+            _collection_metrics(mirror, scripted, self.config.curriculum.reward_field)
+            if mirror or scripted
+            else {}
         )
         collection_metrics["throughput/collection_seconds"] = collection_seconds
         for kind in _ONLINE_KINDS:
@@ -1028,7 +1030,13 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 if assignment.kind is kind
                 for trajectory in assigned
             ]
-            collection_metrics[f"collection/games/{kind.value}"] = len(kind_rows)
+            collection_metrics[f"collection/games/{kind.value}"] = len(
+                {
+                    assignment.game_id
+                    for assignment, _assigned in ordered
+                    if assignment.kind is kind
+                }
+            )
             collection_metrics[f"collection/return/{kind.value}"] = (
                 float(
                     torch.stack(
@@ -1044,12 +1052,16 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 else float("nan")
             )
         opponent_groups: dict[str, list[Trajectory]] = {}
+        opponent_game_ids: dict[str, set[int]] = {}
         for assignment, assigned in ordered:
             opponent_groups.setdefault(assignment.opponent_id, []).extend(assigned)
+            opponent_game_ids.setdefault(assignment.opponent_id, set()).add(
+                assignment.game_id
+            )
         for opponent_id, opponent_rows in opponent_groups.items():
             safe_id = opponent_id.replace("/", "_")
             collection_metrics[f"collection/games_by_opponent/{safe_id}"] = len(
-                opponent_rows
+                opponent_game_ids[opponent_id]
             )
             collection_metrics[f"collection/return_by_opponent/{safe_id}"] = float(
                 torch.stack(
@@ -1119,8 +1131,9 @@ class ToadDataModule(lightning.LightningDataModule):
 
     def publish_manifest(self, manifest: SnapshotManifest) -> None:
         """Bind collection to the callback's exact durable population view."""
+        directory = self.population_directory()
         store = SnapshotStore(
-            self.config.runtime.output_dir / "population",
+            directory,
             capacity=self.config.population.pool_capacity,
             structure=structural_fingerprint(self.config),
         )
@@ -1132,7 +1145,20 @@ class ToadDataModule(lightning.LightningDataModule):
             store,
             seed=self.config.population.population_seed,
         )
+        # Validate each immutable boundary artifact before exposing the new pool.
+        # Different boundaries may legitimately contain identical weights, so
+        # validating the whole manifest through ``SnapshotPool.load_many`` would
+        # incorrectly reject equal digests with distinct entry metadata.
+        for entry in manifest.entries:
+            store.load(entry)
         self.source.pool = pool
+
+    def population_directory(self) -> Path:
+        """Return restored pool identity, or the configured fresh-run directory."""
+        pool = self.source.pool
+        if pool is not None and pool.manifest.entries:
+            return pool.identity().directory
+        return (self.config.runtime.output_dir / "population").resolve()
 
     def train_dataloader(self) -> DataLoader[LearnerBatch]:
         """Return the intentionally single-process iterable loader."""
