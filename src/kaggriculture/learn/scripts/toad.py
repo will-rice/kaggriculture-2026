@@ -71,10 +71,12 @@ from kaggriculture.learn.toad.data import (
 )
 from kaggriculture.learn.toad.data import (
     ReferenceRoundSource,
+    ReferenceWorkerInput,
     ToadDataModule,
     segments,
 )
 from kaggriculture.learn.toad.lightning import ToadLightningModule
+from kaggriculture.learn.toad.model import StatefulPolicy
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -1490,6 +1492,36 @@ def _play(
             # records seat 0 alone, which is exactly what we want -- we never train
             # on the scripted agent's actions.
             return rollout_many(actor, versus if versus else actor, seeds)
+    finally:
+        if previous_money_weight is None:
+            os.environ.pop(MONEY_WEIGHT_ENV, None)
+        else:
+            os.environ[MONEY_WEIGHT_ENV] = previous_money_weight
+
+
+def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
+    """Play one typed native-worker request with its resolved architecture."""
+    torch.set_num_threads(THREADS)
+    if work.model.recurrent:
+        actor: Policy | StatefulPolicy = StatefulPolicy(work.model)
+        actor.load_state_dict(work.actor_state, strict=True)
+    else:
+        actor = Policy(
+            blocks=work.model.blocks,
+            channels=work.model.channels,
+            value_bound=work.model.value_bound,
+        )
+        actor.load_state_dict(work.actor_state, strict=True)
+    actor.eval()
+    previous_money_weight = os.environ.get(MONEY_WEIGHT_ENV)
+    os.environ[MONEY_WEIGHT_ENV] = repr(work.money_weight)
+    try:
+        with torch.no_grad():
+            return rollout_many(
+                actor,
+                work.versus if work.versus is not None else actor,
+                work.seeds,
+            )
     finally:
         if previous_money_weight is None:
             os.environ.pop(MONEY_WEIGHT_ENV, None)

@@ -541,7 +541,7 @@ def play(policy: Policy, seeds: Sequence[int]) -> Games:
         for seat in tallies
     }
     while not environments[0].done:
-        turns = _decide(
+        turns, _ = _decide(
             policy,
             [
                 (environment.state[LEARNER].observation, LEARNER)

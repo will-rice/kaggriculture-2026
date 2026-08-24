@@ -23,6 +23,7 @@ from kaggriculture.learn.toad.config import (
     validate_stored_config,
 )
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
+from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
@@ -40,7 +41,10 @@ class ResumeConfigError(ValueError):
     """The effective config cannot safely consume the stored trainer state."""
 
 
-def load_checkpoint_policy(policy: Policy, path: Path) -> list[str]:
+PolicyLike = Policy | StatefulPolicy
+
+
+def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
     """Load policy weights from bare, legacy-runner, or Lightning checkpoints."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, Mapping):
@@ -62,7 +66,14 @@ def load_checkpoint_policy(policy: Policy, path: Path) -> list[str]:
             raise ValueError("legacy checkpoint learner must be a mapping")
     else:
         weights = checkpoint
-    return load_policy_weights(policy, cast(Mapping[str, torch.Tensor], weights))
+    typed_weights = cast(Mapping[str, torch.Tensor], weights)
+    if isinstance(policy, StatefulPolicy):
+        if policy.config.recurrent:
+            policy.load_state_dict(typed_weights, strict=True)
+        else:
+            policy.load_control_state_dict(typed_weights)
+        return []
+    return load_policy_weights(policy, typed_weights)
 
 
 def read_path(config: ToadConfig, path: str) -> object:
@@ -89,7 +100,7 @@ def assert_resume_compatible(effective: ToadConfig, stored: ToadConfig) -> None:
 
 
 def compute_loss(
-    policy: Policy,
+    policy: PolicyLike,
     batch: LearnerBatch,
     config: ToadConfig,
     teacher: Teacher | None = None,
@@ -122,15 +133,56 @@ def compute_loss(
     dones = stacked("dones")
 
     turns, width = behaviour.shape
-    unit_logits, quantity_logits, market_logits, values = policy(
-        board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
-    )
+    if isinstance(policy, StatefulPolicy):
+        if policy.config.recurrent:
+            required = {"initial_hidden", "initial_cell", "initial_belief"}
+            missing = required.difference(segments[0])
+            if missing or any(required.difference(segment) for segment in segments):
+                raise ValueError(
+                    "recurrent learner batches require initial_hidden, "
+                    "initial_cell, and initial_belief"
+                )
+            hidden_rows = [segment["initial_hidden"] for segment in segments]
+            cell_rows = [segment["initial_cell"] for segment in segments]
+            layer_dimension = 1 if hidden_rows[0].ndim == 4 else 0
+            initial = PolicyState(
+                hidden=torch.stack(hidden_rows, dim=layer_dimension),
+                cell=torch.stack(cell_rows, dim=layer_dimension),
+                prior_belief=torch.stack(
+                    [segment["initial_belief"] for segment in segments]
+                ),
+            )
+            replay_dones = torch.cat((torch.zeros_like(dones[:1]), dones), dim=0)
+        else:
+            initial = None
+            replay_dones = None
+        output = policy(
+            board,
+            scalars,
+            positions,
+            state=initial,
+            dones=replay_dones,
+        )
+        unit_logits = output.unit_logits
+        quantity_logits = output.quantity_logits
+        market_logits = output.market_logits
+        values = output.values
+    else:
+        legacy_output = policy(
+            board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
+        )
+        unit_logits, quantity_logits, market_logits, values = legacy_output
     values = values.view(turns + 1, width)
     bootstrap_value = values[-1].detach()
     values = values[:-1]
-    unit_logits = _acted(unit_logits, turns, width)
-    quantity_logits = _acted(quantity_logits, turns, width)
-    market_logits = _acted(market_logits, turns, width)
+    if isinstance(policy, StatefulPolicy):
+        unit_logits = unit_logits[:-1].flatten(0, 1)
+        quantity_logits = quantity_logits[:-1].flatten(0, 1)
+        market_logits = market_logits[:-1].flatten(0, 1)
+    else:
+        unit_logits = _acted(unit_logits, turns, width)
+        quantity_logits = _acted(quantity_logits, turns, width)
+        market_logits = _acted(market_logits, turns, width)
     flat_unit_actions = unit_actions.flatten(0, 1)
     flat_unit_masks = unit_masks.flatten(0, 1)
     flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
@@ -227,10 +279,14 @@ class ToadLightningModule(lightning.LightningModule):
     def __init__(self, config: ToadConfig) -> None:
         super().__init__()
         self.config = config
-        self.policy = Policy(
-            blocks=config.model.blocks,
-            channels=config.model.channels,
-            value_bound=config.model.value_bound,
+        self.policy: PolicyLike = (
+            StatefulPolicy(config.model)
+            if config.model.recurrent
+            else Policy(
+                blocks=config.model.blocks,
+                channels=config.model.channels,
+                value_bound=config.model.value_bound,
+            )
         )
         if config.curriculum.warm_start_checkpoint is not None:
             load_checkpoint_policy(self.policy, config.curriculum.warm_start_checkpoint)

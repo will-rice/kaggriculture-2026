@@ -251,7 +251,6 @@ class ToadConfig(BaseModel):
 def _validate_active_model(model: ModelConfig) -> None:
     """Reject architecture paths not yet consumed by the active trainer."""
     unsupported = {
-        "recurrent": model.recurrent,
         "transformer": model.transformer,
         "local_patch": model.local_patch,
         "belief": model.belief,

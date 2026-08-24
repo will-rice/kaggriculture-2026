@@ -1,6 +1,7 @@
 """Typed optimizer-boundary batches for the native Toad collector."""
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace
 
 import pytest
 import torch
@@ -21,10 +22,13 @@ from kaggriculture.learn.toad.data import (
     CollectionAssignment,
     CollectionError,
     ReferenceRoundSource,
+    ReferenceWorkerInput,
     RoundBatchExpander,
     RoundMeta,
     ToadDataModule,
+    segments,
 )
+from kaggriculture.learn.toad.model import StatefulPolicy
 
 
 def _trajectory(turns: int) -> Trajectory:
@@ -65,6 +69,144 @@ def _trajectory(turns: int) -> Trajectory:
         realisation=0.0,
         bought=0.0,
     )
+
+
+def _recurrent_trajectory(turns: int = 32, layers: int = 2) -> Trajectory:
+    """Return a trajectory with distinct autograd-connected state per row."""
+    base = _trajectory(turns)
+    source = torch.arange((turns + 1) * layers * 3 * 10 * 10, dtype=torch.float32).view(
+        turns + 1, layers, 3, 10, 10
+    )
+    source.requires_grad_()
+    belief = torch.arange((turns + 1) * 9, dtype=torch.float32).view(turns + 1, 9)
+    belief.requires_grad_()
+    return replace(
+        base,
+        hidden=source * 2,
+        cell=source.square(),
+        prior_belief=belief.sigmoid(),
+    )
+
+
+def test_segments_store_only_detached_state_before_their_first_observation() -> None:
+    """Start 16 must replay state 16, never actor state 15 or all later states."""
+    trajectory = _recurrent_trajectory()
+    assert trajectory.hidden is not None
+    assert trajectory.cell is not None
+    assert trajectory.prior_belief is not None
+
+    batches = segments(trajectory, unroll_length=16)
+
+    assert torch.equal(batches[0]["initial_hidden"], trajectory.hidden[0])
+    assert torch.equal(batches[1]["initial_hidden"], trajectory.hidden[16])
+    assert torch.equal(batches[1]["initial_cell"], trajectory.cell[16])
+    assert torch.equal(batches[1]["initial_belief"], trajectory.prior_belief[16])
+    assert "hidden" not in batches[1]
+    assert "cell" not in batches[1]
+    assert "prior_belief" not in batches[1]
+    assert not batches[0]["initial_hidden"].requires_grad
+    assert not batches[0]["initial_cell"].requires_grad
+    assert not batches[0]["initial_belief"].requires_grad
+
+
+def test_recurrent_reference_worker_receives_the_resolved_model_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker reconstruction must retain recurrent layers and exact stateful keys."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 16,
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+            }
+        }
+    )
+    policy = StatefulPolicy(config.model)
+    assignment = CollectionAssignment(4, 12, "self", BatchKind.SELFPLAY)
+    seen: list[tuple[object, dict[str, torch.Tensor]]] = []
+
+    def fake_play(work: ReferenceWorkerInput) -> list[Trajectory]:
+        seen.append((work.model, work.actor_state))
+        return []
+
+    monkeypatch.setattr(toad, "_play_reference", fake_play)
+    source = ReferenceRoundSource(config, assignments=(assignment,))
+    source.publish_actor(policy.state_dict(), version=3)
+
+    source.collect_assignment(assignment)
+
+    assert seen[0][0] == config.model
+    assert tuple(seen[0][1]) == tuple(policy.state_dict())
+
+
+def test_recurrent_reference_worker_rejects_bare_control_weights() -> None:
+    """Enabled actor components may never survive as random worker parameters."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 16,
+                "recurrent": True,
+                "recurrent_channels": 3,
+            }
+        }
+    )
+    bare = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    work = ReferenceWorkerInput(
+        actor_state=dict(bare.state_dict()),
+        seeds=[0],
+        model=config.model,
+        versus=None,
+        money_weight=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="Missing key.*control"):
+        toad._play_reference(work)
+
+
+def test_recurrent_reference_worker_builds_and_loads_the_stateful_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real worker entrypoint must consume every resolved model dimension."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 16,
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+            }
+        }
+    )
+    expected = StatefulPolicy(config.model)
+    seen: list[StatefulPolicy] = []
+
+    def fake_rollout(
+        actor: object, opponent: object, seeds: Sequence[int]
+    ) -> list[Trajectory]:
+        assert isinstance(actor, StatefulPolicy)
+        assert opponent is actor
+        assert list(seeds) == [19]
+        seen.append(actor)
+        return []
+
+    monkeypatch.setattr(toad, "rollout_many", fake_rollout)
+    work = ReferenceWorkerInput(
+        actor_state=dict(expected.state_dict()),
+        seeds=[19],
+        model=config.model,
+        versus=None,
+        money_weight=0.01,
+    )
+
+    assert toad._play_reference(work) == []
+    assert seen[0].config == config.model
+    for name, tensor in expected.state_dict().items():
+        assert torch.equal(seen[0].state_dict()[name], tensor)
 
 
 def test_round_expansion_preserves_policy_and_value_pass_counts() -> None:
@@ -197,7 +339,7 @@ def test_default_collection_uses_one_typed_round_pool_and_fans_out(
         }
     )
     pool_widths: list[int] = []
-    work: list[tuple[object, ...]] = []
+    work: list[ReferenceWorkerInput] = []
 
     class FakePool:
         def __init__(self, max_workers: int) -> None:
@@ -211,15 +353,15 @@ def test_default_collection_uses_one_typed_round_pool_and_fans_out(
 
         def map(
             self,
-            function: Callable[[tuple[object, ...]], object],
-            assignments: Iterable[tuple[object, ...]],
+            function: Callable[[ReferenceWorkerInput], object],
+            assignments: Iterable[ReferenceWorkerInput],
         ) -> Iterable[object]:
             assigned = list(assignments)
             work.extend(assigned)
             return map(function, assigned)
 
     monkeypatch.setattr("kaggriculture.learn.toad.data.ProcessPoolExecutor", FakePool)
-    monkeypatch.setattr(toad, "_play", lambda _: [_trajectory(64)])
+    monkeypatch.setattr(toad, "_play_reference", lambda _: [_trajectory(64)])
     source = ReferenceRoundSource(config)
     source.publish_actor({"weight": torch.ones(1)}, version=7)
 
@@ -227,9 +369,14 @@ def test_default_collection_uses_one_typed_round_pool_and_fans_out(
 
     assert pool_widths == [3]
     assert len(work) == 4
-    assert all(item[0] == source.actor_state for item in work)
-    assert [item[4] for item in work] == [toad.OPPONENT, toad.OPPONENT, None, None]
-    assert all(item[5] == 0.01 for item in work)
+    assert all(item.actor_state == source.actor_state for item in work)
+    assert [item.versus for item in work] == [
+        toad.OPPONENT,
+        toad.OPPONENT,
+        None,
+        None,
+    ]
+    assert all(item.money_weight == 0.01 for item in work)
 
 
 def test_data_module_detaches_actor_before_publication() -> None:

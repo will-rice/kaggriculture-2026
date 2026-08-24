@@ -357,7 +357,6 @@ def test_optional_model_dimensions_are_validated(
 @pytest.mark.parametrize(
     "model",
     [
-        {"recurrent": True},
         {"transformer": True},
         {"local_patch": True},
         {"belief": True},
@@ -372,3 +371,12 @@ def test_active_trainer_rejects_unimplemented_optional_model_paths(
     """Inactive architecture paths cannot be silently ignored by Lightning."""
     with pytest.raises(ValidationError, match="not implemented in the active trainer"):
         ToadConfig.model_validate({"model": model})
+
+
+def test_active_trainer_accepts_recurrent_but_keeps_later_paths_gated() -> None:
+    """Task 3 relaxes recurrence only; later architecture stages remain errors."""
+    config = ToadConfig.model_validate({"model": {"recurrent": True}})
+
+    assert config.model.recurrent
+    with pytest.raises(ValidationError, match="not implemented in the active trainer"):
+        ToadConfig.model_validate({"model": {"recurrent": True, "transformer": True}})

@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from kaggriculture.learn.rollout import Trajectory
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
 
 # Segment fields are defined beside the public segmenter so all producers share
@@ -36,6 +36,17 @@ ACTED_FIELDS = (
 )
 OBSERVED_FIELDS = ("board", "scalars", "positions")
 WorkerInput = tuple[dict[str, torch.Tensor], list[int], int, int, str | None, float]
+
+
+@dataclass(frozen=True)
+class ReferenceWorkerInput:
+    """Resolved architecture and weights for one reference collector worker."""
+
+    actor_state: dict[str, torch.Tensor]
+    seeds: list[int]
+    model: ModelConfig
+    versus: str | None
+    money_weight: float
 
 
 class BatchKind(StrEnum):
@@ -113,6 +124,23 @@ def segments(
     mask removes it from every return target.
     """
     turns = int(trajectory.dones.shape[0])
+    recurrent_fields = (
+        trajectory.hidden,
+        trajectory.cell,
+        trajectory.prior_belief,
+    )
+    if any(field is not None for field in recurrent_fields) and not all(
+        field is not None for field in recurrent_fields
+    ):
+        raise ValueError(
+            "recurrent trajectories require hidden, cell, and prior_belief"
+        )
+    if any(
+        field is not None and field.shape[0] != turns + 1 for field in recurrent_fields
+    ):
+        raise ValueError(
+            "recurrent trajectories require one state per row plus trailing state"
+        )
     return [
         {
             **{
@@ -125,6 +153,17 @@ def segments(
                 ]
                 for name in OBSERVED_FIELDS
             },
+            **(
+                {
+                    "initial_hidden": trajectory.hidden[start].detach(),
+                    "initial_cell": trajectory.cell[start].detach(),
+                    "initial_belief": trajectory.prior_belief[start].detach(),
+                }
+                if trajectory.hidden is not None
+                and trajectory.cell is not None
+                and trajectory.prior_belief is not None
+                else {}
+            ),
         }
         for start in range(
             turns % unroll_length, turns - unroll_length + 1, unroll_length
@@ -257,12 +296,12 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         """Collect one assigned game through the existing reference collector."""
         if not self.actor_state:
             raise RuntimeError("reference collection needs a published actor state")
-        from kaggriculture.learn.scripts.toad import _play
+        from kaggriculture.learn.scripts.toad import _play_reference
 
-        return _play(self._worker_input(assignment))
+        return _play_reference(self._worker_input(assignment))
 
-    def _worker_input(self, assignment: CollectionAssignment) -> WorkerInput:
-        """Return the legacy worker tuple for one provenance-bearing game."""
+    def _worker_input(self, assignment: CollectionAssignment) -> ReferenceWorkerInput:
+        """Return one resolved typed worker request with no architecture drift."""
         versus = None
         if assignment.kind is BatchKind.SCRIPTED:
             from kaggriculture.learn.scripts.toad import OPPONENT
@@ -272,13 +311,12 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 if assignment.opponent_id == "economic"
                 else assignment.opponent_id
             )
-        return (
-            self.actor_state,
-            [assignment.seed],
-            self.config.model.blocks,
-            self.config.model.channels,
-            versus,
-            self.config.curriculum.money_weight,
+        return ReferenceWorkerInput(
+            actor_state=self.actor_state,
+            seeds=[assignment.seed],
+            model=self.config.model,
+            versus=versus,
+            money_weight=self.config.curriculum.money_weight,
         )
 
     def _collect_round(
@@ -296,12 +334,14 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
 
         if not self.actor_state:
             raise RuntimeError("reference collection needs a published actor state")
-        from kaggriculture.learn.scripts.toad import _play
+        from kaggriculture.learn.scripts.toad import _play_reference
 
         with ProcessPoolExecutor(
             max_workers=self.config.population.collection_processes
         ) as pool:
-            results = iter(pool.map(_play, map(self._worker_input, assignments)))
+            results = iter(
+                pool.map(_play_reference, map(self._worker_input, assignments))
+            )
             collected = []
             for assignment in assignments:
                 try:

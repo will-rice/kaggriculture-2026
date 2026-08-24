@@ -7,15 +7,21 @@ from typing import cast
 import lightning
 import pytest
 import torch
+from kaggle_environments import make
 from torch.utils.data import DataLoader, Dataset
 
+import kaggriculture.learn.rollout as rollout_module
+from kaggriculture.constants import ENVIRONMENT
+from kaggriculture.learn import toad_loss
 from kaggriculture.learn.scripts import toad
-from kaggriculture.learn.toad.data import LearnerBatch
+from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, segments
 from kaggriculture.learn.toad.lightning import (
     ToadLightningModule,
     compute_loss,
     round_decay,
 )
+from kaggriculture.learn.toad.model import PolicyOutput, PolicyState, StatefulPolicy
 from tests.learn.test_toad_control_fixture import (
     _assert_state_equal,
     control_fixture_batch,
@@ -23,6 +29,7 @@ from tests.learn.test_toad_control_fixture import (
     control_fixture_threads,
     load_control_fixture,
 )
+from tests.learn.test_toad_data import _recurrent_trajectory
 
 
 class _BatchDataset(Dataset[LearnerBatch]):
@@ -44,6 +51,238 @@ def _one_batch_loader(fixture: dict[str, object]) -> DataLoader[LearnerBatch]:
         batch_size=None,
         num_workers=0,
     )
+
+
+def _recurrent_config() -> ToadConfig:
+    return toad.ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 16,
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+            },
+            "optimizer": {"value_warmup_batches": 0},
+        }
+    )
+
+
+def test_recurrent_module_uses_stateful_policy_while_control_keeps_bare_policy() -> (
+    None
+):
+    """Changing control to a wrapper would migrate foundation checkpoint keys."""
+    recurrent = ToadLightningModule(_recurrent_config())
+    control = ToadLightningModule(control_fixture_config())
+
+    assert isinstance(recurrent.policy, StatefulPolicy)
+    assert isinstance(control.policy, toad.Policy)
+    assert not isinstance(control.policy, StatefulPolicy)
+
+
+def test_compute_loss_replays_segment_state_and_shifts_action_dones() -> None:
+    """A terminal action resets the following observation, not its own logits."""
+    config = _recurrent_config()
+    policy = StatefulPolicy(config.model)
+    trajectory = _recurrent_trajectory()
+    assert trajectory.hidden is not None
+    recurrent_segments = segments(trajectory, 16)
+    recurrent_segments[0]["dones"][-1] = True
+    captured: dict[str, object] = {}
+
+    class SpyPolicy(StatefulPolicy):
+        def forward(
+            self,
+            board: torch.Tensor,
+            scalars: torch.Tensor,
+            positions: torch.Tensor,
+            state: PolicyState | None = None,
+            dones: torch.Tensor | None = None,
+        ) -> PolicyOutput:
+            captured["state"] = state
+            captured["dones"] = dones
+            return super().forward(board, scalars, positions, state, dones)
+
+    spy = SpyPolicy(config.model)
+    spy.load_state_dict(policy.state_dict())
+    batch = LearnerBatch(
+        segments=(recurrent_segments[0], recurrent_segments[1]),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=32,
+        round_id=0,
+        actor_version=0,
+        game_ids=(0,),
+        opponent_ids=("self",),
+    )
+
+    report = compute_loss(spy, batch, config)
+
+    initial = captured["state"]
+    replay_dones = captured["dones"]
+    assert isinstance(initial, PolicyState)
+    assert isinstance(replay_dones, torch.Tensor)
+    assert torch.equal(initial.hidden[:, 0], trajectory.hidden[0])
+    assert torch.equal(initial.hidden[:, 1], trajectory.hidden[16])
+    assert torch.equal(replay_dones[0], torch.tensor([False, False]))
+    assert torch.equal(replay_dones[15], torch.tensor([False, False]))
+    assert torch.equal(replay_dones[16], torch.tensor([True, True]))
+    assert torch.isfinite(report.total)
+
+
+def test_recurrent_compute_loss_rejects_control_segments_without_state() -> None:
+    """Active recurrence cannot silently replay a segment from zero memory."""
+    config = _recurrent_config()
+    policy = StatefulPolicy(config.model)
+    batch = replace(
+        control_fixture_batch(load_control_fixture()),
+        segments=(segments(_recurrent_trajectory(), 16)[0],),
+    )
+    control_segment = {
+        name: tensor
+        for name, tensor in batch.segments[0].items()
+        if not name.startswith("initial_")
+    }
+
+    with pytest.raises(ValueError, match="require initial_hidden"):
+        compute_loss(policy, replace(batch, segments=(control_segment,)), config)
+
+
+def test_transfer_batch_moves_recurrent_initial_state_with_segment_tensors() -> None:
+    """Lightning device transfer cannot strand recurrent state on actor CPU."""
+    config = _recurrent_config()
+    module = ToadLightningModule(config)
+    batch = LearnerBatch(
+        segments=(segments(_recurrent_trajectory(), 16)[0],),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=16,
+        round_id=0,
+        actor_version=0,
+        game_ids=(0,),
+        opponent_ids=("self",),
+    )
+
+    transferred = module.transfer_batch_to_device(batch, torch.device("meta"), 0)
+
+    assert all(
+        tensor.device.type == "meta" for tensor in transferred.segments[0].values()
+    )
+
+
+def test_module_loads_only_exact_recurrent_warm_start_weights(tmp_path: Path) -> None:
+    """Enabled warm starts load every stateful key and reject bare checkpoints."""
+    base = _recurrent_config()
+    source = StatefulPolicy(base.model)
+    exact_path = tmp_path / "recurrent.pt"
+    torch.save(source.state_dict(), exact_path)
+    exact_config = base.model_copy(
+        update={
+            "curriculum": base.curriculum.model_copy(
+                update={"warm_start_checkpoint": exact_path}
+            )
+        }
+    )
+
+    restored = ToadLightningModule(exact_config)
+
+    for name, tensor in source.state_dict().items():
+        assert torch.equal(restored.policy.state_dict()[name], tensor)
+
+    bare_path = tmp_path / "bare.pt"
+    torch.save(toad.Policy(blocks=1, channels=16).state_dict(), bare_path)
+    bare_config = base.model_copy(
+        update={
+            "curriculum": base.curriculum.model_copy(
+                update={"warm_start_checkpoint": bare_path}
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="Missing key.*control"):
+        ToadLightningModule(bare_config)
+
+
+def test_actor_and_learner_outputs_agree_across_a_reset_segment_boundary() -> None:
+    """Segment 16 must reproduce actor values/log-probs after action 15 ended."""
+    config = _recurrent_config()
+    policy = StatefulPolicy(config.model).eval()
+    environment = make(ENVIRONMENT, configuration={"episodeSteps": 3, "seed": 31})
+    environment.reset(2)
+    request = [(environment.state[0].observation, 0)]
+    turns = []
+    states = []
+    state = None
+    action_dones = torch.zeros(32, dtype=torch.bool)
+    action_dones[15] = True
+    action_dones[-1] = True
+    for step in range(32):
+        decided, next_states = rollout_module._decide(
+            policy,
+            request,
+            torch.Generator().manual_seed(100 + step),
+            states=[state],
+            dones=[bool(action_dones[step - 1]) if step else False],
+        )
+        turn = decided[0]
+        assert turn.policy_state is not None
+        turns.append(turn)
+        states.append(turn.policy_state)
+        state = next_states[0]
+    assert state is not None
+    trajectory = replace(
+        _recurrent_trajectory(),
+        board=torch.cat([turn.board for turn in turns]),
+        scalars=torch.cat([turn.scalars for turn in turns]),
+        positions=torch.cat([turn.positions for turn in turns]),
+        unit_actions=torch.cat([turn.units for turn in turns]),
+        unit_quantities=torch.cat([turn.quantities for turn in turns]),
+        market_actions=torch.cat([turn.market for turn in turns]),
+        unit_masks=torch.cat([turn.unit_mask for turn in turns]),
+        unit_quantity_masks=torch.cat([turn.quantity_mask for turn in turns]),
+        market_masks=torch.cat([turn.market_mask for turn in turns]),
+        log_probs=torch.cat([turn.log_prob for turn in turns]),
+        values=torch.cat([turn.value for turn in turns]),
+        dones=action_dones,
+        hidden=torch.stack([record.hidden for record in states] + [state.hidden]),
+        cell=torch.stack([record.cell for record in states] + [state.cell]),
+        prior_belief=torch.stack(
+            [record.prior_belief for record in states] + [state.prior_belief]
+        ),
+    )
+    replay_segments = segments(trajectory, 16)
+    batch = LearnerBatch(
+        segments=tuple(replay_segments),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=32,
+        round_id=0,
+        actor_version=0,
+        game_ids=(0,),
+        opponent_ids=("self",),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_loss(**kwargs: object) -> toad_loss.Losses:
+        values = cast(torch.Tensor, kwargs["values"])
+        learner = cast(torch.Tensor, kwargs["learner_log_probs"])
+        captured.update(values=values.detach(), learner=learner.detach())
+        zero = values.sum() * 0
+        return toad_loss.Losses(zero, zero, zero, zero, zero, zero)
+
+    compute_loss(policy, batch, config, _losses=capture_loss)
+
+    expected_values = torch.stack((trajectory.values[:16], trajectory.values[16:]), 1)
+    expected_log_probs = torch.stack(
+        (trajectory.log_probs[:16], trajectory.log_probs[16:]), 1
+    )
+    assert torch.allclose(captured["values"], expected_values, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(captured["learner"], expected_log_probs, atol=1e-6, rtol=1e-6)
 
 
 def test_lightning_training_step_matches_control_fixture(tmp_path: Path) -> None:
