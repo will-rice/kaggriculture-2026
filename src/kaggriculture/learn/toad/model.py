@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from kaggriculture.constants import BOARD_SIZE
+from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, UNIT_OPS
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad.config import ModelConfig
 
@@ -32,6 +33,125 @@ class PolicyState:
             hidden=self.hidden.detach(),
             cell=self.cell.detach(),
             prior_belief=self.prior_belief.detach(),
+        )
+
+
+@dataclass(frozen=True)
+class ConvLSTMState:
+    """Hidden and cell maps for every ConvLSTM layer."""
+
+    hidden: torch.Tensor
+    cell: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ConvLSTMOutput:
+    """All recurrent activations plus the state after the final time row."""
+
+    hidden_sequence: torch.Tensor
+    cell_sequence: torch.Tensor
+    state: ConvLSTMState
+
+
+class ConvLSTMCell(torch.nn.Module):
+    """One spatial LSTM update preserving the input's board extent."""
+
+    def __init__(
+        self, input_channels: int, hidden_channels: int, kernel_size: int
+    ) -> None:
+        """Build the four jointly-projected LSTM gates."""
+        super().__init__()
+        self.gates = torch.nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size,
+            padding=kernel_size // 2,
+        )
+
+    def forward(
+        self, x: torch.Tensor, hidden: torch.Tensor, cell: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance one batch of spatial states."""
+        input_gate, forget_gate, output_gate, candidate = self.gates(
+            torch.cat((x, hidden), dim=1)
+        ).chunk(4, dim=1)
+        cell = torch.sigmoid(forget_gate) * cell + torch.sigmoid(
+            input_gate
+        ) * torch.tanh(candidate)
+        hidden = torch.sigmoid(output_gate) * torch.tanh(cell)
+        return hidden, cell
+
+
+class ConvLSTM(torch.nn.Module):
+    """A stacked ConvLSTM that resets terminal rows before their observation."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        layers: int = 1,
+    ) -> None:
+        """Build a recurrent stack whose later layers consume prior hidden maps."""
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.layers = layers
+        self.cells = torch.nn.ModuleList(
+            ConvLSTMCell(
+                input_channels if layer == 0 else hidden_channels,
+                hidden_channels,
+                kernel_size,
+            )
+            for layer in range(layers)
+        )
+
+    def initial_state(
+        self, batch: int, height: int, width: int, *, like: torch.Tensor
+    ) -> ConvLSTMState:
+        """Allocate a layer-major zero state from the caller's tensor metadata."""
+        state = like.new_zeros(self.layers, batch, self.hidden_channels, height, width)
+        return ConvLSTMState(hidden=state, cell=torch.zeros_like(state))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: ConvLSTMState | PolicyState | None,
+        dones: torch.Tensor,
+    ) -> ConvLSTMOutput:
+        """Return last-layer sequences and final state for time-major inputs."""
+        time, batch, _, height, width = x.shape
+        if state is None:
+            state = self.initial_state(batch, height, width, like=x)
+        hidden = state.hidden
+        cell = state.cell
+        if hidden.ndim == 4:
+            hidden = hidden.unsqueeze(0)
+            cell = cell.unsqueeze(0)
+
+        hidden_steps: list[torch.Tensor] = []
+        cell_steps: list[torch.Tensor] = []
+        for step in range(time):
+            keep = (~dones[step]).to(dtype=x.dtype).view(batch, 1, 1, 1)
+            hidden = hidden * keep
+            cell = cell * keep
+            layer_input = x[step]
+            next_hidden: list[torch.Tensor] = []
+            next_cell: list[torch.Tensor] = []
+            for layer, recurrent_cell in enumerate(self.cells):
+                layer_hidden, layer_cell = recurrent_cell(
+                    layer_input, hidden[layer], cell[layer]
+                )
+                next_hidden.append(layer_hidden)
+                next_cell.append(layer_cell)
+                layer_input = layer_hidden
+            hidden = torch.stack(next_hidden)
+            cell = torch.stack(next_cell)
+            hidden_steps.append(hidden[-1])
+            cell_steps.append(cell[-1])
+        return ConvLSTMOutput(
+            hidden_sequence=torch.stack(hidden_steps),
+            cell_sequence=torch.stack(cell_steps),
+            state=ConvLSTMState(hidden=hidden, cell=cell),
         )
 
 
@@ -55,6 +175,18 @@ class StatefulPolicy(torch.nn.Module):
         super().__init__()
         self.config = config
         self.control = Policy(config.blocks, config.channels, config.value_bound)
+        if config.recurrent:
+            self.recurrent = ConvLSTM(
+                config.channels,
+                config.recurrent_channels,
+                config.recurrent_kernel_size,
+                config.recurrent_layers,
+            )
+            self.merge = torch.nn.Conv2d(
+                config.channels + 2 * config.recurrent_channels,
+                config.channels,
+                kernel_size=1,
+            )
 
     def _has_optional_components(self) -> bool:
         return any(
@@ -92,19 +224,31 @@ class StatefulPolicy(torch.nn.Module):
         """Allocate zero state from the caller's device and dtype when needed."""
         if not (self.config.recurrent or self.config.belief):
             return None
+        recurrent_state = (
+            self.recurrent.initial_state(batch, BOARD_SIZE, BOARD_SIZE, like=like)
+            if self.config.recurrent
+            else None
+        )
+        hidden = (
+            recurrent_state.hidden
+            if recurrent_state is not None
+            else like.new_zeros(
+                batch, self.config.recurrent_channels, BOARD_SIZE, BOARD_SIZE
+            )
+        )
+        cell = (
+            recurrent_state.cell
+            if recurrent_state is not None
+            else like.new_zeros(
+                batch, self.config.recurrent_channels, BOARD_SIZE, BOARD_SIZE
+            )
+        )
+        if recurrent_state is not None and self.config.recurrent_layers == 1:
+            hidden = hidden.squeeze(0)
+            cell = cell.squeeze(0)
         return PolicyState(
-            hidden=like.new_zeros(
-                batch,
-                self.config.recurrent_channels,
-                BOARD_SIZE,
-                BOARD_SIZE,
-            ),
-            cell=like.new_zeros(
-                batch,
-                self.config.recurrent_channels,
-                BOARD_SIZE,
-                BOARD_SIZE,
-            ),
+            hidden=hidden,
+            cell=cell,
             prior_belief=like.new_zeros(batch, self.config.belief_size),
         )
 
@@ -116,6 +260,72 @@ class StatefulPolicy(torch.nn.Module):
         state: PolicyState | None = None,
         dones: torch.Tensor | None = None,
     ) -> PolicyOutput:
-        """Return the exact control tensors through the new typed interface."""
-        unit, quantity, market, values = self.control(board, scalars, positions)
-        return PolicyOutput(unit, quantity, market, values, None, None)
+        """Run exact control delegation or the enabled time-major recurrence."""
+        if not self.config.recurrent:
+            unit, quantity, market, values = self.control(board, scalars, positions)
+            return PolicyOutput(unit, quantity, market, values, None, None)
+
+        time, batch = board.shape[:2]
+        flat_board = board.flatten(0, 1)
+        flat_scalars = scalars.flatten(0, 1)
+        features = (
+            self.control.stem(flat_board)
+            + self.control.market(flat_scalars)[:, :, None, None]
+        )
+        for block in self.control.blocks:
+            features = block(features)
+        features = features.view(
+            time, batch, self.config.channels, BOARD_SIZE, BOARD_SIZE
+        )
+        if dones is None:
+            dones = torch.zeros(time, batch, dtype=torch.bool, device=board.device)
+        initial_recurrent = (
+            None
+            if state is None
+            else ConvLSTMState(hidden=state.hidden, cell=state.cell)
+        )
+        recurrent = self.recurrent(features, initial_recurrent, dones)
+        merged = self.merge(
+            torch.cat(
+                (features, recurrent.hidden_sequence, recurrent.cell_sequence), dim=2
+            ).flatten(0, 1)
+        ).view(time, batch, self.config.channels, BOARD_SIZE, BOARD_SIZE)
+
+        flat_features = merged.flatten(0, 1)
+        flat_positions = positions.flatten(0, 1)
+        columns = flat_features.flatten(2)
+        wanted = flat_positions[:, None, :].tile(1, columns.shape[1], 1)
+        gathered = columns.gather(2, wanted).transpose(1, 2)
+        units = self.control.head(gathered).view(time, batch, -1, len(UNIT_OPS))
+        quantities = self.control.quantity_head(gathered).view(
+            time, batch, -1, len(QUANTITIES)
+        )
+        pooled = flat_features.mean(dim=(2, 3))
+        market = self.control.trade_head(pooled).view(
+            time, batch, len(MARKET_SLOTS) + 2, len(QUANTITIES)
+        )
+        values = self.control.value(pooled).squeeze(-1)
+        if self.control.value_bound is not None:
+            values = (
+                torch.sigmoid(values) * (2.0 * self.control.value_bound)
+                - self.control.value_bound
+            )
+        prior_belief = (
+            state.prior_belief
+            if state is not None
+            else board.new_zeros(batch, self.config.belief_size)
+        )
+        for step in range(time):
+            prior_belief = prior_belief * (~dones[step]).to(board.dtype).view(batch, 1)
+        hidden, cell = recurrent.state.hidden, recurrent.state.cell
+        if self.config.recurrent_layers == 1:
+            hidden = hidden.squeeze(0)
+            cell = cell.squeeze(0)
+        return PolicyOutput(
+            units,
+            quantities,
+            market,
+            values.view(time, batch),
+            None,
+            PolicyState(hidden, cell, prior_belief),
+        )

@@ -4,16 +4,24 @@ import pytest
 import torch
 from pydantic import ValidationError
 
-from kaggriculture.learn.encoding import MAX_UNITS, SCALARS, TILE_PLANES
+from kaggriculture.constants import BOARD_SIZE
+from kaggriculture.learn.encoding import (
+    MARKET_SLOTS,
+    MAX_UNITS,
+    QUANTITIES,
+    SCALARS,
+    TILE_PLANES,
+    UNIT_OPS,
+)
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
-from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
+from kaggriculture.learn.toad.model import ConvLSTM, PolicyState, StatefulPolicy
 
 
 def model_inputs(batch: int = 2) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return deterministic inputs accepted by the control policy."""
     generator = torch.Generator().manual_seed(29)
-    board = torch.randn(batch, TILE_PLANES, 10, 10, generator=generator)
+    board = torch.randn(batch, TILE_PLANES, BOARD_SIZE, BOARD_SIZE, generator=generator)
     scalars = torch.randn(batch, SCALARS, generator=generator)
     positions = torch.randint(0, 100, (batch, MAX_UNITS), generator=generator)
     return board, scalars, positions
@@ -90,6 +98,167 @@ def test_loading_control_weights_cannot_initialize_enabled_components() -> None:
 
     with pytest.raises(ValueError, match="enabled optional components"):
         enabled.load_control_state_dict(old.state_dict())
+
+
+def test_terminal_reset_erases_previous_episode_memory_per_batch_row() -> None:
+    """A terminal resets only that row before its next observation is processed."""
+    torch.manual_seed(3)
+    layer = ConvLSTM(input_channels=8, hidden_channels=8, kernel_size=3)
+    first = torch.randn(3, 2, 8, BOARD_SIZE, BOARD_SIZE)
+    second = torch.randn(2, 2, 8, BOARD_SIZE, BOARD_SIZE)
+    carried = layer(
+        first,
+        None,
+        torch.zeros(3, 2, dtype=torch.bool),
+    ).state
+
+    reset = torch.tensor([[True, False], [False, False]])
+    output = layer(second, carried, reset)
+    fresh = layer(second[:, :1], None, reset[:, :1])
+
+    assert torch.allclose(
+        output.hidden_sequence[:, :1],
+        fresh.hidden_sequence,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_two_chunks_equal_one_sequence_without_a_terminal() -> None:
+    """Carrying state across an unroll boundary preserves the full sequence."""
+    torch.manual_seed(5)
+    layer = ConvLSTM(input_channels=8, hidden_channels=8, kernel_size=3)
+    first = torch.randn(3, 2, 8, BOARD_SIZE, BOARD_SIZE)
+    second = torch.randn(2, 2, 8, BOARD_SIZE, BOARD_SIZE)
+    dones = torch.zeros(5, 2, dtype=torch.bool)
+
+    full = layer(torch.cat((first, second)), None, dones)
+    left = layer(first, None, dones[: len(first)])
+    right = layer(second, left.state, dones[len(first) :])
+
+    assert torch.allclose(
+        torch.cat((left.hidden_sequence, right.hidden_sequence)),
+        full.hidden_sequence,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(right.state.hidden, full.state.hidden, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(right.state.cell, full.state.cell, atol=1e-6, rtol=1e-6)
+
+
+def test_convlstm_multi_layer_state_uses_one_state_per_layer() -> None:
+    """Each configured ConvLSTM layer retains a separate hidden and cell map."""
+    layer = ConvLSTM(
+        input_channels=6,
+        hidden_channels=4,
+        kernel_size=3,
+        layers=2,
+    )
+    inputs = torch.randn(4, 3, 6, BOARD_SIZE, BOARD_SIZE)
+
+    output = layer(inputs, None, torch.zeros(4, 3, dtype=torch.bool))
+
+    assert output.hidden_sequence.shape == (4, 3, 4, BOARD_SIZE, BOARD_SIZE)
+    assert output.cell_sequence.shape == (4, 3, 4, BOARD_SIZE, BOARD_SIZE)
+    assert output.state.hidden.shape == (2, 3, 4, BOARD_SIZE, BOARD_SIZE)
+    assert output.state.cell.shape == (2, 3, 4, BOARD_SIZE, BOARD_SIZE)
+
+
+def recurrent_policy() -> StatefulPolicy:
+    """Build the smallest enabled policy used by sequence-contract tests."""
+    return StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=16).model_copy(
+            update={
+                "recurrent": True,
+                "recurrent_channels": 12,
+                "recurrent_layers": 2,
+            }
+        )
+    )
+
+
+def recurrent_inputs(
+    time: int = 3, batch: int = 2
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return time-major inputs accepted by the enabled stateful policy."""
+    generator = torch.Generator().manual_seed(47)
+    board = torch.randn(
+        time, batch, TILE_PLANES, BOARD_SIZE, BOARD_SIZE, generator=generator
+    )
+    scalars = torch.randn(time, batch, SCALARS, generator=generator)
+    positions = torch.randint(0, 100, (time, batch, MAX_UNITS), generator=generator)
+    return board, scalars, positions
+
+
+def test_recurrent_policy_accepts_time_major_inputs_and_keeps_layered_state() -> None:
+    """The enabled path preserves time and batch axes through every output head."""
+    policy = recurrent_policy()
+    board, scalars, positions = recurrent_inputs()
+
+    output = policy(
+        board, scalars, positions, dones=torch.zeros(3, 2, dtype=torch.bool)
+    )
+
+    assert output.unit_logits.shape == (3, 2, MAX_UNITS, len(UNIT_OPS))
+    assert output.quantity_logits.shape == (3, 2, MAX_UNITS, len(QUANTITIES))
+    assert output.market_logits.shape == (
+        3,
+        2,
+        len(MARKET_SLOTS) + 2,
+        len(QUANTITIES),
+    )
+    assert output.values.shape == (3, 2)
+    assert output.state is not None
+    assert output.state.hidden.shape == (2, 2, 12, BOARD_SIZE, BOARD_SIZE)
+    assert output.state.cell.shape == (2, 2, 12, BOARD_SIZE, BOARD_SIZE)
+
+
+def test_recurrent_policy_chunks_match_one_full_time_major_sequence() -> None:
+    """Policy heads and final state are invariant to a nonterminal chunk boundary."""
+    torch.manual_seed(13)
+    policy = recurrent_policy()
+    board, scalars, positions = recurrent_inputs(time=5)
+    dones = torch.zeros(5, 2, dtype=torch.bool)
+
+    full = policy(board, scalars, positions, dones=dones)
+    left = policy(board[:3], scalars[:3], positions[:3], dones=dones[:3])
+    right = policy(
+        board[3:], scalars[3:], positions[3:], state=left.state, dones=dones[3:]
+    )
+
+    assert torch.allclose(
+        torch.cat((left.unit_logits, right.unit_logits)),
+        full.unit_logits,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(right.state.hidden, full.state.hidden, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(right.state.cell, full.state.cell, atol=1e-6, rtol=1e-6)
+
+
+def test_recurrent_policy_resets_prior_belief_at_the_terminal_boundary() -> None:
+    """Later belief feedback's state slot follows recurrent resets now."""
+    policy = recurrent_policy()
+    board, scalars, positions = recurrent_inputs(time=1)
+    state = policy.initial_state(2, like=board)
+    assert state is not None
+    state = PolicyState(
+        hidden=state.hidden,
+        cell=state.cell,
+        prior_belief=torch.tensor([[1.0] * 9, [2.0] * 9]),
+    )
+
+    output = policy(
+        board,
+        scalars,
+        positions,
+        state=state,
+        dones=torch.tensor([[True, False]]),
+    )
+
+    assert output.state is not None
+    assert torch.equal(output.state.prior_belief[0], torch.zeros(9))
+    assert torch.equal(output.state.prior_belief[1], torch.full((9,), 2.0))
 
 
 @pytest.mark.parametrize(
