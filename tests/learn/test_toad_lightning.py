@@ -15,7 +15,7 @@ import kaggriculture.learn.toad.lightning as lightning_module
 from kaggriculture.constants import BOARD_SIZE, ENVIRONMENT
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.scripts import toad
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.config import TeacherSpec, ToadConfig
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, segments
 from kaggriculture.learn.toad.lightning import (
     ToadLightningModule,
@@ -23,6 +23,7 @@ from kaggriculture.learn.toad.lightning import (
     round_decay,
 )
 from kaggriculture.learn.toad.model import PolicyOutput, PolicyState, StatefulPolicy
+from kaggriculture.learn.toad.population import LoadedTeacher
 from tests.learn.test_toad_control_fixture import (
     _assert_state_equal,
     control_fixture_batch,
@@ -51,6 +52,43 @@ def _one_batch_loader(fixture: dict[str, object]) -> DataLoader[LearnerBatch]:
         _BatchDataset(control_fixture_batch(fixture)),
         batch_size=None,
         num_workers=0,
+    )
+
+
+def _loaded_teacher(
+    policy: toad.Policy,
+    config: ToadConfig,
+    *,
+    operation: bool = True,
+    quantity: bool = False,
+    market: bool = True,
+    value: bool = False,
+) -> LoadedTeacher:
+    """Pair a real frozen policy with an explicit in-memory test contract."""
+    policy.requires_grad_(False).eval()
+    heads = tuple(
+        name
+        for name, declared in (
+            ("operation", operation),
+            ("quantity", quantity),
+            ("market", market),
+            ("value", value),
+        )
+        if declared
+    )
+    return LoadedTeacher(
+        policy=policy,
+        spec=TeacherSpec(
+            checkpoint=Path("teacher.pt"),
+            sha256="0" * 64,
+            blocks=config.model.blocks,
+            operation=operation,
+            quantity=quantity,
+            market=market,
+            value=value,
+        ),
+        model=config.model,
+        actual_heads=heads,
     )
 
 
@@ -519,6 +557,210 @@ def test_lightning_training_step_matches_control_fixture(tmp_path: Path) -> None
         assert scheduler.get_last_lr() == fixture["scheduler_last_lr"]
 
 
+def test_teacher_loss_reports_each_raw_and_weighted_declared_head() -> None:
+    """A single aggregate cannot conceal a wrong head or coefficient."""
+    fixture = load_control_fixture()
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 0.25})
+        }
+    )
+    learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    torch.manual_seed(17)
+    teacher_policy = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    teacher = _loaded_teacher(
+        teacher_policy,
+        config,
+        operation=True,
+        quantity=False,
+        market=True,
+        value=False,
+    )
+
+    report = compute_loss(learner, control_fixture_batch(fixture), config, teacher)
+
+    assert report.terms["teacher/operation_kl"].item() > 0.0
+    assert report.terms["teacher/market_kl"].item() > 0.0
+    assert report.terms["teacher/quantity_kl"].item() == 0.0
+    assert report.terms["teacher/value"].item() == 0.0
+    torch.testing.assert_close(
+        report.terms["teacher/operation_kl_weighted"],
+        report.terms["teacher/operation_kl"] * 0.25,
+    )
+    torch.testing.assert_close(
+        report.terms["teacher/market_kl_weighted"],
+        report.terms["teacher/market_kl"] * 0.25,
+    )
+    torch.testing.assert_close(
+        report.terms["teacher"],
+        report.terms["teacher/operation_kl_weighted"]
+        + report.terms["teacher/market_kl_weighted"],
+    )
+
+
+def test_round_log_reports_each_raw_and_weighted_teacher_term() -> None:
+    """Dashboard records must preserve the declared-head loss breakdown."""
+    fixture = load_control_fixture()
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "optimizer": base.optimizer.model_copy(
+                update={"teacher_kl_cost": 0.25, "teacher_baseline_cost": 0.5}
+            )
+        }
+    )
+    learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    teacher = _loaded_teacher(
+        toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND),
+        config,
+        quantity=True,
+        value=True,
+    )
+    report = compute_loss(learner, control_fixture_batch(fixture), config, teacher)
+    module = ToadLightningModule(base)
+    module._round_fresh_terms = [report.terms]
+    module._round_baselines = [report.terms["baseline"]]
+
+    record = module._round_log_record()
+
+    for name in (
+        "teacher/operation_kl",
+        "teacher/operation_kl_weighted",
+        "teacher/quantity_kl",
+        "teacher/quantity_kl_weighted",
+        "teacher/market_kl",
+        "teacher/market_kl_weighted",
+        "teacher/value",
+        "teacher/value_weighted",
+    ):
+        torch.testing.assert_close(cast(torch.Tensor, record[name]), report.terms[name])
+
+
+def test_declared_quantity_and_value_alignment_have_independent_weights() -> None:
+    """Policy KL and teacher baseline alignment use their own typed costs."""
+    fixture = load_control_fixture()
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "optimizer": base.optimizer.model_copy(
+                update={"teacher_kl_cost": 0.25, "teacher_baseline_cost": 0.5}
+            )
+        }
+    )
+    learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    teacher = _loaded_teacher(
+        toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND),
+        config,
+        operation=False,
+        quantity=True,
+        market=False,
+        value=True,
+    )
+
+    report = compute_loss(learner, control_fixture_batch(fixture), config, teacher)
+
+    assert report.terms["teacher/quantity_kl"].item() > 0.0
+    assert report.terms["teacher/value"].item() > 0.0
+    assert report.terms["teacher/operation_kl"].item() == 0.0
+    assert report.terms["teacher/market_kl"].item() == 0.0
+    torch.testing.assert_close(
+        report.terms["teacher/quantity_kl_weighted"],
+        report.terms["teacher/quantity_kl"] * 0.25,
+    )
+    torch.testing.assert_close(
+        report.terms["teacher/value_weighted"],
+        report.terms["teacher/value"] * 0.5,
+    )
+    torch.testing.assert_close(
+        report.total,
+        report.terms["vtrace_pg"]
+        + report.terms["upgo_pg"]
+        + report.terms["baseline"]
+        + report.terms["entropy"]
+        + report.terms["teacher"]
+        + report.terms["teacher/value_weighted"],
+    )
+
+
+def test_teacher_distill_retains_rl_losses_and_matches_normal_teacher_routing() -> None:
+    """The batch kind adds teacher semantics without becoming teacher-only."""
+    fixture = load_control_fixture()
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={
+            "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 0.25})
+        }
+    )
+    learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    teacher = _loaded_teacher(
+        toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND),
+        config,
+        quantity=True,
+    )
+    normal_batch = control_fixture_batch(fixture)
+    teacher_batch = replace(normal_batch, kind=BatchKind.TEACHER_DISTILL)
+
+    normal = compute_loss(learner, normal_batch, config, teacher)
+    distill = compute_loss(learner, teacher_batch, config, teacher)
+
+    for name in (
+        "vtrace_pg",
+        "upgo_pg",
+        "baseline",
+        "entropy",
+        "teacher/operation_kl",
+        "teacher/quantity_kl",
+        "teacher/market_kl",
+        "teacher",
+        "total",
+    ):
+        assert torch.equal(distill.terms[name], normal.terms[name]), name
+    assert distill.terms["baseline"].item() != 0.0
+    assert distill.terms["entropy"].item() != 0.0
+
+
+def test_mixed_teacher_distill_loss_uses_segment_provenance() -> None:
+    """Teacher-only routing in a mixed batch cannot reach unrelated segments."""
+    fixture = load_control_fixture()
+    base = control_fixture_config()
+    config = base.model_copy(
+        update={"optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0})}
+    )
+    learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    teacher = _loaded_teacher(
+        toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND),
+        config,
+        quantity=True,
+    )
+    batch = control_fixture_batch(fixture)
+    kinds = (BatchKind.TEACHER_DISTILL,) + (BatchKind.SELFPLAY,) * (
+        len(batch.segments) - 1
+    )
+    mixed = replace(batch, kind=BatchKind.MIXED, segment_kinds=kinds)
+    teacher_only = replace(
+        batch,
+        segments=(batch.segments[0],),
+        kind=BatchKind.TEACHER_DISTILL,
+        segment_kinds=(BatchKind.TEACHER_DISTILL,),
+    )
+
+    mixed_report = compute_loss(learner, mixed, config, teacher)
+    teacher_report = compute_loss(learner, teacher_only, config, teacher)
+
+    for name in (
+        "teacher/operation_kl",
+        "teacher/quantity_kl",
+        "teacher/market_kl",
+    ):
+        torch.testing.assert_close(mixed_report.terms[name], teacher_report.terms[name])
+
+
 def test_compute_loss_honors_baseline_only_and_optional_teacher() -> None:
     """Warmup must isolate the value loss while the declared teacher path works."""
     fixture = load_control_fixture()
@@ -583,7 +825,13 @@ def test_module_loads_frozen_typed_teacher_and_uses_it(
     config = base.model_copy(
         update={
             "population": base.population.model_copy(
-                update={"teacher_checkpoint": checkpoint, "teacher_blocks": 1}
+                update={
+                    "teacher": TeacherSpec(
+                        checkpoint=checkpoint,
+                        blocks=1,
+                        quantity=False,
+                    )
+                }
             ),
             "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0}),
         }
@@ -601,7 +849,9 @@ def test_module_loads_frozen_typed_teacher_and_uses_it(
 
     assert module.teacher is not None
     assert len(module.teacher.policy.blocks) == 1
-    assert not module.teacher.quantity
+    assert not module.teacher.spec.quantity
+    assert module.teacher.spec.sha256 is not None
+    assert module.config.population.teacher == module.teacher.spec
     assert not module.teacher.policy.training
     assert not any(
         parameter.requires_grad for parameter in module.teacher.policy.parameters()
@@ -638,7 +888,13 @@ def test_module_loads_policy_from_lightning_checkpoint_envelopes(
     teacher = base.model_copy(
         update={
             "population": base.population.model_copy(
-                update={"teacher_checkpoint": checkpoint, "teacher_blocks": 1}
+                update={
+                    "teacher": TeacherSpec(
+                        checkpoint=checkpoint,
+                        blocks=1,
+                        quantity=True,
+                    )
+                }
             ),
             "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0}),
         }

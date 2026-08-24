@@ -7,6 +7,7 @@ schedule silently restarted from step zero restores the initial rate and changes
 the recipe for the remainder of the run without anything looking wrong.
 """
 
+import hashlib
 import itertools
 import pathlib
 import random
@@ -191,7 +192,7 @@ def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> N
         "actor_version": 3,
         "actor_source_global_step": 17,
         "warmup_remaining": 8,
-        "teacher": {"present": False, "blocks": None, "quantity": None},
+        "teacher": {"present": False},
     }
 
 
@@ -744,7 +745,7 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(  # noqa
     assert checkpoint["global_step"] == 4
     assert checkpoint["optimizer_states"]
     assert checkpoint["lr_schedulers"]
-    assert checkpoint_toad["config"] == config.model_dump(mode="json")
+    assert checkpoint_toad["config"] == split_module.config.model_dump(mode="json")
     assert checkpoint_toad["fingerprint"] == structural_fingerprint(config)
     assert checkpoint_toad["environment_steps"] == 64
     assert checkpoint_toad["collection_round"] == 2
@@ -758,8 +759,22 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(  # noqa
     assert checkpoint_toad["warmup_remaining"] == 4
     assert checkpoint_toad["teacher"] == {
         "present": True,
-        "blocks": 1,
-        "quantity": True,
+        "checkpoint": str(teacher_path),
+        "sha256": hashlib.sha256(teacher_path.read_bytes()).hexdigest(),
+        "topology": {
+            "blocks": 1,
+            "channels": 4,
+            "kernel_size": 3,
+            "activation": "relu",
+            "value_bound": 1.0,
+        },
+        "declared_heads": {
+            "operation": True,
+            "quantity": False,
+            "market": True,
+            "value": False,
+        },
+        "actual_heads": ["operation", "market"],
     }
     assert checkpoint_data["next_game_id"] == 2
     assert checkpoint_data["published_actor_version"] == published_actor_version

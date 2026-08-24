@@ -107,8 +107,9 @@ def test_all_active_legacy_semantics_reach_typed_config(
     assert config.curriculum.reward_field == "margin"
     assert config.curriculum.money_weight == pytest.approx(0.01)
     assert config.curriculum.warm_start_checkpoint == warm_start
-    assert config.population.teacher_checkpoint == teacher
-    assert config.population.teacher_blocks == 1
+    assert config.population.teacher is not None
+    assert config.population.teacher.checkpoint == teacher
+    assert config.population.teacher.blocks == 1
 
 
 def test_build_trainer_uses_environment_budget_and_boundary_callbacks(

@@ -102,7 +102,11 @@ def _allocation_config(
                 "scripted": scripted,
                 "frozen_opponent": frozen,
                 "teacher_distill": teacher,
-                "teacher_checkpoint": teacher_checkpoint,
+                "teacher": (
+                    {"checkpoint": teacher_checkpoint}
+                    if teacher_checkpoint is not None
+                    else None
+                ),
                 "environments_per_rank": environments,
                 "snapshot_at_start": frozen > 0,
             }
@@ -934,8 +938,7 @@ def test_teacher_distill_source_materializes_real_checkpoint_provenance(
                 "selfplay": 0.0,
                 "scripted": 0.0,
                 "teacher_distill": 1.0,
-                "teacher_checkpoint": checkpoint,
-                "teacher_blocks": 1,
+                "teacher": {"checkpoint": checkpoint, "blocks": 1},
                 "environments_per_rank": 1,
             },
         }

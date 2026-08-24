@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from kaggriculture.learn.scripts import curriculum, toad
 from kaggriculture.learn.toad.callbacks import ActorSyncCallback
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.config import TeacherSpec, ToadConfig
 from kaggriculture.learn.toad.data import (
     BatchKind,
     CollectionAssignment,
@@ -274,7 +274,6 @@ def test_mixed_full_round_matches_legacy_parameters_adam_and_lr(
         ({"optimizer": {"vtrace_pg_cost": 0.5}}, "vtrace_pg_cost"),
         ({"optimizer": {"upgo_pg_cost": 0.5}}, "upgo_pg_cost"),
         ({"optimizer": {"baseline_cost": 0.5}}, "baseline_cost"),
-        ({"optimizer": {"teacher_baseline_cost": 0.5}}, "teacher_baseline_cost"),
     ],
 )
 def test_foundation_rejects_accepted_but_unimplemented_controls(
@@ -333,7 +332,13 @@ def test_resume_checks_teacher_topology_and_valid_heads(tmp_path: Path) -> None:
     config = base.model_copy(
         update={
             "population": base.population.model_copy(
-                update={"teacher_checkpoint": path, "teacher_blocks": 1}
+                update={
+                    "teacher": TeacherSpec(
+                        checkpoint=path,
+                        blocks=1,
+                        quantity=True,
+                    )
+                }
             ),
             "optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0}),
         }
@@ -344,7 +349,8 @@ def test_resume_checks_teacher_topology_and_valid_heads(tmp_path: Path) -> None:
     teacher_meta = cast(
         dict[str, object], cast(dict[str, object], checkpoint["toad"])["teacher"]
     )
-    teacher_meta["quantity"] = False
+    declared_heads = cast(dict[str, object], teacher_meta["declared_heads"])
+    declared_heads["quantity"] = False
     restored = ToadLightningModule(config)
 
     with pytest.raises(ResumeConfigError, match="teacher metadata mismatch"):

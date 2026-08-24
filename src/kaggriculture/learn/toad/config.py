@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, Self, Sequence, cast
 
@@ -106,6 +107,20 @@ class ModelConfig(BaseModel):
         return self
 
 
+class TeacherSpec(BaseModel):
+    """Immutable provenance, topology override, and valid heads for one teacher."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    checkpoint: Path
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    blocks: PositiveInt | None = None
+    operation: bool = True
+    quantity: bool = False
+    market: bool = True
+    value: bool = False
+
+
 class PopulationConfig(BaseModel):
     """Actor population and opponent-pool settings."""
 
@@ -116,8 +131,7 @@ class PopulationConfig(BaseModel):
     frozen_opponent: float = 0.0
     teacher_distill: float = 0.0
     scripted_opponent: str = "economic"
-    teacher_checkpoint: Path | None = None
-    teacher_blocks: PositiveInt | None = None
+    teacher: TeacherSpec | None = None
     actor_sync_every_rounds: PositiveInt = 4
     environments_per_rank: PositiveInt = 24
     collection_processes: PositiveInt = 24
@@ -128,6 +142,31 @@ class PopulationConfig(BaseModel):
     pool_sampling: Literal["uniform"] = "uniform"
     pool_replacement: Literal["oldest"] = "oldest"
     population_seed: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_teacher(cls, payload: object) -> object:
+        """Atomically migrate the one-release path/depth teacher input pair."""
+        if not isinstance(payload, Mapping):
+            return payload
+        migrated = dict(payload)
+        legacy_fields = {"teacher_checkpoint", "teacher_blocks"}.intersection(migrated)
+        if "teacher" in migrated and legacy_fields:
+            fields = ", ".join(sorted(legacy_fields))
+            raise ValueError(
+                "population.teacher conflicts with legacy teacher fields: " + fields
+            )
+        if not legacy_fields:
+            return migrated
+        checkpoint = migrated.pop("teacher_checkpoint", None)
+        blocks = migrated.pop("teacher_blocks", None)
+        if checkpoint is None:
+            if blocks is not None:
+                raise ValueError("teacher_blocks requires teacher_checkpoint")
+            migrated["teacher"] = None
+        else:
+            migrated["teacher"] = {"checkpoint": checkpoint, "blocks": blocks}
+        return migrated
 
 
 class OptimizerConfig(BaseModel):
@@ -219,7 +258,7 @@ class ToadConfig(BaseModel):
         return cls()
 
     @model_validator(mode="after")
-    def validate_relationships(self, info: ValidationInfo) -> Self:
+    def validate_relationships(self, info: ValidationInfo) -> Self:  # noqa: C901
         """Reject combinations unsupported by the native trainer."""
         probabilities = (
             self.population.selfplay,
@@ -235,15 +274,17 @@ class ToadConfig(BaseModel):
             )
         _validate_foundation_optimizer(self.optimizer)
         if (
-            self.optimizer.teacher_kl_cost or self.population.teacher_distill
-        ) and self.population.teacher_checkpoint is None:
+            self.optimizer.teacher_kl_cost
+            or self.optimizer.teacher_baseline_cost
+            or self.population.teacher_distill
+        ) and self.population.teacher is None:
             raise ValueError(
                 "teacher checkpoint is required by teacher loss or batches"
             )
         historical = bool(info.context and info.context.get("historical"))
-        if self.population.teacher_checkpoint is not None and not historical:
+        if self.population.teacher is not None and not historical:
             _require_readable(
-                self.population.teacher_checkpoint,
+                self.population.teacher.checkpoint,
                 label="teacher checkpoint",
             )
             if self.model.kernel_size != 3 or self.model.activation != "relu":
@@ -251,6 +292,30 @@ class ToadConfig(BaseModel):
                     "teacher checkpoints require the default kernel and activation "
                     "because teacher trunk semantics are not separately declared"
                 )
+        if (
+            self.optimizer.teacher_baseline_cost
+            and self.population.teacher is not None
+            and not self.population.teacher.value
+        ):
+            raise ValueError(
+                "teacher_baseline_cost requires a declared teacher value head"
+            )
+        if (
+            self.population.teacher is not None
+            and self.population.teacher.value
+            and any(
+                (
+                    self.model.recurrent,
+                    self.model.transformer,
+                    self.model.local_patch,
+                    self.model.belief,
+                    self.model.interaction_value,
+                )
+            )
+        ):
+            raise ValueError(
+                "teacher value alignment requires compatible control value semantics"
+            )
         if not historical:
             for snapshot in self.population.initial_snapshots:
                 _require_readable(snapshot, label="initial snapshot")
@@ -275,7 +340,6 @@ class ToadConfig(BaseModel):
 def _validate_foundation_optimizer(optimizer: OptimizerConfig) -> None:
     """Reject loss coefficients whose native consumers do not exist yet."""
     unsupported = {
-        "teacher_baseline_cost": (optimizer.teacher_baseline_cost, 0.0),
         "vtrace_pg_cost": (optimizer.vtrace_pg_cost, 1.0),
         "upgo_pg_cost": (optimizer.upgo_pg_cost, 1.0),
         "baseline_cost": (optimizer.baseline_cost, 1.0),

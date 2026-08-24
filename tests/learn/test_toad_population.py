@@ -8,7 +8,8 @@ import pytest
 import torch
 from pydantic import ValidationError
 
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.model import Policy
+from kaggriculture.learn.toad.config import ModelConfig, TeacherSpec, ToadConfig
 from kaggriculture.learn.toad.population import (
     EmptySnapshotPoolError,
     SnapshotEntry,
@@ -16,6 +17,8 @@ from kaggriculture.learn.toad.population import (
     SnapshotManifest,
     SnapshotPool,
     SnapshotStore,
+    TeacherCompatibilityError,
+    load_teacher,
     sha256_file,
 )
 
@@ -23,6 +26,198 @@ from kaggriculture.learn.toad.population import (
 def state_dict(value: float = 1.0) -> dict[str, torch.Tensor]:
     """Return a small real torch state dictionary with a distinct payload."""
     return {"weight": torch.tensor([value])}
+
+
+def _teacher_state(*, quantity: bool = True) -> dict[str, torch.Tensor]:
+    """Return a small real teacher state with an optionally absent head."""
+    state = Policy(blocks=1, channels=4, value_bound=1.0).state_dict()
+    return {
+        name: tensor
+        for name, tensor in state.items()
+        if quantity or not name.startswith("quantity_head.")
+    }
+
+
+def test_teacher_cannot_claim_a_missing_quantity_head(tmp_path: Path) -> None:
+    """A declared head may never retain random constructor parameters."""
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(_teacher_state(quantity=False), checkpoint)
+    spec = TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=True)
+
+    with pytest.raises(TeacherCompatibilityError, match="quantity_head"):
+        load_teacher(spec, ModelConfig.control(blocks=1, channels=4))
+
+
+def test_teacher_accepts_a_completely_absent_undeclared_quantity_head(
+    tmp_path: Path,
+) -> None:
+    """Historical teachers remain usable only under an explicit false claim."""
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(_teacher_state(quantity=False), checkpoint)
+
+    loaded = load_teacher(
+        TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=False),
+        ModelConfig.control(blocks=1, channels=4),
+    )
+
+    assert loaded.spec.quantity is False
+    assert loaded.spec.sha256 == sha256_file(checkpoint)
+    assert not loaded.policy.training
+    assert not any(parameter.requires_grad for parameter in loaded.policy.parameters())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_shared", "stem[.]weight"),
+        ("unexpected", "unexpected keys"),
+        ("partial_head", "incomplete quantity_head"),
+        ("shape", "shape mismatch.*stem[.]weight"),
+    ],
+)
+def test_teacher_rejects_malformed_or_structurally_incompatible_state(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    """Only a complete declared topology may become a frozen teacher."""
+    state = _teacher_state()
+    if mutation == "missing_shared":
+        del state["stem.weight"]
+    elif mutation == "unexpected":
+        state["foreign.weight"] = torch.ones(1)
+    elif mutation == "partial_head":
+        del state["quantity_head.bias"]
+    else:
+        state["stem.weight"] = state["stem.weight"][:1]
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(state, checkpoint)
+
+    with pytest.raises(TeacherCompatibilityError, match=message):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=False),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
+def test_teacher_rejects_a_declared_digest_mismatch(tmp_path: Path) -> None:
+    """A path can never silently replace the bytes named by its contract."""
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(_teacher_state(), checkpoint)
+
+    with pytest.raises(TeacherCompatibilityError, match="digest.*expected"):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1, sha256="0" * 64),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
+def test_teacher_rejects_mixed_checkpoint_envelopes(tmp_path: Path) -> None:
+    """Neither of two plausible policy containers may win by branch order."""
+    state = _teacher_state()
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(
+        {
+            "learner": state,
+            "state_dict": {f"policy.{name}": value for name, value in state.items()},
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(TeacherCompatibilityError, match="mixed.*layout"):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=True),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
+@pytest.mark.parametrize("envelope", ["learner", "state_dict"])
+def test_teacher_rejects_bare_weights_mixed_with_an_envelope(
+    tmp_path: Path, envelope: str
+) -> None:
+    """Envelope selection cannot silently discard a second plausible policy."""
+    state = _teacher_state()
+    nested = (
+        state
+        if envelope == "learner"
+        else {f"policy.{name}": value for name, value in state.items()}
+    )
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save({**state, envelope: nested}, checkpoint)
+
+    with pytest.raises(TeacherCompatibilityError, match="mixed.*layout"):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=True),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
+@pytest.mark.parametrize("payload", [[], {"learner": []}, {"state_dict": []}])
+def test_teacher_rejects_malformed_non_mapping_policy_payloads(
+    tmp_path: Path, payload: object
+) -> None:
+    """Malformed historical containers fail as compatibility errors."""
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(TeacherCompatibilityError, match="mapping"):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
+def test_teacher_wraps_a_corrupt_serialized_checkpoint(tmp_path: Path) -> None:
+    """Unreadable bytes fail through the stable teacher compatibility API."""
+    checkpoint = tmp_path / "teacher.pt"
+    checkpoint.write_bytes(b"not a torch checkpoint")
+
+    with pytest.raises(TeacherCompatibilityError, match="cannot be loaded"):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
+@pytest.mark.parametrize("layout", ["bare", "learner", "lightning"])
+def test_teacher_loads_each_explicit_historical_policy_envelope_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """Envelope extraction must not deserialize the teacher a second time."""
+    state = _teacher_state()
+    checkpoint = tmp_path / "teacher.pt"
+    if layout == "bare":
+        payload: object = state
+    elif layout == "learner":
+        payload = {"learner": state, "steps": 1}
+    else:
+        payload = {
+            "state_dict": {
+                **{f"policy.{name}": value for name, value in state.items()},
+                "teacher_policy.ignored": torch.ones(1),
+            }
+        }
+    torch.save(payload, checkpoint)
+    calls: list[tuple[Path, bool | None]] = []
+    real_load = torch.load
+
+    def counted_load(path: Path, *, map_location: str, weights_only: bool) -> object:
+        calls.append((path, weights_only))
+        return real_load(
+            path,
+            map_location=map_location,
+            weights_only=weights_only,
+        )
+
+    monkeypatch.setattr(torch, "load", counted_load)
+
+    loaded = load_teacher(
+        TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=True),
+        ModelConfig.control(blocks=1, channels=4),
+    )
+
+    assert loaded.actual_heads == ("operation", "quantity", "market")
+    assert calls == [(checkpoint, True)]
 
 
 def test_initial_population_checkpoint_must_be_readable(tmp_path: Path) -> None:

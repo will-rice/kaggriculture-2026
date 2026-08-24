@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.config import (
+    TeacherSpec,
     ToadConfig,
     apply_overrides,
     load_config,
@@ -47,11 +48,82 @@ def test_teacher_checkpoint_must_be_a_readable_file(tmp_path: Path) -> None:
     checkpoint.touch()
 
     config = ToadConfig(
-        population={"teacher_checkpoint": checkpoint},
+        population={"teacher": {"checkpoint": checkpoint}},
         optimizer={"teacher_kl_cost": 0.1},
     )
 
-    assert config.population.teacher_checkpoint == checkpoint
+    assert config.population.teacher == TeacherSpec(checkpoint=checkpoint)
+
+
+def test_legacy_teacher_path_and_blocks_migrate_atomically(tmp_path: Path) -> None:
+    """One-release inputs become one immutable teacher rather than parallel fields."""
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.touch()
+
+    config = ToadConfig(
+        population={"teacher_checkpoint": checkpoint, "teacher_blocks": 16},
+        optimizer={"teacher_kl_cost": 0.1},
+    )
+
+    assert config.population.teacher == TeacherSpec(
+        checkpoint=checkpoint,
+        blocks=16,
+    )
+    assert "teacher_checkpoint" not in config.population.model_dump()
+    assert "teacher_blocks" not in config.population.model_dump()
+
+
+def test_new_and_legacy_teacher_contracts_conflict(tmp_path: Path) -> None:
+    """Ambiguous dual teacher sources fail before either source can win."""
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.touch()
+
+    with pytest.raises(ValidationError, match="teacher.*conflicts.*teacher_checkpoint"):
+        ToadConfig(
+            population={
+                "teacher": {"checkpoint": checkpoint},
+                "teacher_checkpoint": checkpoint,
+            },
+            optimizer={"teacher_kl_cost": 0.1},
+        )
+
+
+def test_teacher_spec_is_frozen_and_forbids_unknown_semantics(tmp_path: Path) -> None:
+    """The serialized teacher contract cannot drift after validation."""
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.touch()
+    spec = TeacherSpec(checkpoint=checkpoint)
+
+    with pytest.raises(ValidationError, match="frozen"):
+        spec.quantity = True  # ty: ignore[invalid-assignment]
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        TeacherSpec(checkpoint=checkpoint, unknown=True)  # ty: ignore[unknown-argument]
+
+
+def test_teacher_value_cost_requires_declared_compatible_value_semantics(
+    tmp_path: Path,
+) -> None:
+    """Value alignment cannot compare differently structured value functions."""
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.touch()
+
+    accepted = ToadConfig(
+        population={"teacher": {"checkpoint": checkpoint, "value": True}},
+        optimizer={"teacher_baseline_cost": 0.5},
+    )
+    assert accepted.optimizer.teacher_baseline_cost == 0.5
+
+    with pytest.raises(ValidationError, match="requires a declared teacher value"):
+        ToadConfig(
+            population={"teacher": {"checkpoint": checkpoint}},
+            optimizer={"teacher_baseline_cost": 0.5},
+        )
+    with pytest.raises(ValidationError, match="compatible control value"):
+        ToadConfig(
+            model={"interaction_value": True},
+            population={"teacher": {"checkpoint": checkpoint, "value": True}},
+            optimizer={"teacher_baseline_cost": 0.5},
+        )
 
 
 @pytest.mark.parametrize("model", [{"kernel_size": 5}, {"activation": "leaky_relu"}])
@@ -65,7 +137,7 @@ def test_teacher_rejects_ambiguous_nondefault_trunk_semantics(
     with pytest.raises(ValidationError, match="teacher.*default kernel.*activation"):
         ToadConfig(
             model=model,
-            population={"teacher_checkpoint": checkpoint},
+            population={"teacher": {"checkpoint": checkpoint}},
             optimizer={"teacher_kl_cost": 0.1},
         )
 

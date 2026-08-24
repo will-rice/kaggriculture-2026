@@ -40,6 +40,7 @@ from kaggriculture.learn.toad.config import (
     OptimizerConfig,
     PopulationConfig,
     RuntimeConfig,
+    TeacherSpec,
     ToadConfig,
     apply_overrides,
 )
@@ -296,8 +297,14 @@ def phase_config(phase: Phase) -> ToadConfig:
             teacher_kl_cost=phase.teacher_kl_cost,
         ),
         population=PopulationConfig(
-            teacher_checkpoint=teacher,
-            teacher_blocks=_teacher_blocks(phase) if teacher is not None else None,
+            teacher=(
+                TeacherSpec(
+                    checkpoint=teacher,
+                    blocks=_teacher_blocks(phase),
+                )
+                if teacher is not None
+                else None
+            ),
         ),
         runtime=RuntimeConfig(
             total_environment_steps=phase.steps,

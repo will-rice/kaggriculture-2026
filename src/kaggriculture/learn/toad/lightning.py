@@ -35,6 +35,7 @@ from kaggriculture.learn.toad.model import (
     StatefulPolicy,
     uses_stateful_policy,
 )
+from kaggriculture.learn.toad.population import LoadedTeacher, load_teacher
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
@@ -216,11 +217,11 @@ def assert_resume_compatible(effective: ToadConfig, stored: ToadConfig) -> None:
         raise ResumeConfigError(f"structural config mismatch: {rendered}")
 
 
-def compute_loss(
+def compute_loss(  # noqa: C901
     policy: PolicyLike,
     batch: LearnerBatch,
     config: ToadConfig,
-    teacher: Teacher | None = None,
+    teacher: LoadedTeacher | Teacher | None = None,
     *,
     baseline_only: bool | None = None,
     _losses: Callable[..., toad_loss.Losses] = toad_loss.losses,
@@ -335,25 +336,92 @@ def compute_loss(
         + entropy_of(market, flat_market_masks).sum(dim=-1)
     ).view(turns, width)
 
+    zero = values.sum() * 0.0
+    teacher_raw = {
+        "operation_kl": zero,
+        "quantity_kl": zero,
+        "market_kl": zero,
+        "value": zero,
+    }
     teacher_kl = None
     if teacher is not None:
+        declared = (
+            {
+                "operation": teacher.spec.operation,
+                "quantity": teacher.spec.quantity,
+                "market": teacher.spec.market,
+                "value": teacher.spec.value,
+            }
+            if isinstance(teacher, LoadedTeacher)
+            else {
+                "operation": True,
+                "quantity": teacher.quantity,
+                "market": True,
+                "value": False,
+            }
+        )
         with torch.no_grad():
-            teacher_units, teacher_quantity, teacher_market, _ = teacher.policy(
-                board.flatten(0, 1),
-                scalars.flatten(0, 1),
-                positions.flatten(0, 1),
+            teacher_units, teacher_quantity, teacher_market, teacher_values = (
+                teacher.policy(
+                    board.flatten(0, 1),
+                    scalars.flatten(0, 1),
+                    positions.flatten(0, 1),
+                )
             )
-        teacher_kl = _kl(
-            units, _acted(teacher_units, turns, width), flat_unit_masks
-        ).view(turns, width) + _kl(
-            market, _acted(teacher_market, turns, width), flat_market_masks
-        ).view(turns, width)
-        if teacher.quantity:
-            teacher_kl = teacher_kl + _kl(
-                quantities,
-                _acted(teacher_quantity, turns, width),
-                flat_quantity_masks,
+        if batch.segment_kinds:
+            if len(batch.segment_kinds) != width:
+                raise ValueError("segment_kinds must align exactly with batch segments")
+            distill_columns = torch.tensor(
+                [kind is BatchKind.TEACHER_DISTILL for kind in batch.segment_kinds],
+                dtype=torch.bool,
+                device=values.device,
+            )
+            teacher_columns = (
+                distill_columns
+                if distill_columns.any()
+                else torch.ones_like(distill_columns)
+            )
+        elif batch.kind is BatchKind.MIXED:
+            raise ValueError("mixed teacher loss requires per-segment kind provenance")
+        else:
+            teacher_columns = torch.ones(width, dtype=torch.bool, device=values.device)
+
+        teacher_kl = torch.zeros(
+            turns, width, dtype=torch.float32, device=values.device
+        )
+
+        def head_kl(
+            learner_log_probs: torch.Tensor,
+            teacher_head_logits: torch.Tensor,
+            mask: torch.Tensor,
+        ) -> torch.Tensor:
+            per_step = _kl(
+                learner_log_probs.float(),
+                _acted(teacher_head_logits, turns, width).float(),
+                mask,
             ).view(turns, width)
+            return per_step.masked_fill(~teacher_columns.unsqueeze(0), 0.0)
+
+        if declared["operation"]:
+            operation_kl = head_kl(units, teacher_units, flat_unit_masks)
+            teacher_raw["operation_kl"] = toad_loss.reduce(operation_kl)
+            teacher_kl = teacher_kl + operation_kl
+        if declared["quantity"]:
+            quantity_kl = head_kl(quantities, teacher_quantity, flat_quantity_masks)
+            teacher_raw["quantity_kl"] = toad_loss.reduce(quantity_kl)
+            teacher_kl = teacher_kl + quantity_kl
+        if declared["market"]:
+            market_kl = head_kl(market, teacher_market, flat_market_masks)
+            teacher_raw["market_kl"] = toad_loss.reduce(market_kl)
+            teacher_kl = teacher_kl + market_kl
+        if declared["value"]:
+            acted_teacher_values = _acted(
+                teacher_values.unsqueeze(-1), turns, width
+            ).view(turns, width)
+            value_error = functional.smooth_l1_loss(
+                values.float(), acted_teacher_values.float(), reduction="none"
+            ).masked_fill(~teacher_columns.unsqueeze(0), 0.0)
+            teacher_raw["value"] = toad_loss.reduce(value_error)
 
     loss = _losses(
         behaviour_log_probs=behaviour,
@@ -371,20 +439,38 @@ def compute_loss(
         lmb=config.optimizer.lmb,
     )
     total = loss.total
+    teacher_weighted = {
+        "operation_kl": config.optimizer.teacher_kl_cost * teacher_raw["operation_kl"],
+        "quantity_kl": config.optimizer.teacher_kl_cost * teacher_raw["quantity_kl"],
+        "market_kl": config.optimizer.teacher_kl_cost * teacher_raw["market_kl"],
+        "value": config.optimizer.teacher_baseline_cost * teacher_raw["value"],
+    }
+    total = total + teacher_weighted["value"]
     if belief_enabled:
         total = total + config.model.belief_loss_weight * belief_terms["belief"]
-    return LossReport(
-        total=total,
-        terms={
-            "vtrace_pg": loss.vtrace_pg,
-            "upgo_pg": loss.upgo_pg,
-            "baseline": loss.baseline,
-            "entropy": loss.entropy,
-            "teacher": loss.teacher,
-            **belief_terms,
-            "total": total,
-        },
-    )
+    terms = {
+        "vtrace_pg": loss.vtrace_pg,
+        "upgo_pg": loss.upgo_pg,
+        "baseline": loss.baseline,
+        "entropy": loss.entropy,
+        "teacher": loss.teacher,
+        **belief_terms,
+        "total": total,
+    }
+    if teacher is not None:
+        terms.update(
+            {
+                "teacher/operation_kl": teacher_raw["operation_kl"],
+                "teacher/operation_kl_weighted": teacher_weighted["operation_kl"],
+                "teacher/quantity_kl": teacher_raw["quantity_kl"],
+                "teacher/quantity_kl_weighted": teacher_weighted["quantity_kl"],
+                "teacher/market_kl": teacher_raw["market_kl"],
+                "teacher/market_kl_weighted": teacher_weighted["market_kl"],
+                "teacher/value": teacher_raw["value"],
+                "teacher/value_weighted": teacher_weighted["value"],
+            }
+        )
+    return LossReport(total=total, terms=terms)
 
 
 def round_decay(config: ToadConfig) -> Callable[[int], float]:
@@ -422,23 +508,16 @@ class ToadLightningModule(lightning.LightningModule):
                 self.policy, config.curriculum.warm_start_checkpoint
             )
         self.teacher_policy: Policy | None = None
-        self.teacher: Teacher | None = None
-        if config.population.teacher_checkpoint is not None:
-            from kaggriculture.learn.scripts.toad import Teacher
-
-            self.teacher_policy = Policy(
-                blocks=config.population.teacher_blocks or config.model.blocks,
-                channels=config.model.channels,
-                value_bound=config.model.value_bound,
-            )
-            missing = load_checkpoint_policy(
-                self.teacher_policy, config.population.teacher_checkpoint
-            )
-            self.teacher_policy.eval()
-            self.teacher_policy.requires_grad_(False)
-            self.teacher = Teacher(
-                policy=self.teacher_policy,
-                quantity=not any(name.startswith("quantity_head.") for name in missing),
+        self.teacher: LoadedTeacher | None = None
+        if config.population.teacher is not None:
+            self.teacher = load_teacher(config.population.teacher, config.model)
+            self.teacher_policy = self.teacher.policy
+            self.config = config.model_copy(
+                update={
+                    "population": config.population.model_copy(
+                        update={"teacher": self.teacher.spec}
+                    )
+                }
             )
         self.environment_steps = 0
         self.collection_round = 0
@@ -451,7 +530,7 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_baselines: list[torch.Tensor] = []
         self._round_metrics: dict[str, float | int] = {}
         self._round_population = {"selfplay": 0, "scripted": 0}
-        self.save_hyperparameters(config.model_dump(mode="json"))
+        self.save_hyperparameters(self.config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
         """Change learner mode while keeping the frozen teacher in evaluation."""
@@ -545,6 +624,14 @@ class ToadLightningModule(lightning.LightningModule):
             "critic/baseline_passes_self_consistency": baseline_passes,
             "diag/entropy": mean_term("entropy"),
             "diag/teacher_kl": mean_term("teacher"),
+            "teacher/operation_kl": mean_term("teacher/operation_kl"),
+            "teacher/operation_kl_weighted": mean_term("teacher/operation_kl_weighted"),
+            "teacher/quantity_kl": mean_term("teacher/quantity_kl"),
+            "teacher/quantity_kl_weighted": mean_term("teacher/quantity_kl_weighted"),
+            "teacher/market_kl": mean_term("teacher/market_kl"),
+            "teacher/market_kl_weighted": mean_term("teacher/market_kl_weighted"),
+            "teacher/value": mean_term("teacher/value"),
+            "teacher/value_weighted": mean_term("teacher/value_weighted"),
             "loss/belief": mean_term("belief"),
             "belief/shed_error": mean_term("belief_shed"),
             "belief/seeds_error": mean_term("belief_seeds"),
@@ -594,15 +681,7 @@ class ToadLightningModule(lightning.LightningModule):
 
     def _teacher_metadata(self) -> dict[str, object]:
         """Return structural teacher semantics that must survive resume."""
-        return {
-            "present": self.teacher is not None,
-            "blocks": (
-                self.config.population.teacher_blocks or self.config.model.blocks
-                if self.teacher is not None
-                else None
-            ),
-            "quantity": self.teacher.quantity if self.teacher is not None else None,
-        }
+        return {"present": False} if self.teacher is None else self.teacher.metadata()
 
     def on_load_checkpoint(self, checkpoint: dict[str, object]) -> None:
         """Validate structure and restore Toad's logical clocks."""

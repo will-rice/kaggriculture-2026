@@ -562,10 +562,14 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
     payload["population"].update(
         selfplay=1.0 - arguments.econ_fraction,
         scripted=arguments.econ_fraction,
-        teacher_checkpoint=arguments.teacher,
-        teacher_blocks=arguments.teacher_blocks
-        if arguments.teacher is not None
-        else None,
+        teacher=(
+            {
+                "checkpoint": arguments.teacher,
+                "blocks": arguments.teacher_blocks,
+            }
+            if arguments.teacher is not None
+            else None
+        ),
     )
     payload["optimizer"].update(
         lr=arguments.lr,

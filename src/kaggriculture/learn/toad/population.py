@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pickle
 import random
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import torch
 from pydantic import (
@@ -22,6 +24,9 @@ from pydantic import (
     TypeAdapter,
 )
 
+from kaggriculture.learn.model import Policy
+from kaggriculture.learn.toad.config import ModelConfig, TeacherSpec
+
 _EVALUATION = TypeAdapter(dict[str, FiniteFloat])
 _SNAPSHOT_NAME = re.compile(r"^snapshot-(\d{12,})-([0-9a-f]{12})\.pt$")
 
@@ -32,6 +37,218 @@ class SnapshotIntegrityError(RuntimeError):
 
 class EmptySnapshotPoolError(RuntimeError):
     """A collection requested a frozen opponent before any snapshot existed."""
+
+
+class TeacherCompatibilityError(RuntimeError):
+    """A teacher checkpoint does not satisfy its immutable declared contract."""
+
+
+TeacherHead = Literal["operation", "quantity", "market", "value"]
+_TEACHER_HEAD_PREFIXES: dict[TeacherHead, str] = {
+    "operation": "head.",
+    "quantity": "quantity_head.",
+    "market": "trade_head.",
+    "value": "value.",
+}
+_POLICY_KEY_PREFIXES = (
+    "stem.",
+    "market.",
+    "blocks.",
+    *tuple(_TEACHER_HEAD_PREFIXES.values()),
+)
+
+
+@dataclass(frozen=True)
+class LoadedTeacher:
+    """One verified, frozen teacher and its confirmed effective contract."""
+
+    policy: Policy
+    spec: TeacherSpec
+    model: ModelConfig
+    actual_heads: tuple[TeacherHead, ...]
+
+    def metadata(self) -> dict[str, object]:
+        """Return the complete path, digest, topology, and head contract."""
+        return {
+            "present": True,
+            "checkpoint": str(self.spec.checkpoint),
+            "sha256": self.spec.sha256,
+            "topology": {
+                "blocks": self.model.blocks,
+                "channels": self.model.channels,
+                "kernel_size": self.model.kernel_size,
+                "activation": self.model.activation,
+                "value_bound": self.model.value_bound,
+            },
+            "declared_heads": {
+                head: getattr(self.spec, head) for head in _TEACHER_HEAD_PREFIXES
+            },
+            "actual_heads": list(self.actual_heads),
+        }
+
+
+def _teacher_policy_weights(  # noqa: C901
+    checkpoint: object,
+) -> dict[str, torch.Tensor]:
+    """Extract named policy tensors from one accepted checkpoint envelope."""
+    if not isinstance(checkpoint, Mapping):
+        raise TeacherCompatibilityError("teacher checkpoint must contain a mapping")
+    typed_checkpoint = cast(Mapping[object, object], checkpoint)
+    if "state_dict" in typed_checkpoint and "learner" in typed_checkpoint:
+        raise TeacherCompatibilityError(
+            "teacher checkpoint has mixed state_dict and learner layouts"
+        )
+    envelope = "state_dict" in typed_checkpoint or "learner" in typed_checkpoint
+    bare_policy_keys = [
+        name
+        for name, value in typed_checkpoint.items()
+        if isinstance(name, str)
+        and isinstance(value, torch.Tensor)
+        and name.startswith(_POLICY_KEY_PREFIXES)
+    ]
+    if envelope and bare_policy_keys:
+        raise TeacherCompatibilityError(
+            "teacher checkpoint has mixed bare and envelope layouts"
+        )
+    candidate: object
+    if "state_dict" in typed_checkpoint:
+        state_dict = typed_checkpoint["state_dict"]
+        if not isinstance(state_dict, Mapping):
+            raise TeacherCompatibilityError(
+                "teacher Lightning checkpoint state_dict must be a mapping"
+            )
+        has_prefixed_policy = any(
+            isinstance(name, str) and name.startswith("policy.") for name in state_dict
+        )
+        has_bare_policy = any(
+            isinstance(name, str) and name.startswith(_POLICY_KEY_PREFIXES)
+            for name in state_dict
+        )
+        if has_prefixed_policy and has_bare_policy:
+            raise TeacherCompatibilityError(
+                "teacher checkpoint has mixed policy-prefixed and bare layouts"
+            )
+        candidate = {
+            name.removeprefix("policy."): value
+            for name, value in state_dict.items()
+            if isinstance(name, str) and name.startswith("policy.")
+        }
+        if not candidate:
+            raise TeacherCompatibilityError(
+                "teacher Lightning checkpoint has no policy.* weights"
+            )
+    elif "learner" in typed_checkpoint:
+        candidate = typed_checkpoint["learner"]
+        if not isinstance(candidate, Mapping):
+            raise TeacherCompatibilityError(
+                "teacher learner checkpoint must be a mapping"
+            )
+    else:
+        candidate = typed_checkpoint
+    if not isinstance(candidate, Mapping) or not all(
+        isinstance(name, str) and isinstance(value, torch.Tensor)
+        for name, value in candidate.items()
+    ):
+        raise TeacherCompatibilityError(
+            "teacher checkpoint policy must contain only named tensors"
+        )
+    return cast(dict[str, torch.Tensor], dict(candidate))
+
+
+def load_teacher(  # noqa: C901
+    spec: TeacherSpec, model_config: ModelConfig
+) -> LoadedTeacher:
+    """Load exactly one checkpoint and enforce shared and declared-head strictness."""
+    try:
+        digest = sha256_file(spec.checkpoint)
+    except OSError as error:
+        raise TeacherCompatibilityError(
+            f"teacher digest verification failed: {spec.checkpoint}"
+        ) from error
+    if spec.sha256 is not None and digest != spec.sha256:
+        raise TeacherCompatibilityError(
+            "teacher digest does not match TeacherSpec: "
+            f"expected {spec.sha256}, found {digest}"
+        )
+    resolved_model = model_config.model_copy(
+        update={"blocks": spec.blocks or model_config.blocks}
+    )
+    policy = Policy(
+        blocks=resolved_model.blocks,
+        channels=resolved_model.channels,
+        value_bound=resolved_model.value_bound,
+        kernel_size=resolved_model.kernel_size,
+        activation=resolved_model.activation,
+    )
+    try:
+        checkpoint = torch.load(spec.checkpoint, map_location="cpu", weights_only=True)
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        EOFError,
+        pickle.UnpicklingError,
+    ) as error:
+        raise TeacherCompatibilityError(
+            f"teacher checkpoint cannot be loaded: {spec.checkpoint}"
+        ) from error
+    weights = _teacher_policy_weights(checkpoint)
+    expected = policy.state_dict()
+    expected_keys = set(expected)
+    actual_keys = set(weights)
+    unexpected = sorted(actual_keys - expected_keys)
+    if unexpected:
+        raise TeacherCompatibilityError(f"teacher has unexpected keys: {unexpected}")
+
+    actual_heads: list[TeacherHead] = []
+    allowed_missing: set[str] = set()
+    for head, prefix in _TEACHER_HEAD_PREFIXES.items():
+        family = {name for name in expected_keys if name.startswith(prefix)}
+        present = family.intersection(actual_keys)
+        if present and present != family:
+            missing = sorted(family - present)
+            raise TeacherCompatibilityError(
+                f"teacher has incomplete {prefix.removesuffix('.')} head: {missing}"
+            )
+        if present == family and getattr(spec, head):
+            actual_heads.append(head)
+        if getattr(spec, head):
+            if present != family:
+                raise TeacherCompatibilityError(
+                    f"teacher is missing declared {prefix.removesuffix('.')} keys: "
+                    f"{sorted(family - present)}"
+                )
+        else:
+            allowed_missing.update(family)
+
+    missing_shared = sorted((expected_keys - actual_keys) - allowed_missing)
+    if missing_shared:
+        raise TeacherCompatibilityError(
+            f"teacher is missing shared or declared keys: {missing_shared}"
+        )
+    mismatched_shapes = sorted(
+        name
+        for name, value in weights.items()
+        if tuple(value.shape) != tuple(expected[name].shape)
+    )
+    if mismatched_shapes:
+        rendered = ", ".join(
+            f"{name}: checkpoint={tuple(weights[name].shape)}, "
+            f"expected={tuple(expected[name].shape)}"
+            for name in mismatched_shapes
+        )
+        raise TeacherCompatibilityError(f"teacher tensor shape mismatch: {rendered}")
+    policy.load_state_dict(weights, strict=False)
+    policy.requires_grad_(False).eval()
+    effective_spec = spec.model_copy(
+        update={"sha256": digest, "blocks": resolved_model.blocks}
+    )
+    return LoadedTeacher(
+        policy=policy,
+        spec=effective_spec,
+        model=resolved_model,
+        actual_heads=tuple(actual_heads),
+    )
 
 
 class SnapshotEntry(BaseModel):

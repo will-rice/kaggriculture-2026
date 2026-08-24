@@ -141,11 +141,19 @@ def test_every_curriculum_phase_is_a_valid_toad_config(
             if phase.teacher_from is None
             else curriculum._checkpoint(phase.teacher_from)
         )
-        assert config.population.teacher_checkpoint == expected_teacher
+        assert (
+            None
+            if config.population.teacher is None
+            else config.population.teacher.checkpoint
+        ) == expected_teacher
         expected_teacher_blocks = (
             None if phase.teacher_from is None else curriculum._teacher_blocks(phase)
         )
-        assert config.population.teacher_blocks == expected_teacher_blocks
+        assert (
+            None
+            if config.population.teacher is None
+            else config.population.teacher.blocks
+        ) == expected_teacher_blocks
 
 
 def test_curriculum_runtime_resume_override_reaches_native_run(
@@ -240,7 +248,8 @@ def test_phase_one_lightning_output_becomes_phase_two_teacher(
     config = curriculum.phase_config(curriculum._phase("phase2"))
     module = toad.ToadLightningModule(config)
 
-    assert config.population.teacher_checkpoint == checkpoint
+    assert config.population.teacher is not None
+    assert config.population.teacher.checkpoint == checkpoint
     assert module.teacher_policy is not None
     assert torch.equal(
         module.teacher_policy.state_dict()["stem.weight"],

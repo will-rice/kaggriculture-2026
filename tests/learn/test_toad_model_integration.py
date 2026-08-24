@@ -101,8 +101,7 @@ def _all_feature_config(
         runtime["output_dir"] = output_dir
     if teacher_checkpoint is not None:
         population.update(
-            teacher_checkpoint=teacher_checkpoint,
-            teacher_blocks=1,
+            teacher={"checkpoint": teacher_checkpoint, "blocks": 1},
         )
     return ToadConfig.model_validate(payload)
 

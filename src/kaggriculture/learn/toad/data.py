@@ -28,6 +28,8 @@ from kaggriculture.learn.toad.population import (
     SnapshotPool,
     SnapshotPoolIdentity,
     SnapshotStore,
+    TeacherCompatibilityError,
+    load_teacher,
     sha256_file,
 )
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
@@ -201,14 +203,15 @@ def _teacher_identity(
     config: ToadConfig, teacher: SnapshotEntry | None
 ) -> tuple[Path, str, str]:
     """Resolve and hash one teacher checkpoint once for a whole allocation."""
-    teacher_path = (
-        teacher.path if teacher is not None else config.population.teacher_checkpoint
-    )
-    if teacher_path is None:
+    spec = config.population.teacher
+    if spec is None:
         raise ValueError("teacher-distill allocation requires a checkpoint")
-    teacher_digest = (
-        teacher.sha256 if teacher is not None else sha256_file(teacher_path)
-    )
+    teacher_path = spec.checkpoint
+    teacher_digest = spec.sha256 or sha256_file(teacher_path)
+    if teacher is not None and (
+        teacher.path != teacher_path or teacher.sha256 != teacher_digest
+    ):
+        raise ValueError("runtime teacher identity does not match population.teacher")
     return (
         teacher_path,
         teacher_digest,
@@ -763,7 +766,22 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                         "teacher checkpoint digest mismatch for "
                         f"{path}: expected {digest}, found {actual}"
                     )
-                state = _checkpoint_policy_state(path)
+                spec = self.config.population.teacher
+                if spec is None or spec.checkpoint != path:
+                    raise SnapshotIntegrityError(
+                        "teacher assignment does not match population.teacher"
+                    )
+                try:
+                    loaded_teacher = load_teacher(
+                        spec.model_copy(update={"sha256": digest}),
+                        self.config.model,
+                    )
+                except TeacherCompatibilityError as error:
+                    raise SnapshotIntegrityError(
+                        f"teacher checkpoint is incompatible: {path}"
+                    ) from error
+                state = dict(loaded_teacher.policy.state_dict())
+                model = loaded_teacher.model
             materialized[digest] = (state, model)
         return materialized
 
@@ -818,7 +836,12 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             model = self.config.model
             entry: SnapshotEntry | None = matches[0]
         elif assignment.kind is BatchKind.TEACHER_DISTILL:
-            blocks = self.config.population.teacher_blocks
+            teacher = self.config.population.teacher
+            if teacher is None:
+                raise ValueError(
+                    "teacher-distill assignment requires population.teacher"
+                )
+            blocks = teacher.blocks
             model = (
                 self.config.model
                 if blocks is None
