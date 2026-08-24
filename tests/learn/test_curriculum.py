@@ -8,7 +8,9 @@ own flags -- proven against a real checkpoint and a real ``Policy``, not a
 namespace read back at itself.
 """
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +25,7 @@ from kaggriculture.learn.toad.config import (
     RuntimeConfig,
     ToadConfig,
 )
+from kaggriculture.learn.toad.lightning import ToadLightningModule
 
 # Transcribed independently of curriculum.PHASES, from the literal recipe
 # table -- so this file fails if the module's own transcription drifts, not
@@ -171,6 +174,74 @@ def test_curriculum_runtime_resume_override_reaches_native_run(
 
     assert len(seen) == 1
     assert seen[0].runtime.resume == resume
+
+
+def test_failing_phase_gate_records_result_and_stops_production_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared external gate is neither ignored nor reduced to a log line."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    events: list[str] = []
+
+    def train(config: ToadConfig) -> None:
+        events.append("train")
+        config.runtime.output_dir.mkdir(parents=True)
+        module = ToadLightningModule(config)
+        checkpoint: dict[str, object] = {"state_dict": module.state_dict()}
+        module.on_save_checkpoint(checkpoint)
+        torch.save(checkpoint, config.runtime.output_dir / "step-12.ckpt")
+
+    def fail_rollout(
+        policy: object, opponent: object, seeds: object
+    ) -> list[SimpleNamespace]:
+        events.append("gate")
+        assert opponent == toad.OPPONENT
+        assert tuple(seeds) == (
+            curriculum.GATE_SEED_BASE,
+            curriculum.GATE_SEED_BASE + 1,
+        )
+        return [
+            SimpleNamespace(
+                final_margin=-1.0,
+                final_bank=10.0,
+                illegal=0,
+                rewards=torch.zeros(719),
+            )
+            for _ in range(2)
+        ]
+
+    monkeypatch.setattr(toad, "run", train)
+    monkeypatch.setattr(curriculum, "rollout_many", fail_rollout)
+    gate = json.dumps(
+        {
+            "metric": "win_rate",
+            "minimum": 0.5,
+            "opponent": "economic",
+            "seeds": 2,
+        },
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(curriculum.CurriculumGateError, match="win_rate"):
+        curriculum.main(
+            [
+                "phase1",
+                "--set",
+                "model.blocks=1",
+                "--set",
+                "model.channels=4",
+                "--set",
+                f"curriculum.gate={gate}",
+            ]
+        )
+
+    assert events == ["train", "gate"]
+    result = json.loads((tmp_path / "phase1" / "gate.json").read_text())
+    assert result["passed"] is False
+    assert result["metric"] == "win_rate"
+    assert result["value"] == 0.0
+    assert result["minimum"] == 0.5
+    assert result["checkpoint"] == "step-12.ckpt"
 
 
 def test_a_phase_refuses_to_start_without_its_teacher(

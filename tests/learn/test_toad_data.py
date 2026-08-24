@@ -1605,6 +1605,15 @@ def test_round_expansion_preserves_policy_and_value_pass_counts() -> None:
     assert all(batch.collected_steps == 0 for batch in batches[1:])
 
 
+def test_round_expander_rejects_a_policy_or_value_remainder() -> None:
+    """Fresh and replay passes must never silently discard a segment tail."""
+    trajectories = [_trajectory(turns=48)]
+    expander = RoundBatchExpander(batch_segments=2, value_passes=1, seed=7)
+
+    with pytest.raises(ValueError, match="3 segments.*batch_segments=2"):
+        list(expander.expand(trajectories, RoundMeta.control()))
+
+
 def test_collection_error_names_the_failed_game() -> None:
     """A collection failure must retain the assignment that actually failed."""
     assignment = CollectionAssignment(
@@ -1714,7 +1723,7 @@ def test_legacy_vs_econ_metrics_exclude_neural_opponents() -> None:
         BatchKind.TEACHER_DISTILL: teacher,
     }
     source = ReferenceRoundSource(
-        ToadConfig.control(),
+        ToadConfig.model_validate({"optimizer": {"batch_segments": 2}}),
         assignments=assignments,
         collect_assignment=lambda assignment: (by_kind[assignment.kind],),
     )

@@ -998,6 +998,71 @@ def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
     return load_policy_weights(policy, typed_weights)
 
 
+def policy_from_checkpoint(
+    path: Path, *, legacy_value_bound: float | None = 1.0
+) -> PolicyLike:
+    """Reconstruct and strictly load the policy described by ``path``.
+
+    Native Lightning checkpoints carry the complete :class:`ToadConfig`; that
+    stored topology is authoritative, including optional stateful components
+    whose architecture cannot be inferred safely from tensor shapes. Historical
+    bare and ``learner`` envelopes remain readable as legacy control policies.
+
+    Args:
+        path: Native Lightning or retained historical policy checkpoint.
+        legacy_value_bound: Non-parameter value transform for historical
+            checkpoints, which did not serialize a model configuration.
+
+    Returns:
+        A strictly loaded policy in evaluation mode.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("policy checkpoint must contain a mapping")
+
+    toad_state = checkpoint.get("toad")
+    if toad_state is not None:
+        state = _checkpoint_mapping(toad_state)
+        if "config" not in state:
+            raise ResumeConfigError("native Toad checkpoint has no stored config")
+        model = validate_stored_config(state["config"]).model
+        policy: PolicyLike = (
+            StatefulPolicy(model)
+            if uses_stateful_policy(model)
+            else Policy(
+                blocks=model.blocks,
+                channels=model.channels,
+                value_bound=model.value_bound,
+                kernel_size=model.kernel_size,
+                activation=model.activation,
+            )
+        )
+    else:
+        weights, _layout = _checkpoint_policy_weights(path)
+        stem = weights.get("stem.weight")
+        if not isinstance(stem, torch.Tensor) or stem.ndim != 4:
+            raise ValueError("legacy policy checkpoint has no valid stem.weight")
+        block_indices = {
+            int(name.split(".", 2)[1])
+            for name in weights
+            if isinstance(name, str)
+            and name.startswith("blocks.")
+            and len(name.split(".", 2)) == 3
+            and name.split(".", 2)[1].isdigit()
+        }
+        if not block_indices:
+            raise ValueError("legacy policy checkpoint has no residual blocks")
+        policy = Policy(
+            blocks=max(block_indices) + 1,
+            channels=int(stem.shape[0]),
+            value_bound=legacy_value_bound,
+            kernel_size=int(stem.shape[-1]),
+        )
+
+    load_checkpoint_policy(policy, path)
+    return policy.eval()
+
+
 def initialize_policy_from_checkpoint(
     policy: PolicyLike, path: Path
 ) -> WarmStartMigration:

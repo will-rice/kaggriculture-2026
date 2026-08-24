@@ -20,7 +20,7 @@ from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
-from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.scripts import critic_ev, evaluate, gate, toad
 from kaggriculture.learn.toad.callbacks import ActorSyncCallback, BoundaryCheckpoint
 from kaggriculture.learn.toad.config import (
     EntropyControllerConfig,
@@ -39,6 +39,7 @@ from kaggriculture.learn.toad.lightning import (
     ResumeConfigError,
     ToadLightningModule,
     load_checkpoint_policy,
+    policy_from_checkpoint,
 )
 from kaggriculture.learn.toad.model import StatefulPolicy
 from kaggriculture.learn.toad_loss import (
@@ -59,6 +60,147 @@ from tests.learn.test_toad_model_integration import (
 
 # The arm's own mix, so the schedule under test is the one that runs.
 ECON_FRACTION = 0.5
+
+
+def _write_native_policy_checkpoint(
+    module: ToadLightningModule, path: pathlib.Path
+) -> None:
+    """Write the native Lightning policy/config envelope used by production."""
+    checkpoint: dict[str, object] = {"state_dict": module.state_dict()}
+    module.on_save_checkpoint(checkpoint)
+    torch.save(checkpoint, path)
+
+
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_native_checkpoint_factory_reconstructs_control_and_recurrent_policy(
+    tmp_path: pathlib.Path, recurrent: bool
+) -> None:
+    """Stored ToadConfig, not guessed tensor shapes, owns policy reconstruction."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 4,
+                "recurrent": recurrent,
+                "recurrent_channels": 3,
+            }
+        }
+    )
+    module = ToadLightningModule(config)
+    path = tmp_path / f"step-{int(recurrent)}.ckpt"
+    _write_native_policy_checkpoint(module, path)
+
+    policy = policy_from_checkpoint(path)
+
+    assert isinstance(policy, StatefulPolicy) is recurrent
+    assert policy.training is False
+    for name, value in module.policy.state_dict().items():
+        assert torch.equal(policy.state_dict()[name], value), name
+
+
+@pytest.mark.parametrize("envelope", ["bare", "learner"])
+def test_checkpoint_factory_retains_legacy_control_layouts(
+    tmp_path: pathlib.Path, envelope: str
+) -> None:
+    """Canonical native loading does not remove supported read-only history."""
+    source = Policy(blocks=1, channels=4, value_bound=None)
+    path = tmp_path / f"{envelope}.pt"
+    torch.save(
+        source.state_dict() if envelope == "bare" else {"learner": source.state_dict()},
+        path,
+    )
+
+    restored = policy_from_checkpoint(path, legacy_value_bound=None)
+
+    assert isinstance(restored, Policy)
+    for name, value in source.state_dict().items():
+        assert torch.equal(restored.state_dict()[name], value), name
+
+
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_native_checkpoints_load_through_every_evaluation_surface(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, recurrent: bool
+) -> None:
+    """Evaluator, critic evaluator, and frontier gate share the factory."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 4,
+                "recurrent": recurrent,
+                "recurrent_channels": 3,
+            }
+        }
+    )
+    path = tmp_path / f"step-{int(recurrent)}.ckpt"
+    _write_native_policy_checkpoint(ToadLightningModule(config), path)
+    monkeypatch.setattr(gate, "DEVICE", "cpu")
+    gate.under_test.cache_clear()
+
+    evaluated = evaluate._load(path)
+    critiqued = critic_ev.load(critic_ev.Arm("native", path, "sparse"))
+    gated = gate.under_test(path)
+
+    expected_type = StatefulPolicy if recurrent else Policy
+    assert isinstance(evaluated, expected_type)
+    assert isinstance(critiqued, expected_type)
+    assert isinstance(gated, expected_type)
+
+
+def test_evaluator_carries_recurrent_state_between_environment_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The diagnostic evaluator must play the same recurrent agent as rollout."""
+    policy = StatefulPolicy(
+        ToadConfig.model_validate(
+            {
+                "model": {
+                    "blocks": 1,
+                    "channels": 4,
+                    "recurrent": True,
+                    "recurrent_channels": 3,
+                }
+            }
+        ).model
+    ).eval()
+    decide = evaluate._decide
+    supplied_states: list[object] = []
+    supplied_dones: list[object] = []
+
+    def recording_decide(*args: object, **kwargs: object) -> tuple[object, object]:
+        supplied_states.append(kwargs.get("states"))
+        supplied_dones.append(kwargs.get("dones"))
+        return decide(*args, **kwargs)
+
+    monkeypatch.setattr(evaluate, "EPISODE_STEPS", 3)
+    monkeypatch.setattr(evaluate, "_decide", recording_decide)
+
+    evaluate.play(policy, [17])
+    evaluate.play(policy, [18])
+
+    assert supplied_states[0] == [None]
+    assert cast(list[object], supplied_states[1])[0] is not None
+    assert supplied_states[2] == [None]
+    assert cast(list[object], supplied_states[3])[0] is not None
+    assert supplied_dones == [[False], [False], [False], [False]]
+
+
+def test_evaluator_discovers_and_parses_legacy_and_native_checkpoints(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watcher sees native step checkpoints without losing legacy arms."""
+    legacy = tmp_path / "phase_000012.pt"
+    native = tmp_path / "phase" / "step-34.ckpt"
+    ignored = tmp_path / "phase" / "last.ckpt"
+    native.parent.mkdir()
+    for path in (legacy, native, ignored):
+        path.touch()
+    monkeypatch.setattr(evaluate, "RUNS", tmp_path)
+
+    assert set(evaluate._discover_checkpoints("phase")) == {legacy, native}
+    assert evaluate._update_of(legacy) == 12
+    assert evaluate._update_of(native) == 34
+    assert evaluate._checkpoint_record(native) == "phase/step-34.ckpt"
 
 
 @pytest.mark.parametrize(("econ_fraction", "seats"), [(0.0, 48), (0.5, 36), (0.25, 42)])

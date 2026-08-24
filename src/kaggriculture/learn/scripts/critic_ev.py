@@ -70,10 +70,10 @@ from pathlib import Path
 import torch
 
 from kaggriculture.learn.critic import explained_variance, monte_carlo
-from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.rollout import rollout_many
 from kaggriculture.learn.scripts.toad import BATCH_SEGMENTS, OPPONENT
 from kaggriculture.learn.toad.core import td_lambda, vtrace
+from kaggriculture.learn.toad.lightning import PolicyLike, policy_from_checkpoint
 from kaggriculture.learn.toad_loss import DISCOUNTING, LMB, UNROLL_LENGTH
 
 LOGGER = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ class Arm:
 
     Attributes:
         name: How the record is keyed.
-        checkpoint: The ``.pt`` to load.
+        checkpoint: Native Lightning or retained legacy checkpoint to load.
         field: Which recorded reward series this checkpoint's critic was trained
             against. Scoring a critic on a reward it never saw measures nothing.
         update: The optimizer round it was written at, so a record can be placed
@@ -324,12 +324,12 @@ def _worker(work: tuple[Arm, list[int]]) -> list[Episode]:
     ]
 
 
-def load(arm: Arm) -> Policy:
+def load(arm: Arm) -> PolicyLike:
     """Return the checkpoint's policy in eval mode, at the width it was saved with.
 
-    Both checkpoint layouts are accepted -- the Toad arms wrap the weights beside
-    the optimizer and counters, the older self-play runs saved a bare state dict
-    -- and the shape is read off the weights rather than assumed.
+    Native Lightning checkpoints use their stored Toad model config, including
+    stateful topology. Older self-play runs saved a bare control state dict and
+    remain shape-inferred read-only inputs.
 
     ``value_bound`` comes from the arm rather than from a constant, because it is
     not cosmetic here: the Toad arms squash the value head onto ``[-1, +1]`` and
@@ -342,13 +342,7 @@ def load(arm: Arm) -> Policy:
     Returns:
         The policy, ready to play.
     """
-    state = torch.load(arm.checkpoint, map_location="cpu", weights_only=False)
-    weights = state["learner"] if "learner" in state else state
-    channels = int(weights["stem.weight"].shape[0])
-    blocks = 1 + max(int(k.split(".")[1]) for k in weights if k.startswith("blocks."))
-    policy = Policy(blocks=blocks, channels=channels, value_bound=arm.value_bound)
-    load_policy_weights(policy, weights)
-    return policy.eval()
+    return policy_from_checkpoint(arm.checkpoint, legacy_value_bound=arm.value_bound)
 
 
 def diagnostics(episodes: Sequence[Episode]) -> dict[str, float]:

@@ -40,7 +40,9 @@ def _native_config(*, model: ModelConfig | None = None) -> ToadConfig:
             "population": {
                 "selfplay": 1.0,
                 "scripted": 0.0,
-                "environments_per_rank": 1,
+                # Two full self-play environments resolve to 1,436 segments,
+                # exactly divisible by the four-segment optimizer contract.
+                "environments_per_rank": 2,
                 "collection_processes": 1,
             },
             "optimizer": {
@@ -127,6 +129,7 @@ def test_preflight_rejects_scripted_cuda_graph_without_fallback() -> None:
     payload["runtime"]["rollout_device"] = "cuda"
     payload["runtime"]["rollout_cuda_graph"] = True
     payload["population"].update(selfplay=0.0, scripted=1.0)
+    payload["optimizer"]["batch_segments"] = 2
     config = ToadConfig.model_validate(payload)
 
     with pytest.raises(
@@ -144,6 +147,7 @@ def test_preflight_rejects_unverified_native_eager_scripted_identity() -> None:
         scripted=1.0,
         scripted_opponent="starter",
     )
+    payload["optimizer"]["batch_segments"] = 2
     config = ToadConfig.model_validate(payload)
 
     with pytest.raises(

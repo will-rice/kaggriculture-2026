@@ -364,7 +364,9 @@ def test_empty_local_round_reaches_failure_gather_before_signature(
 
     source.set_round_validator(reject_empty)
 
-    with pytest.raises(data.DistributedCollectionError, match="produced no complete"):
+    with pytest.raises(
+        data.DistributedCollectionError, match="must be exactly divisible"
+    ):
         list(source)
 
 

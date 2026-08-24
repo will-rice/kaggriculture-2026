@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import random
 import time
 import traceback
@@ -23,6 +22,8 @@ from kaggriculture.learn.rollout import Trajectory, segment_starts
 from kaggriculture.learn.toad.config import (
     ModelConfig,
     ToadConfig,
+    resolved_population_counts,
+    resolved_round_geometry,
     structural_fingerprint,
 )
 from kaggriculture.learn.toad.population import (
@@ -283,15 +284,10 @@ class DistributedCollectionError(RuntimeError):
 
 def expected_round_batch_counts(config: ToadConfig) -> RoundBatchCounts:
     """Derive one rank's exact optimizer quotas before collection starts."""
-    counts = _round_counts(config)
-    trajectories = sum(counts.values()) + counts[BatchKind.SELFPLAY]
-    segments_per_trajectory = len(
-        segment_starts(EPISODE_STEPS - 1, config.optimizer.unroll_length)
-    )
-    policy = (trajectories * segments_per_trajectory) // config.optimizer.batch_segments
+    geometry = resolved_round_geometry(config.population, config.optimizer)
     return RoundBatchCounts(
-        policy=policy,
-        value=policy * config.optimizer.value_passes,
+        policy=geometry.policy_batches,
+        value=geometry.value_batches,
     )
 
 
@@ -370,27 +366,10 @@ def _all_gather_objects(
 
 def _round_counts(config: ToadConfig) -> dict[BatchKind, int]:
     """Allocate exact environment quotas by deterministic largest remainder."""
-    environments = config.population.environments_per_rank
-    probabilities = {
-        BatchKind.SELFPLAY: config.population.selfplay,
-        BatchKind.SCRIPTED: config.population.scripted,
-        BatchKind.FROZEN_OPPONENT: config.population.frozen_opponent,
-        BatchKind.TEACHER_DISTILL: config.population.teacher_distill,
+    return {
+        BatchKind(name): count
+        for name, count in resolved_population_counts(config.population).items()
     }
-    raw = {
-        kind: probability * environments for kind, probability in probabilities.items()
-    }
-    counts = {kind: math.floor(value) for kind, value in raw.items()}
-    remaining = environments - sum(counts.values())
-    order = sorted(
-        raw,
-        key=lambda kind: (-(raw[kind] - counts[kind]), kind.value),
-    )
-    for kind in order[:remaining]:
-        counts[kind] += 1
-    if sum(counts.values()) != environments:
-        raise AssertionError("population quotas must allocate every environment")
-    return counts
 
 
 def _teacher_identity(
@@ -799,15 +778,20 @@ class RoundBatchExpander:
         round_metrics: Mapping[str, float | int] | None,
     ) -> Iterator[LearnerBatch]:
         """Apply the common optimizer grouping and provenance contract."""
+        if self.batch_segments <= 0:
+            raise ValueError("batch_segments must be positive")
+        remainder = len(all_segments) % self.batch_segments
+        if not all_segments or remainder:
+            raise ValueError(
+                f"round has {len(all_segments)} segments, which must be exactly "
+                f"divisible by batch_segments={self.batch_segments}"
+            )
         groups = [
             tuple(all_segments[start : start + self.batch_segments])
             for start in range(
                 0, len(all_segments) - self.batch_segments + 1, self.batch_segments
             )
         ]
-        if not groups:
-            return
-
         pending: list[
             tuple[
                 tuple[

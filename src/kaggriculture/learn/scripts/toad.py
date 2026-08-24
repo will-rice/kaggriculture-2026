@@ -69,6 +69,7 @@ from kaggriculture.learn.toad.config import (
     RuntimeMetadata,
     ToadConfig,
     load_config,
+    validate_effective_resume,
 )
 from kaggriculture.learn.toad.data import (
     ACTED_FIELDS as _ACTED_FIELDS,
@@ -941,6 +942,7 @@ def build_trainer(config: ToadConfig) -> lightning.Trainer:
 
 def run(config: ToadConfig) -> None:
     """Seed once and hand the complete native control path to Lightning."""
+    validate_effective_resume(config)
     runtime_preflight(config)
     seed_everything(config.runtime.seed, workers=True)
     module = ToadLightningModule(config)

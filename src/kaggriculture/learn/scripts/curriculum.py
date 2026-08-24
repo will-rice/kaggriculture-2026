@@ -27,13 +27,18 @@ is wanted.
 
 import argparse
 import dataclasses
+import json
 import logging
+import os
 import re
+import statistics
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
+from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.scripts.gate import SEED_BASE as GATE_SEED_BASE
 from kaggriculture.learn.toad.config import (
     CurriculumConfig,
     ModelConfig,
@@ -44,6 +49,7 @@ from kaggriculture.learn.toad.config import (
     ToadConfig,
     apply_overrides,
 )
+from kaggriculture.learn.toad.lightning import policy_from_checkpoint
 
 LOGGER = logging.getLogger(__name__)
 
@@ -161,6 +167,10 @@ REWARD_FLAGS: dict[str, tuple[str, ...]] = {
     "shaped": ("--no-money",),
     "sparse": ("--sparse",),
 }
+
+
+class CurriculumGateError(RuntimeError):
+    """A completed phase did not clear its declared external evaluation gate."""
 
 
 def _phase(name: str) -> Phase:
@@ -319,6 +329,100 @@ def phase_config(phase: Phase) -> ToadConfig:
     )
 
 
+def _latest_native_checkpoint(output_dir: Path) -> Path:
+    """Return the newest numeric Lightning checkpoint in one phase output."""
+    checkpoints = [
+        path
+        for path in output_dir.glob("step-*.ckpt")
+        if path.is_file() and re.fullmatch(r"step-[0-9]+[.]ckpt", path.name)
+    ]
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"completed phase has no checkpoint matching {output_dir}/step-*.ckpt"
+        )
+    return max(checkpoints, key=lambda path: int(path.stem.removeprefix("step-")))
+
+
+def _gate_metrics(trajectories: Sequence[Trajectory]) -> dict[str, float]:
+    """Reduce terminal held-out results into the declared gate metric domain."""
+    if not trajectories:
+        raise RuntimeError("curriculum gate produced no trajectories")
+    return {
+        "win_rate": statistics.fmean(
+            float(trajectory.final_margin > 0.0) for trajectory in trajectories
+        ),
+        "mean_terminal_bank": statistics.fmean(
+            trajectory.final_bank for trajectory in trajectories
+        ),
+        "mean_terminal_margin": statistics.fmean(
+            trajectory.final_margin for trajectory in trajectories
+        ),
+    }
+
+
+def _record_gate_result(output_dir: Path, result: dict[str, object]) -> Path:
+    """Atomically publish and fsync the phase-boundary gate verdict."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / "gate.json"
+    temporary = output_dir / ".gate.json.tmp"
+    with temporary.open("w") as handle:
+        json.dump(result, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(destination)
+    directory = os.open(output_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return destination
+
+
+def run_phase_gate(config: ToadConfig) -> dict[str, object]:
+    """Evaluate, persist, and enforce one configured phase-boundary gate."""
+    gate = config.curriculum.gate
+    if gate is None:
+        raise ValueError("run_phase_gate requires curriculum.gate")
+    checkpoint = _latest_native_checkpoint(config.runtime.output_dir)
+    policy = policy_from_checkpoint(checkpoint)
+    seeds = tuple(GATE_SEED_BASE + index for index in range(gate.seeds))
+    opponent = (
+        toad.OPPONENT
+        if gate.opponent in {"economic", "economic_policy"}
+        else gate.opponent
+    )
+    trajectories = rollout_many(policy, opponent, seeds)
+    if len(trajectories) != gate.seeds:
+        raise RuntimeError(
+            "curriculum gate expected one learner trajectory per held-out seed, "
+            f"got {len(trajectories)} for {gate.seeds}"
+        )
+    metrics = _gate_metrics(trajectories)
+    value = metrics[gate.metric]
+    result: dict[str, object] = {
+        "phase": config.curriculum.phase,
+        "checkpoint": checkpoint.name,
+        "opponent": gate.opponent,
+        "seed_base": GATE_SEED_BASE,
+        "games": len(trajectories),
+        "metric": gate.metric,
+        "value": value,
+        "minimum": gate.minimum,
+        "passed": value >= gate.minimum,
+        "metrics": metrics,
+        "on_gate_failure": config.curriculum.on_gate_failure,
+    }
+    destination = _record_gate_result(config.runtime.output_dir, result)
+    LOGGER.info("curriculum: gate verdict written to %s", destination)
+    if not result["passed"]:
+        raise CurriculumGateError(
+            f"{config.curriculum.phase} gate failed: {gate.metric}={value:.6g} "
+            f"< {gate.minimum:.6g}; stopped by {config.curriculum.on_gate_failure}"
+        )
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     """Return this runner's command line.
 
@@ -354,6 +458,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     LOGGER.info("curriculum: running %s", phase.name)
     toad.run(config)
+    if config.curriculum.gate is not None:
+        run_phase_gate(config)
 
 
 if __name__ == "__main__":

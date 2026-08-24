@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self, Sequence, cast
 
@@ -40,12 +41,18 @@ CompileMode = Literal["default", "reduce-overhead", "max-autotune"]
 # The largest centered odd window no wider than the board declares the amount
 # of edge padding this implementation supports; the 7x7 default remains inside it.
 MAX_LOCAL_PATCH_SIZE = BOARD_SIZE - 1 if BOARD_SIZE % 2 == 0 else BOARD_SIZE
+_POPULATION_KINDS = (
+    "selfplay",
+    "scripted",
+    "frozen_opponent",
+    "teacher_distill",
+)
 
 
 class ModelConfig(BaseModel):
     """Policy architecture settings."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     blocks: PositiveInt = 8
     channels: PositiveInt = 128
@@ -125,7 +132,7 @@ class TeacherSpec(BaseModel):
 class PopulationConfig(BaseModel):
     """Actor population and opponent-pool settings."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     selfplay: float = 0.5
     scripted: float = 0.5
@@ -230,16 +237,16 @@ class EntropyControllersConfig(BaseModel):
 class OptimizerConfig(BaseModel):
     """Loss coefficients and optimizer schedule settings."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     lr: PositiveFloat = LEARNING_RATE
     adam_eps: PositiveFloat = ADAM_EPS
-    gamma: float = DISCOUNTING
-    lmb: float = LMB
-    entropy_cost: float = ENTROPY_COST
+    gamma: float = Field(default=DISCOUNTING, ge=0.0, le=1.0)
+    lmb: float = Field(default=LMB, ge=0.0, le=1.0)
+    entropy_cost: NonNegativeFloat = ENTROPY_COST
     adaptive_entropy: bool = False
     entropy: EntropyControllersConfig = Field(default_factory=EntropyControllersConfig)
-    teacher_kl_cost: float = 0.0
+    teacher_kl_cost: NonNegativeFloat = 0.0
     teacher_baseline_cost: NonNegativeFloat = 0.0
     vtrace_pg_cost: NonNegativeFloat = 1.0
     upgo_pg_cost: NonNegativeFloat = 1.0
@@ -250,6 +257,76 @@ class OptimizerConfig(BaseModel):
     batch_segments: PositiveInt = 4
     value_warmup_batches: NonNegativeInt = VALUE_WARMUP_BATCHES
     value_passes: NonNegativeInt = 0
+
+
+@dataclass(frozen=True)
+class RoundGeometry:
+    """Resolved rank-local collection and optimizer geometry for both backends."""
+
+    environments_by_kind: Mapping[str, int]
+    trajectories_by_kind: Mapping[str, int]
+    segments_by_kind: Mapping[str, int]
+    segments_per_trajectory: int
+    policy_segments: int
+    policy_batches: int
+    value_batches: int
+
+
+def resolved_population_counts(population: PopulationConfig) -> dict[str, int]:
+    """Allocate exact largest-remainder environment quotas in stable kind order."""
+    probabilities = {
+        name: float(getattr(population, name)) for name in _POPULATION_KINDS
+    }
+    raw = {
+        name: probability * population.environments_per_rank
+        for name, probability in probabilities.items()
+    }
+    counts = {name: math.floor(value) for name, value in raw.items()}
+    remaining = population.environments_per_rank - sum(counts.values())
+    order = sorted(raw, key=lambda name: (-(raw[name] - counts[name]), name))
+    for name in order[:remaining]:
+        counts[name] += 1
+    if sum(counts.values()) != population.environments_per_rank:
+        raise AssertionError("population quotas must allocate every environment")
+    return counts
+
+
+def resolved_round_geometry(
+    population: PopulationConfig,
+    optimizer: OptimizerConfig,
+) -> RoundGeometry:
+    """Resolve exact reference/native segment and replay counts for one rank."""
+    turns = EPISODE_STEPS - 1
+    if optimizer.unroll_length > turns:
+        raise ValueError(f"optimizer.unroll_length must be at most {turns}")
+    environments = resolved_population_counts(population)
+    trajectories = {
+        name: count * (2 if name == "selfplay" else 1)
+        for name, count in environments.items()
+    }
+    segments_per_trajectory = turns // optimizer.unroll_length
+    segments = {
+        name: count * segments_per_trajectory for name, count in trajectories.items()
+    }
+    policy_segments = sum(segments.values())
+    if policy_segments == 0:
+        raise ValueError("resolved collection round must produce policy segments")
+    remainder = policy_segments % optimizer.batch_segments
+    if remainder:
+        raise ValueError(
+            f"resolved round has {policy_segments} segments, which must be exactly "
+            f"divisible by optimizer.batch_segments={optimizer.batch_segments}"
+        )
+    policy_batches = policy_segments // optimizer.batch_segments
+    return RoundGeometry(
+        environments_by_kind=environments,
+        trajectories_by_kind=trajectories,
+        segments_by_kind=segments,
+        segments_per_trajectory=segments_per_trajectory,
+        policy_segments=policy_segments,
+        policy_batches=policy_batches,
+        value_batches=policy_batches * optimizer.value_passes,
+    )
 
 
 class CompileConfig(BaseModel):
@@ -309,9 +386,9 @@ class RuntimeMetadata(BaseModel):
 class EvaluationGate(BaseModel):
     """An evaluation threshold for curriculum progression."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
-    metric: str
+    metric: Literal["win_rate", "mean_terminal_bank", "mean_terminal_margin"]
     minimum: float
     opponent: str
     seeds: PositiveInt
@@ -320,7 +397,7 @@ class EvaluationGate(BaseModel):
 class CurriculumConfig(BaseModel):
     """Curriculum state and failure behavior."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     phase: str = "phase1"
     reward_field: Literal["shaped_money", "shaped", "sparse", "own", "margin"] = (
@@ -373,6 +450,7 @@ class ToadConfig(BaseModel):
                 "or snapshot_at_start"
             )
         _validate_foundation_optimizer(self.optimizer)
+        resolved_round_geometry(self.population, self.optimizer)
         max_steps_per_round = (
             2 * self.population.environments_per_rank * (EPISODE_STEPS - 1)
         )
@@ -447,11 +525,13 @@ class ToadConfig(BaseModel):
             and self.runtime.resume is not None
         ):
             raise ValueError("warm start and resume are mutually exclusive")
-        if self.runtime.resume is not None and self.runtime.resume.suffix == ".pt":
-            raise ValueError(
-                "legacy .pt resume requires checkpoint migration before Lightning; "
-                "conversion is scheduled for Stage 9"
-            )
+        if self.runtime.resume is not None:
+            _validate_resume_format(self.runtime.resume)
+            if not historical:
+                _require_readable(
+                    self.runtime.resume,
+                    label="resume checkpoint",
+                )
         return self
 
 
@@ -476,6 +556,26 @@ def _require_readable(path: Path, *, label: str) -> None:
             pass
     except OSError as error:
         raise ValueError(f"{label} is not readable: {path}") from error
+
+
+def _validate_resume_format(path: Path) -> None:
+    """Require full Lightning state rather than a policy-only envelope."""
+    if path.suffix == ".pt":
+        raise ValueError(
+            "legacy .pt cannot supply full Lightning resume state; use "
+            "curriculum.warm_start_checkpoint for weight-only initialization "
+            "or the read-only checkpoint policy loader"
+        )
+    if path.suffix != ".ckpt":
+        raise ValueError("resume must name a Lightning .ckpt checkpoint")
+
+
+def validate_effective_resume(config: ToadConfig) -> None:
+    """Recheck mutable resume input immediately before any runtime side effect."""
+    resume = config.runtime.resume
+    if resume is not None:
+        _validate_resume_format(resume)
+        _require_readable(resume, label="resume checkpoint")
 
 
 def load_config(path: Path | None, overrides: Sequence[str] = ()) -> ToadConfig:

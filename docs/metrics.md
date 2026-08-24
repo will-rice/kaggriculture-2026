@@ -6,6 +6,15 @@ production Lightning Trainer, boundary checkpoint/resume, and eight held-out
 games against the real economic opponent; it is not covered by the repository's
 default `not slow` exclusion.
 
+A configured curriculum phase gate is a separate post-training measurement.
+It loads the newest numeric `step-N.ckpt`, plays the configured held-out seed
+count against the external opponent, and atomically writes `gate.json` beside
+the phase checkpoints. The artifact records all three terminal summaries
+(`win_rate`, `mean_terminal_bank`, and `mean_terminal_margin`), the selected
+threshold, checkpoint, opponent, seed block, and pass/fail verdict. A failed
+gate is durable evidence and stops the curriculum command; it is not a W&B-only
+event.
+
 One row per key `toad._record` logs, grouped the way wandb groups the
 dashboard: the text before the first `/` is the section. Every run also ships
 this table into the logger config as `metric_definitions` (see

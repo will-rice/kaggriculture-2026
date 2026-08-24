@@ -610,6 +610,7 @@ def test_run_seeds_builds_native_components_and_passes_resume(
 ) -> None:
     """Production execution delegates placement, optimization, and restore to fit."""
     events: list[tuple[object, ...]] = []
+    (tmp_path / "resume.ckpt").touch()
     config = ToadConfig.control().model_copy(
         update={
             "runtime": ToadConfig.control().runtime.model_copy(
@@ -662,3 +663,43 @@ def test_run_seeds_builds_native_components_and_passes_resume(
         ("fit", module, {"datamodule": data, "ckpt_path": effective.runtime.resume}),
     ]
     assert built == [("data", effective), ("trainer", effective)]
+
+
+def test_run_rechecks_resume_before_runtime_or_training_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint removed after config parsing cannot seed or build the run."""
+    checkpoint = tmp_path / "resume.ckpt"
+    checkpoint.touch()
+    config = ToadConfig.model_validate({"runtime": {"resume": checkpoint}})
+    checkpoint.unlink()
+    monkeypatch.setattr(
+        toad,
+        "runtime_preflight",
+        lambda _config: pytest.fail("runtime preflight ran before resume recheck"),
+    )
+
+    with pytest.raises(ValueError, match="resume checkpoint is not readable"):
+        toad.run(config)
+
+
+def test_run_rejects_a_model_copy_that_bypasses_legacy_resume_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The immediate effective check also enforces the Lightning envelope."""
+    legacy = tmp_path / "legacy.pt"
+    legacy.touch()
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "runtime": base.runtime.model_copy(update={"resume": legacy}),
+        }
+    )
+    monkeypatch.setattr(
+        toad,
+        "runtime_preflight",
+        lambda _config: pytest.fail("preflight accepted a legacy resume"),
+    )
+
+    with pytest.raises(ValueError, match="full Lightning resume"):
+        toad.run(config)

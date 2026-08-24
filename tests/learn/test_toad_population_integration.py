@@ -85,7 +85,7 @@ def test_all_population_kinds_cross_the_real_worker_rollout(
                 "collection_processes": 1,
                 "snapshot_at_start": True,
             },
-            "optimizer": {"unroll_length": 2},
+            "optimizer": {"unroll_length": 2, "batch_segments": 5},
             "runtime": {"output_dir": tmp_path},
         }
     )

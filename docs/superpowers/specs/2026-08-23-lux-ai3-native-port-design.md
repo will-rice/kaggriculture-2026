@@ -196,6 +196,13 @@ Pydantic validation rejects the configuration before W&B, worker processes,
 or CUDA contexts start when:
 
 - batch probabilities are negative or do not sum to one;
+- an optimizer or model float is non-finite, discount or lambda leaves
+  `[0, 1]`, a loss coefficient is negative, or learning-rate/clip parameters
+  are not positive;
+- the 719-decision horizon cannot produce a nonzero, exactly divisible set of
+  optimizer batches for the resolved population (self-play contributes both
+  seats, every other population contributes one); value replay repeats those
+  exact complete batches;
 - teacher batches or teacher losses are enabled without a readable compatible
   teacher checkpoint;
 - frozen-opponent probability is nonzero with neither an initial pool nor a
@@ -208,6 +215,22 @@ or CUDA contexts start when:
 - a value-only phase enables policy-only losses; or
 - structurally incompatible curriculum phases claim an in-place continuation
   without an explicit widening/migration rule.
+
+An effective Lightning resume is also required to be a readable regular
+`.ckpt` before runtime preflight and is rechecked immediately before any seed,
+module, data, logger, or Trainer construction. Historical checkpoint configs
+remain schema-valid after their original external resume path disappears.
+Legacy `.pt` files are weight-only/read-only inputs, not full Lightning resume
+state.
+
+Native `step-N.ckpt` evaluation reconstructs the policy from its stored
+`ToadConfig`, including recurrent and other stateful paths; retained legacy
+control layouts use the same checkpoint-to-policy factory. Evaluators carry a
+separate `PolicyState` for every environment/seat and reset it at episode
+boundaries. When `CurriculumConfig.gate` is present, the curriculum runner
+plays its fixed held-out seeds after training, atomically records `gate.json`
+in the phase output directory, and raises on the declared `stop` policy if the
+threshold is missed.
 
 Hardware availability is checked in a runtime preflight after Lightning has
 resolved the accelerator. Requesting BF16, DDP, compile, or a native rollout

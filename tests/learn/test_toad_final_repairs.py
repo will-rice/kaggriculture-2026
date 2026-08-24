@@ -284,12 +284,12 @@ def test_foundation_rejects_accepted_but_unimplemented_controls(
         ToadConfig.model_validate(update)
 
 
-def test_legacy_resume_requires_migration_before_runtime(tmp_path: Path) -> None:
-    """A legacy runner envelope must never be handed to Lightning restore."""
+def test_legacy_resume_cannot_supply_full_lightning_state(tmp_path: Path) -> None:
+    """A legacy weight envelope must never be handed to Lightning restore."""
     legacy = tmp_path / "old.pt"
     legacy.touch()
 
-    with pytest.raises(ValidationError, match="migration"):
+    with pytest.raises(ValidationError, match="full Lightning resume"):
         toad._legacy_config(["--resume", str(legacy)])
 
 

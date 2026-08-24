@@ -12,8 +12,11 @@ from kaggriculture.learn.toad.config import (
     ToadConfig,
     apply_overrides,
     load_config,
+    resolved_round_geometry,
     structural_fingerprint,
+    validate_stored_config,
 )
+from kaggriculture.learn.toad.data import expected_round_batch_counts
 from kaggriculture.learn.toad.lightning import (
     ResumeConfigError,
     assert_resume_compatible,
@@ -31,6 +34,204 @@ def test_control_config_reproduces_current_constants() -> None:
     assert config.runtime.precision == "32-true"
     assert config.runtime.devices == 1
     assert config.population.selfplay + config.population.scripted == 1.0
+
+
+def test_unroll_cannot_exceed_the_competition_decision_horizon() -> None:
+    """An empty segment stream must be rejected before collection starts."""
+    with pytest.raises(ValidationError, match="unroll_length.*719"):
+        ToadConfig.model_validate({"optimizer": {"unroll_length": 720}})
+
+
+def test_round_segments_must_fill_optimizer_batches_exactly() -> None:
+    """A self-play seat cannot be truncated to fit the batch width."""
+    with pytest.raises(ValidationError, match="segments.*divisible.*batch_segments"):
+        ToadConfig.model_validate(
+            {
+                "population": {
+                    "selfplay": 1.0,
+                    "scripted": 0.0,
+                    "environments_per_rank": 1,
+                },
+                "optimizer": {"batch_segments": 3},
+            }
+        )
+
+
+@pytest.mark.parametrize("backend", ["reference", "native"])
+def test_round_geometry_is_identical_for_both_collection_backends(
+    backend: str,
+) -> None:
+    """Backend selection cannot change policy or value replay batch quotas."""
+    config = ToadConfig.model_validate(
+        {
+            "population": {
+                "selfplay": 1.0,
+                "scripted": 0.0,
+                "environments_per_rank": 2,
+            },
+            "optimizer": {
+                "unroll_length": 719,
+                "batch_segments": 4,
+                "value_passes": 2,
+            },
+            "runtime": {"rollout_backend": backend},
+        }
+    )
+
+    counts = expected_round_batch_counts(config)
+
+    assert counts.policy == 1
+    assert counts.value == 2
+
+
+def test_round_geometry_resolves_every_enabled_population_kind(
+    tmp_path: Path,
+) -> None:
+    """Self-play's second seat and every single-seat kind are counted exactly."""
+    frozen = tmp_path / "frozen.pt"
+    teacher = tmp_path / "teacher.pt"
+    frozen.touch()
+    teacher.touch()
+    config = ToadConfig.model_validate(
+        {
+            "population": {
+                "selfplay": 0.25,
+                "scripted": 0.25,
+                "frozen_opponent": 0.25,
+                "teacher_distill": 0.25,
+                "environments_per_rank": 8,
+                "initial_snapshots": [frozen],
+                "teacher": {"checkpoint": teacher, "quantity": True},
+            },
+            "optimizer": {
+                "unroll_length": 719,
+                "batch_segments": 5,
+                "value_passes": 3,
+            },
+        }
+    )
+
+    geometry = resolved_round_geometry(config.population, config.optimizer)
+
+    assert geometry.environments_by_kind == {
+        "selfplay": 2,
+        "scripted": 2,
+        "frozen_opponent": 2,
+        "teacher_distill": 2,
+    }
+    assert geometry.trajectories_by_kind == {
+        "selfplay": 4,
+        "scripted": 2,
+        "frozen_opponent": 2,
+        "teacher_distill": 2,
+    }
+    assert geometry.segments_by_kind == geometry.trajectories_by_kind
+    assert geometry.policy_batches == 2
+    assert geometry.value_batches == 6
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lr", float("nan")),
+        ("lr", float("inf")),
+        ("gamma", -0.01),
+        ("gamma", 1.01),
+        ("gamma", float("nan")),
+        ("lmb", -0.01),
+        ("lmb", 1.01),
+        ("entropy_cost", -0.01),
+        ("teacher_kl_cost", -0.01),
+        ("baseline_cost", float("inf")),
+        ("clip_grad_norm", float("inf")),
+    ],
+)
+def test_optimizer_rejects_nonfinite_or_mathematically_invalid_values(
+    field: str, value: float
+) -> None:
+    """Invalid optimizer math cannot survive typed config resolution."""
+    with pytest.raises(ValidationError):
+        ToadConfig.model_validate({"optimizer": {field: value}})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"model": {"value_bound": float("inf")}},
+        {"population": {"selfplay": float("nan")}},
+        {
+            "optimizer": {
+                "entropy": {
+                    "operation": {
+                        "initial_target": 0.0,
+                        "initial_multiplier": 0.001,
+                        "multiplier_change_per_step": 0.0,
+                        "maximum": float("inf"),
+                    }
+                }
+            }
+        },
+        {
+            "curriculum": {
+                "gate": {
+                    "metric": "win_rate",
+                    "minimum": float("nan"),
+                    "opponent": "economic",
+                    "seeds": 1,
+                }
+            }
+        },
+        {"curriculum": {"money_weight": float("inf")}},
+    ],
+)
+def test_every_serialized_float_domain_rejects_nan_and_infinity(
+    payload: dict[str, object],
+) -> None:
+    """Non-finite values cannot hide outside the optimizer's top-level fields."""
+    with pytest.raises(ValidationError):
+        ToadConfig.model_validate(payload)
+
+
+def test_effective_resume_must_be_a_readable_lightning_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Missing and directory resumes fail during effective config validation."""
+    missing = tmp_path / "missing.ckpt"
+    directory = tmp_path / "directory.ckpt"
+    directory.mkdir()
+
+    for path in (missing, directory):
+        with pytest.raises(ValidationError, match="resume checkpoint is not readable"):
+            ToadConfig.model_validate({"runtime": {"resume": path}})
+
+
+def test_historical_resume_config_skips_external_checkpoint_readability(
+    tmp_path: Path,
+) -> None:
+    """Stored schema remains valid after its original resume source is removed."""
+    payload = ToadConfig.control().model_dump(mode="python")
+    payload["runtime"]["resume"] = tmp_path / "removed.ckpt"
+
+    stored = validate_stored_config(payload)
+
+    assert stored.runtime.resume == tmp_path / "removed.ckpt"
+
+
+def test_legacy_resume_message_names_supported_weight_only_paths(
+    tmp_path: Path,
+) -> None:
+    """A legacy artifact cannot imply that full resume support is forthcoming."""
+    checkpoint = tmp_path / "legacy.pt"
+    checkpoint.touch()
+
+    with pytest.raises(ValidationError) as excinfo:
+        ToadConfig.model_validate({"runtime": {"resume": checkpoint}})
+
+    message = str(excinfo.value)
+    assert "full Lightning resume" in message
+    assert "warm_start_checkpoint" in message
+    assert "read-only" in message
+    assert "Stage 9" not in message
 
 
 def test_batch_probabilities_must_sum_to_one() -> None:
@@ -220,8 +421,10 @@ def test_warm_start_provenance_does_not_make_resume_structurally_incompatible(
     """A stored initialization source is provenance, not model structure."""
     warm = tmp_path / "warm.pt"
     warm.touch()
+    resume = tmp_path / "resume.ckpt"
+    resume.touch()
     stored = ToadConfig(curriculum={"warm_start_checkpoint": warm})
-    effective = ToadConfig(runtime={"resume": tmp_path / "resume.ckpt"})
+    effective = ToadConfig(runtime={"resume": resume})
 
     assert_resume_compatible(effective, stored)
 
