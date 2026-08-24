@@ -269,16 +269,12 @@ class StatefulPolicy(torch.nn.Module):
         hidden = (
             recurrent_state.hidden
             if recurrent_state is not None
-            else like.new_zeros(
-                batch, self.config.recurrent_channels, BOARD_SIZE, BOARD_SIZE
-            )
+            else like.new_zeros(batch, 0, 0, 0)
         )
         cell = (
             recurrent_state.cell
             if recurrent_state is not None
-            else like.new_zeros(
-                batch, self.config.recurrent_channels, BOARD_SIZE, BOARD_SIZE
-            )
+            else like.new_zeros(batch, 0, 0, 0)
         )
         if recurrent_state is not None and self.config.recurrent_layers == 1:
             hidden = hidden.squeeze(0)
@@ -334,6 +330,54 @@ class StatefulPolicy(torch.nn.Module):
             belief,
         )
 
+    def _validate_state(
+        self, state: PolicyState, batch: int, *, like: torch.Tensor
+    ) -> None:
+        """Reject state whose tensor schema does not match this topology."""
+        if state.hidden.shape != state.cell.shape:
+            raise ValueError("policy hidden and cell state shapes must match")
+        if self.config.recurrent:
+            expected_spatial = (
+                (batch, self.config.recurrent_channels, BOARD_SIZE, BOARD_SIZE)
+                if self.config.recurrent_layers == 1
+                else (
+                    self.config.recurrent_layers,
+                    batch,
+                    self.config.recurrent_channels,
+                    BOARD_SIZE,
+                    BOARD_SIZE,
+                )
+            )
+            if tuple(state.hidden.shape) != expected_spatial:
+                raise ValueError(
+                    "recurrent policy state has the wrong spatial shape: "
+                    f"{tuple(state.hidden.shape)} != {expected_spatial}"
+                )
+        elif state.hidden.numel() != 0 or tuple(state.hidden.shape) != (batch, 0, 0, 0):
+            raise ValueError(
+                "belief-only policy hidden and cell state must be zero-sized "
+                f"batch-aligned tensors, got {tuple(state.hidden.shape)}"
+            )
+        expected_belief = (batch, self.config.belief_size)
+        if self.config.belief and tuple(state.prior_belief.shape) != expected_belief:
+            raise ValueError(
+                "policy prior-belief state has the wrong shape: "
+                f"{tuple(state.prior_belief.shape)} != {expected_belief}"
+            )
+        if not self.config.belief and (
+            state.prior_belief.ndim != 2 or state.prior_belief.shape[0] != batch
+        ):
+            raise ValueError("policy prior-belief state must be batch-aligned")
+        for name, tensor in (
+            ("hidden", state.hidden),
+            ("cell", state.cell),
+            ("prior belief", state.prior_belief),
+        ):
+            if tensor.device != like.device or tensor.dtype != like.dtype:
+                raise ValueError(
+                    f"policy {name} state must match the input device and dtype"
+                )
+
     def forward(
         self,
         board: torch.Tensor,
@@ -352,6 +396,7 @@ class StatefulPolicy(torch.nn.Module):
             dones = torch.zeros(time, batch, dtype=torch.bool, device=board.device)
         state = self.initial_state(batch, like=board) if state is None else state
         assert state is not None
+        self._validate_state(state, batch, like=board)
         feature_steps: list[torch.Tensor] = []
         belief_steps: list[torch.Tensor] = []
         input_state: PolicyState | None = None

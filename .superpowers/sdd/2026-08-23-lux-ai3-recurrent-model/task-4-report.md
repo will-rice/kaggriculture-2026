@@ -67,3 +67,58 @@ stable family metrics without changing the disabled-feature control path.
 - Simulator collection always has complete private state, so reference-rollout
   validity is true. The explicit false mask remains supported for alternate or
   incomplete backends and is NaN-safe in learner loss.
+
+## Fix round 1/5
+
+### Review findings addressed
+
+- Opponent-private encoding and storage now occur only when the learner is a
+  `StatefulPolicy` with an active belief head. Bare control and recurrent-only
+  rollouts retain `None` trajectory fields and emit no belief segment keys.
+- Belief-only `PolicyState` now uses batch-aligned `(batch, 0, 0, 0)` hidden and
+  cell tensors on the input device/dtype. Actor recording, unbatching,
+  trajectory stacking, segmentation, learner batching, reset, and transfer
+  preserve zero elements rather than allocating unused ConvLSTM maps.
+- Stateful entry validation rejects nonempty belief-only spatial state while
+  preserving Task 3's recurrent-only compatibility: the prior-belief width is
+  strict only when an active belief head consumes it.
+- The anti-leakage test now crosses `_decide`, the collector's actual policy
+  input/target construction seam, and proves that changing only the opposing
+  private observation changes the stored target without changing board,
+  scalars, or positions.
+
+### RED evidence
+
+- Review regression selection:
+  `pytest tests/learn/test_toad_belief.py -k 'opponent_private_label or nonbelief_rollout or zero_sized' -v`
+  -> 4 failed, 15 deselected. `_decide` did not accept opposing target
+  observations, both disabled topologies stored belief tensors, and the
+  belief-only trajectory stored 38,400 dummy recurrent elements in the reduced
+  two-turn fixture.
+- Strict-state cycle:
+  `pytest tests/learn/test_toad_belief.py -k rejects_nonempty -v`
+  -> 1 failed, 19 deselected because belief-only forward silently accepted a
+  nonempty hidden/cell map.
+- First broad regression run -> 2 failed, 178 passed, 6 deselected, 1 expected
+  xfail. Both failures showed the new exact prior-belief-width check reaching
+  recurrent-only Task 3 fixtures, where the unused compatibility slot had
+  width 9 rather than the configured inactive-head width. The check was
+  narrowed to active belief heads; recurrent-only state remains batch- and
+  metadata-validated.
+
+### GREEN evidence
+
+- Review regression selection -> 5 passed, 15 deselected.
+- Complete belief suite -> 20 passed.
+- The two recurrent-only compatibility reproductions plus the belief suite ->
+  22 passed.
+- Final focused belief/encoding/rollout/data/Lightning/model/checkpoint/control
+  gate -> 180 passed, 6 deselected, 1 expected xfail in 72.82 seconds.
+- Scoped Ruff and full-source `ty check src` -> all checks passed.
+- `git diff --check` -> passed.
+
+### Remaining concerns
+
+- The pre-existing sale-metrics xfail and existing environment/Lightning
+  warnings remain unchanged. No new runtime or static concern was found in
+  this fix round.

@@ -151,7 +151,6 @@ from kaggle_environments.core import Environment
 
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 from kaggriculture.learn.encoding import (
-    BELIEF_TARGET_SIZE,
     IGNORE,
     decode_market,
     decode_units,
@@ -424,6 +423,8 @@ class Turn:
     log_prob: torch.Tensor
     value: torch.Tensor
     policy_state: RecordedPolicyState | None = None
+    belief_target: torch.Tensor | None = None
+    belief_valid: bool = False
 
 
 def rollout(policy: PolicyLike, opponent: PolicyLike | str, seed: int) -> Trajectory:
@@ -502,7 +503,6 @@ def rollout_many(
         else [_opponent_actor(opponent, environment) for environment in environments]
     )
     opponent_states: list[PolicyState | None] = [None] * len(environments)
-
     while not environments[0].done:
         for stream in streams:
             seen = _observation(environments, stream.environment, stream.seat)
@@ -511,9 +511,6 @@ def rollout_many(
             stream.counts.append(counts(seen, stream.seat))
             stream.snapshots.append(_snapshot(seen))
             stream.potentials.append(potential(seen))
-            opposing = _observation(environments, stream.environment, 1 - stream.seat)
-            stream.belief_targets.append(encode_private_belief_target(opposing).tensor)
-            stream.belief_valid.append(True)
         turns, next_states = _decide(
             policy,
             [
@@ -526,13 +523,11 @@ def rollout_many(
             generator,
             states=[stream.policy_state for stream in streams],
             dones=[stream.done for stream in streams],
+            belief_observations=_belief_observations(policy, environments, streams),
         )
         actions: list[list[Any]] = [[None, None] for _ in environments]
         for stream, turn, next_state in zip(streams, turns, next_states, strict=True):
-            stream.turns.append(turn)
-            if turn.policy_state is not None:
-                stream.states.append(turn.policy_state)
-            stream.policy_state = next_state
+            _record_turn(stream, turn, next_state)
             actions[stream.environment][stream.seat] = turn.action
         opponent_actions, opponent_states = _opponent_actions(
             policy,
@@ -564,6 +559,29 @@ def _observation(
 ) -> Mapping[str, Any]:
     """Return one seat's own observation, whose ``private`` mapping it alone sees."""
     return environments[index].state[seat].observation
+
+
+def _belief_observations(
+    policy: PolicyLike, environments: list[Environment], streams: Sequence[Stream]
+) -> list[Mapping[str, Any]] | None:
+    """Return opposing private observations only for an active learner head."""
+    if not isinstance(policy, StatefulPolicy) or not policy.config.belief:
+        return None
+    return [
+        _observation(environments, stream.environment, 1 - stream.seat)
+        for stream in streams
+    ]
+
+
+def _record_turn(stream: Stream, turn: Turn, next_state: PolicyState | None) -> None:
+    """Append one acted row, including only supervision the collector produced."""
+    stream.turns.append(turn)
+    if turn.policy_state is not None:
+        stream.states.append(turn.policy_state)
+    if turn.belief_target is not None:
+        stream.belief_targets.append(turn.belief_target)
+        stream.belief_valid.append(turn.belief_valid)
+    stream.policy_state = next_state
 
 
 def _agent_observation(environment: Environment, seat: int) -> Mapping[str, Any]:
@@ -739,6 +757,7 @@ def _decide(
     *,
     states: Sequence[PolicyState | None] | None = None,
     dones: Sequence[bool] | None = None,
+    belief_observations: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[list[Turn], list[PolicyState | None]]:
     """Sample one turn's action for every ``(observation, seat)`` in the batch.
 
@@ -777,6 +796,8 @@ def _decide(
         generator: The sampling stream.
         states: One prior state per request, or all ``None`` at episode start.
         dones: Whether each request follows a terminal action.
+        belief_observations: Optional opposing-seat private observations used
+            only to construct supervision stored beside the policy inputs.
 
     Returns:
         One ``Turn`` and next policy state per request, in request order.
@@ -787,6 +808,20 @@ def _decide(
     units = torch.cat([unit_mask(*request) for request in requests])
     counts = torch.cat([unit_quantity_mask(*request) for request in requests])
     trades = torch.cat([market_mask(*request) for request in requests])
+    if belief_observations is not None and (
+        not isinstance(policy, StatefulPolicy) or not policy.config.belief
+    ):
+        raise ValueError("belief observations require an active belief head")
+    if belief_observations is not None and len(belief_observations) != len(requests):
+        raise ValueError("one belief observation is required per decision request")
+    belief_targets = (
+        [
+            encode_private_belief_target(observation).tensor
+            for observation in belief_observations
+        ]
+        if belief_observations is not None
+        else [None] * len(requests)
+    )
 
     device = next(policy.parameters()).device
     current_states = list(states or [None] * len(requests))
@@ -869,6 +904,8 @@ def _decide(
                     if used_state is not None
                     else None
                 ),
+                belief_target=belief_targets[row],
+                belief_valid=belief_targets[row] is not None,
             )
         )
     next_states = _unbatch_policy_state(output.state)
@@ -1096,11 +1133,13 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
             else None
         ),
         belief_targets=(
-            torch.stack(stream.belief_targets)
-            if stream.belief_targets
-            else torch.empty((0, BELIEF_TARGET_SIZE), dtype=torch.float32)
+            torch.stack(stream.belief_targets) if stream.belief_targets else None
         ),
-        belief_valid=torch.tensor(stream.belief_valid, dtype=torch.bool),
+        belief_valid=(
+            torch.tensor(stream.belief_valid, dtype=torch.bool)
+            if stream.belief_valid
+            else None
+        ),
     )
 
 

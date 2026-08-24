@@ -18,10 +18,7 @@ from kaggriculture.learn.encoding import (
     SEED_SCALE,
     SHED_NAMES,
     BeliefTarget,
-    encode_board,
-    encode_positions,
     encode_private_belief_target,
-    encode_scalars,
 )
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
@@ -69,7 +66,7 @@ def test_belief_target_uses_fixed_family_order_and_normalization() -> None:
 
 
 def test_opponent_private_label_cannot_change_policy_inputs() -> None:
-    """Reading target-private data in any policy encoder must fail this test."""
+    """Collector target changes may not alter the policy tensors it forwards."""
     from kaggle_environments import make
 
     from kaggriculture.constants import ENVIRONMENT
@@ -82,24 +79,96 @@ def test_opponent_private_label_cannot_change_policy_inputs() -> None:
     product = PRODUCT_NAMES[0]
     opponent_b["private"]["shed"][product] += 11
 
-    first_input = (
-        encode_board(own, 0),
-        encode_scalars(own, 0),
-        encode_positions(own, 0),
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=16).model_copy(update={"belief": True})
+    ).eval()
+    first, _ = rollout_module._decide(
+        policy,
+        [(own, 0)],
+        torch.Generator().manual_seed(2),
+        belief_observations=[opponent_a],
     )
-    second_input = (
-        encode_board(own, 0),
-        encode_scalars(own, 0),
-        encode_positions(own, 0),
+    second, _ = rollout_module._decide(
+        policy,
+        [(own, 0)],
+        torch.Generator().manual_seed(2),
+        belief_observations=[opponent_b],
     )
-    first_target = encode_private_belief_target(opponent_a).tensor
-    second_target = encode_private_belief_target(opponent_b).tensor
 
-    assert all(
-        torch.equal(first, second)
-        for first, second in zip(first_input, second_input, strict=True)
+    assert torch.equal(first[0].board, second[0].board)
+    assert torch.equal(first[0].scalars, second[0].scalars)
+    assert torch.equal(first[0].positions, second[0].positions)
+    assert first[0].belief_target is not None
+    assert second[0].belief_target is not None
+    assert not torch.equal(first[0].belief_target, second[0].belief_target)
+
+
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_nonbelief_rollout_and_segments_have_no_privileged_labels(
+    recurrent: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control and recurrent-only collection must retain the Task 3 schema."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 3)
+    if recurrent:
+        policy: toad.Policy | StatefulPolicy = StatefulPolicy(
+            ModelConfig.control(blocks=1, channels=16).model_copy(
+                update={"recurrent": True, "recurrent_channels": 4}
+            )
+        ).eval()
+    else:
+        policy = toad.Policy(blocks=1, channels=16).eval()
+
+    trajectories = rollout_module.rollout_many(policy, policy, (43,))
+
+    for trajectory in trajectories:
+        assert trajectory.belief_targets is None
+        assert trajectory.belief_valid is None
+        segment = segments(trajectory, 1)[0]
+        assert "belief_targets" not in segment
+        assert "belief_valid" not in segment
+
+
+def test_belief_only_rollout_records_zero_sized_absent_recurrent_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belief feedback must not allocate full ConvLSTM maps when it is absent."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 3)
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=16).model_copy(
+            update={"belief": True, "belief_feedback": True}
+        )
+    ).eval()
+
+    trajectory = rollout_module.rollout_many(policy, "starter", (47,))[0]
+
+    assert trajectory.hidden is not None
+    assert trajectory.cell is not None
+    assert trajectory.hidden.shape[0] == trajectory.dones.shape[0] + 1
+    assert trajectory.hidden.numel() == 0
+    assert trajectory.cell.numel() == 0
+    segment = segments(trajectory, 1)[0]
+    assert segment["initial_hidden"].numel() == 0
+    assert segment["initial_cell"].numel() == 0
+
+
+def test_belief_only_rejects_nonempty_absent_recurrent_state() -> None:
+    """Malformed segment entry state must not reintroduce hidden map storage."""
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=16).model_copy(
+            update={"belief": True, "belief_feedback": True}
+        )
     )
-    assert not torch.equal(first_target, second_target)
+    board, scalars, positions = recurrent_inputs(time=2, batch=1)
+    state = policy.initial_state(1, like=board)
+    assert state is not None
+    malformed = replace(
+        state,
+        hidden=board.new_zeros(1, 1, 1, 1),
+        cell=board.new_zeros(1, 1, 1, 1),
+    )
+
+    with pytest.raises(ValueError, match="zero-sized"):
+        policy(board, scalars, positions, state=malformed)
 
 
 def test_segments_preserve_acted_belief_targets_and_boolean_validity() -> None:
