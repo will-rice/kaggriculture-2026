@@ -784,6 +784,36 @@ def test_round_log_reports_each_raw_and_weighted_teacher_term() -> None:
         torch.testing.assert_close(cast(torch.Tensor, record[name]), report.terms[name])
 
 
+def test_round_log_reports_raw_head_entropy_statistics() -> None:
+    """Round diagnostics expose sums, decision counts, and safe head means."""
+    fixture = load_control_fixture()
+    config = control_fixture_config()
+    learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
+    report = compute_loss(learner, control_fixture_batch(fixture), config)
+    module = ToadLightningModule(config)
+    module._round_fresh_terms = [report.terms]
+    module._round_fresh_entropy = [report.entropy]
+    module._round_baselines = [report.terms["baseline"]]
+
+    record = module._round_log_record()
+
+    for name, stat in report.entropy.items():
+        torch.testing.assert_close(
+            stat.mean, stat.sum / stat.valid.to(dtype=stat.sum.dtype).clamp_min(1.0)
+        )
+        torch.testing.assert_close(
+            cast(torch.Tensor, record[f"entropy/{name}_sum"]), stat.sum
+        )
+        torch.testing.assert_close(
+            cast(torch.Tensor, record[f"entropy/{name}_valid"]), stat.valid.float()
+        )
+        torch.testing.assert_close(
+            cast(torch.Tensor, record[f"entropy/{name}_mean"]),
+            stat.mean,
+        )
+
+
 def test_declared_quantity_and_value_alignment_have_independent_weights() -> None:
     """Policy KL and teacher baseline alignment use their own typed costs."""
     fixture = load_control_fixture()

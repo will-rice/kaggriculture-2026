@@ -16,6 +16,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.encoding import (
     CROP_NAMES,
+    IGNORE,
     PRODUCT_NAMES,
     SHED_NAMES,
     transfer_slots,
@@ -42,11 +43,117 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class EntropyStat:
+    """Positive entropy mass and the number of decisions that produced it."""
+
+    sum: torch.Tensor
+    valid: torch.Tensor
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Return the safe FP32 diagnostic mean without storing one eagerly."""
+        return self.sum / self.valid.to(dtype=self.sum.dtype).clamp_min(1.0)
+
+
+@dataclass(frozen=True)
+class HeadEntropy:
+    """Entropy statistics for Toad's three action heads."""
+
+    operation: EntropyStat
+    quantity: EntropyStat
+    market: EntropyStat
+
+    def items(self) -> tuple[tuple[str, EntropyStat], ...]:
+        """Return named head statistics in stable action order."""
+        return (
+            ("operation", self.operation),
+            ("quantity", self.quantity),
+            ("market", self.market),
+        )
+
+
+def _entropy_by_row(
+    *,
+    unit_log_probs: torch.Tensor,
+    quantity_log_probs: torch.Tensor,
+    market_log_probs: torch.Tensor,
+    unit_masks: torch.Tensor,
+    quantity_masks: torch.Tensor,
+    market_masks: torch.Tensor,
+    unit_actions: torch.Tensor,
+) -> HeadEntropy:
+    """Return FP32 entropy sum/count pairs retaining every leading row."""
+    padded_units = unit_actions == IGNORE
+    operation_valid = ~padded_units
+    quantity_valid = transfer_slots(unit_actions) & operation_valid
+    market_valid = torch.ones_like(market_masks[..., 0], dtype=torch.bool)
+
+    def stat(
+        log_probs: torch.Tensor, mask: torch.Tensor, valid: torch.Tensor
+    ) -> EntropyStat:
+        # This is an explicit FP32 island: entropy's masked products otherwise
+        # inherit autocast precision even though the network forward may not.
+        safe_log_probs = log_probs.float().masked_fill(~mask, 0.0)
+        per_slot = entropy_of(safe_log_probs, mask).masked_fill(~valid, 0.0)
+        return EntropyStat(sum=per_slot.sum(dim=-1), valid=valid.sum(dim=-1))
+
+    return HeadEntropy(
+        operation=stat(unit_log_probs, unit_masks, operation_valid),
+        quantity=stat(quantity_log_probs, quantity_masks, quantity_valid),
+        market=stat(market_log_probs, market_masks, market_valid),
+    )
+
+
+def _reduce_head_entropy(by_row: HeadEntropy) -> HeadEntropy:
+    """Reduce row-preserving statistics without taking a premature mean."""
+    return HeadEntropy(
+        operation=EntropyStat(
+            sum=by_row.operation.sum.sum(), valid=by_row.operation.valid.sum()
+        ),
+        quantity=EntropyStat(
+            sum=by_row.quantity.sum.sum(), valid=by_row.quantity.valid.sum()
+        ),
+        market=EntropyStat(
+            sum=by_row.market.sum.sum(), valid=by_row.market.valid.sum()
+        ),
+    )
+
+
+def compute_head_entropy(
+    unit_log_probs: torch.Tensor,
+    quantity_log_probs: torch.Tensor,
+    market_log_probs: torch.Tensor,
+    unit_masks: torch.Tensor,
+    quantity_masks: torch.Tensor,
+    market_masks: torch.Tensor,
+    unit_actions: torch.Tensor,
+) -> HeadEntropy:
+    """Measure differentiable, positive entropy by action head.
+
+    Padded unit rows are identified by the recorded operation action, rather
+    than a placeholder logit or mask. Quantity rows additionally require that
+    operation to spend a quantity. Market slots have no such padding and are
+    counted from their actual tensor shape.
+    """
+    by_row = _entropy_by_row(
+        unit_log_probs=unit_log_probs,
+        quantity_log_probs=quantity_log_probs,
+        market_log_probs=market_log_probs,
+        unit_masks=unit_masks,
+        quantity_masks=quantity_masks,
+        market_masks=market_masks,
+        unit_actions=unit_actions,
+    )
+    return _reduce_head_entropy(by_row)
+
+
+@dataclass(frozen=True)
 class LossReport:
-    """Differentiable total and detached-by-caller diagnostic loss terms."""
+    """Differentiable total, head entropy, and detached-by-caller diagnostics."""
 
     total: torch.Tensor
     terms: Mapping[str, torch.Tensor]
+    entropy: HeadEntropy
 
 
 class ResumeConfigError(ValueError):
@@ -322,15 +429,14 @@ def compute_loss(  # noqa: C901
     flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
     flat_market_masks = market_masks.flatten(0, 1)
     units = torch.log_softmax(
-        unit_logits.masked_fill(~flat_unit_masks, -torch.inf), dim=-1
+        unit_logits.float().masked_fill(~flat_unit_masks, -torch.inf), dim=-1
     )
     quantities = torch.log_softmax(
-        quantity_logits.masked_fill(~flat_quantity_masks, -torch.inf), dim=-1
+        quantity_logits.float().masked_fill(~flat_quantity_masks, -torch.inf), dim=-1
     )
     market = torch.log_softmax(
-        market_logits.masked_fill(~flat_market_masks, -torch.inf), dim=-1
+        market_logits.float().masked_fill(~flat_market_masks, -torch.inf), dim=-1
     )
-    transferred = transfer_slots(flat_unit_actions)
     learner_log_probs = joint_log_prob(
         units,
         quantities,
@@ -339,12 +445,22 @@ def compute_loss(  # noqa: C901
         unit_quantity_actions.flatten(0, 1),
         market_actions.flatten(0, 1),
     ).view(turns, width)
+    entropy_by_row = _entropy_by_row(
+        unit_log_probs=units,
+        quantity_log_probs=quantities,
+        market_log_probs=market,
+        unit_masks=flat_unit_masks,
+        quantity_masks=flat_quantity_masks,
+        market_masks=flat_market_masks,
+        unit_actions=flat_unit_actions,
+    )
+    head_entropy = _reduce_head_entropy(entropy_by_row)
+    # Keep the fixed-coefficient control path byte-for-byte shaped as the
+    # historical per-row summed entropy consumed by the authoritative loss.
     negative_entropy = -(
-        entropy_of(units, flat_unit_masks).sum(dim=-1)
-        + entropy_of(quantities, flat_quantity_masks)
-        .masked_fill(~transferred, 0.0)
-        .sum(dim=-1)
-        + entropy_of(market, flat_market_masks).sum(dim=-1)
+        entropy_by_row.operation.sum
+        + entropy_by_row.quantity.sum
+        + entropy_by_row.market.sum
     ).view(turns, width)
 
     zero = values.sum() * 0.0
@@ -481,7 +597,7 @@ def compute_loss(  # noqa: C901
                 "teacher/value_weighted": teacher_weighted["value"],
             }
         )
-    return LossReport(total=total, terms=terms)
+    return LossReport(total=total, terms=terms, entropy=head_entropy)
 
 
 def round_decay(config: ToadConfig) -> Callable[[int], float]:
@@ -538,6 +654,7 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_ended = False
         self._round_started_warming = False
         self._round_fresh_terms: list[Mapping[str, torch.Tensor]] = []
+        self._round_fresh_entropy: list[HeadEntropy] = []
         self._round_baselines: list[torch.Tensor] = []
         self._round_metrics: dict[str, float | int] = {}
         self._round_population = _empty_population_counts()
@@ -570,6 +687,7 @@ class ToadLightningModule(lightning.LightningModule):
         if batch.first_of_round:
             self._round_started_warming = self.warmup_remaining > 0
             self._round_fresh_terms = []
+            self._round_fresh_entropy = []
             self._round_baselines = []
             self._round_metrics = dict(batch.round_metrics)
             self._round_population = _empty_population_counts()
@@ -586,6 +704,22 @@ class ToadLightningModule(lightning.LightningModule):
         if not batch.baseline_only:
             self._round_fresh_terms.append(
                 {name: value.detach() for name, value in report.terms.items()}
+            )
+            self._round_fresh_entropy.append(
+                HeadEntropy(
+                    operation=EntropyStat(
+                        sum=report.entropy.operation.sum.detach(),
+                        valid=report.entropy.operation.valid.detach(),
+                    ),
+                    quantity=EntropyStat(
+                        sum=report.entropy.quantity.sum.detach(),
+                        valid=report.entropy.quantity.valid.detach(),
+                    ),
+                    market=EntropyStat(
+                        sum=report.entropy.market.sum.detach(),
+                        valid=report.entropy.market.valid.detach(),
+                    ),
+                )
             )
             for kind in batch.segment_kinds or (batch.kind,) * len(batch.segments):
                 if kind is not BatchKind.MIXED:
@@ -606,6 +740,17 @@ class ToadLightningModule(lightning.LightningModule):
         def mean_term(name: str) -> torch.Tensor:
             values = [terms[name] for terms in fresh if name in terms]
             return torch.stack(values).mean() if values else torch.tensor(float("nan"))
+
+        def aggregate_entropy(name: str) -> EntropyStat:
+            values = [getattr(item, name) for item in self._round_fresh_entropy]
+            if not values:
+                return EntropyStat(
+                    sum=torch.tensor(0.0), valid=torch.tensor(0, dtype=torch.int64)
+                )
+            return EntropyStat(
+                sum=torch.stack([stat.sum for stat in values]).sum(),
+                valid=torch.stack([stat.valid for stat in values]).sum(),
+            )
 
         optimizer_steps = int(self.global_step) + 1
         try:
@@ -656,6 +801,11 @@ class ToadLightningModule(lightning.LightningModule):
             "belief/valid_count": mean_term("belief_valid"),
             "diag/total_loss": mean_term("total"),
         }
+        for name in ("operation", "quantity", "market"):
+            stat = aggregate_entropy(name)
+            record[f"entropy/{name}_sum"] = stat.sum
+            record[f"entropy/{name}_valid"] = stat.valid.float()
+            record[f"entropy/{name}_mean"] = stat.mean
         return record
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
