@@ -21,7 +21,11 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
-from kaggriculture.learn.toad.config import ToadConfig, structural_fingerprint
+from kaggriculture.learn.toad.config import (
+    ModelConfig,
+    ToadConfig,
+    structural_fingerprint,
+)
 from kaggriculture.learn.toad.data import (
     BatchKind,
     CollectionAssignment,
@@ -448,6 +452,14 @@ def test_opponent_assignment_uses_the_population_stage_positional_order() -> Non
     assert assignment.opponent_id == "economic"
 
 
+def test_collection_assignment_accepts_raw_string_legacy_positional_order() -> None:
+    """The one-release opponent-before-kind call accepts a serialized kind string."""
+    assignment = CollectionAssignment(9, 10, "economic", "scripted")
+
+    assert assignment.kind is BatchKind.SCRIPTED
+    assert assignment.opponent_id == "economic"
+
+
 def test_teacher_assignment_carries_the_actual_checkpoint_digest(
     tmp_path: Path,
 ) -> None:
@@ -807,6 +819,73 @@ def test_legacy_control_resume_without_population_identity_remains_compatible() 
     assert resumed_source.pool is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("next_game_id", True),
+        ("next_game_id", 1.5),
+        ("next_game_id", -1),
+        ("next_round_id", False),
+        ("next_round_id", 0.5),
+        ("next_round_id", -1),
+        ("published_actor_version", True),
+        ("published_actor_version", 1.5),
+        ("published_actor_version", -1),
+    ],
+)
+def test_collector_restore_rejects_malformed_counters_before_mutation(
+    field: str,
+    value: object,
+) -> None:
+    """Collector clocks never coerce booleans, fractions, or negative values."""
+    config = ToadConfig.control()
+    stored_source = ReferenceRoundSource(config)
+    state = ToadDataModule(config, stored_source).state_dict()
+    state[field] = value
+    resumed_source = ReferenceRoundSource(config)
+    resumed_source.next_game_id = 24
+    resumed_source._next_round_id = 1
+    resumed_source.actor_version = 3
+    before = (
+        resumed_source.next_game_id,
+        resumed_source._next_round_id,
+        resumed_source.actor_version,
+        resumed_source.rng.getstate(),
+    )
+
+    with pytest.raises(ValueError, match="invalid collector checkpoint state"):
+        ToadDataModule(config, resumed_source).load_state_dict(state)
+
+    assert (
+        resumed_source.next_game_id,
+        resumed_source._next_round_id,
+        resumed_source.actor_version,
+        resumed_source.rng.getstate(),
+    ) == before
+
+
+def test_active_collector_restore_requires_round_and_game_stream_alignment() -> None:
+    """A generated stream cannot resume from a skipped or repeated game range."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"environments_per_rank": 2}
+            )
+        }
+    )
+    state = ToadDataModule(config, ReferenceRoundSource(config)).state_dict()
+    state["next_game_id"] = 3
+    state["next_round_id"] = 1
+    resumed_source = ReferenceRoundSource(config)
+
+    with pytest.raises(ValueError, match="invalid collector checkpoint state"):
+        ToadDataModule(config, resumed_source).load_state_dict(state)
+
+    assert resumed_source.next_game_id == 0
+    assert resumed_source._next_round_id == 0
+
+
 def test_external_pool_seed_is_normalized_before_precollection_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -858,31 +937,38 @@ def test_external_pool_seed_is_normalized_before_precollection_checkpoint(
     )
 
 
-def test_inconsistent_same_digest_binding_fails_before_materialization(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_same_digest_frozen_and_teacher_bindings_keep_independent_semantics(
+    tmp_path: Path,
 ) -> None:
-    """Digest caching cannot conceal a second assignment with a different kind."""
-    config = ToadConfig.model_validate({"model": {"blocks": 1, "channels": 4}})
+    """Digest equality may share tensors but never merges binding provenance."""
+    preliminary = ToadConfig.model_validate({"model": {"blocks": 1, "channels": 4}})
     policy = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
     store = SnapshotStore(
         tmp_path / "pool",
         capacity=1,
-        structure=structural_fingerprint(config),
+        structure=structural_fingerprint(preliminary),
     )
     entry = store.add(
         policy.state_dict(), environment_steps=1, round_id=0, run_id="run"
     )
+    teacher_path = tmp_path / "teacher.pt"
+    teacher_path.write_bytes(entry.path.read_bytes())
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "teacher": {
+                    "checkpoint": teacher_path,
+                    "sha256": entry.sha256,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                }
+            },
+        }
+    )
     pool = SnapshotPool.from_store(store, seed=config.population.population_seed)
-    loads: list[tuple[str, ...]] = []
-    real_load_many = SnapshotPool.load_many
-
-    def load_many(
-        selected_pool: SnapshotPool, selected: Sequence[SnapshotEntry]
-    ) -> dict[str, dict[str, torch.Tensor]]:
-        loads.append(tuple(item.sha256 for item in selected))
-        return real_load_many(selected_pool, selected)
-
-    monkeypatch.setattr(SnapshotPool, "load_many", load_many)
     assignments = (
         OpponentAssignment(
             0,
@@ -897,7 +983,7 @@ def test_inconsistent_same_digest_binding_fails_before_materialization(
             1,
             BatchKind.TEACHER_DISTILL,
             "teacher",
-            entry.path,
+            teacher_path,
             entry.sha256,
         ),
     )
@@ -911,11 +997,22 @@ def test_inconsistent_same_digest_binding_fails_before_materialization(
         ),
     )
 
-    with pytest.raises(SnapshotIntegrityError, match="inconsistent.*digest"):
-        list(source)
+    batches = list(source)
 
-    assert loads == []
-    assert collected == []
+    assert collected == [0, 1]
+    assert {
+        (kind, opponent_id, digest)
+        for batch in batches
+        for kind, opponent_id, digest in zip(
+            batch.segment_kinds,
+            batch.segment_opponent_ids,
+            batch.segment_opponent_digests,
+            strict=True,
+        )
+    } == {
+        (BatchKind.FROZEN_OPPONENT, "snapshot", entry.sha256),
+        (BatchKind.TEACHER_DISTILL, "teacher", entry.sha256),
+    }
 
 
 def test_initial_snapshot_is_strictly_checked_before_pool_publication(
@@ -1673,6 +1770,105 @@ def test_default_collection_uses_one_typed_round_pool_and_fans_out(
         toad.OPPONENT,
     ]
     assert all(item.money_weight == 0.01 for item in work)
+
+
+def test_production_neural_chunk_constructs_and_loads_once_for_multiple_games(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One immutable frozen binding runs every assigned seed in one worker chunk."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 2,
+                "collection_processes": 2,
+                "snapshot_at_start": True,
+            },
+        }
+    )
+    actor = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(config),
+    )
+    entry = store.add(
+        actor.state_dict(), environment_steps=0, round_id=0, run_id="frozen"
+    )
+    pool = SnapshotPool.from_store(store, seed=config.population.population_seed)
+    works: list[ReferenceWorkerInput] = []
+
+    class FakePool:
+        def __init__(self, max_workers: int) -> None:
+            assert max_workers == 2
+
+        def __enter__(self) -> "FakePool":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def map(
+            self,
+            function: Callable[[ReferenceWorkerInput], object],
+            inputs: Iterable[ReferenceWorkerInput],
+        ) -> Iterable[object]:
+            chunks = list(inputs)
+            works.extend(chunks)
+            return map(function, chunks)
+
+    constructions: list[bool] = []
+    real_reference_policy = toad._reference_policy
+
+    def counted_reference_policy(
+        model: ModelConfig,
+        state: dict[str, torch.Tensor],
+        *,
+        frozen: bool,
+    ) -> object:
+        constructions.append(frozen)
+        return real_reference_policy(model, state, frozen=frozen)
+
+    def fake_rollout(
+        learner: object,
+        opponent: object,
+        seeds: Sequence[int],
+        *,
+        state_unroll_length: int | None = None,
+    ) -> list[Trajectory]:
+        assert learner is not opponent
+        assert state_unroll_length == config.optimizer.unroll_length
+        return [_trajectory(64) for _seed in seeds]
+
+    loads: list[tuple[Path, ...]] = []
+    real_load_many = SnapshotPool.load_many
+
+    def counted_load_many(
+        selected_pool: SnapshotPool, selected: Sequence[SnapshotEntry]
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        loads.append(tuple(item.path for item in selected))
+        return real_load_many(selected_pool, selected)
+
+    monkeypatch.setattr("kaggriculture.learn.toad.data.ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(toad, "_reference_policy", counted_reference_policy)
+    monkeypatch.setattr(toad, "rollout_many", fake_rollout)
+    monkeypatch.setattr(SnapshotPool, "load_many", counted_load_many)
+    source = ReferenceRoundSource(config, pool=pool)
+    source.publish_actor(actor.state_dict(), version=7)
+
+    batches = list(source)
+
+    assert len(works) == 1
+    assert works[0].seeds == [0, 1]
+    assert constructions == [False, True]
+    assert loads == [(entry.path,)]
+    assert {game_id for batch in batches for game_id in batch.segment_game_ids} == {
+        0,
+        1,
+    }
 
 
 def test_data_module_detaches_actor_before_publication() -> None:

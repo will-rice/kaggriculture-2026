@@ -475,6 +475,46 @@ def test_invalid_checkpoint_restore_is_atomic() -> None:
     ) == before
 
 
+def test_resume_config_mismatch_is_stable_and_failure_atomic() -> None:
+    """Late resume validation cannot partially install stored logical clocks."""
+    stored = ToadLightningModule(ToadConfig.control())
+    stored.environment_steps = 320
+    stored.collection_round = 5
+    stored.actor_version = 3
+    checkpoint: dict[str, object] = {}
+    stored.on_save_checkpoint(checkpoint)
+    base = ToadConfig.control()
+    effective = base.model_copy(
+        update={
+            "optimizer": base.optimizer.model_copy(
+                update={"gamma": base.optimizer.gamma - 0.1}
+            )
+        }
+    )
+    resumed = ToadLightningModule(effective)
+    resumed.environment_steps = 7
+    resumed.collection_round = 2
+    resumed.actor_version = 1
+    before = (
+        resumed.environment_steps,
+        resumed.collection_round,
+        resumed.actor_version,
+        dict(resumed.entropy_state),
+        resumed.population_manifest,
+    )
+
+    with pytest.raises(ResumeConfigError, match="resume config mismatch"):
+        resumed.on_load_checkpoint(checkpoint)
+
+    assert (
+        resumed.environment_steps,
+        resumed.collection_round,
+        resumed.actor_version,
+        resumed.entropy_state,
+        resumed.population_manifest,
+    ) == before
+
+
 def test_full_enabled_lightning_policy_extraction_is_structurally_strict(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -569,7 +609,7 @@ def test_native_resume_reports_exact_structural_paths_and_values() -> None:
         restored.on_load_checkpoint(checkpoint)
 
     assert str(caught.value) == (
-        "structural config mismatch: optimizer.batch_segments: stored=4, effective=8"
+        "resume config mismatch: optimizer.batch_segments: stored=4, effective=8"
     )
 
 

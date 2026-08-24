@@ -907,12 +907,16 @@ def test_teacher_distill_retains_rl_losses_and_matches_normal_teacher_routing() 
     assert distill.terms["entropy"].item() != 0.0
 
 
-def test_mixed_teacher_distill_loss_uses_segment_provenance() -> None:
-    """Teacher-only routing in a mixed batch cannot reach unrelated segments."""
+def test_teacher_regularization_is_invariant_to_mixed_segment_grouping() -> None:
+    """Batch packing cannot switch teacher KL or value alignment off by segment."""
     fixture = load_control_fixture()
     base = control_fixture_config()
     config = base.model_copy(
-        update={"optimizer": base.optimizer.model_copy(update={"teacher_kl_cost": 1.0})}
+        update={
+            "optimizer": base.optimizer.model_copy(
+                update={"teacher_kl_cost": 1.0, "teacher_baseline_cost": 0.5}
+            )
+        }
     )
     learner = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
     learner.load_state_dict(cast(dict[str, torch.Tensor], fixture["initial_model"]))
@@ -920,28 +924,33 @@ def test_mixed_teacher_distill_loss_uses_segment_provenance() -> None:
         toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND),
         config,
         quantity=True,
+        value=True,
     )
     batch = control_fixture_batch(fixture)
     kinds = (BatchKind.TEACHER_DISTILL,) + (BatchKind.SELFPLAY,) * (
         len(batch.segments) - 1
     )
     mixed = replace(batch, kind=BatchKind.MIXED, segment_kinds=kinds)
-    teacher_only = replace(
+    regrouped = replace(
         batch,
-        segments=(batch.segments[0],),
-        kind=BatchKind.TEACHER_DISTILL,
-        segment_kinds=(BatchKind.TEACHER_DISTILL,),
+        kind=BatchKind.SELFPLAY,
+        segment_kinds=(BatchKind.SELFPLAY,) * len(batch.segments),
     )
 
     mixed_report = compute_loss(learner, mixed, config, teacher)
-    teacher_report = compute_loss(learner, teacher_only, config, teacher)
+    regrouped_report = compute_loss(learner, regrouped, config, teacher)
 
     for name in (
         "teacher/operation_kl",
         "teacher/quantity_kl",
         "teacher/market_kl",
+        "teacher/value",
+        "teacher",
+        "total",
     ):
-        torch.testing.assert_close(mixed_report.terms[name], teacher_report.terms[name])
+        torch.testing.assert_close(
+            mixed_report.terms[name], regrouped_report.terms[name]
+        )
 
 
 def test_compute_loss_honors_baseline_only_and_optional_teacher() -> None:

@@ -38,6 +38,18 @@ def _population_config(tmp_path: Path) -> ToadConfig:
     )
 
 
+def _callback_trainer(data: ToadDataModule) -> lightning.Trainer:
+    """Expose the checkpoint seam required by durable manifest publication."""
+
+    def save_checkpoint(path: str) -> None:
+        Path(path).write_bytes(b"authoritative checkpoint")
+
+    return cast(
+        lightning.Trainer,
+        SimpleNamespace(datamodule=data, save_checkpoint=save_checkpoint),
+    )
+
+
 def _metric_float(value: object) -> float:
     """Narrow one logged scalar without weakening the record type."""
     if isinstance(value, torch.Tensor):
@@ -182,9 +194,7 @@ def test_corrupt_manifest_publication_is_failure_atomic(tmp_path: Path) -> None:
     callback = PopulationSnapshotCallback()
 
     with pytest.raises(SnapshotIntegrityError, match="digest"):
-        callback.on_fit_start(
-            cast(lightning.Trainer, SimpleNamespace(datamodule=data)), module
-        )
+        callback.on_fit_start(_callback_trainer(data), module)
 
     assert source.pool is None
     assert module.population_manifest == SnapshotManifest()
@@ -211,9 +221,7 @@ def test_population_resume_keeps_checkpointed_pool_after_output_override(
     source = ReferenceRoundSource(config, assignments=())
     data = ToadDataModule(config, source)
     callback = PopulationSnapshotCallback()
-    callback.on_fit_start(
-        cast(lightning.Trainer, SimpleNamespace(datamodule=data)), module
-    )
+    callback.on_fit_start(_callback_trainer(data), module)
     checkpoint: dict[str, object] = {}
     module.on_save_checkpoint(checkpoint)
     data_state = data.state_dict()
@@ -229,7 +237,7 @@ def test_population_resume_keeps_checkpointed_pool_after_output_override(
     resumed_data = ToadDataModule(resumed_config, resumed_source)
     resumed_data.load_state_dict(data_state)
     resumed_callback = PopulationSnapshotCallback()
-    resumed_trainer = cast(lightning.Trainer, SimpleNamespace(datamodule=resumed_data))
+    resumed_trainer = _callback_trainer(resumed_data)
 
     resumed_callback.on_fit_start(resumed_trainer, resumed_module)
     resumed_module.environment_steps = 100
@@ -474,7 +482,7 @@ def test_four_kind_round_trains_and_reports_actual_mix(
     )
     source.publish_actor(module.policy.state_dict(), version=0)
     data = ToadDataModule(config, source)
-    trainer = cast(lightning.Trainer, SimpleNamespace(datamodule=data))
+    trainer = _callback_trainer(data)
     snapshot_callback = PopulationSnapshotCallback()
     snapshot_callback.on_fit_start(trainer, module)
 
@@ -567,7 +575,7 @@ def test_four_kind_round_trains_and_reports_actual_mix(
     resumed_data.load_state_dict(data_state)
     resumed_callback = PopulationSnapshotCallback()
     resumed_callback.on_fit_start(
-        cast(lightning.Trainer, SimpleNamespace(datamodule=resumed_data)),
+        _callback_trainer(resumed_data),
         resumed_module,
     )
 

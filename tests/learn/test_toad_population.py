@@ -4,6 +4,7 @@ import hashlib
 import io
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
@@ -13,12 +14,14 @@ from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad.config import ModelConfig, TeacherSpec, ToadConfig
 from kaggriculture.learn.toad.population import (
     EmptySnapshotPoolError,
+    LoadedTeacher,
     SnapshotEntry,
     SnapshotIntegrityError,
     SnapshotManifest,
     SnapshotPool,
     SnapshotStore,
     TeacherCompatibilityError,
+    TeacherHead,
     load_teacher,
     sha256_file,
 )
@@ -65,6 +68,40 @@ def test_teacher_accepts_a_completely_absent_undeclared_quantity_head(
     assert loaded.spec.sha256 == sha256_file(checkpoint)
     assert not loaded.policy.training
     assert not any(parameter.requires_grad for parameter in loaded.policy.parameters())
+
+
+@pytest.mark.parametrize(
+    "actual_heads",
+    [
+        ("operation", "market", "operation"),
+        ("market", "operation"),
+        ("operation",),
+        ("operation", "quantity", "market"),
+    ],
+)
+def test_loaded_teacher_rejects_noncanonical_or_unconfirmed_actual_heads(
+    actual_heads: tuple[TeacherHead, ...],
+) -> None:
+    """Direct construction cannot bypass the confirmed declared-head contract."""
+    model = ModelConfig.control(blocks=1, channels=4)
+    policy = Policy(blocks=1, channels=4, value_bound=1.0).requires_grad_(False).eval()
+    spec = TeacherSpec(
+        checkpoint=Path("teacher.pt"),
+        sha256="0" * 64,
+        blocks=1,
+        operation=True,
+        quantity=False,
+        market=True,
+        value=False,
+    )
+
+    with pytest.raises(ValueError, match="actual_heads.*declared"):
+        LoadedTeacher(
+            policy=policy,
+            spec=spec,
+            model=model,
+            actual_heads=actual_heads,
+        )
 
 
 @pytest.mark.parametrize(
@@ -457,6 +494,16 @@ def test_nonempty_finite_evaluation_round_trips_through_manifest(
     }
     assert entry.evaluation == {"win_rate": 0.75}
 
+    with pytest.raises(TypeError):
+        cast(dict[str, float], entry.evaluation)["win_rate"] = 0.5
+
+    reloaded = SnapshotManifest.model_validate_json(
+        SnapshotManifest(entries=(entry,)).model_dump_json()
+    )
+    assert reloaded.entries == (entry,)
+    with pytest.raises(TypeError):
+        cast(dict[str, float], reloaded.entries[0].evaluation)["new"] = 1.0
+
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
 def test_nonfinite_evaluation_is_rejected_before_snapshot_mutation(
@@ -585,6 +632,43 @@ def test_pool_load_verifies_each_manifest_digest_once(
     assert torch.equal(loaded["weight"], torch.tensor([1.0]))
     assert calls.count(first.path) == 1
     assert calls.count(second.path) == 1
+
+
+def test_pool_load_many_verifies_distinct_bindings_with_one_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Equal bytes at distinct paths keep provenance while sharing tensor cache."""
+    store = SnapshotStore(tmp_path, capacity=2, structure="model-v1")
+    first = store.add(state_dict(1.0), environment_steps=1, round_id=0, run_id="a")
+    second = store.add(state_dict(1.0), environment_steps=2, round_id=1, run_id="b")
+    assert first.path != second.path
+    assert first.sha256 == second.sha256
+    pool = SnapshotPool.from_store(store, seed=17)
+    hashed: list[Path] = []
+    loaded: list[Path] = []
+    real_hash = sha256_file
+    from kaggriculture.learn.toad import population as population_module
+
+    real_load = population_module._load_state_dict
+
+    def counted_hash(path: Path) -> str:
+        hashed.append(path)
+        return real_hash(path)
+
+    def counted_load(entry: SnapshotEntry) -> dict[str, torch.Tensor]:
+        loaded.append(entry.path)
+        return real_load(entry)
+
+    monkeypatch.setattr(population_module, "sha256_file", counted_hash)
+    monkeypatch.setattr(population_module, "_load_state_dict", counted_load)
+
+    tensors = pool.load_many((first, second))
+
+    assert set(tensors) == {first.sha256}
+    assert torch.equal(tensors[first.sha256]["weight"], torch.tensor([1.0]))
+    assert hashed.count(first.path) == 1
+    assert hashed.count(second.path) == 1
+    assert loaded == [first.path]
 
 
 def test_empty_population_refuses_a_frozen_opponent_request(tmp_path: Path) -> None:

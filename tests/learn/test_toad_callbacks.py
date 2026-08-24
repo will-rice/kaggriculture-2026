@@ -63,6 +63,8 @@ def _callback_fixture(
         collection_round=round_id,
         actor_version=actor_version,
         actor_source_global_step=0,
+        population_manifest=SnapshotManifest(),
+        _authoritative_checkpoint_identity=None,
         global_step=trainer.global_step,
         _round_started_warming=round_started_warming,
     )
@@ -375,3 +377,77 @@ def test_collection_bootstrap_manifest_is_captured_at_first_boundary(
 
     assert module.population_manifest == store.manifest
     assert data.manifests[-1] == store.manifest
+
+
+def test_snapshot_only_cadence_writes_the_latest_authoritative_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A crash between checkpoint cadences resumes the just-published manifest."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"snapshot_every_environment_steps": 100}
+            ),
+            "runtime": base.runtime.model_copy(
+                update={
+                    "output_dir": tmp_path,
+                    "checkpoint_every_environment_steps": 1_000,
+                }
+            ),
+        }
+    )
+    module = ToadLightningModule(config)
+    data = _DataModule()
+
+    class CheckpointingTrainer(_Trainer):
+        def save_checkpoint(self, path: str) -> None:
+            checkpoint: dict[str, object] = {}
+            module.on_save_checkpoint(checkpoint)
+            torch.save(checkpoint, path)
+            self.saved.append(Path(path))
+
+    trainer = CheckpointingTrainer(data)
+    snapshot = PopulationSnapshotCallback()
+    periodic = BoundaryCheckpoint(tmp_path)
+    snapshot.on_fit_start(
+        _lightning_trainer(trainer), cast(lightning.LightningModule, module)
+    )
+    periodic.on_fit_start(
+        _lightning_trainer(trainer), cast(lightning.LightningModule, module)
+    )
+    module.environment_steps = 100
+    module.collection_round = 1
+    boundary = _batch(end_of_round=True)
+
+    snapshot.on_train_batch_end(
+        _lightning_trainer(trainer),
+        cast(lightning.LightningModule, module),
+        None,
+        boundary,
+        0,
+    )
+    periodic.on_train_batch_end(
+        _lightning_trainer(trainer),
+        cast(lightning.LightningModule, module),
+        None,
+        boundary,
+        0,
+    )
+
+    checkpoint_path = tmp_path / "step-100.ckpt"
+    assert checkpoint_path.is_file()
+    assert len(trainer.saved) == 1
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    resumed = ToadLightningModule(config)
+    resumed.on_load_checkpoint(checkpoint)
+    assert resumed.environment_steps == 100
+    assert resumed.population_manifest == module.population_manifest
+
+    resumed_data = _DataModule()
+    resumed_trainer = _Trainer(resumed_data)
+    PopulationSnapshotCallback().on_fit_start(
+        _lightning_trainer(resumed_trainer),
+        cast(lightning.LightningModule, resumed),
+    )
+    assert resumed_data.manifests[-1] == resumed.population_manifest

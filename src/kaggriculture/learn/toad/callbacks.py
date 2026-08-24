@@ -18,6 +18,26 @@ from kaggriculture.learn.toad.population import (
 )
 
 
+def _save_authoritative_checkpoint(
+    trainer: lightning.Trainer,
+    module: ToadLightningModule,
+    output_dir: Path,
+) -> None:
+    """Atomically save the sole resumable state for this manifest generation."""
+    identity = (
+        module.environment_steps,
+        module.population_manifest.model_dump_json(),
+    )
+    if getattr(module, "_authoritative_checkpoint_identity", None) == identity:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final_path = output_dir / f"step-{module.environment_steps}.ckpt"
+    temporary_path = final_path.with_suffix(".tmp")
+    trainer.save_checkpoint(str(temporary_path))
+    os.replace(temporary_path, final_path)  # noqa: PTH105
+    module._authoritative_checkpoint_identity = identity
+
+
 def _data_module(trainer: lightning.Trainer) -> ToadDataModule:
     """Return the Toad data module owned by ``trainer``."""
     data_module = getattr(trainer, "datamodule", None)
@@ -106,11 +126,18 @@ class PopulationSnapshotCallback(lightning.Callback):
         """Open the durable pool and schedule strictly after restored progress."""
         module = cast(ToadLightningModule, pl_module)
         population = module.config.population
+        previous_manifest = module.population_manifest
         self._reopen_store(trainer, module)
         assert self.store is not None
         if population.snapshot_at_start and not self.store.manifest.entries:
             self._add_snapshot(module)
         self._publish(trainer, module)
+        if module.population_manifest != previous_manifest:
+            _save_authoritative_checkpoint(
+                trainer,
+                module,
+                module.config.runtime.output_dir,
+            )
         interval = population.snapshot_every_environment_steps
         self.next_snapshot_steps = (
             None
@@ -131,19 +158,37 @@ class PopulationSnapshotCallback(lightning.Callback):
         learner_batch = cast(LearnerBatch, batch)
         if not learner_batch.end_of_round:
             return
+        previous_manifest = module.population_manifest
         self._reopen_store(trainer, module)
         interval = module.config.population.snapshot_every_environment_steps
         if interval is None:
             self._publish(trainer, module)
+            if module.population_manifest != previous_manifest:
+                _save_authoritative_checkpoint(
+                    trainer,
+                    module,
+                    module.config.runtime.output_dir,
+                )
             return
         if (
             self.next_snapshot_steps is None
             or module.environment_steps < self.next_snapshot_steps
         ):
             self._publish(trainer, module)
+            if module.population_manifest != previous_manifest:
+                _save_authoritative_checkpoint(
+                    trainer,
+                    module,
+                    module.config.runtime.output_dir,
+                )
             return
         self._add_snapshot(module)
         self._publish(trainer, module)
+        _save_authoritative_checkpoint(
+            trainer,
+            module,
+            module.config.runtime.output_dir,
+        )
         self.next_snapshot_steps = (module.environment_steps // interval + 1) * interval
 
     def _reopen_store(
@@ -237,11 +282,7 @@ class BoundaryCheckpoint(lightning.Callback):
         if module.environment_steps < self._next_environment_steps:
             return
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        final_path = self.output_dir / f"step-{module.environment_steps}.ckpt"
-        temporary_path = final_path.with_suffix(".tmp")
-        trainer.save_checkpoint(str(temporary_path))
-        os.replace(temporary_path, final_path)  # noqa: PTH105
+        _save_authoritative_checkpoint(trainer, module, self.output_dir)
         self._next_environment_steps = (
             module.environment_steps // interval + 1
         ) * interval

@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, cast
 
 import torch
@@ -23,6 +24,8 @@ from pydantic import (
     FiniteFloat,
     NonNegativeInt,
     TypeAdapter,
+    field_serializer,
+    field_validator,
 )
 
 from kaggriculture.learn.model import Policy
@@ -67,6 +70,21 @@ class LoadedTeacher:
     spec: TeacherSpec
     model: ModelConfig
     actual_heads: tuple[TeacherHead, ...]
+
+    def __post_init__(self) -> None:
+        """Defend the confirmed canonical head contract at every construction seam."""
+        expected = tuple(
+            head for head in _TEACHER_HEAD_PREFIXES if getattr(self.spec, head)
+        )
+        if self.actual_heads != expected:
+            raise ValueError(
+                "LoadedTeacher actual_heads must exactly match the canonical "
+                "declared head contract"
+            )
+        if self.policy.training or any(
+            parameter.requires_grad for parameter in self.policy.parameters()
+        ):
+            raise ValueError("LoadedTeacher policy must be frozen in evaluation mode")
 
     def metadata(self) -> dict[str, object]:
         """Return the complete path, digest, topology, and head contract."""
@@ -162,17 +180,15 @@ def resolve_teacher_model(spec: TeacherSpec, student: ModelConfig) -> ModelConfi
     ).model_copy(update={"value_bound": student.value_bound})
 
 
-def load_teacher(  # noqa: C901
-    spec: TeacherSpec, model_config: ModelConfig
+def load_teacher_from_state(  # noqa: C901
+    spec: TeacherSpec,
+    model_config: ModelConfig,
+    state: Mapping[str, torch.Tensor],
+    *,
+    sha256: str,
 ) -> LoadedTeacher:
-    """Load exactly one checkpoint and enforce shared and declared-head strictness."""
-    try:
-        serialized = spec.checkpoint.read_bytes()
-    except OSError as error:
-        raise TeacherCompatibilityError(
-            f"teacher digest verification failed: {spec.checkpoint}"
-        ) from error
-    digest = hashlib.sha256(serialized).hexdigest()
+    """Validate cached bare tensors under one independently confirmed binding."""
+    digest = sha256
     if spec.sha256 is not None and digest != spec.sha256:
         raise TeacherCompatibilityError(
             "teacher digest does not match TeacherSpec: "
@@ -186,23 +202,7 @@ def load_teacher(  # noqa: C901
         kernel_size=resolved_model.kernel_size,
         activation=resolved_model.activation,
     )
-    try:
-        checkpoint = torch.load(
-            io.BytesIO(serialized),
-            map_location="cpu",
-            weights_only=True,
-        )
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-        EOFError,
-        pickle.UnpicklingError,
-    ) as error:
-        raise TeacherCompatibilityError(
-            f"teacher checkpoint cannot be loaded: {spec.checkpoint}"
-        ) from error
-    weights = _teacher_policy_weights(checkpoint)
+    weights = _teacher_policy_weights(state)
     expected = policy.state_dict()
     expected_keys = set(expected)
     actual_keys = set(weights)
@@ -261,6 +261,44 @@ def load_teacher(  # noqa: C901
     )
 
 
+def load_teacher(spec: TeacherSpec, model_config: ModelConfig) -> LoadedTeacher:
+    """Load exactly one checkpoint and enforce shared and declared-head strictness."""
+    try:
+        serialized = spec.checkpoint.read_bytes()
+    except OSError as error:
+        raise TeacherCompatibilityError(
+            f"teacher digest verification failed: {spec.checkpoint}"
+        ) from error
+    digest = hashlib.sha256(serialized).hexdigest()
+    if spec.sha256 is not None and digest != spec.sha256:
+        raise TeacherCompatibilityError(
+            "teacher digest does not match TeacherSpec: "
+            f"expected {spec.sha256}, found {digest}"
+        )
+    try:
+        checkpoint = torch.load(
+            io.BytesIO(serialized),
+            map_location="cpu",
+            weights_only=True,
+        )
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        EOFError,
+        pickle.UnpicklingError,
+    ) as error:
+        raise TeacherCompatibilityError(
+            f"teacher checkpoint cannot be loaded: {spec.checkpoint}"
+        ) from error
+    return load_teacher_from_state(
+        spec,
+        model_config,
+        _teacher_policy_weights(checkpoint),
+        sha256=digest,
+    )
+
+
 class SnapshotEntry(BaseModel):
     """Immutable provenance for one content-addressed policy state dictionary."""
 
@@ -273,7 +311,25 @@ class SnapshotEntry(BaseModel):
     round_id: NonNegativeInt
     run_id: str
     created_at: datetime
-    evaluation: dict[str, FiniteFloat] = Field(default_factory=dict)
+    evaluation: Mapping[str, FiniteFloat] = Field(
+        default_factory=dict,
+        validate_default=True,
+    )
+
+    @field_validator("evaluation")
+    @classmethod
+    def freeze_evaluation(
+        cls, evaluation: Mapping[str, FiniteFloat]
+    ) -> Mapping[str, FiniteFloat]:
+        """Copy evaluation metadata into an immutable defensive mapping."""
+        return MappingProxyType(dict(evaluation))
+
+    @field_serializer("evaluation")
+    def serialize_evaluation(
+        self, evaluation: Mapping[str, FiniteFloat]
+    ) -> dict[str, float]:
+        """Keep the immutable mapping's durable JSON representation ordinary."""
+        return {name: float(value) for name, value in evaluation.items()}
 
 
 class SnapshotManifest(BaseModel):
@@ -576,12 +632,11 @@ class SnapshotPool:
                 raise SnapshotIntegrityError(
                     f"selected snapshot is not in the bound store: {entry.path}"
                 )
-            previous = selected_by_digest.get(entry.sha256)
-            if previous is not None and previous != entry:
-                raise SnapshotIntegrityError(
-                    f"selected digest has inconsistent manifest entries: {entry.sha256}"
-                )
-            selected_by_digest[entry.sha256] = entry
+            # Every distinct path/digest binding was independently verified by
+            # ``_validate_existing_members`` above. Tensor deserialization alone
+            # is content-addressed, so equal bytes may reuse the first loaded state
+            # without collapsing either entry's provenance.
+            selected_by_digest.setdefault(entry.sha256, entry)
         for digest, entry in selected_by_digest.items():
             loaded[digest] = _load_state_dict(entry)
         return loaded

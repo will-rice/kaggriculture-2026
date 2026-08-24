@@ -28,7 +28,6 @@ from kaggriculture.learn.encoding import (
 from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.ppo import entropy_of, joint_log_prob
 from kaggriculture.learn.toad.config import (
-    STRUCTURAL_FIELDS,
     EntropyControllerConfig,
     ToadConfig,
     structural_fingerprint,
@@ -662,27 +661,50 @@ def initialize_policy_from_checkpoint(
     return WarmStartMigration("legacy_control", source)
 
 
-def read_path(config: ToadConfig, path: str) -> object:
-    """Read one declared dotted configuration path."""
-    value: object = config
-    for part in path.split("."):
-        value = getattr(value, part)
-    return value
+_RESUME_OVERRIDE_FIELDS = frozenset(
+    {
+        "runtime.accelerator",
+        "runtime.devices",
+        "runtime.num_nodes",
+        "runtime.strategy",
+        "runtime.log_every_n_steps",
+        "runtime.profiler",
+        "runtime.output_dir",
+        "runtime.resume",
+        # Initialization provenance is consumed before the authoritative
+        # checkpoint exists and cannot affect any resumed assignment or update.
+        "curriculum.warm_start_checkpoint",
+    }
+)
+
+
+def _config_leaves(value: object, prefix: str = "") -> dict[str, object]:
+    """Flatten a resolved JSON config so new fields are compared by default."""
+    if not isinstance(value, Mapping):
+        return {prefix: value}
+    leaves: dict[str, object] = {}
+    for name, child in value.items():
+        path = f"{prefix}.{name}" if prefix else str(name)
+        leaves.update(_config_leaves(child, path))
+    return leaves
 
 
 def assert_resume_compatible(effective: ToadConfig, stored: ToadConfig) -> None:
-    """Reject only declared structural differences on resume."""
+    """Compare the complete resolved config except proven operational overrides."""
+    stored_leaves = _config_leaves(stored.model_dump(mode="json"))
+    effective_leaves = _config_leaves(effective.model_dump(mode="json"))
+    paths = (set(stored_leaves) | set(effective_leaves)) - _RESUME_OVERRIDE_FIELDS
     differences = {
-        path: (read_path(stored, path), read_path(effective, path))
-        for path in STRUCTURAL_FIELDS
-        if read_path(stored, path) != read_path(effective, path)
+        path: (stored_leaves.get(path), effective_leaves.get(path))
+        for path in sorted(paths)
+        if stored_leaves.get(path) != effective_leaves.get(path)
     }
     if differences:
         rendered = ", ".join(
             f"{path}: stored={before!r}, effective={after!r}"
             for path, (before, after) in differences.items()
         )
-        raise ResumeConfigError(f"structural config mismatch: {rendered}")
+        raise ResumeConfigError(f"resume config mismatch: {rendered}")
 
 
 def compute_loss(  # noqa: C901
@@ -829,10 +851,8 @@ def compute_loss(  # noqa: C901
     if teacher is not None:
         declared = (
             {
-                "operation": teacher.spec.operation,
-                "quantity": teacher.spec.quantity,
-                "market": teacher.spec.market,
-                "value": teacher.spec.value,
+                head: head in teacher.actual_heads
+                for head in ("operation", "quantity", "market", "value")
             }
             if isinstance(teacher, LoadedTeacher)
             else {
@@ -850,23 +870,6 @@ def compute_loss(  # noqa: C901
                     positions.flatten(0, 1),
                 )
             )
-        if batch.segment_kinds:
-            if len(batch.segment_kinds) != width:
-                raise ValueError("segment_kinds must align exactly with batch segments")
-            distill_columns = torch.tensor(
-                [kind is BatchKind.TEACHER_DISTILL for kind in batch.segment_kinds],
-                dtype=torch.bool,
-                device=values.device,
-            )
-            teacher_columns = (
-                distill_columns
-                if distill_columns.any()
-                else torch.ones_like(distill_columns)
-            )
-        elif batch.kind is BatchKind.MIXED:
-            raise ValueError("mixed teacher loss requires per-segment kind provenance")
-        else:
-            teacher_columns = torch.ones(width, dtype=torch.bool, device=values.device)
 
         teacher_kl = torch.zeros(
             turns, width, dtype=torch.float32, device=values.device
@@ -882,7 +885,7 @@ def compute_loss(  # noqa: C901
                 _acted(teacher_head_logits, turns, width).float(),
                 mask,
             ).view(turns, width)
-            return per_step.masked_fill(~teacher_columns.unsqueeze(0), 0.0)
+            return per_step
 
         if declared["operation"]:
             operation_kl = head_kl(units, teacher_units, flat_unit_masks)
@@ -902,7 +905,7 @@ def compute_loss(  # noqa: C901
             ).view(turns, width)
             value_error = functional.smooth_l1_loss(
                 values.float(), acted_teacher_values.float(), reduction="none"
-            ).masked_fill(~teacher_columns.unsqueeze(0), 0.0)
+            )
             teacher_raw["value"] = toad_loss.reduce(value_error)
 
     effective_baseline_only = (
@@ -1033,6 +1036,7 @@ class ToadLightningModule(lightning.LightningModule):
         self.actor_version = 0
         self.actor_source_global_step = 0
         self.population_manifest = SnapshotManifest()
+        self._authoritative_checkpoint_identity: tuple[int, str] | None = None
         self.warmup_remaining = config.optimizer.value_warmup_batches
         self.entropy_state = {
             name: EntropyControllerState(

@@ -14,7 +14,10 @@ from kaggriculture.learn.toad.config import (
     load_config,
     structural_fingerprint,
 )
-from kaggriculture.learn.toad.lightning import assert_resume_compatible
+from kaggriculture.learn.toad.lightning import (
+    ResumeConfigError,
+    assert_resume_compatible,
+)
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
 
 
@@ -221,6 +224,69 @@ def test_warm_start_provenance_does_not_make_resume_structurally_incompatible(
     effective = ToadConfig(runtime={"resume": tmp_path / "resume.ckpt"})
 
     assert_resume_compatible(effective, stored)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("runtime.seed", 17),
+        ("population.population_seed", 19),
+        ("population.actor_sync_every_rounds", 2),
+        ("optimizer.gamma", 0.9),
+        ("optimizer.lmb", 0.7),
+        ("optimizer.entropy_cost", 0.25),
+        ("curriculum.phase", "phase2"),
+        ("curriculum.reward_field", "own"),
+        ("curriculum.money_weight", 0.5),
+        ("model.blocks", 4),
+    ],
+)
+def test_resume_rejects_every_behavior_changing_config_drift(
+    path: str,
+    value: object,
+) -> None:
+    """The next assignment and update are bound to the complete resolved config."""
+    stored = ToadConfig.control()
+    effective = apply_overrides(stored, [f"{path}={json.dumps(value)}"])
+
+    with pytest.raises(ResumeConfigError, match="resume config mismatch"):
+        assert_resume_compatible(effective, stored)
+
+
+def test_resume_allows_only_explicit_operational_overrides(tmp_path: Path) -> None:
+    """Placement, diagnostics, destination, and resume path do not alter learning."""
+    stored = ToadConfig.control()
+    effective = stored.model_copy(
+        update={
+            "runtime": stored.runtime.model_copy(
+                update={
+                    "accelerator": "cpu",
+                    "strategy": "auto",
+                    "log_every_n_steps": 9,
+                    "profiler": "simple",
+                    "output_dir": tmp_path / "resumed",
+                    "resume": tmp_path / "step.ckpt",
+                }
+            )
+        }
+    )
+
+    assert_resume_compatible(effective, stored)
+
+
+def test_resume_rejects_unlisted_runtime_budget_and_numerics_drift() -> None:
+    """Operational does not mean arbitrary runtime settings are update-neutral."""
+    stored = ToadConfig.control()
+    for field, value in (
+        ("total_environment_steps", stored.runtime.total_environment_steps + 1),
+        ("checkpoint_every_environment_steps", 17),
+        ("deterministic", True),
+    ):
+        effective = stored.model_copy(
+            update={"runtime": stored.runtime.model_copy(update={field: value})}
+        )
+        with pytest.raises(ResumeConfigError, match="resume config mismatch"):
+            assert_resume_compatible(effective, stored)
 
 
 def test_teacher_checkpoint_must_open_for_read(

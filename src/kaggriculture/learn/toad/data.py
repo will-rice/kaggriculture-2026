@@ -33,6 +33,7 @@ from kaggriculture.learn.toad.population import (
     SnapshotStore,
     TeacherCompatibilityError,
     load_teacher,
+    load_teacher_from_state,
     resolve_teacher_model,
     sha256_file,
 )
@@ -174,9 +175,14 @@ class OpponentAssignment:
         checkpoint_sha256: str | None = None,
     ) -> None:
         """Accept the public order plus the legacy opponent-before-kind order."""
-        if not isinstance(kind, BatchKind) and isinstance(opponent_id, BatchKind):
-            kind, opponent_id = opponent_id, kind
-        resolved_kind = BatchKind(kind)
+        try:
+            resolved_kind = BatchKind(kind)
+        except ValueError:
+            try:
+                resolved_kind = BatchKind(opponent_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"{kind!r} is not a valid BatchKind") from None
+            kind, opponent_id = resolved_kind, kind
         if not isinstance(opponent_id, str):
             raise TypeError("opponent_id must be a string")
         object.__setattr__(self, "game_id", game_id)
@@ -189,6 +195,15 @@ class OpponentAssignment:
 
 # Keep the foundation-stage spelling as an exact compatibility alias.
 CollectionAssignment = OpponentAssignment
+
+
+@dataclass(frozen=True)
+class OpponentBinding:
+    """Immutable neural-opponent identity, independent of game provenance."""
+
+    kind: BatchKind
+    checkpoint: Path
+    sha256: str
 
 
 _ONLINE_KINDS = (
@@ -329,6 +344,20 @@ class CollectionError(RuntimeError):
 
 class PopulationResumeMigrationError(RuntimeError):
     """A legacy checkpoint cannot identify its required durable population."""
+
+
+class CollectorCheckpointError(ValueError):
+    """Collector checkpoint state is malformed or cannot name the next stream."""
+
+
+_INVALID_COLLECTOR_STATE = "invalid collector checkpoint state"
+
+
+def _checkpoint_nonnegative_int(value: object) -> int:
+    """Accept only exact non-boolean nonnegative collector counters."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE)
+    return value
 
 
 def _checkpoint_policy_state(path: Path) -> dict[str, torch.Tensor]:
@@ -732,10 +761,22 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
     def _worker_input(
         self,
         assignment: CollectionAssignment,
-        opponents: Mapping[str, tuple[dict[str, torch.Tensor], ModelConfig]]
+        opponents: Mapping[OpponentBinding, tuple[dict[str, torch.Tensor], ModelConfig]]
         | None = None,
     ) -> ReferenceWorkerInput:
         """Return one resolved typed worker request with no architecture drift."""
+        return self._worker_input_chunk((assignment,), opponents)
+
+    def _worker_input_chunk(
+        self,
+        assignments: Sequence[CollectionAssignment],
+        opponents: Mapping[OpponentBinding, tuple[dict[str, torch.Tensor], ModelConfig]]
+        | None = None,
+    ) -> ReferenceWorkerInput:
+        """Build one worker request for games sharing an immutable binding."""
+        if not assignments:
+            raise ValueError("reference worker chunks cannot be empty")
+        assignment = assignments[0]
         versus = None
         if assignment.kind is BatchKind.SCRIPTED:
             from kaggriculture.learn.scripts.toad import OPPONENT
@@ -748,12 +789,15 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         opponent_state: dict[str, torch.Tensor] | None = None
         opponent_model: ModelConfig | None = None
         if assignment.checkpoint_sha256 is not None:
-            if opponents is None or assignment.checkpoint_sha256 not in opponents:
+            binding = self._assignment_binding(assignment)
+            if binding is None or opponents is None or binding not in opponents:
                 raise RuntimeError("neural opponent was not materialized for its round")
-            opponent_state, opponent_model = opponents[assignment.checkpoint_sha256]
+            if any(self._assignment_binding(item) != binding for item in assignments):
+                raise RuntimeError("worker chunk mixes immutable opponent bindings")
+            opponent_state, opponent_model = opponents[binding]
         return ReferenceWorkerInput(
             actor_state=self.actor_state,
-            seeds=[assignment.seed],
+            seeds=[item.seed for item in assignments],
             model=self.config.model,
             versus=versus,
             money_weight=self.config.curriculum.money_weight,
@@ -764,83 +808,102 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
 
     def _materialize_opponents(
         self, assignments: Sequence[CollectionAssignment]
-    ) -> dict[str, tuple[dict[str, torch.Tensor], ModelConfig]]:
-        """Validate and load each selected neural-opponent digest exactly once."""
-        validated: dict[
-            str, tuple[BatchKind, Path, str, ModelConfig, SnapshotEntry | None]
-        ] = {}
-        for digest, group in self._group_opponent_assignments(assignments).items():
-            validated[digest] = self._validate_opponent_group(digest, group)
+    ) -> dict[OpponentBinding, tuple[dict[str, torch.Tensor], ModelConfig]]:
+        """Validate every binding while caching only content-addressed tensors."""
+        validated: dict[OpponentBinding, tuple[ModelConfig, SnapshotEntry | None]] = {}
+        for binding, group in self._group_opponent_assignments(assignments).items():
+            validated[binding] = self._validate_opponent_group(binding, group)
 
         frozen_entries = [
-            entry
-            for _kind, _path, _opponent_id, _model, entry in validated.values()
-            if entry is not None
+            entry for _model, entry in validated.values() if entry is not None
         ]
-        frozen_states = (
+        tensor_cache = (
             self.pool.load_many(frozen_entries)
             if frozen_entries and self.pool is not None
             else {}
         )
-        materialized: dict[str, tuple[dict[str, torch.Tensor], ModelConfig]] = {}
-        for digest, (kind, path, _opponent_id, model, _entry) in validated.items():
-            if kind is BatchKind.FROZEN_OPPONENT:
-                state = frozen_states[digest]
+        materialized: dict[
+            OpponentBinding, tuple[dict[str, torch.Tensor], ModelConfig]
+        ] = {}
+        for binding, (model, _entry) in validated.items():
+            if binding.kind is BatchKind.FROZEN_OPPONENT:
+                state = tensor_cache[binding.sha256]
             else:
                 spec = self.config.population.teacher
-                if spec is None or spec.checkpoint != path:
+                if spec is None or spec.checkpoint != binding.checkpoint:
                     raise SnapshotIntegrityError(
                         "teacher assignment does not match population.teacher"
                     )
                 try:
-                    loaded_teacher = load_teacher(
-                        spec.model_copy(update={"sha256": digest}),
-                        self.config.model,
-                    )
+                    confirmed_spec = spec.model_copy(update={"sha256": binding.sha256})
+                    if binding.sha256 in tensor_cache:
+                        if sha256_file(binding.checkpoint) != binding.sha256:
+                            raise TeacherCompatibilityError(
+                                "teacher digest does not match assignment binding"
+                            )
+                        loaded_teacher = load_teacher_from_state(
+                            confirmed_spec,
+                            self.config.model,
+                            tensor_cache[binding.sha256],
+                            sha256=binding.sha256,
+                        )
+                    else:
+                        loaded_teacher = load_teacher(
+                            confirmed_spec,
+                            self.config.model,
+                        )
                 except TeacherCompatibilityError as error:
                     raise SnapshotIntegrityError(
-                        f"teacher checkpoint is incompatible: {path}: {error}"
+                        "teacher checkpoint is incompatible: "
+                        f"{binding.checkpoint}: {error}"
                     ) from error
                 state = dict(loaded_teacher.policy.state_dict())
+                tensor_cache.setdefault(binding.sha256, state)
                 model = loaded_teacher.model
-            materialized[digest] = (state, model)
+            materialized[binding] = (state, model)
         return materialized
 
-    @staticmethod
+    @classmethod
     def _group_opponent_assignments(
-        assignments: Sequence[CollectionAssignment],
-    ) -> dict[str, list[CollectionAssignment]]:
-        """Group neural assignments while rejecting unbound checkpoint paths."""
-        groups: dict[str, list[CollectionAssignment]] = {}
+        cls, assignments: Sequence[CollectionAssignment]
+    ) -> dict[OpponentBinding, list[CollectionAssignment]]:
+        """Group only exact neural bindings; digest equality is not identity."""
+        groups: dict[OpponentBinding, list[CollectionAssignment]] = {}
         for assignment in assignments:
-            digest = assignment.checkpoint_sha256
-            if digest is None:
-                if assignment.checkpoint is not None:
-                    raise SnapshotIntegrityError(
-                        "opponent checkpoint path has no digest binding"
-                    )
+            binding = cls._assignment_binding(assignment)
+            if binding is None:
                 continue
-            groups.setdefault(digest, []).append(assignment)
+            groups.setdefault(binding, []).append(assignment)
         return groups
 
-    def _validate_opponent_group(
-        self, digest: str, group: Sequence[CollectionAssignment]
-    ) -> tuple[BatchKind, Path, str, ModelConfig, SnapshotEntry | None]:
-        """Require every same-digest slot to carry one exact semantic binding."""
-        bindings = {
-            (assignment.kind, assignment.checkpoint, assignment.opponent_id)
-            for assignment in group
-        }
-        if len(bindings) != 1:
-            raise SnapshotIntegrityError(
-                f"inconsistent assignment binding for digest {digest}"
-            )
-        assignment = group[0]
-        if assignment.checkpoint is None:
+    @staticmethod
+    def _assignment_binding(
+        assignment: CollectionAssignment,
+    ) -> OpponentBinding | None:
+        """Return an exact neural binding or reject incomplete path/digest pairs."""
+        digest = assignment.checkpoint_sha256
+        checkpoint = assignment.checkpoint
+        if digest is None:
+            if checkpoint is not None:
+                raise SnapshotIntegrityError(
+                    "opponent checkpoint path has no digest binding"
+                )
+            return None
+        if checkpoint is None:
             raise SnapshotIntegrityError(
                 f"opponent digest {digest} has no checkpoint path"
             )
-        if assignment.kind is BatchKind.FROZEN_OPPONENT:
+        return OpponentBinding(assignment.kind, checkpoint, digest)
+
+    def _validate_opponent_group(
+        self, binding: OpponentBinding, group: Sequence[CollectionAssignment]
+    ) -> tuple[ModelConfig, SnapshotEntry | None]:
+        """Validate one path/kind/digest binding without merging provenance."""
+        if any(self._assignment_binding(item) != binding for item in group):
+            raise SnapshotIntegrityError(
+                f"inconsistent assignment binding for digest {binding.sha256}"
+            )
+        if binding.kind is BatchKind.FROZEN_OPPONENT:
             if self.pool is None:
                 raise EmptySnapshotPoolError(
                     "frozen opponent requested before pool population"
@@ -848,15 +911,16 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             matches = [
                 entry
                 for entry in self.pool.manifest.entries
-                if entry.sha256 == digest and entry.path == assignment.checkpoint
+                if entry.sha256 == binding.sha256 and entry.path == binding.checkpoint
             ]
             if len(matches) != 1:
                 raise SnapshotIntegrityError(
-                    f"selected frozen opponent is not in the bound pool: {digest}"
+                    "selected frozen opponent is not in the bound pool: "
+                    f"{binding.sha256}"
                 )
             model = self.config.model
             entry: SnapshotEntry | None = matches[0]
-        elif assignment.kind is BatchKind.TEACHER_DISTILL:
+        elif binding.kind is BatchKind.TEACHER_DISTILL:
             teacher = self.config.population.teacher
             if teacher is None:
                 raise ValueError(
@@ -866,16 +930,29 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             entry = None
         else:
             raise ValueError(
-                "non-neural assignment unexpectedly carries a digest: "
-                f"{assignment.kind}"
+                f"non-neural assignment unexpectedly carries a digest: {binding.kind}"
             )
-        return (
-            assignment.kind,
-            assignment.checkpoint,
-            assignment.opponent_id,
-            model,
-            entry,
-        )
+        return model, entry
+
+    @classmethod
+    def _worker_chunks(
+        cls, assignments: Sequence[CollectionAssignment]
+    ) -> tuple[tuple[CollectionAssignment, ...], ...]:
+        """Chunk neural games by exact binding while retaining non-neural calls."""
+        chunks: list[list[CollectionAssignment]] = []
+        neural_chunks: dict[OpponentBinding, int] = {}
+        for assignment in assignments:
+            binding = cls._assignment_binding(assignment)
+            if binding is None:
+                chunks.append([assignment])
+                continue
+            index = neural_chunks.get(binding)
+            if index is None:
+                neural_chunks[binding] = len(chunks)
+                chunks.append([assignment])
+            else:
+                chunks[index].append(assignment)
+        return tuple(tuple(chunk) for chunk in chunks)
 
     def _collect_round(
         self, assignments: Sequence[CollectionAssignment]
@@ -895,24 +972,35 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             raise RuntimeError("reference collection needs a published actor state")
         from kaggriculture.learn.scripts.toad import _play_reference
 
+        chunks = self._worker_chunks(assignments)
+
         with ProcessPoolExecutor(
             max_workers=self.config.population.collection_processes
         ) as pool:
             results = iter(
                 pool.map(
                     _play_reference,
-                    (
-                        self._worker_input(assignment, opponents)
-                        for assignment in assignments
-                    ),
+                    (self._worker_input_chunk(chunk, opponents) for chunk in chunks),
                 )
             )
             collected = []
-            for assignment in assignments:
+            for chunk in chunks:
                 try:
-                    collected.append((assignment, next(results)))
+                    trajectories = tuple(next(results))
                 except Exception as error:
-                    raise self._collection_error(assignment) from error
+                    raise self._collection_error(chunk[0]) from error
+                if len(chunk) == 1:
+                    collected.append((chunk[0], trajectories))
+                    continue
+                if len(trajectories) != len(chunk):
+                    raise CollectionError(
+                        "neural worker chunk returned an unexpected trajectory count: "
+                        f"games={len(chunk)} trajectories={len(trajectories)}"
+                    )
+                collected.extend(
+                    (assignment, (trajectory,))
+                    for assignment, trajectory in zip(chunk, trajectories, strict=True)
+                )
         return collected
 
     @staticmethod
@@ -1202,36 +1290,48 @@ class ToadDataModule(lightning.LightningDataModule):
                 "checkpoint is missing population_pool identity for active frozen "
                 "population; checkpoint migration is required"
             )
-        next_game_id = cast(int, state_dict["next_game_id"])
-        next_round_id = cast(
-            int,
-            state_dict.get(
-                "next_round_id",
-                next_game_id // self.config.population.environments_per_rank,
-            ),
-        )
-        restored_rng = random.Random()
-        restored_rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))
-        actor_version = cast(int, state_dict["published_actor_version"])
-        actor_state = cast(
-            Mapping[str, torch.Tensor], state_dict["published_actor_state"]
-        )
-        restored_actor_state = {
-            name: tensor.detach().to("cpu", copy=True)
-            for name, tensor in actor_state.items()
-        }
-        restored_pool = self.source.pool
-        if "population_pool" in state_dict:
-            pool_payload = state_dict["population_pool"]
-            restored_pool = None
-            if pool_payload is not None:
-                identity = SnapshotPoolIdentity.model_validate(pool_payload)
-                restored_pool = SnapshotPool.reopen(
-                    identity,
-                    structure=structural_fingerprint(self.config),
-                    seed=self.config.population.population_seed,
-                    capacity=self.config.population.pool_capacity,
+        try:
+            next_game_id = _checkpoint_nonnegative_int(state_dict["next_game_id"])
+            next_round_id = _checkpoint_nonnegative_int(
+                state_dict.get(
+                    "next_round_id",
+                    next_game_id // self.config.population.environments_per_rank,
                 )
+            )
+            actor_version = _checkpoint_nonnegative_int(
+                state_dict["published_actor_version"]
+            )
+            if self.source._assignments is None and next_game_id != (
+                next_round_id * self.config.population.environments_per_rank
+            ):
+                raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE)
+
+            restored_rng = random.Random()
+            restored_rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))
+            actor_state = state_dict["published_actor_state"]
+            if not isinstance(actor_state, Mapping):
+                raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE)
+            restored_actor_state: dict[str, torch.Tensor] = {}
+            for name, tensor in actor_state.items():
+                if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
+                    raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE)
+                restored_actor_state[name] = tensor.detach().to("cpu", copy=True)
+            restored_pool = self.source.pool
+            if "population_pool" in state_dict:
+                pool_payload = state_dict["population_pool"]
+                restored_pool = None
+                if pool_payload is not None:
+                    identity = SnapshotPoolIdentity.model_validate(pool_payload)
+                    restored_pool = SnapshotPool.reopen(
+                        identity,
+                        structure=structural_fingerprint(self.config),
+                        seed=self.config.population.population_seed,
+                        capacity=self.config.population.pool_capacity,
+                    )
+        except CollectorCheckpointError:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE) from error
         self.source.next_game_id = next_game_id
         self.source._next_round_id = next_round_id
         self.source.rng = restored_rng
