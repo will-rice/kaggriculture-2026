@@ -46,6 +46,10 @@ from kaggriculture.learn.toad.lightning import (
     ToadLightningModule,
 )
 
+# Characterized control is 0 wins in 2 games; this is its 95% Wilson interval,
+# rounded outward so the acceptance boundary is a stable predeclared literal.
+_ECONOMIC_CONTROL_WIN_RATE_INTERVAL = (0.0, 0.66)
+
 
 def test_rank_game_ids_are_disjoint_and_contiguous() -> None:
     """Changing a rank offset must never overlap another rank's game IDs."""
@@ -1002,7 +1006,6 @@ class _DdpProbe(lightning.Callback):
         self.phase = phase
         self.seen_game_ids = seen_game_ids
         self.seen_opponent_ids = seen_opponent_ids
-        self.scripted_win_rates: list[float] = []
         self.batch_count = 0
         self.first_markers = 0
         self.end_markers = 0
@@ -1032,10 +1035,6 @@ class _DdpProbe(lightning.Callback):
         self.batch_count += 1
         self.first_markers += int(learner_batch.first_of_round)
         self.end_markers += int(learner_batch.end_of_round)
-        if learner_batch.first_of_round:
-            self.scripted_win_rates.append(
-                float(learner_batch.round_metrics["objective/win_rate_vs_econ"])
-            )
 
     def on_fit_end(
         self,
@@ -1049,7 +1048,6 @@ class _DdpProbe(lightning.Callback):
             "rank": trainer.global_rank,
             "game_ids": self.seen_game_ids,
             "opponent_ids": self.seen_opponent_ids,
-            "scripted_win_rates": self.scripted_win_rates,
             "batch_count": self.batch_count,
             "first_markers": self.first_markers,
             "end_markers": self.end_markers,
@@ -1252,10 +1250,10 @@ def _probe_payloads(output_dir: Path, phase: str) -> list[dict[str, object]]:
     ]
 
 
-def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
+def test_real_two_process_cpu_ddp_synchronizes_synthetic_split_and_resume(
     tmp_path: Path,
 ) -> None:
-    """Exercise collection, learning, publication, and resume under real DDP."""
+    """Exercise synchronization and resume with distinct synthetic rank inputs."""
     initial = _launch_ddp_fixture(tmp_path, "initial")
     assert initial.returncode == 0, initial.stdout + initial.stderr
     first = _probe_payloads(tmp_path, "initial")
@@ -1265,7 +1263,7 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
         ["economic"],
         ["economic"],
     ]
-    assert [payload["scripted_win_rates"] for payload in first] == [[1.0], [1.0]]
+    assert all("scripted_win_rates" not in payload for payload in first)
     assert [payload["batch_count"] for payload in first] == [2, 2]
     assert [payload["first_markers"] for payload in first] == [1, 1]
     assert [payload["end_markers"] for payload in first] == [1, 1]
@@ -1289,7 +1287,7 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
         ["economic"],
         ["economic"],
     ]
-    assert [payload["scripted_win_rates"] for payload in second] == [[1.0], [1.0]]
+    assert all("scripted_win_rates" not in payload for payload in second)
     assert [payload["batch_count"] for payload in second] == [2, 2]
     assert len({payload["parameter_digest"] for payload in second}) == 1
     assert [payload["environment_steps"] for payload in second] == [16, 16]
@@ -1307,10 +1305,7 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
         ["economic", "economic"],
         ["economic", "economic"],
     ]
-    assert [payload["scripted_win_rates"] for payload in full] == [
-        [1.0, 1.0],
-        [1.0, 1.0],
-    ]
+    assert all("scripted_win_rates" not in payload for payload in full)
     assert [payload["batch_count"] for payload in full] == [4, 4]
     assert [payload["first_markers"] for payload in full] == [2, 2]
     assert [payload["end_markers"] for payload in full] == [2, 2]
@@ -1334,6 +1329,76 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
         )
         assert resumed_rank["entropy_state"] == uninterrupted_rank["entropy_state"]
         assert resumed_rank["lr"] == uninterrupted_rank["lr"]
+
+
+@pytest.mark.slow
+def test_fixed_seed_economic_reference_collection_resumes_within_interval() -> None:
+    """Real economic rollouts retain their characterized result after resume."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 1.0,
+                "environments_per_rank": 1,
+                "collection_processes": 1,
+            },
+            "optimizer": {
+                "unroll_length": 719,
+                "batch_segments": 1,
+                "value_warmup_batches": 0,
+                "value_passes": 0,
+            },
+            "runtime": {"seed": 117},
+        }
+    )
+    torch.manual_seed(314)
+    actor = ToadLightningModule(config).policy.state_dict()
+    uninterrupted_source = data.ReferenceRoundSource(config)
+    uninterrupted_data = data.ToadDataModule(config, uninterrupted_source)
+    uninterrupted_data.publish_actor(actor, version=0)
+
+    first = tuple(uninterrupted_source)
+    split_boundary = uninterrupted_data.state_dict()
+    uninterrupted_second = tuple(uninterrupted_source)
+    resumed_source = data.ReferenceRoundSource(config)
+    resumed_data = data.ToadDataModule(config, resumed_source)
+    resumed_data.load_state_dict(split_boundary)
+    resumed_second = tuple(resumed_source)
+
+    assert len(first) == len(uninterrupted_second) == len(resumed_second) == 1
+    assert first[0].game_ids == (0,)
+    assert first[0].seeds == (117,)
+    assert first[0].opponent_ids == ("economic",)
+    assert uninterrupted_second[0].game_ids == resumed_second[0].game_ids == (1,)
+    assert uninterrupted_second[0].seeds == resumed_second[0].seeds == (118,)
+    assert (
+        uninterrupted_second[0].opponent_ids
+        == resumed_second[0].opponent_ids
+        == ("economic",)
+    )
+    uninterrupted_metrics = {
+        name: value
+        for name, value in uninterrupted_second[0].round_metrics.items()
+        if not name.startswith("throughput/")
+    }
+    resumed_metrics = {
+        name: value
+        for name, value in resumed_second[0].round_metrics.items()
+        if not name.startswith("throughput/")
+    }
+    assert uninterrupted_metrics == pytest.approx(resumed_metrics, nan_ok=True)
+    observed_win_rate = (
+        sum(
+            float(batch[0].round_metrics["objective/win_rate_vs_econ"])
+            for batch in (first, uninterrupted_second)
+        )
+        / 2.0
+    )
+    lower, upper = _ECONOMIC_CONTROL_WIN_RATE_INTERVAL
+    assert lower <= observed_win_rate <= upper
+    assert resumed_source.next_game_id == uninterrupted_source.next_game_id == 2
+    assert resumed_source._next_round_id == uninterrupted_source._next_round_id == 2
 
 
 if __name__ == "__main__" and len(sys.argv) >= 4 and sys.argv[1] == "--ddp-fixture":

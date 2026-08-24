@@ -395,7 +395,10 @@ METRIC_PREFIXES = (OBJECTIVE, PROXY, CRITIC, DIAG)
 METRIC_DEFINITIONS: dict[str, str] = {
     "diag/update": "Optimizer rounds completed so far.",
     "diag/steps": "Environment decisions collected so far.",
-    "diag/hours": "Wall-clock hours since the run started.",
+    "diag/hours": (
+        "Wall-clock hours since the current Lightning fit process started; resets "
+        "after resume."
+    ),
     "diag/bank_mean": (
         "Mean terminal bank, both populations pooled. Corpus mining over "
         "1,350 seats put bank against ladder rating at Pearson -0.043, so "
@@ -824,6 +827,7 @@ def build_wandb_logger(config: ToadConfig) -> WandbLogger:
     logged_config["runtime_metadata"] = runtime_metadata(config).model_dump(mode="json")
     logged_config["metric_definitions"] = METRIC_DEFINITIONS
     return WandbLogger(
+        entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
         name=config.curriculum.phase,
         save_dir=str(config.runtime.output_dir),

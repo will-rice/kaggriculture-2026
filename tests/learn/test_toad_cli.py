@@ -555,6 +555,7 @@ def test_wandb_logger_receives_the_complete_resolved_config(
 
     logged = cast(dict[str, object], captured["config"])
     resolved = config.model_dump(mode="json")
+    assert captured["entity"] == toad.WANDB_ENTITY
     assert {key: logged[key] for key in resolved} == resolved
     assert logged["runtime_metadata"] == {
         "precision": "32-true",

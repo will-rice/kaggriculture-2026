@@ -797,6 +797,51 @@ def test_round_log_reports_each_raw_and_weighted_teacher_term() -> None:
         torch.testing.assert_close(cast(torch.Tensor, record[name]), report.terms[name])
 
 
+def test_active_round_record_contains_every_declared_legacy_metric() -> None:
+    """The sole Lightning record must implement its published metric glossary."""
+    fixture = load_control_fixture()
+    trajectory = cast(toad.Trajectory, fixture["trajectory"])
+    module = ToadLightningModule(control_fixture_config())
+    collection = toad._collection_metrics(
+        [trajectory],
+        [trajectory],
+        module.config.curriculum.reward_field,
+    )
+    module.round_metrics.reset({**collection, "throughput/collection_seconds": 1.0})
+    module._reduce_round_statistics()
+
+    record = module._round_log_record()
+
+    assert set(toad.METRIC_DEFINITIONS) <= set(record)
+
+
+def test_elapsed_hours_restart_with_each_fit_and_are_not_checkpointed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elapsed diagnostics describe this process's fit, not cumulative runtime."""
+    ticks = iter((100.0, 1_900.0, 5_000.0, 5_900.0))
+    monkeypatch.setattr(lightning_module.time, "monotonic", lambda: next(ticks))
+    config = control_fixture_config()
+    module = ToadLightningModule(config)
+    module.on_fit_start()
+
+    assert module._round_log_record()["diag/hours"] == pytest.approx(0.5)
+    checkpoint: dict[str, object] = {}
+    module.on_save_checkpoint(checkpoint)
+    stored = cast(dict[str, object], checkpoint["toad"])
+    assert not {
+        "fit_started_monotonic",
+        "_fit_started_monotonic",
+        "fit_elapsed_hours",
+    } & set(stored)
+
+    resumed = ToadLightningModule(config)
+    resumed.on_load_checkpoint(checkpoint)
+    resumed.on_fit_start()
+
+    assert resumed._round_log_record()["diag/hours"] == pytest.approx(0.25)
+
+
 def test_round_log_reports_raw_head_entropy_statistics() -> None:
     """Round diagnostics expose sums, decision counts, and safe head means."""
     fixture = load_control_fixture()

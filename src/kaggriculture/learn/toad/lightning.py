@@ -1507,6 +1507,7 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_rank_timings: dict[str, float] = {}
         self._round_global_steps = 0
         self._learner_started: float | None = None
+        self._fit_started_monotonic: float | None = None
         self._pending_round_flush = False
         self._last_finite_provenance: NonFiniteProvenance | None = None
         self.register_state_dict_post_hook(_canonicalize_policy_checkpoint)
@@ -1519,6 +1520,16 @@ class ToadLightningModule(lightning.LightningModule):
         if self.teacher_policy is not None:
             self.teacher_policy.eval()
         return self
+
+    def on_fit_start(self) -> None:
+        """Start the process-local elapsed clock for this Lightning fit."""
+        self._fit_started_monotonic = time.monotonic()
+
+    def _fit_elapsed_hours(self) -> float:
+        """Return process-local fit hours, which intentionally reset on resume."""
+        if self._fit_started_monotonic is None:
+            return 0.0
+        return max(time.monotonic() - self._fit_started_monotonic, 0.0) / 3_600.0
 
     def transfer_batch_to_device(
         self,
@@ -1940,6 +1951,7 @@ class ToadLightningModule(lightning.LightningModule):
             ),
             "diag/update": self.collection_round,
             "diag/steps": self.environment_steps,
+            "diag/hours": self._fit_elapsed_hours(),
             "diag/environment_steps": self.environment_steps,
             "diag/optimizer_steps": optimizer_steps,
             "diag/collection_round": self.collection_round,
