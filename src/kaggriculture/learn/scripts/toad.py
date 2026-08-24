@@ -192,9 +192,10 @@ def runtime_preflight(config: ToadConfig) -> None:
             "CPU accelerator does not accept explicit device indexes"
         )
     world_size = runtime.num_nodes * _requested_device_count(runtime, accelerator)
-    if world_size > 1:
+    if world_size > 1 and runtime.strategy != "ddp":
         raise RuntimePreflightError(
-            "multi-device topology requires DDP support, which is not enabled"
+            "resolved world size above one requires DDP strategy='ddp': "
+            f"world_size={world_size}, strategy={runtime.strategy!r}"
         )
     if accelerator == "gpu":
         available = _cuda_available()
@@ -819,7 +820,8 @@ def run(config: ToadConfig) -> None:
     seed_everything(config.runtime.seed, workers=True)
     module = ToadLightningModule(config)
     effective = module.config
-    module.policy = maybe_compile(module.policy, effective)
+    if effective.runtime.compile.enabled:
+        module.policy = maybe_compile(module.policy, effective)
     data = build_reference_data_module(effective)
     build_trainer(effective).fit(
         module,

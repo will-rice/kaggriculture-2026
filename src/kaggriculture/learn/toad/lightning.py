@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
@@ -38,7 +38,7 @@ from kaggriculture.learn.toad.config import (
     structural_fingerprint,
     validate_stored_config,
 )
-from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
+from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, _all_gather_objects
 from kaggriculture.learn.toad.model import (
     PolicyOutput,
     PolicyState,
@@ -309,6 +309,7 @@ class LossReport:
     entropy: HeadEntropy
     debug_dtypes: Mapping[str, torch.dtype]
     provenance: NonFiniteProvenance
+    nonfinite_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -381,6 +382,17 @@ class NonFiniteProvenance:
             state_norms=state_norms,
         )
 
+    def as_dict(self) -> dict[str, object]:
+        """Return gathered primitives with no tensors or autograd ownership."""
+        return {
+            "batch_kind": self.batch_kind,
+            "game_ids": self.game_ids,
+            "opponent_digests": self.opponent_digests,
+            "actor_version": self.actor_version,
+            "precision": self.precision,
+            "state_norms": self.state_norms,
+        }
+
 
 class NonFiniteTrainingError(RuntimeError):
     """A finite-check failure with collection provenance for recovery and triage."""
@@ -398,6 +410,7 @@ class NonFiniteTrainingError(RuntimeError):
         self.actor_version = provenance.actor_version
         self.precision = provenance.precision
         self.state_norms = provenance.state_norms
+        self.distributed_details: tuple[Mapping[str, object] | None, ...] = ()
         super().__init__(
             "non-finite training tensors "
             f"{tensor_names}; kind={self.batch_kind}; game_ids={self.game_ids}; "
@@ -426,6 +439,23 @@ class NonFiniteTrainingError(RuntimeError):
     ) -> Self:
         """Create an error from detached data; Task 3 can synchronize this seam."""
         return cls(tuple(tensor_names), provenance=provenance)
+
+    @classmethod
+    def render_distributed(
+        cls,
+        details: Sequence[Mapping[str, object] | None],
+        fallback: NonFiniteProvenance,
+    ) -> Self:
+        """Render identical gathered bad-rank provenance on every process."""
+        failures = [detail for detail in details if detail is not None]
+        if not failures:
+            raise ValueError("distributed non-finite error requires a bad rank")
+        first = failures[0]
+        names = [str(name) for name in cast(Sequence[object], first["tensor_names"])]
+        error = cls.from_provenance(names, fallback)
+        error.distributed_details = tuple(details)
+        error.args = (f"{error.args[0]}; distributed_details={tuple(details)!r}",)
+        return error
 
 
 def _nonfinite_tensor_names(tensors: Mapping[str, torch.Tensor]) -> list[str]:
@@ -483,6 +513,22 @@ _ONLINE_BATCH_KINDS = (
 def _empty_population_counts() -> dict[str, int]:
     """Return the stable online-kind metric schema for one logical round."""
     return {kind.value: 0 for kind in _ONLINE_BATCH_KINDS}
+
+
+@dataclass(frozen=True)
+class ReducibleMetric:
+    """A detached metric numerator/count plus its cross-rank interpretation."""
+
+    total: torch.Tensor
+    count: torch.Tensor
+    reduction: Literal["mean", "sum", "max"] = "mean"
+
+    @property
+    def value(self) -> torch.Tensor:
+        """Form a mean only after callers have reduced numerator and count."""
+        if self.reduction == "mean":
+            return self.total / self.count.float().clamp_min(1.0)
+        return self.total
 
 
 class RoundMetricAccumulator:
@@ -656,6 +702,84 @@ class RoundMetricAccumulator:
             else 0.0
         )
         return record
+
+    def reducible_values(  # noqa: C901
+        self, device: torch.device
+    ) -> dict[str, ReducibleMetric]:
+        """Return every global metric as a numerator/count or explicit total."""
+        values: dict[str, ReducibleMetric] = {}
+
+        def add(
+            name: str,
+            total: torch.Tensor | float | int,
+            count: int | torch.Tensor,
+            reduction: Literal["mean", "sum", "max"] = "mean",
+        ) -> None:
+            values[name] = ReducibleMetric(
+                total=torch.as_tensor(total, dtype=torch.float32, device=device),
+                count=torch.as_tensor(count, dtype=torch.int64, device=device),
+                reduction=reduction,
+            )
+
+        for name, raw in self.initial.items():
+            if name == "throughput/collection_seconds":
+                continue
+            value = float(raw)
+            finite = math.isfinite(value)
+            reduction: Literal["mean", "sum", "max"] = "mean"
+            if (
+                name.startswith("collection/games/")
+                or name.startswith("collection/games_by_opponent/")
+                or name.startswith("diag/n_")
+                or name == "diag/illegal"
+            ):
+                reduction = "sum"
+            elif name.endswith("_max"):
+                reduction = "max"
+            add(
+                name,
+                value if finite else (float("-inf") if reduction == "max" else 0.0),
+                int(finite),
+                reduction,
+            )
+        for kind in _ONLINE_BATCH_KINDS:
+            count = len(self.games[kind.value])
+            add(f"collection/games/{kind.value}", count, 1, "sum")
+            add(f"population/selections/{kind.value}", count, 1, "sum")
+        for opponent_id, selections in self.opponents.items():
+            safe_id = opponent_id.replace("/", "_")
+            add(f"population/opponent/{safe_id}", len(selections), 1, "sum")
+        for name, tensors in self.losses.items():
+            if tensors:
+                add(name, torch.stack(tensors).sum(), len(tensors))
+        for name in ("operation", "quantity", "market"):
+            total = self.mask_sums.get(name)
+            count = self.mask_counts.get(name)
+            if total is not None and count is not None:
+                add(f"mask/{name}_density", total, count)
+        for name in ("hidden", "cell"):
+            tensors = self.state_norms[name]
+            if tensors:
+                add(f"state/{name}_norm", torch.stack(tensors).sum(), len(tensors))
+            else:
+                add(f"state/{name}_norm", 0.0, 1)
+        resets = (
+            torch.stack(self.terminal_resets).sum()
+            if self.terminal_resets
+            else torch.tensor(0.0, device=device)
+        )
+        add("state/terminal_resets", resets, 1, "sum")
+        add("throughput/learner_batches", self.learner_batches, 1, "sum")
+        return values
+
+    def local_timings(self) -> dict[str, float]:
+        """Return process-local timings that must retain their rank identity."""
+        return {
+            "collection_seconds": float(
+                self.initial.get("throughput/collection_seconds", float("nan"))
+            ),
+            "learner_seconds": self.learner_seconds,
+        }
 
 
 @dataclass(frozen=True)
@@ -848,6 +972,7 @@ def compute_loss(  # noqa: C901
     *,
     baseline_only: bool | None = None,
     entropy_state: Mapping[str, EntropyControllerState] | None = None,
+    _raise_on_nonfinite: bool = True,
     _losses: Callable[..., toad_loss.Losses] = toad_loss.losses,
 ) -> LossReport:
     """Return Toad's loss tensors without mutating optimizer or gradients."""
@@ -878,6 +1003,7 @@ def compute_loss(  # noqa: C901
     turns, width = behaviour.shape
     eager_policy = unwrap_compiled(policy)
     stateful_policy = eager_policy if isinstance(eager_policy, StatefulPolicy) else None
+    initial_nonfinite: list[str] = []
     if stateful_policy is not None:
         if stateful_policy.config.recurrent or stateful_policy.config.belief:
             required = {"initial_hidden", "initial_cell", "initial_belief"}
@@ -911,7 +1037,7 @@ def compute_loss(  # noqa: C901
             else {}
         )
         initial_nonfinite = _nonfinite_tensor_names(initial_inputs)
-        if initial_nonfinite:
+        if initial_nonfinite and _raise_on_nonfinite:
             raise NonFiniteTrainingError.from_batch(
                 initial_nonfinite, batch, initial, config.runtime.precision
             )
@@ -1186,8 +1312,10 @@ def compute_loss(  # noqa: C901
                 "output/state_prior_belief": state.prior_belief.float(),
             }
         )
-    nonfinite = _nonfinite_tensor_names(checked)
-    if nonfinite:
+    nonfinite = list(
+        dict.fromkeys((*initial_nonfinite, *_nonfinite_tensor_names(checked)))
+    )
+    if nonfinite and _raise_on_nonfinite:
         raise NonFiniteTrainingError.from_batch(
             nonfinite, batch, state, config.runtime.precision
         )
@@ -1208,6 +1336,7 @@ def compute_loss(  # noqa: C901
             "teacher": loss.teacher.dtype,
         },
         provenance=provenance,
+        nonfinite_names=tuple(nonfinite),
     )
 
 
@@ -1285,6 +1414,7 @@ class ToadLightningModule(lightning.LightningModule):
                 }
             )
         self.environment_steps = 0
+        self.round_local_steps = 0
         self.collection_round = 0
         self.actor_version = 0
         self.actor_source_global_step = 0
@@ -1306,6 +1436,12 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_baselines: list[torch.Tensor] = []
         self._round_population = _empty_population_counts()
         self.round_metrics = RoundMetricAccumulator()
+        self._round_reduced_metrics: dict[str, ReducibleMetric] = {}
+        self._round_reduced_terms: dict[str, torch.Tensor] = {}
+        self._round_reduced_entropy: dict[str, EntropyStat] = {}
+        self._round_reduced_baseline = torch.tensor(float("nan"))
+        self._round_rank_timings: dict[str, float] = {}
+        self._round_global_steps = 0
         self._learner_started: float | None = None
         self._pending_round_flush = False
         self._last_finite_provenance: NonFiniteProvenance | None = None
@@ -1344,6 +1480,11 @@ class ToadLightningModule(lightning.LightningModule):
             self._round_baselines = []
             self._round_population = _empty_population_counts()
             self.round_metrics.reset(batch.round_metrics)
+            self._round_reduced_metrics = {}
+            self._round_reduced_terms = {}
+            self._round_reduced_entropy = {}
+            self._round_rank_timings = {}
+            self._round_global_steps = 0
         baseline_only = batch.baseline_only or self.warmup_remaining > 0
         if self._learner_started is None:
             self._learner_started = time.perf_counter()
@@ -1354,8 +1495,10 @@ class ToadLightningModule(lightning.LightningModule):
             teacher=self.teacher,
             baseline_only=baseline_only,
             entropy_state=self.entropy_state,
+            _raise_on_nonfinite=False,
         )
         self._last_finite_provenance = report.provenance
+        self._synchronize_nonfinite(list(report.nonfinite_names), report.provenance)
         self.round_metrics.update(batch, report)
         self._round_ended = batch.end_of_round
         self._round_baselines.append(report.terms["baseline"].detach())
@@ -1384,11 +1527,8 @@ class ToadLightningModule(lightning.LightningModule):
                     self._round_population[kind.value] += 1
         if not batch.baseline_only and self.warmup_remaining:
             self.warmup_remaining -= 1
-        self.environment_steps += batch.collected_steps
+        self.round_local_steps += batch.collected_steps
         if batch.end_of_round:
-            self.collection_round += 1
-        if batch.end_of_round:
-            self._update_entropy_controllers()
             self._pending_round_flush = True
         if self._trainer is None:
             self._finish_learner_batch()
@@ -1429,10 +1569,52 @@ class ToadLightningModule(lightning.LightningModule):
             if parameter.grad is not None
             and not bool(torch.isfinite(parameter.grad).all())
         ]
-        if nonfinite and self._last_finite_provenance is not None:
-            raise NonFiniteTrainingError.from_provenance(
-                nonfinite, self._last_finite_provenance
-            )
+        if self._last_finite_provenance is not None:
+            self._synchronize_nonfinite(nonfinite, self._last_finite_provenance)
+
+    def _reduce_tensor(
+        self, value: torch.Tensor, reduce_op: Literal["sum", "max"] = "sum"
+    ) -> torch.Tensor:
+        """Reduce through Lightning only when a distributed trainer owns us."""
+        if self._trainer is None or int(getattr(self.trainer, "world_size", 1)) == 1:
+            return value
+        return cast(
+            torch.Tensor,
+            self.trainer.strategy.reduce(value, reduce_op=reduce_op),
+        )
+
+    def _synchronize_nonfinite(
+        self,
+        tensor_names: list[str],
+        provenance: NonFiniteProvenance,
+    ) -> None:
+        """Make every rank gather and raise the same finite-check failure."""
+        local_bad = torch.tensor(
+            int(bool(tensor_names)),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        any_bad = self._reduce_tensor(local_bad, reduce_op="max")
+        if not bool(any_bad.item()):
+            return
+        rank = (
+            0 if self._trainer is None else int(getattr(self.trainer, "global_rank", 0))
+        )
+        world_size = (
+            1 if self._trainer is None else int(getattr(self.trainer, "world_size", 1))
+        )
+        local_detail: dict[str, object] | None = None
+        if tensor_names:
+            local_detail = {
+                "rank": rank,
+                "tensor_names": tuple(tensor_names),
+                "provenance": provenance.as_dict(),
+            }
+        gathered = _all_gather_objects(local_detail, world_size)
+        details = tuple(
+            cast(Mapping[str, object] | None, detail) for detail in gathered
+        )
+        raise NonFiniteTrainingError.render_distributed(details, provenance)
 
     def _finish_learner_batch(self) -> None:
         """Record one full optimization interval and flush a due round once."""
@@ -1443,7 +1625,152 @@ class ToadLightningModule(lightning.LightningModule):
         )
         self._learner_started = None
         if self._pending_round_flush:
+            self._finalize_round()
             self.flush_round_metrics()
+
+    def _finalize_round(self) -> None:
+        """Advance global sample/controller clocks from the all-rank boundary."""
+        local = torch.tensor(
+            self.round_local_steps,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        global_delta = self._reduce_tensor(local, reduce_op="sum")
+        self.environment_steps += int(global_delta.item())
+        self._round_global_steps = int(global_delta.item())
+        self.round_local_steps = 0
+        self.collection_round += 1
+        self._reduce_round_statistics()
+        self._update_entropy_controllers()
+
+    def _reduce_round_statistics(self) -> None:
+        """Reduce all global metric numerators/counts before forming means."""
+        local_metrics = self.round_metrics.reducible_values(self.device)
+        world_size = (
+            1 if self._trainer is None else int(getattr(self.trainer, "world_size", 1))
+        )
+        gathered_specs = _all_gather_objects(
+            {name: metric.reduction for name, metric in local_metrics.items()},
+            world_size,
+        )
+        specs: dict[str, Literal["mean", "sum", "max"]] = {}
+        for payload in gathered_specs:
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("distributed metric schema is malformed")
+            for name, reduction in payload.items():
+                if not isinstance(name, str) or reduction not in {"mean", "sum", "max"}:
+                    raise RuntimeError("distributed metric schema is malformed")
+                typed_reduction = cast(Literal["mean", "sum", "max"], reduction)
+                if name in specs and specs[name] != typed_reduction:
+                    raise RuntimeError(f"distributed metric mode differs for {name}")
+                specs[name] = typed_reduction
+        reduced_metrics: dict[str, ReducibleMetric] = {}
+        for name in sorted(specs):
+            reduction = specs[name]
+            local = local_metrics.get(name)
+            neutral = float("-inf") if reduction == "max" else 0.0
+            total = (
+                torch.tensor(neutral, device=self.device)
+                if local is None
+                else local.total.to(self.device)
+            )
+            count = (
+                torch.tensor(0, dtype=torch.int64, device=self.device)
+                if local is None
+                else local.count.to(self.device)
+            )
+            reduced_metrics[name] = ReducibleMetric(
+                total=self._reduce_tensor(
+                    total,
+                    reduce_op="max" if reduction == "max" else "sum",
+                ),
+                count=self._reduce_tensor(count, reduce_op="sum"),
+                reduction=reduction,
+            )
+        self._round_reduced_metrics = reduced_metrics
+        self._round_reduced_terms = self._reduce_named_means(self._round_fresh_terms)
+        baseline = self._reduce_named_means(
+            ({"baseline_pass": value} for value in self._round_baselines)
+        )
+        self._round_reduced_baseline = baseline.get(
+            "baseline_pass", torch.tensor(float("nan"), device=self.device)
+        )
+        self._round_reduced_entropy = {
+            name: EntropyStat(
+                sum=self._reduce_tensor(
+                    self._aggregate_round_entropy(name).sum.float(), reduce_op="sum"
+                ),
+                valid=self._reduce_tensor(
+                    self._aggregate_round_entropy(name).valid.to(torch.int64),
+                    reduce_op="sum",
+                ),
+            )
+            for name in ("operation", "quantity", "market")
+        }
+        self._round_population = {
+            name: int(
+                self._reduce_tensor(
+                    torch.tensor(value, dtype=torch.int64, device=self.device),
+                    reduce_op="sum",
+                ).item()
+            )
+            for name, value in self._round_population.items()
+        }
+        local_timing: dict[str, object] = {
+            "rank": (
+                0
+                if self._trainer is None
+                else int(getattr(self.trainer, "global_rank", 0))
+            ),
+            **self.round_metrics.local_timings(),
+        }
+        gathered_timings = _all_gather_objects(local_timing, world_size)
+        rank_timings: dict[str, float] = {}
+        for payload in gathered_timings:
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("distributed timing payload is malformed")
+            timing = cast(Mapping[str, object], payload)
+            rank = int(cast(int, timing["rank"]))
+            for name in ("collection_seconds", "learner_seconds"):
+                rank_timings[f"rank/{rank}/throughput/{name}"] = float(
+                    cast(float, timing[name])
+                )
+        self._round_rank_timings = rank_timings
+
+    def _reduce_named_means(
+        self, rows: Iterable[Mapping[str, torch.Tensor]]
+    ) -> dict[str, torch.Tensor]:
+        """Reduce named detached totals and counts, tolerating absent optional keys."""
+        materialized = tuple(rows)
+        local_names = sorted({name for row in materialized for name in row})
+        world_size = (
+            1 if self._trainer is None else int(getattr(self.trainer, "world_size", 1))
+        )
+        gathered_names = _all_gather_objects(tuple(local_names), world_size)
+        names = sorted(
+            {
+                str(name)
+                for payload in gathered_names
+                for name in cast(Sequence[object], payload)
+            }
+        )
+        reduced: dict[str, torch.Tensor] = {}
+        for name in names:
+            values = [row[name].detach().float() for row in materialized if name in row]
+            total = (
+                torch.stack(values).sum()
+                if values
+                else torch.tensor(0.0, device=self.device)
+            )
+            count = torch.tensor(len(values), dtype=torch.int64, device=self.device)
+            global_total = self._reduce_tensor(total, reduce_op="sum")
+            global_count = self._reduce_tensor(count, reduce_op="sum")
+            reduced[name] = (
+                global_total / global_count.float()
+                if bool(global_count > 0)
+                else torch.tensor(float("nan"), device=self.device)
+            )
+        return reduced
 
     def flush_round_metrics(self) -> None:
         """Log and clear the sole completed-round accumulator without DDP sync."""
@@ -1459,6 +1786,8 @@ class ToadLightningModule(lightning.LightningModule):
 
     def _aggregate_round_entropy(self, name: str) -> EntropyStat:
         """Reduce detached fresh-batch statistics for one completed round."""
+        if name in self._round_reduced_entropy:
+            return self._round_reduced_entropy[name]
         values = [getattr(item, name) for item in self._round_fresh_entropy]
         if not values:
             return EntropyStat(
@@ -1486,20 +1815,65 @@ class ToadLightningModule(lightning.LightningModule):
 
     def _round_log_record(self) -> dict[str, torch.Tensor | int | float]:
         """Return one stable dashboard record for the completed logical round."""
-        fresh = self._round_fresh_terms
 
         def mean_term(name: str) -> torch.Tensor:
-            values = [terms[name] for terms in fresh if name in terms]
-            return torch.stack(values).mean() if values else torch.tensor(float("nan"))
+            reduced = self._round_reduced_terms.get(name)
+            if reduced is not None:
+                return reduced
+            local = [
+                row[name].detach().float()
+                for row in self._round_fresh_terms
+                if name in row
+            ]
+            return (
+                torch.stack(local).mean()
+                if local
+                else torch.tensor(float("nan"), device=self.device)
+            )
 
         optimizer_steps = int(self.global_step) + 1
         try:
             lr = float(self.trainer.optimizers[0].param_groups[0]["lr"])
         except RuntimeError:
             lr = float(self.config.optimizer.lr)
-        baseline_passes = torch.stack(self._round_baselines).mean()
+        reduced_metrics = {
+            name: (
+                metric.value
+                if bool(metric.count > 0)
+                else torch.tensor(float("nan"), device=self.device)
+            )
+            for name, metric in self._round_reduced_metrics.items()
+        }
+        collection_timings = [
+            value
+            for name, value in self._round_rank_timings.items()
+            if name.endswith("/collection_seconds") and math.isfinite(value)
+        ]
+        learner_timings = [
+            value
+            for name, value in self._round_rank_timings.items()
+            if name.endswith("/learner_seconds") and math.isfinite(value)
+        ]
+        collection_seconds = (
+            max(collection_timings) if collection_timings else float("nan")
+        )
+        learner_seconds = max(learner_timings) if learner_timings else float("nan")
         record: dict[str, torch.Tensor | int | float] = {
-            **self.round_metrics.compute(),
+            **reduced_metrics,
+            **self._round_rank_timings,
+            "throughput/collection_seconds": collection_seconds,
+            "throughput/collection_wait_seconds": collection_seconds,
+            "throughput/collection_steps_per_second": (
+                self._round_global_steps / collection_seconds
+                if math.isfinite(collection_seconds) and collection_seconds > 0
+                else float("nan")
+            ),
+            "throughput/learner_seconds": learner_seconds,
+            "throughput/learner_steps_per_second": (
+                self._round_global_steps / learner_seconds
+                if math.isfinite(learner_seconds) and learner_seconds > 0
+                else float("nan")
+            ),
             "diag/update": self.collection_round,
             "diag/steps": self.environment_steps,
             "diag/environment_steps": self.environment_steps,
@@ -1523,7 +1897,15 @@ class ToadLightningModule(lightning.LightningModule):
             "diag/vtrace_pg": mean_term("vtrace_pg"),
             "diag/upgo_pg": mean_term("upgo_pg"),
             "critic/baseline_self_consistency": mean_term("baseline"),
-            "critic/baseline_passes_self_consistency": baseline_passes,
+            "critic/baseline_passes_self_consistency": (
+                self._round_reduced_baseline
+                if self._round_reduced_terms
+                else (
+                    torch.stack(self._round_baselines).mean()
+                    if self._round_baselines
+                    else torch.tensor(float("nan"), device=self.device)
+                )
+            ),
             "diag/entropy": mean_term("entropy"),
             "diag/teacher_kl": mean_term("teacher"),
             "teacher/operation_kl": mean_term("teacher/operation_kl"),

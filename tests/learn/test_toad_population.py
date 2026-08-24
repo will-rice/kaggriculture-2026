@@ -387,27 +387,28 @@ def test_snapshot_store_writes_a_verified_manifest_entry(tmp_path: Path) -> None
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_snapshot_store_evicts_the_oldest_only_after_manifest_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_snapshot_store_retains_evicted_members_for_checkpoint_generations(
+    tmp_path: Path,
 ) -> None:
-    """An unlink failure leaves the old file orphaned, never manifest-referenced."""
+    """Capacity bounds selection without invalidating an older checkpoint."""
     store = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
     first = store.add(state_dict(1.0), environment_steps=1, round_id=1, run_id="run")
+    first_manifest = store.manifest
 
-    def refuse_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        manifest = SnapshotManifest.load(tmp_path / "manifest.json")
-        assert first not in manifest.entries
-        raise OSError("simulated unlink interruption")
-
-    monkeypatch.setattr(Path, "unlink", refuse_unlink)
-
-    with pytest.raises(OSError, match="simulated unlink interruption"):
-        store.add(state_dict(2.0), environment_steps=2, round_id=2, run_id="run")
+    store.add(state_dict(2.0), environment_steps=2, round_id=2, run_id="run")
 
     manifest = SnapshotManifest.load(tmp_path / "manifest.json")
     assert len(manifest.entries) == 1
     assert manifest.entries[0].environment_steps == 2
     assert first.path.is_file()
+    historical = SnapshotStore.open_generation(
+        tmp_path,
+        capacity=1,
+        structure="model-v1",
+        manifest=first_manifest,
+    )
+    assert historical.load(first)["weight"].item() == 1.0
+    assert len(list(tmp_path.glob("manifest-*.json"))) == 2
 
 
 @pytest.mark.parametrize(

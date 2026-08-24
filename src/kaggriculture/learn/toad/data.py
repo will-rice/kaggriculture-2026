@@ -16,6 +16,7 @@ import lightning
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
+from kaggriculture.constants import EPISODE_STEPS
 from kaggriculture.learn.encoding import IGNORE
 from kaggriculture.learn.rollout import Trajectory, segment_starts
 from kaggriculture.learn.toad.config import (
@@ -212,6 +213,137 @@ _ONLINE_KINDS = (
     BatchKind.FROZEN_OPPONENT,
     BatchKind.TEACHER_DISTILL,
 )
+
+
+def rank_game_ids(
+    start: int,
+    per_rank: int,
+    rank: int,
+    world_size: int,
+) -> tuple[int, ...]:
+    """Return one rank's contiguous slice of a global round allocation."""
+    if start < 0:
+        raise ValueError("start must be nonnegative")
+    if per_rank < 1:
+        raise ValueError("per_rank must be positive")
+    if world_size < 1:
+        raise ValueError("world_size must be positive")
+    if rank < 0 or rank >= world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    rank_start = start + rank * per_rank
+    return tuple(range(rank_start, rank_start + per_rank))
+
+
+@dataclass(frozen=True)
+class RoundBatchCounts:
+    """Deterministic policy/value optimizer quotas for one rank and round."""
+
+    policy: int
+    value: int
+
+    @property
+    def total(self) -> int:
+        """Return the complete optimizer-batch count."""
+        return self.policy + self.value
+
+
+@dataclass(frozen=True)
+class RoundBatchSignature:
+    """One rank's actual completed collection shape before learner entry."""
+
+    rank: int
+    round_id: int
+    expected: RoundBatchCounts
+    policy: int
+    value: int
+    first_markers: int
+    end_markers: int
+
+
+class DistributedRoundMismatch(RuntimeError):  # noqa: N818
+    """Ranks cannot safely enter DDP with different logical round shapes."""
+
+
+def expected_round_batch_counts(config: ToadConfig) -> RoundBatchCounts:
+    """Derive one rank's exact optimizer quotas before collection starts."""
+    counts = _round_counts(config)
+    trajectories = sum(counts.values()) + counts[BatchKind.SELFPLAY]
+    segments_per_trajectory = len(
+        segment_starts(EPISODE_STEPS - 1, config.optimizer.unroll_length)
+    )
+    policy = (trajectories * segments_per_trajectory) // config.optimizer.batch_segments
+    return RoundBatchCounts(
+        policy=policy,
+        value=policy * config.optimizer.value_passes,
+    )
+
+
+def round_batch_signature(
+    batches: Sequence[LearnerBatch],
+    *,
+    expected: RoundBatchCounts,
+    rank: int,
+    round_id: int,
+) -> RoundBatchSignature:
+    """Describe actual batches and boundary markers without consuming tensors."""
+    return RoundBatchSignature(
+        rank=rank,
+        round_id=round_id,
+        expected=expected,
+        policy=sum(not batch.baseline_only for batch in batches),
+        value=sum(batch.baseline_only for batch in batches),
+        first_markers=sum(batch.first_of_round for batch in batches),
+        end_markers=sum(batch.end_of_round for batch in batches),
+    )
+
+
+def validate_distributed_round_signatures(
+    signatures: Sequence[RoundBatchSignature],
+) -> None:
+    """Reject every quota, batch-count, round, and marker disagreement together."""
+    if not signatures:
+        raise DistributedRoundMismatch("distributed round has no rank signatures")
+    expected_ranks = list(range(len(signatures)))
+    if sorted(signature.rank for signature in signatures) != expected_ranks:
+        raise DistributedRoundMismatch(
+            f"distributed round ranks are incomplete: signatures={signatures!r}"
+        )
+    expected = signatures[0].expected
+    round_id = signatures[0].round_id
+    invalid = [
+        signature
+        for signature in signatures
+        if signature.expected != expected
+        or signature.round_id != round_id
+        or signature.policy != expected.policy
+        or signature.value != expected.value
+        or signature.first_markers != 1
+        or signature.end_markers != 1
+    ]
+    if invalid:
+        rendered = "; ".join(
+            "rank="
+            f"{item.rank} round_id={item.round_id} expected={item.expected!r} "
+            f"policy={item.policy} value={item.value} "
+            f"first_markers={item.first_markers} end_markers={item.end_markers}"
+            for item in signatures
+        )
+        raise DistributedRoundMismatch("distributed round mismatch: " + rendered)
+
+
+def _all_gather_objects(local: object, world_size: int) -> tuple[object, ...]:
+    """Gather one small boundary payload through the initialized process group."""
+    if world_size == 1:
+        return (local,)
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise DistributedRoundMismatch(
+            "distributed round preflight requires an initialized process group"
+        )
+    gathered: list[object | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered, local)
+    if any(item is None for item in gathered):
+        raise DistributedRoundMismatch("distributed round gather returned no payload")
+    return tuple(gathered)
 
 
 def _round_counts(config: ToadConfig) -> dict[BatchKind, int]:
@@ -695,6 +827,26 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         self.rng = random.Random(config.runtime.seed)
         self._next_round_id = 0
         self._restored_actor = False
+        self.global_rank = 0
+        self.world_size = 1
+        self._round_validator: Callable[[Sequence[LearnerBatch], int], None] | None = (
+            None
+        )
+
+    def configure_distributed(self, *, rank: int, world_size: int) -> None:
+        """Bind this rank-local collector to one resolved Lightning topology."""
+        # Reuse the pure allocator's complete topology validation without
+        # consuming or advancing the stream.
+        rank_game_ids(0, 1, rank, world_size)
+        self.global_rank = rank
+        self.world_size = world_size
+
+    def set_round_validator(
+        self,
+        validator: Callable[[Sequence[LearnerBatch], int], None] | None,
+    ) -> None:
+        """Install the all-rank batch-shape gate run before the first yield."""
+        self._round_validator = validator
 
     def _ensure_initial_pool(self) -> None:
         """Materialize declared first-round snapshots before opponent selection."""
@@ -1020,9 +1172,15 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         first_game_id = self.next_game_id
         round_id = self._next_round_id
         if assignments is None:
+            local_ids = rank_game_ids(
+                first_game_id,
+                self.config.population.environments_per_rank,
+                self.global_rank,
+                self.world_size,
+            )
             assignments = allocate_round(
                 self.config,
-                first_game_id,
+                local_ids[0],
                 round_id,
                 self.pool,
                 self.teacher,
@@ -1172,13 +1330,16 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 round_metrics=collection_metrics,
             )
         )
+        if self._round_validator is not None:
+            self._round_validator(batches, round_id)
         if not batches:
             raise CollectionError(
                 f"collection round {round_id} produced no complete learner batches"
             )
         if generated:
             self.next_game_id = (
-                first_game_id + self.config.population.environments_per_rank
+                first_game_id
+                + self.config.population.environments_per_rank * self.world_size
             )
         self._next_round_id = round_id + 1
         yield from batches
@@ -1205,6 +1366,51 @@ class ToadDataModule(lightning.LightningDataModule):
         self.config = config
         self.source = source
 
+    def setup(self, stage: str | None) -> None:
+        """Bind rank ownership and reject unequal quotas before collection."""
+        del stage
+        trainer = self.trainer
+        if trainer is None:
+            return
+        rank = int(trainer.global_rank)
+        world_size = int(trainer.world_size)
+        self.source.configure_distributed(rank=rank, world_size=world_size)
+        if world_size == 1:
+            return
+        local = expected_round_batch_counts(self.config)
+        gathered = _all_gather_objects(local, world_size)
+        if any(item != local for item in gathered):
+            raise DistributedRoundMismatch(
+                "expected round quotas differ across ranks: "
+                f"rank={rank}, gathered={gathered!r}"
+            )
+        self.source.set_round_validator(self._validate_round_batches)
+
+    def _validate_round_batches(
+        self, batches: Sequence[LearnerBatch], round_id: int
+    ) -> None:
+        """Collectively gate actual counts and markers before DDP sees a batch."""
+        local = round_batch_signature(
+            batches,
+            expected=expected_round_batch_counts(self.config),
+            rank=self.source.global_rank,
+            round_id=round_id,
+        )
+        gathered = _all_gather_objects(local, self.source.world_size)
+        try:
+            signatures = tuple(
+                cast(RoundBatchSignature, signature) for signature in gathered
+            )
+        except TypeError as error:
+            raise DistributedRoundMismatch(
+                "distributed round gather returned malformed signatures"
+            ) from error
+        if not all(isinstance(item, RoundBatchSignature) for item in signatures):
+            raise DistributedRoundMismatch(
+                "distributed round gather returned malformed signatures"
+            )
+        validate_distributed_round_signatures(signatures)
+
     def publish_actor(
         self, state_dict: Mapping[str, torch.Tensor], version: int
     ) -> None:
@@ -1220,15 +1426,18 @@ class ToadDataModule(lightning.LightningDataModule):
     def publish_manifest(self, manifest: SnapshotManifest) -> None:
         """Bind collection to the callback's exact durable population view."""
         directory = self.population_directory()
-        store = SnapshotStore(
-            directory,
-            capacity=self.config.population.pool_capacity,
-            structure=structural_fingerprint(self.config),
-        )
-        if store.manifest != manifest:
-            raise SnapshotIntegrityError(
-                "published population manifest does not match durable store"
+        try:
+            store = SnapshotStore.open_generation(
+                directory,
+                capacity=self.config.population.pool_capacity,
+                structure=structural_fingerprint(self.config),
+                manifest=manifest,
             )
+        except SnapshotIntegrityError as error:
+            raise SnapshotIntegrityError(
+                "published population manifest does not match a durable generation: "
+                f"{error}"
+            ) from error
         pool = SnapshotPool.from_store(
             store,
             seed=self.config.population.population_seed,
@@ -1240,6 +1449,23 @@ class ToadDataModule(lightning.LightningDataModule):
         for entry in manifest.entries:
             store.load(entry)
         self.source.pool = pool
+
+    def open_population_store(self, manifest: SnapshotManifest) -> SnapshotStore:
+        """Open the exact restored generation or the current fresh-run head."""
+        directory = self.population_directory()
+        pool = self.source.pool
+        if pool is not None and pool.manifest == manifest:
+            return SnapshotStore.open_generation(
+                directory,
+                capacity=self.config.population.pool_capacity,
+                structure=structural_fingerprint(self.config),
+                manifest=manifest,
+            )
+        return SnapshotStore(
+            directory,
+            capacity=self.config.population.pool_capacity,
+            structure=structural_fingerprint(self.config),
+        )
 
     def population_directory(self) -> Path:
         """Return restored pool identity, or the configured fresh-run directory."""
@@ -1275,7 +1501,7 @@ class ToadDataModule(lightning.LightningDataModule):
             "population_pool": pool_identity,
         }
 
-    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:  # noqa: C901
         """Restore the collector stream without retaining stale actor weights."""
         population = self.config.population
         durable_pool_required = bool(
@@ -1301,10 +1527,10 @@ class ToadDataModule(lightning.LightningDataModule):
             actor_version = _checkpoint_nonnegative_int(
                 state_dict["published_actor_version"]
             )
-            if self.source._assignments is None and next_game_id != (
-                next_round_id * self.config.population.environments_per_rank
-            ):
-                raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE)
+            if self.source._assignments is None:
+                per_rank = self.config.population.environments_per_rank
+                if next_game_id % per_rank or next_game_id < next_round_id * per_rank:
+                    raise CollectorCheckpointError(_INVALID_COLLECTOR_STATE)
 
             restored_rng = random.Random()
             restored_rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))

@@ -256,6 +256,72 @@ def test_population_resume_keeps_checkpointed_pool_after_output_override(
     assert not (resumed_root / "population").exists()
 
 
+def test_failed_checkpoint_publication_preserves_prior_authoritative_generation(
+    tmp_path: Path,
+) -> None:
+    """A manifest advance cannot invalidate the last completed checkpoint."""
+    base = _population_config(tmp_path)
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={
+                    "pool_capacity": 1,
+                    "snapshot_at_start": True,
+                    "snapshot_every_environment_steps": 1,
+                }
+            )
+        }
+    )
+    module = ToadLightningModule(config)
+    source = ReferenceRoundSource(config, assignments=())
+    data = ToadDataModule(config, source)
+    callback = PopulationSnapshotCallback()
+    callback.on_fit_start(_callback_trainer(data), module)
+    prior_manifest = module.population_manifest
+    prior_member = prior_manifest.entries[0]
+    checkpoint: dict[str, object] = {}
+    module.on_save_checkpoint(checkpoint)
+    data_state = data.state_dict()
+    # Simulate the pre-generation layout of an authoritative checkpoint that
+    # predates this protocol.  The next manifest mutation must retain it first.
+    for generation in (tmp_path / "population").glob("manifest-*.json"):
+        generation.unlink()
+
+    def fail_checkpoint(_path: str) -> None:
+        raise OSError("simulated checkpoint interruption")
+
+    failing_trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(datamodule=data, save_checkpoint=fail_checkpoint),
+    )
+    module.environment_steps = 1
+    module.collection_round = 1
+    with pytest.raises(OSError, match="simulated checkpoint interruption"):
+        callback.on_train_batch_end(
+            failing_trainer,
+            module,
+            None,
+            SimpleNamespace(end_of_round=True),
+            0,
+        )
+
+    assert module.population_manifest != prior_manifest
+    assert prior_member.path.is_file()
+
+    resumed_module = ToadLightningModule(config)
+    resumed_module.on_load_checkpoint(checkpoint)
+    resumed_source = ReferenceRoundSource(config, assignments=())
+    resumed_data = ToadDataModule(config, resumed_source)
+    resumed_data.load_state_dict(data_state)
+    resumed_callback = PopulationSnapshotCallback()
+    resumed_callback.on_fit_start(_callback_trainer(resumed_data), resumed_module)
+
+    assert resumed_module.population_manifest == prior_manifest
+    assert resumed_source.pool is not None
+    assert resumed_source.pool.manifest == prior_manifest
+    assert resumed_source.pool.load(prior_member)
+
+
 def test_round_metrics_flush_once_with_stable_population_series(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

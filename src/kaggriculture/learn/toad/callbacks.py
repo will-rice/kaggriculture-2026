@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -15,8 +16,13 @@ from kaggriculture.learn.toad.data import LearnerBatch, ToadDataModule
 from kaggriculture.learn.toad.lightning import ToadLightningModule
 from kaggriculture.learn.toad.population import (
     SnapshotIntegrityError,
+    SnapshotManifest,
     SnapshotStore,
 )
+
+
+class DistributedBoundaryError(RuntimeError):
+    """A rank-zero durable action failed and every rank must stop together."""
 
 
 def _save_authoritative_checkpoint(
@@ -34,7 +40,19 @@ def _save_authoritative_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     final_path = output_dir / f"step-{module.environment_steps}.ckpt"
     temporary_path = final_path.with_suffix(".tmp")
-    trainer.save_checkpoint(str(temporary_path))
+    try:
+        if int(getattr(trainer, "world_size", 1)) > 1:
+            # ``Trainer.save_checkpoint`` ends with an unconditional strategy
+            # barrier and therefore cannot live inside this rank-zero failure
+            # envelope.  DDP's ordinary checkpoint dump is process-local; its
+            # strategy writer already restricts filesystem I/O to global zero.
+            checkpoint = trainer._checkpoint_connector.dump_checkpoint()
+            trainer.strategy.save_checkpoint(checkpoint, temporary_path)
+        else:
+            trainer.save_checkpoint(str(temporary_path))
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
     os.replace(temporary_path, final_path)  # noqa: PTH105
     module._authoritative_checkpoint_identity = identity
 
@@ -45,6 +63,115 @@ def _data_module(trainer: lightning.Trainer) -> ToadDataModule:
     if data_module is None:
         raise RuntimeError("Toad callbacks require a ToadDataModule")
     return cast(ToadDataModule, data_module)
+
+
+def _boundary_payload(
+    trainer: lightning.Trainer,
+    module: ToadLightningModule,
+    *,
+    include_manifest: bool,
+) -> dict[str, object]:
+    """Serialize global clocks plus the source-owned next collection boundary."""
+    source = _data_module(trainer).source
+    payload: dict[str, object] = {
+        "environment_steps": module.environment_steps,
+        "collection_round": module.collection_round,
+        "actor_version": module.actor_version,
+        "actor_source_global_step": module.actor_source_global_step,
+        "next_game_id": source.next_game_id,
+        "next_round_id": source._next_round_id,
+    }
+    if include_manifest:
+        payload["population_manifest"] = module.population_manifest.model_dump(
+            mode="json"
+        )
+    return payload
+
+
+def _apply_boundary_payload(
+    trainer: lightning.Trainer,
+    module: ToadLightningModule,
+    payload: object,
+    *,
+    include_manifest: bool,
+) -> None:
+    """Install the rank-zero boundary before any rank starts collection again."""
+    if not isinstance(payload, Mapping):
+        raise DistributedBoundaryError("rank-zero boundary payload is malformed")
+    payload_map = cast(Mapping[str, object], payload)
+
+    def counter(name: str) -> int:
+        value = payload_map.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise DistributedBoundaryError(
+                f"rank-zero boundary counter {name!r} is malformed"
+            )
+        return value
+
+    module.environment_steps = counter("environment_steps")
+    module.collection_round = counter("collection_round")
+    module.actor_version = counter("actor_version")
+    module.actor_source_global_step = counter("actor_source_global_step")
+    data = _data_module(trainer)
+    data.source.next_game_id = counter("next_game_id")
+    data.source._next_round_id = counter("next_round_id")
+    if include_manifest:
+        try:
+            manifest = SnapshotManifest.model_validate(
+                payload_map["population_manifest"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise DistributedBoundaryError(
+                "rank-zero population manifest payload is malformed"
+            ) from error
+        data.publish_manifest(manifest)
+        module.population_manifest = manifest
+
+
+def _run_rank_zero_boundary(
+    trainer: lightning.Trainer,
+    module: ToadLightningModule,
+    action: Callable[[], None],
+    *,
+    include_manifest: bool,
+) -> None:
+    """Run one durable action, propagate failure, then barrier and broadcast."""
+    world_size = int(getattr(trainer, "world_size", 1))
+    is_global_zero = bool(getattr(trainer, "is_global_zero", True))
+    if world_size == 1:
+        action()
+        return
+    status: dict[str, object] | None = None
+    if is_global_zero:
+        try:
+            action()
+        except Exception as error:  # rank peers need a serializable failure
+            status = {
+                "ok": False,
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+        else:
+            status = {"ok": True}
+    status = cast(dict[str, object], trainer.strategy.broadcast(status, src=0))
+    if not bool(status.get("ok")):
+        raise DistributedBoundaryError(
+            "rank-zero durable boundary failed: "
+            f"{status.get('type')}: {status.get('message')}"
+        )
+    trainer.strategy.barrier()
+    payload = (
+        _boundary_payload(trainer, module, include_manifest=include_manifest)
+        if is_global_zero
+        else None
+    )
+    payload = trainer.strategy.broadcast(payload, src=0)
+    _apply_boundary_payload(
+        trainer,
+        module,
+        payload,
+        include_manifest=include_manifest,
+    )
 
 
 class ActorSyncCallback(lightning.Callback):
@@ -127,18 +254,27 @@ class PopulationSnapshotCallback(lightning.Callback):
         """Open the durable pool and schedule strictly after restored progress."""
         module = cast(ToadLightningModule, pl_module)
         population = module.config.population
-        previous_manifest = module.population_manifest
-        self._reopen_store(trainer, module)
-        assert self.store is not None
-        if population.snapshot_at_start and not self.store.manifest.entries:
-            self._add_snapshot(module)
-        self._publish(trainer, module)
-        if module.population_manifest != previous_manifest:
-            _save_authoritative_checkpoint(
-                trainer,
-                module,
-                module.config.runtime.output_dir,
-            )
+
+        def publish_start() -> None:
+            previous_manifest = module.population_manifest
+            self._reopen_store(trainer, module)
+            assert self.store is not None
+            if population.snapshot_at_start and not self.store.manifest.entries:
+                self._add_snapshot(module)
+            self._publish(trainer, module)
+            if module.population_manifest != previous_manifest:
+                _save_authoritative_checkpoint(
+                    trainer,
+                    module,
+                    module.config.runtime.output_dir,
+                )
+
+        _run_rank_zero_boundary(
+            trainer,
+            module,
+            publish_start,
+            include_manifest=True,
+        )
         interval = population.snapshot_every_environment_steps
         self.next_snapshot_steps = (
             None
@@ -159,10 +295,17 @@ class PopulationSnapshotCallback(lightning.Callback):
         learner_batch = cast(LearnerBatch, batch)
         if not learner_batch.end_of_round:
             return
-        previous_manifest = module.population_manifest
-        self._reopen_store(trainer, module)
         interval = module.config.population.snapshot_every_environment_steps
-        if interval is None:
+
+        def publish_boundary() -> None:
+            previous_manifest = module.population_manifest
+            self._reopen_store(trainer, module)
+            if (
+                interval is not None
+                and self.next_snapshot_steps is not None
+                and module.environment_steps >= self.next_snapshot_steps
+            ):
+                self._add_snapshot(module)
             self._publish(trainer, module)
             if module.population_manifest != previous_manifest:
                 _save_authoritative_checkpoint(
@@ -170,27 +313,21 @@ class PopulationSnapshotCallback(lightning.Callback):
                     module,
                     module.config.runtime.output_dir,
                 )
-            return
-        if (
-            self.next_snapshot_steps is None
-            or module.environment_steps < self.next_snapshot_steps
-        ):
-            self._publish(trainer, module)
-            if module.population_manifest != previous_manifest:
-                _save_authoritative_checkpoint(
-                    trainer,
-                    module,
-                    module.config.runtime.output_dir,
-                )
-            return
-        self._add_snapshot(module)
-        self._publish(trainer, module)
-        _save_authoritative_checkpoint(
+
+        _run_rank_zero_boundary(
             trainer,
             module,
-            module.config.runtime.output_dir,
+            publish_boundary,
+            include_manifest=True,
         )
-        self.next_snapshot_steps = (module.environment_steps // interval + 1) * interval
+        if (
+            interval is not None
+            and self.next_snapshot_steps is not None
+            and module.environment_steps >= self.next_snapshot_steps
+        ):
+            self.next_snapshot_steps = (
+                module.environment_steps // interval + 1
+            ) * interval
 
     def _reopen_store(
         self, trainer: lightning.Trainer, module: ToadLightningModule
@@ -203,10 +340,15 @@ class PopulationSnapshotCallback(lightning.Callback):
             if population_directory is not None
             else (module.config.runtime.output_dir / "population").resolve()
         )
-        store = SnapshotStore(
-            directory,
-            capacity=module.config.population.pool_capacity,
-            structure=structural_fingerprint(module.config),
+        open_population_store = getattr(data, "open_population_store", None)
+        store = (
+            open_population_store(module.population_manifest)
+            if open_population_store is not None
+            else SnapshotStore(
+                directory,
+                capacity=module.config.population.pool_capacity,
+                structure=structural_fingerprint(module.config),
+            )
         )
         if (
             module.population_manifest.entries
@@ -283,7 +425,12 @@ class BoundaryCheckpoint(lightning.Callback):
         if module.environment_steps < self._next_environment_steps:
             return
 
-        _save_authoritative_checkpoint(trainer, module, self.output_dir)
+        _run_rank_zero_boundary(
+            trainer,
+            module,
+            lambda: _save_authoritative_checkpoint(trainer, module, self.output_dir),
+            include_manifest=False,
+        )
         self._next_environment_steps = (
             module.environment_steps // interval + 1
         ) * interval

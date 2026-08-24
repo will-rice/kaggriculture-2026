@@ -271,8 +271,8 @@ class RuntimeConfig(BaseModel):
     seed: int = 0
     accelerator: Literal["auto", "cpu", "gpu"] = "auto"
     devices: PositiveInt | tuple[NonNegativeInt, ...] | Literal["auto"] = 1
-    num_nodes: Literal[1] = 1
-    strategy: Literal["auto"] = "auto"
+    num_nodes: PositiveInt = 1
+    strategy: Literal["auto", "ddp"] = "auto"
     precision: Precision = "32-true"
     deterministic: bool = False
     benchmark: bool | None = None

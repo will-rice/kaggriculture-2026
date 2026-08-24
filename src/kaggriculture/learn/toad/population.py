@@ -383,6 +383,39 @@ class SnapshotStore:
             else SnapshotManifest()
         )
 
+    @classmethod
+    def open_generation(
+        cls,
+        directory: Path,
+        *,
+        capacity: int,
+        structure: str,
+        manifest: SnapshotManifest,
+    ) -> SnapshotStore:
+        """Open one immutable checkpointed manifest, even after the head advances."""
+        store = cls(directory, capacity=capacity, structure=structure)
+        if store.manifest == manifest:
+            store._validate_existing_members()
+            return store
+        generation_path = store._generation_path(manifest)
+        if not generation_path.is_file():
+            raise SnapshotIntegrityError(
+                "checkpointed snapshot manifest generation is not durable"
+            )
+        try:
+            durable = SnapshotManifest.load(generation_path)
+        except (OSError, ValueError) as error:
+            raise SnapshotIntegrityError(
+                "checkpointed snapshot manifest generation is corrupt"
+            ) from error
+        if durable != manifest:
+            raise SnapshotIntegrityError(
+                "checkpointed snapshot manifest generation does not match identity"
+            )
+        store.manifest = manifest
+        store._validate_existing_members()
+        return store
+
     def add(
         self,
         state_dict: Mapping[str, torch.Tensor],
@@ -400,6 +433,10 @@ class SnapshotStore:
         """
         validated_evaluation = _EVALUATION.validate_python(evaluation or {})
         self._validate_existing_members()
+        if self.manifest_path.is_file():
+            # Backfill the generation for a head written before versioned
+            # manifests existed, before any newer head can supersede it.
+            self._publish_generation(self.manifest)
         temporary_path = self._write_temporary(state_dict)
         digest = sha256_file(temporary_path)
         final_path = self.directory / (
@@ -417,15 +454,9 @@ class SnapshotStore:
             evaluation=validated_evaluation,
         )
         overflow = max(0, len(self.manifest.entries) + 1 - self.capacity)
-        evicted = self.manifest.entries[:overflow]
         manifest = SnapshotManifest(entries=(*self.manifest.entries[overflow:], entry))
         self._publish_manifest(manifest)
         self.manifest = manifest
-        for old_entry in evicted:
-            if old_entry.path not in {member.path for member in manifest.entries}:
-                old_entry.path.unlink(missing_ok=True)
-        if evicted:
-            _fsync_directory(self.directory)
         return entry
 
     def load(self, entry: SnapshotEntry) -> dict[str, torch.Tensor]:
@@ -488,14 +519,50 @@ class SnapshotStore:
         _fsync_directory(self.directory)
 
     def _publish_manifest(self, manifest: SnapshotManifest) -> None:
-        """Write and atomically replace the population's sole manifest."""
+        """Durably retain a generation before atomically advancing the head."""
+        serialized = manifest.model_dump_json().encode()
+        self._publish_generation(manifest, serialized=serialized)
         temporary_path = self.manifest_path.with_suffix(".json.tmp")
         with temporary_path.open("wb") as temporary:
-            temporary.write(manifest.model_dump_json().encode())
+            temporary.write(serialized)
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, self.manifest_path)  # noqa: PTH105
         _fsync_directory(self.directory)
+
+    def _publish_generation(
+        self,
+        manifest: SnapshotManifest,
+        *,
+        serialized: bytes | None = None,
+    ) -> None:
+        """Create or verify one immutable manifest generation durably."""
+        if serialized is None:
+            serialized = manifest.model_dump_json().encode()
+        generation_path = self._generation_path(manifest)
+        if generation_path.is_file():
+            try:
+                if SnapshotManifest.load(generation_path) != manifest:
+                    raise SnapshotIntegrityError(
+                        "immutable snapshot manifest generation changed"
+                    )
+            except (OSError, ValueError) as error:
+                raise SnapshotIntegrityError(
+                    "immutable snapshot manifest generation is corrupt"
+                ) from error
+        else:
+            generation_temporary = generation_path.with_suffix(".json.tmp")
+            with generation_temporary.open("wb") as temporary:
+                temporary.write(serialized)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(generation_temporary, generation_path)  # noqa: PTH105
+            _fsync_directory(self.directory)
+
+    def _generation_path(self, manifest: SnapshotManifest) -> Path:
+        """Return the content-addressed immutable path for ``manifest``."""
+        digest = hashlib.sha256(manifest.model_dump_json().encode()).hexdigest()
+        return self.directory / f"manifest-{digest}.json"
 
 
 class SnapshotPool:
@@ -584,15 +651,12 @@ class SnapshotPool:
             raise SnapshotIntegrityError(
                 "checkpointed snapshot pool identity does not match resolved config"
             )
-        store = SnapshotStore(
+        store = SnapshotStore.open_generation(
             identity.directory,
             capacity=capacity,
             structure=structure,
+            manifest=identity.manifest,
         )
-        if store.manifest != identity.manifest:
-            raise SnapshotIntegrityError(
-                "checkpointed snapshot manifest does not match the durable store"
-            )
         return cls.from_store(store, seed=seed)
 
     def sample(self, game_id: int) -> SnapshotEntry:
