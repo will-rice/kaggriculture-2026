@@ -59,3 +59,33 @@
 - Task 3 remains responsible for wiring recurrent state and done masks through
   the learner and collector; the `ToadConfig` production stage gate remains
   deliberately closed.
+
+## Fix round 1/5: prior-belief temporal reset
+
+### Delivered
+
+- Added `PolicyState.reset_rows(dones)`, which clears hidden, cell, and prior
+  belief for exactly the terminal batch rows.
+- ConvLSTM now exposes a one-observation `step` transition. Its sequence
+  forward resets state before every step, and the enabled policy uses the same
+  reset-before-step order for its full `PolicyState`. This is the extension
+  point Task 4 needs to replace a reset prior belief with each new prediction.
+- Extended terminal coverage to compare hidden/cell sequences and final state
+  with fresh processing, test the policy wrapper, and place a terminal in the
+  middle of a sequence with a nonzero carried prior belief.
+
+### RED
+
+`PYTHONPATH=src /home/will/projects/kaggriculture-2026/.venv/bin/python -m pytest tests/learn/test_toad_model.py -k "terminal_reset or prior_belief or policy_state_reset" -v`
+failed as intended: `PolicyState` had no `reset_rows` attribute (1 failed, 2
+passed, 20 deselected).
+
+### GREEN
+
+- The same focused terminal-boundary selection — 4 passed.
+- Original Task 2 plus Task 1/control-fixture/checkpoint selection — 70
+  passed, 1 deselected.
+- `python -m ruff format ...` reformatted the two changed files, then
+  `python -m ruff check ...` passed.
+- `python -m ty check src` — all checks passed.
+- `git diff --check` — clean.

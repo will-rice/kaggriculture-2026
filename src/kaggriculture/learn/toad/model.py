@@ -35,6 +35,17 @@ class PolicyState:
             prior_belief=self.prior_belief.detach(),
         )
 
+    def reset_rows(self, dones: torch.Tensor) -> "PolicyState":
+        """Clear terminal rows before their next observation is consumed."""
+        return PolicyState(
+            hidden=_reset_spatial_rows(self.hidden, dones),
+            cell=_reset_spatial_rows(self.cell, dones),
+            prior_belief=self.prior_belief
+            * (~dones)
+            .to(device=self.prior_belief.device, dtype=self.prior_belief.dtype)
+            .view(-1, 1),
+        )
+
 
 @dataclass(frozen=True)
 class ConvLSTMState:
@@ -42,6 +53,13 @@ class ConvLSTMState:
 
     hidden: torch.Tensor
     cell: torch.Tensor
+
+    def reset_rows(self, dones: torch.Tensor) -> "ConvLSTMState":
+        """Clear terminal hidden and cell rows before an LSTM update."""
+        return ConvLSTMState(
+            hidden=_reset_spatial_rows(self.hidden, dones),
+            cell=_reset_spatial_rows(self.cell, dones),
+        )
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,15 @@ class ConvLSTMCell(torch.nn.Module):
         ) * torch.tanh(candidate)
         hidden = torch.sigmoid(output_gate) * torch.tanh(cell)
         return hidden, cell
+
+
+def _reset_spatial_rows(tensor: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
+    """Multiply out terminal batch rows from either one or many LSTM layers."""
+    batch_dimension = 1 if tensor.ndim == 5 else 0
+    shape = [1] * tensor.ndim
+    shape[batch_dimension] = -1
+    keep = (~dones).to(device=tensor.device, dtype=tensor.dtype).view(shape)
+    return tensor * keep
 
 
 class ConvLSTM(torch.nn.Module):
@@ -122,36 +149,41 @@ class ConvLSTM(torch.nn.Module):
         time, batch, _, height, width = x.shape
         if state is None:
             state = self.initial_state(batch, height, width, like=x)
+        elif isinstance(state, PolicyState):
+            state = ConvLSTMState(hidden=state.hidden, cell=state.cell)
+
+        hidden_steps: list[torch.Tensor] = []
+        cell_steps: list[torch.Tensor] = []
+        for step in range(time):
+            state = state.reset_rows(dones[step])
+            state = self.step(x[step], state)
+            hidden_steps.append(state.hidden[-1])
+            cell_steps.append(state.cell[-1])
+        return ConvLSTMOutput(
+            hidden_sequence=torch.stack(hidden_steps),
+            cell_sequence=torch.stack(cell_steps),
+            state=state,
+        )
+
+    def step(self, x: torch.Tensor, state: ConvLSTMState) -> ConvLSTMState:
+        """Advance an already terminal-reset state by one observation."""
         hidden = state.hidden
         cell = state.cell
         if hidden.ndim == 4:
             hidden = hidden.unsqueeze(0)
             cell = cell.unsqueeze(0)
-
-        hidden_steps: list[torch.Tensor] = []
-        cell_steps: list[torch.Tensor] = []
-        for step in range(time):
-            keep = (~dones[step]).to(dtype=x.dtype).view(batch, 1, 1, 1)
-            hidden = hidden * keep
-            cell = cell * keep
-            layer_input = x[step]
-            next_hidden: list[torch.Tensor] = []
-            next_cell: list[torch.Tensor] = []
-            for layer, recurrent_cell in enumerate(self.cells):
-                layer_hidden, layer_cell = recurrent_cell(
-                    layer_input, hidden[layer], cell[layer]
-                )
-                next_hidden.append(layer_hidden)
-                next_cell.append(layer_cell)
-                layer_input = layer_hidden
-            hidden = torch.stack(next_hidden)
-            cell = torch.stack(next_cell)
-            hidden_steps.append(hidden[-1])
-            cell_steps.append(cell[-1])
-        return ConvLSTMOutput(
-            hidden_sequence=torch.stack(hidden_steps),
-            cell_sequence=torch.stack(cell_steps),
-            state=ConvLSTMState(hidden=hidden, cell=cell),
+        layer_input = x
+        next_hidden: list[torch.Tensor] = []
+        next_cell: list[torch.Tensor] = []
+        for layer, recurrent_cell in enumerate(self.cells):
+            layer_hidden, layer_cell = recurrent_cell(
+                layer_input, hidden[layer], cell[layer]
+            )
+            next_hidden.append(layer_hidden)
+            next_cell.append(layer_cell)
+            layer_input = layer_hidden
+        return ConvLSTMState(
+            hidden=torch.stack(next_hidden), cell=torch.stack(next_cell)
         )
 
 
@@ -279,12 +311,27 @@ class StatefulPolicy(torch.nn.Module):
         )
         if dones is None:
             dones = torch.zeros(time, batch, dtype=torch.bool, device=board.device)
-        initial_recurrent = (
-            None
-            if state is None
-            else ConvLSTMState(hidden=state.hidden, cell=state.cell)
+        state = self.initial_state(batch, like=board) if state is None else state
+        assert state is not None
+        hidden_steps: list[torch.Tensor] = []
+        cell_steps: list[torch.Tensor] = []
+        for step in range(time):
+            state = state.reset_rows(dones[step])
+            recurrent_state = self.recurrent.step(
+                features[step], ConvLSTMState(hidden=state.hidden, cell=state.cell)
+            )
+            state = PolicyState(
+                recurrent_state.hidden,
+                recurrent_state.cell,
+                state.prior_belief,
+            )
+            hidden_steps.append(recurrent_state.hidden[-1])
+            cell_steps.append(recurrent_state.cell[-1])
+        recurrent = ConvLSTMOutput(
+            hidden_sequence=torch.stack(hidden_steps),
+            cell_sequence=torch.stack(cell_steps),
+            state=recurrent_state,
         )
-        recurrent = self.recurrent(features, initial_recurrent, dones)
         merged = self.merge(
             torch.cat(
                 (features, recurrent.hidden_sequence, recurrent.cell_sequence), dim=2
@@ -310,13 +357,6 @@ class StatefulPolicy(torch.nn.Module):
                 torch.sigmoid(values) * (2.0 * self.control.value_bound)
                 - self.control.value_bound
             )
-        prior_belief = (
-            state.prior_belief
-            if state is not None
-            else board.new_zeros(batch, self.config.belief_size)
-        )
-        for step in range(time):
-            prior_belief = prior_belief * (~dones[step]).to(board.dtype).view(batch, 1)
         hidden, cell = recurrent.state.hidden, recurrent.state.cell
         if self.config.recurrent_layers == 1:
             hidden = hidden.squeeze(0)
@@ -327,5 +367,5 @@ class StatefulPolicy(torch.nn.Module):
             market,
             values.view(time, batch),
             None,
-            PolicyState(hidden, cell, prior_belief),
+            PolicyState(hidden, cell, state.prior_belief),
         )

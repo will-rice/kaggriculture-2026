@@ -122,6 +122,18 @@ def test_terminal_reset_erases_previous_episode_memory_per_batch_row() -> None:
         atol=1e-6,
         rtol=1e-6,
     )
+    assert torch.allclose(
+        output.cell_sequence[:, :1],
+        fresh.cell_sequence,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        output.state.hidden[:, :1], fresh.state.hidden, atol=1e-6, rtol=1e-6
+    )
+    assert torch.allclose(
+        output.state.cell[:, :1], fresh.state.cell, atol=1e-6, rtol=1e-6
+    )
 
 
 def test_two_chunks_equal_one_sequence_without_a_terminal() -> None:
@@ -236,10 +248,52 @@ def test_recurrent_policy_chunks_match_one_full_time_major_sequence() -> None:
     assert torch.allclose(right.state.cell, full.state.cell, atol=1e-6, rtol=1e-6)
 
 
+def test_recurrent_policy_terminal_row_matches_a_fresh_policy_row() -> None:
+    """The wrapper carries no hidden or cell memory across one row's terminal."""
+    torch.manual_seed(23)
+    policy = recurrent_policy()
+    first_board, first_scalars, first_positions = recurrent_inputs(time=2)
+    carried = policy(
+        first_board,
+        first_scalars,
+        first_positions,
+        dones=torch.zeros(2, 2, dtype=torch.bool),
+    ).state
+    assert carried is not None
+    second_board, second_scalars, second_positions = recurrent_inputs(time=2)
+    dones = torch.tensor([[True, False], [False, False]])
+
+    output = policy(
+        second_board,
+        second_scalars,
+        second_positions,
+        state=carried,
+        dones=dones,
+    )
+    fresh = policy(
+        second_board[:, :1],
+        second_scalars[:, :1],
+        second_positions[:, :1],
+        dones=dones[:, :1],
+    )
+
+    assert torch.allclose(
+        output.unit_logits[:, :1], fresh.unit_logits, atol=1e-6, rtol=1e-6
+    )
+    assert output.state is not None
+    assert fresh.state is not None
+    assert torch.allclose(
+        output.state.hidden[:, :1], fresh.state.hidden, atol=1e-6, rtol=1e-6
+    )
+    assert torch.allclose(
+        output.state.cell[:, :1], fresh.state.cell, atol=1e-6, rtol=1e-6
+    )
+
+
 def test_recurrent_policy_resets_prior_belief_at_the_terminal_boundary() -> None:
     """Later belief feedback's state slot follows recurrent resets now."""
     policy = recurrent_policy()
-    board, scalars, positions = recurrent_inputs(time=1)
+    board, scalars, positions = recurrent_inputs(time=3)
     state = policy.initial_state(2, like=board)
     assert state is not None
     state = PolicyState(
@@ -253,12 +307,30 @@ def test_recurrent_policy_resets_prior_belief_at_the_terminal_boundary() -> None
         scalars,
         positions,
         state=state,
-        dones=torch.tensor([[True, False]]),
+        dones=torch.tensor([[False, False], [True, False], [False, False]]),
     )
 
     assert output.state is not None
     assert torch.equal(output.state.prior_belief[0], torch.zeros(9))
     assert torch.equal(output.state.prior_belief[1], torch.full((9,), 2.0))
+
+
+def test_policy_state_reset_clears_all_terminal_components_before_a_step() -> None:
+    """One reset operation gives later belief feedback the recurrent boundary."""
+    state = PolicyState(
+        hidden=torch.ones(2, 3, BOARD_SIZE, BOARD_SIZE),
+        cell=torch.full((2, 3, BOARD_SIZE, BOARD_SIZE), 2.0),
+        prior_belief=torch.full((2, 9), 3.0),
+    )
+
+    reset = state.reset_rows(torch.tensor([True, False]))
+
+    assert torch.equal(reset.hidden[0], torch.zeros(3, BOARD_SIZE, BOARD_SIZE))
+    assert torch.equal(reset.cell[0], torch.zeros(3, BOARD_SIZE, BOARD_SIZE))
+    assert torch.equal(reset.prior_belief[0], torch.zeros(9))
+    assert torch.equal(reset.hidden[1], torch.ones(3, BOARD_SIZE, BOARD_SIZE))
+    assert torch.equal(reset.cell[1], torch.full((3, BOARD_SIZE, BOARD_SIZE), 2.0))
+    assert torch.equal(reset.prior_belief[1], torch.full((9,), 3.0))
 
 
 @pytest.mark.parametrize(
