@@ -196,6 +196,13 @@ Pydantic validation rejects the configuration before W&B, worker processes,
 or CUDA contexts start when:
 
 - batch probabilities are negative or do not sum to one;
+- an optimizer or model float is non-finite, discount or lambda leaves
+  `[0, 1]`, a loss coefficient is negative, or learning-rate/clip parameters
+  are not positive;
+- the 719-decision horizon cannot produce a nonzero, exactly divisible set of
+  optimizer batches for the resolved population (self-play contributes both
+  seats, every other population contributes one); value replay repeats those
+  exact complete batches;
 - teacher batches or teacher losses are enabled without a readable compatible
   teacher checkpoint;
 - frozen-opponent probability is nonzero with neither an initial pool nor a
@@ -208,6 +215,24 @@ or CUDA contexts start when:
 - a value-only phase enables policy-only losses; or
 - structurally incompatible curriculum phases claim an in-place continuation
   without an explicit widening/migration rule.
+
+An effective Lightning resume is also required to be a readable regular
+`.ckpt` before runtime preflight and is rechecked immediately before any seed,
+module, data, logger, or Trainer construction. Historical checkpoint configs
+remain schema-valid after their original external resume path disappears.
+Legacy `.pt` files are weight-only/read-only inputs, not full Lightning resume
+state.
+
+Native `step-N.ckpt` evaluation reconstructs the policy from its stored
+`ToadConfig`, including recurrent and other stateful paths; retained legacy
+control layouts use the same checkpoint-to-policy factory. Evaluators carry a
+separate `PolicyState` for every environment/seat and reset it at episode
+boundaries. When `CurriculumConfig.gate` is present, the curriculum runner
+unconditionally publishes the successful fit's exact terminal checkpoint,
+passes that identity directly to the gate, and never infers the boundary from
+other files in the output directory. Global rank zero alone plays the fixed
+held-out seeds, atomically records `gate.json` in the phase output directory,
+and raises on the declared `stop` policy if the threshold is missed.
 
 Hardware availability is checked in a runtime preflight after Lightning has
 resolved the accelerator. Requesting BF16, DDP, compile, or a native rollout
@@ -709,3 +734,56 @@ Original Kaggriculture glue, Lightning integration, Pydantic schema, market and
 quantity heads, belief target translation, and tests remain under this
 repository's license. The implementation plan must include the notice change
 in the first commit that adds derived source, not as cleanup after the port.
+
+## 18. Implementation amendment — 2026-08-24
+
+The completed runtime preflight establishes the following selectable boundary:
+
+- reference rollout supports eager FP32 CPU, capability-checked BF16, compile,
+  and explicit DDP; native rollout supports eager execution and explicit DDP;
+- native rollout combined with compile is rejected until that joint path has a
+  proof, and CUDA-graph round collection remains unselectable. Scripted native
+  graph capture is rejected specifically because the opponent consumes host
+  simulator rows;
+- the verified native scripted opponent is `economic`; other scripted
+  opponents fail before Trainer construction. Native CUDA requests and all
+  explicit accelerator/BF16 requests also fail when the required hardware
+  capability is unavailable; and
+- an explicit GPU device tuple is ordered, range checked, and duplicate-free.
+  Any resolved world size above one requires `strategy="ddp"`.
+
+Each logger config now includes a frozen resolved runtime record containing
+precision, the complete compile configuration, world size, and rollout
+backend. Resume treats precision, compile configuration, and rollout backend
+as immutable experiment identity. Only the proven operational placement and
+diagnostic fields (`accelerator`, `devices`, `num_nodes`, `strategy`, logging
+frequency, profiler, output directory, and resume path), plus consumed
+warm-start provenance, may differ from the stored config.
+
+The final performance integration review fixes four additional runtime
+contracts:
+
+- CUDA availability, device count, and BF16 support are resolved together in
+  one disposable subprocess. The parent process performs no CUDA runtime
+  inspection before Lightning creates its workers. CPU learner DDP combined
+  with native CUDA rollout is rejected because the port has no explicit
+  rank-local rollout-device mapping.
+- Stochastic rollout is keyed by game seed. A vector group owns one generator
+  per environment, shared by that environment's two self-play seats, so
+  regrouping games changes neither actions nor simulator trajectories while
+  model forward and simulator stepping remain vectorized.
+- A row-addressable grouped collector exception carries its row to the owning
+  game and seed. Failures without a trustworthy row are reported against the
+  complete affected group; distributed envelopes preserve the same identity
+  on every rank.
+- Finite checks keep per-tensor flags and recurrent-state norms on device.
+  Healthy forward and gradient phases expose only one aggregate scalar (and
+  one all-rank reduction under DDP); tensor names and state norms are
+  materialized only after that aggregate reports a failure.
+
+The fixed-budget acceptance is the production Lightning path: train through
+two collection boundaries, checkpoint after the first, resume through the
+second, require exact resumed/uninterrupted policy and clock parity, then run
+eight fixed held-out economic games. The explicit gate is
+`pytest tests/learn/test_toad_ddp.py -m economic_acceptance -v`; it is not
+excluded by the default `not slow` selection.

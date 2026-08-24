@@ -39,6 +39,24 @@ BLOCKS = 8
 CHANNELS = 256
 
 
+def _activation_module(name: str) -> torch.nn.Module:
+    """Build one configured parameter-free trunk activation."""
+    if name == "relu":
+        return torch.nn.ReLU()
+    if name == "leaky_relu":
+        return torch.nn.LeakyReLU()
+    raise ValueError(f"unsupported policy activation: {name}")
+
+
+def _activate(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    """Apply the configured activation without adding state-dict keys."""
+    if name == "relu":
+        return torch.nn.functional.relu(tensor)
+    if name == "leaky_relu":
+        return torch.nn.functional.leaky_relu(tensor)
+    raise ValueError(f"unsupported policy activation: {name}")
+
+
 class Residual(torch.nn.Module):
     """One 3x3 residual block with squeeze-excitation and no normalisation.
 
@@ -47,19 +65,29 @@ class Residual(torch.nn.Module):
     from first principles about a choice two winners already made.
     """
 
-    def __init__(self, channels: int) -> None:
+    def __init__(
+        self, channels: int, kernel_size: int = 3, activation: str = "relu"
+    ) -> None:
         """Build the block."""
         super().__init__()
-        self.first = torch.nn.Conv2d(channels, channels, 3, padding=1)
-        self.second = torch.nn.Conv2d(channels, channels, 3, padding=1)
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("residual kernel size must be a positive odd integer")
+        _activation_module(activation)
+        self.activation = activation
+        self.first = torch.nn.Conv2d(
+            channels, channels, kernel_size, padding=kernel_size // 2
+        )
+        self.second = torch.nn.Conv2d(
+            channels, channels, kernel_size, padding=kernel_size // 2
+        )
         self.excite = torch.nn.Linear(channels, channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return the block's output for a batch of feature maps."""
-        residual = torch.nn.functional.relu(self.first(x))
+        residual = _activate(self.first(x), self.activation)
         residual = self.second(residual)
         weights = torch.sigmoid(self.excite(residual.mean(dim=(2, 3))))
-        return torch.nn.functional.relu(x + residual * weights[:, :, None, None])
+        return _activate(x + residual * weights[:, :, None, None], self.activation)
 
 
 class Policy(torch.nn.Module):
@@ -70,6 +98,8 @@ class Policy(torch.nn.Module):
         blocks: int = BLOCKS,
         channels: int = CHANNELS,
         value_bound: float | None = None,
+        kernel_size: int = 3,
+        activation: str = "relu",
     ) -> None:
         """Build the policy.
 
@@ -86,16 +116,26 @@ class Policy(torch.nn.Module):
                 shaped reward of ~1e-5 a turn, drove the baseline term to 1.5e17
                 while all three policy terms stayed healthy. Defaults to ``None``
                 so the PPO path keeps the unbounded head it was trained with.
+            kernel_size: Odd spatial kernel used by the stem and residual
+                convolutions. The legacy/default topology is 3.
+            activation: ``relu`` (legacy/default) or ``leaky_relu`` throughout
+                the scalar projection and residual trunk.
         """
         super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("policy kernel size must be a positive odd integer")
         self.value_bound = value_bound
-        self.stem = torch.nn.Conv2d(TILE_PLANES, channels, 3, padding=1)
+        self.stem = torch.nn.Conv2d(
+            TILE_PLANES, channels, kernel_size, padding=kernel_size // 2
+        )
         self.market = torch.nn.Sequential(
             torch.nn.Linear(SCALARS, channels),
-            torch.nn.ReLU(),
+            _activation_module(activation),
             torch.nn.Linear(channels, channels),
         )
-        self.blocks = torch.nn.ModuleList(Residual(channels) for _ in range(blocks))
+        self.blocks = torch.nn.ModuleList(
+            Residual(channels, kernel_size, activation) for _ in range(blocks)
+        )
         self.head = torch.nn.Linear(channels, len(UNIT_OPS))
         self.quantity_head = torch.nn.Linear(channels, len(QUANTITIES))
         self.trade_head = torch.nn.Linear(

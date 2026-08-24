@@ -8,13 +8,25 @@ own flags -- proven against a real checkpoint and a real ``Policy``, not a
 namespace read back at itself.
 """
 
+import json
+from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.scripts import curriculum, toad
+from kaggriculture.learn.toad.config import (
+    CurriculumConfig,
+    ModelConfig,
+    OptimizerConfig,
+    PopulationConfig,
+    RuntimeConfig,
+    ToadConfig,
+)
+from kaggriculture.learn.toad.lightning import PolicyLike, ToadLightningModule
 
 # Transcribed independently of curriculum.PHASES, from the literal recipe
 # table -- so this file fails if the module's own transcription drifts, not
@@ -101,6 +113,188 @@ def test_phase_one_has_no_teacher() -> None:
     assert curriculum.PHASES[0].teacher_from is None
 
 
+def test_every_curriculum_phase_is_a_valid_toad_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each table row must become the complete typed experiment contract."""
+    monkeypatch.setattr(toad, "RUNS", tmp_path)
+    phase1 = tmp_path / "phase1_000025.pt"
+    phase3 = tmp_path / "phase3_000025.pt"
+    phase1.touch()
+    phase3.touch()
+
+    for phase in curriculum.PHASES:
+        config = curriculum.phase_config(phase)
+        assert isinstance(config, ToadConfig)
+        assert isinstance(config.model, ModelConfig)
+        assert isinstance(config.optimizer, OptimizerConfig)
+        assert isinstance(config.population, PopulationConfig)
+        assert isinstance(config.runtime, RuntimeConfig)
+        assert isinstance(config.curriculum, CurriculumConfig)
+        assert config.curriculum.phase == phase.name
+        assert config.curriculum.reward_field == phase.reward
+        assert config.model.blocks == phase.blocks
+        assert config.model.channels == toad.CHANNELS
+        assert config.optimizer.lr == pytest.approx(phase.lr)
+        assert config.optimizer.lmb == pytest.approx(phase.lmb)
+        assert config.optimizer.entropy_cost == pytest.approx(phase.entropy_cost)
+        assert config.optimizer.teacher_kl_cost == pytest.approx(phase.teacher_kl_cost)
+        assert config.runtime.total_environment_steps == phase.steps
+        expected_teacher = (
+            None
+            if phase.teacher_from is None
+            else curriculum._checkpoint(phase.teacher_from)
+        )
+        assert (
+            None
+            if config.population.teacher is None
+            else config.population.teacher.checkpoint
+        ) == expected_teacher
+        expected_teacher_blocks = (
+            None if phase.teacher_from is None else curriculum._teacher_blocks(phase)
+        )
+        assert (
+            None
+            if config.population.teacher is None
+            else config.population.teacher.blocks
+        ) == expected_teacher_blocks
+        if config.population.teacher is not None:
+            assert config.population.teacher.quantity is True
+
+
+def test_curriculum_runtime_resume_override_reaches_native_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume stays explicit and never becomes an implicit phase-4 transition."""
+    resume = tmp_path / "phase3.ckpt"
+    resume.touch()
+    seen: list[ToadConfig] = []
+    monkeypatch.setattr(toad, "run", seen.append)
+
+    curriculum.main(["phase1", "--set", f'runtime.resume="{resume}"'])
+
+    assert len(seen) == 1
+    assert seen[0].runtime.resume == resume
+
+
+def test_failing_phase_gate_records_result_and_stops_production_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared external gate is neither ignored nor reduced to a log line."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    events: list[str] = []
+
+    def train(config: ToadConfig) -> SimpleNamespace:
+        events.append("train")
+        config.runtime.output_dir.mkdir(parents=True)
+        module = ToadLightningModule(config)
+        checkpoint: dict[str, object] = {"state_dict": module.state_dict()}
+        module.on_save_checkpoint(checkpoint)
+        exact = config.runtime.output_dir / "step-12.ckpt"
+        torch.save(checkpoint, exact)
+        torch.save(checkpoint, config.runtime.output_dir / "step-999.ckpt")
+        return SimpleNamespace(
+            checkpoint=exact,
+            global_rank=0,
+            world_size=1,
+            is_global_zero=True,
+        )
+
+    def fail_rollout(
+        policy: PolicyLike,
+        opponent: PolicyLike | str,
+        seeds: Sequence[int],
+    ) -> list[SimpleNamespace]:
+        events.append("gate")
+        assert opponent == toad.OPPONENT
+        assert tuple(seeds) == (
+            curriculum.GATE_SEED_BASE,
+            curriculum.GATE_SEED_BASE + 1,
+        )
+        return [
+            SimpleNamespace(
+                final_margin=-1.0,
+                final_bank=10.0,
+                illegal=0,
+                rewards=torch.zeros(719),
+            )
+            for _ in range(2)
+        ]
+
+    monkeypatch.setattr(toad, "run", train)
+    monkeypatch.setattr(curriculum, "rollout_many", fail_rollout)
+    gate = json.dumps(
+        {
+            "metric": "win_rate",
+            "minimum": 0.5,
+            "opponent": "economic",
+            "seeds": 2,
+        },
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(curriculum.CurriculumGateError, match="win_rate"):
+        curriculum.main(
+            [
+                "phase1",
+                "--set",
+                "model.blocks=1",
+                "--set",
+                "model.channels=4",
+                "--set",
+                f"curriculum.gate={gate}",
+            ]
+        )
+
+    assert events == ["train", "gate"]
+    result = json.loads((tmp_path / "phase1" / "gate.json").read_text())
+    assert result["passed"] is False
+    assert result["metric"] == "win_rate"
+    assert result["value"] == 0.0
+    assert result["minimum"] == 0.5
+    assert result["checkpoint"] == "step-12.ckpt"
+
+
+def test_nonzero_curriculum_rank_does_not_evaluate_or_write_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lightning child ranks stop at the completed fit boundary."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    checkpoint = tmp_path / "phase1" / "step-12.ckpt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    monkeypatch.setattr(
+        toad,
+        "run",
+        lambda _config: SimpleNamespace(
+            checkpoint=checkpoint,
+            global_rank=1,
+            world_size=2,
+            is_global_zero=False,
+        ),
+    )
+    evaluations: list[object] = []
+    monkeypatch.setattr(
+        curriculum,
+        "run_phase_gate",
+        lambda *args: evaluations.append(args),
+    )
+    gate = json.dumps(
+        {
+            "metric": "win_rate",
+            "minimum": 0.5,
+            "opponent": "economic",
+            "seeds": 2,
+        },
+        separators=(",", ":"),
+    )
+
+    curriculum.main(["phase1", "--set", f"curriculum.gate={gate}"])
+
+    assert evaluations == []
+    assert not (checkpoint.parent / "gate.json").exists()
+
+
 def test_a_phase_refuses_to_start_without_its_teacher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -136,6 +330,56 @@ def test_checkpoint_resolves_the_latest_update(
         (tmp_path / f"phase1_{update:06d}.pt").touch()
 
     assert curriculum._checkpoint("phase1") == tmp_path / "phase1_000100.pt"
+
+
+def test_lightning_checkpoints_are_numeric_and_phase_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native phase outputs cannot collide and step 10 must beat step 9."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    phase1_dir = tmp_path / "phase1"
+    phase1_dir.mkdir()
+    (phase1_dir / "step-9.ckpt").touch()
+    (phase1_dir / "step-10.ckpt").touch()
+
+    assert curriculum._checkpoint("phase1") == phase1_dir / "step-10.ckpt"
+    assert curriculum.phase_config(curriculum._phase("phase1")).runtime.output_dir == (
+        tmp_path / "phase1"
+    )
+    assert curriculum.phase_config(curriculum._phase("phase3")).runtime.output_dir == (
+        tmp_path / "phase3"
+    )
+
+
+def test_phase_one_lightning_output_becomes_phase_two_teacher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native checkpoint writer's envelope is readable by the next phase."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    phase1_dir = tmp_path / "phase1"
+    phase1_dir.mkdir()
+    source = Policy(blocks=8, channels=toad.CHANNELS, value_bound=toad.VALUE_BOUND)
+    checkpoint = phase1_dir / "step-200.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                f"policy.{name}": value for name, value in source.state_dict().items()
+            }
+        },
+        checkpoint,
+    )
+
+    config = curriculum.phase_config(curriculum._phase("phase2"))
+    module = toad.ToadLightningModule(config)
+
+    assert config.population.teacher is not None
+    assert config.population.teacher.checkpoint == checkpoint
+    assert config.population.teacher.quantity is True
+    assert module.teacher_policy is not None
+    assert torch.equal(
+        module.teacher_policy.state_dict()["stem.weight"],
+        source.state_dict()["stem.weight"],
+    )
 
 
 def test_phase_one_has_no_sparse_flag() -> None:
@@ -185,27 +429,28 @@ def test_phase_two_reaches_sparse_through_the_real_parser(
     assert toad._field(arguments) == "sparse"
 
 
-def test_flags_reach_a_real_teacher_through_toad_s_own_loader(
+def test_typed_phase_reaches_a_real_teacher_through_lightning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--teacher and --teacher-blocks must resolve to a checkpoint toad can load.
+    """Typed teacher identity must resolve to a checkpoint Lightning can load.
 
     Proven against a real ``Policy`` and a real state dict, not a namespace
-    read back at itself: a runner that pointed ``--teacher`` at the right
-    path but the wrong ``--teacher-blocks`` would fail here with a shape
-    mismatch, exactly as it would training for real.
+    read back at itself: a config with the right checkpoint but the wrong
+    teacher topology would fail here with a shape mismatch.
     """
     monkeypatch.setattr(toad, "RUNS", tmp_path)
     torch.save(
-        Policy(blocks=8, channels=16).state_dict(), tmp_path / "phase1_000025.pt"
+        Policy(blocks=8, channels=toad.CHANNELS).state_dict(),
+        tmp_path / "phase1_000025.pt",
     )
 
-    flags = curriculum._flags(curriculum._phase("phase2"))
-    arguments = toad._parser().parse_args([*flags, "--channels", "16"])
-    teacher = toad._teacher(arguments, "cpu")
+    config = curriculum.phase_config(curriculum._phase("phase2"))
+    module = toad.ToadLightningModule(config)
 
-    assert teacher is not None
-    assert len(teacher.policy.blocks) == 8
+    assert config.population.teacher is not None
+    assert config.population.teacher.quantity is True
+    assert module.teacher_policy is not None
+    assert len(module.teacher_policy.blocks) == 8
 
 
 def test_phase_five_s_teacher_is_the_sixteen_block_checkpoint(
@@ -214,15 +459,15 @@ def test_phase_five_s_teacher_is_the_sixteen_block_checkpoint(
     """The one phase whose teacher is not the 8-block net -- proven, not just tabled."""
     monkeypatch.setattr(toad, "RUNS", tmp_path)
     torch.save(
-        Policy(blocks=16, channels=16).state_dict(), tmp_path / "phase3_000025.pt"
+        Policy(blocks=16, channels=toad.CHANNELS).state_dict(),
+        tmp_path / "phase3_000025.pt",
     )
 
-    flags = curriculum._flags(curriculum._phase("phase5"))
-    arguments = toad._parser().parse_args([*flags, "--channels", "16"])
-    teacher = toad._teacher(arguments, "cpu")
+    config = curriculum.phase_config(curriculum._phase("phase5"))
+    module = toad.ToadLightningModule(config)
 
-    assert teacher is not None
-    assert len(teacher.policy.blocks) == 16
+    assert module.teacher_policy is not None
+    assert len(module.teacher_policy.blocks) == 16
 
 
 def test_the_cli_names_every_phase() -> None:

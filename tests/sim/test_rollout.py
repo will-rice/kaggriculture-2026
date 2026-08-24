@@ -1,7 +1,7 @@
 """Tensor rollout primitive tests."""
 # ruff: noqa: ANN001, ANN202, D103
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -9,16 +9,27 @@ from kaggle_environments import make
 
 from kaggriculture import economic_policy
 from kaggriculture.learn.encoding import (
+    CARRIED_SCALE,
     IGNORE,
     MARKET_SLOTS,
     MAX_TRANSFER,
     QUANTITIES,
+    SEED_SCALE,
     UNIT_OPS,
 )
 from kaggriculture.learn.progress import potential as reference_potential
+from kaggriculture.learn.toad.config import ModelConfig
+from kaggriculture.learn.toad.model import PolicyOutput, PolicyState, StatefulPolicy
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.engine import reset, step, unit_quantity_ones
-from kaggriculture.sim.rollout import collect_segment, potential, scripted_actions
+from kaggriculture.sim.observe import observe
+from kaggriculture.sim.rollout import (
+    RolloutPolicyState,
+    collect_segment,
+    copy_policy_state_,
+    potential,
+    scripted_actions,
+)
 from kaggriculture.sim.state import PRODUCT_NAMES, SHED_NAMES, pack
 from tests.sim.conftest import assert_identical
 
@@ -86,10 +97,162 @@ class _SellWheatPolicy(_UniformPolicy):
         return units, quantities, markets, values
 
 
+class _RecordingStatefulPolicy(StatefulPolicy):
+    """A real recurrent policy that retains its reset-adjusted actor inputs."""
+
+    def __init__(self, *, belief: bool = True) -> None:
+        super().__init__(
+            ModelConfig.control(blocks=1, channels=4).model_copy(
+                update={
+                    "recurrent": True,
+                    "recurrent_channels": 3,
+                    "belief": belief,
+                }
+            )
+        )
+        self.recorded_inputs: list[PolicyState] = []
+
+    def forward(
+        self,
+        board: torch.Tensor,
+        scalars: torch.Tensor,
+        positions: torch.Tensor,
+        state: PolicyState | None = None,
+        dones: torch.Tensor | None = None,
+    ) -> PolicyOutput:
+        output = super().forward(board, scalars, positions, state=state, dones=dones)
+        assert output.input_state is not None
+        self.recorded_inputs.append(output.input_state.detach())
+        return output
+
+
+def test_copy_policy_state_preserves_static_recurrent_buffers() -> None:
+    target = PolicyState(
+        hidden=torch.zeros(2, 3, 10, 10),
+        cell=torch.zeros(2, 3, 10, 10),
+        prior_belief=torch.zeros(2, 4),
+    )
+    source = PolicyState(
+        hidden=torch.ones_like(target.hidden),
+        cell=torch.full_like(target.cell, 2),
+        prior_belief=torch.full_like(target.prior_belief, 3),
+    )
+    pointers = (
+        target.hidden.data_ptr(),
+        target.cell.data_ptr(),
+        target.prior_belief.data_ptr(),
+    )
+
+    copied = copy_policy_state_(target, source)
+
+    assert copied is target
+    assert pointers == (
+        target.hidden.data_ptr(),
+        target.cell.data_ptr(),
+        target.prior_belief.data_ptr(),
+    )
+    assert torch.equal(target.hidden, source.hidden)
+    assert torch.equal(target.cell, source.cell)
+    assert torch.equal(target.prior_belief, source.prior_belief)
+
+
+def test_stateful_collect_segment_carries_resets_and_records_sparse_entry_state() -> (
+    None
+):
+    """A terminal transition clears every actor-state row before the next action."""
+    state = reset(Config(), torch.tensor([197, 199]))
+    state = replace(
+        state,
+        step=torch.full((2,), 718, dtype=torch.int32),
+        day=torch.full((2,), 29, dtype=torch.int32),
+        hour=torch.full((2,), 22, dtype=torch.int32),
+    )
+    policy = _RecordingStatefulPolicy().eval()
+    initial = policy.initial_state(4, like=state.money.float())
+    assert initial is not None
+    carried = PolicyState(
+        hidden=torch.ones_like(initial.hidden),
+        cell=torch.full_like(initial.cell, 2.0),
+        prior_belief=torch.full_like(initial.prior_belief, 3.0),
+    )
+
+    next_state, next_policy_state, trajectory = collect_segment(
+        state,
+        policy,
+        policy_state=carried,
+        turns=2,
+        generator=torch.Generator().manual_seed(211),
+    )
+
+    assert next_state.done.all()
+    assert next_policy_state is not None
+    assert trajectory.state_steps is not None
+    assert trajectory.state_steps.tolist() == [0]
+    assert trajectory.hidden is not None
+    assert trajectory.cell is not None
+    assert trajectory.prior_belief is not None
+    assert trajectory.hidden.shape == (1, 2, 2, 3, 10, 10)
+    assert trajectory.cell.shape == trajectory.hidden.shape
+    assert trajectory.prior_belief.shape == (1, 2, 2, policy.config.belief_size)
+    reset_input = policy.recorded_inputs[1]
+    assert not torch.count_nonzero(reset_input.hidden)
+    assert not torch.count_nonzero(reset_input.cell)
+    assert not torch.count_nonzero(reset_input.prior_belief)
+
+
+def test_stateful_collect_segment_records_exact_end_anchored_boundaries() -> None:
+    """Changing sparse retention must not shift a learner segment by one turn."""
+    state = reset(Config(), torch.tensor([223]))
+    policy = _RecordingStatefulPolicy().eval()
+
+    _state, _policy_state, trajectory = collect_segment(
+        state,
+        policy,
+        turns=5,
+        state_unroll_length=2,
+        generator=torch.Generator().manual_seed(227),
+    )
+
+    assert trajectory.state_steps is not None
+    assert trajectory.state_steps.tolist() == [1, 3]
+    assert trajectory.hidden is not None
+    assert trajectory.hidden.shape[:3] == (2, 1, 2)
+
+
+def test_stateful_collect_segment_records_opponent_private_belief_targets() -> None:
+    """Belief labels are simulator truth aligned to each acting seat, not inputs."""
+    state = reset(Config(), torch.tensor([229]))
+    shed = state.shed.clone()
+    seeds = state.seeds.clone()
+    inventories = state.inv_count.clone()
+    shed[0, 1, SHED_NAMES.index("WHEAT")] = 7
+    seeds[0, 1, 0] = 5
+    inventories[0, 1, 0, SHED_NAMES.index(PRODUCT_NAMES[0])] = 3
+    state = replace(state, shed=shed, seeds=seeds, inv_count=inventories)
+    policy = _RecordingStatefulPolicy().eval()
+
+    _state, _policy_state, trajectory = collect_segment(
+        state,
+        policy,
+        turns=1,
+        generator=torch.Generator().manual_seed(233),
+    )
+
+    assert trajectory.belief_targets is not None
+    assert trajectory.belief_valid is not None
+    seat_zero = trajectory.belief_targets[0, 0, 0]
+    assert seat_zero[SHED_NAMES.index("WHEAT")] == pytest.approx(7 / 100)
+    seed_start = len(SHED_NAMES)
+    assert seat_zero[seed_start] == pytest.approx(5 / SEED_SCALE)
+    carried_start = seed_start + seeds.shape[-1]
+    assert seat_zero[carried_start] == pytest.approx(3 / CARRIED_SCALE)
+    assert trajectory.belief_valid.all()
+
+
 def test_collect_segment_keeps_actions_legal_and_tensors_on_device() -> None:
     state = reset(Config(), torch.tensor([197, 199]))
 
-    next_state, trajectory = collect_segment(
+    next_state, _policy_state, trajectory = collect_segment(
         state,
         _UniformPolicy(),
         turns=2,
@@ -97,11 +260,25 @@ def test_collect_segment_keeps_actions_legal_and_tensors_on_device() -> None:
     )
 
     assert next_state.step.tolist() == [2, 2]
-    assert trajectory.board.shape[:3] == (2, 2, 2)
+    assert trajectory.board.shape[:3] == (3, 2, 2)
     assert trajectory.unit_actions.shape == (2, 2, 2, 20)
     assert int(trajectory.illegal) == 0
     assert trajectory.illegal.device == state.step.device
     assert trajectory.board.device == state.step.device
+
+    final_observations = [observe(next_state, seat) for seat in range(2)]
+    assert torch.equal(
+        trajectory.board[-1],
+        torch.stack([entry[0] for entry in final_observations], dim=1),
+    )
+    assert torch.equal(
+        trajectory.scalars[-1],
+        torch.stack([entry[1] for entry in final_observations], dim=1),
+    )
+    assert torch.equal(
+        trajectory.positions[-1],
+        torch.stack([entry[2] for entry in final_observations], dim=1),
+    )
 
 
 def test_scripted_economic_policy_bridge_matches_reference_action() -> None:
@@ -175,7 +352,7 @@ def test_scripted_actions_encodes_a_bulk_pickup_from_the_opponent() -> None:
 def test_collect_segment_accepts_a_scripted_opponent() -> None:
     state = reset(Config(), torch.tensor([227]))
 
-    next_state, trajectory = collect_segment(
+    next_state, _policy_state, trajectory = collect_segment(
         state,
         _UniformPolicy(),
         turns=2,
@@ -185,6 +362,162 @@ def test_collect_segment_accepts_a_scripted_opponent() -> None:
 
     assert next_state.step.tolist() == [2]
     assert int(trajectory.illegal) == 0
+
+
+class _CalledPolicy(_UniformPolicy):
+    """A distinct neural opponent whose invocation is directly observable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, board, scalars, positions):
+        self.calls += 1
+        return super().forward(board, scalars, positions)
+
+
+def test_collect_segment_accepts_a_distinct_neural_opponent() -> None:
+    """Frozen and teacher seats act from their own verified policy object."""
+    state = reset(Config(), torch.tensor([231]))
+    learner = _CalledPolicy()
+    opponent = _CalledPolicy()
+
+    next_state, _policy_state, trajectory = collect_segment(
+        state,
+        learner,
+        turns=2,
+        generator=torch.Generator().manual_seed(233),
+        opponent_policy=opponent,
+    )
+
+    assert next_state.step.tolist() == [2]
+    assert learner.calls == 2
+    assert opponent.calls == 2
+    assert int(trajectory.illegal) == 0
+
+
+def test_stateful_neural_opponent_matches_one_long_segment_across_boundaries() -> None:
+    """Both actor memories, not only the learner's, cross native source chunks."""
+    model = ModelConfig.control(blocks=1, channels=4).model_copy(
+        update={"recurrent": True, "recurrent_channels": 3, "belief": True}
+    )
+    long_learner = StatefulPolicy(model).eval()
+    long_opponent = StatefulPolicy(model).eval()
+    split_learner = StatefulPolicy(model).eval()
+    split_opponent = StatefulPolicy(model).eval()
+    split_learner.load_state_dict(long_learner.state_dict())
+    split_opponent.load_state_dict(long_opponent.state_dict())
+    long_state = reset(Config(), torch.tensor([241]))
+    split_state = reset(Config(), torch.tensor([241]))
+
+    long_state, long_policy_state, long = collect_segment(
+        long_state,
+        long_learner,
+        turns=4,
+        generator=torch.Generator().manual_seed(251),
+        opponent_policy=long_opponent,
+    )
+    split_generator = torch.Generator().manual_seed(251)
+    split_state, split_policy_state, first = collect_segment(
+        split_state,
+        split_learner,
+        turns=2,
+        generator=split_generator,
+        opponent_policy=split_opponent,
+    )
+    split_state, split_policy_state, second = collect_segment(
+        split_state,
+        split_learner,
+        policy_state=split_policy_state,
+        turns=2,
+        generator=split_generator,
+        opponent_policy=split_opponent,
+    )
+
+    assert isinstance(long_policy_state, RolloutPolicyState)
+    assert isinstance(split_policy_state, RolloutPolicyState)
+    assert long_policy_state.opponent is not None
+    assert split_policy_state.opponent is not None
+    for field in fields(long_state):
+        torch.testing.assert_close(
+            getattr(split_state, field.name), getattr(long_state, field.name)
+        )
+    for name in (
+        "unit_actions",
+        "unit_quantities",
+        "market_actions",
+        "log_probs",
+        "values",
+        "rewards",
+        "own",
+        "shaped",
+        "shaped_money",
+        "margin",
+        "sparse",
+        "dones",
+    ):
+        torch.testing.assert_close(
+            torch.cat((getattr(first, name), getattr(second, name))),
+            getattr(long, name),
+        )
+    for name in ("hidden", "cell", "prior_belief"):
+        torch.testing.assert_close(
+            getattr(split_policy_state.learner, name),
+            getattr(long_policy_state.learner, name),
+        )
+        torch.testing.assert_close(
+            getattr(split_policy_state.opponent, name),
+            getattr(long_policy_state.opponent, name),
+        )
+
+
+def test_stateful_neural_opponent_resets_after_a_segment_terminal() -> None:
+    """A carried opponent state still obeys the next observation's done mask."""
+    state = reset(Config(), torch.tensor([257]))
+    state = replace(
+        state,
+        step=torch.tensor([718], dtype=torch.int32),
+        day=torch.tensor([29], dtype=torch.int32),
+        hour=torch.tensor([22], dtype=torch.int32),
+    )
+    learner = _RecordingStatefulPolicy().eval()
+    opponent = _RecordingStatefulPolicy().eval()
+
+    state, carried, _first = collect_segment(
+        state,
+        learner,
+        turns=1,
+        generator=torch.Generator().manual_seed(263),
+        opponent_policy=opponent,
+    )
+    _state, carried, _second = collect_segment(
+        state,
+        learner,
+        policy_state=carried,
+        turns=1,
+        generator=torch.Generator().manual_seed(269),
+        opponent_policy=opponent,
+    )
+
+    assert isinstance(carried, RolloutPolicyState)
+    reset_input = opponent.recorded_inputs[-1]
+    assert not torch.count_nonzero(reset_input.hidden)
+    assert not torch.count_nonzero(reset_input.cell)
+    assert not torch.count_nonzero(reset_input.prior_belief)
+
+
+def test_collect_segment_rejects_two_opponent_owners() -> None:
+    """A seat cannot silently switch from a named script to neural weights."""
+    state = reset(Config(), torch.tensor([237]))
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        collect_segment(
+            state,
+            _UniformPolicy(),
+            turns=1,
+            opponent=economic_policy.agent,
+            opponent_policy=_UniformPolicy(),
+        )
 
 
 def test_terminal_segment_rewards_telescope_to_the_terminal_margin() -> None:
@@ -201,7 +534,7 @@ def test_terminal_segment_rewards_telescope_to_the_terminal_margin() -> None:
     )
     initial_margin = state.money[:, 0] - state.money[:, 1]
 
-    final_state, trajectory = collect_segment(
+    final_state, _policy_state, trajectory = collect_segment(
         state,
         _SellWheatPolicy(),
         turns=1,
@@ -426,7 +759,7 @@ def test_collect_segment_records_a_quantity_for_every_unit_slot() -> None:
     """
     state = reset(Config(), torch.tensor([241, 251]))
 
-    _next_state, trajectory = collect_segment(
+    _next_state, _policy_state, trajectory = collect_segment(
         state,
         _UniformPolicy(),
         turns=4,
@@ -458,7 +791,7 @@ def test_collect_segment_spends_the_sampled_quantity_in_the_engine() -> None:
     shed[:, :, wheat] = 5
     state = replace(state, shed=shed)
 
-    next_state, _trajectory = collect_segment(
+    next_state, _policy_state, _trajectory = collect_segment(
         replace(state),
         _BulkPickupPolicy(),
         turns=1,

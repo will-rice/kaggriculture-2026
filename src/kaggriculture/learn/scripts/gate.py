@@ -57,8 +57,8 @@ from typing import Sequence
 import torch
 
 from kaggriculture.learn import CHECKPOINT
-from kaggriculture.learn.model import Policy, load_policy_weights
 from kaggriculture.learn.rollout import Trajectory, rollout_many
+from kaggriculture.learn.toad.lightning import PolicyLike, policy_from_checkpoint
 from kaggriculture.report import wilson_interval
 
 LOGGER = logging.getLogger(__name__)
@@ -286,12 +286,12 @@ def play(assignment: Assignment) -> list[Trajectory]:
 
 
 @functools.lru_cache(maxsize=1)
-def under_test(weights: Path) -> Policy:
+def under_test(weights: Path) -> PolicyLike:
     """Return the policy being gated, loaded once per worker.
 
-    Loaded strictly. This is a checkpoint the self-play run wrote from the
-    current ``Policy``, so every key must be there; a non-strict load here
-    would silently gate a network with a randomly initialised head.
+    Native topology is reconstructed from its stored config and policy weights
+    are loaded through the shared checkpoint contract, including stateful
+    models. Historical control layouts retain their explicit compatibility.
 
     Args:
         weights: The checkpoint.
@@ -300,21 +300,16 @@ def under_test(weights: Path) -> Policy:
         The policy on ``DEVICE``, in eval mode.
     """
     torch.set_num_threads(THREADS)
-    policy = Policy()
-    policy.load_state_dict(torch.load(weights, map_location="cpu"))
-    return policy.to(DEVICE).eval()
+    return policy_from_checkpoint(weights).to(DEVICE).eval()
 
 
 @functools.lru_cache(maxsize=1)
-def frozen(weights: Path) -> Policy:
+def frozen(weights: Path) -> PolicyLike:
     """Return a network opponent, loaded once per worker.
 
-    Non-strict, unlike ``under_test``, and gated through ``load_policy_weights``
-    -- the same helper ``learn.play`` loads its checkpoint through, so there is
-    one contract for what "close enough to load" means. That contract
-    tolerates only ``quantity_head.*`` being absent (the one head this task
-    adds, which no checkpoint written before it can carry) and raises on any
-    other gap, including a missing value head.
+    Routed through the same canonical loader as ``under_test``. Historical
+    control checkpoints retain the one compatibility concession for a missing
+    ``quantity_head.*``; native checkpoints use their stored topology.
 
     Args:
         weights: The checkpoint.
@@ -329,9 +324,7 @@ def frozen(weights: Path) -> Policy:
             has a shape ``load_state_dict`` cannot reconcile.
     """
     torch.set_num_threads(THREADS)
-    policy = Policy()
-    load_policy_weights(policy, torch.load(weights, map_location="cpu"))
-    return policy.to(DEVICE).eval()
+    return policy_from_checkpoint(weights).to(DEVICE).eval()
 
 
 def summarise(name: str, played: Sequence[Trajectory]) -> Rung:

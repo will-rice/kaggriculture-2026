@@ -4,8 +4,8 @@ Every arm this project has run executed phase 1 with phase 2's teacher cost,
 against a behaviour clone the recipe uses nowhere, because those numbers lived
 in a command line nobody could check. This module is the fix: the five
 phases, transcribed verbatim from the recipe into ``PHASES``, and a runner
-that translates one row of that table into the flags ``toad`` already
-exposes rather than a remembered invocation.
+that translates one row into the validated ``ToadConfig`` consumed by the
+native Lightning entry point rather than a remembered invocation.
 
 ``PHASES`` is deliberately the only place these numbers are typed. A phase
 boundary is now a dataclass field a test can assert against, not a line in a
@@ -21,18 +21,39 @@ phase 4); every other phase starts from its own fresh initialisation, guided
 toward its teacher by the KL term alone. This runner resolves each phase's
 teacher checkpoint and refuses to start without it; it does not attempt to
 resume phase 4's weights from phase 3 automatically -- see the module's task
-report for why, and pass ``--resume`` to ``toad`` by hand if that is
-wanted.
+report for why, and pass an explicit ``--set runtime.resume="..."`` if that
+is wanted.
 """
 
 import argparse
 import dataclasses
+import json
 import logging
+import os
+import re
+import statistics
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
+from kaggriculture.learn.rollout import Trajectory, rollout_many
 from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.scripts.gate import SEED_BASE as GATE_SEED_BASE
+from kaggriculture.learn.toad.config import (
+    CurriculumConfig,
+    ModelConfig,
+    OptimizerConfig,
+    PopulationConfig,
+    RuntimeConfig,
+    TeacherSpec,
+    ToadConfig,
+    apply_overrides,
+)
+from kaggriculture.learn.toad.lightning import policy_from_checkpoint
 
 LOGGER = logging.getLogger(__name__)
+
+RewardField = Literal["shaped_money", "shaped", "sparse", "own"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,7 +83,7 @@ class Phase:
     name: str
     blocks: int
     steps: int
-    reward: str
+    reward: RewardField
     teacher_kl_cost: float
     lr: float
     entropy_cost: float
@@ -132,6 +153,7 @@ PHASES: tuple[Phase, ...] = (
 )
 
 _BY_NAME = {phase.name: phase for phase in PHASES}
+OUTPUT_ROOT = RuntimeConfig().output_dir
 
 # Every reward the table may name, and the flags that select it. Total rather
 # than a test against ``"sparse"`` alone, because an unlisted reward must raise
@@ -145,6 +167,10 @@ REWARD_FLAGS: dict[str, tuple[str, ...]] = {
     "shaped": ("--no-money",),
     "sparse": ("--sparse",),
 }
+
+
+class CurriculumGateError(RuntimeError):
+    """A completed phase did not clear its declared external evaluation gate."""
 
 
 def _phase(name: str) -> Phase:
@@ -188,12 +214,11 @@ def _teacher_blocks(phase: Phase) -> int:
 def _checkpoint(name: str) -> Path:
     """Return the newest checkpoint a phase has written, or raise.
 
-    ``toad`` writes ``RUNS/{name}_{update:06d}.pt`` every
-    ``CHECKPOINT_EVERY`` updates and this runner always names a phase's run
-    after the phase itself (``--name``), so ``{name}_*.pt`` is exactly that
-    phase's checkpoint family. The zero-padded update number sorts
-    lexicographically the same as numerically, so the last glob match is the
-    latest one -- no separate "final" marker is needed.
+    Native Lightning runs write ``OUTPUT_ROOT/{name}/step-N.ckpt``. The
+    phase-specific directory prevents collisions, and the numeric suffix
+    selects the latest environment boundary. The old
+    ``RUNS/{name}_{update:06d}.pt`` family remains a one-release migration
+    fallback for curricula started by the legacy runner.
 
     Args:
         name: A phase's ``name`` field.
@@ -205,17 +230,32 @@ def _checkpoint(name: str) -> Path:
         FileNotFoundError: If ``name`` has no checkpoint on disk. A missing
             teacher must fail loudly, not train unanchored.
     """
-    checkpoints = sorted(toad.RUNS.glob(f"{name}_*.pt"))
-    if not checkpoints:
-        raise FileNotFoundError(
-            f"{name} has no checkpoint matching {toad.RUNS}/{name}_*.pt "
-            f"-- run {name} to completion first"
-        )
-    return checkpoints[-1]
+    native = [
+        path
+        for path in (OUTPUT_ROOT / name).glob("step-*.ckpt")
+        if re.fullmatch(r"step-[0-9]+[.]ckpt", path.name)
+    ]
+    if native:
+        return max(native, key=lambda path: int(path.stem.removeprefix("step-")))
+    legacy = [
+        path
+        for path in toad.RUNS.glob(f"{name}_*.pt")
+        if re.fullmatch(rf"{re.escape(name)}_[0-9]+[.]pt", path.name)
+    ]
+    if legacy:
+        return max(legacy, key=lambda path: int(path.stem.rsplit("_", 1)[1]))
+    raise FileNotFoundError(
+        f"{name} has no checkpoint matching {OUTPUT_ROOT / name}/step-*.ckpt "
+        f"or {toad.RUNS}/{name}_*.pt -- run {name} to completion first"
+    )
 
 
 def _flags(phase: Phase) -> list[str]:
-    """Translate one ``Phase`` into the flags ``toad`` exposes.
+    """Translate one ``Phase`` into the deprecated flags ``toad`` exposed.
+
+    Kept for one release so helper imports and compatibility tests can inspect
+    the former CLI mapping. Production curriculum execution uses
+    :func:`phase_config` and :func:`toad.run` directly.
 
     Args:
         phase: The phase to run.
@@ -251,8 +291,121 @@ def _flags(phase: Phase) -> list[str]:
             str(_checkpoint(phase.teacher_from)),
             "--teacher-blocks",
             str(_teacher_blocks(phase)),
+            "--teacher-quantity",
         ]
     return flags
+
+
+def phase_config(phase: Phase) -> ToadConfig:
+    """Resolve one declared curriculum phase into nested Pydantic models."""
+    teacher = _checkpoint(phase.teacher_from) if phase.teacher_from else None
+    return ToadConfig(
+        model=ModelConfig(blocks=phase.blocks, channels=toad.CHANNELS),
+        optimizer=OptimizerConfig(
+            lr=phase.lr,
+            lmb=phase.lmb,
+            entropy_cost=phase.entropy_cost,
+            teacher_kl_cost=phase.teacher_kl_cost,
+        ),
+        population=PopulationConfig(
+            teacher=(
+                TeacherSpec(
+                    checkpoint=teacher,
+                    blocks=_teacher_blocks(phase),
+                    quantity=True,
+                )
+                if teacher is not None
+                else None
+            ),
+        ),
+        runtime=RuntimeConfig(
+            total_environment_steps=phase.steps,
+            output_dir=OUTPUT_ROOT / phase.name,
+        ),
+        curriculum=CurriculumConfig(
+            phase=phase.name,
+            reward_field=phase.reward,
+        ),
+    )
+
+
+def _gate_metrics(trajectories: Sequence[Trajectory]) -> dict[str, float]:
+    """Reduce terminal held-out results into the declared gate metric domain."""
+    if not trajectories:
+        raise RuntimeError("curriculum gate produced no trajectories")
+    return {
+        "win_rate": statistics.fmean(
+            float(trajectory.final_margin > 0.0) for trajectory in trajectories
+        ),
+        "mean_terminal_bank": statistics.fmean(
+            trajectory.final_bank for trajectory in trajectories
+        ),
+        "mean_terminal_margin": statistics.fmean(
+            trajectory.final_margin for trajectory in trajectories
+        ),
+    }
+
+
+def _record_gate_result(output_dir: Path, result: dict[str, object]) -> Path:
+    """Atomically publish and fsync the phase-boundary gate verdict."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / "gate.json"
+    temporary = output_dir / ".gate.json.tmp"
+    with temporary.open("w") as handle:
+        json.dump(result, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(destination)
+    directory = os.open(output_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return destination
+
+
+def run_phase_gate(config: ToadConfig, checkpoint: Path) -> dict[str, object]:
+    """Evaluate, persist, and enforce one configured phase-boundary gate."""
+    gate = config.curriculum.gate
+    if gate is None:
+        raise ValueError("run_phase_gate requires curriculum.gate")
+    policy = policy_from_checkpoint(checkpoint)
+    seeds = tuple(GATE_SEED_BASE + index for index in range(gate.seeds))
+    opponent = (
+        toad.OPPONENT
+        if gate.opponent in {"economic", "economic_policy"}
+        else gate.opponent
+    )
+    trajectories = rollout_many(policy, opponent, seeds)
+    if len(trajectories) != gate.seeds:
+        raise RuntimeError(
+            "curriculum gate expected one learner trajectory per held-out seed, "
+            f"got {len(trajectories)} for {gate.seeds}"
+        )
+    metrics = _gate_metrics(trajectories)
+    value = metrics[gate.metric]
+    result: dict[str, object] = {
+        "phase": config.curriculum.phase,
+        "checkpoint": checkpoint.name,
+        "opponent": gate.opponent,
+        "seed_base": GATE_SEED_BASE,
+        "games": len(trajectories),
+        "metric": gate.metric,
+        "value": value,
+        "minimum": gate.minimum,
+        "passed": value >= gate.minimum,
+        "metrics": metrics,
+        "on_gate_failure": config.curriculum.on_gate_failure,
+    }
+    destination = _record_gate_result(config.runtime.output_dir, result)
+    LOGGER.info("curriculum: gate verdict written to %s", destination)
+    if not result["passed"]:
+        raise CurriculumGateError(
+            f"{config.curriculum.phase} gate failed: {gate.metric}={value:.6g} "
+            f"< {gate.minimum:.6g}; stopped by {config.curriculum.on_gate_failure}"
+        )
+    return result
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -267,21 +420,31 @@ def _parser() -> argparse.ArgumentParser:
         choices=tuple(_BY_NAME),
         help="which phase of the curriculum to run",
     )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=JSON_VALUE",
+        help="validated dotted override applied after the declared phase",
+    )
     return parser
 
 
-def main() -> None:
-    """Resolve one phase's flags and hand them to ``toad``'s own entry point.
+def main(argv: Sequence[str] | None = None) -> None:
+    r"""Resolve one phase config and run the native Lightning entry point.
 
-    Does not duplicate the training loop: every phase runs through
-    ``toad.main``, which is the same code path Tasks 1-3 tested.
+    No phase resumes another implicitly. Operational resume remains an explicit
+    ``--set runtime.resume=\"...\"`` override.
     """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    arguments = _parser().parse_args()
+    arguments = _parser().parse_args(argv)
     phase = _phase(arguments.phase)
-    flags = _flags(phase)
-    LOGGER.info("curriculum: running %s as %s", phase.name, " ".join(flags))
-    toad.main(flags)
+    config = apply_overrides(phase_config(phase), arguments.overrides)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    LOGGER.info("curriculum: running %s", phase.name)
+    result = toad.run(config)
+    if config.curriculum.gate is not None and result.is_global_zero:
+        run_phase_gate(config, result.checkpoint)
 
 
 if __name__ == "__main__":

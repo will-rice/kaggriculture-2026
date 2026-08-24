@@ -35,50 +35,337 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
 """
 
 import argparse
-import copy
 import json
 import logging
 import os
-import time
+import re
+import subprocess
+import sys
+import warnings
 from collections.abc import Callable, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from importlib import metadata
 from pathlib import Path
+from typing import Literal, cast
 
+import lightning
 import torch
 from lightning import seed_everything
+from lightning.pytorch.loggers import WandbLogger
 
-import wandb
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.critic import critic_scores
-from kaggriculture.learn.encoding import transfer_slots
-from kaggriculture.learn.model import Policy, load_policy_weights
-from kaggriculture.learn.ppo import entropy_of, joint_log_prob
+from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory, rollout_many
+from kaggriculture.learn.toad.callbacks import (
+    ActorSyncCallback,
+    BoundaryCheckpoint,
+    EnvironmentStepStop,
+    PopulationSnapshotCallback,
+)
+from kaggriculture.learn.toad.compile import maybe_compile
+from kaggriculture.learn.toad.config import (
+    ModelConfig,
+    RuntimeConfig,
+    RuntimeMetadata,
+    ToadConfig,
+    load_config,
+    validate_effective_resume,
+)
+from kaggriculture.learn.toad.data import (
+    ACTED_FIELDS as _ACTED_FIELDS,
+)
+from kaggriculture.learn.toad.data import (
+    OBSERVED_FIELDS as _OBSERVED_FIELDS,
+)
+from kaggriculture.learn.toad.data import (
+    NativeRoundSource,
+    ReferenceRoundSource,
+    ReferenceWorkerInput,
+    ToadDataModule,
+    segments,
+)
+from kaggriculture.learn.toad.lightning import ToadLightningModule
+from kaggriculture.learn.toad.model import StatefulPolicy, uses_stateful_policy
 from kaggriculture.learn.toad_loss import (
-    ADAM_EPS,
-    CLIP_GRADS,
-    DISCOUNTING,
-    ENTROPY_COST,
-    LEARNING_RATE,
-    LMB,
     MIN_LR_MOD,
-    TEACHER_KL_COST,
     TOTAL_STEPS,
     UNROLL_LENGTH,
-    VALUE_WARMUP_BATCHES,
-    losses,
 )
 from kaggriculture.learn.toad_reward import (
-    ABSOLUTE_WEIGHT,
-    CAPITAL_WEIGHT,
-    MARGIN_WEIGHT,
     MONEY_WEIGHT_ENV,
-    money_weight,
+)
+from kaggriculture.learn.toad_reward import (
+    money_weight as money_weight,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class RuntimePreflightError(RuntimeError):
+    """A requested runtime cannot be honored without changing the experiment."""
+
+
+@dataclass(frozen=True)
+class ToadRunResult:
+    """Exact terminal checkpoint and distributed identity of a completed fit."""
+
+    checkpoint: Path
+    global_rank: int
+    world_size: int
+
+    @property
+    def is_global_zero(self) -> bool:
+        """Return whether this process owns post-fit external orchestration."""
+        return self.global_rank == 0
+
+
+@dataclass(frozen=True)
+class CudaCapabilities:
+    """CUDA facts returned by one disposable child-process probe."""
+
+    available: bool
+    device_count: int
+    bf16: bool
+
+
+def _cuda_capabilities() -> CudaCapabilities:
+    """Inspect CUDA availability, topology, and BF16 outside the trainer parent."""
+    try:
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, torch; "
+                    "available=torch.cuda.is_available(); "
+                    "print(json.dumps({'available': available, "
+                    "'device_count': torch.cuda.device_count() if available else 0, "
+                    "'bf16': torch.cuda.is_bf16_supported() if available else False}, "
+                    "separators=(',', ':')))"
+                ),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return CudaCapabilities(False, 0, False)
+    if probe.returncode != 0:
+        return CudaCapabilities(False, 0, False)
+    try:
+        payload = json.loads(probe.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return CudaCapabilities(False, 0, False)
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("available"), bool)
+        or not isinstance(payload.get("device_count"), int)
+        or isinstance(payload.get("device_count"), bool)
+        or cast(int, payload["device_count"]) < 0
+        or not isinstance(payload.get("bf16"), bool)
+    ):
+        return CudaCapabilities(False, 0, False)
+    return CudaCapabilities(
+        available=cast(bool, payload["available"]),
+        device_count=cast(int, payload["device_count"]),
+        bf16=cast(bool, payload["bf16"]),
+    )
+
+
+def _effective_accelerator(
+    runtime: RuntimeConfig,
+    capabilities: CudaCapabilities | None = None,
+) -> Literal["cpu", "gpu"]:
+    """Resolve Lightning's ``auto`` selection without constructing a Trainer."""
+    if runtime.accelerator == "auto":
+        resolved = capabilities or _cuda_capabilities()
+        return "gpu" if resolved.available else "cpu"
+    return runtime.accelerator
+
+
+def _requested_gpu_count(runtime: RuntimeConfig, capabilities: CudaCapabilities) -> int:
+    """Return the requested CUDA device count without selecting a CUDA device."""
+    if runtime.devices == "auto":
+        return capabilities.device_count
+    if isinstance(runtime.devices, tuple):
+        return len(runtime.devices)
+    return runtime.devices
+
+
+def _requested_device_count(
+    runtime: RuntimeConfig,
+    accelerator: str,
+    capabilities: CudaCapabilities | None = None,
+) -> int:
+    """Resolve the single-process topology without constructing a strategy."""
+    if runtime.devices == "auto":
+        if accelerator == "gpu":
+            return (capabilities or _cuda_capabilities()).device_count
+        return 1
+    if isinstance(runtime.devices, tuple):
+        return len(runtime.devices)
+    return runtime.devices
+
+
+def _cpu_bf16_supported() -> bool:
+    """Ask the installed PyTorch/Lightning stack whether CPU autocast exists."""
+    from lightning.pytorch.plugins.precision import MixedPrecision
+
+    try:
+        MixedPrecision("bf16-mixed", "cpu")
+        return torch.amp.autocast_mode.is_autocast_available("cpu")
+    except (RuntimeError, ValueError):
+        return False
+
+
+def _rollout_preflight(
+    config: ToadConfig,
+    capabilities: CudaCapabilities | None,
+) -> None:
+    """Reject rollout modes that would otherwise fall back or be ignored."""
+    runtime = config.runtime
+    if (
+        runtime.rollout_backend == "native"
+        and config.population.scripted > 0
+        and config.population.scripted_opponent != "economic"
+    ):
+        raise RuntimePreflightError(
+            "native scripted rollout supports only the verified 'economic' opponent"
+        )
+    if runtime.rollout_backend == "native" and runtime.compile.enabled:
+        raise RuntimePreflightError(
+            "native rollout with torch.compile is not proved; refusing eager fallback"
+        )
+    if runtime.rollout_cuda_graph:
+        if runtime.rollout_backend != "native":
+            raise RuntimePreflightError(
+                "CUDA-graph rollout requires rollout_backend='native'"
+            )
+        if config.population.scripted > 0:
+            raise RuntimePreflightError(
+                "scripted CUDA-graph rollout is unsupported because the scripted "
+                "opponent reads simulator rows on the host"
+            )
+        raise RuntimePreflightError(
+            "CUDA-graph round collection is not yet selectable; refusing eager fallback"
+        )
+    if runtime.rollout_backend == "reference" and runtime.rollout_device != "cpu":
+        raise RuntimePreflightError(
+            "reference rollout does not consume rollout_device; refusing an ignored "
+            f"{runtime.rollout_device!r} request"
+        )
+    if (
+        runtime.rollout_backend == "native"
+        and runtime.rollout_device == "cuda"
+        and (capabilities is None or not capabilities.available)
+    ):
+        raise RuntimePreflightError(
+            "native CUDA rollout requested but CUDA is unavailable"
+        )
+
+
+def _gpu_runtime_preflight(
+    runtime: RuntimeConfig, capabilities: CudaCapabilities
+) -> None:
+    """Reject an unavailable explicit GPU or BF16 placement."""
+    if not capabilities.available:
+        if runtime.precision == "bf16-mixed":
+            raise RuntimePreflightError(
+                "bf16-mixed requested but CUDA BF16 is unavailable"
+            )
+        raise RuntimePreflightError("GPU accelerator requested but CUDA is unavailable")
+    requested = _requested_gpu_count(runtime, capabilities)
+    available_devices = capabilities.device_count
+    if isinstance(runtime.devices, tuple) and len(set(runtime.devices)) != len(
+        runtime.devices
+    ):
+        raise RuntimePreflightError(
+            f"requested GPU device indexes must be unique: devices={runtime.devices}"
+        )
+    if requested < 1 or requested > available_devices:
+        raise RuntimePreflightError(
+            "requested GPU devices are unavailable: "
+            f"requested={requested}, available={available_devices}"
+        )
+    if isinstance(runtime.devices, tuple) and any(
+        device >= available_devices for device in runtime.devices
+    ):
+        raise RuntimePreflightError(
+            "requested GPU device index is unavailable: "
+            f"available={available_devices}, devices={runtime.devices}"
+        )
+    if runtime.precision == "bf16-mixed" and not capabilities.bf16:
+        raise RuntimePreflightError("bf16-mixed requested but CUDA BF16 is unavailable")
+
+
+def runtime_preflight(config: ToadConfig) -> None:
+    """Reject unavailable runtime requests before creating trainer side effects.
+
+    This deliberately performs only hardware capability inspection.  It does
+    not construct a Trainer, logger, worker, file, or policy, and it never
+    changes an explicit request into a different precision or accelerator.
+    """
+    runtime = config.runtime
+    needs_cuda_probe = runtime.accelerator in {"auto", "gpu"} or (
+        runtime.rollout_backend == "native" and runtime.rollout_device == "cuda"
+    )
+    capabilities = _cuda_capabilities() if needs_cuda_probe else None
+    _rollout_preflight(config, capabilities)
+    accelerator = _effective_accelerator(runtime, capabilities)
+    if accelerator == "cpu" and isinstance(runtime.devices, tuple):
+        raise RuntimePreflightError(
+            "CPU accelerator does not accept explicit device indexes"
+        )
+    world_size = runtime.num_nodes * _requested_device_count(
+        runtime, accelerator, capabilities
+    )
+    if world_size > 1 and runtime.strategy != "ddp":
+        raise RuntimePreflightError(
+            "resolved world size above one requires DDP strategy='ddp': "
+            f"world_size={world_size}, strategy={runtime.strategy!r}"
+        )
+    if (
+        world_size > 1
+        and accelerator == "cpu"
+        and runtime.rollout_backend == "native"
+        and runtime.rollout_device == "cuda"
+    ):
+        raise RuntimePreflightError(
+            "native CUDA rollout with a CPU DDP learner has no explicit rank-local "
+            "device mapping"
+        )
+    if accelerator == "gpu":
+        assert capabilities is not None
+        _gpu_runtime_preflight(runtime, capabilities)
+        return
+    if runtime.precision == "bf16-mixed" and not _cpu_bf16_supported():
+        raise RuntimePreflightError(
+            "bf16-mixed requested but CPU BF16 autocast is unavailable"
+        )
+
+
+def runtime_metadata(config: ToadConfig) -> RuntimeMetadata:
+    """Return immutable resolved identity for logging this trainer run."""
+    capabilities = (
+        _cuda_capabilities() if config.runtime.accelerator == "auto" else None
+    )
+    accelerator = _effective_accelerator(config.runtime, capabilities)
+    return RuntimeMetadata(
+        precision=config.runtime.precision,
+        compile=config.runtime.compile,
+        world_size=(
+            config.runtime.num_nodes
+            * _requested_device_count(config.runtime, accelerator, capabilities)
+        ),
+        rollout_backend=config.runtime.rollout_backend,
+    )
+
+
+# Temporary aliases preserve the runner's original segmentation surface while
+# callers move to ``kaggriculture.learn.toad.data.segments``.
+ACTED_FIELDS = _ACTED_FIELDS
+OBSERVED_FIELDS = _OBSERVED_FIELDS
 
 
 @dataclass(frozen=True)
@@ -92,8 +379,8 @@ class Teacher:
     answer, and that answer is known exactly once, at load time, where
     ``load_policy_weights`` reports the keys it did not find. Carrying the two
     together makes the pairing impossible to get wrong downstream: there is no
-    way to hand ``_step`` a teacher without also telling it which heads that
-    teacher is entitled to constrain.
+    way to hand ``compute_loss`` a teacher without also telling it which heads
+    that teacher is entitled to constrain.
 
     Attributes:
         policy: The frozen network, in eval mode with gradients off.
@@ -140,13 +427,12 @@ TURNS = 719
 # rollout is env-bound rather than network-bound, so the GPU does not fix it.
 # Collection is spread over processes the way `selfplay.collect` does it.
 #
-# One per environment. `_collect` splits the pool in half when an arm mixes
-# opponents, so 12 gave each worker two episodes to play in series on a 64-core
-# box that was running about ten of them. ENVIRONMENTS is deliberately NOT
-# changed with it: that would move the effective batch and therefore the recipe.
+# One per environment. ``ReferenceRoundSource`` fans the typed assignments out
+# while preserving the round quota. ENVIRONMENTS is deliberately not changed
+# with it: that would move the effective batch and therefore the recipe.
 WORKERS = ENVIRONMENTS
 # Torch threads per worker. One, so WORKERS processes do not each claim the
-# whole machine; see _play.
+# whole machine; see ``_play_reference``.
 THREADS = 1
 # How many updates the actor's weights lag the learner's. See D7 above.
 SYNC_EVERY = 4
@@ -156,22 +442,6 @@ OPPONENT = "src/kaggriculture/economic_policy.py"
 # the value target bootstraps from the state *after* the segment's last action
 # and not from that action's own state; see `_segments` for why the difference
 # is the whole ballgame.
-ACTED_FIELDS = (
-    "unit_actions",
-    "unit_quantities",
-    "market_actions",
-    "unit_masks",
-    "unit_quantity_masks",
-    "market_masks",
-    "log_probs",
-    "shaped",
-    "shaped_money",
-    "margin",
-    "own",
-    "sparse",
-    "dones",
-)
-OBSERVED_FIELDS = ("board", "scalars", "positions")
 RUNS = Path("/data/kaggriculture/toad")
 # Every 25 updates is ~13 minutes of work at the measured 3.97M steps/hour.
 # Attempt one had none, and an external kill at update 253 cost 2.3 hours.
@@ -192,16 +462,19 @@ PROXY = "proxy/"
 CRITIC = "critic/"
 DIAG = "diag/"
 METRIC_PREFIXES = (OBJECTIVE, PROXY, CRITIC, DIAG)
-# One line per logged key, shipped into every run (see `_log_definitions`) so
-# the meaning of a number sits beside the number instead of requiring someone
-# to open this file. Derived from the comments at each metric's definition
-# site in `_record`, `_population` and `_critic`; kept in sync with them by
+# One line per logged key, shipped in the logger config so the meaning of a
+# number sits beside the number instead of requiring someone to open this
+# file. Derived from the comments at each metric's definition site in
+# `_record`, `_population` and `_critic`; kept in sync with them by
 # `test_every_logged_metric_carries_a_role_prefix`, which asserts this dict's
 # keys are exactly the keys `_record` returns.
 METRIC_DEFINITIONS: dict[str, str] = {
     "diag/update": "Optimizer rounds completed so far.",
     "diag/steps": "Environment decisions collected so far.",
-    "diag/hours": "Wall-clock hours since the run started.",
+    "diag/hours": (
+        "Wall-clock hours since the current Lightning fit process started; resets "
+        "after resume."
+    ),
     "diag/bank_mean": (
         "Mean terminal bank, both populations pooled. Corpus mining over "
         "1,350 seats put bank against ladder rating at Pearson -0.043, so "
@@ -345,15 +618,18 @@ METRIC_DEFINITIONS: dict[str, str] = {
 
 
 def _parser() -> argparse.ArgumentParser:
-    """Return this arm's command line, pulled out of ``main`` so a test can parse it.
+    """Return the one-release legacy command line translator's parser.
 
-    Every flag's default is the constant it overrides, never a literal, so an
-    invocation that passes none of them is byte-identical to one that predates
-    the flag existing.
+    Production execution uses :func:`parse_config`. This parser remains for one
+    release so existing invocations and helper-level tests can resolve their
+    old flags into the same immutable :class:`ToadConfig` passed to
+    :func:`run`. Defaults come from the control config or the current constants
+    rather than a separately authoritative table.
 
     Returns:
         The argument parser ``main`` parses ``sys.argv`` with.
     """
+    control = ToadConfig.control()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--no-money",
@@ -393,14 +669,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--blocks",
         type=int,
-        default=BLOCKS,
+        default=control.model.blocks,
         help="residual blocks in the learner's (and rollout actor's) trunk. "
         "Phases 3-5 of the curriculum need 16 and 24 against phase 1-2's 8.",
     )
     parser.add_argument(
         "--channels",
         type=int,
-        default=CHANNELS,
+        default=control.model.channels,
         help="trunk width. Arm C needs 256 to match the BC clone, against "
         "Toad's hidden_dim of 128 -- a declared deviation, not a tuning knob.",
     )
@@ -416,7 +692,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher-blocks",
         type=int,
-        default=BLOCKS,
+        default=control.model.blocks,
         help="residual blocks in the frozen teacher's trunk -- the depth its "
         "own checkpoint was written at, not this arm's --blocks. The recipe's "
         "teachers are always smaller nets than the phase they teach (phase 5's "
@@ -424,9 +700,16 @@ def _parser() -> argparse.ArgumentParser:
         "assumed equal to --blocks.",
     )
     parser.add_argument(
+        "--teacher-quantity",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="declare whether the named legacy teacher has a complete quantity "
+        "head; required with --teacher and translated into TeacherSpec",
+    )
+    parser.add_argument(
         "--econ-fraction",
         type=float,
-        default=0.0,
+        default=control.population.scripted,
         help="fraction of each round's environments played against "
         "economic_policy instead of the mirror. Only our seat trains from "
         "those: the scripted agent is market pressure, not a tape to clone.",
@@ -434,28 +717,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--teacher-kl-cost",
         type=float,
-        default=TEACHER_KL_COST,
+        default=control.optimizer.teacher_kl_cost,
         help="teacher KL weight. Their cascade drops it to 0.001 at phase 3, "
         "where the policy should start out-earning its teacher.",
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=LEARNING_RATE,
+        default=control.optimizer.lr,
         help="Adam learning rate the schedule decays from. Sweep knob; "
         "the default reproduces every earlier arm exactly.",
     )
     parser.add_argument(
         "--entropy-cost",
         type=float,
-        default=ENTROPY_COST,
+        default=control.optimizer.entropy_cost,
         help="coefficient on the entropy loss term. Sweep knob; the default "
         "reproduces every earlier arm exactly.",
     )
     parser.add_argument(
         "--gamma",
         type=float,
-        default=DISCOUNTING,
+        default=control.optimizer.gamma,
         help="discount the return and advantage targets are built at "
         "(``losses``' ``discounting``). Sweep knob; the default reproduces "
         "every earlier arm exactly.",
@@ -463,7 +746,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lmb",
         type=float,
-        default=LMB,
+        default=control.optimizer.lmb,
         help="lambda for both TD(lambda) and UPGO, named to match "
         "toad_loss.losses' own parameter rather than shadowing the Python "
         "keyword. Their 0.8 for phases 1-4 and 0.9 for phase 5.",
@@ -471,7 +754,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--value-warmup-batches",
         type=int,
-        default=VALUE_WARMUP_BATCHES,
+        default=control.optimizer.value_warmup_batches,
         help="train the value head alone for this many batches before the "
         "policy gradient fires (arm C'). Their phase-2 mechanism, for a "
         "warm-started policy whose critic is untrained. 0 means no warmup.",
@@ -479,7 +762,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--value-passes",
         type=int,
-        default=0,
+        default=control.optimizer.value_passes,
         help="extra value-only passes over each round after the policy's one "
         "(arm S uses 4). A round is otherwise seen once and discarded, and the "
         "ceiling experiment put a critic trained 150 times over the same data at "
@@ -507,7 +790,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--total-steps",
         type=int,
-        default=TOTAL_STEPS,
+        default=control.runtime.total_environment_steps,
         help="environment steps this arm trains for. The curriculum's five "
         "phases each need a different budget (2e7-1e7) against this "
         "constant's declared-deviation 1e8.",
@@ -515,173 +798,215 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Run one arm to ``--total-steps``, checkpointing and logging as it goes.
+def _config_parser() -> argparse.ArgumentParser:
+    """Return the primary typed-config command line parser."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=JSON_VALUE",
+    )
+    return parser
 
-    Args:
-        argv: Flags to parse, or None for ``sys.argv[1:]`` (the CLI's own
-            default). ``curriculum.py`` passes an explicit list here so it can
-            invoke this entry point directly rather than shelling out or
-            duplicating the training loop.
-    """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+def parse_config(argv: Sequence[str] | None = None) -> ToadConfig:
+    """Resolve and validate the primary config CLI without runtime side effects."""
+    arguments = _config_parser().parse_args(argv)
+    return load_config(arguments.config, arguments.overrides)
+
+
+def _legacy_config(argv: Sequence[str]) -> ToadConfig:
+    """Translate the former flags into the native immutable config contract."""
     arguments = _parser().parse_args(argv)
+    reward_field = _field(arguments)
+    if arguments.name is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*", arguments.name
+    ):
+        raise ValueError("legacy --name must be a safe run name")
+    if arguments.teacher is not None and arguments.teacher_quantity is None:
+        raise ValueError(
+            "legacy --teacher requires an explicit teacher quantity compatibility "
+            "flag (--teacher-quantity or --no-teacher-quantity)"
+        )
+    if arguments.teacher is None and arguments.teacher_quantity is not None:
+        raise ValueError("teacher quantity compatibility requires --teacher")
 
-    seed_everything(SEED, workers=True)
-    RUNS.mkdir(parents=True, exist_ok=True)
-    # The single constant the ablation turns on. Everything downstream -- file
-    # names, wandb run name, which reward the learner reads -- follows from it,
-    # so the two arms cannot drift apart in any other respect.
-    if arguments.money_weight is not None:
-        # Into the environment before the worker pool forks, so every rollout
-        # process computes `shaped_money` at this arm's weight.
-        os.environ[MONEY_WEIGHT_ENV] = repr(arguments.money_weight)
-    field = _field(arguments)
-    prefix = _prefix(arguments)
+    control = ToadConfig.control()
+    payload = control.model_dump(mode="python")
+    payload["model"].update(blocks=arguments.blocks, channels=arguments.channels)
+    payload["population"].update(
+        selfplay=1.0 - arguments.econ_fraction,
+        scripted=arguments.econ_fraction,
+        teacher=(
+            {
+                "checkpoint": arguments.teacher,
+                "blocks": arguments.teacher_blocks,
+                "quantity": arguments.teacher_quantity,
+            }
+            if arguments.teacher is not None
+            else None
+        ),
+    )
+    payload["optimizer"].update(
+        lr=arguments.lr,
+        gamma=arguments.gamma,
+        lmb=arguments.lmb,
+        entropy_cost=arguments.entropy_cost,
+        teacher_kl_cost=arguments.teacher_kl_cost,
+        value_warmup_batches=arguments.value_warmup_batches,
+        value_passes=arguments.value_passes,
+    )
+    payload["runtime"].update(
+        total_environment_steps=arguments.total_steps,
+        resume=arguments.resume,
+        output_dir=(
+            control.runtime.output_dir / arguments.name
+            if arguments.name is not None
+            else control.runtime.output_dir
+        ),
+    )
+    payload["curriculum"].update(
+        phase=arguments.name or control.curriculum.phase,
+        reward_field=reward_field,
+        warm_start_checkpoint=CHECKPOINT if arguments.clone_init else None,
+        money_weight=arguments.money_weight
+        if arguments.money_weight is not None
+        else control.curriculum.money_weight,
+    )
+    return ToadConfig.model_validate(payload)
 
-    device = _device()
-    learner = _learner(arguments, device)
-    if arguments.clone_init:
-        _warm_start(learner, device)
-    optimizer = _optimizer(learner, arguments.lr)
-    schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, _decay(arguments.econ_fraction, arguments.total_steps)
+
+def _uses_legacy_cli(argv: Sequence[str]) -> bool:
+    """Return whether ``argv`` contains a flag outside the primary surface."""
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument.startswith("--config=") or argument.startswith("--set="):
+            index += 1
+            continue
+        if argument in {"-h", "--help"}:
+            index += 1
+            continue
+        if argument in {"--config", "--set"}:
+            index += 2
+            continue
+        return True
+    return False
+
+
+def build_wandb_logger(config: ToadConfig) -> WandbLogger:
+    """Build the sole tracking surface from the complete resolved config."""
+    logged_config = config.model_dump(mode="json")
+    logged_config["runtime_metadata"] = runtime_metadata(config).model_dump(mode="json")
+    logged_config["metric_definitions"] = METRIC_DEFINITIONS
+    return WandbLogger(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        name=config.curriculum.phase,
+        save_dir=str(config.runtime.output_dir),
+        config=logged_config,
     )
 
-    steps, update = 0, 0
-    if arguments.resume is not None:
-        steps, update = _restore(arguments.resume, learner, optimizer, schedule, device)
-        LOGGER.info(
-            "resumed from %s at update %d, step %d", arguments.resume, update, steps
-        )
 
-    log = RUNS / f"{prefix}_{int(time.time())}.jsonl"
-    run = _start_run(arguments, field)
-    parameters = sum(p.numel() for p in learner.parameters())
-    LOGGER.info(
-        "phase 1: %d params, device %s, log %s, wandb %s",
-        parameters,
-        device,
-        log,
-        run.url,
+def build_reference_data_module(config: ToadConfig) -> ToadDataModule:
+    """Build the requested synchronous collector behind the common bridge."""
+    source: ReferenceRoundSource
+    if config.runtime.rollout_backend == "native":
+        source = NativeRoundSource(config)
+    else:
+        source = ReferenceRoundSource(config)
+    return ToadDataModule(config, source)
+
+
+def build_trainer(config: ToadConfig) -> lightning.Trainer:
+    """Build the requested Lightning Trainer with round-boundary ownership."""
+    devices: int | str | list[int] = (
+        list(config.runtime.devices)
+        if isinstance(config.runtime.devices, tuple)
+        else config.runtime.devices
+    )
+    return lightning.Trainer(
+        accelerator=config.runtime.accelerator,
+        devices=devices,
+        num_nodes=config.runtime.num_nodes,
+        strategy=config.runtime.strategy,
+        precision=config.runtime.precision,
+        deterministic=config.runtime.deterministic,
+        benchmark=config.runtime.benchmark,
+        profiler=config.runtime.profiler,
+        log_every_n_steps=config.runtime.log_every_n_steps,
+        gradient_clip_val=config.optimizer.clip_grad_norm,
+        gradient_clip_algorithm="norm",
+        max_steps=-1,
+        max_epochs=-1,
+        use_distributed_sampler=False,
+        enable_checkpointing=False,
+        callbacks=[
+            ActorSyncCallback(config.population.actor_sync_every_rounds),
+            EnvironmentStepStop(config.runtime.total_environment_steps),
+            PopulationSnapshotCallback(),
+            BoundaryCheckpoint(config.runtime.output_dir),
+        ],
+        logger=build_wandb_logger(config),
     )
 
-    teacher = _teacher(arguments, device)
-    actor = copy.deepcopy(learner).eval()
-    warmup_left = arguments.value_warmup_batches
-    if warmup_left:
-        LOGGER.info(
-            "value warmup: %d batches (~%.1f updates at %d batches/update)",
-            warmup_left,
-            warmup_left / _batches_per_update(arguments.econ_fraction),
-            _batches_per_update(arguments.econ_fraction),
-        )
-    started = time.monotonic()
-    pool = ProcessPoolExecutor(max_workers=WORKERS)
-    while steps < arguments.total_steps:
-        seeds = tuple(range(update * ENVIRONMENTS, (update + 1) * ENVIRONMENTS))
-        weights = {key: value.cpu() for key, value in actor.state_dict().items()}
-        mirror_batch, econ_batch = _collect(
-            pool,
-            weights,
-            seeds,
-            arguments.blocks,
-            arguments.channels,
-            arguments.econ_fraction,
-        )
-        batch = mirror_batch + econ_batch
-        steps += sum(int(t.shaped.shape[0]) for t in batch)
-        terms, consumed = _update(
-            learner,
-            optimizer,
-            batch,
-            device,
-            field,
-            warmup_left,
-            teacher,
-            arguments.teacher_kl_cost,
-            arguments.value_passes,
-            entropy_cost=arguments.entropy_cost,
-            discounting=arguments.gamma,
-            lmb=arguments.lmb,
-        )
-        warming = warmup_left > 0
-        warmup_left = max(0, warmup_left - consumed)
-        schedule.step()
-        update += 1
-        # No sync while the value head warms up: the actor must keep rolling
-        # out the warm-started policy so the critic learns on the distribution
-        # it will actually have to evaluate. Syncing here is precisely what
-        # destroyed arm C at update 5.
-        if not warming and update % SYNC_EVERY == 0:
-            actor.load_state_dict(learner.state_dict())
-        if update % CHECKPOINT_EVERY == 0:
-            _checkpoint(learner, optimizer, schedule, steps, update, prefix)
 
-        record = _record(
-            mirror_batch,
-            econ_batch,
-            field,
-            update=update,
-            steps=steps,
-            hours=round((time.monotonic() - started) / 3600.0, 4),
-            lr=float(schedule.get_last_lr()[0]),
-            warming=warming,
-            warmup_left=warmup_left,
-            terms=terms,
-        )
-        with log.open("a") as handle:
-            handle.write(json.dumps(record) + "\n")
-        wandb.log(record, step=steps)
-        LOGGER.info(
-            "update %d steps %d win_vs_econ %.3f margin %.1f bank %.1f "
-            "sale_price %.1f reward %.4f total_loss %.3f",
-            update,
-            steps,
-            record["objective/win_rate_vs_econ"],
-            record["objective/margin_vs_econ"],
-            record["diag/bank_mean"],
-            record["diag/mean_sale_price_vs_econ"],
-            record["proxy/shaped_reward_mean"],
-            record["diag/total_loss"],
-        )
-    wandb.finish()
+def run(config: ToadConfig) -> ToadRunResult:
+    """Train and return the exact terminal checkpoint plus process rank."""
+    validate_effective_resume(config)
+    runtime_preflight(config)
+    seed_everything(config.runtime.seed, workers=True)
+    module = ToadLightningModule(config)
+    effective = module.config
+    if effective.runtime.compile.enabled:
+        module.policy = maybe_compile(module.policy, effective)
+    data = build_reference_data_module(effective)
+    trainer = build_trainer(effective)
+    trainer.fit(
+        module,
+        datamodule=data,
+        ckpt_path=effective.runtime.resume,
+    )
+    callbacks = cast(
+        Sequence[lightning.Callback],
+        getattr(trainer, "callbacks", ()),
+    )
+    boundaries = [
+        callback for callback in callbacks if isinstance(callback, BoundaryCheckpoint)
+    ]
+    if len(boundaries) != 1 or boundaries[0].final_checkpoint is None:
+        raise RuntimeError("successful Toad fit did not publish its final checkpoint")
+    return ToadRunResult(
+        checkpoint=boundaries[0].final_checkpoint,
+        global_rank=int(trainer.global_rank),
+        world_size=int(trainer.world_size),
+    )
 
 
-def _learner(arguments: argparse.Namespace, device: str) -> Policy:
-    """Return the network being trained, built from the parsed command line.
-
-    Pulled out of ``main`` so a test can construct one from a parsed
-    ``--blocks`` and count its own residual blocks -- the only way to tell
-    "parsed the flag" from "parsed the flag and never used it".
+def main(argv: Sequence[str] | None = None) -> None:
+    """Validate one config, then run it exclusively through Lightning.
 
     Args:
-        arguments: The parsed command line.
-        device: Where to place the network.
-
-    Returns:
-        The learner, not yet warm-started or optimized.
+        argv: Primary ``--config``/``--set`` arguments or one-release legacy
+            flags. ``None`` reads ``sys.argv[1:]``.
     """
-    return Policy(
-        blocks=arguments.blocks, channels=arguments.channels, value_bound=VALUE_BOUND
-    ).to(device)
-
-
-def _optimizer(learner: Policy, lr: float) -> torch.optim.Optimizer:
-    """Return the Adam optimizer this arm trains with.
-
-    Pulled out of ``main`` so a test can construct one from a parsed ``--lr``
-    and read the rate back off its own ``param_groups`` -- the only way to
-    tell "parsed the flag" from "parsed the flag and never used it".
-
-    Args:
-        learner: The network whose parameters the optimizer will update.
-        lr: The learning rate, threaded from ``--lr`` (default ``LEARNING_RATE``).
-
-    Returns:
-        The constructed optimizer, before any schedule wraps it.
-    """
-    return torch.optim.Adam(learner.parameters(), lr=lr, eps=ADAM_EPS)
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if _uses_legacy_cli(arguments):
+        config = _legacy_config(arguments)
+        message = (
+            "legacy Toad flags are deprecated for one release; use --config "
+            "PATH plus repeatable --set PATH=JSON_VALUE"
+        )
+        warnings.warn(message, DeprecationWarning, stacklevel=2)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+        LOGGER.warning(message)
+    else:
+        config = parse_config(arguments)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    run(config)
 
 
 def _record(
@@ -826,6 +1151,47 @@ def _record(
     return record
 
 
+def _collection_metrics(
+    mirror_batch: list[Trajectory], econ_batch: list[Trajectory], field: str
+) -> dict[str, float | int]:
+    """Return the legacy stable metrics available immediately after collection."""
+    terms = {
+        "vtrace_pg": 0.0,
+        "upgo_pg": 0.0,
+        "baseline": 0.0,
+        "baseline_passes": 0.0,
+        "entropy": 0.0,
+        "teacher": 0.0,
+        "total": 0.0,
+    }
+    record = _record(
+        mirror_batch,
+        econ_batch,
+        field,
+        update=0,
+        steps=0,
+        hours=0.0,
+        lr=0.0,
+        warming=False,
+        warmup_left=0,
+        terms=terms,
+    )
+    dynamic = {
+        "diag/update",
+        "diag/steps",
+        "diag/hours",
+        "diag/lr",
+        "diag/warming",
+        "diag/warmup_left",
+        *(_TERM_PREFIX.values()),
+    }
+    return {
+        name: cast(float | int, value)
+        for name, value in record.items()
+        if name not in dynamic
+    }
+
+
 def _mean(values: list[float]) -> float:
     """Return the mean, or NaN for an empty population.
 
@@ -917,10 +1283,8 @@ def _critic(batch: list[Trajectory], field: str, population: str) -> dict[str, f
     }
 
 
-# The internal loss-term names `_step` returns -> their logged, prefixed key.
-# `_step` and `_update` keep the short names (tested directly by
-# test_toad_runner.py); this table is the one place those names become the
-# public, dashboard-grouped ones.
+# The internal ``LossReport`` term names -> their logged, prefixed key. This
+# table is the one place those names become the public dashboard-grouped ones.
 _TERM_PREFIX = {
     "vtrace_pg": f"{DIAG}vtrace_pg",
     "upgo_pg": f"{DIAG}upgo_pg",
@@ -933,184 +1297,15 @@ _TERM_PREFIX = {
 
 
 def _prefixed_terms(terms: dict[str, float]) -> dict[str, float]:
-    """Return ``_update``'s loss terms under their public, prefixed keys.
+    """Return loss-report terms under their public, prefixed keys.
 
     Args:
-        terms: The loss terms ``_update`` returned, by their internal names.
+        terms: Loss terms by their internal names.
 
     Returns:
         The same values keyed by ``_TERM_PREFIX``.
     """
     return {_TERM_PREFIX[key]: value for key, value in terms.items()}
-
-
-def _start_run(arguments: argparse.Namespace, field: str) -> "wandb.sdk.wandb_run.Run":
-    """Open the tracked wandb run for this arm and ship every metric's meaning into it.
-
-    Every knob that distinguishes one arm from another is recorded here, so a
-    run's identity can be read off the dashboard rather than reconstructed from
-    a shell command nobody kept. That includes the weights of whichever reward
-    is live and zeroes for the ones that are not.
-
-    THE INCIDENT this exists to prevent read a dashboard and trusted two
-    numbers whose correct interpretation was sitting in this file's comments
-    the whole time, unreachable from wandb. ``METRIC_DEFINITIONS`` is those
-    comments, one line each; logging it as a table puts the run's own page one
-    click from the explanation instead of a source read.
-
-    Args:
-        arguments: The parsed command line.
-        field: The reward series the learner will read.
-
-    Returns:
-        The started run, with its metric glossary already logged.
-    """
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        name=arguments.name or _default_name(arguments),
-        config={
-            "blocks": arguments.blocks,
-            "teacher_blocks": arguments.teacher_blocks if arguments.teacher else None,
-            "channels": arguments.channels,
-            "value_bound": VALUE_BOUND,
-            "reward_field": field,
-            "money_weight": 0.0 if arguments.no_money else money_weight(),
-            "margin_weight": MARGIN_WEIGHT if arguments.margin else 0.0,
-            "absolute_weight": ABSOLUTE_WEIGHT if arguments.margin else 0.0,
-            # Live on every arm that reads a `shaped` field and zero on the
-            # margin arm, which prices capital through ABSOLUTE_WEIGHT instead.
-            # Recorded because it is the one weight in the shaped set that is
-            # not Toad's published number, so a run's reward is not identifiable
-            # without it.
-            "capital_weight": 0.0 if arguments.margin else CAPITAL_WEIGHT,
-            "econ_fraction": arguments.econ_fraction,
-            "value_warmup_batches": arguments.value_warmup_batches,
-            "value_passes": arguments.value_passes,
-            "teacher": str(arguments.teacher)
-            if arguments.teacher is not None
-            else None,
-            "teacher_kl_cost": arguments.teacher_kl_cost,
-            "clone_init": arguments.clone_init,
-            "environments": ENVIRONMENTS,
-            "batch_segments": BATCH_SEGMENTS,
-            "unroll_length": UNROLL_LENGTH,
-            "sync_every": SYNC_EVERY,
-            "lr": arguments.lr,
-            "entropy_cost": arguments.entropy_cost,
-            "gamma": arguments.gamma,
-            "lmb": arguments.lmb,
-            "adam_eps": ADAM_EPS,
-            "clip_grads": CLIP_GRADS,
-            "total_steps": arguments.total_steps,
-            "engine": metadata.version("kaggle-environments"),
-        },
-    )
-    _log_definitions(run)
-    return run
-
-
-def _log_definitions(run: "wandb.sdk.wandb_run.Run") -> None:
-    """Log ``METRIC_DEFINITIONS`` once, as a table, so it lives beside the run.
-
-    A ``wandb.Table`` logged once (the default ``log_mode="IMMUTABLE"``) is
-    stored as a single snapshot on the run and surfaces in its Tables tab and
-    summary -- the documented pattern for "one value that does not change over
-    the run" (see the Tables logging guide), as opposed to a metric logged
-    every step. A metric definition does not change during a run either, so
-    this is logged once here rather than folded into ``record`` and repeated
-    719 times.
-
-    Args:
-        run: The run just opened by ``wandb.init``.
-    """
-    run.log(
-        {
-            "metric_definitions": wandb.Table(
-                columns=["metric", "definition"],
-                data=[list(row) for row in sorted(METRIC_DEFINITIONS.items())],
-            )
-        }
-    )
-
-
-def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
-    """Return the frozen checkpoint the learner is held near, or None.
-
-    The recipe's teachers are "always the pipeline's own earlier, smaller
-    checkpoints" -- never a behaviour clone and never a replay. ``--teacher``
-    names one such checkpoint per phase; phase 1 passes none, because its
-    ``teacher_kl_cost`` is 0 and it is genuinely teacher-free self-play from
-    random initialisation. This project has measured what anchoring to the
-    wrong thing costs: removing the penalty took the bank from 17,675 to 9 in
-    five updates, and dropping the cost to 0.001 cliffed within a single sync
-    cycle -- both true of *a* teacher, not of any one checkpoint being right.
-
-    Which heads the KL may cover is decided here and nowhere else, from the
-    keys the checkpoint was missing. A checkpoint written before the quantity
-    head existed leaves that head at its random initialisation, and anchoring
-    the learner to random weights is worse than not anchoring it at all -- so
-    the answer travels with the network, in ``Teacher``, rather than being
-    re-guessed at the loss.
-
-    The teacher's trunk is built at ``--teacher-blocks``, not ``--blocks``:
-    the recipe's teachers are smaller nets than the phase they teach (phase
-    5's is the 16-block checkpoint, taught against its own 24), so the two
-    cannot be assumed equal, and ``load_policy_weights`` raises rather than
-    silently reconciling a shape mismatch if they are.
-
-    Args:
-        arguments: The parsed command line.
-        device: Where to place the teacher.
-
-    Returns:
-        The frozen policy loaded from ``arguments.teacher``, paired with
-        whether its checkpoint taught the quantity head, or None when the
-        arm runs teacher-free (``arguments.teacher is None``).
-    """
-    if arguments.teacher is None:
-        return None
-    policy = Policy(
-        blocks=arguments.teacher_blocks,
-        channels=arguments.channels,
-        value_bound=VALUE_BOUND,
-    ).to(device)
-    state = torch.load(arguments.teacher, map_location=device, weights_only=True)
-    missing = load_policy_weights(policy, state)
-    policy.eval()
-    policy.requires_grad_(False)
-    quantity = not any(key.startswith("quantity_head.") for key in missing)
-    LOGGER.info(
-        "teacher: %s, kl_cost %.4f, quantity head %s",
-        arguments.teacher,
-        arguments.teacher_kl_cost,
-        "taught" if quantity else "absent from the checkpoint, excluded from the KL",
-    )
-    return Teacher(policy=policy, quantity=quantity)
-
-
-def _prefix(arguments: argparse.Namespace) -> str:
-    """Return the stem for this arm's checkpoints and jsonl.
-
-    Distinct per arm, because two arms sharing a prefix overwrite each other's
-    checkpoints silently and the evaluator globs on it.
-    """
-    if arguments.name:
-        return arguments.name
-    if arguments.margin:
-        return "phase1m"
-    if arguments.no_money:
-        return "phase1-no-money"
-    return "phase1"
-
-
-def _default_name(arguments: argparse.Namespace) -> str:
-    """Return the run name for an arm that did not pass ``--name``."""
-    if arguments.margin:
-        return "toad-phase1m-margin"
-    if arguments.no_money:
-        return "toad-phase1-no-money"
-    return "toad-phase1-baseline"
 
 
 def _field(arguments: argparse.Namespace) -> str:
@@ -1147,41 +1342,11 @@ def _field(arguments: argparse.Namespace) -> str:
     return chosen[0] if chosen else REWARD_FIELD
 
 
-def _warm_start(learner: Policy, device: str) -> list[str]:
-    """Load the BC clone into the trunk and every trained head.
-
-    ``load_policy_weights`` does the loading; see it for what non-strict means
-    here. It is not a promise that ``CHECKPOINT`` loads -- the quantity-lane
-    widening resized ``trade_head``, an existing key, and ``CHECKPOINT`` on
-    disk predates that widening, so this currently raises out of
-    ``load_state_dict`` before ``load_policy_weights``'s own check ever runs.
-    Retraining the clone is Phase 2's job, not this arm's.
-
-    Args:
-        learner: The network to warm-start, modified in place.
-        device: Where to map the checkpoint.
-
-    Returns:
-        The keys the checkpoint did not carry, which ``load_policy_weights``
-        confines to the quantity head.
-
-    Raises:
-        ValueError: If the checkpoint is missing or renaming anything beyond
-            the quantity head.
-        RuntimeError: If a key present in both the checkpoint and the module
-            has a shape ``load_state_dict`` cannot reconcile -- the case
-            ``CHECKPOINT`` currently hits.
-    """
-    state = torch.load(CHECKPOINT, map_location=device, weights_only=True)
-    missing = load_policy_weights(learner, state)
-    LOGGER.info(
-        "warm started from %s; fresh heads (%s)", CHECKPOINT, ", ".join(missing)
-    )
-    return missing
-
-
 def _decay(
-    econ_fraction: float, total_steps: int = TOTAL_STEPS
+    econ_fraction: float,
+    total_steps: int = TOTAL_STEPS,
+    environments: int = ENVIRONMENTS,
+    min_lr_multiplier: float = MIN_LR_MOD,
 ) -> Callable[[int], float]:
     """Return the LR multiplier function, floored at their ``min_lr_mod``.
 
@@ -1205,196 +1370,79 @@ def _decay(
         total_steps: Environment steps this arm trains for, from ``--total-steps``
             (default ``TOTAL_STEPS``). The curriculum's five phases each need a
             different budget (2e7-1e7 against the constant's 1e8).
+        environments: Games collected in each logical round.
+        min_lr_multiplier: Floor applied after linear learning-rate decay.
 
     Returns:
         The multiplier at a given schedule step.
     """
-    updates = max(total_steps // (_seats_per_update(econ_fraction) * TURNS), 1)
+    updates = max(
+        total_steps // (_seats_per_update(econ_fraction, environments) * TURNS), 1
+    )
 
     def decay(step: int) -> float:
-        return max(1.0 - step / updates, MIN_LR_MOD)
+        return max(1.0 - step / updates, min_lr_multiplier)
 
     return decay
 
 
-def _checkpoint(
-    learner: Policy,
-    optimizer: torch.optim.Optimizer,
-    schedule: torch.optim.lr_scheduler.LRScheduler,
-    steps: int,
-    update: int,
-    prefix: str,
-) -> Path:
-    """Write everything needed to continue the run, atomically.
-
-    Toad's monobeast checkpoints continuously; ours did not, and an external
-    kill at update 253 cost 2.3 hours of training because the weights lived only
-    in the process. Written to a temporary name and renamed, so a kill during
-    the write leaves the previous checkpoint intact rather than a truncated one.
-
-    Args:
-        learner: The network being trained.
-        optimizer: Its optimizer, whose Adam moments matter as much as the weights.
-        schedule: The LR schedule, so the recipe continues rather than restarts.
-        steps: Environment steps consumed so far.
-        update: Optimizer rounds so far.
-        prefix: Run-distinguishing stem, so the two arms cannot clobber each
-            other's checkpoints.
-
-    Returns:
-        The path written.
-    """
-    path = RUNS / f"{prefix}_{update:06d}.pt"
-    temporary = path.with_suffix(".pt.tmp")
-    torch.save(
-        {
-            "learner": learner.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "schedule": schedule.state_dict(),
-            "steps": steps,
-            "update": update,
-        },
-        temporary,
-    )
-    temporary.rename(path)
-    LOGGER.info("checkpoint %s", path)
-    return path
-
-
-def _restore(
-    path: Path,
-    learner: Policy,
-    optimizer: torch.optim.Optimizer,
-    schedule: torch.optim.lr_scheduler.LRScheduler,
-    device: str,
-) -> tuple[int, int]:
-    """Load a checkpoint in place and return its ``(steps, update)``.
-
-    Restores the schedule's own state rather than fast-forwarding it, because
-    recomputing the position by stepping it ``update`` times is exactly where an
-    off-by-one would hide, and a schedule one step out changes the learning rate
-    for the rest of the run.
-
-    ``load_policy_weights`` tolerates a checkpoint missing ``quantity_head.*``
-    because that gap is expected of a warm start from an older, pre-widening
-    clone. A resume checkpoint is not that -- it is this script's own prior
-    output, already written by a ``Policy`` that has every current head -- so
-    a gap here means the wrong file was pointed at, and loading it anyway
-    would silently continue training with that head randomly initialised.
-
-    Args:
-        path: The checkpoint.
-        learner: Network to load into.
-        optimizer: Optimizer to load into.
-        schedule: Schedule to load into.
-        device: Where to map the tensors.
-
-    Returns:
-        The ``(steps, update)`` the checkpoint was written at.
-
-    Raises:
-        ValueError: If ``load_policy_weights`` reports any missing key, since
-            a resume checkpoint should never have one.
-    """
-    state = torch.load(path, map_location=device, weights_only=False)
-    missing = load_policy_weights(learner, state["learner"])
-    if missing:
-        raise ValueError(
-            f"{path} is missing {missing}: a resume checkpoint is this "
-            "script's own prior output, not a warm start from an older "
-            "clone, so it should already carry every current head, and "
-            "continuing would silently leave the missing head randomly "
-            "initialised for the rest of the run"
-        )
-    optimizer.load_state_dict(state["optimizer"])
-    schedule.load_state_dict(state["schedule"])
-    return int(state["steps"]), int(state["update"])
-
-
-def _device() -> str:
-    """Return the CUDA device with the most free memory, or CPU.
-
-    The machine's GPUs are shared with other runs, so a hardcoded ``cuda:0``
-    lands on whichever card someone else already filled -- measured, that is how
-    the first attempt died.
-    """
-    if not torch.cuda.is_available():
-        return "cpu"
-    free = [
-        torch.cuda.mem_get_info(index)[0] for index in range(torch.cuda.device_count())
-    ]
-    return f"cuda:{free.index(max(free))}"
-
-
-def _collect(
-    pool: ProcessPoolExecutor,
+def _reference_policy(
+    model: ModelConfig,
     state: dict[str, torch.Tensor],
-    seeds: Sequence[int],
-    blocks: int = BLOCKS,
-    channels: int = CHANNELS,
-    econ_fraction: float = 0.0,
-) -> tuple[list[Trajectory], list[Trajectory]]:
-    """Play ``seeds`` across worker processes and return every trajectory.
-
-    Both seats of each episode are recorded, because the actor plays itself and
-    the two seats therefore carry identical weights -- the condition
-    ``rollout_many`` requires before it will record seat 1.
-
-    Args:
-        pool: The process pool to spread episodes over.
-        state: The actor's weights, on CPU so they pickle to the workers.
-        seeds: One seed per episode.
-        blocks: Residual blocks in the trunk, so the workers rebuild the actor
-            at this arm's depth rather than the module default.
-        channels: Trunk width, so the workers rebuild the actor at this arm's
-            size rather than the module default.
-        econ_fraction: Share of the round played against ``OPPONENT`` instead of
-            the mirror. Those episodes record our seat only.
-
-    Returns:
-        Every recorded trajectory: two per mirror seed and one per scripted one.
-    """
-    split = int(len(seeds) * econ_fraction)
-    econ_seeds, mirror_seeds = list(seeds[:split]), list(seeds[split:])
-    work = []
-    for group, versus in ((mirror_seeds, None), (econ_seeds, OPPONENT)):
-        share = max(1, WORKERS // 2) if econ_seeds else WORKERS
-        chunks = [group[index::share] for index in range(share)]
-        work.extend(
-            (state, chunk, blocks, channels, versus) for chunk in chunks if chunk
+    *,
+    frozen: bool,
+) -> Policy | StatefulPolicy:
+    """Construct and strictly load one resolved worker-side policy."""
+    if uses_stateful_policy(model):
+        policy: Policy | StatefulPolicy = StatefulPolicy(model)
+    else:
+        policy = Policy(
+            blocks=model.blocks,
+            channels=model.channels,
+            value_bound=model.value_bound,
+            kernel_size=model.kernel_size,
+            activation=model.activation,
         )
-    played = list(pool.map(_play, work))
-    mirror: list[Trajectory] = []
-    econ: list[Trajectory] = []
-    for (_, _, _, _, versus), batch in zip(work, played, strict=True):
-        (econ if versus else mirror).extend(batch)
-    return mirror, econ
+    policy.load_state_dict(state, strict=True)
+    policy.eval()
+    if frozen:
+        policy.requires_grad_(False)
+    return policy
 
 
-def _play(
-    work: tuple[dict[str, torch.Tensor], list[int], int, int, str | None],
-) -> list[Trajectory]:
-    """Play one worker's share of a round. Runs in a subprocess.
-
-    Torch is pinned to one thread here for the same reason ``selfplay`` pins it
-    (:509): every worker otherwise defaults to a pool the width of the machine,
-    and WORKERS of those oversubscribe it badly enough to be slower than a
-    single process. Measured at 64 cores, leaving this out drove load average
-    past 230 and the round did not finish.
-    """
+def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
+    """Play one typed native-worker request with its resolved architecture."""
     torch.set_num_threads(THREADS)
-    state, seeds, blocks, channels, versus = work
-    actor = Policy(blocks=blocks, channels=channels, value_bound=VALUE_BOUND)
-    actor.load_state_dict(state)
-    actor.eval()
-    with torch.no_grad():
-        # A mirror records both seats; against a named agent `rollout_many`
-        # records seat 0 alone, which is exactly what we want -- we never train
-        # on the scripted agent's actions.
-        return rollout_many(actor, versus if versus else actor, seeds)
+    actor = _reference_policy(work.model, work.actor_state, frozen=False)
+    opponent: Policy | StatefulPolicy | str
+    if work.opponent_state is not None:
+        if work.opponent_model is None:
+            raise ValueError("neural opponent weights require a resolved model config")
+        opponent = _reference_policy(
+            work.opponent_model,
+            work.opponent_state,
+            frozen=True,
+        )
+    else:
+        opponent = work.versus if work.versus is not None else actor
+    previous_money_weight = os.environ.get(MONEY_WEIGHT_ENV)
+    os.environ[MONEY_WEIGHT_ENV] = repr(work.money_weight)
+    try:
+        with torch.no_grad():
+            return rollout_many(
+                actor,
+                opponent,
+                work.seeds,
+                state_unroll_length=work.unroll_length,
+            )
+    finally:
+        if previous_money_weight is None:
+            os.environ.pop(MONEY_WEIGHT_ENV, None)
+        else:
+            os.environ[MONEY_WEIGHT_ENV] = previous_money_weight
 
 
-def _seats_per_update(econ_fraction: float) -> int:
+def _seats_per_update(econ_fraction: float, environments: int = ENVIRONMENTS) -> int:
     """Return how many recorded seats one collection round yields.
 
     ``rollout_many`` records both seats of a mirror episode and ours alone
@@ -1403,333 +1451,19 @@ def _seats_per_update(econ_fraction: float) -> int:
 
     Args:
         econ_fraction: Share of each round played against ``OPPONENT``.
+        environments: Games collected in each logical round.
 
     Returns:
         Trajectories, and so ``TURNS`` times this many environment steps.
     """
-    econ = int(ENVIRONMENTS * econ_fraction)
-    return 2 * (ENVIRONMENTS - econ) + econ
+    econ = int(environments * econ_fraction)
+    return 2 * (environments - econ) + econ
 
 
 def _batches_per_update(econ_fraction: float) -> int:
     """Return how many learner batches one collection round yields."""
     segments = _seats_per_update(econ_fraction) * (TURNS // UNROLL_LENGTH)
     return segments // BATCH_SEGMENTS
-
-
-def _update(
-    learner: Policy,
-    optimizer: torch.optim.Optimizer,
-    batch: list[Trajectory],
-    device: str,
-    field: str,
-    warmup_left: int = 0,
-    teacher: Teacher | None = None,
-    teacher_kl_cost: float = TEACHER_KL_COST,
-    value_passes: int = 0,
-    entropy_cost: float = ENTROPY_COST,
-    discounting: float = DISCOUNTING,
-    lmb: float = LMB,
-) -> tuple[dict[str, float], int]:
-    """Take one optimizer step per ``BATCH_SEGMENTS`` unrolls and return the means.
-
-    Their learner consumes batches of four 16-step unrolls and steps once per
-    batch, continuously fed by the actors. Collecting a whole round and stepping
-    once on all of it would be a different algorithm with a different effective
-    learning rate, so the round is chopped into their batch shape instead.
-
-    **A round's data is otherwise seen once and thrown away**, and that is what
-    ``value_passes`` exists to change. Measured on 2026-08-15: a fresh value head
-    trained on 32 episodes from a live arm's own checkpoint reaches held-out
-    explained variance of 0.348 under this exact target -- ``_segments`` feeding
-    ``_step(baseline_only=True)`` -- against a clock-only critic's 0.121, while
-    the critic inside the arm that produced those episodes sat at -0.103
-    within-step. The target was not the difference; the number of looks was, 150
-    against one. Each extra pass reshuffles and replays the same round through the
-    value head alone, which is the same call ``--value-warmup`` already makes, so
-    the deviation is in how often it is made rather than in what it does. Their
-    warmup backpropagates through the shared trunk too, so this is not
-    policy-neutral -- monobeast.py:416-418 and ``toad_loss.losses``.
-
-    Args:
-        learner: The network being trained, updated in place.
-        optimizer: Its optimizer.
-        batch: The trajectories collected this round.
-        device: Where to run the learner.
-        field: Which recorded reward series the learner reads.
-        warmup_left: Batches still owed to the value head alone.
-        teacher: The frozen checkpoint to stay near and what it was taught,
-            or None.
-        teacher_kl_cost: Coefficient on that KL.
-        value_passes: Extra value-only passes over the same round, after the
-            policy has taken its one. Zero reproduces every earlier arm exactly.
-        entropy_cost: Coefficient on the entropy loss term.
-        discounting: Gamma the return and advantage targets are built at,
-            passed through to every ``_step`` and ``_value_passes`` call this
-            round makes.
-        lmb: Lambda for both TD(lambda) and UPGO. Their 0.8 for phases 1-4,
-            0.9 for phase 5.
-
-    Returns:
-        The loss terms averaged over the round's policy steps, plus
-        ``baseline_passes`` -- the value loss averaged over the extra passes, or
-        the round's own baseline when there are none -- and the number of batches
-        the policy pass consumed. The extra passes are deliberately absent from
-        that count: it is the warmup budget's clock, and warmup is measured in
-        batches the *policy* did not learn from.
-    """
-    segments = [s for trajectory in batch for s in _segments(trajectory)]
-    totals: dict[str, float] = {}
-    steps = 0
-    for start in range(0, len(segments) - BATCH_SEGMENTS + 1, BATCH_SEGMENTS):
-        terms = _step(
-            learner,
-            optimizer,
-            segments[start : start + BATCH_SEGMENTS],
-            device,
-            field,
-            baseline_only=steps < warmup_left,
-            teacher=teacher,
-            teacher_kl_cost=teacher_kl_cost,
-            entropy_cost=entropy_cost,
-            discounting=discounting,
-            lmb=lmb,
-        )
-        for key, value in terms.items():
-            totals[key] = totals.get(key, 0.0) + value
-        steps += 1
-    means = {key: value / max(steps, 1) for key, value in totals.items()}
-    means["baseline_passes"] = _value_passes(
-        learner,
-        optimizer,
-        segments,
-        device,
-        field,
-        value_passes,
-        discounting=discounting,
-        lmb=lmb,
-    ) or means.get("baseline", 0.0)
-    return means, steps
-
-
-def _value_passes(
-    learner: Policy,
-    optimizer: torch.optim.Optimizer,
-    segments: list[dict[str, torch.Tensor]],
-    device: str,
-    field: str,
-    passes: int,
-    discounting: float = DISCOUNTING,
-    lmb: float = LMB,
-) -> float:
-    """Replay a round through the value head alone and return the mean loss.
-
-    Reshuffled each pass, because the segments arrive ordered by episode and then
-    by turn: walking that order repeatedly would hand the optimizer a sequence of
-    batches drawn from one episode at a time, which is the correlation the
-    ceiling experiment's ``randperm`` did not have.
-
-    Args:
-        learner: The network being trained, updated in place.
-        optimizer: Its optimizer.
-        segments: The round's unrolls.
-        device: Where to run the learner.
-        field: Which recorded reward series the learner reads.
-        passes: How many times to replay. Zero returns 0.0 and touches nothing.
-        discounting: Gamma the value target is built at, same one the policy
-            pass used.
-        lmb: Lambda for the TD(lambda) value target.
-
-    Returns:
-        The mean ``baseline`` loss across every extra batch, or 0.0 if there were
-        none.
-    """
-    total, steps = 0.0, 0
-    for _ in range(passes):
-        order = torch.randperm(len(segments))
-        for start in range(0, len(segments) - BATCH_SEGMENTS + 1, BATCH_SEGMENTS):
-            terms = _step(
-                learner,
-                optimizer,
-                [segments[index] for index in order[start : start + BATCH_SEGMENTS]],
-                device,
-                field,
-                baseline_only=True,
-                discounting=discounting,
-                lmb=lmb,
-            )
-            total += terms["baseline"]
-            steps += 1
-    return total / steps if steps else 0.0
-
-
-def _step(
-    learner: Policy,
-    optimizer: torch.optim.Optimizer,
-    segments: list[dict[str, torch.Tensor]],
-    device: str,
-    field: str,
-    baseline_only: bool = False,
-    teacher: Teacher | None = None,
-    teacher_kl_cost: float = TEACHER_KL_COST,
-    entropy_cost: float = ENTROPY_COST,
-    discounting: float = DISCOUNTING,
-    lmb: float = LMB,
-) -> dict[str, float]:
-    """Take one gradient step on one batch of unrolls.
-
-    Each unroll is re-scored under the learner's current weights, which is what
-    makes the importance ratios meaningful: the batch was played by the actor,
-    and the actor lags.
-
-    Args:
-        learner: The network being trained, updated in place.
-        optimizer: Its optimizer.
-        segments: ``BATCH_SEGMENTS`` unrolls of ``UNROLL_LENGTH`` turns.
-        device: Where to run the learner.
-        field: Which recorded reward series the learner reads.
-        baseline_only: Train the value head alone, excluding the policy gradient
-            and entropy terms from the total.
-        teacher: The frozen checkpoint to stay near and what it was taught,
-            or None.
-        teacher_kl_cost: Coefficient on that KL.
-        entropy_cost: Coefficient on the entropy loss term.
-        discounting: Gamma the return and advantage targets are built at.
-            ``losses``' own default, ``toad_loss.DISCOUNTING``.
-        lmb: Lambda for both TD(lambda) and UPGO, passed to ``toad_loss.losses``.
-
-    Returns:
-        The four loss terms and their total, as floats.
-    """
-
-    def stacked(name: str) -> torch.Tensor:
-        return torch.stack([s[name] for s in segments], dim=1).to(device)
-
-    board = stacked("board")
-    scalars = stacked("scalars")
-    positions = stacked("positions")
-    unit_actions = stacked("unit_actions")
-    unit_quantity_actions = stacked("unit_quantities")
-    market_actions = stacked("market_actions")
-    unit_masks = stacked("unit_masks")
-    unit_quantity_masks = stacked("unit_quantity_masks")
-    market_masks = stacked("market_masks")
-    behaviour = stacked("log_probs")
-    rewards = stacked(field)
-    dones = stacked("dones")
-
-    turns, width = behaviour.shape
-    # The observed fields are one row longer than the acted ones, so this
-    # forwards `turns + 1` states per segment. Only the trailing state's *value*
-    # is wanted -- no action was taken there -- so its logits are sliced off
-    # immediately and its value becomes the bootstrap. monobeast.py:292-296 does
-    # exactly this split.
-    unit_logits, quantity_logits, market_logits, values = learner(
-        board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
-    )
-    values = values.view(turns + 1, width)
-    bootstrap_value = values[-1].detach()
-    values = values[:-1]
-    unit_logits = _acted(unit_logits, turns, width)
-    quantity_logits = _acted(quantity_logits, turns, width)
-    market_logits = _acted(market_logits, turns, width)
-    flat_unit_actions = unit_actions.flatten(0, 1)
-    flat_unit_masks = unit_masks.flatten(0, 1)
-    flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
-    flat_market_masks = market_masks.flatten(0, 1)
-    units = torch.log_softmax(
-        unit_logits.masked_fill(~flat_unit_masks, -torch.inf), dim=-1
-    )
-    quantities = torch.log_softmax(
-        quantity_logits.masked_fill(~flat_quantity_masks, -torch.inf), dim=-1
-    )
-    market = torch.log_softmax(
-        market_logits.masked_fill(~flat_market_masks, -torch.inf), dim=-1
-    )
-    # Which slots spent the bucket they drew. The same rule the rollout stored
-    # its behaviour log-probability under, so the ratio these two form is a
-    # ratio over one action rather than over two different ones.
-    transferred = transfer_slots(flat_unit_actions)
-    learner_log_probs = joint_log_prob(
-        units,
-        quantities,
-        market,
-        flat_unit_actions,
-        unit_quantity_actions.flatten(0, 1),
-        market_actions.flatten(0, 1),
-    ).view(turns, width)
-    # `entropy_of` returns positive entropy; Toad's `combine_policy_entropy`
-    # returns sum p*log p, which is its negation. Feeding the wrong sign trains
-    # the policy to collapse onto one action, which looks like fast progress.
-    #
-    # The quantity head's entropy is zeroed on the slots that spent no bucket,
-    # the same condition its log-probability is under: an entropy bonus there
-    # would pay the head to spread mass over a decision the engine never read.
-    negative_entropy = -(
-        entropy_of(units, flat_unit_masks).sum(dim=-1)
-        + entropy_of(quantities, flat_quantity_masks)
-        .masked_fill(~transferred, 0.0)
-        .sum(dim=-1)
-        + entropy_of(market, flat_market_masks).sum(dim=-1)
-    ).view(turns, width)
-
-    teacher_kl = None
-    if teacher is not None:
-        with torch.no_grad():
-            teacher_units, teacher_quantity, teacher_market, _ = teacher.policy(
-                board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
-            )
-        teacher_kl = _kl(
-            units, _acted(teacher_units, turns, width), flat_unit_masks
-        ).view(turns, width) + _kl(
-            market, _acted(teacher_market, turns, width), flat_market_masks
-        ).view(turns, width)
-        # The quantity head joins the anchor only if the teacher's checkpoint
-        # carried one; otherwise its head is a random initialisation and this
-        # would pull the learner toward noise. Unlike the log-probability, this
-        # term is not conditioned on the sampled op: a KL is a distance between
-        # distributions rather than a score for an action, and holding the head
-        # near the teacher on a slot that happened not to transfer is exactly
-        # the drift the anchor exists to prevent.
-        if teacher.quantity:
-            teacher_kl = teacher_kl + _kl(
-                quantities,
-                _acted(teacher_quantity, turns, width),
-                flat_quantity_masks,
-            ).view(turns, width)
-
-    terms = losses(
-        behaviour_log_probs=behaviour,
-        learner_log_probs=learner_log_probs,
-        negative_entropy=negative_entropy,
-        values=values,
-        # The value of the state *after* the segment's last action, which is
-        # what couples one segment to the next and is the only route by which
-        # the end of the season reaches a target built in the middle of it.
-        bootstrap_value=bootstrap_value,
-        rewards=rewards,
-        dones=dones,
-        discounting=discounting,
-        baseline_only=baseline_only,
-        teacher_kl=teacher_kl,
-        teacher_kl_cost=teacher_kl_cost,
-        entropy_cost=entropy_cost,
-        lmb=lmb,
-    )
-    optimizer.zero_grad(set_to_none=True)
-    terms.total.backward()
-    # monobeast.py:502-505, with their saved runs' clip_grads of 10.0. Without
-    # it this diverges to a loss of 6e20 inside two updates.
-    torch.nn.utils.clip_grad_norm_(learner.parameters(), CLIP_GRADS)
-    optimizer.step()
-    return {
-        "vtrace_pg": terms.vtrace_pg.item(),
-        "upgo_pg": terms.upgo_pg.item(),
-        "baseline": terms.baseline.item(),
-        "entropy": terms.entropy.item(),
-        "teacher": terms.teacher.item(),
-        "total": terms.total.item(),
-    }
 
 
 def _acted(logits: torch.Tensor, turns: int, width: int) -> torch.Tensor:
@@ -1819,22 +1553,7 @@ def _segments(trajectory: Trajectory) -> list[dict[str, torch.Tensor]]:
         One dict per segment, ``ACTED_FIELDS`` carrying ``UNROLL_LENGTH`` rows
         and ``OBSERVED_FIELDS`` carrying one more.
     """
-    turns = int(trajectory.dones.shape[0])
-    return [
-        {
-            **{
-                name: getattr(trajectory, name)[start : start + UNROLL_LENGTH]
-                for name in ACTED_FIELDS
-            },
-            **{
-                name: getattr(trajectory, name)[_observed(turns, start)]
-                for name in OBSERVED_FIELDS
-            },
-        }
-        for start in range(
-            turns % UNROLL_LENGTH, turns - UNROLL_LENGTH + 1, UNROLL_LENGTH
-        )
-    ]
+    return segments(trajectory, UNROLL_LENGTH)
 
 
 def _observed(turns: int, start: int) -> torch.Tensor:

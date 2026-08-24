@@ -463,6 +463,35 @@ def test_a_padded_slot_survives_a_mask_that_forbids_its_clamped_option() -> None
     assert torch.isfinite(gradient).all()
 
 
+def test_joint_log_prob_separates_real_slot_validity_from_action_presence() -> None:
+    """A real slot with no selected action scores neither an op nor a bucket."""
+    transfer = UNIT_OPS.index("PICKUP:WHEAT")
+    unit_logits = torch.randn(1, 3, len(UNIT_OPS), requires_grad=True)
+    quantity_logits = torch.randn(1, 3, 2, requires_grad=True)
+    units = torch.log_softmax(unit_logits, dim=-1)
+    quantities = torch.log_softmax(quantity_logits, dim=-1)
+    market = torch.zeros(1, 1, 1)
+    action = torch.tensor([[IGNORE, transfer, 0]])
+    valid = torch.tensor([[True, False, True]])
+
+    joint = joint_log_prob(
+        units,
+        quantities,
+        market,
+        action,
+        torch.tensor([[0, 1, 0]]),
+        torch.tensor([[0]]),
+        unit_valid=valid,
+    )
+    unit_gradient, quantity_gradient = torch.autograd.grad(
+        joint.sum(), [unit_logits, quantity_logits]
+    )
+
+    torch.testing.assert_close(joint, units[:, 2, 0])
+    assert not unit_gradient[:, :2].any()
+    assert not quantity_gradient.any()
+
+
 def test_the_quantity_term_counts_only_the_units_that_transferred() -> None:
     """One turn, one transferring unit and one that did not -- both scored at once.
 

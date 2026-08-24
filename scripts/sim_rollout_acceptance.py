@@ -34,7 +34,7 @@ def legality_gate(device: torch.device, batch: int, turns: int) -> dict[str, int
     """Collect at least one million masked decisions and require zero illegal."""
     seeds = torch.arange(batch, dtype=torch.int64, device=device) + 300_001
     state = reset(Config(), seeds)
-    _, trajectory = collect_segment(
+    _, _, trajectory = collect_segment(
         state,
         _UniformPolicy().to(device),
         turns=turns,

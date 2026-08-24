@@ -8,7 +8,7 @@ against something outside the run.
 
 It is a separate process on purpose. It never imports from a live run, never
 writes where a run writes, and touches no training script; the only coupling is
-that it reads ``.pt`` files after they appear.
+that it reads completed legacy ``.pt`` or native ``step-N.ckpt`` files.
 
 One process watches every arm. A per-arm process was one wandb run per arm and
 one nice'd python per arm for the same 16 episodes; this takes a list of
@@ -71,7 +71,6 @@ from kaggle_environments.core import Environment
 
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 from kaggriculture.learn import corpus
-from kaggriculture.learn.model import Policy, load_policy_weights
 
 # The eval rollout drives the episode itself so that it can keep observations,
 # but it does not decide anything itself: the masked sampling and the opponent
@@ -91,6 +90,7 @@ from kaggriculture.learn.rollout import (
 )
 from kaggriculture.learn.sales import buy_units, sale_metrics
 from kaggriculture.learn.scripts.gate import SEED_BASE
+from kaggriculture.learn.toad.lightning import PolicyLike, policy_from_checkpoint
 
 LOGGER = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ def watch(prefixes: Sequence[str], banks: np.ndarray) -> None:
         pending = [
             (checkpoint, prefix)
             for prefix in prefixes
-            for checkpoint in RUNS.glob(f"{prefix}_*.pt")
+            for checkpoint in _discover_checkpoints(prefix)
             if checkpoint not in seen
         ]
         if not pending:
@@ -269,7 +269,7 @@ def measure_once(checkpoint: Path, name: str, banks: np.ndarray) -> dict[str, An
     """Measure one checkpoint and publish it as a flat reference line.
 
     Args:
-        checkpoint: The ``.pt`` to load. May be a bare state dict.
+        checkpoint: Native Lightning or retained legacy checkpoint to load.
         name: The wandb run name to publish under.
         banks: The corpus reference distribution.
 
@@ -370,7 +370,7 @@ def evaluate(
     """Play one checkpoint against the scripted opponent and score it.
 
     Args:
-        checkpoint: The ``.pt`` to load.
+        checkpoint: Native Lightning or retained legacy checkpoint to load.
         banks: The corpus reference distribution.
         arm: Which run produced this checkpoint.
         update: The x position this record belongs at.
@@ -392,7 +392,7 @@ def evaluate(
     return {
         "arm": arm,
         "update": update,
-        "checkpoint": checkpoint.name,
+        "checkpoint": _checkpoint_record(checkpoint),
         "eval_bank_mean": mean,
         "eval_bank_max": float(np.max(played.ours)),
         "opponent_bank_mean": float(np.mean(played.theirs)),
@@ -505,7 +505,7 @@ class Games:
     opponent_tally: Tally = field(default_factory=lambda: Tally(seat=OPPONENT_SEAT))
 
 
-def play(policy: Policy, seeds: Sequence[int]) -> Games:
+def play(policy: PolicyLike, seeds: Sequence[int]) -> Games:
     """Play a group of episodes against the scripted opponent, keeping observations.
 
     The lockstep loop of ``rollout_many`` without the trajectory: every
@@ -540,19 +540,24 @@ def play(policy: Policy, seeds: Sequence[int]) -> Games:
         for index, environment in enumerate(environments)
         for seat in tallies
     }
+    states = [None] * len(environments)
+    dones = [False] * len(environments)
     while not environments[0].done:
-        turns = _decide(
+        turns, states = _decide(
             policy,
             [
                 (environment.state[LEARNER].observation, LEARNER)
                 for environment in environments
             ],
             generator,
+            states=states,
+            dones=dones,
         )
         for environment, turn, act in zip(environments, turns, actors, strict=True):
             environment.step(
                 [turn.action, act(_agent_observation(environment, OPPONENT_SEAT))]
             )
+        dones = [environment.done for environment in environments]
         for index, environment in enumerate(environments):
             for seat, tally in tallies.items():
                 seen = snapshot(environment, seat)
@@ -651,37 +656,53 @@ def _terminal_banks(episode: dict) -> list[float]:
     return [float(farm["money"]) for farm in farms]
 
 
-def _load(checkpoint: Path) -> Policy:
+def _load(checkpoint: Path) -> PolicyLike:
     """Return the policy inside a checkpoint, in eval mode.
 
-    The training checkpoints wrap the weights beside the optimizer and counters;
-    the older self-play runs saved the bare state dict. Both are accepted, and
-    the shape is read off the weights rather than assumed, because the arms and
-    the old PPO lineage differ in width.
+    Native checkpoints reconstruct their complete topology from the stored
+    config. Older bare and ``learner`` control-policy layouts remain readable.
 
     Args:
-        checkpoint: The ``.pt`` to load.
+        checkpoint: Native Lightning or retained legacy checkpoint to load.
 
     Returns:
         The policy, ready to play.
     """
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    weights = state["learner"] if "learner" in state else state
-    channels = int(weights["stem.weight"].shape[0])
-    blocks = 1 + max(int(k.split(".")[1]) for k in weights if k.startswith("blocks."))
-    LOGGER.info("%s: %d blocks, %d channels", checkpoint.name, blocks, channels)
-    # ``value_bound`` reshapes nothing and is not a parameter, so it does not
-    # affect loading; the value head is not read during a rollout's action
-    # choice either, which is why the arms and the unbounded PPO lineage can
-    # share one constructor here.
-    policy = Policy(blocks=blocks, channels=channels, value_bound=1.0)
-    load_policy_weights(policy, weights)
-    return policy.eval()
+    policy = policy_from_checkpoint(checkpoint)
+    LOGGER.info("%s: %s", checkpoint.name, type(policy).__name__)
+    return policy
 
 
 def _update_of(checkpoint: Path) -> int:
     """Return the update number encoded in a checkpoint's name."""
-    return int(checkpoint.stem.rsplit("_", 1)[-1])
+    if checkpoint.suffix == ".ckpt" and checkpoint.stem.startswith("step-"):
+        encoded = checkpoint.stem.removeprefix("step-")
+    elif checkpoint.suffix == ".pt":
+        encoded = checkpoint.stem.rsplit("_", 1)[-1]
+    else:
+        raise ValueError(f"unsupported evaluator checkpoint name: {checkpoint.name}")
+    if not encoded.isdigit():
+        raise ValueError(f"checkpoint has no numeric update: {checkpoint.name}")
+    return int(encoded)
+
+
+def _discover_checkpoints(prefix: str) -> Iterator[Path]:
+    """Yield numeric historical and native checkpoints for one run name."""
+    candidates = (*RUNS.glob(f"{prefix}_*.pt"), *(RUNS / prefix).glob("step-*.ckpt"))
+    for checkpoint in candidates:
+        try:
+            _update_of(checkpoint)
+        except ValueError:
+            continue
+        yield checkpoint
+
+
+def _checkpoint_record(checkpoint: Path) -> str:
+    """Return the stable RUNS-relative identifier persisted in eval jsonl."""
+    try:
+        return checkpoint.relative_to(RUNS).as_posix()
+    except ValueError:
+        return checkpoint.name
 
 
 if __name__ == "__main__":

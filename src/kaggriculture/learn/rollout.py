@@ -156,6 +156,7 @@ from kaggriculture.learn.encoding import (
     decode_units,
     encode_board,
     encode_positions,
+    encode_private_belief_target,
     encode_scalars,
     transfer_slots,
     unit_count,
@@ -164,6 +165,7 @@ from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.progress import potential
 from kaggriculture.learn.sales import buy_units, sale_metrics
+from kaggriculture.learn.toad.model import PolicyOutput, PolicyState, StatefulPolicy
 from kaggriculture.learn.toad_reward import (
     Counts,
     counts,
@@ -188,6 +190,27 @@ LOGGER = logging.getLogger(__name__)
 # and the encoders are called with this constant rather than with whatever seat
 # an observation happens to carry.
 LEARNER, OPPONENT = 0, 1
+PolicyLike = Policy | StatefulPolicy
+SamplingGenerator = torch.Generator | Sequence[torch.Generator]
+
+
+@dataclass(frozen=True)
+class RecordedPolicyState:
+    """One detached, unbatched policy state recorded before an observation."""
+
+    hidden: torch.Tensor
+    cell: torch.Tensor
+    prior_belief: torch.Tensor
+
+    @classmethod
+    def from_policy_state(cls, state: PolicyState) -> "RecordedPolicyState":
+        """Detach actor memory and move it beside the CPU trajectory tensors."""
+        detached = state.detach()
+        return cls(
+            hidden=detached.hidden.cpu(),
+            cell=detached.cell.cpu(),
+            prior_belief=detached.prior_belief.cpu(),
+        )
 
 
 @dataclass(frozen=True)
@@ -204,16 +227,17 @@ class Trajectory:
         scalars: ``(turns, SCALARS)`` market and phase features.
         positions: ``(turns, MAX_UNITS)`` flattened tile indices per unit.
         unit_actions: ``(turns, MAX_UNITS)`` sampled op indices, ``IGNORE``
-            in the slots no unit was standing in. That padding is the update's
-            only statement of which slots were real, and it is the same
-            sentinel ``encode_units`` writes, so the behaviour-cloning loss and
-            the PPO loss mask the same slots the same way.
+            in the slots no unit was standing in. ``toad.data.segments``
+            freezes that observation-bounded fact into ``unit_valid`` at the
+            learner boundary, before any test or learner transformation can
+            edit action labels. The sentinel remains the source encoding's
+            statement of absent slots and is shared with behaviour cloning.
         unit_quantities: ``(turns, MAX_UNITS)`` the bucket each unit's quantity
             head sampled, into ``QUANTITIES``. Every slot carries one, padded
             slots included, because the head emits a row for every slot and a
-            masked-out row would softmax to NaN; the padding is stated once, on
-            ``unit_actions``, and a slot spends its bucket only where the op
-            beside it is a ``PICKUP`` or a ``PLACE``.
+            masked-out row would softmax to NaN. Learner-side padding comes
+            from the frozen ``unit_valid`` mask, and a real slot spends its
+            bucket only where the op beside it is a ``PICKUP`` or a ``PLACE``.
         market_actions: ``(turns, len(MARKET_SLOTS) + 2)`` sampled quantity
             buckets. No slot is ever padding here -- bucket 0 is "trade
             nothing", a decision the engine acts on by emitting no order.
@@ -271,6 +295,16 @@ class Trajectory:
             ``progress.progress_reward``.
         dones: ``(turns,)`` bool, True on the last turn alone. A rollout is
             one whole episode, so GAE bootstraps from nothing at the end.
+        hidden: Optional recurrent hidden maps. Production collection stores
+            only the exact segment starts named by ``state_steps``; legacy
+            fixtures may retain one state before every observation plus a
+            trailing state. Stacked recurrence retains its layer axis after
+            the sparse/dense row axis. ``None`` preserves control inputs.
+        cell: Optional recurrent cell maps on the same clock as ``hidden``.
+        prior_belief: Optional prior-belief state on the same clock as
+            ``hidden``.
+        state_steps: Optional acted-row indices for sparse production state.
+            ``None`` identifies the source-compatible dense schema.
         final_margin: This seat's terminal bank minus the other's. Positive is
             a win.
         final_bank: This seat's terminal bank on its own. Not derivable from
@@ -323,6 +357,12 @@ class Trajectory:
     mean_sale_price: float
     realisation: float
     bought: float
+    hidden: torch.Tensor | None = None
+    cell: torch.Tensor | None = None
+    prior_belief: torch.Tensor | None = None
+    state_steps: torch.Tensor | None = None
+    belief_targets: torch.Tensor | None = None
+    belief_valid: torch.Tensor | None = None
 
 
 @dataclass
@@ -359,6 +399,13 @@ class Stream:
     counts: list[Counts] = field(default_factory=list)
     snapshots: list[dict[str, Any]] = field(default_factory=list)
     potentials: list[list[float]] = field(default_factory=list)
+    policy_state: PolicyState | None = None
+    states: list[RecordedPolicyState] = field(default_factory=list)
+    state_steps: list[int] = field(default_factory=list)
+    state_unroll_length: int | None = None
+    belief_targets: list[torch.Tensor] = field(default_factory=list)
+    belief_valid: list[bool] = field(default_factory=list)
+    done: bool = False
 
 
 @dataclass(frozen=True)
@@ -383,9 +430,27 @@ class Turn:
     market_mask: torch.Tensor
     log_prob: torch.Tensor
     value: torch.Tensor
+    policy_state: RecordedPolicyState | None = None
+    belief_target: torch.Tensor | None = None
+    belief_valid: bool = False
 
 
-def rollout(policy: Policy, opponent: Policy | str, seed: int) -> Trajectory:
+def segment_starts(turns: int, unroll_length: int) -> tuple[int, ...]:
+    """Return fixed end-anchored segment starts shared by actor and learner."""
+    if isinstance(turns, bool) or turns < 0:
+        raise ValueError("turn count must be a non-negative integer")
+    if isinstance(unroll_length, bool) or unroll_length <= 0:
+        raise ValueError("unroll length must be a positive integer")
+    return tuple(range(turns % unroll_length, turns - unroll_length + 1, unroll_length))
+
+
+def rollout(
+    policy: PolicyLike,
+    opponent: PolicyLike | str,
+    seed: int,
+    *,
+    state_unroll_length: int | None = None,
+) -> Trajectory:
     """Play one episode from seat 0 and return everything the update needs.
 
     The one-seed case of ``rollout_many``, and seat 0's trajectory out of it.
@@ -402,17 +467,25 @@ def rollout(policy: Policy, opponent: Policy | str, seed: int) -> Trajectory:
         seed: The episode seed, which fixes the weed spawns and the town's
             shop unlock order. The action sampling is seeded from it too, so a
             rollout is reproducible given the weights.
+        state_unroll_length: When set, retain recurrent state only at the
+            end-anchored segment starts consumed by the learner.
 
     Returns:
         The episode's ``Trajectory``, 719 turns long -- ``episodeSteps`` is
         720 and the engine marks the season done on the last one, so there are
         720 recorded states and 719 decisions between them.
     """
-    return rollout_many(policy, opponent, (seed,))[0]
+    return rollout_many(
+        policy, opponent, (seed,), state_unroll_length=state_unroll_length
+    )[0]
 
 
 def rollout_many(
-    policy: Policy, opponent: Policy | str, seeds: Sequence[int]
+    policy: PolicyLike,
+    opponent: PolicyLike | str,
+    seeds: Sequence[int],
+    *,
+    state_unroll_length: int | None = None,
 ) -> list[Trajectory]:
     """Play a group of episodes in lockstep, one forward per turn for all of them.
 
@@ -431,7 +504,10 @@ def rollout_many(
         policy: The network being trained.
         opponent: Another ``Policy``, or a spec the environment can build.
         seeds: One seed per environment in the group. Each seeds its own
-            episode; the first also seeds the group's shared sampling stream.
+            episode and its own sampling stream, so regrouping environments
+            cannot change a game's actions.
+        state_unroll_length: When set, retain recurrent state only at the
+            end-anchored segment starts consumed by the learner.
 
     Returns:
         The group's trajectories, environment-major and seat-minor, so seat 0
@@ -441,7 +517,7 @@ def rollout_many(
         ValueError: If the group's episodes do not all end on the same turn,
             which would leave the recorded streams ragged.
     """
-    generator = torch.Generator().manual_seed(int(seeds[0]))
+    generators = tuple(torch.Generator().manual_seed(int(seed)) for seed in seeds)
     environments = [
         make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed})
         for seed in seeds
@@ -450,18 +526,28 @@ def rollout_many(
         environment.reset(2)
 
     mirror = opponent is policy
+    state_boundaries = (
+        set(segment_starts(EPISODE_STEPS - 1, state_unroll_length))
+        if state_unroll_length is not None
+        else None
+    )
     streams = [
-        Stream(environment=index, seat=seat)
+        Stream(
+            environment=index,
+            seat=seat,
+            state_unroll_length=state_unroll_length,
+        )
         for index in range(len(environments))
         for seat in ((LEARNER, OPPONENT) if mirror else (LEARNER,))
     ]
     actors = (
         ()
-        if isinstance(opponent, Policy)
+        if not isinstance(opponent, str)
         else [_opponent_actor(opponent, environment) for environment in environments]
     )
-
+    opponent_states: list[PolicyState | None] = [None] * len(environments)
     while not environments[0].done:
+        turn_index = len(streams[0].turns)
         for stream in streams:
             seen = _observation(environments, stream.environment, stream.seat)
             stream.margins.append(_margin(seen))
@@ -469,7 +555,7 @@ def rollout_many(
             stream.counts.append(counts(seen, stream.seat))
             stream.snapshots.append(_snapshot(seen))
             stream.potentials.append(potential(seen))
-        turns = _decide(
+        turns, next_states = _decide(
             policy,
             [
                 (
@@ -478,18 +564,31 @@ def rollout_many(
                 )
                 for stream in streams
             ],
-            generator,
+            tuple(generators[stream.environment] for stream in streams),
+            states=[stream.policy_state for stream in streams],
+            dones=[stream.done for stream in streams],
+            belief_observations=_belief_observations(policy, environments, streams),
+            record_states=[state_boundaries is None or turn_index in state_boundaries]
+            * len(streams),
         )
         actions: list[list[Any]] = [[None, None] for _ in environments]
-        for stream, turn in zip(streams, turns, strict=True):
-            stream.turns.append(turn)
+        for stream, turn, next_state in zip(streams, turns, next_states, strict=True):
+            _record_turn(stream, turn, next_state)
             actions[stream.environment][stream.seat] = turn.action
-        for index, action in enumerate(
-            _opponent_actions(policy, opponent, actors, environments, generator)
-        ):
+        opponent_actions, opponent_states = _opponent_actions(
+            policy,
+            opponent,
+            actors,
+            environments,
+            generators,
+            states=opponent_states,
+        )
+        for index, action in enumerate(opponent_actions):
             actions[index][OPPONENT] = action
         for environment, pair in zip(environments, actions, strict=True):
             environment.step(pair)
+        for stream in streams:
+            stream.done = bool(environments[stream.environment].done)
 
     if not all(environment.done for environment in environments):
         raise ValueError(
@@ -506,6 +605,30 @@ def _observation(
 ) -> Mapping[str, Any]:
     """Return one seat's own observation, whose ``private`` mapping it alone sees."""
     return environments[index].state[seat].observation
+
+
+def _belief_observations(
+    policy: PolicyLike, environments: list[Environment], streams: Sequence[Stream]
+) -> list[Mapping[str, Any]] | None:
+    """Return opposing private observations only for an active learner head."""
+    if not isinstance(policy, StatefulPolicy) or not policy.config.belief:
+        return None
+    return [
+        _observation(environments, stream.environment, 1 - stream.seat)
+        for stream in streams
+    ]
+
+
+def _record_turn(stream: Stream, turn: Turn, next_state: PolicyState | None) -> None:
+    """Append one acted row, including only supervision the collector produced."""
+    stream.turns.append(turn)
+    if turn.policy_state is not None:
+        stream.states.append(turn.policy_state)
+        stream.state_steps.append(len(stream.turns) - 1)
+    if turn.belief_target is not None:
+        stream.belief_targets.append(turn.belief_target)
+        stream.belief_valid.append(turn.belief_valid)
+    stream.policy_state = next_state
 
 
 def _agent_observation(environment: Environment, seat: int) -> Mapping[str, Any]:
@@ -553,12 +676,14 @@ def _agent_observation(environment: Environment, seat: int) -> Mapping[str, Any]
 
 
 def _opponent_actions(
-    policy: Policy,
-    opponent: Policy | str,
+    policy: PolicyLike,
+    opponent: PolicyLike | str,
     actors: Sequence[Callable[[Mapping[str, Any]], Any]],
     environments: list[Environment],
-    generator: torch.Generator,
-) -> list[Any]:
+    generator: SamplingGenerator,
+    *,
+    states: Sequence[PolicyState | None],
+) -> tuple[list[Any], list[PolicyState | None]]:
     """Return seat 1's action for every environment in the group.
 
     Three cases. A mirror opponent's seat-1 action came out of the learner's own
@@ -573,30 +698,36 @@ def _opponent_actions(
         opponent: What seat 1 is.
         actors: One built agent per environment, empty for a ``Policy``.
         environments: The group.
-        generator: The sampling stream.
+        generator: One sampling stream per environment, or one shared stream
+            for a single-game caller.
+        states: One opponent state per environment, in environment order.
 
     Returns:
-        One action per environment, or an empty list when seat 1 was already
-        decided by the learner's own forward.
+        One action per environment plus next opponent states, or empty actions
+        when seat 1 was already decided by the learner's own forward.
     """
     if opponent is policy:
-        return []
-    if isinstance(opponent, Policy):
-        return [
-            turn.action
-            for turn in _decide(
-                opponent,
-                [
-                    (_observation(environments, index, OPPONENT), OPPONENT)
-                    for index in range(len(environments))
-                ],
-                generator,
-            )
-        ]
-    return [
-        act(_agent_observation(environments[index], OPPONENT))
-        for index, act in enumerate(actors)
-    ]
+        return [], list(states)
+    if not isinstance(opponent, str):
+        turns, next_states = _decide(
+            opponent,
+            [
+                (_observation(environments, index, OPPONENT), OPPONENT)
+                for index in range(len(environments))
+            ],
+            generator,
+            states=states,
+            dones=[False] * len(environments),
+            record_states=[False] * len(environments),
+        )
+        return [turn.action for turn in turns], next_states
+    return (
+        [
+            act(_agent_observation(environments[index], OPPONENT))
+            for index, act in enumerate(actors)
+        ],
+        list(states),
+    )
 
 
 def _margin(observation: Mapping[str, Any]) -> float:
@@ -669,10 +800,15 @@ def _opponent_actor(
 
 
 def _decide(
-    policy: Policy,
+    policy: PolicyLike,
     requests: Sequence[tuple[Mapping[str, Any], int]],
-    generator: torch.Generator,
-) -> list[Turn]:
+    generator: SamplingGenerator,
+    *,
+    states: Sequence[PolicyState | None] | None = None,
+    dones: Sequence[bool] | None = None,
+    belief_observations: Sequence[Mapping[str, Any]] | None = None,
+    record_states: Sequence[bool] | None = None,
+) -> tuple[list[Turn], list[PolicyState | None]]:
     """Sample one turn's action for every ``(observation, seat)`` in the batch.
 
     Each row is encoded once and every consumer -- both heads, both masks, the
@@ -685,8 +821,8 @@ def _decide(
     The forward runs on whatever device the policy is on and the logits come
     straight back to the CPU. Sampling, masking and storage stay on the CPU
     deliberately: the masks are built there by pure Python, the trajectory is
-    consumed there, and one ``torch.Generator`` then seeds the whole run rather
-    than one per device.
+    consumed there. Each environment retains its seed-keyed sampling stream, so
+    changing the vector group affects neither seat's stochastic trajectory.
 
     Ops for slots past the crew are sampled anyway, because a row of the unit
     head exists for every slot and ``masked_fill`` would leave an all-``-inf``
@@ -707,10 +843,17 @@ def _decide(
         requests: One ``(observation, seat)`` per row. The observation must be
             that seat's own, whose ``private`` mapping is the only one legible
             to it.
-        generator: The sampling stream.
+        generator: One sampling stream per environment. The same stream object
+            is repeated for both seats of a self-play environment.
+        states: One prior state per request, or all ``None`` at episode start.
+        dones: Whether each request follows a terminal action.
+        belief_observations: Optional opposing-seat private observations used
+            only to construct supervision stored beside the policy inputs.
+        record_states: One flag per row selecting whether the input recurrent
+            state is copied into the resulting ``Turn``.
 
     Returns:
-        One ``Turn`` per request, in the order the requests were given.
+        One ``Turn`` and next policy state per request, in request order.
     """
     board = torch.cat([encode_board(*request) for request in requests])
     scalars = torch.cat([encode_scalars(*request) for request in requests])
@@ -718,12 +861,44 @@ def _decide(
     units = torch.cat([unit_mask(*request) for request in requests])
     counts = torch.cat([unit_quantity_mask(*request) for request in requests])
     trades = torch.cat([market_mask(*request) for request in requests])
+    if belief_observations is not None and (
+        not isinstance(policy, StatefulPolicy) or not policy.config.belief
+    ):
+        raise ValueError("belief observations require an active belief head")
+    if belief_observations is not None and len(belief_observations) != len(requests):
+        raise ValueError("one belief observation is required per decision request")
+    belief_targets = (
+        [
+            encode_private_belief_target(observation).tensor
+            for observation in belief_observations
+        ]
+        if belief_observations is not None
+        else [None] * len(requests)
+    )
 
     device = next(policy.parameters()).device
+    current_states = list(states or [None] * len(requests))
+    if len(current_states) != len(requests):
+        raise ValueError("one policy state is required per decision request")
+    prior_dones = list(dones or [False] * len(requests))
+    if len(prior_dones) != len(requests):
+        raise ValueError("one done flag is required per decision request")
+    retained = list(record_states or [True] * len(requests))
+    if len(retained) != len(requests):
+        raise ValueError("one state-retention flag is required per decision request")
     with torch.no_grad():
-        unit_logits, quantity_logits, market_logits, value = policy(
-            board.to(device), scalars.to(device), positions.to(device)
+        output, used_states = _actor_forward(
+            policy,
+            board.to(device),
+            scalars.to(device),
+            positions.to(device),
+            current_states,
+            torch.tensor(prior_dones, dtype=torch.bool, device=device),
         )
+    unit_logits = output.unit_logits
+    quantity_logits = output.quantity_logits
+    market_logits = output.market_logits
+    value = output.values
     unit_logits, quantity_logits, market_logits, value = (
         unit_logits.cpu(),
         quantity_logits.cpu(),
@@ -742,6 +917,7 @@ def _decide(
     for row, request in enumerate(requests):
         count = unit_count(*request)
         rows = slice(row, row + 1)
+        used_state = used_states[row]
         action = decode_units(
             _one_hot(chosen_units[rows], unit_logits.shape[-1]),
             _one_hot(chosen_quantities[rows], quantity_logits.shape[-1]),
@@ -779,13 +955,98 @@ def _decide(
                     + market_log[rows].sum(dim=1)
                 ),
                 value=value[rows],
+                policy_state=(
+                    RecordedPolicyState.from_policy_state(used_state)
+                    if used_state is not None and retained[row]
+                    else None
+                ),
+                belief_target=belief_targets[row],
+                belief_valid=belief_targets[row] is not None,
             )
         )
-    return turns
+    next_states = _unbatch_policy_state(output.state)
+    return turns, next_states or [None] * len(requests)
+
+
+def _actor_forward(
+    policy: PolicyLike,
+    board: torch.Tensor,
+    scalars: torch.Tensor,
+    positions: torch.Tensor,
+    states: Sequence[PolicyState | None],
+    dones: torch.Tensor,
+) -> tuple[PolicyOutput, list[PolicyState | None]]:
+    """Normalize bare and recurrent actor forwards without changing sampling."""
+    if isinstance(policy, StatefulPolicy):
+        state = _batch_policy_state(states)
+        if state is None:
+            state = policy.initial_state(len(states), like=board)
+        output = policy(
+            board.unsqueeze(0),
+            scalars.unsqueeze(0),
+            positions.unsqueeze(0),
+            state=state,
+            dones=dones.unsqueeze(0),
+        )
+        used = _unbatch_policy_state(output.input_state)
+        if not used:
+            used = [None] * len(states)
+        return (
+            PolicyOutput(
+                output.unit_logits.squeeze(0),
+                output.quantity_logits.squeeze(0),
+                output.market_logits.squeeze(0),
+                output.values.squeeze(0),
+                (
+                    output.belief_logits.squeeze(0)
+                    if output.belief_logits is not None
+                    else None
+                ),
+                output.state,
+                output.input_state,
+            ),
+            used,
+        )
+    unit, quantity, market, values = policy(board, scalars, positions)
+    return PolicyOutput(unit, quantity, market, values, None, None), [None] * len(
+        states
+    )
+
+
+def _batch_policy_state(states: Sequence[PolicyState | None]) -> PolicyState | None:
+    """Batch stable stream-ordered states, retaining an optional layer axis."""
+    if all(state is None for state in states):
+        return None
+    if any(state is None for state in states):
+        raise ValueError("policy states must be either all present or all absent")
+    present = [state for state in states if state is not None]
+    layer_dimension = 1 if present[0].hidden.ndim == 4 else 0
+    return PolicyState(
+        hidden=torch.stack([state.hidden for state in present], dim=layer_dimension),
+        cell=torch.stack([state.cell for state in present], dim=layer_dimension),
+        prior_belief=torch.stack([state.prior_belief for state in present]),
+    )
+
+
+def _unbatch_policy_state(state: PolicyState | None) -> list[PolicyState | None]:
+    """Split a policy state into stable stream order for the next actor step."""
+    if state is None:
+        return []
+    batch = state.hidden.shape[1] if state.hidden.ndim == 5 else state.hidden.shape[0]
+    return [
+        PolicyState(
+            hidden=(
+                state.hidden[:, row] if state.hidden.ndim == 5 else state.hidden[row]
+            ),
+            cell=(state.cell[:, row] if state.cell.ndim == 5 else state.cell[row]),
+            prior_belief=state.prior_belief[row],
+        ).detach()
+        for row in range(batch)
+    ]
 
 
 def _sample(
-    logits: torch.Tensor, mask: torch.Tensor, generator: torch.Generator
+    logits: torch.Tensor, mask: torch.Tensor, generator: SamplingGenerator
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return one index per row and its log-probability, sampled under the mask.
 
@@ -803,14 +1064,34 @@ def _sample(
     Args:
         logits: ``(1, slots, options)`` head output.
         mask: ``(1, slots, options)`` bool, True where the option is legal.
-        generator: The sampling stream.
+        generator: One sampling stream per environment, or one shared stream.
 
     Returns:
         ``(1, slots)`` int64 indices and ``(1, slots)`` float log-probabilities.
     """
     log_probs = torch.log_softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
     rows = log_probs.flatten(0, -2)
-    chosen = torch.multinomial(rows.exp(), 1, generator=generator)
+    if isinstance(generator, torch.Generator):
+        chosen = torch.multinomial(rows.exp(), 1, generator=generator)
+    else:
+        if len(generator) != logits.shape[0]:
+            raise ValueError("one sampling generator is required per environment")
+        sampled = []
+        start = 0
+        while start < len(generator):
+            row_generator = generator[start]
+            end = start + 1
+            while end < len(generator) and generator[end] is row_generator:
+                end += 1
+            sampled.append(
+                torch.multinomial(
+                    log_probs[start:end].flatten(0, -2).exp(),
+                    1,
+                    generator=row_generator,
+                )
+            )
+            start = end
+        chosen = torch.cat(sampled)
     return (
         chosen.reshape(logits.shape[:-1]),
         rows.gather(1, chosen).reshape(logits.shape[:-1]),
@@ -879,6 +1160,9 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     unit_masks = torch.cat([turn.unit_mask for turn in turns])
     unit_quantity_masks = torch.cat([turn.quantity_mask for turn in turns])
     market_masks = torch.cat([turn.market_mask for turn in turns])
+    recurrent = list(stream.states)
+    if stream.state_unroll_length is None and stream.policy_state is not None:
+        recurrent.append(RecordedPolicyState.from_policy_state(stream.policy_state))
     return Trajectory(
         board=torch.cat([turn.board for turn in turns]),
         scalars=torch.cat([turn.scalars for turn in turns]),
@@ -917,6 +1201,28 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         mean_sale_price=sold["mean_sale_price"],
         realisation=sold["price_realisation"],
         bought=buy_units(snapshots, stream.seat),
+        hidden=(
+            torch.stack([state.hidden for state in recurrent]) if recurrent else None
+        ),
+        cell=(torch.stack([state.cell for state in recurrent]) if recurrent else None),
+        prior_belief=(
+            torch.stack([state.prior_belief for state in recurrent])
+            if recurrent
+            else None
+        ),
+        state_steps=(
+            torch.tensor(stream.state_steps, dtype=torch.int64)
+            if recurrent and stream.state_unroll_length is not None
+            else None
+        ),
+        belief_targets=(
+            torch.stack(stream.belief_targets) if stream.belief_targets else None
+        ),
+        belief_valid=(
+            torch.tensor(stream.belief_valid, dtype=torch.bool)
+            if stream.belief_valid
+            else None
+        ),
     )
 
 

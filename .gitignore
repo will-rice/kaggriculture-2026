@@ -238,6 +238,9 @@ wandb/
 # tree — but it is a 40 MB build artifact of a run recorded in wandb, not
 # source, and committing it would put a binary blob in every diff.
 *.pt
+# This small, deterministic CPU control freezes the Toad optimizer boundary.
+!tests/learn/fixtures/
+!tests/learn/fixtures/toad_control_batch.pt
 
 # The prototype store, for the same reason. `routes.scripts.harvest` writes
 # src/kaggriculture/routes/prototypes.json.gz out of the 107 GB replay corpus

@@ -1,6 +1,6 @@
 """On-device rollout utilities for the batched simulator."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,11 +14,33 @@ from kaggriculture.constants import (
     SHED_CAPACITY,
 )
 from kaggriculture.learn.encoding import (
+    CARRIED_SCALE,
     IGNORE,
     MAX_UNITS,
     QUANTITIES,
+    SEED_SCALE,
     TRANSFER_OPS,
     UNIT_OPS,
+)
+from kaggriculture.learn.rollout import segment_starts
+from kaggriculture.learn.toad.model import (
+    PolicyOutput,
+    PolicyState,
+    StatefulPolicy,
+    uses_stateful_policy,
+)
+from kaggriculture.learn.toad_reward import (
+    ABSOLUTE_WEIGHT,
+    CAPITAL_WEIGHT,
+    CITY_WEIGHT,
+    FUEL_WEIGHT,
+    GAME_RESULT_WEIGHT,
+    MARGIN_WEIGHT,
+    MONEY_WEIGHT,
+    NORMALISER,
+    RESEARCH_WEIGHT,
+    STEP_WEIGHT,
+    UNIT_WEIGHT,
 )
 from kaggriculture.sim.decode import decode_market_buckets
 from kaggriculture.sim.engine import (
@@ -41,6 +63,7 @@ from kaggriculture.sim.tensors import tensor_constant
 
 GROWING = 0.4
 ScriptedOpponent = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+SamplingGenerator = torch.Generator | Sequence[torch.Generator]
 
 _MARKET_TYPES = {
     "SELL": (1, PRODUCT_NAMES),
@@ -48,6 +71,22 @@ _MARKET_TYPES = {
     "BUY_PRODUCT": (3, ("WHEAT", "FERTILIZER")),
     "BUY_ANIMAL": (4, ANIMAL_NAMES),
 }
+
+
+@dataclass(frozen=True)
+class RolloutPolicyState:
+    """Actor memories carried between segments with a distinct neural opponent.
+
+    Self-play owns one state over both flattened seats and scripted collection
+    owns only the learner state, so those paths keep returning ``PolicyState``
+    exactly as before.  Frozen and teacher collection run two policy objects;
+    this container prevents the opponent memory from being silently restarted
+    at every source segment while retaining the same three-value return.
+    """
+
+    learner: PolicyState | None
+    opponent: PolicyState | None = None
+
 
 # `potential` runs twice per collected turn, so its six price tables are frozen
 # here and handed to `tensor_constant` rather than rebuilt with `torch.tensor`
@@ -116,9 +155,30 @@ class Trajectory:
     values: torch.Tensor
     rewards: torch.Tensor
     own: torch.Tensor
+    shaped: torch.Tensor
+    shaped_money: torch.Tensor
+    margin: torch.Tensor
+    sparse: torch.Tensor
     potentials: torch.Tensor
     dones: torch.Tensor
     illegal: torch.Tensor
+    hidden: torch.Tensor | None = None
+    cell: torch.Tensor | None = None
+    prior_belief: torch.Tensor | None = None
+    state_steps: torch.Tensor | None = None
+    belief_targets: torch.Tensor | None = None
+    belief_valid: torch.Tensor | None = None
+    final_margin: torch.Tensor | None = None
+    final_bank: torch.Tensor | None = None
+    final_capital: torch.Tensor | None = None
+    illegal_by_stream: torch.Tensor | None = None
+    sales: torch.Tensor | None = None
+    units_sold: torch.Tensor | None = None
+    mean_sale_price: torch.Tensor | None = None
+    realisation: torch.Tensor | None = None
+    bought: torch.Tensor | None = None
+    sale_proceeds: torch.Tensor | None = None
+    sale_market_value: torch.Tensor | None = None
 
 
 def potential(state: SimState, seat: int) -> torch.Tensor:
@@ -169,11 +229,33 @@ def potential(state: SimState, seat: int) -> torch.Tensor:
 
 
 def _sample(
-    logits: torch.Tensor, mask: torch.Tensor, generator: torch.Generator | None
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    generator: SamplingGenerator | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     log_prob = torch.log_softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
     flat = log_prob.flatten(0, -2)
-    chosen = torch.multinomial(flat.exp(), 1, generator=generator)
+    if generator is None or isinstance(generator, torch.Generator):
+        chosen = torch.multinomial(flat.exp(), 1, generator=generator)
+    else:
+        if len(generator) != logits.shape[0]:
+            raise ValueError("one sampling generator is required per environment")
+        sampled = []
+        start = 0
+        while start < len(generator):
+            row_generator = generator[start]
+            end = start + 1
+            while end < len(generator) and generator[end] is row_generator:
+                end += 1
+            sampled.append(
+                torch.multinomial(
+                    log_prob[start:end].flatten(0, -2).exp(),
+                    1,
+                    generator=row_generator,
+                )
+            )
+            start = end
+        chosen = torch.cat(sampled)
     return (
         chosen.reshape(logits.shape[:-1]),
         flat.gather(1, chosen).reshape(logits.shape[:-1]),
@@ -412,7 +494,16 @@ def scripted_actions(
     )
     markets = MarketActions.empty(state.batch_size, device=device)
     for batch in range(state.batch_size):
-        encoded = encode_turn(opponent(unpack(state, batch, seat)))
+        try:
+            encoded = encode_turn(opponent(unpack(state, batch, seat)))
+        except Exception as error:
+            from kaggriculture.learn.toad.data import CollectionRowError
+
+            raise CollectionRowError(
+                row=batch,
+                error_type=type(error).__name__,
+                message=str(error),
+            ) from error
         for unit, op in enumerate(encoded.units):
             units[batch, unit] = op
         for unit, quantity in enumerate(encoded.quantities):
@@ -424,14 +515,180 @@ def scripted_actions(
     return units, quantities, markets
 
 
+def _policy_forward(
+    policy: torch.nn.Module,
+    board: torch.Tensor,
+    scalars: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    state: PolicyState | None,
+    dones: torch.Tensor,
+) -> PolicyOutput:
+    """Normalize one actor step onto the accepted stateful output contract."""
+    if isinstance(policy, StatefulPolicy) and uses_stateful_policy(policy.config):
+        output = policy(
+            board.unsqueeze(0),
+            scalars.unsqueeze(0),
+            positions.unsqueeze(0),
+            state=state,
+            dones=dones.unsqueeze(0),
+        )
+        return PolicyOutput(
+            output.unit_logits.squeeze(0),
+            output.quantity_logits.squeeze(0),
+            output.market_logits.squeeze(0),
+            output.values.squeeze(0),
+            (
+                output.belief_logits.squeeze(0)
+                if output.belief_logits is not None
+                else None
+            ),
+            output.state,
+            output.input_state,
+        )
+    if state is not None:
+        raise ValueError("a stateless policy cannot consume PolicyState")
+    output = policy(board, scalars, positions)
+    if isinstance(output, PolicyOutput):
+        return output
+    unit, quantity, market, values = output
+    return PolicyOutput(unit, quantity, market, values, None, None)
+
+
+def _reshape_state_rows(state: PolicyState, batch: int, seats: int) -> PolicyState:
+    """Restore environment/seat axes on one flattened actor state."""
+    if state.hidden.ndim == 5:
+        hidden = state.hidden.reshape(
+            state.hidden.shape[0], batch, seats, *state.hidden.shape[2:]
+        )
+        cell = state.cell.reshape(
+            state.cell.shape[0], batch, seats, *state.cell.shape[2:]
+        )
+    else:
+        hidden = state.hidden.reshape(batch, seats, *state.hidden.shape[1:])
+        cell = state.cell.reshape(batch, seats, *state.cell.shape[1:])
+    return PolicyState(
+        hidden=hidden,
+        cell=cell,
+        prior_belief=state.prior_belief.reshape(batch, seats, -1),
+    )
+
+
+def copy_policy_state_(target: PolicyState, source: PolicyState) -> PolicyState:
+    """Copy successor actor state into stable buffers for CUDA graph replay."""
+    target.hidden.copy_(source.hidden)
+    target.cell.copy_(source.cell)
+    target.prior_belief.copy_(source.prior_belief)
+    return target
+
+
+_PRODUCT_SHED_INDICES = tuple(SHED_NAMES.index(name) for name in PRODUCT_NAMES)
+_ANIMAL_SHED_INDICES = tuple(SHED_NAMES.index(name) for name in ANIMAL_NAMES)
+_FUEL_SHED_INDICES = tuple(
+    index for index, name in enumerate(SHED_NAMES) if name not in ANIMAL_NAMES
+)
+
+
+@dataclass(frozen=True)
+class _TensorCounts:
+    """The Toad reward counts for both seats of every tensor environment."""
+
+    city: torch.Tensor
+    unit: torch.Tensor
+    research: torch.Tensor
+    fuel: torch.Tensor
+    capital: torch.Tensor
+    money: torch.Tensor
+    opponent: torch.Tensor
+
+
+def _tensor_counts(state: SimState) -> _TensorCounts:
+    """Read reward counts without decoding a simulator row on the host."""
+    device = state.step.device
+    animal_indices = tensor_constant(
+        _ANIMAL_SHED_INDICES, dtype=torch.int64, device=device
+    )
+    fuel_indices = tensor_constant(_FUEL_SHED_INDICES, dtype=torch.int64, device=device)
+    unlocked = (state.kind != 1).sum(dim=(-2, -1))
+    plants = (state.kind == 3).sum(dim=(-2, -1))
+    herd = state.shed.index_select(-1, animal_indices).sum(dim=-1)
+    placed = (state.occupant > 0).sum(dim=(-2, -1))
+    return _TensorCounts(
+        city=(unlocked + plants).to(torch.float32),
+        unit=(state.hand_count + 1).to(torch.float32),
+        research=state.shop_count[:, None].expand(-1, 2).to(torch.float32),
+        fuel=state.shed.index_select(-1, fuel_indices).sum(dim=-1).to(torch.float32),
+        capital=(herd + placed).to(torch.float32),
+        money=state.money.to(torch.float32),
+        opponent=state.money.flip(1).to(torch.float32),
+    )
+
+
+def _toad_rewards(
+    before: _TensorCounts,
+    after: _TensorCounts,
+    terminal: torch.Tensor,
+    *,
+    money_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return shaped, faithful-shaped, margin, and sparse rewards on-device."""
+    result = torch.sign(after.money - after.opponent) * terminal[:, None]
+    shaped_base = (
+        CITY_WEIGHT * (after.city - before.city)
+        + UNIT_WEIGHT * (after.unit - before.unit)
+        + RESEARCH_WEIGHT * (after.research - before.research)
+        + CAPITAL_WEIGHT * (after.capital - before.capital)
+        + FUEL_WEIGHT * (after.fuel - before.fuel).clamp_min(0)
+        + STEP_WEIGHT
+    )
+    terminal_reward = GAME_RESULT_WEIGHT * result
+    shaped = (shaped_base + terminal_reward) / NORMALISER
+    shaped_money = (
+        shaped_base + money_weight * (after.money - before.money) + terminal_reward
+    ) / NORMALISER
+    margin = (
+        MARGIN_WEIGHT
+        * ((after.money - after.opponent) - (before.money - before.opponent))
+        + ABSOLUTE_WEIGHT * (after.capital - before.capital)
+        + terminal_reward
+    ) / NORMALISER
+    return shaped, shaped_money, margin, result
+
+
+def belief_targets(state: SimState) -> torch.Tensor:
+    """Return opposing-private labels for both acting seats, entirely on-device."""
+    device = state.step.device
+    product_indices = tensor_constant(
+        _PRODUCT_SHED_INDICES, dtype=torch.int64, device=device
+    )
+    targets = []
+    for seat in range(2):
+        opponent = 1 - seat
+        shed = state.shed[:, opponent].to(torch.float32) / SHED_CAPACITY
+        seeds = state.seeds[:, opponent].to(torch.float32) / SEED_SCALE
+        carried = (
+            state.inv_count[:, opponent]
+            .index_select(-1, product_indices)
+            .sum(dim=1)
+            .to(torch.float32)
+            / CARRIED_SCALE
+        )
+        targets.append(torch.cat((shed, seeds, carried), dim=-1))
+    return torch.stack(targets, dim=1)
+
+
 def collect_segment(
     state: SimState,
     policy: torch.nn.Module,
     *,
+    policy_state: PolicyState | RolloutPolicyState | None = None,
     turns: int = 32,
-    generator: torch.Generator | None = None,
+    state_unroll_length: int | None = None,
+    money_weight: float = MONEY_WEIGHT,
+    generator: SamplingGenerator | None = None,
     opponent: ScriptedOpponent | None = None,
-) -> tuple[SimState, Trajectory]:
+    opponent_policy: torch.nn.Module | None = None,
+) -> tuple[SimState, PolicyState | RolloutPolicyState | None, Trajectory]:
     """Collect a fixed-length segment, optionally bridging a scripted seat 1.
 
     With ``opponent=None`` the whole body is device work and holds no
@@ -443,8 +700,9 @@ def collect_segment(
     buffers inside the captured region, otherwise every replay recomputes the
     same turn from unchanged inputs; and ``generator`` must either be ``None``,
     for the default CUDA generator that ``torch.cuda.graph`` registers itself,
-    or a CUDA generator the caller registered with the graph. A CPU generator
-    never reaches these tensors.
+    or a CUDA generator the caller registered with the graph. Per-environment
+    generators preserve game-keyed eager sampling but are not a graph-capture
+    mode. A CPU generator never reaches these tensors.
 
     A scripted ``opponent`` is the exception, and it is not one that can be
     removed: ``scripted_actions`` reads each row's state on the host and asks a
@@ -473,14 +731,37 @@ def collect_segment(
     Args:
         state: The batch to advance. Left untouched; the successor is returned.
         policy: The network, called once per turn with both seats batched.
+        policy_state: Recurrent actor state carried into the first observation.
+            A distinct neural opponent returns ``RolloutPolicyState`` so both
+            policy objects' memories cross the next segment boundary.
         turns: Turns to collect. Every turn is recorded.
-        generator: The sampling stream, or ``None`` for the device default.
-        opponent: A scripted seat 1, or ``None`` for self-play on the policy.
+        state_unroll_length: Learner unroll length whose exact segment starts
+            determine the sparse entry-state rows retained in the trajectory.
+        money_weight: Curriculum coefficient for the faithful shaped reward.
+        generator: One sampling stream per environment, one shared stream, or
+            ``None`` for the device default.
+        opponent: A scripted seat 1, or ``None`` for a neural seat.
+        opponent_policy: A distinct frozen/teacher seat 1 policy. Mutually
+            exclusive with ``opponent``; when both are absent, self-play uses
+            ``policy`` for both seats in the same forward.
 
     Returns:
-        The state after ``turns`` turns, and the segment's ``Trajectory``. Every
-        field of it is a device tensor, ``illegal`` included.
+        The state after ``turns`` turns, successor policy state, and the
+        segment's ``Trajectory``. Every populated field is a device tensor,
+        ``illegal`` included.
     """
+    if opponent is not None and opponent_policy is not None:
+        raise ValueError("scripted and neural opponents are mutually exclusive")
+    if isinstance(policy_state, RolloutPolicyState):
+        if opponent_policy is None:
+            raise ValueError(
+                "combined rollout state requires a distinct neural opponent"
+            )
+        learner_policy_state = policy_state.learner
+        opponent_policy_state = policy_state.opponent
+    else:
+        learner_policy_state = policy_state
+        opponent_policy_state = None
     records: dict[str, list[torch.Tensor]] = {
         name: []
         for name in (
@@ -497,13 +778,35 @@ def collect_segment(
             "values",
             "rewards",
             "own",
+            "shaped",
+            "shaped_money",
+            "margin",
+            "sparse",
             "potentials",
             "dones",
         )
     }
     device = state.step.device
     illegal_count = torch.zeros((), dtype=torch.int64, device=device)
-    for _ in range(turns):
+    retained_steps = (
+        set(segment_starts(turns, state_unroll_length))
+        if state_unroll_length is not None
+        else {0}
+    )
+    retained_states: list[PolicyState] = []
+    retained_indices: list[int] = []
+    target_records: list[torch.Tensor] = []
+    target_valid_records: list[torch.Tensor] = []
+    stream_illegal = torch.zeros(
+        (state.batch_size, 2), dtype=torch.int64, device=device
+    )
+    sales = torch.zeros((state.batch_size, 2), dtype=torch.float32, device=device)
+    units_sold = torch.zeros_like(sales)
+    proceeds = torch.zeros_like(sales)
+    market_value = torch.zeros_like(sales)
+    bought = torch.zeros_like(sales)
+    actor_seats = 2 if opponent is None and opponent_policy is None else 1
+    for turn in range(turns):
         observed = [observe(state, seat) for seat in range(2)]
         boards = torch.stack([value[0] for value in observed], dim=1)
         scalars = torch.stack([value[1] for value in observed], dim=1)
@@ -514,20 +817,103 @@ def collect_segment(
         market_masks = torch.stack([value[2] for value in masks], dim=1)
         batch = state.batch_size
         with torch.no_grad():
-            unit_logits, quantity_logits, market_logits, values = policy(
-                boards.flatten(0, 1),
-                scalars.flatten(0, 1),
-                positions.flatten(0, 1),
+            output = _policy_forward(
+                policy,
+                boards[:, :actor_seats].flatten(0, 1),
+                scalars[:, :actor_seats].flatten(0, 1),
+                positions[:, :actor_seats].flatten(0, 1),
+                state=learner_policy_state,
+                dones=state.done[:, None].expand(-1, actor_seats).flatten(0, 1),
             )
-        unit_logits = unit_logits.reshape(batch, 2, *unit_logits.shape[1:])
-        quantity_logits = quantity_logits.reshape(batch, 2, *quantity_logits.shape[1:])
-        market_logits = market_logits.reshape(batch, 2, *market_logits.shape[1:])
-        values = values.reshape(batch, 2, -1).squeeze(-1)
-        chosen_units, unit_log = _sample(unit_logits, unit_masks, generator)
-        chosen_quantities, quantity_log = _sample(
-            quantity_logits, quantity_masks, generator
+        learner_policy_state = output.state
+        unit_logits = output.unit_logits
+        quantity_logits = output.quantity_logits
+        market_logits = output.market_logits
+        values = output.values
+        if turn in retained_steps and output.input_state is not None:
+            retained_states.append(
+                _reshape_state_rows(output.input_state, batch, actor_seats)
+            )
+            retained_indices.append(turn)
+        if output.belief_logits is not None:
+            target_records.append(belief_targets(state)[:, :actor_seats])
+            target_valid_records.append(
+                torch.ones((batch, actor_seats), dtype=torch.bool, device=device)
+            )
+        unit_logits = unit_logits.reshape(batch, actor_seats, *unit_logits.shape[1:])
+        quantity_logits = quantity_logits.reshape(
+            batch, actor_seats, *quantity_logits.shape[1:]
         )
-        chosen_market, market_log = _sample(market_logits, market_masks, generator)
+        market_logits = market_logits.reshape(
+            batch, actor_seats, *market_logits.shape[1:]
+        )
+        values = values.reshape(batch, actor_seats, -1).squeeze(-1)
+        main_units, main_unit_log = _sample(
+            unit_logits, unit_masks[:, :actor_seats], generator
+        )
+        main_quantities, main_quantity_log = _sample(
+            quantity_logits, quantity_masks[:, :actor_seats], generator
+        )
+        main_market, main_market_log = _sample(
+            market_logits, market_masks[:, :actor_seats], generator
+        )
+        chosen_units = torch.full(
+            (batch, 2, MAX_UNITS),
+            UNIT_OPS.index("PASS"),
+            dtype=main_units.dtype,
+            device=device,
+        )
+        chosen_quantities = torch.zeros(
+            (batch, 2, MAX_UNITS), dtype=main_quantities.dtype, device=device
+        )
+        chosen_market = torch.zeros(
+            (batch, 2, market_masks.shape[2]),
+            dtype=main_market.dtype,
+            device=device,
+        )
+        unit_log = torch.zeros(
+            (batch, 2, MAX_UNITS), dtype=main_unit_log.dtype, device=device
+        )
+        quantity_log = torch.zeros_like(unit_log)
+        market_log = torch.zeros(
+            (batch, 2, market_masks.shape[2]),
+            dtype=main_market_log.dtype,
+            device=device,
+        )
+        stored_values = torch.zeros((batch, 2), dtype=values.dtype, device=device)
+        chosen_units[:, :actor_seats].copy_(main_units)
+        chosen_quantities[:, :actor_seats].copy_(main_quantities)
+        chosen_market[:, :actor_seats].copy_(main_market)
+        unit_log[:, :actor_seats].copy_(main_unit_log)
+        quantity_log[:, :actor_seats].copy_(main_quantity_log)
+        market_log[:, :actor_seats].copy_(main_market_log)
+        stored_values[:, :actor_seats].copy_(values)
+        if opponent_policy is not None:
+            with torch.no_grad():
+                opponent_output = _policy_forward(
+                    opponent_policy,
+                    boards[:, 1],
+                    scalars[:, 1],
+                    positions[:, 1],
+                    state=opponent_policy_state,
+                    dones=state.done,
+                )
+            opponent_policy_state = opponent_output.state
+            opponent_units, opponent_unit_log = _sample(
+                opponent_output.unit_logits, unit_masks[:, 1], generator
+            )
+            opponent_quantities, opponent_quantity_log = _sample(
+                opponent_output.quantity_logits, quantity_masks[:, 1], generator
+            )
+            opponent_market, opponent_market_log = _sample(
+                opponent_output.market_logits, market_masks[:, 1], generator
+            )
+            chosen_units[:, 1].copy_(opponent_units)
+            chosen_quantities[:, 1].copy_(opponent_quantities)
+            chosen_market[:, 1].copy_(opponent_market)
+            unit_log[:, 1].copy_(opponent_unit_log)
+            quantity_log[:, 1].copy_(opponent_quantity_log)
+            market_log[:, 1].copy_(opponent_market_log)
         market_orders = decode_market_buckets(chosen_market)
         # Buckets are what the head sampled and what the trajectory stores; the
         # engine is handed the quantities they stand for. The lookup is a
@@ -569,6 +955,10 @@ def collect_segment(
         before_potential = torch.stack(
             (potential(state, 0), potential(state, 1)), dim=1
         )
+        before_counts = _tensor_counts(state)
+        before_shed = state.shed
+        before_prices = state.prices
+        before_done = state.done
         next_state = step(
             state,
             chosen_units.to(torch.int16),
@@ -577,6 +967,14 @@ def collect_segment(
         )
         after_money = next_state.money
         after_margin = after_money - after_money.flip(1)
+        after_counts = _tensor_counts(next_state)
+        terminal = ~before_done & next_state.done
+        shaped, shaped_money, margin, sparse = _toad_rewards(
+            before_counts,
+            after_counts,
+            terminal,
+            money_weight=money_weight,
+        )
         records["board"].append(boards)
         records["scalars"].append(scalars)
         records["positions"].append(positions)
@@ -587,33 +985,108 @@ def collect_segment(
         records["unit_quantity_masks"].append(quantity_masks)
         records["market_masks"].append(market_masks)
         records["log_probs"].append(joint_log)
-        records["values"].append(values)
+        records["values"].append(stored_values)
         records["rewards"].append((after_margin - before_margin).to(torch.float32))
         records["own"].append((after_money - before_money).to(torch.float32))
+        records["shaped"].append(shaped)
+        records["shaped_money"].append(shaped_money)
+        records["margin"].append(margin)
+        records["sparse"].append(sparse)
         records["potentials"].append(before_potential)
         records["dones"].append(next_state.done[:, None].expand(-1, 2))
         checked_seats = slice(0, 1) if opponent is not None else slice(None)
-        illegal_count.add_(
-            (
-                ~unit_masks[:, checked_seats]
-                .gather(-1, chosen_units[:, checked_seats, ..., None])
-                .squeeze(-1)
-                & alive[:, checked_seats]
-            ).sum()
+        per_stream_illegal = (
+            (~unit_masks.gather(-1, chosen_units[..., None]).squeeze(-1) & alive).sum(
+                dim=-1
+            )
             + (
-                ~quantity_masks[:, checked_seats]
-                .gather(-1, chosen_quantities[:, checked_seats, ..., None])
-                .squeeze(-1)
-            ).sum()
-            + (
-                ~market_masks[:, checked_seats]
-                .gather(-1, chosen_market[:, checked_seats, ..., None])
-                .squeeze(-1)
-            ).sum()
+                ~quantity_masks.gather(-1, chosen_quantities[..., None]).squeeze(-1)
+            ).sum(dim=-1)
+            + (~market_masks.gather(-1, chosen_market[..., None]).squeeze(-1)).sum(
+                dim=-1
+            )
         )
+        stream_illegal.add_(per_stream_illegal)
+        illegal_count.add_(per_stream_illegal[:, checked_seats].sum())
+
+        product_indices = tensor_constant(
+            _PRODUCT_SHED_INDICES, dtype=torch.int64, device=device
+        )
+        shed_before = before_shed.index_select(-1, product_indices)
+        shed_after = next_state.shed.index_select(-1, product_indices)
+        sold = (shed_before - shed_after).clamp_min(0)
+        gained = (after_money - before_money) > 0
+        sold = sold * gained[..., None]
+        sales.add_((sold > 0).sum(dim=-1))
+        units_sold.add_(sold.sum(dim=-1))
+        proceeds.add_((after_money - before_money).clamp_min(0))
+        market_value.add_(
+            (sold.to(torch.float32) * before_prices[:, None].to(torch.float32)).sum(
+                dim=-1
+            )
+        )
+        shed_increase = (next_state.shed - before_shed).clamp_min(0).sum(dim=-1)
+        bought.add_(shed_increase * ((after_money - before_money) < 0))
         state = next_state
+    final_observed = [observe(state, seat) for seat in range(2)]
+    records["board"].append(torch.stack([value[0] for value in final_observed], dim=1))
+    records["scalars"].append(
+        torch.stack([value[1] for value in final_observed], dim=1)
+    )
+    records["positions"].append(
+        torch.stack([value[2] for value in final_observed], dim=1)
+    )
+    final_counts = _tensor_counts(state)
+    mean_sale_price = torch.where(units_sold > 0, proceeds / units_sold, 0.0)
+    mean_market_price = torch.where(units_sold > 0, market_value / units_sold, 0.0)
+    realisation = torch.where(
+        mean_market_price > 0, mean_sale_price / mean_market_price, 0.0
+    )
     trajectory = Trajectory(
         **{name: torch.stack(values) for name, values in records.items()},
         illegal=illegal_count,
+        hidden=(
+            torch.stack([record.hidden for record in retained_states])
+            if retained_states
+            else None
+        ),
+        cell=(
+            torch.stack([record.cell for record in retained_states])
+            if retained_states
+            else None
+        ),
+        prior_belief=(
+            torch.stack([record.prior_belief for record in retained_states])
+            if retained_states
+            else None
+        ),
+        state_steps=(
+            tensor_constant(tuple(retained_indices), dtype=torch.int64, device=device)
+            if retained_states
+            else None
+        ),
+        belief_targets=(torch.stack(target_records) if target_records else None),
+        belief_valid=(
+            torch.stack(target_valid_records) if target_valid_records else None
+        ),
+        final_margin=(state.money - state.money.flip(1)).to(torch.float32),
+        final_bank=state.money.to(torch.float32),
+        final_capital=final_counts.capital,
+        illegal_by_stream=stream_illegal,
+        sales=sales,
+        units_sold=units_sold,
+        mean_sale_price=mean_sale_price,
+        realisation=realisation,
+        bought=bought,
+        sale_proceeds=proceeds,
+        sale_market_value=market_value,
     )
-    return state, trajectory
+    successor: PolicyState | RolloutPolicyState | None
+    if opponent_policy is not None:
+        successor = RolloutPolicyState(
+            learner=learner_policy_state,
+            opponent=opponent_policy_state,
+        )
+    else:
+        successor = learner_policy_state
+    return state, successor, trajectory

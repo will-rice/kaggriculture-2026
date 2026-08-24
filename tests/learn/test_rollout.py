@@ -21,7 +21,9 @@ import pytest
 import torch
 from kaggle_environments import make
 
+import kaggriculture.learn.rollout as rollout_module
 from kaggriculture.constants import (
+    BOARD_SIZE,
     ENVIRONMENT,
     EPISODE_STEPS,
     STARTING_MONEY,
@@ -49,6 +51,8 @@ from kaggriculture.learn.model import BLOCKS, CHANNELS, Policy
 from kaggriculture.learn.progress import POTENTIAL_COMPONENTS, potential
 from kaggriculture.learn.rollout import Trajectory, rollout, rollout_many
 from kaggriculture.learn.scripts import toad
+from kaggriculture.learn.toad.config import ModelConfig
+from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
 
 # Far enough in that the two farms have diverged. The opening position is
 # identical for both seats -- same tiles, same money, same empty shed -- so a
@@ -79,6 +83,150 @@ def _untrained() -> Policy:
     """
     torch.manual_seed(0)
     return Policy(blocks=1, channels=32).eval()
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+def test_decide_batches_and_unbatches_recurrent_state_on_the_actor_clock(
+    layers: int,
+) -> None:
+    """Done resets the recorded state before the next observation is processed."""
+    environment = make(ENVIRONMENT, configuration={"episodeSteps": 3, "seed": 17})
+    environment.reset(2)
+    requests = [(environment.state[seat].observation, seat) for seat in (0, 1)]
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=16).model_copy(
+            update={
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": layers,
+            }
+        )
+    ).eval()
+
+    first_turns, carried = rollout_module._decide(
+        policy,
+        requests,
+        torch.Generator().manual_seed(9),
+        states=[None, None],
+        dones=[False, False],
+    )
+    second_turns, reset = rollout_module._decide(
+        policy,
+        requests,
+        torch.Generator().manual_seed(10),
+        states=carried,
+        dones=[True, False],
+    )
+    _, fresh = rollout_module._decide(
+        policy,
+        requests[:1],
+        torch.Generator().manual_seed(10),
+        states=[None],
+        dones=[False],
+    )
+
+    assert all(turn.policy_state is not None for turn in first_turns)
+    assert all(turn.policy_state is not None for turn in second_turns)
+    second_state = second_turns[0].policy_state
+    carried_state = carried[0]
+    fresh_state = fresh[0]
+    assert second_state is not None
+    assert carried_state is not None
+    assert fresh_state is not None
+    assert torch.equal(
+        second_state.hidden,
+        torch.zeros_like(second_state.hidden),
+    )
+    assert not torch.equal(second_state.hidden, carried_state.hidden)
+    assert not second_state.hidden.requires_grad
+    assert isinstance(reset[0], PolicyState)
+    assert torch.allclose(reset[0].hidden, fresh_state.hidden, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(reset[0].cell, fresh_state.cell, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"transformer": True, "transformer_blocks": 1},
+        {"local_patch": True, "local_patch_blocks": 1},
+        {"interaction_value": True},
+    ],
+)
+def test_decide_owns_every_stateless_optional_row(model: dict[str, object]) -> None:
+    """Stateless wrappers must return one used-state and next-state row per request."""
+    environment = make(ENVIRONMENT, configuration={"episodeSteps": 3, "seed": 37})
+    environment.reset(2)
+    requests = [(environment.state[seat].observation, seat) for seat in (0, 1)]
+    policy = StatefulPolicy(
+        ModelConfig.model_validate({"blocks": 1, "channels": 4, **model})
+    ).eval()
+
+    turns, next_states = rollout_module._decide(
+        policy,
+        requests,
+        torch.Generator().manual_seed(41),
+        states=[None, None],
+        dones=[False, False],
+    )
+
+    assert len(turns) == len(next_states) == 2
+    assert all(turn.policy_state is None for turn in turns)
+    assert next_states == [None, None]
+
+
+def test_recurrent_rollout_records_a_trailing_state_for_segment_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every acted observation plus its terminal bootstrap has actor memory."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 4)
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=16).model_copy(
+            update={"recurrent": True, "recurrent_channels": 3}
+        )
+    ).eval()
+
+    trajectory = rollout(policy, "starter", seed=21)
+
+    assert trajectory.hidden is not None
+    assert trajectory.cell is not None
+    assert trajectory.prior_belief is not None
+    assert trajectory.hidden.shape[0] == trajectory.dones.shape[0] + 1
+    assert trajectory.cell.shape[0] == trajectory.dones.shape[0] + 1
+    assert trajectory.prior_belief.shape[0] == trajectory.dones.shape[0] + 1
+    assert not trajectory.hidden.requires_grad
+
+
+def test_recurrent_rollout_records_only_configured_segment_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production-style rollout keeps exact sparse multi-layer and belief state."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 6)
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=4).model_copy(
+            update={
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+                "belief": True,
+            }
+        )
+    ).eval()
+
+    trajectory = rollout(
+        policy,
+        "starter",
+        seed=23,
+        state_unroll_length=2,
+    )
+
+    assert trajectory.state_steps is not None
+    assert trajectory.state_steps.tolist() == [1, 3]
+    assert trajectory.hidden is not None
+    assert trajectory.cell is not None
+    assert trajectory.prior_belief is not None
+    assert trajectory.hidden.shape == (2, 2, 3, BOARD_SIZE, BOARD_SIZE)
+    assert trajectory.cell.shape == trajectory.hidden.shape
+    assert trajectory.prior_belief.shape == (2, policy.config.belief_size)
 
 
 @pytest.fixture(scope="module")
