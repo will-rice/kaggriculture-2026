@@ -754,6 +754,74 @@ def test_fit_start_materializes_initial_file_and_actor_once_on_rank_zero(
     assert rank1_data.source.pool is not None
 
 
+def test_resume_preserves_capacity_evicted_bootstrap_manifest(tmp_path: Path) -> None:
+    """A restored nonempty generation must not infer an evicted initial is missing."""
+    base = _stream_config()
+    initial_path = tmp_path / "initial.pt"
+    torch.save(ToadLightningModule(base).policy.state_dict(), initial_path)
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={
+                    "initial_snapshots": (initial_path,),
+                    "pool_capacity": 1,
+                    "snapshot_every_environment_steps": 8,
+                }
+            ),
+            "runtime": base.runtime.model_copy(update={"output_dir": tmp_path}),
+        }
+    )
+
+    def save_checkpoint(path: str) -> None:
+        Path(path).write_bytes(b"authoritative")
+
+    module = ToadLightningModule(config)
+    data_module = data.ToadDataModule(config, data.ReferenceRoundSource(config))
+    trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(datamodule=data_module, save_checkpoint=save_checkpoint),
+    )
+    callback = PopulationSnapshotCallback()
+    callback.on_fit_start(trainer, module)
+    assert module.population_manifest.entries[0].run_id.startswith("initial:")
+
+    module.environment_steps = 8
+    module.collection_round = 1
+    callback.on_train_batch_end(
+        trainer,
+        module,
+        None,
+        SimpleNamespace(end_of_round=True),
+        0,
+    )
+    authoritative = module.population_manifest
+    assert len(authoritative.entries) == 1
+    assert authoritative.entries[0].run_id == config.curriculum.phase
+    manifest_bytes = (tmp_path / "population" / "manifest.json").read_bytes()
+    checkpoint: dict[str, object] = {}
+    module.on_save_checkpoint(checkpoint)
+    data_state = data_module.state_dict()
+
+    resumed_module = ToadLightningModule(config)
+    resumed_module.on_load_checkpoint(checkpoint)
+    resumed_data = data.ToadDataModule(
+        config,
+        data.ReferenceRoundSource(config),
+    )
+    resumed_data.load_state_dict(data_state)
+    resumed_trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(datamodule=resumed_data, save_checkpoint=save_checkpoint),
+    )
+
+    PopulationSnapshotCallback().on_fit_start(resumed_trainer, resumed_module)
+
+    assert resumed_module.population_manifest == authoritative
+    assert resumed_data.source.pool is not None
+    assert resumed_data.source.pool.manifest == authoritative
+    assert (tmp_path / "population" / "manifest.json").read_bytes() == manifest_bytes
+
+
 def test_boundary_install_failure_is_acknowledged_by_every_rank(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -296,13 +296,14 @@ class PopulationSnapshotCallback(lightning.Callback):
             previous_manifest = module.population_manifest
             self._reopen_store(trainer, module)
             assert self.store is not None
-            _data_module(trainer).materialize_population_bootstrap(
-                self.store,
-                policy_state_dict(module),
-                environment_steps=module.environment_steps,
-                round_id=module.collection_round,
-                run_id=module.config.curriculum.phase,
-            )
+            if not previous_manifest.entries:
+                _data_module(trainer).materialize_population_bootstrap(
+                    self.store,
+                    policy_state_dict(module),
+                    environment_steps=module.environment_steps,
+                    round_id=module.collection_round,
+                    run_id=module.config.curriculum.phase,
+                )
             self._publish(trainer, module)
             if module.population_manifest != previous_manifest:
                 _save_authoritative_checkpoint(
