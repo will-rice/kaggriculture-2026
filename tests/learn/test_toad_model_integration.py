@@ -298,11 +298,23 @@ def _component_parameters(
         "belief_feedback": lambda name: name.startswith("feedback."),
         "belief_head": lambda name: name.startswith("belief_head."),
         "transformer_position": lambda name: name == "transformer.position",
+        "transformer_attention_norm": lambda name: name.startswith(
+            "transformer.blocks.0.attention_norm."
+        ),
         "transformer_attention": lambda name: name.startswith(
             "transformer.blocks.0.attention."
         ),
+        "transformer_mlp_norm": lambda name: name.startswith(
+            "transformer.blocks.0.mlp_norm."
+        ),
         "transformer_mlp": lambda name: name.startswith("transformer.blocks.0.mlp."),
         "interaction_query": lambda name: name == "interaction_value.value_token",
+        "interaction_query_norm": lambda name: name.startswith(
+            "interaction_value.query_norm."
+        ),
+        "interaction_context_norm": lambda name: name.startswith(
+            "interaction_value.context_norm."
+        ),
         "interaction_global": lambda name: name.startswith(
             "interaction_value.global_projection."
         ),
@@ -310,6 +322,9 @@ def _component_parameters(
             "interaction_value.attention."
         ),
         "interaction_mlp": lambda name: name.startswith("interaction_value.mlp."),
+        "interaction_mlp_norm": lambda name: name.startswith(
+            "interaction_value.mlp_norm."
+        ),
         "interaction_value": lambda name: name.startswith(
             "interaction_value.value_projection."
         ),
@@ -374,6 +389,23 @@ def test_two_segment_training_resets_and_updates_every_component(
     assert all(report.terms["belief_valid"].item() == 16 for report in reports)
     torch.stack([report.total for report in reports]).sum().backward()
     components = _component_parameters(module.policy)
+    # These legacy readouts are structurally superseded by the enabled local
+    # operation/quantity heads and the interaction value head, respectively.
+    superseded = (
+        "control.head.",
+        "control.quantity_head.",
+        "control.value.",
+    )
+    active_parameters = {
+        name: parameter
+        for name, parameter in module.policy.named_parameters()
+        if not name.startswith(superseded)
+    }
+    covered = {
+        name for parameters in components.values() for name, _parameter in parameters
+    }
+    assert covered == active_parameters.keys()
+    initial_zero_gradients: list[str] = []
     for component, parameters in components.items():
         assert parameters, component
         gradients = [parameter.grad for _, parameter in parameters]
@@ -382,9 +414,17 @@ def test_two_segment_training_resets_and_updates_every_component(
         assert all(torch.isfinite(gradient).all() for gradient in present_gradients), (
             component
         )
-        assert any(torch.count_nonzero(gradient) for gradient in present_gradients), (
-            component
+        initial_zero_gradients.extend(
+            name
+            for (name, _parameter), gradient in zip(
+                parameters, present_gradients, strict=True
+            )
+            if not torch.count_nonzero(gradient)
         )
+    # The query token is initialized to zero, so the first LayerNorm sees an
+    # identically zero normalized input and its scale has no gradient until the
+    # first Adam step moves that token. The second automatic step must train it.
+    assert initial_zero_gradients == ["interaction_value.query_norm.weight"]
 
     before = {
         name: parameter.detach().clone()
@@ -414,12 +454,12 @@ def test_two_segment_training_resets_and_updates_every_component(
     assert trainer.global_step == 2
     assert module.environment_steps == 32
     assert module.collection_round == 1
-    for component, parameters in components.items():
-        assert any(
-            not torch.equal(before[name], parameter.detach())
-            for name, parameter in parameters
-        ), component
-        assert all(torch.isfinite(parameter).all() for _, parameter in parameters)
+    for name, parameter in active_parameters.items():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert torch.count_nonzero(parameter.grad), name
+        assert not torch.equal(before[name], parameter.detach()), name
+        assert torch.isfinite(parameter).all(), name
 
 
 def test_every_optional_model_field_round_trips_and_changes_the_fingerprint() -> None:

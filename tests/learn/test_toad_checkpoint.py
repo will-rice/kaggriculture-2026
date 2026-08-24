@@ -504,6 +504,8 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
         value_warmup_batches=3,
     )
     initial_model = _initial_policy_state(config)
+    published_actor_version = 6
+    actor_source_global_step = 1
     trajectories = {
         game_id: _synthetic_trajectory(
             config,
@@ -590,6 +592,8 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
     uninterrupted_data = ToadDataModule(config, uninterrupted_source)
     uninterrupted_module = ToadLightningModule(config)
     uninterrupted_module.policy.load_state_dict(initial_model, strict=True)
+    uninterrupted_module.actor_version = published_actor_version
+    uninterrupted_module.actor_source_global_step = actor_source_global_step
     uninterrupted_entries = BatchEntryRecorder()
     uninterrupted_trainer = trainer(
         tmp_path / "uninterrupted",
@@ -605,6 +609,8 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
     split_data = ToadDataModule(config, split_source)
     split_module = ToadLightningModule(config)
     split_module.policy.load_state_dict(initial_model, strict=True)
+    split_module.actor_version = published_actor_version
+    split_module.actor_source_global_step = actor_source_global_step
     split_trainer = trainer(
         tmp_path / "split",
         max_steps=2,
@@ -617,6 +623,16 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
     uninterrupted_trainer.fit(uninterrupted_module, datamodule=uninterrupted_data)
     split_trainer.fit(split_module, datamodule=split_data)
 
+    assert split_source.actor_version == published_actor_version
+    assert all(
+        torch.equal(split_source.actor_state[name], value)
+        for name, value in initial_model.items()
+    )
+    assert any(
+        not torch.equal(split_module.policy.state_dict()[name], value)
+        for name, value in split_source.actor_state.items()
+    )
+
     checkpoint_path = config.runtime.output_dir / "step-32.ckpt"
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint_toad = cast(dict[str, object], checkpoint["toad"])
@@ -627,7 +643,12 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
     assert checkpoint_toad["fingerprint"] == structural_fingerprint(config)
     assert checkpoint_toad["environment_steps"] == 32
     assert checkpoint_toad["collection_round"] == 1
-    assert checkpoint_toad["actor_version"] == 0
+    assert checkpoint_toad["actor_version"] == published_actor_version
+    checkpoint_actor_source_step = cast(
+        int, checkpoint_toad["actor_source_global_step"]
+    )
+    assert checkpoint_actor_source_step == actor_source_global_step
+    assert checkpoint["global_step"] - checkpoint_actor_source_step == 1
     assert checkpoint_toad["warmup_remaining"] == 1
     assert checkpoint_toad["teacher"] == {
         "present": True,
@@ -658,6 +679,10 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
     assert split_records[0][2:] == uninterrupted_records[0][2:]
     assert resumed_records[0][1:] == uninterrupted_records[1][1:]
     assert all(record[3] for record in uninterrupted_records + resumed_records)
+    assert all(
+        record[1] == published_actor_version
+        for record in uninterrupted_records + split_records + resumed_records
+    )
     uninterrupted_next = next(
         entry for entry in uninterrupted_entries.entries if entry[0] == 1
     )
@@ -671,13 +696,24 @@ def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
     assert resumed_trainer.global_step == uninterrupted_trainer.global_step == 3
     assert resumed_module.environment_steps == uninterrupted_module.environment_steps
     assert resumed_module.collection_round == uninterrupted_module.collection_round
-    assert resumed_module.actor_version == uninterrupted_module.actor_version
-    assert resumed_module.actor_source_global_step == (
-        uninterrupted_module.actor_source_global_step
+    assert (
+        resumed_module.actor_version
+        == uninterrupted_module.actor_version
+        == published_actor_version
     )
+    assert (
+        resumed_module.actor_source_global_step
+        == uninterrupted_module.actor_source_global_step
+        == actor_source_global_step
+    )
+    assert resumed_trainer.global_step - resumed_module.actor_source_global_step == 2
     assert resumed_module.warmup_remaining == uninterrupted_module.warmup_remaining == 0
     assert resumed_source.next_game_id == uninterrupted_source.next_game_id == 2
-    assert resumed_source.actor_version == uninterrupted_source.actor_version == 0
+    assert (
+        resumed_source.actor_version
+        == uninterrupted_source.actor_version
+        == published_actor_version
+    )
     for name, value in uninterrupted_source.actor_state.items():
         assert torch.equal(resumed_source.actor_state[name], value), name
     for name, value in uninterrupted_module.policy.state_dict().items():
