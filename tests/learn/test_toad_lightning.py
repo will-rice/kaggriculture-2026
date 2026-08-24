@@ -11,6 +11,7 @@ from kaggle_environments import make
 from torch.utils.data import DataLoader, Dataset
 
 import kaggriculture.learn.rollout as rollout_module
+import kaggriculture.learn.toad.lightning as lightning_module
 from kaggriculture.constants import BOARD_SIZE, ENVIRONMENT
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.scripts import toad
@@ -322,8 +323,10 @@ def test_transfer_batch_moves_recurrent_initial_state_with_segment_tensors() -> 
     )
 
 
-def test_module_loads_only_exact_recurrent_warm_start_weights(tmp_path: Path) -> None:
-    """Enabled warm starts load every stateful key and reject bare checkpoints."""
+def test_module_distinguishes_exact_and_control_migration_warm_starts(
+    tmp_path: Path,
+) -> None:
+    """Enabled initialization may migrate control weights without weakening resume."""
     base = _recurrent_config()
     source = StatefulPolicy(base.model)
     exact_path = tmp_path / "recurrent.pt"
@@ -340,9 +343,12 @@ def test_module_loads_only_exact_recurrent_warm_start_weights(tmp_path: Path) ->
 
     for name, tensor in source.state_dict().items():
         assert torch.equal(restored.policy.state_dict()[name], tensor)
+    assert restored.warm_start_migration is not None
+    assert restored.warm_start_migration.mode == "exact_stateful"
 
     bare_path = tmp_path / "bare.pt"
-    torch.save(toad.Policy(blocks=1, channels=16).state_dict(), bare_path)
+    bare_state = toad.Policy(blocks=1, channels=16).state_dict()
+    torch.save(bare_state, bare_path)
     bare_config = base.model_copy(
         update={
             "curriculum": base.curriculum.model_copy(
@@ -350,8 +356,53 @@ def test_module_loads_only_exact_recurrent_warm_start_weights(tmp_path: Path) ->
             )
         }
     )
-    with pytest.raises(RuntimeError, match="Missing key.*control"):
-        ToadLightningModule(bare_config)
+    migrated = ToadLightningModule(bare_config)
+    assert isinstance(migrated.policy, StatefulPolicy)
+    assert migrated.warm_start_migration is not None
+    assert migrated.warm_start_migration.mode == "control_migration"
+    for name, tensor in bare_state.items():
+        assert torch.equal(migrated.policy.control.state_dict()[name], tensor)
+
+
+@pytest.mark.parametrize("layout", ["bare", "legacy_learner", "lightning_policy"])
+def test_enabled_warm_start_migrates_every_control_checkpoint_layout(
+    tmp_path: Path, layout: str
+) -> None:
+    """Bare, legacy learner, and foundation Lightning weights migrate explicitly."""
+    config = _recurrent_config()
+    torch.manual_seed(211)
+    policy = StatefulPolicy(config.model)
+    optional_before = {
+        name: value.detach().clone()
+        for name, value in policy.state_dict().items()
+        if not name.startswith("control.")
+    }
+    torch.manual_seed(223)
+    control = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    control_state = dict(control.state_dict())
+    checkpoint: object
+    if layout == "bare":
+        checkpoint = control_state
+    elif layout == "legacy_learner":
+        checkpoint = {"learner": control_state}
+    else:
+        checkpoint = {
+            "state_dict": {
+                f"policy.{name}": value for name, value in control_state.items()
+            }
+        }
+    path = tmp_path / f"{layout}.pt"
+    torch.save(checkpoint, path)
+
+    result = lightning_module.initialize_policy_from_checkpoint(policy, path)
+
+    assert result.mode == "control_migration"
+    assert result.source == layout
+    assert set(result.fresh_keys) == set(optional_before)
+    for name, value in control_state.items():
+        assert torch.equal(policy.control.state_dict()[name], value), name
+    for name, value in optional_before.items():
+        assert torch.equal(policy.state_dict()[name], value), name
 
 
 def test_actor_and_learner_outputs_agree_across_a_reset_segment_boundary() -> None:
@@ -374,13 +425,15 @@ def test_actor_and_learner_outputs_agree_across_a_reset_segment_boundary() -> No
             torch.Generator().manual_seed(100 + step),
             states=[state],
             dones=[bool(action_dones[step - 1]) if step else False],
+            record_states=[step in (0, 16)],
         )
         turn = decided[0]
-        assert turn.policy_state is not None
         turns.append(turn)
-        states.append(turn.policy_state)
+        if turn.policy_state is not None:
+            states.append(turn.policy_state)
         state = next_states[0]
     assert state is not None
+    assert len(states) == 2
     trajectory = replace(
         _recurrent_trajectory(),
         board=torch.cat([turn.board for turn in turns]),
@@ -395,11 +448,10 @@ def test_actor_and_learner_outputs_agree_across_a_reset_segment_boundary() -> No
         log_probs=torch.cat([turn.log_prob for turn in turns]),
         values=torch.cat([turn.value for turn in turns]),
         dones=action_dones,
-        hidden=torch.stack([record.hidden for record in states] + [state.hidden]),
-        cell=torch.stack([record.cell for record in states] + [state.cell]),
-        prior_belief=torch.stack(
-            [record.prior_belief for record in states] + [state.prior_belief]
-        ),
+        hidden=torch.stack([record.hidden for record in states]),
+        cell=torch.stack([record.cell for record in states]),
+        prior_belief=torch.stack([record.prior_belief for record in states]),
+        state_steps=torch.tensor([0, 16]),
     )
     replay_segments = segments(trajectory, 16)
     batch = LearnerBatch(

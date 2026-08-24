@@ -247,6 +247,11 @@ class ToadConfig(BaseModel):
                 self.population.teacher_checkpoint,
                 label="teacher checkpoint",
             )
+            if self.model.kernel_size != 3 or self.model.activation != "relu":
+                raise ValueError(
+                    "teacher checkpoints require the default kernel and activation "
+                    "because teacher trunk semantics are not separately declared"
+                )
         if self.curriculum.warm_start_checkpoint is not None and not historical:
             _require_readable(
                 self.curriculum.warm_start_checkpoint,

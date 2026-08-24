@@ -13,7 +13,7 @@ import lightning
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from kaggriculture.learn.rollout import Trajectory
+from kaggriculture.learn.rollout import Trajectory, segment_starts
 from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
 
@@ -47,6 +47,7 @@ class ReferenceWorkerInput:
     model: ModelConfig
     versus: str | None
     money_weight: float
+    unroll_length: int = UNROLL_LENGTH
 
 
 class BatchKind(StrEnum):
@@ -113,6 +114,52 @@ class CollectionError(RuntimeError):
     """Collection failed while retaining the exact assigned game provenance."""
 
 
+def _recurrent_state_rows(
+    trajectory: Trajectory,
+    recurrent_fields: tuple[torch.Tensor | None, ...],
+    turns: int,
+    starts: tuple[int, ...],
+) -> dict[int, int] | None:
+    """Validate dense or sparse recurrent storage and map acted steps to rows."""
+    if trajectory.state_steps is None:
+        if any(
+            field is not None and field.shape[0] != turns + 1
+            for field in recurrent_fields
+        ):
+            raise ValueError(
+                "dense recurrent trajectories require one state per row "
+                "plus trailing state"
+            )
+        return None
+    if not all(field is not None for field in recurrent_fields):
+        raise ValueError("state_steps require active recurrent trajectory state")
+    state_steps = trajectory.state_steps
+    if state_steps.ndim != 1 or state_steps.dtype not in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("state_steps must be a rank-1 integer tensor")
+    listed = [int(step) for step in state_steps.tolist()]
+    if listed != sorted(set(listed)) or any(
+        step < 0 or step >= turns for step in listed
+    ):
+        raise ValueError("state_steps must be sorted unique acted-row indices")
+    if any(
+        field is not None and field.shape[0] != len(listed)
+        for field in recurrent_fields
+    ):
+        raise ValueError("sparse recurrent fields must align exactly with state_steps")
+    rows = {step: row for row, step in enumerate(listed)}
+    missing = [start for start in starts if start not in rows]
+    if missing:
+        raise ValueError(
+            f"missing recurrent state at required segment start {missing[0]}"
+        )
+    return rows
+
+
 def segments(
     trajectory: Trajectory, unroll_length: int
 ) -> list[dict[str, torch.Tensor]]:
@@ -142,12 +189,8 @@ def segments(
         raise ValueError(
             "recurrent trajectories require hidden, cell, and prior_belief"
         )
-    if any(
-        field is not None and field.shape[0] != turns + 1 for field in recurrent_fields
-    ):
-        raise ValueError(
-            "recurrent trajectories require one state per row plus trailing state"
-        )
+    starts = segment_starts(turns, unroll_length)
+    state_rows = _recurrent_state_rows(trajectory, recurrent_fields, turns, starts)
     return [
         {
             **{
@@ -167,9 +210,21 @@ def segments(
             },
             **(
                 {
-                    "initial_hidden": trajectory.hidden[start].detach(),
-                    "initial_cell": trajectory.cell[start].detach(),
-                    "initial_belief": trajectory.prior_belief[start].detach(),
+                    "initial_hidden": trajectory.hidden[
+                        start if state_rows is None else state_rows[start]
+                    ]
+                    .detach()
+                    .clone(),
+                    "initial_cell": trajectory.cell[
+                        start if state_rows is None else state_rows[start]
+                    ]
+                    .detach()
+                    .clone(),
+                    "initial_belief": trajectory.prior_belief[
+                        start if state_rows is None else state_rows[start]
+                    ]
+                    .detach()
+                    .clone(),
                 }
                 if trajectory.hidden is not None
                 and trajectory.cell is not None
@@ -177,9 +232,7 @@ def segments(
                 else {}
             ),
         }
-        for start in range(
-            turns % unroll_length, turns - unroll_length + 1, unroll_length
-        )
+        for start in starts
     ]
 
 
@@ -329,6 +382,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             model=self.config.model,
             versus=versus,
             money_weight=self.config.curriculum.money_weight,
+            unroll_length=self.config.optimizer.unroll_length,
         )
 
     def _collect_round(

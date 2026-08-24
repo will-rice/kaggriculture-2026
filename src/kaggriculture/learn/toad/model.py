@@ -14,7 +14,14 @@ from dataclasses import dataclass
 import torch
 
 from kaggriculture.constants import BOARD_SIZE
-from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, SCALARS, UNIT_OPS
+from kaggriculture.learn.encoding import (
+    MARKET_SLOTS,
+    MAX_UNITS,
+    QUANTITIES,
+    SCALARS,
+    TILE_PLANES,
+    UNIT_OPS,
+)
 from kaggriculture.learn.model import Policy, Residual
 from kaggriculture.learn.toad.config import MAX_LOCAL_PATCH_SIZE, ModelConfig
 
@@ -443,7 +450,13 @@ class StatefulPolicy(torch.nn.Module):
         """Build the configured policy without changing the control topology."""
         super().__init__()
         self.config = config
-        self.control = Policy(config.blocks, config.channels, config.value_bound)
+        self.control = Policy(
+            blocks=config.blocks,
+            channels=config.channels,
+            value_bound=config.value_bound,
+            kernel_size=config.kernel_size,
+            activation=config.activation,
+        )
         if config.recurrent:
             self.recurrent = ConvLSTM(
                 config.channels,
@@ -654,6 +667,92 @@ class StatefulPolicy(torch.nn.Module):
         gathered = columns.gather(2, wanted).transpose(1, 2)
         return self.control.head(gathered), self.control.quantity_head(gathered)
 
+    @staticmethod
+    def _validate_board(board: torch.Tensor) -> tuple[int, int]:
+        """Validate and return the time/batch extent of enabled board input."""
+        if board.ndim != 5:
+            raise ValueError("enabled policy board must have rank 5 (T,B,C,10,10)")
+        time, batch = board.shape[:2]
+        if board.shape[2] != TILE_PLANES:
+            raise ValueError(
+                f"enabled policy board channels must be {TILE_PLANES}, "
+                f"got {board.shape[2]}"
+            )
+        if tuple(board.shape[-2:]) != (BOARD_SIZE, BOARD_SIZE):
+            raise ValueError(
+                f"enabled policy board must have {BOARD_SIZE}x{BOARD_SIZE} "
+                "spatial extent"
+            )
+        if not torch.is_floating_point(board):
+            raise TypeError("enabled policy board must use a floating dtype")
+        return time, batch
+
+    @staticmethod
+    def _validate_scalars(
+        scalars: torch.Tensor, board: torch.Tensor, time: int, batch: int
+    ) -> None:
+        """Validate enabled scalar input against the board extent and type."""
+        if scalars.ndim != 3:
+            raise ValueError("enabled policy scalars must have rank 3 (T,B,S)")
+        if tuple(scalars.shape[:2]) != (time, batch):
+            raise ValueError("enabled policy scalars must share board time and batch")
+        if scalars.shape[2] != SCALARS:
+            raise ValueError(
+                f"enabled policy scalars extent must be {SCALARS}, "
+                f"got {scalars.shape[2]}"
+            )
+        if not torch.is_floating_point(scalars):
+            raise TypeError("enabled policy scalars must use a floating dtype")
+        if scalars.device != board.device or scalars.dtype != board.dtype:
+            raise ValueError("enabled policy scalars must match board device and dtype")
+
+    @staticmethod
+    def _validate_positions(
+        positions: torch.Tensor, board: torch.Tensor, time: int, batch: int
+    ) -> None:
+        """Validate enabled integer unit positions against the board extent."""
+        if positions.ndim != 3:
+            raise ValueError("enabled policy positions must have rank 3 (T,B,U)")
+        if tuple(positions.shape[:2]) != (time, batch):
+            raise ValueError("enabled policy positions must share board time and batch")
+        if positions.shape[2] != MAX_UNITS:
+            raise ValueError(
+                f"enabled policy positions extent must be {MAX_UNITS}, "
+                f"got {positions.shape[2]}"
+            )
+        if positions.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+            raise TypeError("enabled policy positions must use an integer dtype")
+        if positions.device != board.device:
+            raise ValueError("enabled policy positions must share the board device")
+
+    @staticmethod
+    def _validate_dones(
+        dones: torch.Tensor | None, board: torch.Tensor, time: int, batch: int
+    ) -> None:
+        """Validate an optional terminal-boundary mask before boolean algebra."""
+        if dones is not None:
+            if dones.dtype is not torch.bool:
+                raise TypeError("enabled policy dones must use the boolean dtype")
+            if tuple(dones.shape) != (time, batch):
+                raise ValueError(
+                    "enabled policy dones shape must equal the board (T,B) extent"
+                )
+            if dones.device != board.device:
+                raise ValueError("enabled policy dones must share the board device")
+
+    def _validate_inputs(
+        self,
+        board: torch.Tensor,
+        scalars: torch.Tensor,
+        positions: torch.Tensor,
+        dones: torch.Tensor | None,
+    ) -> None:
+        """Validate the enabled policy's public time-major tensor contract."""
+        time, batch = self._validate_board(board)
+        self._validate_scalars(scalars, board, time, batch)
+        self._validate_positions(positions, board, time, batch)
+        self._validate_dones(dones, board, time, batch)
+
     def forward(
         self,
         board: torch.Tensor,
@@ -667,6 +766,7 @@ class StatefulPolicy(torch.nn.Module):
             unit, quantity, market, values = self.control(board, scalars, positions)
             return PolicyOutput(unit, quantity, market, values, None, None)
 
+        self._validate_inputs(board, scalars, positions, dones)
         time, batch = board.shape[:2]
         if dones is None:
             dones = torch.zeros(time, batch, dtype=torch.bool, device=board.device)

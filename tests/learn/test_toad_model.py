@@ -15,6 +15,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
+from kaggriculture.learn.toad.lightning import ToadLightningModule
 from kaggriculture.learn.toad.model import (
     ConvLSTM,
     InteractionValueHead,
@@ -255,6 +256,93 @@ def test_disabled_features_match_the_current_policy() -> None:
     assert torch.equal(new_output.values, old_output[3])
     assert new_output.belief_logits is None
     assert new_output.state is None
+
+
+def test_default_kernel_and_activation_preserve_the_control_topology_and_output() -> (
+    None
+):
+    """Explicit default trunk settings must remain an exact legacy no-op."""
+    torch.manual_seed(101)
+    implicit = Policy(blocks=1, channels=16, value_bound=1.0)
+    explicit = Policy(
+        blocks=1,
+        channels=16,
+        value_bound=1.0,
+        kernel_size=3,
+        activation="relu",
+    )
+    explicit.load_state_dict(implicit.state_dict(), strict=True)
+    inputs = model_inputs()
+
+    assert tuple(implicit.state_dict()) == tuple(explicit.state_dict())
+    for actual, expected in zip(explicit(*inputs), implicit(*inputs), strict=True):
+        assert torch.equal(actual, expected)
+
+
+def test_kernel_five_changes_the_real_trunk_receptive_field() -> None:
+    """The configured kernel must shape both stem and residual convolutions."""
+    policy = Policy(blocks=1, channels=4, kernel_size=5)
+    assert policy.stem.weight.shape[-2:] == (5, 5)
+    assert policy.state_dict()["blocks.0.first.weight"].shape[-2:] == (5, 5)
+    assert policy.state_dict()["blocks.0.second.weight"].shape[-2:] == (5, 5)
+
+    with torch.no_grad():
+        policy.stem.weight.zero_()
+        assert policy.stem.bias is not None
+        policy.stem.bias.zero_()
+        policy.stem.weight[0, 0].fill_(1)
+    impulse = torch.zeros(1, TILE_PLANES, BOARD_SIZE, BOARD_SIZE)
+    impulse[0, 0, 5, 5] = 1
+    affected = policy.stem(impulse)[0, 0].ne(0)
+    assert affected.sum() == 25
+
+
+def test_leaky_relu_changes_the_configured_policy_output() -> None:
+    """Activation is executable topology, not fingerprint-only metadata."""
+    torch.manual_seed(109)
+    relu = Policy(blocks=1, channels=8, activation="relu")
+    leaky = Policy(blocks=1, channels=8, activation="leaky_relu")
+    leaky.load_state_dict(relu.state_dict(), strict=True)
+    inputs = model_inputs(batch=1)
+
+    relu_outputs = relu(*inputs)
+    leaky_outputs = leaky(*inputs)
+
+    assert any(
+        not torch.equal(relu_output, leaky_output)
+        for relu_output, leaky_output in zip(relu_outputs, leaky_outputs, strict=True)
+    )
+
+
+def test_configured_control_and_stateful_policies_share_trunk_settings() -> None:
+    """Bare Lightning control and enabled wrappers must consume the same config."""
+    control_config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 8,
+                "kernel_size": 5,
+                "activation": "leaky_relu",
+            }
+        }
+    )
+    enabled_config = control_config.model_copy(
+        update={
+            "model": control_config.model.model_copy(
+                update={"transformer": True, "transformer_blocks": 1}
+            )
+        }
+    )
+
+    control = ToadLightningModule(control_config)
+    enabled = ToadLightningModule(enabled_config)
+
+    assert isinstance(control.policy, Policy)
+    assert isinstance(enabled.policy, StatefulPolicy)
+    assert control.policy.stem.kernel_size == (5, 5)
+    assert enabled.policy.control.stem.kernel_size == (5, 5)
+    assert isinstance(control.policy.market[1], torch.nn.LeakyReLU)
+    assert isinstance(enabled.policy.control.market[1], torch.nn.LeakyReLU)
 
 
 def test_control_constructor_disables_every_optional_component() -> None:
@@ -728,6 +816,74 @@ def test_recurrent_policy_accepts_time_major_inputs_and_keeps_layered_state() ->
     assert output.state is not None
     assert output.state.hidden.shape == (2, 2, 12, BOARD_SIZE, BOARD_SIZE)
     assert output.state.cell.shape == (2, 2, 12, BOARD_SIZE, BOARD_SIZE)
+
+
+def test_enabled_policy_rejects_malformed_public_tensor_contracts() -> None:
+    """Every malformed time-major extent or dtype must fail before convolution."""
+    policy = recurrent_policy()
+    board, scalars, positions = recurrent_inputs()
+    initial = policy.initial_state(2, like=board)
+    assert initial is not None
+    malformed = [
+        ((board.flatten(0, 1), scalars, positions, None), ValueError, "board.*rank 5"),
+        ((board[:, :, :-1], scalars, positions, None), ValueError, "board.*channels"),
+        ((board[..., :-1, :], scalars, positions, None), ValueError, "10x10"),
+        (
+            (board.to(torch.int64), scalars, positions, None),
+            TypeError,
+            "board.*floating",
+        ),
+        ((board, scalars.unsqueeze(0), positions, None), ValueError, "scalars.*rank 3"),
+        ((board, scalars[..., :-1], positions, None), ValueError, "scalars.*extent"),
+        ((board, scalars[:-1], positions, None), ValueError, "time and batch"),
+        (
+            (board, scalars, positions.unsqueeze(0), None),
+            ValueError,
+            "positions.*rank 3",
+        ),
+        ((board, scalars, positions[..., :-1], None), ValueError, "positions.*extent"),
+        ((board, scalars, positions.float(), None), TypeError, "positions.*integer"),
+        (
+            (board, scalars, positions, torch.zeros(3, 2, dtype=torch.int64)),
+            TypeError,
+            "dones.*boolean",
+        ),
+        (
+            (board, scalars, positions, torch.zeros(2, 3, dtype=torch.bool)),
+            ValueError,
+            "dones.*shape",
+        ),
+    ]
+    for (bad_board, bad_scalars, bad_positions, bad_dones), error, message in malformed:
+        with pytest.raises(error, match=message):
+            policy(
+                bad_board,
+                bad_scalars,
+                bad_positions,
+                state=initial,
+                dones=bad_dones,
+            )
+
+    malformed_states = [
+        PolicyState(
+            hidden=initial.hidden[:, :1],
+            cell=initial.cell[:, :1],
+            prior_belief=initial.prior_belief[:1],
+        ),
+        PolicyState(
+            hidden=initial.hidden[:1],
+            cell=initial.cell[:1],
+            prior_belief=initial.prior_belief,
+        ),
+        PolicyState(
+            hidden=initial.hidden[:, :, :-1],
+            cell=initial.cell[:, :, :-1],
+            prior_belief=initial.prior_belief,
+        ),
+    ]
+    for malformed_state in malformed_states:
+        with pytest.raises(ValueError, match="wrong spatial shape"):
+            policy(board, scalars, positions, state=malformed_state)
 
 
 def test_recurrent_policy_chunks_match_one_full_time_major_sequence() -> None:

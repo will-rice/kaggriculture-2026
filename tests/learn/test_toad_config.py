@@ -54,6 +54,22 @@ def test_teacher_checkpoint_must_be_a_readable_file(tmp_path: Path) -> None:
     assert config.population.teacher_checkpoint == checkpoint
 
 
+@pytest.mark.parametrize("model", [{"kernel_size": 5}, {"activation": "leaky_relu"}])
+def test_teacher_rejects_ambiguous_nondefault_trunk_semantics(
+    tmp_path: Path, model: dict[str, object]
+) -> None:
+    """Teacher checkpoints cannot silently inherit undeclared trunk settings."""
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.touch()
+
+    with pytest.raises(ValidationError, match="teacher.*default kernel.*activation"):
+        ToadConfig(
+            model=model,
+            population={"teacher_checkpoint": checkpoint},
+            optimizer={"teacher_kl_cost": 0.1},
+        )
+
+
 def test_warm_start_checkpoint_is_readable_and_excludes_resume(tmp_path: Path) -> None:
     """Warm-start weights are validated input and cannot masquerade as resume."""
     checkpoint = tmp_path / "warm.pt"

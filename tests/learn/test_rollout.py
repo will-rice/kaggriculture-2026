@@ -23,6 +23,7 @@ from kaggle_environments import make
 
 import kaggriculture.learn.rollout as rollout_module
 from kaggriculture.constants import (
+    BOARD_SIZE,
     ENVIRONMENT,
     EPISODE_STEPS,
     STARTING_MONEY,
@@ -143,6 +144,36 @@ def test_decide_batches_and_unbatches_recurrent_state_on_the_actor_clock(
     assert torch.allclose(reset[0].cell, fresh_state.cell, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"transformer": True, "transformer_blocks": 1},
+        {"local_patch": True, "local_patch_blocks": 1},
+        {"interaction_value": True},
+    ],
+)
+def test_decide_owns_every_stateless_optional_row(model: dict[str, object]) -> None:
+    """Stateless wrappers must return one used-state and next-state row per request."""
+    environment = make(ENVIRONMENT, configuration={"episodeSteps": 3, "seed": 37})
+    environment.reset(2)
+    requests = [(environment.state[seat].observation, seat) for seat in (0, 1)]
+    policy = StatefulPolicy(
+        ModelConfig.model_validate({"blocks": 1, "channels": 4, **model})
+    ).eval()
+
+    turns, next_states = rollout_module._decide(
+        policy,
+        requests,
+        torch.Generator().manual_seed(41),
+        states=[None, None],
+        dones=[False, False],
+    )
+
+    assert len(turns) == len(next_states) == 2
+    assert all(turn.policy_state is None for turn in turns)
+    assert next_states == [None, None]
+
+
 def test_recurrent_rollout_records_a_trailing_state_for_segment_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -163,6 +194,39 @@ def test_recurrent_rollout_records_a_trailing_state_for_segment_replay(
     assert trajectory.cell.shape[0] == trajectory.dones.shape[0] + 1
     assert trajectory.prior_belief.shape[0] == trajectory.dones.shape[0] + 1
     assert not trajectory.hidden.requires_grad
+
+
+def test_recurrent_rollout_records_only_configured_segment_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production-style rollout keeps exact sparse multi-layer and belief state."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 6)
+    policy = StatefulPolicy(
+        ModelConfig.control(blocks=1, channels=4).model_copy(
+            update={
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+                "belief": True,
+            }
+        )
+    ).eval()
+
+    trajectory = rollout(
+        policy,
+        "starter",
+        seed=23,
+        state_unroll_length=2,
+    )
+
+    assert trajectory.state_steps is not None
+    assert trajectory.state_steps.tolist() == [1, 3]
+    assert trajectory.hidden is not None
+    assert trajectory.cell is not None
+    assert trajectory.prior_belief is not None
+    assert trajectory.hidden.shape == (2, 2, 3, BOARD_SIZE, BOARD_SIZE)
+    assert trajectory.cell.shape == trajectory.hidden.shape
+    assert trajectory.prior_belief.shape == (2, policy.config.belief_size)
 
 
 @pytest.fixture(scope="module")

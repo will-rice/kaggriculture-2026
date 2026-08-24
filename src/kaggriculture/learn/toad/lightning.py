@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 import lightning
 import torch
@@ -53,6 +53,17 @@ class ResumeConfigError(ValueError):
 
 
 PolicyLike = Policy | StatefulPolicy
+
+CheckpointLayout = Literal["bare", "legacy_learner", "lightning_policy"]
+
+
+@dataclass(frozen=True)
+class WarmStartMigration:
+    """Auditable result of the initialization-only checkpoint path."""
+
+    mode: Literal["exact_stateful", "control_migration", "legacy_control"]
+    source: CheckpointLayout
+    fresh_keys: tuple[str, ...] = ()
 
 
 def _belief_loss_terms(
@@ -102,8 +113,10 @@ def _belief_loss_terms(
     }
 
 
-def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
-    """Load policy weights from bare, legacy-runner, or Lightning checkpoints."""
+def _checkpoint_policy_weights(
+    path: Path,
+) -> tuple[Mapping[str, torch.Tensor], CheckpointLayout]:
+    """Extract policy tensors and retain their historical container layout."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, Mapping):
         raise ValueError("policy checkpoint must contain a mapping")
@@ -118,13 +131,21 @@ def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
         }
         if not weights:
             raise ValueError("Lightning checkpoint has no policy.* weights")
+        source: CheckpointLayout = "lightning_policy"
     elif "learner" in checkpoint:
         weights = checkpoint["learner"]
         if not isinstance(weights, Mapping):
             raise ValueError("legacy checkpoint learner must be a mapping")
+        source = "legacy_learner"
     else:
         weights = checkpoint
-    typed_weights = cast(Mapping[str, torch.Tensor], weights)
+        source = "bare"
+    return cast(Mapping[str, torch.Tensor], weights), source
+
+
+def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
+    """Strictly load worker/resume policy weights from historical containers."""
+    typed_weights, _source = _checkpoint_policy_weights(path)
     if isinstance(policy, StatefulPolicy):
         if uses_stateful_policy(policy.config):
             policy.load_state_dict(typed_weights, strict=True)
@@ -132,6 +153,44 @@ def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
             policy.load_control_state_dict(typed_weights)
         return []
     return load_policy_weights(policy, typed_weights)
+
+
+def initialize_policy_from_checkpoint(
+    policy: PolicyLike, path: Path
+) -> WarmStartMigration:
+    """Initialize a policy, explicitly migrating control-only foundation weights.
+
+    This is intentionally separate from ``load_checkpoint_policy``: actor,
+    worker, and resume loads remain exact, while a user-declared warm start may
+    seed the shared control trunk and leave optional modules at their deliberate
+    constructor initialization.
+    """
+    weights, source = _checkpoint_policy_weights(path)
+    if isinstance(policy, StatefulPolicy) and uses_stateful_policy(policy.config):
+        if set(weights) == set(policy.state_dict()):
+            policy.load_state_dict(weights, strict=True)
+            return WarmStartMigration("exact_stateful", source)
+        keys = tuple(weights)
+        prefixed = [name.startswith("control.") for name in keys]
+        if any(prefixed) and not all(prefixed):
+            raise ValueError("warm-start checkpoint mixes bare and control key layouts")
+        control_weights = (
+            {name.removeprefix("control."): value for name, value in weights.items()}
+            if prefixed
+            else dict(weights)
+        )
+        policy.control.load_state_dict(control_weights, strict=True)
+        fresh = tuple(
+            sorted(
+                name for name in policy.state_dict() if not name.startswith("control.")
+            )
+        )
+        return WarmStartMigration("control_migration", source, fresh)
+    if isinstance(policy, StatefulPolicy):
+        policy.load_control_state_dict(weights)
+    else:
+        load_policy_weights(policy, weights)
+    return WarmStartMigration("legacy_control", source)
 
 
 def read_path(config: ToadConfig, path: str) -> object:
@@ -353,10 +412,15 @@ class ToadLightningModule(lightning.LightningModule):
                 blocks=config.model.blocks,
                 channels=config.model.channels,
                 value_bound=config.model.value_bound,
+                kernel_size=config.model.kernel_size,
+                activation=config.model.activation,
             )
         )
+        self.warm_start_migration: WarmStartMigration | None = None
         if config.curriculum.warm_start_checkpoint is not None:
-            load_checkpoint_policy(self.policy, config.curriculum.warm_start_checkpoint)
+            self.warm_start_migration = initialize_policy_from_checkpoint(
+                self.policy, config.curriculum.warm_start_checkpoint
+            )
         self.teacher_policy: Policy | None = None
         self.teacher: Teacher | None = None
         if config.population.teacher_checkpoint is not None:

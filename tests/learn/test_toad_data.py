@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+import kaggriculture.learn.rollout as rollout_module
 from kaggriculture.learn.encoding import (
     MARKET_SLOTS,
     MAX_UNITS,
@@ -109,6 +110,96 @@ def test_segments_store_only_detached_state_before_their_first_observation() -> 
     assert not batches[0]["initial_belief"].requires_grad
 
 
+@pytest.mark.parametrize(
+    ("turns", "unroll_length", "expected"),
+    [
+        (32, 16, (0, 16)),
+        (31, 16, (15,)),
+        (719, 16, tuple(range(15, 704, 16))),
+        (10, 4, (2, 6)),
+    ],
+)
+def test_segment_starts_are_exactly_end_anchored(
+    turns: int, unroll_length: int, expected: tuple[int, ...]
+) -> None:
+    """Collector and learner must share literal starts for every episode shape."""
+    assert rollout_module.segment_starts(turns, unroll_length) == expected
+
+
+def test_sparse_recurrent_segments_clone_exact_boundary_states() -> None:
+    """Sparse multi-layer/belief state must detach and not retain trajectory storage."""
+    dense = _recurrent_trajectory(turns=32, layers=2)
+    assert dense.hidden is not None
+    assert dense.cell is not None
+    assert dense.prior_belief is not None
+    starts = torch.tensor([0, 16], dtype=torch.int64)
+    sparse = replace(
+        dense,
+        hidden=dense.hidden[starts],
+        cell=dense.cell[starts],
+        prior_belief=dense.prior_belief[starts],
+        state_steps=starts,
+    )
+
+    batches = segments(sparse, 16)
+
+    assert len(batches) == 2
+    assert batches[1]["initial_hidden"].shape == (2, 3, 10, 10)
+    assert batches[1]["initial_belief"].shape == (9,)
+    sparse_hidden = sparse.hidden
+    assert sparse_hidden is not None
+    expected = sparse_hidden[1].detach().clone()
+    sparse_hidden[1].detach().zero_()
+    assert torch.equal(batches[1]["initial_hidden"], expected)
+    assert batches[1]["initial_hidden"].untyped_storage().data_ptr() != (
+        sparse_hidden.untyped_storage().data_ptr()
+    )
+
+
+def test_sparse_recurrent_segments_reject_a_missing_active_start() -> None:
+    """An active recurrent trajectory may not silently initialize a missing unroll."""
+    dense = _recurrent_trajectory(turns=32)
+    assert dense.hidden is not None
+    assert dense.cell is not None
+    assert dense.prior_belief is not None
+    sparse = replace(
+        dense,
+        hidden=dense.hidden[[0]],
+        cell=dense.cell[[0]],
+        prior_belief=dense.prior_belief[[0]],
+        state_steps=torch.tensor([0]),
+    )
+
+    with pytest.raises(ValueError, match="missing recurrent state.*16"):
+        segments(sparse, 16)
+
+
+def test_default_recurrent_state_memory_is_boundary_sized_without_allocation() -> None:
+    """The fixed 719-decision horizon stores 44, not 720, default-width states."""
+    starts = rollout_module.segment_starts(719, 16)
+    dense_elements = 720 * 2 * 128 * 10 * 10
+    sparse_elements = len(starts) * 2 * 128 * 10 * 10
+
+    assert len(starts) == 44
+    assert starts[0] == 15
+    assert starts[-1] == 703
+    assert sparse_elements * 16 < dense_elements
+
+
+def test_reference_worker_carries_the_optimizer_unroll_length() -> None:
+    """Worker IPC must tell production rollout which boundary states to retain."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 16, "recurrent": True},
+            "optimizer": {"unroll_length": 7},
+        }
+    )
+    source = ReferenceRoundSource(config)
+    work = source._worker_input(CollectionAssignment(0, 1, "self", BatchKind.SELFPLAY))
+
+    assert work.unroll_length == 7
+
+
 def test_recurrent_reference_worker_receives_the_resolved_model_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -118,6 +209,8 @@ def test_recurrent_reference_worker_receives_the_resolved_model_config(
             "model": {
                 "blocks": 1,
                 "channels": 16,
+                "kernel_size": 5,
+                "activation": "leaky_relu",
                 "recurrent": True,
                 "recurrent_channels": 3,
                 "recurrent_layers": 2,
@@ -176,6 +269,8 @@ def test_recurrent_reference_worker_builds_and_loads_the_stateful_actor(
             "model": {
                 "blocks": 1,
                 "channels": 16,
+                "kernel_size": 5,
+                "activation": "leaky_relu",
                 "recurrent": True,
                 "recurrent_channels": 3,
                 "recurrent_layers": 2,
@@ -186,11 +281,16 @@ def test_recurrent_reference_worker_builds_and_loads_the_stateful_actor(
     seen: list[StatefulPolicy] = []
 
     def fake_rollout(
-        actor: object, opponent: object, seeds: Sequence[int]
+        actor: object,
+        opponent: object,
+        seeds: Sequence[int],
+        *,
+        state_unroll_length: int | None = None,
     ) -> list[Trajectory]:
         assert isinstance(actor, StatefulPolicy)
         assert opponent is actor
         assert list(seeds) == [19]
+        assert state_unroll_length == 16
         seen.append(actor)
         return []
 
@@ -205,6 +305,8 @@ def test_recurrent_reference_worker_builds_and_loads_the_stateful_actor(
 
     assert toad._play_reference(work) == []
     assert seen[0].config == config.model
+    assert seen[0].control.stem.kernel_size == (5, 5)
+    assert isinstance(seen[0].control.market[1], torch.nn.LeakyReLU)
     for name, tensor in expected.state_dict().items():
         assert torch.equal(seen[0].state_dict()[name], tensor)
 
@@ -228,10 +330,15 @@ def test_optional_reference_worker_builds_exact_stateful_actor(
     seen: list[StatefulPolicy] = []
 
     def fake_rollout(
-        actor: object, opponent: object, seeds: Sequence[int]
+        actor: object,
+        opponent: object,
+        seeds: Sequence[int],
+        *,
+        state_unroll_length: int | None = None,
     ) -> list[Trajectory]:
         assert isinstance(actor, StatefulPolicy)
         assert opponent is actor
+        assert state_unroll_length == 16
         seen.append(actor)
         return []
 
@@ -247,6 +354,36 @@ def test_optional_reference_worker_builds_exact_stateful_actor(
     assert toad._play_reference(work) == []
     for name, tensor in expected.state_dict().items():
         assert torch.equal(seen[0].state_dict()[name], tensor)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"transformer": True, "transformer_blocks": 1},
+        {"local_patch": True, "local_patch_blocks": 1},
+        {"interaction_value": True},
+    ],
+)
+def test_optional_reference_worker_runs_real_stateless_rollout(
+    model: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Typed worker reconstruction must cross the real decide seam unmocked."""
+    monkeypatch.setattr(rollout_module, "EPISODE_STEPS", 3)
+    config = ToadConfig.model_validate({"model": {"blocks": 1, "channels": 4, **model}})
+    actor = StatefulPolicy(config.model)
+    work = ReferenceWorkerInput(
+        actor_state=dict(actor.state_dict()),
+        seeds=[29],
+        model=config.model,
+        versus=None,
+        money_weight=0.01,
+    )
+
+    trajectories = toad._play_reference(work)
+
+    assert len(trajectories) == 2
+    assert all(len(trajectory.dones) == 2 for trajectory in trajectories)
+    assert all(trajectory.hidden is None for trajectory in trajectories)
 
 
 def test_round_expansion_preserves_policy_and_value_pass_counts() -> None:

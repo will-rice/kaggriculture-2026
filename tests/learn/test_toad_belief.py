@@ -522,7 +522,14 @@ def test_belief_only_lightning_and_worker_use_strict_stateful_weights(
     assert isinstance(module.policy, StatefulPolicy)
     seen: list[object] = []
 
-    def capture(actor: object, opponent: object, seeds: object) -> list[object]:
+    def capture(
+        actor: object,
+        opponent: object,
+        seeds: object,
+        *,
+        state_unroll_length: int | None = None,
+    ) -> list[object]:
+        assert state_unroll_length == 16
         seen.append(actor)
         return []
 

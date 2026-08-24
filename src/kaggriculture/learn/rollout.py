@@ -293,13 +293,16 @@ class Trajectory:
             ``progress.progress_reward``.
         dones: ``(turns,)`` bool, True on the last turn alone. A rollout is
             one whole episode, so GAE bootstraps from nothing at the end.
-        hidden: Optional recurrent hidden maps before every acted observation,
-            plus the state after the final action. Single-layer state is
-            ``(turns + 1, channels, 10, 10)``; stacked recurrence retains its
-            layer axis after time. ``None`` preserves legacy trajectory inputs.
+        hidden: Optional recurrent hidden maps. Production collection stores
+            only the exact segment starts named by ``state_steps``; legacy
+            fixtures may retain one state before every observation plus a
+            trailing state. Stacked recurrence retains its layer axis after
+            the sparse/dense row axis. ``None`` preserves control inputs.
         cell: Optional recurrent cell maps on the same clock as ``hidden``.
         prior_belief: Optional prior-belief state on the same clock as
             ``hidden``.
+        state_steps: Optional acted-row indices for sparse production state.
+            ``None`` identifies the source-compatible dense schema.
         final_margin: This seat's terminal bank minus the other's. Positive is
             a win.
         final_bank: This seat's terminal bank on its own. Not derivable from
@@ -355,6 +358,7 @@ class Trajectory:
     hidden: torch.Tensor | None = None
     cell: torch.Tensor | None = None
     prior_belief: torch.Tensor | None = None
+    state_steps: torch.Tensor | None = None
     belief_targets: torch.Tensor | None = None
     belief_valid: torch.Tensor | None = None
 
@@ -395,6 +399,8 @@ class Stream:
     potentials: list[list[float]] = field(default_factory=list)
     policy_state: PolicyState | None = None
     states: list[RecordedPolicyState] = field(default_factory=list)
+    state_steps: list[int] = field(default_factory=list)
+    state_unroll_length: int | None = None
     belief_targets: list[torch.Tensor] = field(default_factory=list)
     belief_valid: list[bool] = field(default_factory=list)
     done: bool = False
@@ -427,7 +433,22 @@ class Turn:
     belief_valid: bool = False
 
 
-def rollout(policy: PolicyLike, opponent: PolicyLike | str, seed: int) -> Trajectory:
+def segment_starts(turns: int, unroll_length: int) -> tuple[int, ...]:
+    """Return fixed end-anchored segment starts shared by actor and learner."""
+    if isinstance(turns, bool) or turns < 0:
+        raise ValueError("turn count must be a non-negative integer")
+    if isinstance(unroll_length, bool) or unroll_length <= 0:
+        raise ValueError("unroll length must be a positive integer")
+    return tuple(range(turns % unroll_length, turns - unroll_length + 1, unroll_length))
+
+
+def rollout(
+    policy: PolicyLike,
+    opponent: PolicyLike | str,
+    seed: int,
+    *,
+    state_unroll_length: int | None = None,
+) -> Trajectory:
     """Play one episode from seat 0 and return everything the update needs.
 
     The one-seed case of ``rollout_many``, and seat 0's trajectory out of it.
@@ -444,17 +465,25 @@ def rollout(policy: PolicyLike, opponent: PolicyLike | str, seed: int) -> Trajec
         seed: The episode seed, which fixes the weed spawns and the town's
             shop unlock order. The action sampling is seeded from it too, so a
             rollout is reproducible given the weights.
+        state_unroll_length: When set, retain recurrent state only at the
+            end-anchored segment starts consumed by the learner.
 
     Returns:
         The episode's ``Trajectory``, 719 turns long -- ``episodeSteps`` is
         720 and the engine marks the season done on the last one, so there are
         720 recorded states and 719 decisions between them.
     """
-    return rollout_many(policy, opponent, (seed,))[0]
+    return rollout_many(
+        policy, opponent, (seed,), state_unroll_length=state_unroll_length
+    )[0]
 
 
 def rollout_many(
-    policy: PolicyLike, opponent: PolicyLike | str, seeds: Sequence[int]
+    policy: PolicyLike,
+    opponent: PolicyLike | str,
+    seeds: Sequence[int],
+    *,
+    state_unroll_length: int | None = None,
 ) -> list[Trajectory]:
     """Play a group of episodes in lockstep, one forward per turn for all of them.
 
@@ -474,6 +503,8 @@ def rollout_many(
         opponent: Another ``Policy``, or a spec the environment can build.
         seeds: One seed per environment in the group. Each seeds its own
             episode; the first also seeds the group's shared sampling stream.
+        state_unroll_length: When set, retain recurrent state only at the
+            end-anchored segment starts consumed by the learner.
 
     Returns:
         The group's trajectories, environment-major and seat-minor, so seat 0
@@ -492,8 +523,17 @@ def rollout_many(
         environment.reset(2)
 
     mirror = opponent is policy
+    state_boundaries = (
+        set(segment_starts(EPISODE_STEPS - 1, state_unroll_length))
+        if state_unroll_length is not None
+        else None
+    )
     streams = [
-        Stream(environment=index, seat=seat)
+        Stream(
+            environment=index,
+            seat=seat,
+            state_unroll_length=state_unroll_length,
+        )
         for index in range(len(environments))
         for seat in ((LEARNER, OPPONENT) if mirror else (LEARNER,))
     ]
@@ -504,6 +544,7 @@ def rollout_many(
     )
     opponent_states: list[PolicyState | None] = [None] * len(environments)
     while not environments[0].done:
+        turn_index = len(streams[0].turns)
         for stream in streams:
             seen = _observation(environments, stream.environment, stream.seat)
             stream.margins.append(_margin(seen))
@@ -524,6 +565,8 @@ def rollout_many(
             states=[stream.policy_state for stream in streams],
             dones=[stream.done for stream in streams],
             belief_observations=_belief_observations(policy, environments, streams),
+            record_states=[state_boundaries is None or turn_index in state_boundaries]
+            * len(streams),
         )
         actions: list[list[Any]] = [[None, None] for _ in environments]
         for stream, turn, next_state in zip(streams, turns, next_states, strict=True):
@@ -578,6 +621,7 @@ def _record_turn(stream: Stream, turn: Turn, next_state: PolicyState | None) -> 
     stream.turns.append(turn)
     if turn.policy_state is not None:
         stream.states.append(turn.policy_state)
+        stream.state_steps.append(len(stream.turns) - 1)
     if turn.belief_target is not None:
         stream.belief_targets.append(turn.belief_target)
         stream.belief_valid.append(turn.belief_valid)
@@ -670,6 +714,7 @@ def _opponent_actions(
             generator,
             states=states,
             dones=[False] * len(environments),
+            record_states=[False] * len(environments),
         )
         return [turn.action for turn in turns], next_states
     return (
@@ -758,6 +803,7 @@ def _decide(
     states: Sequence[PolicyState | None] | None = None,
     dones: Sequence[bool] | None = None,
     belief_observations: Sequence[Mapping[str, Any]] | None = None,
+    record_states: Sequence[bool] | None = None,
 ) -> tuple[list[Turn], list[PolicyState | None]]:
     """Sample one turn's action for every ``(observation, seat)`` in the batch.
 
@@ -798,6 +844,8 @@ def _decide(
         dones: Whether each request follows a terminal action.
         belief_observations: Optional opposing-seat private observations used
             only to construct supervision stored beside the policy inputs.
+        record_states: One flag per row selecting whether the input recurrent
+            state is copied into the resulting ``Turn``.
 
     Returns:
         One ``Turn`` and next policy state per request, in request order.
@@ -830,6 +878,9 @@ def _decide(
     prior_dones = list(dones or [False] * len(requests))
     if len(prior_dones) != len(requests):
         raise ValueError("one done flag is required per decision request")
+    retained = list(record_states or [True] * len(requests))
+    if len(retained) != len(requests):
+        raise ValueError("one state-retention flag is required per decision request")
     with torch.no_grad():
         output, used_states = _actor_forward(
             policy,
@@ -901,7 +952,7 @@ def _decide(
                 value=value[rows],
                 policy_state=(
                     RecordedPolicyState.from_policy_state(used_state)
-                    if used_state is not None
+                    if used_state is not None and retained[row]
                     else None
                 ),
                 belief_target=belief_targets[row],
@@ -933,6 +984,8 @@ def _actor_forward(
             dones=dones.unsqueeze(0),
         )
         used = _unbatch_policy_state(output.input_state)
+        if not used:
+            used = [None] * len(states)
         return (
             PolicyOutput(
                 output.unit_logits.squeeze(0),
@@ -1083,7 +1136,7 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
     unit_quantity_masks = torch.cat([turn.quantity_mask for turn in turns])
     market_masks = torch.cat([turn.market_mask for turn in turns])
     recurrent = list(stream.states)
-    if stream.policy_state is not None:
+    if stream.state_unroll_length is None and stream.policy_state is not None:
         recurrent.append(RecordedPolicyState.from_policy_state(stream.policy_state))
     return Trajectory(
         board=torch.cat([turn.board for turn in turns]),
@@ -1130,6 +1183,11 @@ def _trajectory(stream: Stream, environment: Environment) -> Trajectory:
         prior_belief=(
             torch.stack([state.prior_belief for state in recurrent])
             if recurrent
+            else None
+        ),
+        state_steps=(
+            torch.tensor(stream.state_steps, dtype=torch.int64)
+            if recurrent and stream.state_unroll_length is not None
             else None
         ),
         belief_targets=(

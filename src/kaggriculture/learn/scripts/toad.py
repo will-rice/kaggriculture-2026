@@ -1510,6 +1510,8 @@ def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
             blocks=work.model.blocks,
             channels=work.model.channels,
             value_bound=work.model.value_bound,
+            kernel_size=work.model.kernel_size,
+            activation=work.model.activation,
         )
         actor.load_state_dict(work.actor_state, strict=True)
     actor.eval()
@@ -1521,6 +1523,7 @@ def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
                 actor,
                 work.versus if work.versus is not None else actor,
                 work.seeds,
+                state_unroll_length=work.unroll_length,
             )
     finally:
         if previous_money_weight is None:
