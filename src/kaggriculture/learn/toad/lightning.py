@@ -20,8 +20,9 @@ from kaggriculture.learn.toad.config import (
     STRUCTURAL_FIELDS,
     ToadConfig,
     structural_fingerprint,
+    validate_stored_config,
 )
-from kaggriculture.learn.toad.data import LearnerBatch
+from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
@@ -216,6 +217,7 @@ def round_decay(config: ToadConfig) -> Callable[[int], float]:
         config.population.scripted,
         total_steps=config.runtime.total_environment_steps,
         environments=config.population.environments_per_rank,
+        min_lr_multiplier=config.optimizer.final_lr_multiplier,
     )
 
 
@@ -258,6 +260,10 @@ class ToadLightningModule(lightning.LightningModule):
         self.warmup_remaining = config.optimizer.value_warmup_batches
         self._round_ended = False
         self._round_started_warming = False
+        self._round_fresh_terms: list[Mapping[str, torch.Tensor]] = []
+        self._round_baselines: list[torch.Tensor] = []
+        self._round_metrics: dict[str, float | int] = {}
+        self._round_population = {"selfplay": 0, "scripted": 0}
         self.save_hyperparameters(config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
@@ -286,6 +292,10 @@ class ToadLightningModule(lightning.LightningModule):
         """Compute one optimizer-sized batch and advance logical round clocks."""
         if batch.first_of_round:
             self._round_started_warming = self.warmup_remaining > 0
+            self._round_fresh_terms = []
+            self._round_baselines = []
+            self._round_metrics = dict(batch.round_metrics)
+            self._round_population = {"selfplay": 0, "scripted": 0}
         baseline_only = batch.baseline_only or self.warmup_remaining > 0
         report = compute_loss(
             self.policy,
@@ -295,15 +305,62 @@ class ToadLightningModule(lightning.LightningModule):
             baseline_only=baseline_only,
         )
         self._round_ended = batch.end_of_round
+        self._round_baselines.append(report.terms["baseline"].detach())
+        if not batch.baseline_only:
+            self._round_fresh_terms.append(
+                {name: value.detach() for name, value in report.terms.items()}
+            )
+            for kind in batch.segment_kinds or (batch.kind,) * len(batch.segments):
+                if kind is not BatchKind.MIXED:
+                    self._round_population[kind.value] += 1
         if not batch.baseline_only and self.warmup_remaining:
             self.warmup_remaining -= 1
         self.environment_steps += batch.collected_steps
         if batch.end_of_round:
             self.collection_round += 1
-        self.log_dict(
-            {f"loss/{name}": value.detach() for name, value in report.terms.items()}
-        )
+        if batch.end_of_round:
+            self.log_dict(self._round_log_record())
         return report.total
+
+    def _round_log_record(self) -> dict[str, torch.Tensor | int | float]:
+        """Return one stable dashboard record for the completed logical round."""
+        fresh = self._round_fresh_terms
+
+        def mean_term(name: str) -> torch.Tensor:
+            values = [terms[name] for terms in fresh]
+            return torch.stack(values).mean() if values else torch.tensor(float("nan"))
+
+        optimizer_steps = int(self.global_step) + 1
+        try:
+            lr = float(self.trainer.optimizers[0].param_groups[0]["lr"])
+        except RuntimeError:
+            lr = float(self.config.optimizer.lr)
+        baseline_passes = torch.stack(self._round_baselines).mean()
+        record: dict[str, torch.Tensor | int | float] = {
+            **self._round_metrics,
+            "diag/update": self.collection_round,
+            "diag/steps": self.environment_steps,
+            "diag/environment_steps": self.environment_steps,
+            "diag/optimizer_steps": optimizer_steps,
+            "diag/collection_round": self.collection_round,
+            "diag/population_selfplay_segments": self._round_population["selfplay"],
+            "diag/population_scripted_segments": self._round_population["scripted"],
+            "diag/actor_version": self.actor_version,
+            "diag/actor_lag_optimizer_steps": (
+                optimizer_steps - self.actor_source_global_step
+            ),
+            "diag/lr": lr,
+            "diag/warming": self._round_started_warming,
+            "diag/warmup_left": self.warmup_remaining,
+            "diag/vtrace_pg": mean_term("vtrace_pg"),
+            "diag/upgo_pg": mean_term("upgo_pg"),
+            "critic/baseline_self_consistency": mean_term("baseline"),
+            "critic/baseline_passes_self_consistency": baseline_passes,
+            "diag/entropy": mean_term("entropy"),
+            "diag/teacher_kl": mean_term("teacher"),
+            "diag/total_loss": mean_term("total"),
+        }
+        return record
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         """Construct the pinned Adam optimizer and round-stepped LR schedule."""
@@ -340,13 +397,33 @@ class ToadLightningModule(lightning.LightningModule):
             "actor_version": self.actor_version,
             "actor_source_global_step": self.actor_source_global_step,
             "warmup_remaining": self.warmup_remaining,
+            "teacher": self._teacher_metadata(),
+        }
+
+    def _teacher_metadata(self) -> dict[str, object]:
+        """Return structural teacher semantics that must survive resume."""
+        return {
+            "present": self.teacher is not None,
+            "blocks": (
+                self.config.population.teacher_blocks or self.config.model.blocks
+                if self.teacher is not None
+                else None
+            ),
+            "quantity": self.teacher.quantity if self.teacher is not None else None,
         }
 
     def on_load_checkpoint(self, checkpoint: dict[str, object]) -> None:
         """Validate structure and restore Toad's logical clocks."""
         state = cast(dict[str, object], checkpoint["toad"])
-        stored_config = ToadConfig.model_validate(state["config"])
+        stored_config = validate_stored_config(state["config"])
         assert_resume_compatible(self.config, stored_config)
+        stored_teacher = cast(dict[str, object], state["teacher"])
+        current_teacher = self._teacher_metadata()
+        if stored_teacher != current_teacher:
+            raise ResumeConfigError(
+                "teacher metadata mismatch: "
+                f"stored={stored_teacher!r}, effective={current_teacher!r}"
+            )
         self.environment_steps = cast(int, state["environment_steps"])
         self.collection_round = cast(int, state["collection_round"])
         self.actor_version = cast(int, state["actor_version"])

@@ -240,10 +240,15 @@ def test_round_decay_uses_typed_mixture_and_environment_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Scheduler round sizing must describe the games collection actually runs."""
-    seen: list[tuple[float, int, int]] = []
+    seen: list[tuple[float, int, int, float]] = []
 
-    def fake_decay(fraction: float, total_steps: int, environments: int) -> object:
-        seen.append((fraction, total_steps, environments))
+    def fake_decay(
+        fraction: float,
+        total_steps: int,
+        environments: int,
+        min_lr_multiplier: float,
+    ) -> object:
+        seen.append((fraction, total_steps, environments, min_lr_multiplier))
         return lambda _: 1.0
 
     monkeypatch.setattr(toad, "_decay", fake_decay)
@@ -262,7 +267,14 @@ def test_round_decay_uses_typed_mixture_and_environment_quota(
 
     round_decay(config)
 
-    assert seen == [(0.25, config.runtime.total_environment_steps, 4)]
+    assert seen == [
+        (
+            0.25,
+            config.runtime.total_environment_steps,
+            4,
+            config.optimizer.final_lr_multiplier,
+        )
+    ]
 
 
 def test_scheduler_steps_only_after_the_batch_that_closes_a_round(

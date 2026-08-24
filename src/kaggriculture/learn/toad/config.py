@@ -14,6 +14,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
+    ValidationInfo,
     model_validator,
 )
 
@@ -164,7 +165,7 @@ class ToadConfig(BaseModel):
         return cls()
 
     @model_validator(mode="after")
-    def validate_relationships(self) -> Self:
+    def validate_relationships(self, info: ValidationInfo) -> Self:
         """Reject combinations unsupported by the native trainer."""
         probabilities = (
             self.population.selfplay,
@@ -178,18 +179,21 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "population probabilities must be nonnegative and sum to one"
             )
+        _validate_foundation_population(self.population)
+        _validate_foundation_optimizer(self.optimizer)
         if (
             self.optimizer.teacher_kl_cost or self.population.teacher_distill
         ) and self.population.teacher_checkpoint is None:
             raise ValueError(
                 "teacher checkpoint is required by teacher loss or batches"
             )
-        if self.population.teacher_checkpoint is not None:
+        historical = bool(info.context and info.context.get("historical"))
+        if self.population.teacher_checkpoint is not None and not historical:
             _require_readable(
                 self.population.teacher_checkpoint,
                 label="teacher checkpoint",
             )
-        if self.curriculum.warm_start_checkpoint is not None:
+        if self.curriculum.warm_start_checkpoint is not None and not historical:
             _require_readable(
                 self.curriculum.warm_start_checkpoint,
                 label="warm-start checkpoint",
@@ -199,18 +203,33 @@ class ToadConfig(BaseModel):
             and self.runtime.resume is not None
         ):
             raise ValueError("warm start and resume are mutually exclusive")
-        if self.population.frozen_opponent and not (
-            self.population.initial_snapshots
-            or (
-                self.population.snapshot_at_start
-                and self.population.snapshot_every_environment_steps
-            )
-        ):
+        if self.runtime.resume is not None and self.runtime.resume.suffix == ".pt":
             raise ValueError(
-                "frozen opponent batches require initial snapshots "
-                "or a snapshot schedule"
+                "legacy .pt resume requires checkpoint migration before Lightning; "
+                "conversion is scheduled for Stage 9"
             )
         return self
+
+
+def _validate_foundation_population(population: PopulationConfig) -> None:
+    """Reject population modes implemented only by later native-port stages."""
+    if population.frozen_opponent:
+        raise ValueError("frozen_opponent is not implemented in the foundation trainer")
+    if population.teacher_distill:
+        raise ValueError("teacher_distill is not implemented in the foundation trainer")
+
+
+def _validate_foundation_optimizer(optimizer: OptimizerConfig) -> None:
+    """Reject loss coefficients whose native consumers do not exist yet."""
+    unsupported = {
+        "teacher_baseline_cost": (optimizer.teacher_baseline_cost, 0.0),
+        "vtrace_pg_cost": (optimizer.vtrace_pg_cost, 1.0),
+        "upgo_pg_cost": (optimizer.upgo_pg_cost, 1.0),
+        "baseline_cost": (optimizer.baseline_cost, 1.0),
+    }
+    for name, (value, control) in unsupported.items():
+        if value != control:
+            raise ValueError(f"{name} is not configurable in the foundation trainer")
 
 
 def _require_readable(path: Path, *, label: str) -> None:
@@ -228,6 +247,11 @@ def load_config(path: Path | None, overrides: Sequence[str] = ()) -> ToadConfig:
     """Load a JSON configuration and apply validated dotted overrides."""
     payload = {} if path is None else json.loads(path.read_text())
     return apply_overrides(ToadConfig.model_validate(payload), overrides)
+
+
+def validate_stored_config(payload: object) -> ToadConfig:
+    """Validate checkpoint schema without rechecking historical external files."""
+    return ToadConfig.model_validate(payload, context={"historical": True})
 
 
 def apply_overrides(config: ToadConfig, overrides: Sequence[str]) -> ToadConfig:

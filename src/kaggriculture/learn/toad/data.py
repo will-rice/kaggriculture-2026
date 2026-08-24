@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
 
@@ -43,6 +43,7 @@ class BatchKind(StrEnum):
 
     SELFPLAY = "selfplay"
     SCRIPTED = "scripted"
+    MIXED = "mixed"
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,8 @@ class LearnerBatch:
     actor_version: int
     game_ids: tuple[int, ...]
     opponent_ids: tuple[str, ...]
+    segment_kinds: tuple[BatchKind, ...] = ()
+    round_metrics: Mapping[str, float | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -146,12 +149,19 @@ class RoundBatchExpander:
         self.seed = seed
 
     def expand(
-        self, trajectories: Sequence[Trajectory], meta: RoundMeta
+        self,
+        trajectories: Sequence[Trajectory],
+        meta: RoundMeta,
+        *,
+        trajectory_kinds: Sequence[BatchKind] | None = None,
+        kind_metas: Mapping[BatchKind, RoundMeta] | None = None,
+        round_metrics: Mapping[str, float | int] | None = None,
     ) -> Iterator[LearnerBatch]:
         """Yield fresh policy batches followed by deterministic value replays."""
+        kinds = trajectory_kinds or [meta.kind] * len(trajectories)
         all_segments = [
-            segment
-            for trajectory in trajectories
+            (segment, kind)
+            for trajectory, kind in zip(trajectories, kinds, strict=True)
             for segment in segments(trajectory, self.unroll_length)
         ]
         groups = [
@@ -163,9 +173,9 @@ class RoundBatchExpander:
         if not groups:
             return
 
-        pending: list[tuple[tuple[dict[str, torch.Tensor], ...], bool]] = [
-            (group, False) for group in groups
-        ]
+        pending: list[
+            tuple[tuple[tuple[dict[str, torch.Tensor], BatchKind], ...], bool]
+        ] = [(group, False) for group in groups]
         generator = torch.Generator().manual_seed(self.seed + meta.round_id)
         for _ in range(self.value_passes):
             order = torch.randperm(len(all_segments), generator=generator).tolist()
@@ -187,18 +197,28 @@ class RoundBatchExpander:
         collected_steps = sum(
             int(trajectory.dones.shape[0]) for trajectory in trajectories
         )
-        for index, (batch_segments, baseline_only) in enumerate(pending):
+        for index, (entries, baseline_only) in enumerate(pending):
+            batch_segments = tuple(entry[0] for entry in entries)
+            segment_kinds = tuple(entry[1] for entry in entries)
+            batch_kind = (
+                segment_kinds[0]
+                if all(kind is segment_kinds[0] for kind in segment_kinds)
+                else BatchKind.MIXED
+            )
+            batch_meta = (kind_metas or {}).get(batch_kind, meta)
             yield LearnerBatch(
                 segments=batch_segments,
-                kind=meta.kind,
+                kind=batch_kind,
                 baseline_only=baseline_only,
                 first_of_round=index == 0,
                 end_of_round=index == len(pending) - 1,
                 collected_steps=collected_steps if index == 0 else 0,
-                round_id=meta.round_id,
-                actor_version=meta.actor_version,
-                game_ids=meta.game_ids,
-                opponent_ids=meta.opponent_ids,
+                round_id=batch_meta.round_id,
+                actor_version=batch_meta.actor_version,
+                game_ids=batch_meta.game_ids,
+                opponent_ids=batch_meta.opponent_ids,
+                segment_kinds=segment_kinds,
+                round_metrics=round_metrics or {},
             )
 
 
@@ -221,6 +241,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         self.next_game_id = 0
         self.rng = random.Random(config.runtime.seed)
         self._next_round_id = 0
+        self._restored_actor = False
 
     def publish_actor(
         self, state_dict: Mapping[str, torch.Tensor], version: int
@@ -228,6 +249,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         """Install the immutable CPU snapshot used by the next collection."""
         self.actor_state = dict(state_dict)
         self.actor_version = version
+        self._restored_actor = False
 
     def collect_assignment(
         self, assignment: CollectionAssignment
@@ -241,9 +263,15 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
 
     def _worker_input(self, assignment: CollectionAssignment) -> WorkerInput:
         """Return the legacy worker tuple for one provenance-bearing game."""
-        versus = (
-            assignment.opponent_id if assignment.kind is BatchKind.SCRIPTED else None
-        )
+        versus = None
+        if assignment.kind is BatchKind.SCRIPTED:
+            from kaggriculture.learn.scripts.toad import OPPONENT
+
+            versus = (
+                OPPONENT
+                if assignment.opponent_id == "economic"
+                else assignment.opponent_id
+            )
         return (
             self.actor_state,
             [assignment.seed],
@@ -319,15 +347,10 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         if not assignments:
             return
         collected = self._collect_round(assignments)
-        grouped: dict[
-            BatchKind, list[tuple[CollectionAssignment, Sequence[Trajectory]]]
-        ] = {
-            BatchKind.SCRIPTED: [],
-            BatchKind.SELFPLAY: [],
-        }
-        for assignment, trajectories in collected:
-            grouped[assignment.kind].append((assignment, trajectories))
-
+        ordered = sorted(
+            collected,
+            key=lambda entry: 0 if entry[0].kind is BatchKind.SELFPLAY else 1,
+        )
         round_id = self._next_round_id
         self._next_round_id += 1
         expander = RoundBatchExpander(
@@ -336,35 +359,67 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             value_passes=self.config.optimizer.value_passes,
             seed=self.config.runtime.seed,
         )
-        batches: list[LearnerBatch] = []
-        total_steps = 0
-        for kind in (BatchKind.SCRIPTED, BatchKind.SELFPLAY):
-            entries = grouped[kind]
-            if not entries:
-                continue
-            kind_assignments = tuple(entry[0] for entry in entries)
-            trajectories = [
-                trajectory for _, assigned in entries for trajectory in assigned
-            ]
-            total_steps += sum(
-                int(trajectory.dones.shape[0]) for trajectory in trajectories
-            )
-            meta = RoundMeta(
+        ordered_assignments = tuple(entry[0] for entry in ordered)
+        trajectories = [
+            trajectory for _, assigned in ordered for trajectory in assigned
+        ]
+        trajectory_kinds = [
+            assignment.kind
+            for assignment, assigned in ordered
+            for _trajectory in assigned
+        ]
+        present = set(trajectory_kinds)
+        round_kind = next(iter(present)) if len(present) == 1 else BatchKind.MIXED
+        meta = RoundMeta(
+            round_id=round_id,
+            actor_version=self.actor_version,
+            game_ids=tuple(item.game_id for item in ordered_assignments),
+            seeds=tuple(item.seed for item in ordered_assignments),
+            opponent_ids=tuple(item.opponent_id for item in ordered_assignments),
+            kind=round_kind,
+        )
+        kind_metas = {
+            kind: RoundMeta(
                 round_id=round_id,
                 actor_version=self.actor_version,
-                game_ids=tuple(item.game_id for item in kind_assignments),
-                seeds=tuple(item.seed for item in kind_assignments),
-                opponent_ids=tuple(item.opponent_id for item in kind_assignments),
+                game_ids=tuple(
+                    item.game_id for item in ordered_assignments if item.kind is kind
+                ),
+                seeds=tuple(
+                    item.seed for item in ordered_assignments if item.kind is kind
+                ),
+                opponent_ids=tuple(
+                    item.opponent_id
+                    for item in ordered_assignments
+                    if item.kind is kind
+                ),
                 kind=kind,
             )
-            batches.extend(expander.expand(trajectories, meta))
-        for index, batch in enumerate(batches):
-            yield replace(
-                batch,
-                first_of_round=index == 0,
-                end_of_round=index == len(batches) - 1,
-                collected_steps=total_steps if index == 0 else 0,
-            )
+            for kind in present
+        }
+        mirror = [
+            trajectory
+            for assignment, assigned in ordered
+            if assignment.kind is BatchKind.SELFPLAY
+            for trajectory in assigned
+        ]
+        scripted = [
+            trajectory
+            for assignment, assigned in ordered
+            if assignment.kind is BatchKind.SCRIPTED
+            for trajectory in assigned
+        ]
+        from kaggriculture.learn.scripts.toad import _collection_metrics
+
+        yield from expander.expand(
+            trajectories,
+            meta,
+            trajectory_kinds=trajectory_kinds,
+            kind_metas=kind_metas,
+            round_metrics=_collection_metrics(
+                mirror, scripted, self.config.curriculum.reward_field
+            ),
+        )
 
 
 class RoundIterableDataset(IterableDataset[LearnerBatch]):
@@ -414,6 +469,10 @@ class ToadDataModule(lightning.LightningDataModule):
             "next_game_id": self.source.next_game_id,
             "collector_rng": self.source.rng.getstate(),
             "published_actor_version": self.source.actor_version,
+            "published_actor_state": {
+                name: tensor.detach().to("cpu", copy=True)
+                for name, tensor in self.source.actor_state.items()
+            },
         }
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
@@ -424,3 +483,17 @@ class ToadDataModule(lightning.LightningDataModule):
         )
         self.source.rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))
         self.source.actor_version = cast(int, state_dict["published_actor_version"])
+        actor_state = cast(
+            Mapping[str, torch.Tensor], state_dict["published_actor_state"]
+        )
+        self.source.actor_state = {
+            name: tensor.detach().to("cpu", copy=True)
+            for name, tensor in actor_state.items()
+        }
+        self.source._restored_actor = True
+
+    def consume_restored_actor(self) -> bool:
+        """Return and clear whether checkpoint load supplied the actor snapshot."""
+        restored = self.source._restored_actor
+        self.source._restored_actor = False
+        return restored

@@ -182,6 +182,7 @@ def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> N
         "actor_version": 3,
         "actor_source_global_step": 17,
         "warmup_remaining": 8,
+        "teacher": {"present": False, "blocks": None, "quantity": None},
     }
 
 
@@ -388,11 +389,6 @@ def test_lightning_resume_matches_uninterrupted_full_state(
 
     checkpoint_path = config.runtime.output_dir / "step-64.ckpt"
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    checkpoint_model = {
-        name.removeprefix("policy."): value
-        for name, value in checkpoint["state_dict"].items()
-        if name.startswith("policy.")
-    }
     assert checkpoint["global_step"] == 1
     assert checkpoint["optimizer_states"]
     assert checkpoint["lr_schedulers"]
@@ -403,7 +399,7 @@ def test_lightning_resume_matches_uninterrupted_full_state(
     def collect_resumed(assignment: CollectionAssignment) -> tuple[Trajectory]:
         actor_matches = all(
             torch.equal(resumed_source.actor_state[name], value)
-            for name, value in checkpoint_model.items()
+            for name, value in initial_model.items()
         )
         collected.append(
             (assignment.game_id, resumed_source.actor_version, actor_matches)

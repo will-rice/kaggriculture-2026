@@ -37,6 +37,7 @@ Deviations from monobeast, all deliberate and all recorded in the task report:
 import argparse
 import logging
 import os
+import re
 import sys
 import warnings
 from collections.abc import Callable, Sequence
@@ -44,6 +45,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
+from typing import cast
 
 import lightning
 import torch
@@ -547,6 +549,10 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
     """Translate the former flags into the native immutable config contract."""
     arguments = _parser().parse_args(argv)
     reward_field = _field(arguments)
+    if arguments.name is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*", arguments.name
+    ):
+        raise ValueError("legacy --name must be a safe run name")
 
     control = ToadConfig.control()
     payload = control.model_dump(mode="python")
@@ -571,6 +577,11 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
     payload["runtime"].update(
         total_environment_steps=arguments.total_steps,
         resume=arguments.resume,
+        output_dir=(
+            control.runtime.output_dir / arguments.name
+            if arguments.name is not None
+            else control.runtime.output_dir
+        ),
     )
     payload["curriculum"].update(
         phase=arguments.name or control.curriculum.phase,
@@ -663,18 +674,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv: Primary ``--config``/``--set`` arguments or one-release legacy
             flags. ``None`` reads ``sys.argv[1:]``.
     """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     if _uses_legacy_cli(arguments):
+        config = _legacy_config(arguments)
         message = (
             "legacy Toad flags are deprecated for one release; use --config "
             "PATH plus repeatable --set PATH=JSON_VALUE"
         )
         warnings.warn(message, DeprecationWarning, stacklevel=2)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
         LOGGER.warning(message)
-        config = _legacy_config(arguments)
     else:
         config = parse_config(arguments)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     run(config)
 
 
@@ -854,6 +866,47 @@ def _record(
         **_prefixed_terms(terms),
     }
     return record
+
+
+def _collection_metrics(
+    mirror_batch: list[Trajectory], econ_batch: list[Trajectory], field: str
+) -> dict[str, float | int]:
+    """Return the legacy stable metrics available immediately after collection."""
+    terms = {
+        "vtrace_pg": 0.0,
+        "upgo_pg": 0.0,
+        "baseline": 0.0,
+        "baseline_passes": 0.0,
+        "entropy": 0.0,
+        "teacher": 0.0,
+        "total": 0.0,
+    }
+    record = _record(
+        mirror_batch,
+        econ_batch,
+        field,
+        update=0,
+        steps=0,
+        hours=0.0,
+        lr=0.0,
+        warming=False,
+        warmup_left=0,
+        terms=terms,
+    )
+    dynamic = {
+        "diag/update",
+        "diag/steps",
+        "diag/hours",
+        "diag/lr",
+        "diag/warming",
+        "diag/warmup_left",
+        *(_TERM_PREFIX.values()),
+    }
+    return {
+        name: cast(float | int, value)
+        for name, value in record.items()
+        if name not in dynamic
+    }
 
 
 def _mean(values: list[float]) -> float:
@@ -1214,6 +1267,7 @@ def _decay(
     econ_fraction: float,
     total_steps: int = TOTAL_STEPS,
     environments: int = ENVIRONMENTS,
+    min_lr_multiplier: float = MIN_LR_MOD,
 ) -> Callable[[int], float]:
     """Return the LR multiplier function, floored at their ``min_lr_mod``.
 
@@ -1238,6 +1292,7 @@ def _decay(
             (default ``TOTAL_STEPS``). The curriculum's five phases each need a
             different budget (2e7-1e7 against the constant's 1e8).
         environments: Games collected in each logical round.
+        min_lr_multiplier: Floor applied after linear learning-rate decay.
 
     Returns:
         The multiplier at a given schedule step.
@@ -1247,7 +1302,7 @@ def _decay(
     )
 
     def decay(step: int) -> float:
-        return max(1.0 - step / updates, MIN_LR_MOD)
+        return max(1.0 - step / updates, min_lr_multiplier)
 
     return decay
 

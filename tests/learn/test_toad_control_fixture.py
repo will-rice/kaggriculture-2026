@@ -60,9 +60,7 @@ def control_fixture_config() -> ToadConfig:
     control = ToadConfig.control()
     return control.model_copy(
         update={
-            "model": control.model.model_copy(
-                update={"blocks": 1, "channels": 16}
-            ),
+            "model": control.model.model_copy(update={"blocks": 1, "channels": 16}),
             "optimizer": control.optimizer.model_copy(
                 update={"value_warmup_batches": 0, "value_passes": 1}
             ),
@@ -73,9 +71,7 @@ def control_fixture_config() -> ToadConfig:
 def control_fixture_batch(fixture: dict[str, object]) -> LearnerBatch:
     """Wrap the checked-in segments in the immutable native batch contract."""
     return LearnerBatch(
-        segments=tuple(
-            cast(list[dict[str, torch.Tensor]], fixture["segments"])
-        ),
+        segments=tuple(cast(list[dict[str, torch.Tensor]], fixture["segments"])),
         kind=BatchKind.SELFPLAY,
         baseline_only=False,
         first_of_round=True,

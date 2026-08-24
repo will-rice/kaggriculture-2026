@@ -175,7 +175,7 @@ def test_default_round_honors_typed_population_quotas_and_one_clock() -> None:
 
     next_round = list(source)
     assert {batch.round_id for batch in next_round} == {1}
-    assert next_round[0].game_ids == (4,)
+    assert next_round[0].game_ids == (5, 6, 7)
 
 
 def test_default_collection_uses_one_typed_round_pool_and_fans_out(
@@ -228,7 +228,7 @@ def test_default_collection_uses_one_typed_round_pool_and_fans_out(
     assert pool_widths == [3]
     assert len(work) == 4
     assert all(item[0] == source.actor_state for item in work)
-    assert [item[4] for item in work] == ["economic", "economic", None, None]
+    assert [item[4] for item in work] == [toad.OPPONENT, toad.OPPONENT, None, None]
     assert all(item[5] == 0.01 for item in work)
 
 

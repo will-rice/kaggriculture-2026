@@ -34,9 +34,11 @@ class ActorSyncCallback(lightning.Callback):
     ) -> None:
         """Publish restored/current learner weights before collection begins."""
         module = cast(ToadLightningModule, pl_module)
-        _data_module(trainer).publish_actor(
-            module.policy.state_dict(), module.actor_version
-        )
+        data = _data_module(trainer)
+        consume_restored = getattr(data, "consume_restored_actor", None)
+        if consume_restored is not None and consume_restored():
+            return
+        data.publish_actor(module.policy.state_dict(), module.actor_version)
 
     def on_train_batch_end(
         self,

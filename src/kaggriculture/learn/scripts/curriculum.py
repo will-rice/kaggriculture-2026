@@ -28,6 +28,7 @@ is wanted.
 import argparse
 import dataclasses
 import logging
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
@@ -218,10 +219,18 @@ def _checkpoint(name: str) -> Path:
         FileNotFoundError: If ``name`` has no checkpoint on disk. A missing
             teacher must fail loudly, not train unanchored.
     """
-    native = list((OUTPUT_ROOT / name).glob("step-*.ckpt"))
+    native = [
+        path
+        for path in (OUTPUT_ROOT / name).glob("step-*.ckpt")
+        if re.fullmatch(r"step-[0-9]+[.]ckpt", path.name)
+    ]
     if native:
         return max(native, key=lambda path: int(path.stem.removeprefix("step-")))
-    legacy = list(toad.RUNS.glob(f"{name}_*.pt"))
+    legacy = [
+        path
+        for path in toad.RUNS.glob(f"{name}_*.pt")
+        if re.fullmatch(rf"{re.escape(name)}_[0-9]+[.]pt", path.name)
+    ]
     if legacy:
         return max(legacy, key=lambda path: int(path.stem.rsplit("_", 1)[1]))
     raise FileNotFoundError(
@@ -330,10 +339,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     No phase resumes another implicitly. Operational resume remains an explicit
     ``--set runtime.resume=\"...\"`` override.
     """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     arguments = _parser().parse_args(argv)
     phase = _phase(arguments.phase)
     config = apply_overrides(phase_config(phase), arguments.overrides)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     LOGGER.info("curriculum: running %s", phase.name)
     toad.run(config)
 
