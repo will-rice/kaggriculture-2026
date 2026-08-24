@@ -16,6 +16,11 @@ from kaggriculture.learn.toad.callbacks import (
     EnvironmentStepStop,
 )
 from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.lightning import compute_loss
+from tests.learn.test_toad_control_fixture import (
+    control_fixture_batch,
+    load_control_fixture,
+)
 
 
 def test_cli_resolves_config_and_json_overrides(tmp_path: Path) -> None:
@@ -99,6 +104,7 @@ def test_all_active_legacy_semantics_reach_typed_config(
             str(teacher),
             "--teacher-blocks",
             "1",
+            "--teacher-quantity",
             "--teacher-kl-cost",
             "0.005",
         ]
@@ -110,6 +116,74 @@ def test_all_active_legacy_semantics_reach_typed_config(
     assert config.population.teacher is not None
     assert config.population.teacher.checkpoint == teacher
     assert config.population.teacher.blocks == 1
+    assert config.population.teacher.quantity is True
+
+
+@pytest.mark.parametrize(
+    ("quantity_flag", "has_quantity"),
+    [("--teacher-quantity", True), ("--no-teacher-quantity", False)],
+)
+def test_legacy_teacher_quantity_flag_controls_the_quantity_loss(
+    tmp_path: Path,
+    quantity_flag: str,
+    has_quantity: bool,
+) -> None:
+    """Legacy compatibility declares quantity validity instead of inferring it."""
+    checkpoint = tmp_path / "teacher.pt"
+    state = toad.Policy(
+        blocks=1,
+        channels=16,
+        value_bound=toad.VALUE_BOUND,
+    ).state_dict()
+    torch.save(
+        {
+            name: value
+            for name, value in state.items()
+            if has_quantity or not name.startswith("quantity_head.")
+        },
+        checkpoint,
+    )
+    config = toad._legacy_config(
+        [
+            "--blocks",
+            "1",
+            "--channels",
+            "16",
+            "--teacher",
+            str(checkpoint),
+            "--teacher-blocks",
+            "1",
+            quantity_flag,
+            "--teacher-kl-cost",
+            "0.25",
+        ]
+    )
+    module = toad.ToadLightningModule(config)
+
+    report = compute_loss(
+        module.policy,
+        control_fixture_batch(load_control_fixture()),
+        module.config,
+        module.teacher,
+    )
+
+    assert module.teacher is not None
+    assert module.teacher.spec.quantity is has_quantity
+    if has_quantity:
+        assert report.terms["teacher/quantity_kl"].item() > 0.0
+    else:
+        assert report.terms["teacher/quantity_kl"].item() == 0.0
+
+
+def test_legacy_teacher_requires_an_explicit_quantity_compatibility_flag(
+    tmp_path: Path,
+) -> None:
+    """A historical invocation cannot silently default teacher head validity."""
+    checkpoint = tmp_path / "teacher.pt"
+    checkpoint.touch()
+
+    with pytest.raises(ValueError, match="teacher quantity compatibility"):
+        toad._legacy_config(["--teacher", str(checkpoint)])
 
 
 def test_build_trainer_uses_environment_budget_and_boundary_callbacks(
@@ -183,9 +257,29 @@ def test_run_seeds_builds_native_components_and_passes_resume(
 ) -> None:
     """Production execution delegates placement, optimization, and restore to fit."""
     events: list[tuple[object, ...]] = []
-    module = object()
+    config = ToadConfig.control().model_copy(
+        update={
+            "runtime": ToadConfig.control().runtime.model_copy(
+                update={"resume": tmp_path / "resume.ckpt"}
+            )
+        }
+    )
+    effective = config.model_copy(
+        update={
+            "runtime": config.runtime.model_copy(
+                update={"output_dir": tmp_path / "confirmed"}
+            )
+        }
+    )
+
+    class _Module:
+        def __init__(self, original: ToadConfig) -> None:
+            assert original is config
+            self.config = effective
+
+    module = _Module(config)
     data = object()
-    resume = tmp_path / "resume.ckpt"
+    built: list[tuple[str, ToadConfig]] = []
 
     class _Trainer:
         def fit(self, fitted: object, **kwargs: object) -> None:
@@ -196,20 +290,22 @@ def test_run_seeds_builds_native_components_and_passes_resume(
         "seed_everything",
         lambda seed, workers: events.append(("seed", seed, workers)),
     )
-    monkeypatch.setattr(toad, "ToadLightningModule", lambda config: module)
-    monkeypatch.setattr(toad, "build_reference_data_module", lambda config: data)
-    monkeypatch.setattr(toad, "build_trainer", lambda config: _Trainer())
-    config = ToadConfig.control().model_copy(
-        update={
-            "runtime": ToadConfig.control().runtime.model_copy(
-                update={"resume": resume}
-            )
-        }
+    monkeypatch.setattr(toad, "ToadLightningModule", lambda original: module)
+    monkeypatch.setattr(
+        toad,
+        "build_reference_data_module",
+        lambda received: built.append(("data", received)) or data,
+    )
+    monkeypatch.setattr(
+        toad,
+        "build_trainer",
+        lambda received: built.append(("trainer", received)) or _Trainer(),
     )
 
     toad.run(config)
 
     assert events == [
         ("seed", config.runtime.seed, True),
-        ("fit", module, {"datamodule": data, "ckpt_path": resume}),
+        ("fit", module, {"datamodule": data, "ckpt_path": effective.runtime.resume}),
     ]
+    assert built == [("data", effective), ("trainer", effective)]

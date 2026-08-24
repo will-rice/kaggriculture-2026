@@ -281,17 +281,26 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "teacher checkpoint is required by teacher loss or batches"
             )
+        if (
+            self.population.teacher_distill
+            and self.population.teacher is not None
+            and not all(
+                (
+                    self.population.teacher.operation,
+                    self.population.teacher.quantity,
+                    self.population.teacher.market,
+                )
+            )
+        ):
+            raise ValueError(
+                "teacher_distill requires operation, quantity, and market heads"
+            )
         historical = bool(info.context and info.context.get("historical"))
         if self.population.teacher is not None and not historical:
             _require_readable(
                 self.population.teacher.checkpoint,
                 label="teacher checkpoint",
             )
-            if self.model.kernel_size != 3 or self.model.activation != "relu":
-                raise ValueError(
-                    "teacher checkpoints require the default kernel and activation "
-                    "because teacher trunk semantics are not separately declared"
-                )
         if (
             self.optimizer.teacher_baseline_cost
             and self.population.teacher is not None

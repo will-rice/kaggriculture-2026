@@ -15,7 +15,7 @@ import kaggriculture.learn.toad.lightning as lightning_module
 from kaggriculture.constants import BOARD_SIZE, ENVIRONMENT
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.scripts import toad
-from kaggriculture.learn.toad.config import TeacherSpec, ToadConfig
+from kaggriculture.learn.toad.config import ModelConfig, TeacherSpec, ToadConfig
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, segments
 from kaggriculture.learn.toad.lightning import (
     ToadLightningModule,
@@ -555,6 +555,151 @@ def test_lightning_training_step_matches_control_fixture(tmp_path: Path) -> None
         scheduler = trainer.lr_scheduler_configs[0].scheduler
         _assert_state_equal(scheduler.state_dict(), fixture["scheduler_state"])
         assert scheduler.get_last_lr() == fixture["scheduler_last_lr"]
+
+
+def test_frozen_opponent_training_step_logs_all_population_kinds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frozen-only fresh batch cannot index a two-kind metrics table."""
+    module = ToadLightningModule(control_fixture_config())
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    batch = control_fixture_batch(load_control_fixture())
+    frozen = replace(
+        batch,
+        kind=BatchKind.FROZEN_OPPONENT,
+        segment_kinds=(BatchKind.FROZEN_OPPONENT,) * len(batch.segments),
+    )
+
+    module.training_step(frozen, 0)
+
+    assert len(records) == 1
+    assert {
+        "diag/population_selfplay_segments": records[0][
+            "diag/population_selfplay_segments"
+        ],
+        "diag/population_scripted_segments": records[0][
+            "diag/population_scripted_segments"
+        ],
+        "diag/population_frozen_opponent_segments": records[0][
+            "diag/population_frozen_opponent_segments"
+        ],
+        "diag/population_teacher_distill_segments": records[0][
+            "diag/population_teacher_distill_segments"
+        ],
+    } == {
+        "diag/population_selfplay_segments": 0,
+        "diag/population_scripted_segments": 0,
+        "diag/population_frozen_opponent_segments": 4,
+        "diag/population_teacher_distill_segments": 0,
+    }
+
+
+def test_teacher_distill_training_step_logs_all_population_kinds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teacher-only fresh batch has the same stable four-kind metric schema."""
+    teacher = toad.Policy(blocks=1, channels=16, value_bound=toad.VALUE_BOUND)
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(teacher.state_dict(), checkpoint)
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 16},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "teacher_distill": 1.0,
+                "teacher": {
+                    "checkpoint": checkpoint,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                },
+            },
+            "optimizer": {"value_warmup_batches": 0, "teacher_kl_cost": 0.25},
+        }
+    )
+    module = ToadLightningModule(config)
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(module, "log_dict", lambda record: records.append(dict(record)))
+    batch = control_fixture_batch(load_control_fixture())
+    distill = replace(
+        batch,
+        kind=BatchKind.TEACHER_DISTILL,
+        segment_kinds=(BatchKind.TEACHER_DISTILL,) * len(batch.segments),
+    )
+
+    module.training_step(distill, 0)
+
+    assert len(records) == 1
+    assert records[0]["diag/population_selfplay_segments"] == 0
+    assert records[0]["diag/population_scripted_segments"] == 0
+    assert records[0]["diag/population_frozen_opponent_segments"] == 0
+    assert records[0]["diag/population_teacher_distill_segments"] == 4
+
+
+def test_stateful_student_computes_loss_against_a_control_teacher(
+    tmp_path: Path,
+) -> None:
+    """Action regularization flattens public observations for the bare teacher."""
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save(
+        toad.Policy(
+            blocks=1,
+            channels=16,
+            value_bound=toad.VALUE_BOUND,
+        ).state_dict(),
+        checkpoint,
+    )
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 16,
+                "recurrent": True,
+                "recurrent_channels": 3,
+                "recurrent_layers": 2,
+            },
+            "population": {
+                "teacher": {
+                    "checkpoint": checkpoint,
+                    "blocks": 1,
+                    "quantity": True,
+                }
+            },
+            "optimizer": {"value_warmup_batches": 0, "teacher_kl_cost": 0.25},
+        }
+    )
+    module = ToadLightningModule(config)
+    recurrent_segments = segments(_recurrent_trajectory(), 16)
+    batch = LearnerBatch(
+        segments=(recurrent_segments[0], recurrent_segments[1]),
+        kind=BatchKind.SELFPLAY,
+        baseline_only=False,
+        first_of_round=True,
+        end_of_round=True,
+        collected_steps=32,
+        round_id=0,
+        actor_version=0,
+        game_ids=(0,),
+        opponent_ids=("self",),
+    )
+
+    report = compute_loss(
+        module.policy,
+        batch,
+        module.config,
+        module.teacher,
+    )
+
+    assert module.teacher is not None
+    assert module.teacher.model == ModelConfig.control(blocks=1, channels=16)
+    assert torch.isfinite(report.total)
+    assert report.terms["teacher/operation_kl"].item() > 0.0
+    assert report.terms["teacher/quantity_kl"].item() > 0.0
+    assert report.terms["teacher/market_kl"].item() > 0.0
 
 
 def test_teacher_loss_reports_each_raw_and_weighted_declared_head() -> None:

@@ -154,6 +154,8 @@ def test_every_curriculum_phase_is_a_valid_toad_config(
             if config.population.teacher is None
             else config.population.teacher.blocks
         ) == expected_teacher_blocks
+        if config.population.teacher is not None:
+            assert config.population.teacher.quantity is True
 
 
 def test_curriculum_runtime_resume_override_reaches_native_run(
@@ -250,6 +252,7 @@ def test_phase_one_lightning_output_becomes_phase_two_teacher(
 
     assert config.population.teacher is not None
     assert config.population.teacher.checkpoint == checkpoint
+    assert config.population.teacher.quantity is True
     assert module.teacher_policy is not None
     assert torch.equal(
         module.teacher_policy.state_dict()["stem.weight"],
@@ -324,6 +327,7 @@ def test_flags_reach_a_real_teacher_through_toad_s_own_loader(
     teacher = toad._teacher(arguments, "cpu")
 
     assert teacher is not None
+    assert arguments.teacher_quantity is True
     assert len(teacher.policy.blocks) == 8
 
 

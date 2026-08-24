@@ -281,6 +281,7 @@ def _flags(phase: Phase) -> list[str]:
             str(_checkpoint(phase.teacher_from)),
             "--teacher-blocks",
             str(_teacher_blocks(phase)),
+            "--teacher-quantity",
         ]
     return flags
 
@@ -301,6 +302,7 @@ def phase_config(phase: Phase) -> ToadConfig:
                 TeacherSpec(
                     checkpoint=teacher,
                     blocks=_teacher_blocks(phase),
+                    quantity=True,
                 )
                 if teacher is not None
                 else None

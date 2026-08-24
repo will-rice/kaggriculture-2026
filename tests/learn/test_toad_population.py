@@ -1,6 +1,7 @@
 """Contracts for verified immutable frozen-opponent snapshots."""
 
 import hashlib
+import io
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,6 +151,27 @@ def test_teacher_rejects_bare_weights_mixed_with_an_envelope(
         )
 
 
+@pytest.mark.parametrize("envelope", ["learner", "state_dict"])
+def test_teacher_rejects_non_tensor_bare_policy_keys_mixed_with_an_envelope(
+    tmp_path: Path, envelope: str
+) -> None:
+    """A malformed competing layout cannot disappear during tensor filtering."""
+    state = _teacher_state()
+    nested = (
+        state
+        if envelope == "learner"
+        else {f"policy.{name}": value for name, value in state.items()}
+    )
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save({"stem.weight": "malformed", envelope: nested}, checkpoint)
+
+    with pytest.raises(TeacherCompatibilityError, match="mixed.*layout"):
+        load_teacher(
+            TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=True),
+            ModelConfig.control(blocks=1, channels=4),
+        )
+
+
 @pytest.mark.parametrize("payload", [[], {"learner": []}, {"state_dict": []}])
 def test_teacher_rejects_malformed_non_mapping_policy_payloads(
     tmp_path: Path, payload: object
@@ -198,17 +220,29 @@ def test_teacher_loads_each_explicit_historical_policy_envelope_once(
             }
         }
     torch.save(payload, checkpoint)
-    calls: list[tuple[Path, bool | None]] = []
+    opens: list[Path] = []
+    loads: list[bool] = []
+    real_open = Path.open
     real_load = torch.load
 
-    def counted_load(path: Path, *, map_location: str, weights_only: bool) -> object:
-        calls.append((path, weights_only))
+    def counted_open(path: Path, *args: object, **kwargs: object) -> object:
+        opens.append(path)
+        assert args == ()
+        assert kwargs == {"mode": "rb"}
+        return real_open(path, "rb")
+
+    def counted_load(
+        source: object, *, map_location: str, weights_only: bool
+    ) -> object:
+        assert isinstance(source, io.BytesIO)
+        loads.append(weights_only)
         return real_load(
-            path,
+            source,
             map_location=map_location,
             weights_only=weights_only,
         )
 
+    monkeypatch.setattr(Path, "open", counted_open)
     monkeypatch.setattr(torch, "load", counted_load)
 
     loaded = load_teacher(
@@ -217,7 +251,49 @@ def test_teacher_loads_each_explicit_historical_policy_envelope_once(
     )
 
     assert loaded.actual_heads == ("operation", "quantity", "market")
-    assert calls == [(checkpoint, True)]
+    assert opens == [checkpoint]
+    assert loads == [True]
+
+
+def test_teacher_topology_is_control_even_for_a_stateful_student(
+    tmp_path: Path,
+) -> None:
+    """Teacher topology cannot inherit learner-only wrappers or trunk semantics."""
+    checkpoint = tmp_path / "teacher.pt"
+    teacher = Policy(
+        blocks=1,
+        channels=4,
+        value_bound=2.0,
+        kernel_size=3,
+        activation="relu",
+    )
+    torch.save(teacher.state_dict(), checkpoint)
+    student = ModelConfig(
+        blocks=2,
+        channels=4,
+        kernel_size=5,
+        activation="leaky_relu",
+        value_bound=2.0,
+        recurrent=True,
+        recurrent_channels=3,
+        transformer=True,
+        transformer_blocks=1,
+        local_patch=True,
+        local_patch_blocks=1,
+        belief=True,
+        interaction_value=True,
+    )
+
+    loaded = load_teacher(
+        TeacherSpec(checkpoint=checkpoint, blocks=1, quantity=True),
+        student,
+    )
+
+    assert loaded.model == ModelConfig.control(blocks=1, channels=4).model_copy(
+        update={"value_bound": 2.0}
+    )
+    assert loaded.policy.stem.kernel_size == (3, 3)
+    assert isinstance(loaded.policy.market[1], torch.nn.ReLU)
 
 
 def test_initial_population_checkpoint_must_be_readable(tmp_path: Path) -> None:

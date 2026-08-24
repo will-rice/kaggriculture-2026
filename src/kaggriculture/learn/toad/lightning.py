@@ -56,6 +56,17 @@ class ResumeConfigError(ValueError):
 PolicyLike = Policy | StatefulPolicy
 
 CheckpointLayout = Literal["bare", "legacy_learner", "lightning_policy"]
+_ONLINE_BATCH_KINDS = (
+    BatchKind.SELFPLAY,
+    BatchKind.SCRIPTED,
+    BatchKind.FROZEN_OPPONENT,
+    BatchKind.TEACHER_DISTILL,
+)
+
+
+def _empty_population_counts() -> dict[str, int]:
+    """Return the stable online-kind metric schema for one logical round."""
+    return {kind.value: 0 for kind in _ONLINE_BATCH_KINDS}
 
 
 @dataclass(frozen=True)
@@ -529,7 +540,7 @@ class ToadLightningModule(lightning.LightningModule):
         self._round_fresh_terms: list[Mapping[str, torch.Tensor]] = []
         self._round_baselines: list[torch.Tensor] = []
         self._round_metrics: dict[str, float | int] = {}
-        self._round_population = {"selfplay": 0, "scripted": 0}
+        self._round_population = _empty_population_counts()
         self.save_hyperparameters(self.config.model_dump(mode="json"))
 
     def train(self, mode: bool = True) -> Self:
@@ -561,7 +572,7 @@ class ToadLightningModule(lightning.LightningModule):
             self._round_fresh_terms = []
             self._round_baselines = []
             self._round_metrics = dict(batch.round_metrics)
-            self._round_population = {"selfplay": 0, "scripted": 0}
+            self._round_population = _empty_population_counts()
         baseline_only = batch.baseline_only or self.warmup_remaining > 0
         report = compute_loss(
             self.policy,
@@ -611,6 +622,12 @@ class ToadLightningModule(lightning.LightningModule):
             "diag/collection_round": self.collection_round,
             "diag/population_selfplay_segments": self._round_population["selfplay"],
             "diag/population_scripted_segments": self._round_population["scripted"],
+            "diag/population_frozen_opponent_segments": self._round_population[
+                "frozen_opponent"
+            ],
+            "diag/population_teacher_distill_segments": self._round_population[
+                "teacher_distill"
+            ],
             "diag/actor_version": self.actor_version,
             "diag/actor_lag_optimizer_steps": (
                 optimizer_steps - self.actor_source_global_step

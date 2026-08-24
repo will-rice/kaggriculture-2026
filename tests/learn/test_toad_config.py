@@ -127,18 +127,54 @@ def test_teacher_value_cost_requires_declared_compatible_value_semantics(
 
 
 @pytest.mark.parametrize("model", [{"kernel_size": 5}, {"activation": "leaky_relu"}])
-def test_teacher_rejects_ambiguous_nondefault_trunk_semantics(
+def test_control_teacher_does_not_inherit_student_trunk_semantics(
     tmp_path: Path, model: dict[str, object]
 ) -> None:
-    """Teacher checkpoints cannot silently inherit undeclared trunk settings."""
+    """Explicit control teachers remain valid beside a non-control student."""
     checkpoint = tmp_path / "teacher.ckpt"
     checkpoint.touch()
 
-    with pytest.raises(ValidationError, match="teacher.*default kernel.*activation"):
+    config = ToadConfig(
+        model=model,
+        population={"teacher": {"checkpoint": checkpoint}},
+        optimizer={"teacher_kl_cost": 0.1},
+    )
+
+    assert config.population.teacher is not None
+    assert config.population.teacher.checkpoint == checkpoint
+
+
+@pytest.mark.parametrize("missing_head", ["operation", "quantity", "market"])
+def test_teacher_distill_requires_every_action_head_before_file_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_head: str,
+) -> None:
+    """Rollout-incomplete teachers fail validation before touching their path."""
+    teacher = {
+        "checkpoint": tmp_path / "missing.pt",
+        "operation": True,
+        "quantity": True,
+        "market": True,
+        missing_head: False,
+    }
+
+    def unexpected_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("teacher path was opened before head validation")
+
+    monkeypatch.setattr(Path, "open", unexpected_open)
+
+    with pytest.raises(
+        ValidationError,
+        match="teacher_distill requires operation, quantity, and market",
+    ):
         ToadConfig(
-            model=model,
-            population={"teacher": {"checkpoint": checkpoint}},
-            optimizer={"teacher_kl_cost": 0.1},
+            population={
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "teacher_distill": 1.0,
+                "teacher": teacher,
+            }
         )
 
 

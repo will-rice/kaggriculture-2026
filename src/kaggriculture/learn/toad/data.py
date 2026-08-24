@@ -30,6 +30,7 @@ from kaggriculture.learn.toad.population import (
     SnapshotStore,
     TeacherCompatibilityError,
     load_teacher,
+    resolve_teacher_model,
     sha256_file,
 )
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
@@ -760,12 +761,6 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             if kind is BatchKind.FROZEN_OPPONENT:
                 state = frozen_states[digest]
             else:
-                actual = sha256_file(path)
-                if actual != digest:
-                    raise SnapshotIntegrityError(
-                        "teacher checkpoint digest mismatch for "
-                        f"{path}: expected {digest}, found {actual}"
-                    )
                 spec = self.config.population.teacher
                 if spec is None or spec.checkpoint != path:
                     raise SnapshotIntegrityError(
@@ -778,7 +773,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                     )
                 except TeacherCompatibilityError as error:
                     raise SnapshotIntegrityError(
-                        f"teacher checkpoint is incompatible: {path}"
+                        f"teacher checkpoint is incompatible: {path}: {error}"
                     ) from error
                 state = dict(loaded_teacher.policy.state_dict())
                 model = loaded_teacher.model
@@ -841,12 +836,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 raise ValueError(
                     "teacher-distill assignment requires population.teacher"
                 )
-            blocks = teacher.blocks
-            model = (
-                self.config.model
-                if blocks is None
-                else self.config.model.model_copy(update={"blocks": blocks})
-            )
+            model = resolve_teacher_model(teacher, self.config.model)
             entry = None
         else:
             raise ValueError(

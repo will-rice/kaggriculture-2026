@@ -34,6 +34,7 @@ from kaggriculture.learn.toad.data import (
     allocate_round,
     segments,
 )
+from kaggriculture.learn.toad.lightning import ToadLightningModule
 from kaggriculture.learn.toad.model import StatefulPolicy
 from kaggriculture.learn.toad.population import (
     EmptySnapshotPoolError,
@@ -103,7 +104,12 @@ def _allocation_config(
                 "frozen_opponent": frozen,
                 "teacher_distill": teacher,
                 "teacher": (
-                    {"checkpoint": teacher_checkpoint}
+                    {
+                        "checkpoint": teacher_checkpoint,
+                        "operation": True,
+                        "quantity": True,
+                        "market": True,
+                    }
                     if teacher_checkpoint is not None
                     else None
                 ),
@@ -938,7 +944,13 @@ def test_teacher_distill_source_materializes_real_checkpoint_provenance(
                 "selfplay": 0.0,
                 "scripted": 0.0,
                 "teacher_distill": 1.0,
-                "teacher": {"checkpoint": checkpoint, "blocks": 1},
+                "teacher": {
+                    "checkpoint": checkpoint,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                },
                 "environments_per_rank": 1,
             },
         }
@@ -958,6 +970,159 @@ def test_teacher_distill_source_materializes_real_checkpoint_provenance(
     assert all(batch.kind is BatchKind.TEACHER_DISTILL for batch in batches)
     assert all(batch.opponent_digests == (digest,) for batch in batches)
     assert all(set(batch.segment_opponent_digests) == {digest} for batch in batches)
+
+
+def test_teacher_distill_rejects_a_missing_declared_head_before_collection(
+    tmp_path: Path,
+) -> None:
+    """A rollout-incomplete teacher cannot reach the external collector seam."""
+    checkpoint = tmp_path / "teacher.pt"
+    teacher = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    torch.save(
+        {
+            name: value
+            for name, value in teacher.state_dict().items()
+            if not name.startswith("quantity_head.")
+        },
+        checkpoint,
+    )
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "teacher_distill": 1.0,
+                "teacher": {
+                    "checkpoint": checkpoint,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                },
+                "environments_per_rank": 1,
+            },
+        }
+    )
+    collected: list[int] = []
+    source = ReferenceRoundSource(
+        config,
+        collect_assignment=lambda assignment: (
+            collected.append(assignment.game_id) or (_trajectory(64),)
+        ),
+    )
+
+    with pytest.raises(
+        SnapshotIntegrityError, match="teacher checkpoint is incompatible"
+    ):
+        list(source)
+
+    assert collected == []
+
+
+def test_stateful_collection_builds_a_strict_control_teacher_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teacher rollout uses a bare control opponent beside a stateful learner."""
+    checkpoint = tmp_path / "teacher.pt"
+    teacher = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    torch.save(teacher.state_dict(), checkpoint)
+    config = ToadConfig.model_validate(
+        {
+            "model": {
+                "blocks": 1,
+                "channels": 4,
+                "recurrent": True,
+                "recurrent_channels": 3,
+            },
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "teacher_distill": 1.0,
+                "teacher": {
+                    "checkpoint": checkpoint,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                },
+                "environments_per_rank": 1,
+            },
+        }
+    )
+    module = ToadLightningModule(config)
+    source = ReferenceRoundSource(module.config)
+    source.publish_actor(module.policy.state_dict(), version=1)
+    assignment = allocate_round(module.config, 0, 0)[0]
+    seen: list[tuple[object, object]] = []
+
+    def fake_rollout(
+        learner: object,
+        opponent: object,
+        seeds: Sequence[int],
+        *,
+        state_unroll_length: int | None = None,
+    ) -> list[Trajectory]:
+        seen.append((learner, opponent))
+        return []
+
+    monkeypatch.setattr(toad, "rollout_many", fake_rollout)
+
+    source.collect_assignment(assignment)
+
+    assert len(seen) == 1
+    assert isinstance(seen[0][0], StatefulPolicy)
+    assert isinstance(seen[0][1], toad.Policy)
+    assert not isinstance(seen[0][1], StatefulPolicy)
+    assert seen[0][1].stem.kernel_size == (3, 3)
+
+
+def test_confirmed_teacher_digest_fails_closed_after_path_mutation(
+    tmp_path: Path,
+) -> None:
+    """Collection must retain module-confirmed bytes across the handoff."""
+    checkpoint = tmp_path / "teacher.pt"
+    first = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    torch.save(first.state_dict(), checkpoint)
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "teacher_distill": 1.0,
+                "teacher": {
+                    "checkpoint": checkpoint,
+                    "blocks": 1,
+                    "operation": True,
+                    "quantity": True,
+                    "market": True,
+                },
+                "environments_per_rank": 1,
+            },
+        }
+    )
+    module = ToadLightningModule(config)
+    assert module.config.population.teacher is not None
+    confirmed = module.config.population.teacher.sha256
+    assert confirmed is not None
+    torch.save(
+        toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND).state_dict(),
+        checkpoint,
+    )
+    collected: list[int] = []
+    source = ReferenceRoundSource(
+        module.config,
+        collect_assignment=lambda assignment: (
+            collected.append(assignment.game_id) or (_trajectory(64),)
+        ),
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match=confirmed):
+        list(source)
+
+    assert collected == []
 
 
 def _recurrent_trajectory(turns: int = 32, layers: int = 2) -> Trajectory:

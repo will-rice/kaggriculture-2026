@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import pickle
 import random
@@ -101,10 +102,8 @@ def _teacher_policy_weights(  # noqa: C901
     envelope = "state_dict" in typed_checkpoint or "learner" in typed_checkpoint
     bare_policy_keys = [
         name
-        for name, value in typed_checkpoint.items()
-        if isinstance(name, str)
-        and isinstance(value, torch.Tensor)
-        and name.startswith(_POLICY_KEY_PREFIXES)
+        for name in typed_checkpoint
+        if isinstance(name, str) and name.startswith(_POLICY_KEY_PREFIXES)
     ]
     if envelope and bare_policy_keys:
         raise TeacherCompatibilityError(
@@ -155,24 +154,31 @@ def _teacher_policy_weights(  # noqa: C901
     return cast(dict[str, torch.Tensor], dict(candidate))
 
 
+def resolve_teacher_model(spec: TeacherSpec, student: ModelConfig) -> ModelConfig:
+    """Return the explicit bare control topology for one teacher contract."""
+    return ModelConfig.control(
+        blocks=spec.blocks or student.blocks,
+        channels=student.channels,
+    ).model_copy(update={"value_bound": student.value_bound})
+
+
 def load_teacher(  # noqa: C901
     spec: TeacherSpec, model_config: ModelConfig
 ) -> LoadedTeacher:
     """Load exactly one checkpoint and enforce shared and declared-head strictness."""
     try:
-        digest = sha256_file(spec.checkpoint)
+        serialized = spec.checkpoint.read_bytes()
     except OSError as error:
         raise TeacherCompatibilityError(
             f"teacher digest verification failed: {spec.checkpoint}"
         ) from error
+    digest = hashlib.sha256(serialized).hexdigest()
     if spec.sha256 is not None and digest != spec.sha256:
         raise TeacherCompatibilityError(
             "teacher digest does not match TeacherSpec: "
             f"expected {spec.sha256}, found {digest}"
         )
-    resolved_model = model_config.model_copy(
-        update={"blocks": spec.blocks or model_config.blocks}
-    )
+    resolved_model = resolve_teacher_model(spec, model_config)
     policy = Policy(
         blocks=resolved_model.blocks,
         channels=resolved_model.channels,
@@ -181,7 +187,11 @@ def load_teacher(  # noqa: C901
         activation=resolved_model.activation,
     )
     try:
-        checkpoint = torch.load(spec.checkpoint, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(
+            io.BytesIO(serialized),
+            map_location="cpu",
+            weights_only=True,
+        )
     except (
         OSError,
         RuntimeError,

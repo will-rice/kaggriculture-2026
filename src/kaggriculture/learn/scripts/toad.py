@@ -436,6 +436,13 @@ def _parser() -> argparse.ArgumentParser:
         "assumed equal to --blocks.",
     )
     parser.add_argument(
+        "--teacher-quantity",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="declare whether the named legacy teacher has a complete quantity "
+        "head; required with --teacher and translated into TeacherSpec",
+    )
+    parser.add_argument(
         "--econ-fraction",
         type=float,
         default=control.population.scripted,
@@ -555,6 +562,13 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
         r"[A-Za-z0-9][A-Za-z0-9._-]*", arguments.name
     ):
         raise ValueError("legacy --name must be a safe run name")
+    if arguments.teacher is not None and arguments.teacher_quantity is None:
+        raise ValueError(
+            "legacy --teacher requires an explicit teacher quantity compatibility "
+            "flag (--teacher-quantity or --no-teacher-quantity)"
+        )
+    if arguments.teacher is None and arguments.teacher_quantity is not None:
+        raise ValueError("teacher quantity compatibility requires --teacher")
 
     control = ToadConfig.control()
     payload = control.model_dump(mode="python")
@@ -566,6 +580,7 @@ def _legacy_config(argv: Sequence[str]) -> ToadConfig:
             {
                 "checkpoint": arguments.teacher,
                 "blocks": arguments.teacher_blocks,
+                "quantity": arguments.teacher_quantity,
             }
             if arguments.teacher is not None
             else None
@@ -665,11 +680,12 @@ def run(config: ToadConfig) -> None:
     """Seed once and hand the complete native control path to Lightning."""
     seed_everything(config.runtime.seed, workers=True)
     module = ToadLightningModule(config)
-    data = build_reference_data_module(config)
-    build_trainer(config).fit(
+    effective = module.config
+    data = build_reference_data_module(effective)
+    build_trainer(effective).fit(
         module,
         datamodule=data,
-        ckpt_path=config.runtime.resume,
+        ckpt_path=effective.runtime.resume,
     )
 
 
@@ -1135,12 +1151,12 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     five updates, and dropping the cost to 0.001 cliffed within a single sync
     cycle -- both true of *a* teacher, not of any one checkpoint being right.
 
-    Which heads the KL may cover is decided here and nowhere else, from the
-    keys the checkpoint was missing. A checkpoint written before the quantity
-    head existed leaves that head at its random initialisation, and anchoring
-    the learner to random weights is worse than not anchoring it at all -- so
-    the answer travels with the network, in ``Teacher``, rather than being
-    re-guessed at the loss.
+    Quantity-head compatibility is declared explicitly by
+    ``--teacher-quantity`` or ``--no-teacher-quantity``. A checkpoint written
+    before the quantity head existed leaves that head at its random
+    initialisation, and anchoring the learner to random weights is worse than
+    not anchoring it at all -- so the answer travels with the network, in
+    ``Teacher``, rather than being inferred from a permissive load.
 
     The teacher's trunk is built at ``--teacher-blocks``, not ``--blocks``:
     the recipe's teachers are smaller nets than the phase they teach (phase
@@ -1159,6 +1175,11 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     """
     if arguments.teacher is None:
         return None
+    if arguments.teacher_quantity is None:
+        raise ValueError(
+            "legacy --teacher requires an explicit teacher quantity compatibility "
+            "flag (--teacher-quantity or --no-teacher-quantity)"
+        )
     policy = Policy(
         blocks=arguments.teacher_blocks,
         channels=arguments.channels,
@@ -1168,7 +1189,10 @@ def _teacher(arguments: argparse.Namespace, device: str) -> Teacher | None:
     missing = load_policy_weights(policy, state)
     policy.eval()
     policy.requires_grad_(False)
-    quantity = not any(key.startswith("quantity_head.") for key in missing)
+    missing_quantity = any(key.startswith("quantity_head.") for key in missing)
+    quantity = bool(arguments.teacher_quantity)
+    if quantity and missing_quantity:
+        raise RuntimeError("declared teacher quantity head is missing from checkpoint")
     LOGGER.info(
         "teacher: %s, kl_cost %.4f, quantity head %s",
         arguments.teacher,

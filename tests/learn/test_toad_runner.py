@@ -412,7 +412,7 @@ def test_teacher_loads_the_named_checkpoint(tmp_path: Path) -> None:
     torch.save(named.state_dict(), checkpoint)
 
     arguments = toad._parser().parse_args(
-        ["--channels", "16", "--teacher", str(checkpoint)]
+        ["--channels", "16", "--teacher", str(checkpoint), "--teacher-quantity"]
     )
     teacher = toad._teacher(arguments, "cpu")
 
