@@ -168,6 +168,76 @@ def test_controller_rejects_negative_or_backward_step_deltas(
         )
 
 
+@pytest.mark.parametrize(
+    ("last_steps", "steps"),
+    [
+        (False, 0),
+        (0, True),
+        (0.0, 1),
+        (0, 1.0),
+        ("0", 1),
+        (0, "1"),
+        (math.nan, 1),
+        (0, math.nan),
+        (math.inf, 1),
+        (0, math.inf),
+    ],
+)
+def test_controller_rejects_non_integer_clocks(
+    last_steps: object,
+    steps: object,
+) -> None:
+    """Booleans, coercible values, and nonfinite floats are not step clocks."""
+    state = EntropyControllerState(
+        target=1.0,
+        multiplier=0.1,
+        last_steps=cast(int, last_steps),
+    )
+
+    with pytest.raises(ValueError, match="nonnegative non-boolean integers"):
+        update_entropy_controller(
+            state,
+            observed=1.0,
+            steps=cast(int, steps),
+            config=_controller_config(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("state", "steps", "config"),
+    [
+        (
+            EntropyControllerState(target=3e38, multiplier=0.1, last_steps=0),
+            2,
+            _controller_config(target_change_per_step=3e38),
+        ),
+        (
+            EntropyControllerState(target=1.0, multiplier=0.1, last_steps=0),
+            2,
+            _controller_config(multiplier_change_per_step=3e38),
+        ),
+        (
+            EntropyControllerState(target=1.0, multiplier=0.1, last_steps=0),
+            10**400,
+            _controller_config(target_change_per_step=1.0),
+        ),
+    ],
+)
+def test_controller_rejects_derived_fp32_overflow(
+    state: EntropyControllerState,
+    steps: int,
+    config: EntropyControllerConfig,
+) -> None:
+    """FP32 overflow cannot enter a controller state or hide behind clamping."""
+    with pytest.raises(ValueError, match="computed.*finite"):
+        update_entropy_controller(
+            state,
+            observed=0.0,
+            steps=steps,
+            config=config,
+        )
+
+
 @pytest.mark.parametrize("observed", [math.nan, math.inf, -math.inf])
 def test_controller_rejects_nonfinite_observations(observed: float) -> None:
     """A nonfinite diagnostic cannot poison checkpointed controller state."""

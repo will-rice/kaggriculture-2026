@@ -52,6 +52,53 @@ class EntropyControllerState:
     last_steps: int
 
 
+def _validate_controller_steps(last_steps: object, steps: object) -> None:
+    """Reject malformed controller clocks before ordering or arithmetic."""
+    if (
+        not isinstance(last_steps, int)
+        or isinstance(last_steps, bool)
+        or not isinstance(steps, int)
+        or isinstance(steps, bool)
+        or last_steps < 0
+        or steps < 0
+    ):
+        raise ValueError("controller steps must be nonnegative non-boolean integers")
+    if steps < last_steps:
+        raise ValueError("controller steps must be nondecreasing")
+
+
+def _controller_fp32_values(
+    state: EntropyControllerState,
+    observed: float | None,
+    delta: int,
+    config: EntropyControllerConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Materialize controller inputs and target, rejecting FP32 overflow."""
+    try:
+        values = torch.tensor(
+            [
+                state.target,
+                state.multiplier,
+                state.target if observed is None else observed,
+                config.target_change_per_step,
+                config.target_floor,
+                config.multiplier_change_per_step,
+                config.minimum,
+                config.maximum,
+            ],
+            dtype=torch.float32,
+        )
+        delta_fp32 = torch.tensor(delta, dtype=torch.float32)
+    except (OverflowError, RuntimeError) as error:
+        raise ValueError("computed controller values must be finite in FP32") from error
+    if not bool(torch.isfinite(values).all()) or not bool(torch.isfinite(delta_fp32)):
+        raise ValueError("computed controller values must be finite in FP32")
+    target = torch.maximum(values[4], values[0] + values[3] * delta_fp32)
+    if not bool(torch.isfinite(target)):
+        raise ValueError("computed controller values must be finite in FP32")
+    return values, delta_fp32, target
+
+
 def update_entropy_controller(
     state: EntropyControllerState,
     observed: float | None,
@@ -59,8 +106,7 @@ def update_entropy_controller(
     config: EntropyControllerConfig,
 ) -> EntropyControllerState:
     """Advance one controller using FP32 multiplicative target feedback."""
-    if state.last_steps < 0 or steps < 0 or steps < state.last_steps:
-        raise ValueError("controller steps must be nonnegative and nondecreasing")
+    _validate_controller_steps(state.last_steps, steps)
     finite_values = (state.target, state.multiplier)
     if observed is not None:
         finite_values = (*finite_values, observed)
@@ -68,27 +114,14 @@ def update_entropy_controller(
         raise ValueError("controller state and observation must be finite")
 
     delta = steps - state.last_steps
-    values = torch.tensor(
-        [
-            state.target,
-            state.multiplier,
-            state.target if observed is None else observed,
-            config.target_change_per_step,
-            config.target_floor,
-            config.multiplier_change_per_step,
-            config.minimum,
-            config.maximum,
-        ],
-        dtype=torch.float32,
-    )
-    target = torch.maximum(values[4], values[0] + values[3] * delta)
+    values, delta_fp32, target = _controller_fp32_values(state, observed, delta, config)
     if observed is None:
         return EntropyControllerState(
             target=float(target),
             multiplier=state.multiplier,
             last_steps=steps,
         )
-    change = values[5] * delta
+    change = values[5] * delta_fp32
     multiplier = values[1]
     if values[2] > target:
         multiplier = multiplier * (1.0 - change)
@@ -100,6 +133,8 @@ def update_entropy_controller(
             multiplier=state.multiplier,
             last_steps=steps,
         )
+    if not bool(torch.isfinite(multiplier)):
+        raise ValueError("computed controller values must be finite in FP32")
     multiplier = multiplier.clamp(min=values[6], max=values[7])
     return EntropyControllerState(
         target=float(target),
@@ -264,6 +299,34 @@ class LossReport:
 
 class ResumeConfigError(ValueError):
     """The effective config cannot safely consume the stored trainer state."""
+
+
+_INVALID_CHECKPOINT_STATE = "invalid Toad checkpoint state"
+_ENTROPY_HEADS = frozenset(("operation", "quantity", "market"))
+_ENTROPY_STATE_FIELDS = frozenset(("target", "multiplier", "last_steps"))
+
+
+def _checkpoint_mapping(value: object) -> Mapping[str, object]:
+    """Require a mapping without accepting sequence-shaped checkpoint data."""
+    if not isinstance(value, Mapping):
+        raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+    return cast(Mapping[str, object], value)
+
+
+def _checkpoint_nonnegative_int(value: object) -> int:
+    """Return a checkpoint clock only when its runtime type is strictly integral."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+    return value
+
+
+def _checkpoint_finite_float(value: object) -> float:
+    """Return a finite checkpoint float without coercing another runtime type."""
+    if not isinstance(value, float):
+        raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+    if not math.isfinite(value):
+        raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+    return value
 
 
 PolicyLike = Policy | StatefulPolicy
@@ -1038,43 +1101,60 @@ class ToadLightningModule(lightning.LightningModule):
 
     def on_load_checkpoint(self, checkpoint: dict[str, object]) -> None:
         """Validate structure and restore Toad's logical clocks."""
-        state = cast(dict[str, object], checkpoint["toad"])
-        stored_config = validate_stored_config(state["config"])
-        assert_resume_compatible(self.config, stored_config)
-        stored_teacher = cast(dict[str, object], state["teacher"])
-        current_teacher = self._teacher_metadata()
-        if stored_teacher != current_teacher:
-            raise ResumeConfigError(
-                "teacher metadata mismatch: "
-                f"stored={stored_teacher!r}, effective={current_teacher!r}"
+        try:
+            state = _checkpoint_mapping(checkpoint["toad"])
+            stored_config = validate_stored_config(state["config"])
+            assert_resume_compatible(self.config, stored_config)
+            stored_teacher = _checkpoint_mapping(state["teacher"])
+            current_teacher = self._teacher_metadata()
+            if stored_teacher != current_teacher:
+                raise ResumeConfigError(
+                    "teacher metadata mismatch: "
+                    f"stored={stored_teacher!r}, effective={current_teacher!r}"
+                )
+
+            environment_steps = _checkpoint_nonnegative_int(state["environment_steps"])
+            collection_round = _checkpoint_nonnegative_int(state["collection_round"])
+            actor_version = _checkpoint_nonnegative_int(state["actor_version"])
+            actor_source_global_step = _checkpoint_nonnegative_int(
+                state["actor_source_global_step"]
             )
-        self.environment_steps = cast(int, state["environment_steps"])
-        self.collection_round = cast(int, state["collection_round"])
-        self.actor_version = cast(int, state["actor_version"])
-        self.actor_source_global_step = cast(int, state["actor_source_global_step"])
-        self.warmup_remaining = cast(int, state["warmup_remaining"])
-        stored_entropy = cast(dict[str, object], state["entropy_state"])
-        expected_heads = {name for name, _ in self.config.optimizer.entropy.items()}
-        if set(stored_entropy) != expected_heads:
-            raise ResumeConfigError(
-                "entropy controller state must contain operation, quantity, and market"
-            )
-        restored_entropy: dict[str, EntropyControllerState] = {}
-        for name, controller in self.config.optimizer.entropy.items():
-            payload = cast(dict[str, object], stored_entropy[name])
-            restored = EntropyControllerState(
-                target=float(cast(float, payload["target"])),
-                multiplier=float(cast(float, payload["multiplier"])),
-                last_steps=int(cast(int, payload["last_steps"])),
-            )
-            if (
-                restored.target < 0
-                or not math.isfinite(restored.target)
-                or not math.isfinite(restored.multiplier)
-                or not controller.minimum <= restored.multiplier <= controller.maximum
-                or restored.last_steps < 0
-                or restored.last_steps > self.environment_steps
-            ):
-                raise ResumeConfigError(f"invalid entropy controller state for {name}")
-            restored_entropy[name] = restored
+            warmup_remaining = _checkpoint_nonnegative_int(state["warmup_remaining"])
+            stored_entropy = _checkpoint_mapping(state["entropy_state"])
+            if set(stored_entropy) != _ENTROPY_HEADS:
+                raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+
+            restored_entropy: dict[str, EntropyControllerState] = {}
+            for name, controller in self.config.optimizer.entropy.items():
+                payload = _checkpoint_mapping(stored_entropy[name])
+                if set(payload) != _ENTROPY_STATE_FIELDS:
+                    raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+                target = _checkpoint_finite_float(payload["target"])
+                multiplier = _checkpoint_finite_float(payload["multiplier"])
+                last_steps = _checkpoint_nonnegative_int(payload["last_steps"])
+                if (
+                    target < controller.target_floor
+                    or not controller.minimum <= multiplier <= controller.maximum
+                    or last_steps > environment_steps
+                    or (
+                        self.config.optimizer.adaptive_entropy
+                        and last_steps != environment_steps
+                    )
+                ):
+                    raise ResumeConfigError(_INVALID_CHECKPOINT_STATE)
+                restored_entropy[name] = EntropyControllerState(
+                    target=target,
+                    multiplier=multiplier,
+                    last_steps=last_steps,
+                )
+        except ResumeConfigError:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ResumeConfigError(_INVALID_CHECKPOINT_STATE) from error
+
+        self.environment_steps = environment_steps
+        self.collection_round = collection_round
+        self.actor_version = actor_version
+        self.actor_source_global_step = actor_source_global_step
+        self.warmup_remaining = warmup_remaining
         self.entropy_state = restored_entropy

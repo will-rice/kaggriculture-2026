@@ -210,22 +210,213 @@ def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> N
     }
 
 
-def test_entropy_controller_round_trips_in_checkpoint() -> None:
-    """All per-head targets, multipliers, and step clocks restore exactly."""
-    stored = ToadLightningModule(ToadConfig.control())
+def _adaptive_entropy_checkpoint() -> tuple[ToadConfig, dict[str, object]]:
+    """Return one valid boundary checkpoint with live controller clocks."""
+    base = ToadConfig.control()
+    controller = EntropyControllerConfig(
+        initial_target=0.5,
+        target_floor=0.5,
+        initial_multiplier=0.001,
+        multiplier_change_per_step=0.0,
+        maximum=1.0,
+    )
+    entropy = EntropyControllersConfig(
+        operation=controller,
+        quantity=controller,
+        market=controller,
+    )
+    config = base.model_copy(
+        update={
+            "optimizer": base.optimizer.model_copy(
+                update={"adaptive_entropy": True, "entropy": entropy}
+            )
+        }
+    )
+    stored = ToadLightningModule(config)
     stored.environment_steps = 320
+    stored.collection_round = 5
+    stored.actor_version = 3
+    stored.actor_source_global_step = 17
+    stored.warmup_remaining = 8
     stored.entropy_state = {
         "operation": EntropyControllerState(0.9, 0.01, 320),
         "quantity": EntropyControllerState(0.8, 0.02, 320),
         "market": EntropyControllerState(0.7, 0.03, 320),
     }
     checkpoint: dict[str, object] = {}
-
     stored.on_save_checkpoint(checkpoint)
-    resumed = ToadLightningModule(ToadConfig.control())
+    return config, checkpoint
+
+
+def test_entropy_controller_round_trips_in_checkpoint() -> None:
+    """All per-head targets, multipliers, and step clocks restore exactly."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    resumed = ToadLightningModule(config)
     resumed.on_load_checkpoint(checkpoint)
 
-    assert resumed.entropy_state == stored.entropy_state
+    assert resumed.entropy_state == {
+        "operation": EntropyControllerState(0.9, 0.01, 320),
+        "quantity": EntropyControllerState(0.8, 0.02, 320),
+        "market": EntropyControllerState(0.7, 0.03, 320),
+    }
+
+
+@pytest.mark.parametrize("environment_steps", [True, 1.5, "320", -1])
+def test_checkpoint_rejects_malformed_environment_clock(
+    environment_steps: object,
+) -> None:
+    """The authoritative environment clock is never silently coerced."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    state = cast(dict[str, object], checkpoint["toad"])
+    state["environment_steps"] = environment_steps
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        ToadLightningModule(config).on_load_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize("last_steps", [True, 1.5, "320", -1])
+def test_checkpoint_rejects_malformed_entropy_clock(last_steps: object) -> None:
+    """Per-head clocks use the same strict nonnegative integer domain."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    state = cast(dict[str, object], checkpoint["toad"])
+    entropy = cast(dict[str, object], state["entropy_state"])
+    operation = cast(dict[str, object], entropy["operation"])
+    operation["last_steps"] = last_steps
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        ToadLightningModule(config).on_load_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target", True),
+        ("target", 1),
+        ("target", "0.9"),
+        ("target", float("nan")),
+        ("target", float("inf")),
+        ("target", 0.1),
+        ("target", -0.1),
+        ("multiplier", True),
+        ("multiplier", 0),
+        ("multiplier", "0.01"),
+        ("multiplier", float("nan")),
+        ("multiplier", float("inf")),
+        ("multiplier", 2.0),
+    ],
+)
+def test_checkpoint_rejects_invalid_entropy_numbers(
+    field: str,
+    value: object,
+) -> None:
+    """Controller quantities must be exact finite floats within config bounds."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    state = cast(dict[str, object], checkpoint["toad"])
+    entropy = cast(dict[str, object], state["entropy_state"])
+    operation = cast(dict[str, object], entropy["operation"])
+    operation[field] = value
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        ToadLightningModule(config).on_load_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_head",
+        "extra_head",
+        "outer_list",
+        "missing_field",
+        "extra_field",
+        "payload_list",
+    ],
+)
+def test_checkpoint_rejects_non_exact_entropy_schema(malformation: str) -> None:
+    """Controller state has one exact outer and inner checkpoint schema."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    state = cast(dict[str, object], checkpoint["toad"])
+    entropy = cast(dict[str, object], state["entropy_state"])
+    operation = cast(dict[str, object], entropy["operation"])
+    if malformation == "missing_head":
+        entropy.pop("market")
+    elif malformation == "extra_head":
+        entropy["other"] = dict(operation)
+    elif malformation == "outer_list":
+        state["entropy_state"] = []
+    elif malformation == "missing_field":
+        operation.pop("target")
+    elif malformation == "extra_field":
+        operation["other"] = 0
+    elif malformation == "payload_list":
+        entropy["operation"] = []
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        ToadLightningModule(config).on_load_checkpoint(checkpoint)
+
+
+def test_adaptive_checkpoint_requires_every_controller_at_boundary() -> None:
+    """Adaptive restore cannot defer stale multi-round controller feedback."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    state = cast(dict[str, object], checkpoint["toad"])
+    entropy = cast(dict[str, object], state["entropy_state"])
+    quantity = cast(dict[str, object], entropy["quantity"])
+    quantity["last_steps"] = 319
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        ToadLightningModule(config).on_load_checkpoint(checkpoint)
+
+
+def test_disabled_checkpoint_allows_initial_controller_clocks() -> None:
+    """Disabled fixed entropy does not advance inert controller clocks."""
+    stored = ToadLightningModule(ToadConfig.control())
+    stored.environment_steps = 320
+    checkpoint: dict[str, object] = {}
+    stored.on_save_checkpoint(checkpoint)
+    resumed = ToadLightningModule(ToadConfig.control())
+
+    resumed.on_load_checkpoint(checkpoint)
+
+    assert resumed.environment_steps == 320
+    assert {state.last_steps for state in resumed.entropy_state.values()} == {0}
+
+
+def test_invalid_checkpoint_restore_is_atomic() -> None:
+    """A late validation failure cannot partially replace live module clocks."""
+    config, checkpoint = _adaptive_entropy_checkpoint()
+    state = cast(dict[str, object], checkpoint["toad"])
+    entropy = cast(dict[str, object], state["entropy_state"])
+    market = cast(dict[str, object], entropy["market"])
+    market["multiplier"] = 2.0
+    resumed = ToadLightningModule(config)
+    resumed.environment_steps = 7
+    resumed.collection_round = 2
+    resumed.actor_version = 1
+    resumed.actor_source_global_step = 4
+    resumed.warmup_remaining = 3
+    resumed.entropy_state = {
+        name: EntropyControllerState(0.1, 0.001, 7)
+        for name in ("operation", "quantity", "market")
+    }
+    before = (
+        resumed.environment_steps,
+        resumed.collection_round,
+        resumed.actor_version,
+        resumed.actor_source_global_step,
+        resumed.warmup_remaining,
+        dict(resumed.entropy_state),
+    )
+
+    with pytest.raises(ResumeConfigError, match="invalid Toad checkpoint state"):
+        resumed.on_load_checkpoint(checkpoint)
+
+    assert (
+        resumed.environment_steps,
+        resumed.collection_round,
+        resumed.actor_version,
+        resumed.actor_source_global_step,
+        resumed.warmup_remaining,
+        resumed.entropy_state,
+    ) == before
 
 
 def test_full_enabled_lightning_policy_extraction_is_structurally_strict(
