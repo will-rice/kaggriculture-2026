@@ -89,7 +89,11 @@ class ModelConfig(BaseModel):
             )
         if self.local_patch and self.local_patch_size % 2 == 0:
             raise ValueError("local patch size must be odd")
-        if self.transformer and self.channels % self.transformer_heads:
+        if self.transformer and self.transformer_blocks == 0:
+            raise ValueError("transformer requires positive transformer_blocks")
+        if (
+            self.transformer or self.interaction_value
+        ) and self.channels % self.transformer_heads:
             raise ValueError("transformer channels must divide evenly across heads")
         return self
 
@@ -257,9 +261,7 @@ class ToadConfig(BaseModel):
 def _validate_active_model(model: ModelConfig) -> None:
     """Reject architecture paths not yet consumed by the active trainer."""
     unsupported = {
-        "transformer": model.transformer,
         "local_patch": model.local_patch,
-        "interaction_value": model.interaction_value,
     }
     for name, enabled in unsupported.items():
         if enabled:

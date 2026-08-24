@@ -29,7 +29,12 @@ from kaggriculture.learn.toad.config import (
     validate_stored_config,
 )
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch
-from kaggriculture.learn.toad.model import PolicyOutput, PolicyState, StatefulPolicy
+from kaggriculture.learn.toad.model import (
+    PolicyOutput,
+    PolicyState,
+    StatefulPolicy,
+    uses_stateful_policy,
+)
 
 if TYPE_CHECKING:
     from kaggriculture.learn.scripts.toad import Teacher
@@ -121,7 +126,7 @@ def load_checkpoint_policy(policy: PolicyLike, path: Path) -> list[str]:
         weights = checkpoint
     typed_weights = cast(Mapping[str, torch.Tensor], weights)
     if isinstance(policy, StatefulPolicy):
-        if policy.config.recurrent or policy.config.belief:
+        if uses_stateful_policy(policy.config):
             policy.load_state_dict(typed_weights, strict=True)
         else:
             policy.load_control_state_dict(typed_weights)
@@ -343,7 +348,7 @@ class ToadLightningModule(lightning.LightningModule):
         self.config = config
         self.policy: PolicyLike = (
             StatefulPolicy(config.model)
-            if config.model.recurrent or config.model.belief
+            if uses_stateful_policy(config.model)
             else Policy(
                 blocks=config.model.blocks,
                 channels=config.model.channels,

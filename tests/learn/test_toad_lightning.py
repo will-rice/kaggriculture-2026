@@ -80,6 +80,37 @@ def test_recurrent_module_uses_stateful_policy_while_control_keeps_bare_policy()
     assert not isinstance(control.policy, StatefulPolicy)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"transformer": True, "transformer_blocks": 1},
+        {"interaction_value": True},
+    ],
+)
+def test_attention_module_uses_exact_stateful_topology(
+    model: dict[str, object], tmp_path: Path
+) -> None:
+    """Attention-only production learners must not fall back to bare Policy."""
+    payload = {"blocks": 1, "channels": 16, **model}
+    config = ToadConfig.model_validate({"model": payload})
+    source = StatefulPolicy(config.model)
+    path = tmp_path / "stateful.pt"
+    torch.save(source.state_dict(), path)
+    restored_config = config.model_copy(
+        update={
+            "curriculum": config.curriculum.model_copy(
+                update={"warm_start_checkpoint": path}
+            )
+        }
+    )
+
+    restored = ToadLightningModule(restored_config)
+
+    assert isinstance(restored.policy, StatefulPolicy)
+    for name, tensor in source.state_dict().items():
+        assert torch.equal(restored.policy.state_dict()[name], tensor)
+
+
 def test_compute_loss_replays_segment_state_and_shifts_action_dones() -> None:
     """A terminal action resets the following observation, not its own logits."""
     config = _recurrent_config()

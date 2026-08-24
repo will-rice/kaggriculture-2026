@@ -209,6 +209,45 @@ def test_recurrent_reference_worker_builds_and_loads_the_stateful_actor(
         assert torch.equal(seen[0].state_dict()[name], tensor)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"transformer": True, "transformer_blocks": 1},
+        {"interaction_value": True},
+    ],
+)
+def test_attention_reference_worker_builds_exact_stateful_actor(
+    model: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers must construct and strictly load attention-only stateful weights."""
+    config = ToadConfig.model_validate(
+        {"model": {"blocks": 1, "channels": 16, **model}}
+    )
+    expected = StatefulPolicy(config.model)
+    seen: list[StatefulPolicy] = []
+
+    def fake_rollout(
+        actor: object, opponent: object, seeds: Sequence[int]
+    ) -> list[Trajectory]:
+        assert isinstance(actor, StatefulPolicy)
+        assert opponent is actor
+        seen.append(actor)
+        return []
+
+    monkeypatch.setattr(toad, "rollout_many", fake_rollout)
+    work = ReferenceWorkerInput(
+        actor_state=dict(expected.state_dict()),
+        seeds=[23],
+        model=config.model,
+        versus=None,
+        money_weight=0.01,
+    )
+
+    assert toad._play_reference(work) == []
+    for name, tensor in expected.state_dict().items():
+        assert torch.equal(seen[0].state_dict()[name], tensor)
+
+
 def test_round_expansion_preserves_policy_and_value_pass_counts() -> None:
     """Dropping a fresh group or counting a replay as collection is a bug."""
     trajectories = [_trajectory(turns=32) for _ in range(2)]

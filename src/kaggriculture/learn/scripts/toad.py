@@ -76,7 +76,7 @@ from kaggriculture.learn.toad.data import (
     segments,
 )
 from kaggriculture.learn.toad.lightning import ToadLightningModule
-from kaggriculture.learn.toad.model import StatefulPolicy
+from kaggriculture.learn.toad.model import StatefulPolicy, uses_stateful_policy
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -1502,7 +1502,7 @@ def _play(
 def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
     """Play one typed native-worker request with its resolved architecture."""
     torch.set_num_threads(THREADS)
-    if work.model.recurrent or work.model.belief:
+    if uses_stateful_policy(work.model):
         actor: Policy | StatefulPolicy = StatefulPolicy(work.model)
         actor.load_state_dict(work.actor_state, strict=True)
     else:

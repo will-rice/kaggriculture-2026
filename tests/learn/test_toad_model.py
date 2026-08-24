@@ -15,7 +15,13 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
-from kaggriculture.learn.toad.model import ConvLSTM, PolicyState, StatefulPolicy
+from kaggriculture.learn.toad.model import (
+    ConvLSTM,
+    InteractionValueHead,
+    PolicyState,
+    SpatialTransformer,
+    StatefulPolicy,
+)
 
 
 def model_inputs(batch: int = 2) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -202,6 +208,160 @@ def recurrent_inputs(
     return board, scalars, positions
 
 
+def test_spatial_transformer_preserves_shape_and_trains_explicit_positions() -> None:
+    """Removing spatial positions or either residual branch must break gradients."""
+    layer = SpatialTransformer(channels=16, blocks=2, heads=4, mlp_ratio=2)
+    features = torch.randn(3, 16, BOARD_SIZE, BOARD_SIZE, requires_grad=True)
+
+    output = layer(features)
+    output.square().mean().backward()
+
+    assert output.shape == features.shape
+    assert layer.position.shape == (1, BOARD_SIZE * BOARD_SIZE, 16)
+    assert layer.position.grad is not None
+    assert torch.count_nonzero(layer.position.grad)
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in layer.parameters()
+    )
+
+
+def test_interaction_value_attends_to_remote_spatial_and_global_tokens() -> None:
+    """The new head itself must read all 100 cells and projected global context."""
+    torch.manual_seed(37)
+    head = InteractionValueHead(
+        channels=16,
+        global_features=SCALARS,
+        heads=4,
+        mlp_ratio=2,
+        value_bound=0.75,
+    )
+    features = torch.randn(
+        2, 16, BOARD_SIZE, BOARD_SIZE, requires_grad=True
+    )
+    scalars = torch.randn(2, SCALARS, requires_grad=True)
+    attended_shapes: list[tuple[torch.Size, torch.Size]] = []
+
+    def capture_attention_inputs(
+        _module: torch.nn.Module, args: tuple[torch.Tensor, ...]
+    ) -> None:
+        attended_shapes.append((args[0].shape, args[1].shape))
+
+    hook = head.attention.register_forward_pre_hook(capture_attention_inputs)
+    values = head(features, scalars)
+    hook.remove()
+    values.sum().backward()
+
+    assert values.shape == (2,)
+    assert torch.all(values >= -0.75)
+    assert torch.all(values <= 0.75)
+    assert attended_shapes == [
+        (
+            torch.Size((2, 1, 16)),
+            torch.Size((2, BOARD_SIZE * BOARD_SIZE + 1, 16)),
+        )
+    ]
+    assert features.grad is not None
+    assert torch.count_nonzero(features.grad[:, :, -1, -1])
+    assert scalars.grad is not None
+    assert torch.count_nonzero(scalars.grad)
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in head.parameters()
+    )
+
+
+@pytest.mark.parametrize(
+    ("recurrent", "belief", "transformer", "interaction_value"),
+    [
+        (False, False, True, False),
+        (False, False, False, True),
+        (False, True, True, True),
+        (True, False, True, True),
+        (True, True, True, True),
+    ],
+)
+def test_optional_attention_combinations_preserve_time_major_shapes(
+    recurrent: bool,
+    belief: bool,
+    transformer: bool,
+    interaction_value: bool,
+) -> None:
+    """Every supported optional composition must retain time and batch axes."""
+    config = ModelConfig.model_validate(
+        {
+            "blocks": 1,
+            "channels": 16,
+            "recurrent": recurrent,
+            "recurrent_channels": 4,
+            "belief": belief,
+            "transformer": transformer,
+            "transformer_blocks": 1 if transformer else 0,
+            "interaction_value": interaction_value,
+        }
+    )
+    policy = StatefulPolicy(config)
+    board, scalars, positions = recurrent_inputs(time=2, batch=1)
+
+    output = policy(board, scalars, positions)
+
+    assert output.unit_logits.shape == (2, 1, MAX_UNITS, len(UNIT_OPS))
+    assert output.quantity_logits.shape == (2, 1, MAX_UNITS, len(QUANTITIES))
+    assert output.market_logits.shape == (
+        2,
+        1,
+        len(MARKET_SLOTS) + 2,
+        len(QUANTITIES),
+    )
+    assert output.values.shape == (2, 1)
+    assert (output.belief_logits is not None) is belief
+    assert (output.state is not None) is (recurrent or belief)
+
+
+def test_combined_attention_policy_trains_every_enabled_component() -> None:
+    """Spatial, interaction, recurrent, and belief parameters all receive gradients."""
+    config = ModelConfig.model_validate(
+        {
+            "blocks": 1,
+            "channels": 16,
+            "recurrent": True,
+            "recurrent_channels": 4,
+            "belief": True,
+            "belief_feedback": True,
+            "transformer": True,
+            "transformer_blocks": 1,
+            "interaction_value": True,
+        }
+    )
+    policy = StatefulPolicy(config)
+    board, scalars, positions = recurrent_inputs(time=3, batch=2)
+
+    output = policy(board, scalars, positions)
+    assert output.belief_logits is not None
+    loss = (
+        output.unit_logits.square().mean()
+        + output.quantity_logits.square().mean()
+        + output.market_logits.square().mean()
+        + output.values.square().mean()
+        + output.belief_logits.square().mean()
+    )
+    loss.backward()
+
+    for prefix in ("recurrent.", "transformer.", "belief_head.", "interaction_value."):
+        gradients = [
+            parameter.grad
+            for name, parameter in policy.named_parameters()
+            if name.startswith(prefix)
+        ]
+        assert gradients
+        assert all(gradient is not None for gradient in gradients)
+        assert all(
+            torch.isfinite(gradient).all()
+            for gradient in gradients
+            if gradient is not None
+        )
+
+
 def test_recurrent_policy_accepts_time_major_inputs_and_keeps_layered_state() -> None:
     """The enabled path preserves time and batch axes through every output head."""
     policy = recurrent_policy()
@@ -339,8 +499,21 @@ def test_policy_state_reset_clears_all_terminal_components_before_a_step() -> No
         ({"belief_feedback": True}, "requires the belief head"),
         ({"belief_loss_weight": 0.5}, "requires the belief head"),
         (
-            {"transformer": True, "channels": 10, "transformer_heads": 4},
+            {
+                "transformer": True,
+                "transformer_blocks": 1,
+                "channels": 10,
+                "transformer_heads": 4,
+            },
             "divide evenly",
+        ),
+        (
+            {"interaction_value": True, "channels": 10, "transformer_heads": 4},
+            "divide evenly",
+        ),
+        (
+            {"transformer": True, "transformer_blocks": 0},
+            "positive transformer_blocks",
         ),
         ({"local_patch": True, "local_patch_size": 6}, "must be odd"),
         ({"recurrent_layers": 0}, "greater than 0"),
@@ -361,9 +534,7 @@ def test_optional_model_dimensions_are_validated(
 @pytest.mark.parametrize(
     "model",
     [
-        {"transformer": True},
         {"local_patch": True},
-        {"interaction_value": True},
     ],
 )
 def test_active_trainer_rejects_unimplemented_optional_model_paths(
@@ -374,15 +545,24 @@ def test_active_trainer_rejects_unimplemented_optional_model_paths(
         ToadConfig.model_validate({"model": model})
 
 
-def test_active_trainer_accepts_recurrent_and_belief_but_keeps_later_paths_gated() -> (
-    None
-):
-    """Task 4 relaxes belief only; later architecture stages remain errors."""
+def test_active_trainer_accepts_attention_paths_but_keeps_local_patch_gated() -> None:
+    """Task 5 relaxes only the transformer and interaction-value stage gates."""
     config = ToadConfig.model_validate(
-        {"model": {"recurrent": True, "belief": True, "belief_feedback": True}}
+        {
+            "model": {
+                "recurrent": True,
+                "belief": True,
+                "belief_feedback": True,
+                "transformer": True,
+                "transformer_blocks": 1,
+                "interaction_value": True,
+            }
+        }
     )
 
     assert config.model.recurrent
     assert config.model.belief
+    assert config.model.transformer
+    assert config.model.interaction_value
     with pytest.raises(ValidationError, match="not implemented in the active trainer"):
-        ToadConfig.model_validate({"model": {"recurrent": True, "transformer": True}})
+        ToadConfig.model_validate({"model": {"local_patch": True}})

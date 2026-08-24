@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from kaggriculture.constants import BOARD_SIZE
-from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, UNIT_OPS
+from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, SCALARS, UNIT_OPS
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.toad.config import ModelConfig
 
@@ -187,6 +187,148 @@ class ConvLSTM(torch.nn.Module):
         )
 
 
+class _TransformerBlock(torch.nn.Module):
+    """One pre-normalized self-attention and MLP residual block."""
+
+    def __init__(self, channels: int, heads: int, mlp_ratio: int) -> None:
+        super().__init__()
+        self.attention_norm = torch.nn.LayerNorm(channels)
+        self.attention = torch.nn.MultiheadAttention(
+            channels, heads, batch_first=True
+        )
+        self.mlp_norm = torch.nn.LayerNorm(channels)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(channels, channels * mlp_ratio),
+            torch.nn.GELU(),
+            torch.nn.Linear(channels * mlp_ratio, channels),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        normalized = self.attention_norm(tokens)
+        attended, _ = self.attention(
+            normalized,
+            normalized,
+            normalized,
+            need_weights=False,
+        )
+        tokens = tokens + attended
+        return tokens + self.mlp(self.mlp_norm(tokens))
+
+
+def _validate_attention_dimensions(
+    channels: int, heads: int, mlp_ratio: int
+) -> None:
+    """Reject malformed attention dimensions at the standalone module boundary."""
+    if channels <= 0 or heads <= 0 or mlp_ratio <= 0:
+        raise ValueError("attention channels, heads, and mlp_ratio must be positive")
+    if channels % heads:
+        raise ValueError("attention channels must divide evenly across heads")
+
+
+class SpatialTransformer(torch.nn.Module):
+    """Pre-normalized attention over the explicit 10x10 spatial token grid."""
+
+    def __init__(
+        self, channels: int, blocks: int, heads: int, mlp_ratio: int
+    ) -> None:
+        super().__init__()
+        _validate_attention_dimensions(channels, heads, mlp_ratio)
+        if blocks <= 0:
+            raise ValueError("spatial transformer blocks must be positive")
+        self.position = torch.nn.Parameter(
+            torch.zeros(1, BOARD_SIZE * BOARD_SIZE, channels)
+        )
+        self.blocks = torch.nn.ModuleList(
+            _TransformerBlock(channels, heads, mlp_ratio) for _ in range(blocks)
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Preserve ``(batch, channels, 10, 10)`` around token attention."""
+        batch, channels, height, width = features.shape
+        if (height, width) != (BOARD_SIZE, BOARD_SIZE):
+            raise ValueError(
+                "spatial transformer requires a 10x10 map, got "
+                f"{height}x{width}"
+            )
+        tokens = features.flatten(2).transpose(1, 2) + self.position
+        for block in self.blocks:
+            tokens = block(tokens)
+        return tokens.transpose(1, 2).reshape(batch, channels, height, width)
+
+
+def _bound_value(value: torch.Tensor, bound: float | None) -> torch.Tensor:
+    """Apply the control policy's established optional scalar value bound."""
+    if bound is None:
+        return value
+    return torch.sigmoid(value) * (2.0 * bound) - bound
+
+
+class InteractionValueHead(torch.nn.Module):
+    """Read value with one query over a global token and 100 spatial tokens."""
+
+    def __init__(
+        self,
+        channels: int,
+        global_features: int,
+        heads: int,
+        mlp_ratio: int,
+        value_bound: float | None,
+    ) -> None:
+        super().__init__()
+        _validate_attention_dimensions(channels, heads, mlp_ratio)
+        if global_features <= 0:
+            raise ValueError("interaction global_features must be positive")
+        self.value_bound = value_bound
+        self.value_token = torch.nn.Parameter(torch.zeros(1, 1, channels))
+        self.global_projection = torch.nn.Linear(global_features, channels)
+        self.query_norm = torch.nn.LayerNorm(channels)
+        self.context_norm = torch.nn.LayerNorm(channels)
+        self.attention = torch.nn.MultiheadAttention(
+            channels, heads, batch_first=True
+        )
+        self.mlp_norm = torch.nn.LayerNorm(channels)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(channels, channels * mlp_ratio),
+            torch.nn.GELU(),
+            torch.nn.Linear(channels * mlp_ratio, channels),
+        )
+        self.value_projection = torch.nn.Linear(channels, 1)
+
+    def forward(
+        self, features: torch.Tensor, global_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Attend before reducing, without pooling away spatial interactions."""
+        batch, _channels, height, width = features.shape
+        if (height, width) != (BOARD_SIZE, BOARD_SIZE):
+            raise ValueError(
+                "interaction value requires a 10x10 map, got "
+                f"{height}x{width}"
+            )
+        spatial = features.flatten(2).transpose(1, 2)
+        global_token = self.global_projection(global_features).unsqueeze(1)
+        context = self.context_norm(torch.cat((global_token, spatial), dim=1))
+        value = self.value_token.expand(batch, -1, -1)
+        attended, _ = self.attention(
+            self.query_norm(value), context, context, need_weights=False
+        )
+        value = value + attended
+        value = value + self.mlp(self.mlp_norm(value))
+        scalar = self.value_projection(value[:, 0]).squeeze(-1)
+        return _bound_value(scalar, self.value_bound)
+
+
+def uses_stateful_policy(config: ModelConfig) -> bool:
+    """Return whether implemented optional components need typed time-major I/O."""
+    return any(
+        (
+            config.recurrent,
+            config.transformer,
+            config.belief,
+            config.interaction_value,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class PolicyOutput:
     """Every tensor emitted by a stateful Toad policy forward pass."""
@@ -220,10 +362,25 @@ class StatefulPolicy(torch.nn.Module):
                 config.channels,
                 kernel_size=1,
             )
+        if config.transformer:
+            self.transformer = SpatialTransformer(
+                config.channels,
+                config.transformer_blocks,
+                config.transformer_heads,
+                config.transformer_mlp_ratio,
+            )
         if config.belief:
             self.belief_head = torch.nn.Linear(config.channels, config.belief_size)
         if config.belief_feedback:
             self.feedback = torch.nn.Linear(config.belief_size, config.channels)
+        if config.interaction_value:
+            self.interaction_value = InteractionValueHead(
+                config.channels,
+                SCALARS,
+                config.transformer_heads,
+                config.transformer_mlp_ratio,
+                config.value_bound,
+            )
 
     def _has_optional_components(self) -> bool:
         return any(
@@ -289,16 +446,18 @@ class StatefulPolicy(torch.nn.Module):
         self,
         board: torch.Tensor,
         scalars: torch.Tensor,
-        state: PolicyState,
-    ) -> tuple[torch.Tensor, PolicyState, torch.Tensor | None]:
+        state: PolicyState | None,
+    ) -> tuple[torch.Tensor, PolicyState | None, torch.Tensor | None]:
         """Advance optional recurrence and belief feedback for one time row."""
         scalar_features = self.control.market(scalars)
         if self.config.belief_feedback:
+            assert state is not None
             scalar_features = scalar_features + self.feedback(state.prior_belief)
         features = self.control.stem(board) + scalar_features[:, :, None, None]
         for block in self.control.blocks:
             features = block(features)
         if self.config.recurrent:
+            assert state is not None
             recurrent_state = self.recurrent.step(
                 features, ConvLSTMState(hidden=state.hidden, cell=state.cell)
             )
@@ -315,11 +474,17 @@ class StatefulPolicy(torch.nn.Module):
             hidden = recurrent_state.hidden
             cell = recurrent_state.cell
         else:
-            hidden = state.hidden
-            cell = state.cell
+            hidden = state.hidden if state is not None else None
+            cell = state.cell if state is not None else None
+        if self.config.transformer:
+            features = self.transformer(features)
         belief = (
             self.belief_head(features.mean(dim=(2, 3))) if self.config.belief else None
         )
+        if state is None:
+            return features, None, belief
+        assert hidden is not None
+        assert cell is not None
         return (
             features,
             PolicyState(
@@ -387,23 +552,27 @@ class StatefulPolicy(torch.nn.Module):
         dones: torch.Tensor | None = None,
     ) -> PolicyOutput:
         """Run exact control delegation or the enabled time-major recurrence."""
-        if not (self.config.recurrent or self.config.belief):
+        if not uses_stateful_policy(self.config):
             unit, quantity, market, values = self.control(board, scalars, positions)
             return PolicyOutput(unit, quantity, market, values, None, None)
 
         time, batch = board.shape[:2]
         if dones is None:
             dones = torch.zeros(time, batch, dtype=torch.bool, device=board.device)
-        state = self.initial_state(batch, like=board) if state is None else state
-        assert state is not None
-        self._validate_state(state, batch, like=board)
+        if self.config.recurrent or self.config.belief:
+            state = self.initial_state(batch, like=board) if state is None else state
+            assert state is not None
+            self._validate_state(state, batch, like=board)
+        elif state is not None:
+            raise ValueError("attention-only policy does not accept recurrent state")
         feature_steps: list[torch.Tensor] = []
         belief_steps: list[torch.Tensor] = []
         input_state: PolicyState | None = None
         for step in range(time):
-            state = state.reset_rows(dones[step])
-            if step == 0:
-                input_state = state
+            if state is not None:
+                state = state.reset_rows(dones[step])
+                if step == 0:
+                    input_state = state
             features, state, belief = self._stateful_step(
                 board[step], scalars[step], state
             )
@@ -424,22 +593,28 @@ class StatefulPolicy(torch.nn.Module):
         market = self.control.trade_head(pooled).view(
             time, batch, len(MARKET_SLOTS) + 2, len(QUANTITIES)
         )
-        values = self.control.value(pooled).squeeze(-1)
-        if self.control.value_bound is not None:
-            values = (
-                torch.sigmoid(values) * (2.0 * self.control.value_bound)
-                - self.control.value_bound
+        values = (
+            self.interaction_value(flat_features, scalars.flatten(0, 1))
+            if self.config.interaction_value
+            else _bound_value(
+                self.control.value(pooled).squeeze(-1), self.control.value_bound
             )
-        hidden, cell = state.hidden, state.cell
-        if self.config.recurrent and self.config.recurrent_layers == 1:
-            hidden = hidden.squeeze(0)
-            cell = cell.squeeze(0)
+        )
+        output_state = state
+        if (
+            state is not None
+            and self.config.recurrent
+            and self.config.recurrent_layers == 1
+        ):
+            output_state = PolicyState(
+                state.hidden.squeeze(0), state.cell.squeeze(0), state.prior_belief
+            )
         return PolicyOutput(
             units,
             quantities,
             market,
             values.view(time, batch),
             torch.stack(belief_steps) if belief_steps else None,
-            PolicyState(hidden, cell, state.prior_belief),
+            output_state,
             input_state,
         )
