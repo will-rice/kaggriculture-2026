@@ -656,7 +656,7 @@ def _run_store(
     length = segment_length(state.batch_size)
     remaining = turns
     while remaining > 0:
-        state, _trajectory = collect_segment(
+        state, _policy_state, _trajectory = collect_segment(
             state, policy, turns=min(length, remaining), generator=generator
         )
         remaining -= min(length, remaining)
@@ -717,7 +717,7 @@ def _capture_segment(
     graph = torch.cuda.CUDAGraph()
     graph.register_generator_state(generator)
     with torch.cuda.graph(graph):
-        successor, trajectory = collect_segment(
+        successor, _policy_state, trajectory = collect_segment(
             state, policy, turns=length, generator=generator
         )
         for field in fields(SimState):
@@ -912,7 +912,7 @@ def verify_segment_graph(device: torch.device) -> None:
     stepped = reset(Config(), seeds)
     eager = torch.Generator(device=device).manual_seed(SEED_BASE)
     for _ in range(replays):
-        stepped, collected = collect_segment(
+        stepped, _policy_state, collected = collect_segment(
             stepped, peaked, turns=VERIFY_SEGMENT, generator=eager
         )
     divergent = [

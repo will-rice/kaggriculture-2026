@@ -78,6 +78,7 @@ from kaggriculture.learn.toad.data import (
     OBSERVED_FIELDS as _OBSERVED_FIELDS,
 )
 from kaggriculture.learn.toad.data import (
+    NativeRoundSource,
     ReferenceRoundSource,
     ReferenceWorkerInput,
     ToadDataModule,
@@ -178,6 +179,41 @@ def _cpu_bf16_supported() -> bool:
         return False
 
 
+def _rollout_preflight(config: ToadConfig) -> None:
+    """Reject rollout modes that would otherwise fall back or be ignored."""
+    runtime = config.runtime
+    if runtime.rollout_backend == "native" and runtime.compile.enabled:
+        raise RuntimePreflightError(
+            "native rollout with torch.compile is not proved; refusing eager fallback"
+        )
+    if runtime.rollout_cuda_graph:
+        if runtime.rollout_backend != "native":
+            raise RuntimePreflightError(
+                "CUDA-graph rollout requires rollout_backend='native'"
+            )
+        if config.population.scripted > 0:
+            raise RuntimePreflightError(
+                "scripted CUDA-graph rollout is unsupported because the scripted "
+                "opponent reads simulator rows on the host"
+            )
+        raise RuntimePreflightError(
+            "CUDA-graph round collection is not yet selectable; refusing eager fallback"
+        )
+    if runtime.rollout_backend == "reference" and runtime.rollout_device != "cpu":
+        raise RuntimePreflightError(
+            "reference rollout does not consume rollout_device; refusing an ignored "
+            f"{runtime.rollout_device!r} request"
+        )
+    if (
+        runtime.rollout_backend == "native"
+        and runtime.rollout_device == "cuda"
+        and not _cuda_available()
+    ):
+        raise RuntimePreflightError(
+            "native CUDA rollout requested but CUDA is unavailable"
+        )
+
+
 def runtime_preflight(config: ToadConfig) -> None:
     """Reject unavailable runtime requests before creating trainer side effects.
 
@@ -186,6 +222,7 @@ def runtime_preflight(config: ToadConfig) -> None:
     changes an explicit request into a different precision or accelerator.
     """
     runtime = config.runtime
+    _rollout_preflight(config)
     accelerator = _effective_accelerator(runtime)
     if accelerator == "cpu" and isinstance(runtime.devices, tuple):
         raise RuntimePreflightError(
@@ -776,8 +813,12 @@ def build_wandb_logger(config: ToadConfig) -> WandbLogger:
 
 
 def build_reference_data_module(config: ToadConfig) -> ToadDataModule:
-    """Build the synchronous reference collector bridge."""
-    source = ReferenceRoundSource(config)
+    """Build the requested synchronous collector behind the common bridge."""
+    source: ReferenceRoundSource
+    if config.runtime.rollout_backend == "native":
+        source = NativeRoundSource(config)
+    else:
+        source = ReferenceRoundSource(config)
     return ToadDataModule(config, source)
 
 

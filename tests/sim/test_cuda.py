@@ -7,13 +7,15 @@ import pytest
 import torch
 
 from kaggriculture.learn.encoding import MARKET_SLOTS, MAX_UNITS, QUANTITIES, UNIT_OPS
+from kaggriculture.learn.toad.config import ModelConfig
+from kaggriculture.learn.toad.model import StatefulPolicy
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.decode import decode_market_buckets
 from kaggriculture.sim.engine import reset, step, unit_quantity_ones
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.rng import select_day_words
-from kaggriculture.sim.rollout import collect_segment
+from kaggriculture.sim.rollout import collect_segment, copy_policy_state_
 from kaggriculture.sim.state import SimState
 
 pytestmark = pytest.mark.skipif(
@@ -129,20 +131,43 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
     length = 2
     replays = 3
     state = reset(Config(), torch.tensor([269, 271], device=device))
-    policy = _ZeroPolicy().to(device)
+    policy = (
+        StatefulPolicy(
+            ModelConfig.control(blocks=1, channels=4).model_copy(
+                update={"recurrent": True, "recurrent_channels": 3, "belief": True}
+            )
+        )
+        .to(device)
+        .eval()
+    )
+    policy_state = policy.initial_state(state.batch_size * 2, like=state.money.float())
+    assert policy_state is not None
     generator = torch.Generator(device=device).manual_seed(277)
     for _ in range(2):
-        state = collect_segment(state, policy, turns=length, generator=generator)[0]
+        state, policy_state, _trajectory = collect_segment(
+            state,
+            policy,
+            policy_state=policy_state,
+            turns=length,
+            generator=generator,
+        )
+        assert policy_state is not None
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     graph.register_generator_state(generator)
     with torch.cuda.graph(graph):
-        successor, trajectory = collect_segment(
-            state, policy, turns=length, generator=generator
+        successor, successor_policy_state, trajectory = collect_segment(
+            state,
+            policy,
+            policy_state=policy_state,
+            turns=length,
+            generator=generator,
         )
         for field in fields(SimState):
             getattr(state, field.name).copy_(getattr(successor, field.name))
+        assert successor_policy_state is not None
+        copy_policy_state_(policy_state, successor_policy_state)
     started = int(state.step[0])
     for _ in range(replays):
         graph.replay()

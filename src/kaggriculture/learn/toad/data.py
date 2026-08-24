@@ -724,6 +724,53 @@ class RoundBatchExpander:
             )
             for segment in segments(trajectory, self.unroll_length)
         ]
+        collected_steps = sum(
+            int(trajectory.dones.shape[0]) for trajectory in trajectories
+        )
+        yield from self._expand_entries(
+            all_segments,
+            meta,
+            collected_steps=collected_steps,
+            kind_metas=kind_metas,
+            round_metrics=round_metrics,
+        )
+
+    def expand_native(
+        self,
+        entries: Sequence[
+            tuple[dict[str, torch.Tensor], BatchKind, CollectionAssignment]
+        ],
+        meta: RoundMeta,
+        *,
+        collected_steps: int,
+        kind_metas: Mapping[BatchKind, RoundMeta] | None = None,
+        round_metrics: Mapping[str, float | int] | None = None,
+    ) -> Iterator[LearnerBatch]:
+        """Expand already-segmented on-device trajectories without CPU conversion."""
+        yield from self._expand_entries(
+            entries,
+            meta,
+            collected_steps=collected_steps,
+            kind_metas=kind_metas,
+            round_metrics=round_metrics,
+        )
+
+    def _expand_entries(
+        self,
+        all_segments: Sequence[
+            tuple[
+                dict[str, torch.Tensor],
+                BatchKind,
+                CollectionAssignment | None,
+            ]
+        ],
+        meta: RoundMeta,
+        *,
+        collected_steps: int,
+        kind_metas: Mapping[BatchKind, RoundMeta] | None,
+        round_metrics: Mapping[str, float | int] | None,
+    ) -> Iterator[LearnerBatch]:
+        """Apply the common optimizer grouping and provenance contract."""
         groups = [
             tuple(all_segments[start : start + self.batch_segments])
             for start in range(
@@ -764,9 +811,6 @@ class RoundBatchExpander:
                 )
             )
 
-        collected_steps = sum(
-            int(trajectory.dones.shape[0]) for trajectory in trajectories
-        )
         for index, (entries, baseline_only) in enumerate(pending):
             batch_segments = tuple(entry[0] for entry in entries)
             segment_kinds = tuple(entry[1] for entry in entries)
@@ -813,6 +857,126 @@ class RoundBatchExpander:
                 ),
                 round_metrics=round_metrics or {},
             )
+
+
+def _native_recurrent_row(
+    field: torch.Tensor,
+    row: int,
+    environment: int,
+    seat: int,
+) -> torch.Tensor:
+    """Select one unbatched sparse policy-state row from native storage."""
+    if field.ndim == 7:
+        return field[row, :, environment, seat]
+    return field[row, environment, seat]
+
+
+def _native_state_rows(
+    state_steps: torch.Tensor | None,
+    recurrent: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None],
+    starts: tuple[int, ...],
+) -> dict[int, int]:
+    """Validate sparse native actor state and map acted steps to state rows."""
+    if state_steps is None:
+        if any(field is not None for field in recurrent):
+            raise ValueError("native recurrent fields require sparse state_steps")
+        return {}
+    if not all(field is not None for field in recurrent):
+        raise ValueError("native state_steps require every recurrent field")
+    listed = [int(step) for step in state_steps.tolist()]
+    if listed != list(starts):
+        raise ValueError("native recurrent state_steps must equal segment starts")
+    return {step: row for row, step in enumerate(listed)}
+
+
+def native_segments(
+    trajectory: object,
+    assignments: Sequence[CollectionAssignment],
+    *,
+    unroll_length: int,
+    recorded_seats: int,
+) -> list[tuple[dict[str, torch.Tensor], BatchKind, CollectionAssignment]]:
+    """Slice a tensor trajectory directly into the accepted learner schema.
+
+    The simulator owns ``(time, environment, seat, ...)`` device tensors.  This
+    adapter removes those two collection axes without constructing the CPU
+    ``learn.rollout.Trajectory`` type: self-play retains both seats and every
+    other population kind retains learner seat zero only.
+    """
+    from kaggriculture.sim.rollout import Trajectory as NativeTrajectory
+
+    if not isinstance(trajectory, NativeTrajectory):
+        raise TypeError("native segment expansion requires sim.rollout.Trajectory")
+    if len(assignments) != trajectory.board.shape[1]:
+        raise ValueError("one native assignment is required per environment row")
+    if recorded_seats not in (1, 2):
+        raise ValueError("recorded_seats must be one or two")
+    turns = int(trajectory.dones.shape[0])
+    starts = segment_starts(turns, unroll_length)
+    recurrent = (
+        trajectory.hidden,
+        trajectory.cell,
+        trajectory.prior_belief,
+    )
+    state_rows = _native_state_rows(trajectory.state_steps, recurrent, starts)
+
+    result: list[tuple[dict[str, torch.Tensor], BatchKind, CollectionAssignment]] = []
+    for environment, assignment in enumerate(assignments):
+        seats = range(2) if recorded_seats == 2 else range(1)
+        for seat in seats:
+            for start in starts:
+                observation_rows = torch.arange(
+                    start,
+                    start + unroll_length + 1,
+                    device=trajectory.board.device,
+                )
+                segment = {
+                    **{
+                        name: getattr(trajectory, name)[
+                            start : start + unroll_length, environment, seat
+                        ]
+                        for name in ACTED_FIELDS
+                    },
+                    "unit_valid": trajectory.unit_actions[
+                        start : start + unroll_length, environment, seat
+                    ]
+                    != IGNORE,
+                    **{
+                        name: getattr(trajectory, name)[
+                            start : start + unroll_length, environment, seat
+                        ]
+                        for name in BELIEF_FIELDS
+                        if getattr(trajectory, name) is not None
+                    },
+                    **{
+                        name: getattr(trajectory, name)[
+                            observation_rows, environment, seat
+                        ]
+                        for name in OBSERVED_FIELDS
+                    },
+                }
+                if state_rows:
+                    row = state_rows[start]
+                    assert trajectory.hidden is not None
+                    assert trajectory.cell is not None
+                    assert trajectory.prior_belief is not None
+                    segment.update(
+                        initial_hidden=_native_recurrent_row(
+                            trajectory.hidden, row, environment, seat
+                        )
+                        .detach()
+                        .clone(),
+                        initial_cell=_native_recurrent_row(
+                            trajectory.cell, row, environment, seat
+                        )
+                        .detach()
+                        .clone(),
+                        initial_belief=trajectory.prior_belief[row, environment, seat]
+                        .detach()
+                        .clone(),
+                    )
+                result.append((segment, assignment.kind, assignment))
+    return result
 
 
 class ReferenceRoundSource(Iterable[LearnerBatch]):
@@ -1389,6 +1553,289 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 raise distributed
         if self._round_validator is not None:
             self._round_validator(batches, self._next_round_id - 1)
+        yield from batches
+
+
+class NativeRoundSource(ReferenceRoundSource):
+    """Synchronous tensor-simulator source emitting common batches directly."""
+
+    def __init__(
+        self,
+        config: ToadConfig,
+        *,
+        assignments: Iterable[CollectionAssignment] | None = None,
+        pool: SnapshotPool | None = None,
+        teacher: SnapshotEntry | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            assignments=assignments,
+            pool=pool,
+            teacher=teacher,
+        )
+        self.device = torch.device(config.runtime.rollout_device)
+
+    def _native_policy(
+        self,
+        model: ModelConfig,
+        state: Mapping[str, torch.Tensor],
+    ) -> torch.nn.Module:
+        """Instantiate one exact eager actor identity on the rollout device."""
+        from kaggriculture.learn.model import Policy
+        from kaggriculture.learn.toad.model import StatefulPolicy, uses_stateful_policy
+
+        policy: torch.nn.Module
+        if uses_stateful_policy(model):
+            policy = StatefulPolicy(model)
+        else:
+            policy = Policy(
+                blocks=model.blocks,
+                channels=model.channels,
+                value_bound=model.value_bound,
+                kernel_size=model.kernel_size,
+                activation=model.activation,
+            )
+        policy.load_state_dict(state, strict=True)
+        return policy.to(self.device).eval()
+
+    def _scripted_opponent(self) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+        """Resolve the configured native scripted identity without substitution."""
+        if self.config.population.scripted_opponent != "economic":
+            raise CollectionError(
+                "native scripted collection supports only the verified economic "
+                f"opponent, got {self.config.population.scripted_opponent!r}"
+            )
+        from kaggriculture import economic_policy
+
+        return economic_policy.agent
+
+    def _collect_native_round(
+        self, assignments: Sequence[CollectionAssignment]
+    ) -> list[tuple[tuple[CollectionAssignment, ...], object, int]]:
+        """Collect assignments as on-device trajectories, preserving bindings."""
+        if not self.actor_state:
+            raise RuntimeError("native collection needs a published actor state")
+        from kaggriculture.sim.config import Config as SimConfig
+        from kaggriculture.sim.engine import reset
+        from kaggriculture.sim.rollout import collect_segment
+
+        actor = self._native_policy(self.config.model, self.actor_state)
+        opponents = self._materialize_opponents(assignments)
+        chunks: list[list[CollectionAssignment]] = []
+        chunk_indices: dict[BatchKind | OpponentBinding, int] = {}
+        for assignment in assignments:
+            binding = self._assignment_binding(assignment)
+            key: BatchKind | OpponentBinding = binding or assignment.kind
+            index = chunk_indices.get(key)
+            if index is None:
+                chunk_indices[key] = len(chunks)
+                chunks.append([assignment])
+            else:
+                chunks[index].append(assignment)
+
+        collected: list[tuple[tuple[CollectionAssignment, ...], object, int]] = []
+        for mutable_chunk in chunks:
+            chunk = tuple(mutable_chunk)
+            assignment = chunk[0]
+            try:
+                scripted = (
+                    self._scripted_opponent()
+                    if assignment.kind is BatchKind.SCRIPTED
+                    else None
+                )
+                opponent_policy: torch.nn.Module | None = None
+                if assignment.kind in {
+                    BatchKind.FROZEN_OPPONENT,
+                    BatchKind.TEACHER_DISTILL,
+                }:
+                    binding = self._assignment_binding(assignment)
+                    if binding is None or binding not in opponents:
+                        raise CollectionError(
+                            "native neural opponent was not materialized"
+                        )
+                    opponent_state, opponent_model = opponents[binding]
+                    opponent_policy = self._native_policy(
+                        opponent_model,
+                        opponent_state,
+                    )
+                state = reset(
+                    SimConfig(),
+                    torch.tensor([item.seed for item in chunk], device=self.device),
+                )
+                _next_state, _policy_state, trajectory = collect_segment(
+                    state,
+                    actor,
+                    turns=EPISODE_STEPS - 1,
+                    state_unroll_length=self.config.optimizer.unroll_length,
+                    money_weight=self.config.curriculum.money_weight,
+                    generator=torch.Generator(device=self.device).manual_seed(
+                        assignment.seed
+                    ),
+                    opponent=scripted,
+                    opponent_policy=opponent_policy,
+                )
+                recorded_seats = 2 if assignment.kind is BatchKind.SELFPLAY else 1
+                collected.append((chunk, trajectory, recorded_seats))
+            except Exception as error:
+                raise self._collection_error(assignment) from error
+        return collected
+
+    def _native_metrics(
+        self,
+        collected: Sequence[tuple[tuple[CollectionAssignment, ...], object, int]],
+        seconds: float,
+    ) -> dict[str, float | int]:
+        """Summarize native tensors only after collection leaves the hot path."""
+        from kaggriculture.sim.rollout import Trajectory as NativeTrajectory
+
+        metrics: dict[str, float | int] = {
+            "throughput/collection_seconds": seconds,
+        }
+        by_kind: dict[BatchKind, list[torch.Tensor]] = {
+            kind: [] for kind in _ONLINE_KINDS
+        }
+        by_opponent: dict[str, list[torch.Tensor]] = {}
+        flattened: list[CollectionAssignment] = []
+        for assignments, trajectory, recorded_seats in collected:
+            if not isinstance(trajectory, NativeTrajectory):
+                raise TypeError("native metrics require sim.rollout.Trajectory")
+            returns = getattr(trajectory, self.config.curriculum.reward_field).float()
+            for environment, assignment in enumerate(assignments):
+                flattened.append(assignment)
+                values = returns[:, environment, :recorded_seats].sum(dim=0)
+                by_kind[assignment.kind].extend(values.unbind())
+                by_opponent.setdefault(assignment.opponent_id, []).extend(
+                    values.unbind()
+                )
+        for kind, values in by_kind.items():
+            metrics[f"collection/games/{kind.value}"] = sum(
+                assignment.kind is kind for assignment in flattened
+            )
+            metrics[f"collection/return/{kind.value}"] = (
+                float(torch.stack(values).mean()) if values else float("nan")
+            )
+        for opponent_id, values in by_opponent.items():
+            safe_id = opponent_id.replace("/", "_")
+            total = torch.stack(values).sum()
+            metrics[f"collection/games_by_opponent/{safe_id}"] = sum(
+                assignment.opponent_id == opponent_id for assignment in flattened
+            )
+            metrics[f"collection/return_by_opponent/{safe_id}"] = float(
+                total / len(values)
+            )
+            metrics[f"collection/return_sum_by_opponent/{safe_id}"] = float(total)
+            metrics[f"collection/return_count_by_opponent/{safe_id}"] = len(values)
+        return metrics
+
+    def _iter_local_round(self) -> Iterator[LearnerBatch]:
+        """Collect one rank-owned round and expand native device tensors directly."""
+        self._ensure_initial_pool()
+        assignments = self._assignments
+        generated = assignments is None
+        first_game_id = self.next_game_id
+        round_id = self._next_round_id
+        if assignments is None:
+            local_ids = rank_game_ids(
+                first_game_id,
+                self.config.population.environments_per_rank,
+                self.global_rank,
+                self.world_size,
+            )
+            assignments = allocate_round(
+                self.config,
+                local_ids[0],
+                round_id,
+                self.pool,
+                self.teacher,
+            )
+        if not assignments:
+            return
+        started = time.perf_counter()
+        collected = self._collect_native_round(assignments)
+        collection_seconds = time.perf_counter() - started
+        ordered = sorted(
+            collected,
+            key=lambda entry: _ONLINE_KINDS.index(entry[0][0].kind),
+        )
+        ordered_assignments = tuple(
+            assignment for entry in ordered for assignment in entry[0]
+        )
+        present = {assignment.kind for assignment in ordered_assignments}
+        round_kind = next(iter(present)) if len(present) == 1 else BatchKind.MIXED
+        meta = RoundMeta(
+            round_id=round_id,
+            actor_version=self.actor_version,
+            game_ids=tuple(item.game_id for item in ordered_assignments),
+            seeds=tuple(item.seed for item in ordered_assignments),
+            opponent_ids=tuple(item.opponent_id for item in ordered_assignments),
+            kind=round_kind,
+            opponent_digests=tuple(
+                item.checkpoint_sha256 for item in ordered_assignments
+            ),
+        )
+        kind_metas = {
+            kind: RoundMeta(
+                round_id=round_id,
+                actor_version=self.actor_version,
+                game_ids=tuple(
+                    item.game_id for item in ordered_assignments if item.kind is kind
+                ),
+                seeds=tuple(
+                    item.seed for item in ordered_assignments if item.kind is kind
+                ),
+                opponent_ids=tuple(
+                    item.opponent_id
+                    for item in ordered_assignments
+                    if item.kind is kind
+                ),
+                kind=kind,
+                opponent_digests=tuple(
+                    item.checkpoint_sha256
+                    for item in ordered_assignments
+                    if item.kind is kind
+                ),
+            )
+            for kind in present
+        }
+        entries = [
+            entry
+            for assignments, trajectory, recorded_seats in ordered
+            for entry in native_segments(
+                trajectory,
+                assignments,
+                unroll_length=self.config.optimizer.unroll_length,
+                recorded_seats=recorded_seats,
+            )
+        ]
+        collected_steps = (EPISODE_STEPS - 1) * sum(
+            len(assignments) * recorded_seats
+            for assignments, _trajectory, recorded_seats in ordered
+        )
+        expander = RoundBatchExpander(
+            batch_segments=self.config.optimizer.batch_segments,
+            unroll_length=self.config.optimizer.unroll_length,
+            value_passes=self.config.optimizer.value_passes,
+            seed=self.config.runtime.seed,
+        )
+        batches = tuple(
+            expander.expand_native(
+                entries,
+                meta,
+                collected_steps=collected_steps,
+                kind_metas=kind_metas,
+                round_metrics=self._native_metrics(ordered, collection_seconds),
+            )
+        )
+        if not batches:
+            raise CollectionError(
+                f"collection round {round_id} produced no complete learner batches"
+            )
+        if generated:
+            self.next_game_id = (
+                first_game_id
+                + self.config.population.environments_per_rank * self.world_size
+            )
+        self._next_round_id = round_id + 1
         yield from batches
 
 

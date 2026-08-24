@@ -283,7 +283,9 @@ class RuntimeConfig(BaseModel):
     output_dir: Path = Path("run/toad")
     resume: Path | None = None
     compile: CompileConfig = Field(default_factory=CompileConfig)
-    rollout_backend: Literal["reference"] = "reference"
+    rollout_backend: Literal["reference", "native"] = "reference"
+    rollout_device: Literal["cpu", "cuda"] = "cpu"
+    rollout_cuda_graph: bool = False
 
     @model_validator(mode="after")
     def validate_device_topology(self) -> Self:
@@ -506,6 +508,9 @@ STRUCTURAL_FIELDS = (
     "optimizer.unroll_length",
     "optimizer.batch_segments",
     "runtime.compile",
+    "runtime.rollout_backend",
+    "runtime.rollout_device",
+    "runtime.rollout_cuda_graph",
 )
 
 
