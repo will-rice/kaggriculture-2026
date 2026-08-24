@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
 from pydantic import ValidationError
 from torch import nn
 
-from kaggriculture.learn.encoding import MAX_UNITS, SCALARS, TILE_PLANES
 from kaggriculture.learn.toad.callbacks import ActorSyncCallback
 from kaggriculture.learn.toad.compile import (
     CompileRequestedError,
@@ -21,6 +21,7 @@ from kaggriculture.learn.toad.config import (
     CompileConfig,
     ToadConfig,
     structural_fingerprint,
+    validate_stored_config,
 )
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, segments
 from kaggriculture.learn.toad.lightning import ToadLightningModule, compute_loss
@@ -158,6 +159,37 @@ def test_compile_settings_are_immutable_resume_identity() -> None:
     assert structural_fingerprint(eager) != structural_fingerprint(compiled)
 
 
+def test_historical_disabled_compile_checkpoint_resumes_as_eager() -> None:
+    """The former boolean eager setting remains a valid stored checkpoint."""
+    config = control_fixture_config()
+    stored = ToadLightningModule(config)
+    checkpoint: dict[str, object] = {}
+    stored.on_save_checkpoint(checkpoint)
+    metadata = cast(dict[str, object], checkpoint["toad"])
+    stored_config = cast(dict[str, object], metadata["config"])
+    stored_runtime = cast(dict[str, object], stored_config["runtime"])
+    stored_runtime["compile"] = False
+    resumed = ToadLightningModule(config)
+
+    resumed.on_load_checkpoint(checkpoint)
+
+    assert validate_stored_config(stored_config).runtime.compile == CompileConfig()
+    assert resumed.environment_steps == stored.environment_steps
+
+
+@pytest.mark.parametrize("legacy_value", [True, [], "false", 0])
+def test_historical_compile_accepts_only_the_former_false_literal(
+    legacy_value: object,
+) -> None:
+    """Malformed historical compile values cannot accidentally enable a mode."""
+    payload = control_fixture_config().model_dump(mode="json")
+    runtime = cast(dict[str, object], payload["runtime"])
+    runtime["compile"] = legacy_value
+
+    with pytest.raises(ValidationError):
+        validate_stored_config(payload)
+
+
 def _recurrent_fixture() -> tuple[ToadConfig, LearnerBatch]:
     config = ToadConfig.model_validate(
         {
@@ -168,17 +200,17 @@ def _recurrent_fixture() -> tuple[ToadConfig, LearnerBatch]:
                 "recurrent_channels": 3,
                 "recurrent_layers": 2,
             },
-            "optimizer": {"value_warmup_batches": 0},
+            "optimizer": {"unroll_length": 2, "value_warmup_batches": 0},
             "runtime": {"compile": {"enabled": True}},
         }
     )
     batch = LearnerBatch(
-        segments=tuple(segments(_recurrent_trajectory(), 16)),
+        segments=tuple(segments(_recurrent_trajectory(turns=2), 2)),
         kind=BatchKind.SELFPLAY,
         baseline_only=False,
         first_of_round=True,
         end_of_round=True,
-        collected_steps=32,
+        collected_steps=2,
         round_id=0,
         actor_version=0,
         game_ids=(0,),
@@ -192,65 +224,56 @@ def _recurrent_fixture() -> tuple[ToadConfig, LearnerBatch]:
 def test_compiled_recurrent_update_matches_eager_and_exports_eager_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The compiled active recurrent forward updates like eager and saves cleanly."""
-    config, _ = _recurrent_fixture()
-    eager = StatefulPolicy(config.model)
-    compiled = StatefulPolicy(config.model)
+    """Compiled learner loss/update matches eager and checkpoint keys stay canonical."""
+    config, batch = _recurrent_fixture()
+    eager = ToadLightningModule(config)
+    compiled = ToadLightningModule(config)
     compiled.load_state_dict(eager.state_dict())
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
-    compiled = maybe_compile(compiled, config)
-    eager_optimizer = torch.optim.Adam(eager.parameters(), lr=config.optimizer.lr)
-    compiled_optimizer = torch.optim.Adam(compiled.parameters(), lr=config.optimizer.lr)
-    board = torch.zeros(2, 1, TILE_PLANES, 10, 10)
-    scalars = torch.zeros(2, 1, SCALARS)
-    positions = torch.zeros(2, 1, MAX_UNITS, dtype=torch.int64)
-    dones = torch.tensor([[False], [True]])
-
-    eager_output = eager(
-        board, scalars, positions, state=eager.initial_state(1, like=board), dones=dones
+    compiled.policy = maybe_compile(compiled.policy, config)
+    eager_optimizer = torch.optim.Adam(
+        eager.policy.parameters(), lr=config.optimizer.lr
     )
-    eager_loss = (
-        eager_output.unit_logits.sum()
-        + eager_output.quantity_logits.sum()
-        + eager_output.market_logits.sum()
-        + eager_output.values.sum()
+    compiled_optimizer = torch.optim.Adam(
+        compiled.policy.parameters(), lr=config.optimizer.lr
     )
-    eager_loss.backward()
+    eager_optimizer.zero_grad(set_to_none=True)
+    eager_report = eager.compute_report(batch)
+    eager_report.total.backward()
     eager_optimizer.step()
-    compiled_stateful = unwrap_compiled(compiled)
-    assert isinstance(compiled_stateful, StatefulPolicy)
-    compiled_output = compiled(
-        board,
-        scalars,
-        positions,
-        state=compiled_stateful.initial_state(1, like=board),
-        dones=dones,
-    )
-    assert hasattr(compiled_output, "unit_logits")
-    compiled_loss = (
-        compiled_output.unit_logits.sum()
-        + compiled_output.quantity_logits.sum()
-        + compiled_output.market_logits.sum()
-        + compiled_output.values.sum()
-    )
-    compiled_loss.backward()
+    compiled_optimizer.zero_grad(set_to_none=True)
+    compiled_report = compiled.compute_report(batch)
+    compiled_report.total.backward()
     compiled_optimizer.step()
 
-    assert compiled_loss.item() == pytest.approx(eager_loss.item(), rel=1e-5, abs=1e-6)
-    for name, parameter in eager.state_dict().items():
+    assert compiled_report.total.item() == pytest.approx(
+        eager_report.total.item(), rel=1e-5, abs=1e-6
+    )
+    assert compiled_report.debug_dtypes == eager_report.debug_dtypes
+    assert all(
+        dtype is torch.float32 for dtype in compiled_report.debug_dtypes.values()
+    )
+    for name, parameter in eager.policy.state_dict().items():
         assert torch.allclose(
-            unwrap_compiled(compiled).state_dict()[name],
+            policy_state_dict(compiled)[name],
             parameter,
             rtol=1e-5,
             atol=1e-6,
         )
 
-    path = tmp_path / "policy.pt"
-    torch.save(policy_state_dict(compiled), path)
-    restored = StatefulPolicy(config.model)
-    restored.load_state_dict(torch.load(path, weights_only=True))
-    assert all(not key.startswith("_orig_mod.") for key in policy_state_dict(compiled))
+    checkpoint = compiled.state_dict()
+    restored = ToadLightningModule(config)
+    restored.load_state_dict(checkpoint)
+    assert all("_orig_mod." not in key for key in checkpoint)
+    assert policy_state_dict(restored).keys() == policy_state_dict(compiled).keys()
+
+    if torch.amp.autocast_mode.is_autocast_available("cpu"):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            bf16_report = compiled.compute_report(batch)
+        assert all(
+            dtype is torch.float32 for dtype in bf16_report.debug_dtypes.values()
+        )
 
 
 def test_compiled_control_policy_runs_the_real_learner_forward(

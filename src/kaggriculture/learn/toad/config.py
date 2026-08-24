@@ -472,8 +472,14 @@ def load_config(path: Path | None, overrides: Sequence[str] = ()) -> ToadConfig:
 
 
 def validate_stored_config(payload: object) -> ToadConfig:
-    """Validate checkpoint schema without rechecking historical external files."""
-    return ToadConfig.model_validate(payload, context={"historical": True})
+    """Validate checkpoint schema, migrating the former eager compile literal."""
+    normalized = payload
+    if isinstance(payload, Mapping):
+        runtime = payload.get("runtime")
+        if isinstance(runtime, Mapping) and runtime.get("compile") is False:
+            normalized = dict(payload)
+            normalized["runtime"] = dict(runtime) | {"compile": {"enabled": False}}
+    return ToadConfig.model_validate(normalized, context={"historical": True})
 
 
 def apply_overrides(config: ToadConfig, overrides: Sequence[str]) -> ToadConfig:

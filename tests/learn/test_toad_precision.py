@@ -216,7 +216,12 @@ def test_after_backward_rejects_nonfinite_gradients_with_batch_provenance() -> N
             return value
 
         @staticmethod
-        def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor]:
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx, *gradients: object
+        ) -> tuple[torch.Tensor]:
+            del ctx
+            (gradient,) = gradients
+            assert isinstance(gradient, torch.Tensor)
             return (torch.full_like(gradient, torch.inf),)
 
     class InfiniteGradientPolicy(Policy):
