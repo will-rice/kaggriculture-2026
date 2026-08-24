@@ -182,6 +182,14 @@ def _cpu_bf16_supported() -> bool:
 def _rollout_preflight(config: ToadConfig) -> None:
     """Reject rollout modes that would otherwise fall back or be ignored."""
     runtime = config.runtime
+    if (
+        runtime.rollout_backend == "native"
+        and config.population.scripted > 0
+        and config.population.scripted_opponent != "economic"
+    ):
+        raise RuntimePreflightError(
+            "native scripted rollout supports only the verified 'economic' opponent"
+        )
     if runtime.rollout_backend == "native" and runtime.compile.enabled:
         raise RuntimePreflightError(
             "native rollout with torch.compile is not proved; refusing eager fallback"

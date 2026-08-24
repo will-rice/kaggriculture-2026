@@ -1,7 +1,7 @@
 """Tensor rollout primitive tests."""
 # ruff: noqa: ANN001, ANN202, D103
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from kaggriculture.sim.config import Config
 from kaggriculture.sim.engine import reset, step, unit_quantity_ones
 from kaggriculture.sim.observe import observe
 from kaggriculture.sim.rollout import (
+    RolloutPolicyState,
     collect_segment,
     copy_policy_state_,
     potential,
@@ -393,6 +394,116 @@ def test_collect_segment_accepts_a_distinct_neural_opponent() -> None:
     assert learner.calls == 2
     assert opponent.calls == 2
     assert int(trajectory.illegal) == 0
+
+
+def test_stateful_neural_opponent_matches_one_long_segment_across_boundaries() -> None:
+    """Both actor memories, not only the learner's, cross native source chunks."""
+    model = ModelConfig.control(blocks=1, channels=4).model_copy(
+        update={"recurrent": True, "recurrent_channels": 3, "belief": True}
+    )
+    long_learner = StatefulPolicy(model).eval()
+    long_opponent = StatefulPolicy(model).eval()
+    split_learner = StatefulPolicy(model).eval()
+    split_opponent = StatefulPolicy(model).eval()
+    split_learner.load_state_dict(long_learner.state_dict())
+    split_opponent.load_state_dict(long_opponent.state_dict())
+    long_state = reset(Config(), torch.tensor([241]))
+    split_state = reset(Config(), torch.tensor([241]))
+
+    long_state, long_policy_state, long = collect_segment(
+        long_state,
+        long_learner,
+        turns=4,
+        generator=torch.Generator().manual_seed(251),
+        opponent_policy=long_opponent,
+    )
+    split_generator = torch.Generator().manual_seed(251)
+    split_state, split_policy_state, first = collect_segment(
+        split_state,
+        split_learner,
+        turns=2,
+        generator=split_generator,
+        opponent_policy=split_opponent,
+    )
+    split_state, split_policy_state, second = collect_segment(
+        split_state,
+        split_learner,
+        policy_state=split_policy_state,
+        turns=2,
+        generator=split_generator,
+        opponent_policy=split_opponent,
+    )
+
+    assert isinstance(long_policy_state, RolloutPolicyState)
+    assert isinstance(split_policy_state, RolloutPolicyState)
+    assert long_policy_state.opponent is not None
+    assert split_policy_state.opponent is not None
+    for field in fields(long_state):
+        torch.testing.assert_close(
+            getattr(split_state, field.name), getattr(long_state, field.name)
+        )
+    for name in (
+        "unit_actions",
+        "unit_quantities",
+        "market_actions",
+        "log_probs",
+        "values",
+        "rewards",
+        "own",
+        "shaped",
+        "shaped_money",
+        "margin",
+        "sparse",
+        "dones",
+    ):
+        torch.testing.assert_close(
+            torch.cat((getattr(first, name), getattr(second, name))),
+            getattr(long, name),
+        )
+    for name in ("hidden", "cell", "prior_belief"):
+        torch.testing.assert_close(
+            getattr(split_policy_state.learner, name),
+            getattr(long_policy_state.learner, name),
+        )
+        torch.testing.assert_close(
+            getattr(split_policy_state.opponent, name),
+            getattr(long_policy_state.opponent, name),
+        )
+
+
+def test_stateful_neural_opponent_resets_after_a_segment_terminal() -> None:
+    """A carried opponent state still obeys the next observation's done mask."""
+    state = reset(Config(), torch.tensor([257]))
+    state = replace(
+        state,
+        step=torch.tensor([718], dtype=torch.int32),
+        day=torch.tensor([29], dtype=torch.int32),
+        hour=torch.tensor([22], dtype=torch.int32),
+    )
+    learner = _RecordingStatefulPolicy().eval()
+    opponent = _RecordingStatefulPolicy().eval()
+
+    state, carried, _first = collect_segment(
+        state,
+        learner,
+        turns=1,
+        generator=torch.Generator().manual_seed(263),
+        opponent_policy=opponent,
+    )
+    _state, carried, _second = collect_segment(
+        state,
+        learner,
+        policy_state=carried,
+        turns=1,
+        generator=torch.Generator().manual_seed(269),
+        opponent_policy=opponent,
+    )
+
+    assert isinstance(carried, RolloutPolicyState)
+    reset_input = opponent.recorded_inputs[-1]
+    assert not torch.count_nonzero(reset_input.hidden)
+    assert not torch.count_nonzero(reset_input.cell)
+    assert not torch.count_nonzero(reset_input.prior_belief)
 
 
 def test_collect_segment_rejects_two_opponent_owners() -> None:

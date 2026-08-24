@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import lightning
 import torch
@@ -40,6 +40,9 @@ from kaggriculture.learn.toad.population import (
     sha256_file,
 )
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
+
+if TYPE_CHECKING:
+    from kaggriculture.sim.rollout import Trajectory as NativeTrajectory
 
 # Segment fields are defined beside the public segmenter so all producers share
 # the exact one-bootstrap-row contract.
@@ -895,6 +898,7 @@ def native_segments(
     *,
     unroll_length: int,
     recorded_seats: int,
+    clamp_terminal: bool = True,
 ) -> list[tuple[dict[str, torch.Tensor], BatchKind, CollectionAssignment]]:
     """Slice a tensor trajectory directly into the accepted learner schema.
 
@@ -930,6 +934,8 @@ def native_segments(
                     start + unroll_length + 1,
                     device=trajectory.board.device,
                 )
+                if clamp_terminal:
+                    observation_rows.clamp_(max=turns - 1)
                 segment = {
                     **{
                         name: getattr(trajectory, name)[
@@ -1556,6 +1562,15 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         yield from batches
 
 
+@dataclass(frozen=True)
+class _NativeCollection:
+    """One compatible vector group and its sequential on-device chunks."""
+
+    assignments: tuple[CollectionAssignment, ...]
+    trajectories: tuple[NativeTrajectory, ...]
+    recorded_seats: int
+
+
 class NativeRoundSource(ReferenceRoundSource):
     """Synchronous tensor-simulator source emitting common batches directly."""
 
@@ -1611,13 +1626,14 @@ class NativeRoundSource(ReferenceRoundSource):
 
     def _collect_native_round(
         self, assignments: Sequence[CollectionAssignment]
-    ) -> list[tuple[tuple[CollectionAssignment, ...], object, int]]:
+    ) -> list[_NativeCollection]:
         """Collect assignments as on-device trajectories, preserving bindings."""
         if not self.actor_state:
             raise RuntimeError("native collection needs a published actor state")
+        from kaggriculture.learn.toad.model import PolicyState
         from kaggriculture.sim.config import Config as SimConfig
         from kaggriculture.sim.engine import reset
-        from kaggriculture.sim.rollout import collect_segment
+        from kaggriculture.sim.rollout import RolloutPolicyState, collect_segment
 
         actor = self._native_policy(self.config.model, self.actor_state)
         opponents = self._materialize_opponents(assignments)
@@ -1633,7 +1649,7 @@ class NativeRoundSource(ReferenceRoundSource):
             else:
                 chunks[index].append(assignment)
 
-        collected: list[tuple[tuple[CollectionAssignment, ...], object, int]] = []
+        collected: list[_NativeCollection] = []
         for mutable_chunk in chunks:
             chunk = tuple(mutable_chunk)
             assignment = chunk[0]
@@ -1662,68 +1678,314 @@ class NativeRoundSource(ReferenceRoundSource):
                     SimConfig(),
                     torch.tensor([item.seed for item in chunk], device=self.device),
                 )
-                _next_state, _policy_state, trajectory = collect_segment(
-                    state,
-                    actor,
-                    turns=EPISODE_STEPS - 1,
-                    state_unroll_length=self.config.optimizer.unroll_length,
-                    money_weight=self.config.curriculum.money_weight,
-                    generator=torch.Generator(device=self.device).manual_seed(
-                        assignment.seed
-                    ),
-                    opponent=scripted,
-                    opponent_policy=opponent_policy,
+                generator = torch.Generator(device=self.device).manual_seed(
+                    assignment.seed
                 )
+                unroll = self.config.optimizer.unroll_length
+                turns = EPISODE_STEPS - 1
+                remainder = turns % unroll
+                lengths = ((remainder,) if remainder else ()) + (unroll,) * (
+                    turns // unroll
+                )
+                policy_state: PolicyState | RolloutPolicyState | None = None
+                trajectories = []
+                for length in lengths:
+                    state, policy_state, trajectory = collect_segment(
+                        state,
+                        actor,
+                        policy_state=policy_state,
+                        turns=length,
+                        state_unroll_length=unroll,
+                        money_weight=self.config.curriculum.money_weight,
+                        generator=generator,
+                        opponent=scripted,
+                        opponent_policy=opponent_policy,
+                    )
+                    trajectories.append(trajectory)
                 recorded_seats = 2 if assignment.kind is BatchKind.SELFPLAY else 1
-                collected.append((chunk, trajectory, recorded_seats))
+                collected.append(
+                    _NativeCollection(
+                        assignments=chunk,
+                        trajectories=tuple(trajectories),
+                        recorded_seats=recorded_seats,
+                    )
+                )
             except Exception as error:
                 raise self._collection_error(assignment) from error
         return collected
 
-    def _native_metrics(
+    def _native_metrics(  # noqa: C901 - one direct mirror of the public metric map
         self,
-        collected: Sequence[tuple[tuple[CollectionAssignment, ...], object, int]],
+        collected: Sequence[_NativeCollection],
         seconds: float,
     ) -> dict[str, float | int]:
-        """Summarize native tensors only after collection leaves the hot path."""
+        """Reproduce the accepted round metrics directly from device trajectories."""
+        from kaggriculture.learn.critic import critic_scores
         from kaggriculture.sim.rollout import Trajectory as NativeTrajectory
 
         metrics: dict[str, float | int] = {
             "throughput/collection_seconds": seconds,
         }
-        by_kind: dict[BatchKind, list[torch.Tensor]] = {
-            kind: [] for kind in _ONLINE_KINDS
-        }
-        by_opponent: dict[str, list[torch.Tensor]] = {}
+        streams: list[dict[str, Any]] = []
         flattened: list[CollectionAssignment] = []
-        for assignments, trajectory, recorded_seats in collected:
-            if not isinstance(trajectory, NativeTrajectory):
-                raise TypeError("native metrics require sim.rollout.Trajectory")
-            returns = getattr(trajectory, self.config.curriculum.reward_field).float()
-            for environment, assignment in enumerate(assignments):
+        for collection in collected:
+            trajectories = collection.trajectories
+            if not trajectories or not all(
+                isinstance(trajectory, NativeTrajectory) for trajectory in trajectories
+            ):
+                raise TypeError("native metrics require sim.rollout.Trajectory chunks")
+            final = trajectories[-1]
+
+            def required(trajectory: NativeTrajectory, name: str) -> torch.Tensor:
+                value = getattr(trajectory, name)
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(
+                        f"native trajectory is missing metric field {name}"
+                    )
+                return value
+
+            for environment, assignment in enumerate(collection.assignments):
                 flattened.append(assignment)
-                values = returns[:, environment, :recorded_seats].sum(dim=0)
-                by_kind[assignment.kind].extend(values.unbind())
-                by_opponent.setdefault(assignment.opponent_id, []).extend(
-                    values.unbind()
+                for seat in range(collection.recorded_seats):
+                    series = {
+                        name: torch.cat(
+                            [
+                                getattr(trajectory, name)[:, environment, seat]
+                                for trajectory in trajectories
+                            ]
+                        ).float()
+                        for name in (
+                            "values",
+                            "shaped",
+                            "shaped_money",
+                            "margin",
+                            "own",
+                            "sparse",
+                            "dones",
+                        )
+                    }
+                    units = torch.stack(
+                        [
+                            required(trajectory, "units_sold")[environment, seat]
+                            for trajectory in trajectories
+                        ]
+                    ).sum()
+                    proceeds = torch.stack(
+                        [
+                            required(trajectory, "sale_proceeds")[environment, seat]
+                            for trajectory in trajectories
+                        ]
+                    ).sum()
+                    market_value = torch.stack(
+                        [
+                            required(trajectory, "sale_market_value")[environment, seat]
+                            for trajectory in trajectories
+                        ]
+                    ).sum()
+                    mean_sale = torch.where(units > 0, proceeds / units, 0.0)
+                    mean_market = torch.where(units > 0, market_value / units, 0.0)
+                    streams.append(
+                        {
+                            "assignment": assignment,
+                            **series,
+                            "selected": series[self.config.curriculum.reward_field],
+                            "final_margin": float(
+                                required(final, "final_margin")[environment, seat]
+                            ),
+                            "final_bank": float(
+                                required(final, "final_bank")[environment, seat]
+                            ),
+                            "final_capital": float(
+                                required(final, "final_capital")[environment, seat]
+                            ),
+                            "illegal": int(
+                                sum(
+                                    required(trajectory, "illegal_by_stream")[
+                                        environment, seat
+                                    ]
+                                    for trajectory in trajectories
+                                )
+                            ),
+                            "sales": float(
+                                sum(
+                                    required(trajectory, "sales")[environment, seat]
+                                    for trajectory in trajectories
+                                )
+                            ),
+                            "units_sold": float(units),
+                            "mean_sale_price": float(mean_sale),
+                            "realisation": float(
+                                torch.where(
+                                    mean_market > 0,
+                                    mean_sale / mean_market,
+                                    0.0,
+                                )
+                            ),
+                            "bought": float(
+                                sum(
+                                    required(trajectory, "bought")[environment, seat]
+                                    for trajectory in trajectories
+                                )
+                            ),
+                        }
+                    )
+
+        mirror = [
+            stream
+            for stream in streams
+            if cast(CollectionAssignment, stream["assignment"]).kind
+            is BatchKind.SELFPLAY
+        ]
+        econ = [
+            stream
+            for stream in streams
+            if cast(CollectionAssignment, stream["assignment"]).kind
+            is BatchKind.SCRIPTED
+        ]
+        legacy = mirror + econ
+
+        def mean(values: Sequence[float]) -> float:
+            return sum(values) / len(values) if values else float("nan")
+
+        def population(
+            population_streams: Sequence[dict[str, Any]], suffix: str
+        ) -> dict[str, float]:
+            return {
+                f"diag/{name}_{suffix}": mean(
+                    [float(stream[name]) for stream in population_streams]
                 )
-        for kind, values in by_kind.items():
-            metrics[f"collection/games/{kind.value}"] = sum(
-                assignment.kind is kind for assignment in flattened
+                for name in (
+                    "mean_sale_price",
+                    "realisation",
+                    "sales",
+                    "units_sold",
+                    "bought",
+                    "final_capital",
+                )
+            }
+
+        def critic(
+            population_streams: Sequence[dict[str, Any]], suffix: str
+        ) -> dict[str, float]:
+            scores = critic_scores(
+                [cast(torch.Tensor, stream["values"]) for stream in population_streams],
+                [
+                    cast(torch.Tensor, stream["selected"])
+                    for stream in population_streams
+                ],
+                [
+                    cast(torch.Tensor, stream["dones"]).bool()
+                    for stream in population_streams
+                ],
             )
-            metrics[f"collection/return/{kind.value}"] = (
-                float(torch.stack(values).mean()) if values else float("nan")
+            return {
+                f"critic/ev_{suffix}": scores["ev_vs_return"],
+                f"critic/ev_within_turn_{suffix}": scores["ev_vs_return_within_turn"],
+            }
+
+        if legacy:
+            banks = [float(stream["final_bank"]) for stream in legacy]
+            metrics.update(
+                {
+                    "diag/bank_mean": mean(banks),
+                    "diag/bank_max": max(banks),
+                    "diag/bank_mirror": mean(
+                        [float(stream["final_bank"]) for stream in mirror]
+                    ),
+                    "diag/bank_vs_econ": mean(
+                        [float(stream["final_bank"]) for stream in econ]
+                    ),
+                    "diag/n_econ_envs": len(econ),
+                    "objective/win_rate_vs_econ": mean(
+                        [float(float(stream["final_margin"]) > 0.0) for stream in econ]
+                    ),
+                    "diag/mirror_decisive_rate": 2.0
+                    * mean(
+                        [
+                            float(float(stream["final_margin"]) > 0.0)
+                            for stream in mirror
+                        ]
+                    ),
+                    "objective/margin_vs_econ": mean(
+                        [float(stream["final_margin"]) for stream in econ]
+                    ),
+                    "diag/margin_mean_mirror": mean(
+                        [float(stream["final_margin"]) for stream in mirror]
+                    ),
+                    **population(econ, "vs_econ"),
+                    **population(mirror, "mirror"),
+                    **critic(econ, "econ_games"),
+                    **critic(mirror, "mirror_games"),
+                    "proxy/shaped_mean": mean(
+                        [
+                            float(cast(torch.Tensor, stream["shaped"]).sum())
+                            for stream in legacy
+                        ]
+                    ),
+                    "proxy/shaped_reward_mean": mean(
+                        [
+                            float(cast(torch.Tensor, stream["selected"]).sum())
+                            for stream in legacy
+                        ]
+                    ),
+                    "diag/illegal": sum(int(stream["illegal"]) for stream in legacy),
+                    "diag/gross_purchases": mean(
+                        [
+                            float(
+                                (
+                                    -cast(torch.Tensor, stream["own"]).clamp(max=0.0)
+                                ).sum()
+                            )
+                            for stream in legacy
+                        ]
+                    ),
+                    "proxy/money_term": mean(
+                        [
+                            float(
+                                (
+                                    cast(torch.Tensor, stream["shaped_money"])
+                                    - cast(torch.Tensor, stream["shaped"])
+                                ).sum()
+                            )
+                            for stream in legacy
+                        ]
+                    ),
+                }
             )
-        for opponent_id, values in by_opponent.items():
+
+        for kind in _ONLINE_KINDS:
+            values = [
+                float(cast(torch.Tensor, stream["selected"]).sum())
+                for stream in streams
+                if cast(CollectionAssignment, stream["assignment"]).kind is kind
+            ]
+            metrics[f"collection/games/{kind.value}"] = len(
+                {
+                    assignment.game_id
+                    for assignment in flattened
+                    if assignment.kind is kind
+                }
+            )
+            metrics[f"collection/return/{kind.value}"] = mean(values)
+
+        for opponent_id in {assignment.opponent_id for assignment in flattened}:
+            values = [
+                float(cast(torch.Tensor, stream["selected"]).sum())
+                for stream in streams
+                if cast(CollectionAssignment, stream["assignment"]).opponent_id
+                == opponent_id
+            ]
             safe_id = opponent_id.replace("/", "_")
-            total = torch.stack(values).sum()
-            metrics[f"collection/games_by_opponent/{safe_id}"] = sum(
-                assignment.opponent_id == opponent_id for assignment in flattened
+            total = sum(values)
+            metrics[f"collection/games_by_opponent/{safe_id}"] = len(
+                {
+                    assignment.game_id
+                    for assignment in flattened
+                    if assignment.opponent_id == opponent_id
+                }
             )
-            metrics[f"collection/return_by_opponent/{safe_id}"] = float(
-                total / len(values)
-            )
-            metrics[f"collection/return_sum_by_opponent/{safe_id}"] = float(total)
+            metrics[f"collection/return_by_opponent/{safe_id}"] = mean(values)
+            metrics[f"collection/return_sum_by_opponent/{safe_id}"] = total
             metrics[f"collection/return_count_by_opponent/{safe_id}"] = len(values)
         return metrics
 
@@ -1755,10 +2017,10 @@ class NativeRoundSource(ReferenceRoundSource):
         collection_seconds = time.perf_counter() - started
         ordered = sorted(
             collected,
-            key=lambda entry: _ONLINE_KINDS.index(entry[0][0].kind),
+            key=lambda entry: _ONLINE_KINDS.index(entry.assignments[0].kind),
         )
         ordered_assignments = tuple(
-            assignment for entry in ordered for assignment in entry[0]
+            assignment for entry in ordered for assignment in entry.assignments
         )
         present = {assignment.kind for assignment in ordered_assignments}
         round_kind = next(iter(present)) if len(present) == 1 else BatchKind.MIXED
@@ -1797,19 +2059,24 @@ class NativeRoundSource(ReferenceRoundSource):
             )
             for kind in present
         }
-        entries = [
-            entry
-            for assignments, trajectory, recorded_seats in ordered
-            for entry in native_segments(
-                trajectory,
-                assignments,
-                unroll_length=self.config.optimizer.unroll_length,
-                recorded_seats=recorded_seats,
-            )
-        ]
+        entries = []
+        for collection in ordered:
+            chunk_entries = [
+                native_segments(
+                    trajectory,
+                    collection.assignments,
+                    unroll_length=self.config.optimizer.unroll_length,
+                    recorded_seats=collection.recorded_seats,
+                    clamp_terminal=index == len(collection.trajectories) - 1,
+                )
+                for index, trajectory in enumerate(collection.trajectories)
+            ]
+            stream_count = len(collection.assignments) * collection.recorded_seats
+            for stream in range(stream_count):
+                entries.extend(chunk[stream] for chunk in chunk_entries if chunk)
         collected_steps = (EPISODE_STEPS - 1) * sum(
-            len(assignments) * recorded_seats
-            for assignments, _trajectory, recorded_seats in ordered
+            len(collection.assignments) * collection.recorded_seats
+            for collection in ordered
         )
         expander = RoundBatchExpander(
             batch_segments=self.config.optimizer.batch_segments,

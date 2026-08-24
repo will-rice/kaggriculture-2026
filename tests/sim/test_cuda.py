@@ -8,7 +8,7 @@ import torch
 
 from kaggriculture.learn.encoding import MARKET_SLOTS, MAX_UNITS, QUANTITIES, UNIT_OPS
 from kaggriculture.learn.toad.config import ModelConfig
-from kaggriculture.learn.toad.model import StatefulPolicy
+from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
 from kaggriculture.sim.config import Config
 from kaggriculture.sim.decode import decode_market_buckets
 from kaggriculture.sim.engine import reset, step, unit_quantity_ones
@@ -151,8 +151,21 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
             turns=length,
             generator=generator,
         )
-        assert policy_state is not None
+        assert isinstance(policy_state, PolicyState)
     torch.cuda.synchronize()
+
+    eager_state = SimState(
+        **{field.name: getattr(state, field.name).clone() for field in fields(SimState)}
+    )
+    eager_policy = StatefulPolicy(policy.config).to(device).eval()
+    eager_policy.load_state_dict(policy.state_dict())
+    eager_policy_state = PolicyState(
+        hidden=policy_state.hidden.clone(),
+        cell=policy_state.cell.clone(),
+        prior_belief=policy_state.prior_belief.clone(),
+    )
+    eager_generator = torch.Generator(device=device)
+    eager_generator.set_state(generator.get_state())
 
     graph = torch.cuda.CUDAGraph()
     graph.register_generator_state(generator)
@@ -166,13 +179,46 @@ def test_cuda_collect_segment_is_graph_capturable_and_replays_the_season() -> No
         )
         for field in fields(SimState):
             getattr(state, field.name).copy_(getattr(successor, field.name))
-        assert successor_policy_state is not None
+        assert isinstance(successor_policy_state, PolicyState)
         copy_policy_state_(policy_state, successor_policy_state)
+    eager_state, eager_policy_state, eager_trajectory = collect_segment(
+        eager_state,
+        eager_policy,
+        policy_state=eager_policy_state,
+        turns=length,
+        generator=eager_generator,
+    )
+    assert isinstance(eager_policy_state, PolicyState)
     started = int(state.step[0])
     for _ in range(replays):
         graph.replay()
+        eager_state, eager_policy_state, eager_trajectory = collect_segment(
+            eager_state,
+            eager_policy,
+            policy_state=eager_policy_state,
+            turns=length,
+            generator=eager_generator,
+        )
+        assert isinstance(eager_policy_state, PolicyState)
     torch.cuda.synchronize()
 
     assert int(state.step[0]) == started + replays * length
     assert trajectory.illegal.is_cuda
     assert int(trajectory.illegal) == 0
+    for field in fields(SimState):
+        torch.testing.assert_close(
+            getattr(state, field.name), getattr(eager_state, field.name)
+        )
+    torch.testing.assert_close(policy_state.hidden, eager_policy_state.hidden)
+    torch.testing.assert_close(policy_state.cell, eager_policy_state.cell)
+    torch.testing.assert_close(
+        policy_state.prior_belief, eager_policy_state.prior_belief
+    )
+    assert torch.count_nonzero(policy_state.hidden)
+    assert torch.count_nonzero(policy_state.cell)
+    assert torch.count_nonzero(policy_state.prior_belief)
+    assert trajectory.belief_targets is not None
+    assert eager_trajectory.belief_targets is not None
+    torch.testing.assert_close(
+        trajectory.belief_targets, eager_trajectory.belief_targets
+    )

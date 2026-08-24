@@ -71,6 +71,22 @@ _MARKET_TYPES = {
     "BUY_ANIMAL": (4, ANIMAL_NAMES),
 }
 
+
+@dataclass(frozen=True)
+class RolloutPolicyState:
+    """Actor memories carried between segments with a distinct neural opponent.
+
+    Self-play owns one state over both flattened seats and scripted collection
+    owns only the learner state, so those paths keep returning ``PolicyState``
+    exactly as before.  Frozen and teacher collection run two policy objects;
+    this container prevents the opponent memory from being silently restarted
+    at every source segment while retaining the same three-value return.
+    """
+
+    learner: PolicyState | None
+    opponent: PolicyState | None = None
+
+
 # `potential` runs twice per collected turn, so its six price tables are frozen
 # here and handed to `tensor_constant` rather than rebuilt with `torch.tensor`
 # on every call. Rebuilding them copied host memory to the device inside the
@@ -160,6 +176,8 @@ class Trajectory:
     mean_sale_price: torch.Tensor | None = None
     realisation: torch.Tensor | None = None
     bought: torch.Tensor | None = None
+    sale_proceeds: torch.Tensor | None = None
+    sale_market_value: torch.Tensor | None = None
 
 
 def potential(state: SimState, seat: int) -> torch.Tensor:
@@ -631,14 +649,14 @@ def collect_segment(
     state: SimState,
     policy: torch.nn.Module,
     *,
-    policy_state: PolicyState | None = None,
+    policy_state: PolicyState | RolloutPolicyState | None = None,
     turns: int = 32,
     state_unroll_length: int | None = None,
     money_weight: float = MONEY_WEIGHT,
     generator: torch.Generator | None = None,
     opponent: ScriptedOpponent | None = None,
     opponent_policy: torch.nn.Module | None = None,
-) -> tuple[SimState, PolicyState | None, Trajectory]:
+) -> tuple[SimState, PolicyState | RolloutPolicyState | None, Trajectory]:
     """Collect a fixed-length segment, optionally bridging a scripted seat 1.
 
     With ``opponent=None`` the whole body is device work and holds no
@@ -681,6 +699,8 @@ def collect_segment(
         state: The batch to advance. Left untouched; the successor is returned.
         policy: The network, called once per turn with both seats batched.
         policy_state: Recurrent actor state carried into the first observation.
+            A distinct neural opponent returns ``RolloutPolicyState`` so both
+            policy objects' memories cross the next segment boundary.
         turns: Turns to collect. Every turn is recorded.
         state_unroll_length: Learner unroll length whose exact segment starts
             determine the sparse entry-state rows retained in the trajectory.
@@ -698,6 +718,16 @@ def collect_segment(
     """
     if opponent is not None and opponent_policy is not None:
         raise ValueError("scripted and neural opponents are mutually exclusive")
+    if isinstance(policy_state, RolloutPolicyState):
+        if opponent_policy is None:
+            raise ValueError(
+                "combined rollout state requires a distinct neural opponent"
+            )
+        learner_policy_state = policy_state.learner
+        opponent_policy_state = policy_state.opponent
+    else:
+        learner_policy_state = policy_state
+        opponent_policy_state = None
     records: dict[str, list[torch.Tensor]] = {
         name: []
         for name in (
@@ -741,7 +771,6 @@ def collect_segment(
     proceeds = torch.zeros_like(sales)
     market_value = torch.zeros_like(sales)
     bought = torch.zeros_like(sales)
-    opponent_policy_state: PolicyState | None = None
     actor_seats = 2 if opponent is None and opponent_policy is None else 1
     for turn in range(turns):
         observed = [observe(state, seat) for seat in range(2)]
@@ -759,10 +788,10 @@ def collect_segment(
                 boards[:, :actor_seats].flatten(0, 1),
                 scalars[:, :actor_seats].flatten(0, 1),
                 positions[:, :actor_seats].flatten(0, 1),
-                state=policy_state,
+                state=learner_policy_state,
                 dones=state.done[:, None].expand(-1, actor_seats).flatten(0, 1),
             )
-        policy_state = output.state
+        learner_policy_state = output.state
         unit_logits = output.unit_logits
         quantity_logits = output.quantity_logits
         market_logits = output.market_logits
@@ -1015,5 +1044,15 @@ def collect_segment(
         mean_sale_price=mean_sale_price,
         realisation=realisation,
         bought=bought,
+        sale_proceeds=proceeds,
+        sale_market_value=market_value,
     )
-    return state, policy_state, trajectory
+    successor: PolicyState | RolloutPolicyState | None
+    if opponent_policy is not None:
+        successor = RolloutPolicyState(
+            learner=learner_policy_state,
+            opponent=opponent_policy_state,
+        )
+    else:
+        successor = learner_policy_state
+    return state, successor, trajectory
