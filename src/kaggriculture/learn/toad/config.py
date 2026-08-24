@@ -91,6 +91,8 @@ class ModelConfig(BaseModel):
             raise ValueError("local patch size must be odd")
         if self.transformer and self.transformer_blocks == 0:
             raise ValueError("transformer requires positive transformer_blocks")
+        if (self.transformer or self.interaction_value) and self.channels < 2:
+            raise ValueError("attention-enabled channels must be at least 2")
         if (
             self.transformer or self.interaction_value
         ) and self.channels % self.transformer_heads:

@@ -60,3 +60,39 @@ loader worker count/pytree deprecation, and the scheduler-order fixture.
   established Python 3.11 environment instead.
 - No model, checkpoint, numerical-control, belief-isolation, shifted-done,
   rollout-schema, or metric regression remains in the exercised suites.
+
+## Fix round 1/5: reject degenerate width-one attention
+
+Reviewer evidence showed that an accepted interaction-value topology with
+`channels=1` and `transformer_heads=1` was input-independent. Reproduction with
+two unrelated board/scalar batches returned the identical value tensor
+`[0.3342, 0.3342]` both times. The root cause is mathematical: `LayerNorm(1)`
+maps every token to zero before attention. The same normalization degeneracy is
+disallowed for the spatial transformer even though its residual can retain
+some input dependence.
+
+RED added four independently failing cases: Pydantic rejected neither
+transformer nor interaction-value width one, and both direct module constructors
+also accepted it.
+The fix requires attention-enabled `ModelConfig.channels >= 2` and enforces the
+same lower bound in the shared direct-constructor validator. Existing head
+divisibility checks remain unchanged.
+
+The smallest valid `channels=2`, `heads=1` interaction head is covered by a
+controlled sensitivity fixture: identity query/key/value and output
+projections, a fixed `[1, -1]` query, zero MLP, and explicit scalar projection.
+Changing only the remote bottom-right spatial token or only one global scalar
+increases its value relative to the all-zero context, independent of random
+initialization.
+
+Fix-round verification:
+
+- Targeted width/config gate: `14 passed`.
+- Original focused model/Lightning/belief/rollout/data/checkpoint/control gate:
+  `125 passed, 1 xfailed`.
+- Touched-file Ruff: passed.
+- Full-source `ty check src`: passed.
+- `git diff --check`: passed.
+
+No new concerns. The expected rollout xfail and pre-existing environment
+warnings are unchanged.

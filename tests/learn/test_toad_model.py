@@ -271,6 +271,84 @@ def test_interaction_value_attends_to_remote_spatial_and_global_tokens() -> None
     )
 
 
+def test_spatial_transformer_rejects_single_channel_layer_norm() -> None:
+    """Direct spatial construction cannot create width-one token normalization."""
+    with pytest.raises(ValueError, match="at least 2"):
+        SpatialTransformer(channels=1, blocks=1, heads=1, mlp_ratio=2)
+
+
+def test_interaction_value_rejects_single_channel_layer_norm() -> None:
+    """Direct value-head construction cannot erase every context token."""
+    with pytest.raises(ValueError, match="at least 2"):
+        InteractionValueHead(
+            channels=1,
+            global_features=SCALARS,
+            heads=1,
+            mlp_ratio=2,
+            value_bound=None,
+        )
+
+
+def test_width_two_interaction_responds_to_isolated_spatial_and_global_changes() -> (
+    None
+):
+    """The smallest valid head retains both token sources after normalization."""
+    head = InteractionValueHead(
+        channels=2,
+        global_features=SCALARS,
+        heads=1,
+        mlp_ratio=2,
+        value_bound=None,
+    )
+    with torch.no_grad():
+        head.value_token.copy_(torch.tensor([[[1.0, -1.0]]]))
+        head.global_projection.weight.zero_()
+        head.global_projection.weight[:, 0] = torch.tensor([1.0, -1.0])
+        head.global_projection.bias.zero_()
+        head.attention.in_proj_weight.zero_()
+        identity = torch.eye(2)
+        head.attention.in_proj_weight[:2].copy_(identity)
+        head.attention.in_proj_weight[2:4].copy_(identity)
+        head.attention.in_proj_weight[4:].copy_(identity)
+        head.attention.in_proj_bias.zero_()
+        head.attention.out_proj.weight.copy_(identity)
+        head.attention.out_proj.bias.zero_()
+        for parameter in head.mlp.parameters():
+            parameter.zero_()
+        head.value_projection.weight.copy_(torch.tensor([[1.0, 0.0]]))
+        head.value_projection.bias.zero_()
+
+    spatial = torch.zeros(1, 2, BOARD_SIZE, BOARD_SIZE)
+    global_features = torch.zeros(1, SCALARS)
+    remote = spatial.clone()
+    remote[0, :, -1, -1] = torch.tensor([1.0, -1.0])
+    changed_global = global_features.clone()
+    changed_global[0, 0] = 1.0
+
+    baseline = head(spatial, global_features)
+    remote_value = head(remote, global_features)
+    global_value = head(spatial, changed_global)
+
+    assert remote_value.item() > baseline.item()
+    assert global_value.item() > baseline.item()
+
+
+def test_width_two_single_head_attention_config_is_valid() -> None:
+    """The new lower bound must preserve the smallest nondegenerate topology."""
+    config = ModelConfig.model_validate(
+        {
+            "channels": 2,
+            "transformer": True,
+            "transformer_blocks": 1,
+            "transformer_heads": 1,
+            "interaction_value": True,
+        }
+    )
+
+    assert config.channels == 2
+    assert config.transformer_heads == 1
+
+
 @pytest.mark.parametrize(
     ("recurrent", "belief", "transformer", "interaction_value"),
     [
@@ -514,6 +592,23 @@ def test_policy_state_reset_clears_all_terminal_components_before_a_step() -> No
         (
             {"transformer": True, "transformer_blocks": 0},
             "positive transformer_blocks",
+        ),
+        (
+            {
+                "transformer": True,
+                "transformer_blocks": 1,
+                "channels": 1,
+                "transformer_heads": 1,
+            },
+            "at least 2",
+        ),
+        (
+            {
+                "interaction_value": True,
+                "channels": 1,
+                "transformer_heads": 1,
+            },
+            "at least 2",
         ),
         ({"local_patch": True, "local_patch_size": 6}, "must be odd"),
         ({"recurrent_layers": 0}, "greater than 0"),

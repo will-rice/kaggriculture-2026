@@ -221,6 +221,8 @@ def _validate_attention_dimensions(
     """Reject malformed attention dimensions at the standalone module boundary."""
     if channels <= 0 or heads <= 0 or mlp_ratio <= 0:
         raise ValueError("attention channels, heads, and mlp_ratio must be positive")
+    if channels < 2:
+        raise ValueError("attention channels must be at least 2")
     if channels % heads:
         raise ValueError("attention channels must divide evenly across heads")
 
