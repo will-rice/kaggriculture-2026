@@ -5,13 +5,24 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, cast
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    NonNegativeInt,
+    TypeAdapter,
+)
+
+_EVALUATION = TypeAdapter(dict[str, FiniteFloat])
+_SNAPSHOT_NAME = re.compile(r"^snapshot-(\d{12})-([0-9a-f]{12})\.pt$")
 
 
 class SnapshotIntegrityError(RuntimeError):
@@ -34,7 +45,7 @@ class SnapshotEntry(BaseModel):
     round_id: NonNegativeInt
     run_id: str
     created_at: datetime
-    evaluation: dict[str, float] = Field(default_factory=dict)
+    evaluation: dict[str, FiniteFloat] = Field(default_factory=dict)
 
 
 class SnapshotManifest(BaseModel):
@@ -65,7 +76,7 @@ class SnapshotStore:
     def __init__(self, directory: Path, *, capacity: int, structure: str) -> None:
         if capacity < 1:
             raise ValueError("snapshot capacity must be positive")
-        self.directory = directory
+        self.directory = directory.resolve()
         self.capacity = capacity
         self.structure = structure
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -91,6 +102,8 @@ class SnapshotStore:
         interruption can therefore leave an unreferenced old file, but cannot
         publish a manifest whose entry was already removed from disk.
         """
+        validated_evaluation = _EVALUATION.validate_python(evaluation or {})
+        self._validate_existing_members()
         temporary_path = self._write_temporary(state_dict)
         digest = sha256_file(temporary_path)
         final_path = self.directory / (
@@ -105,7 +118,7 @@ class SnapshotStore:
             round_id=round_id,
             run_id=run_id,
             created_at=datetime.now(timezone.utc),
-            evaluation=dict(evaluation or {}),
+            evaluation=validated_evaluation,
         )
         overflow = max(0, len(self.manifest.entries) + 1 - self.capacity)
         evicted = self.manifest.entries[:overflow]
@@ -121,8 +134,31 @@ class SnapshotStore:
 
     def load(self, entry: SnapshotEntry) -> dict[str, torch.Tensor]:
         """Validate a selected entry before loading its tensor state dictionary."""
+        self._validate_entry_path(entry)
         _verify_entry(entry, self.structure)
         return _load_state_dict(entry)
+
+    def _validate_existing_members(self) -> None:
+        """Refuse to replace a member that is invalid, missing, or corrupt."""
+        for entry in self.manifest.entries:
+            self._validate_entry_path(entry)
+            _verify_entry(entry, self.structure)
+
+    def _validate_entry_path(self, entry: SnapshotEntry) -> None:
+        """Require an entry to name one canonical content-addressed pool file."""
+        path = entry.path
+        match = _SNAPSHOT_NAME.fullmatch(path.name)
+        if (
+            not path.is_absolute()
+            or path.parent != self.directory
+            or path.resolve().parent != self.directory
+            or match is None
+            or match.group(1) != f"{entry.environment_steps:012d}"
+            or match.group(2) != entry.sha256[:12]
+            or len(entry.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in entry.sha256)
+        ):
+            raise SnapshotIntegrityError(f"manifest snapshot path is invalid: {path}")
 
     def _write_temporary(self, state_dict: Mapping[str, torch.Tensor]) -> Path:
         """Serialize and fsync a sibling temporary snapshot before publishing it."""
