@@ -8,6 +8,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from kaggriculture.learn.toad.config import ToadConfig
 from kaggriculture.learn.toad.population import (
     EmptySnapshotPoolError,
     SnapshotEntry,
@@ -22,6 +23,19 @@ from kaggriculture.learn.toad.population import (
 def state_dict(value: float = 1.0) -> dict[str, torch.Tensor]:
     """Return a small real torch state dictionary with a distinct payload."""
     return {"weight": torch.tensor([value])}
+
+
+def test_initial_population_checkpoint_must_be_readable(tmp_path: Path) -> None:
+    """A declared initial member fails config validation before pool mutation."""
+    with pytest.raises(ValidationError, match="initial snapshot is not readable"):
+        ToadConfig(
+            population={
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "initial_snapshots": [tmp_path / "missing.pt"],
+            }
+        )
 
 
 def populated_pool(path: Path, *, count: int, seed: int) -> SnapshotPool:
@@ -257,9 +271,7 @@ def test_store_rejects_an_alternate_large_step_filename_spelling(
     steps = 1_000_000_000_000
     store = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
     entry = store.add(state_dict(), environment_steps=steps, round_id=0, run_id="run")
-    alternate = entry.path.with_name(
-        f"snapshot-0{steps:012d}-{entry.sha256[:12]}.pt"
-    )
+    alternate = entry.path.with_name(f"snapshot-0{steps:012d}-{entry.sha256[:12]}.pt")
     entry.path.rename(alternate)
     malformed = entry.model_copy(update={"path": alternate})
     (tmp_path / "manifest.json").write_text(

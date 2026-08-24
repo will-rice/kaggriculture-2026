@@ -62,7 +62,7 @@ from kaggriculture.learn.toad.callbacks import (
     BoundaryCheckpoint,
     EnvironmentStepStop,
 )
-from kaggriculture.learn.toad.config import ToadConfig, load_config
+from kaggriculture.learn.toad.config import ModelConfig, ToadConfig, load_config
 from kaggriculture.learn.toad.data import (
     ACTED_FIELDS as _ACTED_FIELDS,
 )
@@ -1499,29 +1499,52 @@ def _play(
             os.environ[MONEY_WEIGHT_ENV] = previous_money_weight
 
 
+def _reference_policy(
+    model: ModelConfig,
+    state: dict[str, torch.Tensor],
+    *,
+    frozen: bool,
+) -> Policy | StatefulPolicy:
+    """Construct and strictly load one resolved worker-side policy."""
+    if uses_stateful_policy(model):
+        policy: Policy | StatefulPolicy = StatefulPolicy(model)
+    else:
+        policy = Policy(
+            blocks=model.blocks,
+            channels=model.channels,
+            value_bound=model.value_bound,
+            kernel_size=model.kernel_size,
+            activation=model.activation,
+        )
+    policy.load_state_dict(state, strict=True)
+    policy.eval()
+    if frozen:
+        policy.requires_grad_(False)
+    return policy
+
+
 def _play_reference(work: ReferenceWorkerInput) -> list[Trajectory]:
     """Play one typed native-worker request with its resolved architecture."""
     torch.set_num_threads(THREADS)
-    if uses_stateful_policy(work.model):
-        actor: Policy | StatefulPolicy = StatefulPolicy(work.model)
-        actor.load_state_dict(work.actor_state, strict=True)
-    else:
-        actor = Policy(
-            blocks=work.model.blocks,
-            channels=work.model.channels,
-            value_bound=work.model.value_bound,
-            kernel_size=work.model.kernel_size,
-            activation=work.model.activation,
+    actor = _reference_policy(work.model, work.actor_state, frozen=False)
+    opponent: Policy | StatefulPolicy | str
+    if work.opponent_state is not None:
+        if work.opponent_model is None:
+            raise ValueError("neural opponent weights require a resolved model config")
+        opponent = _reference_policy(
+            work.opponent_model,
+            work.opponent_state,
+            frozen=True,
         )
-        actor.load_state_dict(work.actor_state, strict=True)
-    actor.eval()
+    else:
+        opponent = work.versus if work.versus is not None else actor
     previous_money_weight = os.environ.get(MONEY_WEIGHT_ENV)
     os.environ[MONEY_WEIGHT_ENV] = repr(work.money_weight)
     try:
         with torch.no_grad():
             return rollout_many(
                 actor,
-                work.versus if work.versus is not None else actor,
+                opponent,
                 work.seeds,
                 state_unroll_length=work.unroll_length,
             )

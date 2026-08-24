@@ -271,14 +271,6 @@ def test_mixed_full_round_matches_legacy_parameters_adam_and_lr(
 @pytest.mark.parametrize(
     "update, message",
     [
-        (
-            {"population": {"selfplay": 0.5, "scripted": 0.0, "frozen_opponent": 0.5}},
-            "frozen_opponent",
-        ),
-        (
-            {"population": {"selfplay": 0.5, "scripted": 0.0, "teacher_distill": 0.5}},
-            "teacher_distill",
-        ),
         ({"optimizer": {"vtrace_pg_cost": 0.5}}, "vtrace_pg_cost"),
         ({"optimizer": {"upgo_pg_cost": 0.5}}, "upgo_pg_cost"),
         ({"optimizer": {"baseline_cost": 0.5}}, "baseline_cost"),

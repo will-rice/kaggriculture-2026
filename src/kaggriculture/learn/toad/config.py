@@ -233,7 +233,6 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "population probabilities must be nonnegative and sum to one"
             )
-        _validate_foundation_population(self.population)
         _validate_foundation_optimizer(self.optimizer)
         if (
             self.optimizer.teacher_kl_cost or self.population.teacher_distill
@@ -252,6 +251,9 @@ class ToadConfig(BaseModel):
                     "teacher checkpoints require the default kernel and activation "
                     "because teacher trunk semantics are not separately declared"
                 )
+        if not historical:
+            for snapshot in self.population.initial_snapshots:
+                _require_readable(snapshot, label="initial snapshot")
         if self.curriculum.warm_start_checkpoint is not None and not historical:
             _require_readable(
                 self.curriculum.warm_start_checkpoint,
@@ -268,14 +270,6 @@ class ToadConfig(BaseModel):
                 "conversion is scheduled for Stage 9"
             )
         return self
-
-
-def _validate_foundation_population(population: PopulationConfig) -> None:
-    """Reject population modes implemented only by later native-port stages."""
-    if population.frozen_opponent:
-        raise ValueError("frozen_opponent is not implemented in the foundation trainer")
-    if population.teacher_distill:
-        raise ValueError("teacher_distill is not implemented in the foundation trainer")
 
 
 def _validate_foundation_optimizer(optimizer: OptimizerConfig) -> None:

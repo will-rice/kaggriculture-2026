@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, cast
 
 import lightning
@@ -14,7 +16,19 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from kaggriculture.learn.rollout import Trajectory, segment_starts
-from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
+from kaggriculture.learn.toad.config import (
+    ModelConfig,
+    ToadConfig,
+    structural_fingerprint,
+)
+from kaggriculture.learn.toad.population import (
+    EmptySnapshotPoolError,
+    SnapshotEntry,
+    SnapshotIntegrityError,
+    SnapshotPool,
+    SnapshotStore,
+    sha256_file,
+)
 from kaggriculture.learn.toad_loss import UNROLL_LENGTH
 
 # Segment fields are defined beside the public segmenter so all producers share
@@ -48,6 +62,8 @@ class ReferenceWorkerInput:
     versus: str | None
     money_weight: float
     unroll_length: int = UNROLL_LENGTH
+    opponent_state: dict[str, torch.Tensor] | None = None
+    opponent_model: ModelConfig | None = None
 
 
 class BatchKind(StrEnum):
@@ -55,6 +71,8 @@ class BatchKind(StrEnum):
 
     SELFPLAY = "selfplay"
     SCRIPTED = "scripted"
+    FROZEN_OPPONENT = "frozen_opponent"
+    TEACHER_DISTILL = "teacher_distill"
     MIXED = "mixed"
 
 
@@ -68,6 +86,7 @@ class RoundMeta:
     seeds: tuple[int, ...]
     opponent_ids: tuple[str, ...]
     kind: BatchKind
+    opponent_digests: tuple[str | None, ...] = ()
 
     @classmethod
     def control(cls, round_id: int = 0) -> RoundMeta:
@@ -97,21 +116,198 @@ class LearnerBatch:
     game_ids: tuple[int, ...]
     opponent_ids: tuple[str, ...]
     segment_kinds: tuple[BatchKind, ...] = ()
+    seeds: tuple[int, ...] = ()
+    opponent_digests: tuple[str | None, ...] = ()
+    segment_opponent_ids: tuple[str, ...] = ()
+    segment_opponent_digests: tuple[str | None, ...] = ()
+    segment_game_ids: tuple[int, ...] = ()
+    segment_seeds: tuple[int, ...] = ()
     round_metrics: Mapping[str, float | int] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class CollectionAssignment:
+@dataclass(frozen=True, init=False)
+class OpponentAssignment:
     """One game assigned to the synchronous reference collector."""
 
     game_id: int
     seed: int
-    opponent_id: str
     kind: BatchKind
+    opponent_id: str
+    checkpoint: Path | None = None
+    checkpoint_sha256: str | None = None
+
+    def __init__(
+        self,
+        game_id: int,
+        seed: int,
+        kind: BatchKind | str,
+        opponent_id: str | BatchKind,
+        checkpoint: Path | None = None,
+        checkpoint_sha256: str | None = None,
+    ) -> None:
+        """Accept the public order plus the legacy opponent-before-kind order."""
+        if not isinstance(kind, BatchKind) and isinstance(opponent_id, BatchKind):
+            kind, opponent_id = opponent_id, kind
+        resolved_kind = BatchKind(kind)
+        if not isinstance(opponent_id, str):
+            raise TypeError("opponent_id must be a string")
+        object.__setattr__(self, "game_id", game_id)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "kind", resolved_kind)
+        object.__setattr__(self, "opponent_id", opponent_id)
+        object.__setattr__(self, "checkpoint", checkpoint)
+        object.__setattr__(self, "checkpoint_sha256", checkpoint_sha256)
+
+
+# Keep the foundation-stage spelling as an exact compatibility alias.
+CollectionAssignment = OpponentAssignment
+
+
+_ONLINE_KINDS = (
+    BatchKind.SELFPLAY,
+    BatchKind.SCRIPTED,
+    BatchKind.FROZEN_OPPONENT,
+    BatchKind.TEACHER_DISTILL,
+)
+
+
+def allocate_round(
+    config: ToadConfig,
+    start_game_id: int,
+    round_id: int,
+    pool: SnapshotPool | None = None,
+    teacher: SnapshotEntry | None = None,
+) -> tuple[OpponentAssignment, ...]:
+    """Allocate one deterministic, quota-exact collection round.
+
+    Kind slots are shuffled before monotonically increasing game IDs are bound,
+    preserving contiguous global identity while varying opponent order by round.
+    """
+    environments = config.population.environments_per_rank
+    probabilities = {
+        BatchKind.SELFPLAY: config.population.selfplay,
+        BatchKind.SCRIPTED: config.population.scripted,
+        BatchKind.FROZEN_OPPONENT: config.population.frozen_opponent,
+        BatchKind.TEACHER_DISTILL: config.population.teacher_distill,
+    }
+    raw = {
+        kind: probability * environments for kind, probability in probabilities.items()
+    }
+    counts = {kind: math.floor(value) for kind, value in raw.items()}
+    remaining = environments - sum(counts.values())
+    order = sorted(
+        raw,
+        key=lambda kind: (-(raw[kind] - counts[kind]), kind.value),
+    )
+    for kind in order[:remaining]:
+        counts[kind] += 1
+    if sum(counts.values()) != environments:
+        raise AssertionError("population quotas must allocate every environment")
+
+    kinds = [kind for kind in _ONLINE_KINDS for _ in range(counts[kind])]
+    population_seed = config.runtime.seed + config.population.population_seed
+    random.Random(population_seed ^ round_id).shuffle(kinds)
+
+    assignments: list[OpponentAssignment] = []
+    for offset, kind in enumerate(kinds):
+        game_id = start_game_id + offset
+        checkpoint: Path | None = None
+        checkpoint_sha256: str | None = None
+        if kind is BatchKind.SELFPLAY:
+            opponent_id = "self"
+        elif kind is BatchKind.SCRIPTED:
+            opponent_id = config.population.scripted_opponent
+        elif kind is BatchKind.FROZEN_OPPONENT:
+            if pool is None:
+                raise EmptySnapshotPoolError(
+                    "frozen opponent requested before pool population"
+                )
+            selected = pool.sample(game_id)
+            checkpoint = selected.path
+            checkpoint_sha256 = selected.sha256
+            opponent_id = (
+                f"snapshot:{selected.run_id}:{selected.environment_steps}:"
+                f"{selected.sha256[:12]}"
+            )
+        else:
+            selected_teacher = teacher
+            checkpoint = (
+                selected_teacher.path
+                if selected_teacher is not None
+                else config.population.teacher_checkpoint
+            )
+            if checkpoint is None:
+                raise ValueError("teacher-distill allocation requires a checkpoint")
+            checkpoint_sha256 = (
+                selected_teacher.sha256
+                if selected_teacher is not None
+                else sha256_file(checkpoint)
+            )
+            opponent_id = f"teacher:{checkpoint.name}:{checkpoint_sha256[:12]}"
+        assignments.append(
+            OpponentAssignment(
+                game_id=game_id,
+                seed=config.runtime.seed + game_id,
+                opponent_id=opponent_id,
+                kind=kind,
+                checkpoint=checkpoint,
+                checkpoint_sha256=checkpoint_sha256,
+            )
+        )
+    return tuple(assignments)
 
 
 class CollectionError(RuntimeError):
     """Collection failed while retaining the exact assigned game provenance."""
+
+
+def _checkpoint_policy_state(path: Path) -> dict[str, torch.Tensor]:
+    """Extract exact policy tensors from a bare, legacy, or Lightning checkpoint."""
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(loaded, Mapping):
+        raise ValueError("policy checkpoint must contain a mapping")
+    candidate: object
+    if "state_dict" in loaded:
+        state_dict = loaded["state_dict"]
+        if not isinstance(state_dict, Mapping):
+            raise ValueError("Lightning checkpoint state_dict must be a mapping")
+        candidate = {
+            name.removeprefix("policy."): value
+            for name, value in state_dict.items()
+            if isinstance(name, str) and name.startswith("policy.")
+        }
+        if not candidate:
+            raise ValueError("Lightning checkpoint has no policy.* weights")
+    elif "learner" in loaded:
+        candidate = loaded["learner"]
+    else:
+        candidate = loaded
+    if not isinstance(candidate, Mapping) or not all(
+        isinstance(name, str) and isinstance(value, torch.Tensor)
+        for name, value in candidate.items()
+    ):
+        raise ValueError("policy checkpoint must contain only named tensors")
+    return cast(dict[str, torch.Tensor], dict(candidate))
+
+
+def _strictly_validate_policy_state(
+    model: ModelConfig, state: Mapping[str, torch.Tensor]
+) -> None:
+    """Prove checkpoint tensors exactly instantiate the resolved policy topology."""
+    from kaggriculture.learn.model import Policy
+    from kaggriculture.learn.toad.model import StatefulPolicy, uses_stateful_policy
+
+    if uses_stateful_policy(model):
+        policy: Policy | StatefulPolicy = StatefulPolicy(model)
+    else:
+        policy = Policy(
+            blocks=model.blocks,
+            channels=model.channels,
+            value_bound=model.value_bound,
+            kernel_size=model.kernel_size,
+            activation=model.activation,
+        )
+    policy.load_state_dict(state, strict=True)
 
 
 def _recurrent_state_rows(
@@ -258,14 +454,22 @@ class RoundBatchExpander:
         meta: RoundMeta,
         *,
         trajectory_kinds: Sequence[BatchKind] | None = None,
+        trajectory_assignments: Sequence[CollectionAssignment] | None = None,
         kind_metas: Mapping[BatchKind, RoundMeta] | None = None,
         round_metrics: Mapping[str, float | int] | None = None,
     ) -> Iterator[LearnerBatch]:
         """Yield fresh policy batches followed by deterministic value replays."""
         kinds = trajectory_kinds or [meta.kind] * len(trajectories)
+        assignments: Sequence[CollectionAssignment | None] = (
+            trajectory_assignments
+            if trajectory_assignments is not None
+            else [None] * len(trajectories)
+        )
         all_segments = [
-            (segment, kind)
-            for trajectory, kind in zip(trajectories, kinds, strict=True)
+            (segment, kind, assignment)
+            for trajectory, kind, assignment in zip(
+                trajectories, kinds, assignments, strict=True
+            )
             for segment in segments(trajectory, self.unroll_length)
         ]
         groups = [
@@ -278,7 +482,17 @@ class RoundBatchExpander:
             return
 
         pending: list[
-            tuple[tuple[tuple[dict[str, torch.Tensor], BatchKind], ...], bool]
+            tuple[
+                tuple[
+                    tuple[
+                        dict[str, torch.Tensor],
+                        BatchKind,
+                        CollectionAssignment | None,
+                    ],
+                    ...,
+                ],
+                bool,
+            ]
         ] = [(group, False) for group in groups]
         generator = torch.Generator().manual_seed(self.seed + meta.round_id)
         for _ in range(self.value_passes):
@@ -304,6 +518,7 @@ class RoundBatchExpander:
         for index, (entries, baseline_only) in enumerate(pending):
             batch_segments = tuple(entry[0] for entry in entries)
             segment_kinds = tuple(entry[1] for entry in entries)
+            segment_assignments = tuple(entry[2] for entry in entries)
             batch_kind = (
                 segment_kinds[0]
                 if all(kind is segment_kinds[0] for kind in segment_kinds)
@@ -322,6 +537,28 @@ class RoundBatchExpander:
                 game_ids=batch_meta.game_ids,
                 opponent_ids=batch_meta.opponent_ids,
                 segment_kinds=segment_kinds,
+                seeds=batch_meta.seeds,
+                opponent_digests=batch_meta.opponent_digests,
+                segment_opponent_ids=tuple(
+                    assignment.opponent_id
+                    for assignment in segment_assignments
+                    if assignment is not None
+                ),
+                segment_opponent_digests=tuple(
+                    assignment.checkpoint_sha256
+                    for assignment in segment_assignments
+                    if assignment is not None
+                ),
+                segment_game_ids=tuple(
+                    assignment.game_id
+                    for assignment in segment_assignments
+                    if assignment is not None
+                ),
+                segment_seeds=tuple(
+                    assignment.seed
+                    for assignment in segment_assignments
+                    if assignment is not None
+                ),
                 round_metrics=round_metrics or {},
             )
 
@@ -336,16 +573,58 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         assignments: Iterable[CollectionAssignment] | None = None,
         collect_assignment: Callable[[CollectionAssignment], Sequence[Trajectory]]
         | None = None,
+        pool: SnapshotPool | None = None,
+        teacher: SnapshotEntry | None = None,
     ) -> None:
         self.config = config
         self._assignments = tuple(assignments) if assignments is not None else None
         self._collector = collect_assignment
+        self.pool = pool
+        self.teacher = teacher
         self.actor_state: dict[str, torch.Tensor] = {}
         self.actor_version = 0
         self.next_game_id = 0
         self.rng = random.Random(config.runtime.seed)
         self._next_round_id = 0
         self._restored_actor = False
+
+    def _ensure_initial_pool(self) -> None:
+        """Materialize declared first-round snapshots before opponent selection."""
+        if self.pool is not None and self.pool.manifest.entries:
+            return
+        population = self.config.population
+        if not population.initial_snapshots and not population.snapshot_at_start:
+            return
+
+        initial: list[tuple[dict[str, torch.Tensor], str]] = []
+        for path in population.initial_snapshots:
+            state = _checkpoint_policy_state(path)
+            _strictly_validate_policy_state(self.config.model, state)
+            initial.append((state, f"initial:{path}"))
+        if population.snapshot_at_start:
+            if not self.actor_state:
+                raise RuntimeError(
+                    "snapshot_at_start requires a published actor before collection"
+                )
+            _strictly_validate_policy_state(self.config.model, self.actor_state)
+            initial.append((dict(self.actor_state), "actor-at-start"))
+
+        store = SnapshotStore(
+            self.config.runtime.output_dir / "population",
+            capacity=population.pool_capacity,
+            structure=structural_fingerprint(self.config),
+        )
+        for index, (state, run_id) in enumerate(initial):
+            store.add(
+                state,
+                environment_steps=index,
+                round_id=0,
+                run_id=run_id,
+            )
+        self.pool = SnapshotPool.from_store(
+            store,
+            seed=self.config.runtime.seed + population.population_seed,
+        )
 
     def publish_actor(
         self, state_dict: Mapping[str, torch.Tensor], version: int
@@ -363,9 +642,15 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             raise RuntimeError("reference collection needs a published actor state")
         from kaggriculture.learn.scripts.toad import _play_reference
 
-        return _play_reference(self._worker_input(assignment))
+        opponents = self._materialize_opponents((assignment,))
+        return _play_reference(self._worker_input(assignment, opponents))
 
-    def _worker_input(self, assignment: CollectionAssignment) -> ReferenceWorkerInput:
+    def _worker_input(
+        self,
+        assignment: CollectionAssignment,
+        opponents: Mapping[str, tuple[dict[str, torch.Tensor], ModelConfig]]
+        | None = None,
+    ) -> ReferenceWorkerInput:
         """Return one resolved typed worker request with no architecture drift."""
         versus = None
         if assignment.kind is BatchKind.SCRIPTED:
@@ -376,6 +661,12 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 if assignment.opponent_id == "economic"
                 else assignment.opponent_id
             )
+        opponent_state: dict[str, torch.Tensor] | None = None
+        opponent_model: ModelConfig | None = None
+        if assignment.checkpoint_sha256 is not None:
+            if opponents is None or assignment.checkpoint_sha256 not in opponents:
+                raise RuntimeError("neural opponent was not materialized for its round")
+            opponent_state, opponent_model = opponents[assignment.checkpoint_sha256]
         return ReferenceWorkerInput(
             actor_state=self.actor_state,
             seeds=[assignment.seed],
@@ -383,12 +674,66 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             versus=versus,
             money_weight=self.config.curriculum.money_weight,
             unroll_length=self.config.optimizer.unroll_length,
+            opponent_state=opponent_state,
+            opponent_model=opponent_model,
         )
+
+    def _materialize_opponents(
+        self, assignments: Sequence[CollectionAssignment]
+    ) -> dict[str, tuple[dict[str, torch.Tensor], ModelConfig]]:
+        """Validate and load each selected neural-opponent digest exactly once."""
+        materialized: dict[str, tuple[dict[str, torch.Tensor], ModelConfig]] = {}
+        for assignment in assignments:
+            digest = assignment.checkpoint_sha256
+            if digest is None or digest in materialized:
+                continue
+            if assignment.checkpoint is None:
+                raise SnapshotIntegrityError(
+                    f"opponent digest {digest} has no checkpoint path"
+                )
+            if assignment.kind is BatchKind.FROZEN_OPPONENT:
+                if self.pool is None:
+                    raise EmptySnapshotPoolError(
+                        "frozen opponent requested before pool population"
+                    )
+                matches = [
+                    entry
+                    for entry in self.pool.manifest.entries
+                    if entry.sha256 == digest and entry.path == assignment.checkpoint
+                ]
+                if len(matches) != 1:
+                    raise SnapshotIntegrityError(
+                        f"selected frozen opponent is not in the bound pool: {digest}"
+                    )
+                state = self.pool.load(matches[0])
+                model = self.config.model
+            elif assignment.kind is BatchKind.TEACHER_DISTILL:
+                actual = sha256_file(assignment.checkpoint)
+                if actual != digest:
+                    raise SnapshotIntegrityError(
+                        "teacher checkpoint digest mismatch for "
+                        f"{assignment.checkpoint}: expected {digest}, found {actual}"
+                    )
+                state = _checkpoint_policy_state(assignment.checkpoint)
+                blocks = self.config.population.teacher_blocks
+                model = (
+                    self.config.model
+                    if blocks is None
+                    else self.config.model.model_copy(update={"blocks": blocks})
+                )
+            else:
+                raise ValueError(
+                    "non-neural assignment unexpectedly carries a digest: "
+                    f"{assignment.kind}"
+                )
+            materialized[digest] = (state, model)
+        return materialized
 
     def _collect_round(
         self, assignments: Sequence[CollectionAssignment]
     ) -> list[tuple[CollectionAssignment, Sequence[Trajectory]]]:
         """Collect all assignments through one typed, round-scoped pool."""
+        opponents = self._materialize_opponents(assignments)
         if self._collector is not None:
             collected = []
             for assignment in assignments:
@@ -406,7 +751,13 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             max_workers=self.config.population.collection_processes
         ) as pool:
             results = iter(
-                pool.map(_play_reference, map(self._worker_input, assignments))
+                pool.map(
+                    _play_reference,
+                    (
+                        self._worker_input(assignment, opponents)
+                        for assignment in assignments
+                    ),
+                )
             )
             collected = []
             for assignment in assignments:
@@ -429,33 +780,23 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         """Collect one assignment set, then expose it as one logical round."""
         assignments = self._assignments
         if assignments is None:
+            self._ensure_initial_pool()
             first_game_id = self.next_game_id
             environments = self.config.population.environments_per_rank
             self.next_game_id += environments
-            scripted = int(environments * self.config.population.scripted)
-            assignments = tuple(
-                CollectionAssignment(
-                    game_id=game_id,
-                    seed=game_id + self.config.runtime.seed,
-                    opponent_id=(
-                        self.config.population.scripted_opponent
-                        if game_id - first_game_id < scripted
-                        else "self"
-                    ),
-                    kind=(
-                        BatchKind.SCRIPTED
-                        if game_id - first_game_id < scripted
-                        else BatchKind.SELFPLAY
-                    ),
-                )
-                for game_id in range(first_game_id, self.next_game_id)
+            assignments = allocate_round(
+                self.config,
+                first_game_id,
+                self._next_round_id,
+                self.pool,
+                self.teacher,
             )
         if not assignments:
             return
         collected = self._collect_round(assignments)
         ordered = sorted(
             collected,
-            key=lambda entry: 0 if entry[0].kind is BatchKind.SELFPLAY else 1,
+            key=lambda entry: _ONLINE_KINDS.index(entry[0].kind),
         )
         round_id = self._next_round_id
         self._next_round_id += 1
@@ -474,6 +815,9 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             for assignment, assigned in ordered
             for _trajectory in assigned
         ]
+        trajectory_assignments = [
+            assignment for assignment, assigned in ordered for _trajectory in assigned
+        ]
         present = set(trajectory_kinds)
         round_kind = next(iter(present)) if len(present) == 1 else BatchKind.MIXED
         meta = RoundMeta(
@@ -483,6 +827,9 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             seeds=tuple(item.seed for item in ordered_assignments),
             opponent_ids=tuple(item.opponent_id for item in ordered_assignments),
             kind=round_kind,
+            opponent_digests=tuple(
+                item.checkpoint_sha256 for item in ordered_assignments
+            ),
         )
         kind_metas = {
             kind: RoundMeta(
@@ -500,6 +847,11 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                     if item.kind is kind
                 ),
                 kind=kind,
+                opponent_digests=tuple(
+                    item.checkpoint_sha256
+                    for item in ordered_assignments
+                    if item.kind is kind
+                ),
             )
             for kind in present
         }
@@ -509,10 +861,10 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             if assignment.kind is BatchKind.SELFPLAY
             for trajectory in assigned
         ]
-        scripted = [
+        opponents = [
             trajectory
             for assignment, assigned in ordered
-            if assignment.kind is BatchKind.SCRIPTED
+            if assignment.kind is not BatchKind.SELFPLAY
             for trajectory in assigned
         ]
         from kaggriculture.learn.scripts.toad import _collection_metrics
@@ -521,9 +873,10 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             trajectories,
             meta,
             trajectory_kinds=trajectory_kinds,
+            trajectory_assignments=trajectory_assignments,
             kind_metas=kind_metas,
             round_metrics=_collection_metrics(
-                mirror, scripted, self.config.curriculum.reward_field
+                mirror, opponents, self.config.curriculum.reward_field
             ),
         )
 
