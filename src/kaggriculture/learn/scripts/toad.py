@@ -45,7 +45,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import lightning
 import torch
@@ -63,7 +63,12 @@ from kaggriculture.learn.toad.callbacks import (
     EnvironmentStepStop,
     PopulationSnapshotCallback,
 )
-from kaggriculture.learn.toad.config import ModelConfig, ToadConfig, load_config
+from kaggriculture.learn.toad.config import (
+    ModelConfig,
+    RuntimeConfig,
+    ToadConfig,
+    load_config,
+)
 from kaggriculture.learn.toad.data import (
     ACTED_FIELDS as _ACTED_FIELDS,
 )
@@ -100,6 +105,96 @@ from kaggriculture.learn.toad_reward import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class RuntimePreflightError(RuntimeError):
+    """A requested runtime cannot be honored without changing the experiment."""
+
+
+def _effective_accelerator(runtime: RuntimeConfig) -> Literal["cpu", "gpu"]:
+    """Resolve Lightning's ``auto`` selection without constructing a Trainer."""
+    if runtime.accelerator == "auto":
+        return "gpu" if torch.cuda.is_available() else "cpu"
+    return runtime.accelerator
+
+
+def _requested_gpu_count(runtime: RuntimeConfig) -> int:
+    """Return the requested CUDA device count without selecting a CUDA device."""
+    if runtime.devices == "auto":
+        return torch.cuda.device_count()
+    if isinstance(runtime.devices, tuple):
+        return len(runtime.devices)
+    return runtime.devices
+
+
+def _requested_device_count(runtime: RuntimeConfig, accelerator: str) -> int:
+    """Resolve the single-process topology without constructing a strategy."""
+    if runtime.devices == "auto":
+        return torch.cuda.device_count() if accelerator == "gpu" else 1
+    if isinstance(runtime.devices, tuple):
+        return len(runtime.devices)
+    return runtime.devices
+
+
+def _cpu_bf16_supported() -> bool:
+    """Ask the installed PyTorch/Lightning stack whether CPU autocast exists."""
+    from lightning.pytorch.plugins.precision import MixedPrecision
+
+    try:
+        MixedPrecision("bf16-mixed", "cpu")
+        return torch.amp.autocast_mode.is_autocast_available("cpu")
+    except (RuntimeError, ValueError):
+        return False
+
+
+def runtime_preflight(config: ToadConfig) -> None:
+    """Reject unavailable runtime requests before creating trainer side effects.
+
+    This deliberately performs only hardware capability inspection.  It does
+    not construct a Trainer, logger, worker, file, or policy, and it never
+    changes an explicit request into a different precision or accelerator.
+    """
+    runtime = config.runtime
+    accelerator = _effective_accelerator(runtime)
+    world_size = runtime.num_nodes * _requested_device_count(runtime, accelerator)
+    if world_size > 1:
+        raise RuntimePreflightError(
+            "multi-device topology requires DDP support, which is not enabled"
+        )
+    if accelerator == "gpu":
+        available = torch.cuda.is_available()
+        if not available:
+            if runtime.precision == "bf16-mixed":
+                raise RuntimePreflightError(
+                    "bf16-mixed requested but CUDA BF16 is unavailable"
+                )
+            raise RuntimePreflightError(
+                "GPU accelerator requested but CUDA is unavailable"
+            )
+        requested = _requested_gpu_count(runtime)
+        available_devices = torch.cuda.device_count()
+        if requested < 1 or requested > available_devices:
+            raise RuntimePreflightError(
+                "requested GPU devices are unavailable: "
+                f"requested={requested}, available={available_devices}"
+            )
+        if isinstance(runtime.devices, tuple) and any(
+            device >= available_devices for device in runtime.devices
+        ):
+            raise RuntimePreflightError(
+                "requested GPU device index is unavailable: "
+                f"available={available_devices}, devices={runtime.devices}"
+            )
+        if runtime.precision == "bf16-mixed" and not torch.cuda.is_bf16_supported():
+            raise RuntimePreflightError(
+                "bf16-mixed requested but CUDA BF16 is unavailable"
+            )
+        return
+    if runtime.precision == "bf16-mixed" and not _cpu_bf16_supported():
+        raise RuntimePreflightError(
+            "bf16-mixed requested but CPU BF16 autocast is unavailable"
+        )
+
 
 # Temporary aliases preserve the runner's original segmentation surface while
 # callers move to ``kaggriculture.learn.toad.data.segments``.
@@ -652,9 +747,14 @@ def build_reference_data_module(config: ToadConfig) -> ToadDataModule:
 
 def build_trainer(config: ToadConfig) -> lightning.Trainer:
     """Build the one-device control Trainer with round-boundary ownership."""
+    devices: int | str | list[int] = (
+        list(config.runtime.devices)
+        if isinstance(config.runtime.devices, tuple)
+        else config.runtime.devices
+    )
     return lightning.Trainer(
         accelerator=config.runtime.accelerator,
-        devices=config.runtime.devices,
+        devices=devices,
         num_nodes=config.runtime.num_nodes,
         strategy=config.runtime.strategy,
         precision=config.runtime.precision,
@@ -680,6 +780,7 @@ def build_trainer(config: ToadConfig) -> lightning.Trainer:
 
 def run(config: ToadConfig) -> None:
     """Seed once and hand the complete native control path to Lightning."""
+    runtime_preflight(config)
     seed_everything(config.runtime.seed, workers=True)
     module = ToadLightningModule(config)
     effective = module.config

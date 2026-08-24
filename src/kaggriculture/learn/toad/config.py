@@ -252,16 +252,16 @@ class OptimizerConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    """Single-device execution settings supported by the native trainer."""
+    """Resolved Lightning execution settings for the native trainer."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     seed: int = 0
-    accelerator: str = "auto"
-    devices: Literal[1] = 1
+    accelerator: Literal["auto", "cpu", "gpu"] = "auto"
+    devices: PositiveInt | tuple[NonNegativeInt, ...] | Literal["auto"] = 1
     num_nodes: Literal[1] = 1
     strategy: Literal["auto"] = "auto"
-    precision: Literal["32-true"] = "32-true"
+    precision: Precision = "32-true"
     deterministic: bool = False
     benchmark: bool | None = None
     total_environment_steps: PositiveInt = TOTAL_STEPS

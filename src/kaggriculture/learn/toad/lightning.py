@@ -302,6 +302,100 @@ class LossReport:
     total: torch.Tensor
     terms: Mapping[str, torch.Tensor]
     entropy: HeadEntropy
+    debug_dtypes: Mapping[str, torch.dtype]
+
+
+@dataclass(frozen=True)
+class FP32PolicyTerms:
+    """The numerically sensitive policy outputs after the autocast boundary."""
+
+    unit_logits: torch.Tensor
+    quantity_logits: torch.Tensor
+    market_logits: torch.Tensor
+    values: torch.Tensor
+    belief_logits: torch.Tensor | None
+
+
+def fp32_policy_terms(output: PolicyOutput, batch: LearnerBatch) -> FP32PolicyTerms:
+    """Promote all loss-facing policy outputs while leaving feature compute alone."""
+    for segment in batch.segments:
+        for name in ("unit_masks", "unit_quantity_masks", "market_masks", "unit_valid"):
+            if segment[name].dtype is not torch.bool:
+                raise ValueError(f"{name} must remain boolean across the FP32 boundary")
+    return FP32PolicyTerms(
+        unit_logits=output.unit_logits.float(),
+        quantity_logits=output.quantity_logits.float(),
+        market_logits=output.market_logits.float(),
+        values=output.values.float(),
+        belief_logits=(
+            None if output.belief_logits is None else output.belief_logits.float()
+        ),
+    )
+
+
+class NonFiniteTrainingError(RuntimeError):
+    """A finite-check failure with collection provenance for recovery and triage."""
+
+    def __init__(
+        self,
+        tensor_names: tuple[str, ...],
+        *,
+        batch_kind: str,
+        game_ids: tuple[int, ...],
+        opponent_digests: tuple[str | None, ...],
+        actor_version: int,
+        precision: str,
+        state_norms: Mapping[str, float],
+    ) -> None:
+        self.tensor_names = tensor_names
+        self.batch_kind = batch_kind
+        self.game_ids = game_ids
+        self.opponent_digests = opponent_digests
+        self.actor_version = actor_version
+        self.precision = precision
+        self.state_norms = dict(state_norms)
+        super().__init__(
+            "non-finite training tensors "
+            f"{tensor_names}; kind={batch_kind}; game_ids={game_ids}; "
+            f"opponent_digests={opponent_digests}; actor_version={actor_version}; "
+            f"precision={precision}; state_norms={self.state_norms}"
+        )
+
+    @classmethod
+    def from_batch(
+        cls,
+        tensor_names: list[str],
+        batch: LearnerBatch,
+        state: PolicyState | None,
+        precision: str,
+    ) -> Self:
+        """Create a structured local finite failure without distributed collectives."""
+        state_norms = {
+            name: float(value.detach().float().norm())
+            for name, value in (
+                ("hidden", None if state is None else state.hidden),
+                ("cell", None if state is None else state.cell),
+            )
+            if value is not None
+        }
+        return cls(
+            tuple(tensor_names),
+            batch_kind=batch.kind.value,
+            game_ids=batch.game_ids,
+            opponent_digests=batch.opponent_digests,
+            actor_version=batch.actor_version,
+            precision=precision,
+            state_norms=state_norms,
+        )
+
+
+def _nonfinite_tensor_names(tensors: Mapping[str, torch.Tensor]) -> list[str]:
+    """Return stable names for every finite-check failure in one loss report."""
+    return [
+        name
+        for name, tensor in tensors.items()
+        if not bool(torch.isfinite(tensor).all())
+    ]
 
 
 class ResumeConfigError(ValueError):
@@ -738,8 +832,8 @@ def compute_loss(  # noqa: C901
     unit_masks = stacked("unit_masks")
     unit_quantity_masks = stacked("unit_quantity_masks")
     market_masks = stacked("market_masks")
-    behaviour = stacked("log_probs")
-    rewards = stacked(config.curriculum.reward_field)
+    behaviour = stacked("log_probs").float()
+    rewards = stacked(config.curriculum.reward_field).float()
     dones = stacked("dones")
 
     turns, width = behaviour.shape
@@ -773,15 +867,24 @@ def compute_loss(  # noqa: C901
             state=initial,
             dones=replay_dones,
         )
-        unit_logits = output.unit_logits
-        quantity_logits = output.quantity_logits
-        market_logits = output.market_logits
-        values = output.values
     else:
         legacy_output = policy(
             board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
         )
-        unit_logits, quantity_logits, market_logits, values = legacy_output
+        output = PolicyOutput(*legacy_output, belief_logits=None, state=None)
+    policy_terms = fp32_policy_terms(output, batch)
+    unit_logits = policy_terms.unit_logits
+    quantity_logits = policy_terms.quantity_logits
+    market_logits = policy_terms.market_logits
+    values = policy_terms.values
+    loss_output = replace(
+        output,
+        unit_logits=unit_logits,
+        quantity_logits=quantity_logits,
+        market_logits=market_logits,
+        values=values,
+        belief_logits=policy_terms.belief_logits,
+    )
     values = values.view(turns + 1, width)
     bootstrap_value = values[-1].detach()
     values = values[:-1]
@@ -797,7 +900,7 @@ def compute_loss(  # noqa: C901
     belief_enabled = isinstance(policy, StatefulPolicy) and policy.config.belief
     belief_terms: dict[str, torch.Tensor] = {}
     if belief_enabled:
-        belief_terms = _belief_loss_terms(output, segments)
+        belief_terms = _belief_loss_terms(loss_output, segments)
     flat_unit_actions = unit_actions.flatten(0, 1)
     flat_unit_valid = unit_valid.flatten(0, 1)
     flat_unit_masks = unit_masks.flatten(0, 1)
@@ -847,6 +950,7 @@ def compute_loss(  # noqa: C901
         "market_kl": zero,
         "value": zero,
     }
+    teacher_outputs: dict[str, torch.Tensor] = {}
     teacher_kl = None
     if teacher is not None:
         declared = (
@@ -870,6 +974,12 @@ def compute_loss(  # noqa: C901
                     positions.flatten(0, 1),
                 )
             )
+        teacher_outputs = {
+            "teacher/unit_logits": teacher_units,
+            "teacher/quantity_logits": teacher_quantity,
+            "teacher/market_logits": teacher_market,
+            "teacher/values": teacher_values,
+        }
 
         teacher_kl = torch.zeros(
             turns, width, dtype=torch.float32, device=values.device
@@ -982,7 +1092,57 @@ def compute_loss(  # noqa: C901
                 "teacher/value_weighted": teacher_weighted["value"],
             }
         )
-    return LossReport(total=total, terms=terms, entropy=head_entropy)
+    checked = {
+        "input/board": board,
+        "input/scalars": scalars,
+        "input/positions": positions,
+        "input/unit_actions": unit_actions,
+        "input/unit_quantity_actions": unit_quantity_actions,
+        "input/market_actions": market_actions,
+        "input/unit_masks": unit_masks,
+        "input/unit_quantity_masks": unit_quantity_masks,
+        "input/market_masks": market_masks,
+        "input/behaviour_log_probs": behaviour,
+        "input/rewards": rewards,
+        "input/dones": dones,
+        "unit_logits": policy_terms.unit_logits,
+        "quantity_logits": policy_terms.quantity_logits,
+        "market_logits": policy_terms.market_logits,
+        "values": policy_terms.values,
+        **teacher_outputs,
+        **(
+            {"belief_logits": policy_terms.belief_logits}
+            if policy_terms.belief_logits is not None
+            else {}
+        ),
+        **terms,
+    }
+    state = output.state
+    if state is not None:
+        checked.update(
+            {
+                "output/state_hidden": state.hidden.float(),
+                "output/state_cell": state.cell.float(),
+                "output/state_prior_belief": state.prior_belief.float(),
+            }
+        )
+    nonfinite = _nonfinite_tensor_names(checked)
+    if nonfinite:
+        raise NonFiniteTrainingError.from_batch(
+            nonfinite, batch, state, config.runtime.precision
+        )
+    return LossReport(
+        total=total,
+        terms=terms,
+        entropy=head_entropy,
+        debug_dtypes={
+            "learner_log_probs": learner_log_probs.dtype,
+            "importance_ratios": (learner_log_probs - behaviour).exp().dtype,
+            "value_targets": values.dtype,
+            "entropy": entropy_term.dtype,
+            "teacher": loss.teacher.dtype,
+        },
+    )
 
 
 def round_decay(config: ToadConfig) -> Callable[[int], float]:
@@ -1136,6 +1296,16 @@ class ToadLightningModule(lightning.LightningModule):
         if self._trainer is None:
             self._finish_learner_batch()
         return report.total
+
+    def compute_report(self, batch: LearnerBatch) -> LossReport:
+        """Compute a report for tests and diagnostics without mutating module clocks."""
+        return compute_loss(
+            self.policy,
+            batch,
+            self.config,
+            teacher=self.teacher,
+            entropy_state=self.entropy_state,
+        )
 
     def optimizer_step(
         self,
