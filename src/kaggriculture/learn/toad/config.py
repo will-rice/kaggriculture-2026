@@ -31,6 +31,7 @@ from kaggriculture.learn.toad_loss import (
     VALUE_WARMUP_BATCHES,
 )
 from kaggriculture.learn.toad_reward import MONEY_WEIGHT
+from kaggriculture.sim.state import CROP_NAMES, PRODUCT_NAMES, SHED_NAMES
 
 Precision = Literal["32-true", "bf16-mixed"]
 
@@ -46,10 +47,45 @@ class ModelConfig(BaseModel):
     activation: Literal["relu", "leaky_relu"] = "relu"
     value_bound: PositiveFloat | None = 1.0
     recurrent: bool = False
+    recurrent_channels: PositiveInt = 128
+    recurrent_kernel_size: Literal[3, 5] = 3
+    recurrent_layers: PositiveInt = 1
     transformer: bool = False
+    transformer_blocks: NonNegativeInt = 0
+    transformer_heads: PositiveInt = 4
+    transformer_mlp_ratio: PositiveInt = 2
     local_patch: bool = False
+    local_patch_size: PositiveInt = 7
+    local_patch_blocks: NonNegativeInt = 0
     belief: bool = False
+    belief_size: PositiveInt = len(SHED_NAMES) + len(CROP_NAMES) + len(PRODUCT_NAMES)
+    belief_loss_weight: NonNegativeFloat = 0.0
+    belief_feedback: bool = False
     interaction_value: bool = False
+
+    @classmethod
+    def control(cls, blocks: int = 8, channels: int = 128) -> Self:
+        """Return the permanent all-optional-features-disabled topology."""
+        return cls(
+            blocks=blocks,
+            channels=channels,
+            recurrent=False,
+            transformer=False,
+            local_patch=False,
+            belief=False,
+            interaction_value=False,
+        )
+
+    @model_validator(mode="after")
+    def validate_optional_model_paths(self) -> Self:
+        """Reject inconsistent dimensions before torch modules are created."""
+        if (self.belief_feedback or self.belief_loss_weight > 0) and not self.belief:
+            raise ValueError("belief feedback/loss requires the belief head")
+        if self.local_patch and self.local_patch_size % 2 == 0:
+            raise ValueError("local patch size must be odd")
+        if self.transformer and self.channels % self.transformer_heads:
+            raise ValueError("transformer channels must divide evenly across heads")
+        return self
 
 
 class PopulationConfig(BaseModel):
