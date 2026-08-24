@@ -294,9 +294,15 @@ def resolved_population_counts(population: PopulationConfig) -> dict[str, int]:
 def resolved_round_geometry(
     population: PopulationConfig,
     optimizer: OptimizerConfig,
+    *,
+    episode_steps: int = EPISODE_STEPS,
 ) -> RoundGeometry:
     """Resolve exact reference/native segment and replay counts for one rank."""
-    turns = EPISODE_STEPS - 1
+    if episode_steps < 2:
+        raise ValueError(
+            "episode_steps must include at least one decision and terminal"
+        )
+    turns = episode_steps - 1
     if optimizer.unroll_length > turns:
         raise ValueError(f"optimizer.unroll_length must be at most {turns}")
     environments = resolved_population_counts(population)

@@ -282,9 +282,17 @@ class DistributedCollectionError(RuntimeError):
         super().__init__("distributed collection failed: " + rendered)
 
 
-def expected_round_batch_counts(config: ToadConfig) -> RoundBatchCounts:
+def expected_round_batch_counts(
+    config: ToadConfig,
+    *,
+    episode_steps: int | None = None,
+) -> RoundBatchCounts:
     """Derive one rank's exact optimizer quotas before collection starts."""
-    geometry = resolved_round_geometry(config.population, config.optimizer)
+    geometry = resolved_round_geometry(
+        config.population,
+        config.optimizer,
+        episode_steps=EPISODE_STEPS if episode_steps is None else episode_steps,
+    )
     return RoundBatchCounts(
         policy=geometry.policy_batches,
         value=geometry.value_batches,
@@ -1006,8 +1014,14 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         | None = None,
         pool: SnapshotPool | None = None,
         teacher: SnapshotEntry | None = None,
+        episode_steps: int | None = None,
     ) -> None:
         self.config = config
+        self.episode_steps = EPISODE_STEPS if episode_steps is None else episode_steps
+        if self.episode_steps < 2:
+            raise ValueError(
+                "episode_steps must include at least one decision and terminal"
+            )
         self._assignments = tuple(assignments) if assignments is not None else None
         self._collector = collect_assignment
         self.pool = (
@@ -1621,12 +1635,14 @@ class NativeRoundSource(ReferenceRoundSource):
         assignments: Iterable[CollectionAssignment] | None = None,
         pool: SnapshotPool | None = None,
         teacher: SnapshotEntry | None = None,
+        episode_steps: int | None = None,
     ) -> None:
         super().__init__(
             config,
             assignments=assignments,
             pool=pool,
             teacher=teacher,
+            episode_steps=episode_steps,
         )
         self.device = torch.device(config.runtime.rollout_device)
 
@@ -1723,7 +1739,7 @@ class NativeRoundSource(ReferenceRoundSource):
                     for item in chunk
                 )
                 unroll = self.config.optimizer.unroll_length
-                turns = EPISODE_STEPS - 1
+                turns = self.episode_steps - 1
                 remainder = turns % unroll
                 lengths = ((remainder,) if remainder else ()) + (unroll,) * (
                     turns // unroll
@@ -2115,7 +2131,7 @@ class NativeRoundSource(ReferenceRoundSource):
             stream_count = len(collection.assignments) * collection.recorded_seats
             for stream in range(stream_count):
                 entries.extend(chunk[stream] for chunk in chunk_entries if chunk)
-        collected_steps = (EPISODE_STEPS - 1) * sum(
+        collected_steps = (self.episode_steps - 1) * sum(
             len(collection.assignments) * collection.recorded_seats
             for collection in ordered
         )
@@ -2179,7 +2195,10 @@ class ToadDataModule(lightning.LightningDataModule):
         self.source.configure_distributed(rank=rank, world_size=world_size)
         if world_size == 1:
             return
-        local = expected_round_batch_counts(self.config)
+        local = expected_round_batch_counts(
+            self.config,
+            episode_steps=self.source.episode_steps,
+        )
         gathered = _all_gather_objects(local, world_size)
         if any(item != local for item in gathered):
             raise DistributedRoundMismatch(
@@ -2194,7 +2213,10 @@ class ToadDataModule(lightning.LightningDataModule):
         """Collectively gate actual counts and markers before DDP sees a batch."""
         local = round_batch_signature(
             batches,
-            expected=expected_round_batch_counts(self.config),
+            expected=expected_round_batch_counts(
+                self.config,
+                episode_steps=self.source.episode_steps,
+            ),
             rank=self.source.global_rank,
             round_id=round_id,
         )

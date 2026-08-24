@@ -1243,11 +1243,82 @@ def _ddp_fixture_trajectory(game_id: int) -> Trajectory:
     )
 
 
+@pytest.mark.parametrize("backend", ["reference", "native"])
+def test_shortened_collection_horizon_matches_expected_round_geometry(
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expected DDP quotas use the source's real horizon on both backends."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 1.0,
+                "environments_per_rank": 1,
+                "collection_processes": 1,
+            },
+            "optimizer": {
+                "unroll_length": 2,
+                "batch_segments": 1,
+                "value_warmup_batches": 0,
+                "value_passes": 0,
+            },
+            "runtime": {
+                "rollout_backend": backend,
+                "rollout_device": "cpu",
+            },
+        }
+    )
+    assignment = data.CollectionAssignment(
+        game_id=0,
+        seed=117,
+        opponent_id="economic",
+        kind=data.BatchKind.SCRIPTED,
+    )
+    if backend == "native":
+        monkeypatch.setattr(sim_day, "EPISODE_STEPS", 5)
+        source = data.NativeRoundSource(
+            config,
+            assignments=(assignment,),
+            episode_steps=5,
+        )
+        source.publish_actor(ToadLightningModule(config).policy.state_dict(), version=0)
+    else:
+        source = data.ReferenceRoundSource(
+            config,
+            assignments=(assignment,),
+            collect_assignment=lambda _assignment: (_trajectory(),),
+            episode_steps=5,
+        )
+
+    def gather(local: object, world_size: int, **_kwargs: object) -> tuple[object, ...]:
+        if isinstance(local, data.RoundBatchSignature):
+            return (local, replace(local, rank=1))
+        return (local,) * world_size
+
+    monkeypatch.setattr(data, "_all_gather_objects", gather)
+    data_module = data.ToadDataModule(config, source)
+    data_module.trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(global_rank=0, world_size=2),
+    )
+    data_module.setup("fit")
+    batches = tuple(source)
+    expected = data.expected_round_batch_counts(
+        config,
+        episode_steps=source.episode_steps,
+    )
+
+    assert data.expected_round_batch_counts(config).policy == 359
+    assert expected.policy == sum(not batch.baseline_only for batch in batches) == 2
+    assert expected.value == sum(batch.baseline_only for batch in batches) == 0
+
+
 def _run_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
     """Run inside Lightning's parent and child subprocesses."""
     torch.set_num_threads(1)
     lightning.seed_everything(117, workers=True)
-    data.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
     config = _ddp_fixture_config(output_dir, resume)
     seen_game_ids: list[int] = []
     seen_opponent_ids: list[str] = []
@@ -1257,7 +1328,11 @@ def _run_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
         seen_opponent_ids.append(assignment.opponent_id)
         return (_ddp_fixture_trajectory(assignment.game_id),)
 
-    source = data.ReferenceRoundSource(config, collect_assignment=collect)
+    source = data.ReferenceRoundSource(
+        config,
+        collect_assignment=collect,
+        episode_steps=5,
+    )
     data_module = data.ToadDataModule(config, source)
     callbacks: list[lightning.Callback] = [
         ActorSyncCallback(1),
@@ -1293,10 +1368,9 @@ def _run_native_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -
     """Run the real tensor simulator and NativeRoundSource under CPU Gloo."""
     torch.set_num_threads(1)
     lightning.seed_everything(117, workers=True)
-    data.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
     sim_day.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
     config = _ddp_fixture_config(output_dir, resume, native=True)
-    source = data.NativeRoundSource(config)
+    source = data.NativeRoundSource(config, episode_steps=5)
     data_module = data.ToadDataModule(config, source)
     seen_game_ids: list[int] = []
     seen_opponent_ids: list[str] = []
