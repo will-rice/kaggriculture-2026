@@ -11,7 +11,7 @@ from kaggle_environments import make
 from torch.utils.data import DataLoader, Dataset
 
 import kaggriculture.learn.rollout as rollout_module
-from kaggriculture.constants import ENVIRONMENT
+from kaggriculture.constants import BOARD_SIZE, ENVIRONMENT
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.config import ToadConfig
@@ -84,13 +84,14 @@ def test_recurrent_module_uses_stateful_policy_while_control_keeps_bare_policy()
     "model",
     [
         {"transformer": True, "transformer_blocks": 1},
+        {"local_patch": True, "local_patch_blocks": 1},
         {"interaction_value": True},
     ],
 )
-def test_attention_module_uses_exact_stateful_topology(
+def test_optional_module_uses_exact_stateful_topology(
     model: dict[str, object], tmp_path: Path
 ) -> None:
-    """Attention-only production learners must not fall back to bare Policy."""
+    """Optional production learners must not fall back to bare Policy."""
     payload = {"blocks": 1, "channels": 16, **model}
     config = ToadConfig.model_validate({"model": payload})
     source = StatefulPolicy(config.model)
@@ -179,6 +180,122 @@ def test_recurrent_compute_loss_rejects_control_segments_without_state() -> None
 
     with pytest.raises(ValueError, match="require initial_hidden"):
         compute_loss(policy, replace(batch, segments=(control_segment,)), config)
+
+
+def test_padded_local_slots_cannot_change_loss_or_parameter_gradients() -> None:
+    """Placeholder positions and logits must be invisible to policy and entropy."""
+    fixture = load_control_fixture()
+    control_config = control_fixture_config()
+    config = control_config.model_copy(
+        update={
+            "model": control_config.model.model_copy(
+                update={"local_patch": True, "local_patch_blocks": 1}
+            )
+        }
+    )
+    baseline = StatefulPolicy(config.model)
+
+    class PerturbedPaddedPolicy(StatefulPolicy):
+        padded_units: torch.Tensor
+        padded_quantities: torch.Tensor
+
+        def forward(
+            self,
+            board: torch.Tensor,
+            scalars: torch.Tensor,
+            positions: torch.Tensor,
+            state: PolicyState | None = None,
+            dones: torch.Tensor | None = None,
+        ) -> PolicyOutput:
+            output = super().forward(board, scalars, positions, state, dones)
+            unit_delta = torch.zeros_like(output.unit_logits)
+            unit_delta[..., -1, :] = torch.linspace(
+                -500.0,
+                500.0,
+                output.unit_logits.shape[-1],
+                device=output.unit_logits.device,
+            )
+            quantity_delta = torch.zeros_like(output.quantity_logits)
+            quantity_delta[..., -1, :] = torch.linspace(
+                700.0,
+                -700.0,
+                output.quantity_logits.shape[-1],
+                device=output.quantity_logits.device,
+            )
+            self.padded_units = output.unit_logits + unit_delta
+            self.padded_quantities = output.quantity_logits + quantity_delta
+            self.padded_units.retain_grad()
+            self.padded_quantities.retain_grad()
+            return replace(
+                output,
+                unit_logits=self.padded_units,
+                quantity_logits=self.padded_quantities,
+            )
+
+    perturbed = PerturbedPaddedPolicy(config.model)
+    perturbed.load_state_dict(baseline.state_dict())
+    batch = control_fixture_batch(fixture)
+    padded_segments = []
+    for segment in batch.segments:
+        unit_masks = segment["unit_masks"].clone()
+        unit_masks[:, -1] = False
+        unit_masks[:, -1, 0] = True
+        quantity_masks = segment["unit_quantity_masks"].clone()
+        quantity_masks[:, -1] = False
+        quantity_masks[:, -1, 0] = True
+        unit_actions = segment["unit_actions"].clone()
+        unit_actions[:, -1] = 0
+        unit_quantities = segment["unit_quantities"].clone()
+        unit_quantities[:, -1] = 0
+        padded_segments.append(
+            {
+                **segment,
+                "unit_masks": unit_masks,
+                "unit_quantity_masks": quantity_masks,
+                "unit_actions": unit_actions,
+                "unit_quantities": unit_quantities,
+            }
+        )
+    batch = replace(batch, segments=tuple(padded_segments))
+    assert all(
+        torch.equal(
+            segment["unit_masks"][:, -1].sum(dim=-1),
+            torch.ones(segment["unit_masks"].shape[0], dtype=torch.int64),
+        )
+        for segment in batch.segments
+    )
+    changed_segments = []
+    for segment in batch.segments:
+        positions = segment["positions"].clone()
+        positions[:, -1] = BOARD_SIZE * BOARD_SIZE - 1
+        changed_segments.append({**segment, "positions": positions})
+
+    baseline_report = compute_loss(baseline, batch, config)
+    baseline_report.total.backward()
+    changed_report = compute_loss(
+        perturbed,
+        replace(batch, segments=tuple(changed_segments)),
+        config,
+    )
+    changed_report.total.backward()
+
+    torch.testing.assert_close(changed_report.total, baseline_report.total)
+    assert perturbed.padded_units.grad is not None
+    assert perturbed.padded_quantities.grad is not None
+    assert not perturbed.padded_units.grad[..., -1, :].any()
+    assert not perturbed.padded_quantities.grad[..., -1, :].any()
+    for (baseline_name, baseline_parameter), (
+        changed_name,
+        changed_parameter,
+    ) in zip(baseline.named_parameters(), perturbed.named_parameters(), strict=True):
+        assert baseline_name == changed_name
+        if baseline_parameter.grad is None or changed_parameter.grad is None:
+            assert baseline_parameter.grad is None
+            assert changed_parameter.grad is None
+        else:
+            torch.testing.assert_close(
+                changed_parameter.grad, baseline_parameter.grad, atol=1e-6, rtol=1e-6
+            )
 
 
 def test_transfer_batch_moves_recurrent_initial_state_with_segment_tensors() -> None:

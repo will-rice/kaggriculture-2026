@@ -213,13 +213,14 @@ def test_recurrent_reference_worker_builds_and_loads_the_stateful_actor(
     "model",
     [
         {"transformer": True, "transformer_blocks": 1},
+        {"local_patch": True, "local_patch_blocks": 1},
         {"interaction_value": True},
     ],
 )
-def test_attention_reference_worker_builds_exact_stateful_actor(
+def test_optional_reference_worker_builds_exact_stateful_actor(
     model: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Workers must construct and strictly load attention-only stateful weights."""
+    """Workers must construct and strictly load optional stateful weights."""
     config = ToadConfig.model_validate(
         {"model": {"blocks": 1, "channels": 16, **model}}
     )

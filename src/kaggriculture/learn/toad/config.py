@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from kaggriculture.constants import BOARD_SIZE
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     CLIP_GRADS,
@@ -34,6 +35,9 @@ from kaggriculture.learn.toad_reward import MONEY_WEIGHT
 from kaggriculture.sim.state import CROP_NAMES, PRODUCT_NAMES, SHED_NAMES
 
 Precision = Literal["32-true", "bf16-mixed"]
+# The largest centered odd window no wider than the board declares the amount
+# of edge padding this implementation supports; the 7x7 default remains inside it.
+MAX_LOCAL_PATCH_SIZE = BOARD_SIZE - 1 if BOARD_SIZE % 2 == 0 else BOARD_SIZE
 
 
 class ModelConfig(BaseModel):
@@ -89,6 +93,8 @@ class ModelConfig(BaseModel):
             )
         if self.local_patch and self.local_patch_size % 2 == 0:
             raise ValueError("local patch size must be odd")
+        if self.local_patch and self.local_patch_size > MAX_LOCAL_PATCH_SIZE:
+            raise ValueError(f"local patch size must be at most {MAX_LOCAL_PATCH_SIZE}")
         if self.transformer and self.transformer_blocks == 0:
             raise ValueError("transformer requires positive transformer_blocks")
         if (self.transformer or self.interaction_value) and self.channels < 2:
@@ -227,7 +233,6 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "population probabilities must be nonnegative and sum to one"
             )
-        _validate_active_model(self.model)
         _validate_foundation_population(self.population)
         _validate_foundation_optimizer(self.optimizer)
         if (
@@ -258,16 +263,6 @@ class ToadConfig(BaseModel):
                 "conversion is scheduled for Stage 9"
             )
         return self
-
-
-def _validate_active_model(model: ModelConfig) -> None:
-    """Reject architecture paths not yet consumed by the active trainer."""
-    unsupported = {
-        "local_patch": model.local_patch,
-    }
-    for name, enabled in unsupported.items():
-        if enabled:
-            raise ValueError(f"{name} is not implemented in the active trainer")
 
 
 def _validate_foundation_population(population: PopulationConfig) -> None:

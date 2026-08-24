@@ -260,6 +260,8 @@ def test_feedback_state_resets_once_before_a_mid_sequence_observation(
 
 def _belief_batch(
     valid: torch.Tensor | None,
+    *,
+    local_patch: bool = False,
 ) -> tuple[ToadConfig, StatefulPolicy, LearnerBatch]:
     config = ToadConfig.model_validate(
         {
@@ -268,6 +270,8 @@ def _belief_batch(
                 "channels": 16,
                 "belief": True,
                 "belief_loss_weight": 0.25,
+                "local_patch": local_patch,
+                "local_patch_blocks": 1 if local_patch else 0,
             },
             "optimizer": {"value_warmup_batches": 0},
         }
@@ -338,6 +342,42 @@ def test_zero_valid_belief_rows_produce_finite_exact_zero() -> None:
     assert report.total.item() == 0.0
     assert report.terms["belief"].item() == 0.0
     assert report.terms["belief_valid"].item() == 0.0
+
+
+def test_padded_local_position_cannot_change_belief_loss_or_gradient() -> None:
+    """Unit-slot placeholders are not inputs to privileged belief supervision."""
+    config, baseline, batch = _belief_batch(
+        torch.tensor([True, False]), local_patch=True
+    )
+    changed = StatefulPolicy(config.model)
+    changed.load_state_dict(baseline.state_dict())
+    segment = dict(batch.segments[0])
+    positions = segment["positions"].clone()
+    positions[:, -1] = 99
+    segment["positions"] = positions
+
+    baseline_report = compute_loss(baseline, batch, config, _losses=_zero_rl_losses)
+    baseline_report.total.backward()
+    changed_report = compute_loss(
+        changed,
+        replace(batch, segments=(segment,)),
+        config,
+        _losses=_zero_rl_losses,
+    )
+    changed_report.total.backward()
+
+    assert torch.equal(changed_report.total, baseline_report.total)
+    assert torch.equal(changed_report.terms["belief"], baseline_report.terms["belief"])
+    assert baseline.belief_head.weight.grad is not None
+    assert changed.belief_head.weight.grad is not None
+    assert torch.equal(
+        changed.belief_head.weight.grad, baseline.belief_head.weight.grad
+    )
+    assert all(
+        parameter.grad is None
+        for name, parameter in changed.named_parameters()
+        if name.startswith("local_head.")
+    )
 
 
 def test_active_belief_training_rejects_missing_targets() -> None:

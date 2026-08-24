@@ -18,9 +18,11 @@ from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
 from kaggriculture.learn.toad.model import (
     ConvLSTM,
     InteractionValueHead,
+    LocalUnitHead,
     PolicyState,
     SpatialTransformer,
     StatefulPolicy,
+    extract_unit_patches,
 )
 
 
@@ -31,6 +33,195 @@ def model_inputs(batch: int = 2) -> tuple[torch.Tensor, torch.Tensor, torch.Tens
     scalars = torch.randn(batch, SCALARS, generator=generator)
     positions = torch.randint(0, 100, (batch, MAX_UNITS), generator=generator)
     return board, scalars, positions
+
+
+def test_unit_patch_is_centered_on_the_flat_position() -> None:
+    """The middle of an odd window must be the indexed board cell."""
+    features = torch.arange(BOARD_SIZE**2, dtype=torch.float32).view(
+        1, 1, BOARD_SIZE, BOARD_SIZE
+    )
+
+    patch = extract_unit_patches(
+        features,
+        torch.tensor([[5 * BOARD_SIZE + 4]]),
+        size=7,
+    )
+
+    assert patch.shape == (1, 1, 2, 7, 7)
+    assert patch[0, 0, 0, 3, 3] == 54
+    assert patch[0, 0, 0, 0, 0] == 21
+    assert not patch[0, 0, 1].any()
+
+
+@pytest.mark.parametrize(
+    ("position", "feature_plane", "indicator"),
+    [
+        (
+            0,
+            [[0, 0, 0], [0, 0, 1], [0, 10, 11]],
+            [[1, 1, 1], [1, 0, 0], [1, 0, 0]],
+        ),
+        (
+            9,
+            [[0, 0, 0], [8, 9, 0], [18, 19, 0]],
+            [[1, 1, 1], [0, 0, 1], [0, 0, 1]],
+        ),
+        (
+            90,
+            [[0, 80, 81], [0, 90, 91], [0, 0, 0]],
+            [[1, 0, 0], [1, 0, 0], [1, 1, 1]],
+        ),
+        (
+            99,
+            [[88, 89, 0], [98, 99, 0], [0, 0, 0]],
+            [[0, 0, 1], [0, 0, 1], [1, 1, 1]],
+        ),
+    ],
+)
+def test_corner_patches_have_exact_padding(
+    position: int,
+    feature_plane: list[list[int]],
+    indicator: list[list[int]],
+) -> None:
+    """Each corner must preserve orientation and mark only off-board cells."""
+    features = torch.arange(BOARD_SIZE**2, dtype=torch.float32).view(
+        1, 1, BOARD_SIZE, BOARD_SIZE
+    )
+
+    patch = extract_unit_patches(features, torch.tensor([[position]]), size=3)
+
+    assert torch.equal(patch[0, 0, 0], torch.tensor(feature_plane, dtype=torch.float32))
+    assert torch.equal(patch[0, 0, 1], torch.tensor(indicator, dtype=torch.float32))
+
+
+def test_padding_indicator_is_independent_of_zero_features() -> None:
+    """A real zero tile must remain distinguishable from an off-board zero."""
+    features = torch.zeros(1, 2, BOARD_SIZE, BOARD_SIZE)
+
+    edge = extract_unit_patches(features, torch.tensor([[0]]), size=7)
+    center = extract_unit_patches(features, torch.tensor([[55]]), size=7)
+
+    assert not edge[0, 0, :-1].any()
+    assert edge[0, 0, -1, :3].all()
+    assert edge[0, 0, -1, 3:, 3:].sum() == 0
+    assert not center[0, 0, -1].any()
+
+
+def test_patch_extraction_batches_multiple_units_without_cross_talk() -> None:
+    """Every batch/unit pair must gather its own integer-indexed center."""
+    features = torch.stack(
+        (
+            torch.arange(BOARD_SIZE**2).view(1, BOARD_SIZE, BOARD_SIZE),
+            torch.arange(BOARD_SIZE**2, 2 * BOARD_SIZE**2).view(
+                1, BOARD_SIZE, BOARD_SIZE
+            ),
+        )
+    ).float()
+    positions = torch.tensor([[0, 54, 99], [99, 45, 0]])
+
+    patches = extract_unit_patches(features, positions, size=9)
+
+    assert patches.shape == (2, 3, 2, 9, 9)
+    assert torch.equal(
+        patches[:, :, 0, 4, 4], torch.tensor([[0, 54, 99], [199, 145, 100]])
+    )
+
+
+@pytest.mark.parametrize(
+    ("positions", "message"),
+    [
+        (torch.zeros(1, MAX_UNITS, 1, dtype=torch.int64), "rank 2"),
+        (torch.zeros(2, MAX_UNITS, dtype=torch.int64), "batch dimension"),
+        (torch.zeros(1, MAX_UNITS, dtype=torch.float32), "integer dtype"),
+        (torch.tensor([[-1]]), "between 0 and 99"),
+        (torch.tensor([[100]]), "between 0 and 99"),
+    ],
+)
+def test_patch_extraction_rejects_invalid_positions(
+    positions: torch.Tensor, message: str
+) -> None:
+    """Malformed gather indices must fail at the public helper boundary."""
+    features = torch.zeros(1, 1, BOARD_SIZE, BOARD_SIZE)
+
+    with pytest.raises(ValueError, match=message):
+        extract_unit_patches(features, positions, size=7)
+
+
+@pytest.mark.parametrize(
+    ("size", "message"),
+    [
+        (7.0, "integer"),
+        (0, "positive"),
+        (2, "odd"),
+        (11, "at most 9"),
+    ],
+)
+def test_patch_extraction_rejects_unsupported_sizes(
+    size: int | float, message: str
+) -> None:
+    """Only positive odd windows within the declared board ceiling are valid."""
+    features = torch.zeros(1, 1, BOARD_SIZE, BOARD_SIZE)
+
+    with pytest.raises(ValueError, match=message):
+        extract_unit_patches(features, torch.zeros(1, 1, dtype=torch.int64), size)
+
+
+def test_local_unit_head_outputs_encoding_derived_dimensions() -> None:
+    """The two decisions retain their established independent option spaces."""
+    head = LocalUnitHead(channels=8, blocks=1, patch_size=7)
+    features = torch.randn(2, 8, BOARD_SIZE, BOARD_SIZE)
+    positions = torch.tensor([[0, 54, 99], [99, 45, 0]])
+
+    unit_logits, quantity_logits = head(features, positions)
+
+    assert unit_logits.shape == (2, 3, len(UNIT_OPS))
+    assert quantity_logits.shape == (2, 3, len(QUANTITIES))
+
+
+def test_local_operation_and_quantity_projections_are_independent() -> None:
+    """Changing either final projection must leave the other output untouched."""
+    torch.manual_seed(53)
+    head = LocalUnitHead(channels=8, blocks=0, patch_size=7)
+    features = torch.randn(1, 8, BOARD_SIZE, BOARD_SIZE)
+    positions = torch.tensor([[0, 54]])
+    baseline_units, baseline_quantities = head(features, positions)
+
+    with torch.no_grad():
+        head.operation.bias.add_(1.0)
+    changed_units, unchanged_quantities = head(features, positions)
+    with torch.no_grad():
+        head.quantity.bias.add_(2.0)
+    unchanged_units, changed_quantities = head(features, positions)
+
+    assert not torch.equal(changed_units, baseline_units)
+    assert torch.equal(unchanged_quantities, baseline_quantities)
+    assert torch.equal(unchanged_units, changed_units)
+    assert not torch.equal(changed_quantities, unchanged_quantities)
+
+
+def test_local_residual_preprocessing_receives_finite_gradients() -> None:
+    """Both shared preprocessing and every local residual parameter must train."""
+    head = LocalUnitHead(channels=8, blocks=2, patch_size=7)
+    features = torch.randn(2, 8, BOARD_SIZE, BOARD_SIZE, requires_grad=True)
+    positions = torch.tensor([[0, 54, 99], [99, 45, 0]])
+
+    unit_logits, quantity_logits = head(features, positions)
+    (unit_logits.square().mean() + quantity_logits.square().mean()).backward()
+
+    shared_parameters = [
+        parameter
+        for name, parameter in head.named_parameters()
+        if name.startswith(("preprocess.", "blocks."))
+    ]
+    assert shared_parameters
+    assert all(parameter.grad is not None for parameter in shared_parameters)
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in shared_parameters
+        if parameter.grad is not None
+    )
+    assert features.grad is not None
+    assert torch.count_nonzero(features.grad)
 
 
 def test_disabled_features_match_the_current_policy() -> None:
@@ -236,9 +427,7 @@ def test_interaction_value_attends_to_remote_spatial_and_global_tokens() -> None
         mlp_ratio=2,
         value_bound=0.75,
     )
-    features = torch.randn(
-        2, 16, BOARD_SIZE, BOARD_SIZE, requires_grad=True
-    )
+    features = torch.randn(2, 16, BOARD_SIZE, BOARD_SIZE, requires_grad=True)
     scalars = torch.randn(2, SCALARS, requires_grad=True)
     attended_shapes: list[tuple[torch.Size, torch.Size]] = []
 
@@ -350,19 +539,21 @@ def test_width_two_single_head_attention_config_is_valid() -> None:
 
 
 @pytest.mark.parametrize(
-    ("recurrent", "belief", "transformer", "interaction_value"),
+    ("recurrent", "belief", "transformer", "local_patch", "interaction_value"),
     [
-        (False, False, True, False),
-        (False, False, False, True),
-        (False, True, True, True),
-        (True, False, True, True),
-        (True, True, True, True),
+        (False, False, False, True, False),
+        (False, False, True, False, False),
+        (False, False, False, False, True),
+        (False, True, True, True, True),
+        (True, False, True, True, True),
+        (True, True, True, True, True),
     ],
 )
-def test_optional_attention_combinations_preserve_time_major_shapes(
+def test_optional_model_combinations_preserve_time_major_shapes(
     recurrent: bool,
     belief: bool,
     transformer: bool,
+    local_patch: bool,
     interaction_value: bool,
 ) -> None:
     """Every supported optional composition must retain time and batch axes."""
@@ -375,6 +566,8 @@ def test_optional_attention_combinations_preserve_time_major_shapes(
             "belief": belief,
             "transformer": transformer,
             "transformer_blocks": 1 if transformer else 0,
+            "local_patch": local_patch,
+            "local_patch_blocks": 1,
             "interaction_value": interaction_value,
         }
     )
@@ -397,7 +590,7 @@ def test_optional_attention_combinations_preserve_time_major_shapes(
 
 
 def test_combined_attention_policy_trains_every_enabled_component() -> None:
-    """Spatial, interaction, recurrent, and belief parameters all receive gradients."""
+    """Every optional component receives finite gradients in one composition."""
     config = ModelConfig.model_validate(
         {
             "blocks": 1,
@@ -408,6 +601,8 @@ def test_combined_attention_policy_trains_every_enabled_component() -> None:
             "belief_feedback": True,
             "transformer": True,
             "transformer_blocks": 1,
+            "local_patch": True,
+            "local_patch_blocks": 1,
             "interaction_value": True,
         }
     )
@@ -425,7 +620,13 @@ def test_combined_attention_policy_trains_every_enabled_component() -> None:
     )
     loss.backward()
 
-    for prefix in ("recurrent.", "transformer.", "belief_head.", "interaction_value."):
+    for prefix in (
+        "recurrent.",
+        "transformer.",
+        "belief_head.",
+        "local_head.",
+        "interaction_value.",
+    ):
         gradients = [
             parameter.grad
             for name, parameter in policy.named_parameters()
@@ -438,6 +639,58 @@ def test_combined_attention_policy_trains_every_enabled_component() -> None:
             for gradient in gradients
             if gradient is not None
         )
+
+
+def test_local_patch_changes_only_unit_readouts_from_the_control_paths() -> None:
+    """Market and control-value heads must remain byte-identical when local is on."""
+    torch.manual_seed(71)
+    control = Policy(blocks=1, channels=16, value_bound=1.0)
+    config = ModelConfig.control(blocks=1, channels=16).model_copy(
+        update={"local_patch": True, "local_patch_blocks": 1}
+    )
+    local = StatefulPolicy(config)
+    local.control.load_state_dict(control.state_dict())
+    board, scalars, positions = recurrent_inputs(time=2, batch=2)
+
+    expected = control(
+        board.flatten(0, 1), scalars.flatten(0, 1), positions.flatten(0, 1)
+    )
+    output = local(board, scalars, positions)
+
+    torch.testing.assert_close(
+        output.market_logits.flatten(0, 1), expected[2], atol=2e-7, rtol=0
+    )
+    assert torch.equal(output.values.flatten(), expected[3])
+
+
+def test_local_patch_receives_post_transformer_features() -> None:
+    """Patch extraction must follow, rather than bypass, spatial attention."""
+    config = ModelConfig.model_validate(
+        {
+            "blocks": 1,
+            "channels": 16,
+            "transformer": True,
+            "transformer_blocks": 1,
+            "local_patch": True,
+            "local_patch_blocks": 1,
+        }
+    )
+    policy = StatefulPolicy(config)
+    board, scalars, positions = recurrent_inputs(time=2, batch=1)
+    transformed: list[torch.Tensor] = []
+    local_inputs: list[torch.Tensor] = []
+
+    transformer_hook = policy.transformer.register_forward_hook(
+        lambda _module, _args, output: transformed.append(output.detach())
+    )
+    local_hook = policy.local_head.register_forward_pre_hook(
+        lambda _module, args: local_inputs.append(args[0].detach())
+    )
+    policy(board, scalars, positions)
+    transformer_hook.remove()
+    local_hook.remove()
+
+    assert torch.equal(torch.stack(transformed).flatten(0, 1), local_inputs[0])
 
 
 def test_recurrent_policy_accepts_time_major_inputs_and_keeps_layered_state() -> None:
@@ -611,6 +864,7 @@ def test_policy_state_reset_clears_all_terminal_components_before_a_step() -> No
             "at least 2",
         ),
         ({"local_patch": True, "local_patch_size": 6}, "must be odd"),
+        ({"local_patch": True, "local_patch_size": 11}, "at most 9"),
         ({"recurrent_layers": 0}, "greater than 0"),
         (
             {"belief": True, "belief_size": 9},
@@ -626,22 +880,8 @@ def test_optional_model_dimensions_are_validated(
         ModelConfig.model_validate(override)
 
 
-@pytest.mark.parametrize(
-    "model",
-    [
-        {"local_patch": True},
-    ],
-)
-def test_active_trainer_rejects_unimplemented_optional_model_paths(
-    model: dict[str, object],
-) -> None:
-    """Inactive architecture paths cannot be silently ignored by Lightning."""
-    with pytest.raises(ValidationError, match="not implemented in the active trainer"):
-        ToadConfig.model_validate({"model": model})
-
-
-def test_active_trainer_accepts_attention_paths_but_keeps_local_patch_gated() -> None:
-    """Task 5 relaxes only the transformer and interaction-value stage gates."""
+def test_active_trainer_accepts_every_implemented_optional_model_path() -> None:
+    """Task 6 relaxes the final architecture gate only after local integration."""
     config = ToadConfig.model_validate(
         {
             "model": {
@@ -650,6 +890,8 @@ def test_active_trainer_accepts_attention_paths_but_keeps_local_patch_gated() ->
                 "belief_feedback": True,
                 "transformer": True,
                 "transformer_blocks": 1,
+                "local_patch": True,
+                "local_patch_blocks": 1,
                 "interaction_value": True,
             }
         }
@@ -658,6 +900,5 @@ def test_active_trainer_accepts_attention_paths_but_keeps_local_patch_gated() ->
     assert config.model.recurrent
     assert config.model.belief
     assert config.model.transformer
+    assert config.model.local_patch
     assert config.model.interaction_value
-    with pytest.raises(ValidationError, match="not implemented in the active trainer"):
-        ToadConfig.model_validate({"model": {"local_patch": True}})

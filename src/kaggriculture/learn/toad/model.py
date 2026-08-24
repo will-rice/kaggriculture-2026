@@ -15,8 +15,103 @@ import torch
 
 from kaggriculture.constants import BOARD_SIZE
 from kaggriculture.learn.encoding import MARKET_SLOTS, QUANTITIES, SCALARS, UNIT_OPS
-from kaggriculture.learn.model import Policy
-from kaggriculture.learn.toad.config import ModelConfig
+from kaggriculture.learn.model import Policy, Residual
+from kaggriculture.learn.toad.config import MAX_LOCAL_PATCH_SIZE, ModelConfig
+
+
+def _validate_local_patch_size(size: int) -> None:
+    """Validate one public or configured local window size."""
+    if isinstance(size, bool) or not isinstance(size, int):
+        raise ValueError("local patch size must be an integer")
+    if size <= 0:
+        raise ValueError("local patch size must be positive")
+    if size % 2 == 0:
+        raise ValueError("local patch size must be odd")
+    if size > MAX_LOCAL_PATCH_SIZE:
+        raise ValueError(f"local patch size must be at most {MAX_LOCAL_PATCH_SIZE}")
+
+
+def _validate_patch_inputs(features: torch.Tensor, positions: torch.Tensor) -> None:
+    """Validate feature-map and integer-position tensor schemas."""
+    if features.ndim != 4:
+        raise ValueError("local patch features must have rank 4")
+    batch, _channels, height, width = features.shape
+    if (height, width) != (BOARD_SIZE, BOARD_SIZE):
+        raise ValueError(
+            "local patch features require a "
+            f"{BOARD_SIZE}x{BOARD_SIZE} map, got {height}x{width}"
+        )
+    if positions.ndim != 2:
+        raise ValueError("local patch positions must have rank 2")
+    if positions.shape[0] != batch:
+        raise ValueError("local patch positions batch dimension must match features")
+    integer_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64)
+    if positions.dtype not in integer_dtypes:
+        raise ValueError("local patch positions must have an integer dtype")
+    if positions.device != features.device:
+        raise ValueError("local patch positions must be on the features device")
+    if positions.numel() and (
+        torch.any(positions < 0) or torch.any(positions >= BOARD_SIZE * BOARD_SIZE)
+    ):
+        raise ValueError(
+            f"local patch positions must be between 0 and {BOARD_SIZE * BOARD_SIZE - 1}"
+        )
+
+
+def extract_unit_patches(
+    features: torch.Tensor, positions: torch.Tensor, size: int
+) -> torch.Tensor:
+    """Gather centered odd local windows with an out-of-bounds indicator plane."""
+    _validate_local_patch_size(size)
+    _validate_patch_inputs(features, positions)
+    batch, channels, _height, _width = features.shape
+
+    radius = size // 2
+    spatial = torch.nn.functional.pad(features, (radius,) * 4)
+    indicator = torch.nn.functional.pad(
+        features.new_zeros(batch, 1, BOARD_SIZE, BOARD_SIZE),
+        (radius,) * 4,
+        value=1,
+    )
+    padded = torch.cat((spatial, indicator), dim=1)
+    windows = torch.nn.functional.unfold(padded, kernel_size=size)
+    indices = positions.to(dtype=torch.int64)[:, None, :].expand(
+        -1, windows.shape[1], -1
+    )
+    selected = windows.gather(2, indices).transpose(1, 2)
+    return selected.reshape(batch, positions.shape[1], channels + 1, size, size)
+
+
+class LocalUnitHead(torch.nn.Module):
+    """Shared residual patch processing with independent unit decision heads."""
+
+    def __init__(self, channels: int, blocks: int, patch_size: int) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError("local patch channels must be positive")
+        if blocks < 0:
+            raise ValueError("local patch blocks must be nonnegative")
+        _validate_local_patch_size(patch_size)
+        self.patch_size = patch_size
+        self.preprocess = torch.nn.Sequential(
+            torch.nn.Conv2d(channels + 1, channels, kernel_size=3, padding=1),
+            torch.nn.ReLU(),
+        )
+        self.blocks = torch.nn.ModuleList(Residual(channels) for _ in range(blocks))
+        self.operation = torch.nn.Linear(channels, len(UNIT_OPS))
+        self.quantity = torch.nn.Linear(channels, len(QUANTITIES))
+
+    def forward(
+        self, features: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return operation and quantity logits for every supplied unit slot."""
+        patches = extract_unit_patches(features, positions, self.patch_size)
+        batch, units = patches.shape[:2]
+        local = self.preprocess(patches.flatten(0, 1))
+        for block in self.blocks:
+            local = block(local)
+        pooled = local.mean(dim=(-2, -1)).view(batch, units, -1)
+        return self.operation(pooled), self.quantity(pooled)
 
 
 @dataclass(frozen=True)
@@ -193,9 +288,7 @@ class _TransformerBlock(torch.nn.Module):
     def __init__(self, channels: int, heads: int, mlp_ratio: int) -> None:
         super().__init__()
         self.attention_norm = torch.nn.LayerNorm(channels)
-        self.attention = torch.nn.MultiheadAttention(
-            channels, heads, batch_first=True
-        )
+        self.attention = torch.nn.MultiheadAttention(channels, heads, batch_first=True)
         self.mlp_norm = torch.nn.LayerNorm(channels)
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(channels, channels * mlp_ratio),
@@ -215,9 +308,7 @@ class _TransformerBlock(torch.nn.Module):
         return tokens + self.mlp(self.mlp_norm(tokens))
 
 
-def _validate_attention_dimensions(
-    channels: int, heads: int, mlp_ratio: int
-) -> None:
+def _validate_attention_dimensions(channels: int, heads: int, mlp_ratio: int) -> None:
     """Reject malformed attention dimensions at the standalone module boundary."""
     if channels <= 0 or heads <= 0 or mlp_ratio <= 0:
         raise ValueError("attention channels, heads, and mlp_ratio must be positive")
@@ -230,9 +321,7 @@ def _validate_attention_dimensions(
 class SpatialTransformer(torch.nn.Module):
     """Pre-normalized attention over the explicit 10x10 spatial token grid."""
 
-    def __init__(
-        self, channels: int, blocks: int, heads: int, mlp_ratio: int
-    ) -> None:
+    def __init__(self, channels: int, blocks: int, heads: int, mlp_ratio: int) -> None:
         super().__init__()
         _validate_attention_dimensions(channels, heads, mlp_ratio)
         if blocks <= 0:
@@ -249,8 +338,7 @@ class SpatialTransformer(torch.nn.Module):
         batch, channels, height, width = features.shape
         if (height, width) != (BOARD_SIZE, BOARD_SIZE):
             raise ValueError(
-                "spatial transformer requires a 10x10 map, got "
-                f"{height}x{width}"
+                f"spatial transformer requires a 10x10 map, got {height}x{width}"
             )
         tokens = features.flatten(2).transpose(1, 2) + self.position
         for block in self.blocks:
@@ -285,9 +373,7 @@ class InteractionValueHead(torch.nn.Module):
         self.global_projection = torch.nn.Linear(global_features, channels)
         self.query_norm = torch.nn.LayerNorm(channels)
         self.context_norm = torch.nn.LayerNorm(channels)
-        self.attention = torch.nn.MultiheadAttention(
-            channels, heads, batch_first=True
-        )
+        self.attention = torch.nn.MultiheadAttention(channels, heads, batch_first=True)
         self.mlp_norm = torch.nn.LayerNorm(channels)
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(channels, channels * mlp_ratio),
@@ -303,8 +389,7 @@ class InteractionValueHead(torch.nn.Module):
         batch, _channels, height, width = features.shape
         if (height, width) != (BOARD_SIZE, BOARD_SIZE):
             raise ValueError(
-                "interaction value requires a 10x10 map, got "
-                f"{height}x{width}"
+                f"interaction value requires a 10x10 map, got {height}x{width}"
             )
         spatial = features.flatten(2).transpose(1, 2)
         global_token = self.global_projection(global_features).unsqueeze(1)
@@ -325,6 +410,7 @@ def uses_stateful_policy(config: ModelConfig) -> bool:
         (
             config.recurrent,
             config.transformer,
+            config.local_patch,
             config.belief,
             config.interaction_value,
         )
@@ -375,6 +461,12 @@ class StatefulPolicy(torch.nn.Module):
             self.belief_head = torch.nn.Linear(config.channels, config.belief_size)
         if config.belief_feedback:
             self.feedback = torch.nn.Linear(config.belief_size, config.channels)
+        if config.local_patch:
+            self.local_head = LocalUnitHead(
+                config.channels,
+                config.local_patch_blocks,
+                config.local_patch_size,
+            )
         if config.interaction_value:
             self.interaction_value = InteractionValueHead(
                 config.channels,
@@ -545,6 +637,17 @@ class StatefulPolicy(torch.nn.Module):
                     f"policy {name} state must match the input device and dtype"
                 )
 
+    def _unit_readouts(
+        self, features: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use either exact control columns or configured local patches."""
+        if self.config.local_patch:
+            return self.local_head(features, positions)
+        columns = features.flatten(2)
+        wanted = positions[:, None, :].tile(1, columns.shape[1], 1)
+        gathered = columns.gather(2, wanted).transpose(1, 2)
+        return self.control.head(gathered), self.control.quantity_head(gathered)
+
     def forward(
         self,
         board: torch.Tensor,
@@ -584,13 +687,9 @@ class StatefulPolicy(torch.nn.Module):
 
         flat_features = torch.stack(feature_steps).flatten(0, 1)
         flat_positions = positions.flatten(0, 1)
-        columns = flat_features.flatten(2)
-        wanted = flat_positions[:, None, :].tile(1, columns.shape[1], 1)
-        gathered = columns.gather(2, wanted).transpose(1, 2)
-        units = self.control.head(gathered).view(time, batch, -1, len(UNIT_OPS))
-        quantities = self.control.quantity_head(gathered).view(
-            time, batch, -1, len(QUANTITIES)
-        )
+        flat_units, flat_quantities = self._unit_readouts(flat_features, flat_positions)
+        units = flat_units.view(time, batch, -1, len(UNIT_OPS))
+        quantities = flat_quantities.view(time, batch, -1, len(QUANTITIES))
         pooled = flat_features.mean(dim=(2, 3))
         market = self.control.trade_head(pooled).view(
             time, batch, len(MARKET_SLOTS) + 2, len(QUANTITIES)
