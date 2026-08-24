@@ -411,6 +411,27 @@ def test_snapshot_store_retains_evicted_members_for_checkpoint_generations(
     assert len(list(tmp_path.glob("manifest-*.json"))) == 2
 
 
+def test_snapshot_gc_prunes_only_outside_caller_retained_generations(
+    tmp_path: Path,
+) -> None:
+    """Explicit retention protects every member named by a live checkpoint."""
+    store = SnapshotStore(tmp_path, capacity=1, structure="model-v1")
+    first = store.add(state_dict(1.0), environment_steps=1, round_id=1, run_id="run")
+    first_manifest = store.manifest
+    second = store.add(state_dict(2.0), environment_steps=2, round_id=2, run_id="run")
+
+    assert (
+        store.prune_unreferenced(retained_authoritative_generations=(first_manifest,))
+        == ()
+    )
+    removed = store.prune_unreferenced(retained_authoritative_generations=())
+
+    assert first.path in removed
+    assert not first.path.exists()
+    assert second.path.exists()
+    assert store.load(second)["weight"].item() == 2.0
+
+
 @pytest.mark.parametrize(
     "kind",
     ["absolute", "traversal", "nested", "wrong_steps", "wrong_digest"],

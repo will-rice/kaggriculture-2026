@@ -21,7 +21,8 @@ from kaggriculture.learn.toad.population import SnapshotManifest, SnapshotStore
 class _DataModule:
     """Record actor publications without replacing callback behavior."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: ToadConfig | None = None) -> None:
+        self.config = config
         self.published: list[tuple[dict[str, torch.Tensor], int]] = []
         self.manifests: list[SnapshotManifest] = []
 
@@ -30,6 +31,33 @@ class _DataModule:
 
     def publish_manifest(self, manifest: SnapshotManifest) -> None:
         self.manifests.append(manifest)
+
+    def materialize_population_bootstrap(
+        self,
+        store: SnapshotStore,
+        actor_state: dict[str, torch.Tensor],
+        *,
+        environment_steps: int,
+        round_id: int,
+        run_id: str,
+    ) -> None:
+        """Mirror rank-zero bootstrap writes for callback-only tests."""
+        if self.config is None:
+            return
+        for path in self.config.population.initial_snapshots:
+            store.add(
+                torch.load(path, map_location="cpu", weights_only=True),
+                environment_steps=environment_steps,
+                round_id=round_id,
+                run_id=f"initial:{path}",
+            )
+        if self.config.population.snapshot_at_start:
+            store.add(
+                actor_state,
+                environment_steps=environment_steps,
+                round_id=round_id,
+                run_id=f"{run_id}:actor-at-start",
+            )
 
 
 class _Trainer:
@@ -258,7 +286,7 @@ def test_population_snapshot_is_boundary_only_and_resume_stable(
         }
     )
     module = ToadLightningModule(config)
-    data = _DataModule()
+    data = _DataModule(config)
     trainer = _Trainer(data)
     callback = PopulationSnapshotCallback()
     callback.on_fit_start(
@@ -295,7 +323,7 @@ def test_population_snapshot_is_boundary_only_and_resume_stable(
 
     resumed = ToadLightningModule(config)
     resumed.on_load_checkpoint(checkpoint)
-    resumed_data = _DataModule()
+    resumed_data = _DataModule(config)
     resumed_trainer = _Trainer(resumed_data)
     resumed_callback = PopulationSnapshotCallback()
     resumed_callback.on_fit_start(
@@ -329,7 +357,7 @@ def test_population_snapshot_at_start_is_published_before_collection(
         }
     )
     module = ToadLightningModule(config)
-    data = _DataModule()
+    data = _DataModule(config)
     trainer = _Trainer(data)
 
     PopulationSnapshotCallback().on_fit_start(
@@ -349,7 +377,7 @@ def test_collection_bootstrap_manifest_is_captured_at_first_boundary(
         update={"runtime": base.runtime.model_copy(update={"output_dir": tmp_path})}
     )
     module = ToadLightningModule(config)
-    data = _DataModule()
+    data = _DataModule(config)
     trainer = _Trainer(data)
     callback = PopulationSnapshotCallback()
     callback.on_fit_start(
@@ -398,7 +426,7 @@ def test_snapshot_only_cadence_writes_the_latest_authoritative_checkpoint(
         }
     )
     module = ToadLightningModule(config)
-    data = _DataModule()
+    data = _DataModule(config)
 
     class CheckpointingTrainer(_Trainer):
         def save_checkpoint(self, path: str) -> None:
@@ -444,7 +472,7 @@ def test_snapshot_only_cadence_writes_the_latest_authoritative_checkpoint(
     assert resumed.environment_steps == 100
     assert resumed.population_manifest == module.population_manifest
 
-    resumed_data = _DataModule()
+    resumed_data = _DataModule(config)
     resumed_trainer = _Trainer(resumed_data)
     PopulationSnapshotCallback().on_fit_start(
         _lightning_trainer(resumed_trainer),

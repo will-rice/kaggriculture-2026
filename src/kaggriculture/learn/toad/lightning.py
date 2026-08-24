@@ -393,6 +393,49 @@ class NonFiniteProvenance:
             "state_norms": self.state_norms,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> Self:
+        """Validate gathered primitives into canonical bad-rank provenance."""
+        batch_kind = payload.get("batch_kind")
+        game_ids = payload.get("game_ids")
+        opponent_digests = payload.get("opponent_digests")
+        actor_version = payload.get("actor_version")
+        precision = payload.get("precision")
+        state_norms = payload.get("state_norms")
+        if (
+            not isinstance(batch_kind, str)
+            or not isinstance(game_ids, (tuple, list))
+            or not all(
+                isinstance(item, int) and not isinstance(item, bool)
+                for item in game_ids
+            )
+            or not isinstance(opponent_digests, (tuple, list))
+            or not all(
+                item is None or isinstance(item, str) for item in opponent_digests
+            )
+            or not isinstance(actor_version, int)
+            or isinstance(actor_version, bool)
+            or actor_version < 0
+            or not isinstance(precision, str)
+            or not isinstance(state_norms, Mapping)
+        ):
+            raise ValueError("distributed non-finite provenance is malformed")
+        norms = {
+            str(name): float(value)
+            for name, value in state_norms.items()
+            if isinstance(name, str) and isinstance(value, (int, float))
+        }
+        if len(norms) != len(state_norms):
+            raise ValueError("distributed non-finite state norms are malformed")
+        return cls(
+            batch_kind=batch_kind,
+            game_ids=tuple(cast(Sequence[int], game_ids)),
+            opponent_digests=tuple(cast(Sequence[str | None], opponent_digests)),
+            actor_version=actor_version,
+            precision=precision,
+            state_norms=norms,
+        )
+
 
 class NonFiniteTrainingError(RuntimeError):
     """A finite-check failure with collection provenance for recovery and triage."""
@@ -447,12 +490,19 @@ class NonFiniteTrainingError(RuntimeError):
         fallback: NonFiniteProvenance,
     ) -> Self:
         """Render identical gathered bad-rank provenance on every process."""
+        del fallback
         failures = [detail for detail in details if detail is not None]
         if not failures:
             raise ValueError("distributed non-finite error requires a bad rank")
-        first = failures[0]
+        first = min(failures, key=lambda detail: int(cast(int, detail["rank"])))
         names = [str(name) for name in cast(Sequence[object], first["tensor_names"])]
-        error = cls.from_provenance(names, fallback)
+        provenance_payload = first.get("provenance")
+        if not isinstance(provenance_payload, Mapping):
+            raise ValueError("distributed non-finite provenance is malformed")
+        provenance = NonFiniteProvenance.from_dict(
+            cast(Mapping[str, object], provenance_payload)
+        )
+        error = cls.from_provenance(names, provenance)
         error.distributed_details = tuple(details)
         error.args = (f"{error.args[0]}; distributed_details={tuple(details)!r}",)
         return error
@@ -727,9 +777,24 @@ class RoundMetricAccumulator:
             value = float(raw)
             finite = math.isfinite(value)
             reduction: Literal["mean", "sum", "max"] = "mean"
+            total: float = value
+            count = int(finite)
+            opponent_return = "collection/return_by_opponent/"
+            if name.startswith(opponent_return):
+                suffix = name.removeprefix(opponent_return)
+                total = float(
+                    self.initial.get(
+                        f"collection/return_sum_by_opponent/{suffix}", value
+                    )
+                )
+                count = int(
+                    self.initial.get(f"collection/return_count_by_opponent/{suffix}", 1)
+                )
             if (
                 name.startswith("collection/games/")
                 or name.startswith("collection/games_by_opponent/")
+                or name.startswith("collection/return_sum_by_opponent/")
+                or name.startswith("collection/return_count_by_opponent/")
                 or name.startswith("diag/n_")
                 or name == "diag/illegal"
             ):
@@ -738,8 +803,8 @@ class RoundMetricAccumulator:
                 reduction = "max"
             add(
                 name,
-                value if finite else (float("-inf") if reduction == "max" else 0.0),
-                int(finite),
+                total if finite else (float("-inf") if reduction == "max" else 0.0),
+                count if finite else 0,
                 reduction,
             )
         for kind in _ONLINE_BATCH_KINDS:
@@ -753,10 +818,10 @@ class RoundMetricAccumulator:
             if tensors:
                 add(name, torch.stack(tensors).sum(), len(tensors))
         for name in ("operation", "quantity", "market"):
-            total = self.mask_sums.get(name)
-            count = self.mask_counts.get(name)
-            if total is not None and count is not None:
-                add(f"mask/{name}_density", total, count)
+            mask_total = self.mask_sums.get(name)
+            mask_count = self.mask_counts.get(name)
+            if mask_total is not None and mask_count is not None:
+                add(f"mask/{name}_density", mask_total, mask_count)
         for name in ("hidden", "cell"):
             tensors = self.state_norms[name]
             if tensors:
@@ -1341,15 +1406,14 @@ def compute_loss(  # noqa: C901
 
 
 def round_decay(config: ToadConfig) -> Callable[[int], float]:
-    """Return the control schedule keyed to one step per collection round."""
-    from kaggriculture.learn.scripts.toad import _decay
+    """Return LR multiplier keyed only to reduced global environment steps."""
+    total = config.runtime.total_environment_steps
+    floor = config.optimizer.final_lr_multiplier
 
-    return _decay(
-        config.population.scripted,
-        total_steps=config.runtime.total_environment_steps,
-        environments=config.population.environments_per_rank,
-        min_lr_multiplier=config.optimizer.final_lr_multiplier,
-    )
+    def decay(environment_steps: int) -> float:
+        return max(1.0 - environment_steps / total, floor)
+
+    return decay
 
 
 def _canonicalize_policy_checkpoint(
@@ -1610,7 +1674,7 @@ class ToadLightningModule(lightning.LightningModule):
                 "tensor_names": tuple(tensor_names),
                 "provenance": provenance.as_dict(),
             }
-        gathered = _all_gather_objects(local_detail, world_size)
+        gathered = _all_gather_objects(local_detail, world_size, allow_none=True)
         details = tuple(
             cast(Mapping[str, object] | None, detail) for detail in gathered
         )
@@ -1971,9 +2035,10 @@ class ToadLightningModule(lightning.LightningModule):
         }
 
     def lr_scheduler_step(self, scheduler: LRScheduler, metric: object | None) -> None:
-        """Advance LR exactly once when an optimizer step closes a round."""
+        """Set LR from the reduced global environment boundary once per round."""
+        del metric
         if self._round_ended:
-            scheduler.step()
+            scheduler.step(self.environment_steps)
 
     def on_save_checkpoint(self, checkpoint: dict[str, object]) -> None:
         """Extend Lightning's authoritative state with Toad's logical clocks."""

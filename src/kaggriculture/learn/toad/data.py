@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import time
+import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -264,6 +265,19 @@ class DistributedRoundMismatch(RuntimeError):  # noqa: N818
     """Ranks cannot safely enter DDP with different logical round shapes."""
 
 
+class DistributedCollectionError(RuntimeError):
+    """At least one rank failed before a collected round became safe to yield."""
+
+    def __init__(self, details: Sequence[Mapping[str, object]]) -> None:
+        self.distributed_details = tuple(details)
+        rendered = "; ".join(
+            f"rank={detail.get('rank')} {detail.get('type')}: "
+            f"{detail.get('message')}\n{detail.get('traceback')}"
+            for detail in self.distributed_details
+        )
+        super().__init__("distributed collection failed: " + rendered)
+
+
 def expected_round_batch_counts(config: ToadConfig) -> RoundBatchCounts:
     """Derive one rank's exact optimizer quotas before collection starts."""
     counts = _round_counts(config)
@@ -331,7 +345,12 @@ def validate_distributed_round_signatures(
         raise DistributedRoundMismatch("distributed round mismatch: " + rendered)
 
 
-def _all_gather_objects(local: object, world_size: int) -> tuple[object, ...]:
+def _all_gather_objects(
+    local: object,
+    world_size: int,
+    *,
+    allow_none: bool = False,
+) -> tuple[object, ...]:
     """Gather one small boundary payload through the initialized process group."""
     if world_size == 1:
         return (local,)
@@ -341,7 +360,7 @@ def _all_gather_objects(local: object, world_size: int) -> tuple[object, ...]:
         )
     gathered: list[object | None] = [None] * world_size
     torch.distributed.all_gather_object(gathered, local)
-    if any(item is None for item in gathered):
+    if not allow_none and any(item is None for item in gathered):
         raise DistributedRoundMismatch("distributed round gather returned no payload")
     return tuple(gathered)
 
@@ -849,7 +868,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         self._round_validator = validator
 
     def _ensure_initial_pool(self) -> None:
-        """Materialize declared first-round snapshots before opponent selection."""
+        """Require fit-start to install bootstrap population without local writes."""
         population = self.config.population
         structure = structural_fingerprint(self.config)
         if self.pool is not None and self.pool.manifest.entries:
@@ -860,35 +879,9 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             return
         if not population.initial_snapshots and not population.snapshot_at_start:
             return
-
-        initial: list[tuple[dict[str, torch.Tensor], str]] = []
-        for path in population.initial_snapshots:
-            state = _checkpoint_policy_state(path)
-            _strictly_validate_policy_state(self.config.model, state)
-            initial.append((state, f"initial:{path}"))
-        if population.snapshot_at_start:
-            if not self.actor_state:
-                raise RuntimeError(
-                    "snapshot_at_start requires a published actor before collection"
-                )
-            _strictly_validate_policy_state(self.config.model, self.actor_state)
-            initial.append((dict(self.actor_state), "actor-at-start"))
-
-        store = SnapshotStore(
-            self.config.runtime.output_dir / "population",
-            capacity=population.pool_capacity,
-            structure=structure,
-        )
-        for index, (state, run_id) in enumerate(initial):
-            store.add(
-                state,
-                environment_steps=index,
-                round_id=0,
-                run_id=run_id,
-            )
-        self.pool = SnapshotPool.from_store(
-            store,
-            seed=population.population_seed,
+        raise RuntimeError(
+            "population bootstrap was not installed by the coordinated fit-start "
+            "boundary"
         )
 
     def publish_actor(
@@ -1060,11 +1053,25 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 raise EmptySnapshotPoolError(
                     "frozen opponent requested before pool population"
                 )
-            matches = [
+            identity_matches = [
                 entry
                 for entry in self.pool.manifest.entries
                 if entry.sha256 == binding.sha256 and entry.path == binding.checkpoint
             ]
+            matches = identity_matches
+            if len(matches) > 1:
+                matches = [
+                    entry
+                    for entry in identity_matches
+                    if all(
+                        assignment.opponent_id
+                        == (
+                            f"snapshot:{entry.run_id}:{entry.environment_steps}:"
+                            f"{entry.sha256[:12]}"
+                        )
+                        for assignment in group
+                    )
+                ]
             if len(matches) != 1:
                 raise SnapshotIntegrityError(
                     "selected frozen opponent is not in the bound pool: "
@@ -1164,8 +1171,8 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             f"opponent={assignment.opponent_id}"
         )
 
-    def __iter__(self) -> Iterator[LearnerBatch]:
-        """Collect one assignment set, then expose it as one logical round."""
+    def _iter_local_round(self) -> Iterator[LearnerBatch]:
+        """Materialize one local round without entering distributed collectives."""
         self._ensure_initial_pool()
         assignments = self._assignments
         generated = assignments is None
@@ -1306,18 +1313,25 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             )
         for opponent_id, opponent_rows in opponent_groups.items():
             safe_id = opponent_id.replace("/", "_")
+            returns = torch.stack(
+                [
+                    getattr(trajectory, self.config.curriculum.reward_field)
+                    .float()
+                    .sum()
+                    for trajectory in opponent_rows
+                ]
+            )
             collection_metrics[f"collection/games_by_opponent/{safe_id}"] = len(
                 opponent_game_ids[opponent_id]
             )
             collection_metrics[f"collection/return_by_opponent/{safe_id}"] = float(
-                torch.stack(
-                    [
-                        getattr(trajectory, self.config.curriculum.reward_field)
-                        .float()
-                        .sum()
-                        for trajectory in opponent_rows
-                    ]
-                ).mean()
+                returns.mean()
+            )
+            collection_metrics[f"collection/return_sum_by_opponent/{safe_id}"] = float(
+                returns.sum()
+            )
+            collection_metrics[f"collection/return_count_by_opponent/{safe_id}"] = len(
+                opponent_rows
             )
 
         batches = tuple(
@@ -1330,8 +1344,6 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 round_metrics=collection_metrics,
             )
         )
-        if self._round_validator is not None:
-            self._round_validator(batches, round_id)
         if not batches:
             raise CollectionError(
                 f"collection round {round_id} produced no complete learner batches"
@@ -1342,6 +1354,41 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
                 + self.config.population.environments_per_rank * self.world_size
             )
         self._next_round_id = round_id + 1
+        yield from batches
+
+    def __iter__(self) -> Iterator[LearnerBatch]:
+        """Acknowledge full local materialization before any batch-shape gather."""
+        if self.world_size == 1:
+            batches = tuple(self._iter_local_round())
+        else:
+            local_error: Exception | None = None
+            local_traceback = ""
+            try:
+                batches = tuple(self._iter_local_round())
+            except Exception as error:
+                batches = ()
+                local_error = error
+                local_traceback = traceback.format_exc()
+            status: dict[str, object] = {
+                "ok": local_error is None,
+                "rank": self.global_rank,
+                "type": None if local_error is None else type(local_error).__name__,
+                "message": None if local_error is None else str(local_error),
+                "traceback": local_traceback,
+            }
+            gathered = _all_gather_objects(status, self.world_size)
+            failures = tuple(
+                cast(Mapping[str, object], item)
+                for item in gathered
+                if isinstance(item, Mapping) and not bool(item.get("ok"))
+            )
+            if failures:
+                distributed = DistributedCollectionError(failures)
+                if local_error is not None:
+                    raise distributed from local_error
+                raise distributed
+        if self._round_validator is not None:
+            self._round_validator(batches, self._next_round_id - 1)
         yield from batches
 
 
@@ -1422,6 +1469,48 @@ class ToadDataModule(lightning.LightningDataModule):
             },
             version,
         )
+
+    def materialize_population_bootstrap(
+        self,
+        store: SnapshotStore,
+        actor_state: Mapping[str, torch.Tensor],
+        *,
+        environment_steps: int,
+        round_id: int,
+        run_id: str,
+    ) -> None:
+        """Materialize every configured bootstrap source in rank-zero order."""
+        existing_run_ids = {entry.run_id for entry in store.manifest.entries}
+        for path in self.config.population.initial_snapshots:
+            initial_run_id = f"initial:{path}"
+            if initial_run_id in existing_run_ids:
+                continue
+            state = _checkpoint_policy_state(path)
+            _strictly_validate_policy_state(self.config.model, state)
+            store.add(
+                state,
+                environment_steps=environment_steps,
+                round_id=round_id,
+                run_id=initial_run_id,
+            )
+            existing_run_ids.add(initial_run_id)
+        if self.config.population.snapshot_at_start:
+            actor_run_id = f"{run_id}:actor-at-start"
+            legacy_actor_exists = any(
+                entry.run_id == run_id
+                and entry.environment_steps == environment_steps
+                and entry.round_id == round_id
+                for entry in store.manifest.entries
+            )
+            if actor_run_id in existing_run_ids or legacy_actor_exists:
+                return
+            _strictly_validate_policy_state(self.config.model, actor_state)
+            store.add(
+                actor_state,
+                environment_steps=environment_steps,
+                round_id=round_id,
+                run_id=actor_run_id,
+            )
 
     def publish_manifest(self, manifest: SnapshotManifest) -> None:
         """Bind collection to the callback's exact durable population view."""

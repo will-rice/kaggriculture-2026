@@ -12,7 +12,11 @@ from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 from kaggriculture.learn.toad.compile import policy_state_dict
 from kaggriculture.learn.toad.config import structural_fingerprint
-from kaggriculture.learn.toad.data import LearnerBatch, ToadDataModule
+from kaggriculture.learn.toad.data import (
+    LearnerBatch,
+    ToadDataModule,
+    _all_gather_objects,
+)
 from kaggriculture.learn.toad.lightning import ToadLightningModule
 from kaggriculture.learn.toad.population import (
     SnapshotIntegrityError,
@@ -23,6 +27,10 @@ from kaggriculture.learn.toad.population import (
 
 class DistributedBoundaryError(RuntimeError):
     """A rank-zero durable action failed and every rank must stop together."""
+
+    def __init__(self, message: str, details: object = None) -> None:
+        self.distributed_details = details
+        super().__init__(message)
 
 
 def _save_authoritative_checkpoint(
@@ -166,12 +174,41 @@ def _run_rank_zero_boundary(
         else None
     )
     payload = trainer.strategy.broadcast(payload, src=0)
-    _apply_boundary_payload(
-        trainer,
-        module,
-        payload,
-        include_manifest=include_manifest,
+    install_error: Exception | None = None
+    try:
+        _apply_boundary_payload(
+            trainer,
+            module,
+            payload,
+            include_manifest=include_manifest,
+        )
+    except Exception as error:
+        install_error = error
+    install_status: dict[str, object] = {
+        "ok": install_error is None,
+        "rank": int(getattr(trainer, "global_rank", 0)),
+        "type": None if install_error is None else type(install_error).__name__,
+        "message": None if install_error is None else str(install_error),
+    }
+    gathered = _all_gather_objects(install_status, world_size)
+    failures = tuple(
+        cast(Mapping[str, object], item)
+        for item in gathered
+        if isinstance(item, Mapping) and not bool(item.get("ok"))
     )
+    if failures:
+        rendered = "; ".join(
+            f"rank={failure.get('rank')} {failure.get('type')}: "
+            f"{failure.get('message')}"
+            for failure in failures
+        )
+        distributed = DistributedBoundaryError(
+            "distributed boundary install failed: " + rendered,
+            failures,
+        )
+        if install_error is not None:
+            raise distributed from install_error
+        raise distributed
 
 
 class ActorSyncCallback(lightning.Callback):
@@ -259,8 +296,13 @@ class PopulationSnapshotCallback(lightning.Callback):
             previous_manifest = module.population_manifest
             self._reopen_store(trainer, module)
             assert self.store is not None
-            if population.snapshot_at_start and not self.store.manifest.entries:
-                self._add_snapshot(module)
+            _data_module(trainer).materialize_population_bootstrap(
+                self.store,
+                policy_state_dict(module),
+                environment_steps=module.environment_steps,
+                round_id=module.collection_round,
+                run_id=module.config.curriculum.phase,
+            )
             self._publish(trainer, module)
             if module.population_manifest != previous_manifest:
                 _save_authoritative_checkpoint(

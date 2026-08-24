@@ -367,7 +367,7 @@ def sha256_file(path: Path) -> str:
 
 
 class SnapshotStore:
-    """Store immutable snapshots and publish bounded manifests atomically."""
+    """Store immutable snapshots with ``capacity`` bounding active selection only."""
 
     def __init__(self, directory: Path, *, capacity: int, structure: str) -> None:
         if capacity < 1:
@@ -464,6 +464,54 @@ class SnapshotStore:
         self._validate_entry_path(entry)
         _verify_entry(entry, self.structure)
         return _load_state_dict(entry)
+
+    def prune_unreferenced(
+        self,
+        *,
+        retained_authoritative_generations: Sequence[SnapshotManifest],
+    ) -> tuple[Path, ...]:
+        """Delete only artifacts outside the caller's complete live-checkpoint set.
+
+        ``capacity`` never triggers deletion. The caller must supply every
+        authoritative checkpoint generation still eligible for resume; the
+        active head is always retained in addition to that explicit set.
+        """
+        retained = (self.manifest, *retained_authoritative_generations)
+        protected_members: set[Path] = set()
+        protected_generations: set[Path] = set()
+        for manifest in retained:
+            generation = SnapshotStore.open_generation(
+                self.directory,
+                capacity=self.capacity,
+                structure=self.structure,
+                manifest=manifest,
+            )
+            protected_members.update(entry.path for entry in manifest.entries)
+            protected_generations.add(self._generation_path(manifest))
+            generation._validate_existing_members()
+        removable = sorted(
+            (
+                path
+                for path in self.directory.glob("snapshot-*.pt")
+                if path not in protected_members
+            ),
+            key=str,
+        )
+        removable.extend(
+            sorted(
+                (
+                    path
+                    for path in self.directory.glob("manifest-*.json")
+                    if path not in protected_generations
+                ),
+                key=str,
+            )
+        )
+        for path in removable:
+            path.unlink()
+        if removable:
+            _fsync_directory(self.directory)
+        return tuple(removable)
 
     def _validate_existing_members(self) -> None:
         """Refuse to replace a member that is invalid, missing, or corrupt."""

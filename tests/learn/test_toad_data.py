@@ -91,6 +91,27 @@ def _trajectory(turns: int) -> Trajectory:
     )
 
 
+def _materialize_population_bootstrap(
+    data_module: ToadDataModule,
+    config: ToadConfig,
+    actor_state: dict[str, torch.Tensor],
+) -> None:
+    """Model the rank-zero fit-start boundary in direct source tests."""
+    store = SnapshotStore(
+        data_module.population_directory(),
+        capacity=config.population.pool_capacity,
+        structure=structural_fingerprint(config),
+    )
+    data_module.materialize_population_bootstrap(
+        store,
+        actor_state,
+        environment_steps=0,
+        round_id=0,
+        run_id=config.curriculum.phase,
+    )
+    data_module.publish_manifest(store.manifest)
+
+
 def test_segments_freeze_unit_valid_from_original_encoded_actions() -> None:
     """Later learner action edits cannot redefine which observed slots existed."""
     trajectory = _trajectory(4)
@@ -667,7 +688,9 @@ def test_snapshot_at_start_populates_before_first_frozen_selection(
             seen.append(assignment) or (_trajectory(64),)
         ),
     )
-    source.publish_actor(actor.state_dict(), version=5)
+    data_module = ToadDataModule(config, source)
+    data_module.publish_actor(actor.state_dict(), version=5)
+    _materialize_population_bootstrap(data_module, config, dict(actor.state_dict()))
 
     batches = list(source)
 
@@ -714,6 +737,7 @@ def test_snapshot_bootstrap_resume_reopens_exact_pool_without_republication(
     )
     data = ToadDataModule(config, source)
     data.publish_actor(actor.state_dict(), version=4)
+    _materialize_population_bootstrap(data, config, dict(actor.state_dict()))
     list(source)
     state = data.state_dict()
     manifest_path = tmp_path / "run" / "population" / "manifest.json"
@@ -769,7 +793,7 @@ def test_legacy_frozen_resume_requires_population_identity_before_mutation(
     original_source = ReferenceRoundSource(config, assignments=())
     original = ToadDataModule(config, original_source)
     original.publish_actor(actor.state_dict(), version=4)
-    original_source._ensure_initial_pool()
+    _materialize_population_bootstrap(original, config, dict(actor.state_dict()))
     legacy_state = original.state_dict()
     legacy_state.pop("population_pool")
     manifest_path = tmp_path / "run" / "population" / "manifest.json"
@@ -1044,9 +1068,11 @@ def test_initial_snapshot_is_strictly_checked_before_pool_publication(
         config,
         collect_assignment=collect_unexpected,
     )
+    data_module = ToadDataModule(config, source)
+    actor = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
 
     with pytest.raises(RuntimeError, match="Missing key|Unexpected key"):
-        list(source)
+        _materialize_population_bootstrap(data_module, config, dict(actor.state_dict()))
 
     assert collected == []
     assert not (tmp_path / "run" / "population" / "manifest.json").exists()

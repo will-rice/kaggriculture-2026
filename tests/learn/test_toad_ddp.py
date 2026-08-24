@@ -18,6 +18,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+import kaggriculture.learn.toad.callbacks as toad_callbacks
 import kaggriculture.learn.toad.lightning as toad_lightning
 from kaggriculture.learn.encoding import (
     MARKET_SLOTS,
@@ -33,11 +34,13 @@ from kaggriculture.learn.toad import data
 from kaggriculture.learn.toad.callbacks import (
     ActorSyncCallback,
     BoundaryCheckpoint,
+    DistributedBoundaryError,
     EnvironmentStepStop,
     PopulationSnapshotCallback,
 )
 from kaggriculture.learn.toad.config import RuntimeConfig, ToadConfig
 from kaggriculture.learn.toad.lightning import (
+    NonFiniteProvenance,
     NonFiniteTrainingError,
     ReducibleMetric,
     ToadLightningModule,
@@ -176,8 +179,15 @@ def _stream_config() -> ToadConfig:
     )
 
 
-def test_each_rank_owns_unique_ids_but_the_same_global_boundary() -> None:
+def test_each_rank_owns_unique_ids_but_the_same_global_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Rank-local sources advance one shared global stream, not local streams."""
+    monkeypatch.setattr(
+        data,
+        "_all_gather_objects",
+        lambda local, world_size, **_kwargs: (local,) * world_size,
+    )
     config = _stream_config()
     seen: list[list[int]] = []
     next_ids: list[int] = []
@@ -207,8 +217,15 @@ def test_each_rank_owns_unique_ids_but_the_same_global_boundary() -> None:
     assert next_ids == [4, 4]
 
 
-def test_changed_world_size_resume_advances_from_the_absolute_boundary() -> None:
+def test_changed_world_size_resume_advances_from_the_absolute_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Restoring with more ranks neither recomputes nor gaps the next game ID."""
+    monkeypatch.setattr(
+        data,
+        "_all_gather_objects",
+        lambda local, world_size, **_kwargs: (local,) * world_size,
+    )
     config = _stream_config()
     original = data.ReferenceRoundSource(
         config,
@@ -315,8 +332,10 @@ def test_data_module_preflights_equal_quotas_before_collection(
     assert source.world_size == 2
 
 
-def test_empty_local_round_reaches_collective_validator_before_local_raise() -> None:
-    """A zero-batch rank must notify peers instead of abandoning their gather."""
+def test_empty_local_round_reaches_failure_gather_before_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-batch rank must notify peers before any signature collective."""
     config = _stream_config().model_copy(
         update={
             "optimizer": _stream_config().optimizer.model_copy(
@@ -329,15 +348,18 @@ def test_empty_local_round_reaches_collective_validator_before_local_raise() -> 
         collect_assignment=lambda _assignment: (_trajectory(),),
     )
     source.configure_distributed(rank=0, world_size=2)
+    monkeypatch.setattr(
+        data,
+        "_all_gather_objects",
+        lambda local, world_size, **_kwargs: (local,) * world_size,
+    )
 
-    def reject_empty(batches: Sequence[data.LearnerBatch], round_id: int) -> None:
-        assert batches == ()
-        assert round_id == 0
-        raise data.DistributedRoundMismatch("collective saw empty rank")
+    def reject_empty(_batches: Sequence[data.LearnerBatch], _round_id: int) -> None:
+        raise AssertionError("batch signature ran after failed collection")
 
     source.set_round_validator(reject_empty)
 
-    with pytest.raises(data.DistributedRoundMismatch, match="collective saw empty"):
+    with pytest.raises(data.DistributedCollectionError, match="produced no complete"):
         list(source)
 
 
@@ -437,6 +459,107 @@ def test_gradient_finite_flag_is_synchronized_even_when_this_rank_is_clean(
     assert synchronized == [()]
 
 
+def test_one_bad_rank_uses_canonical_bad_provenance_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean rank must raise the same structured failure as the bad rank."""
+    from tests.learn.test_toad_control_fixture import (
+        control_fixture_batch,
+        control_fixture_config,
+        load_control_fixture,
+    )
+
+    module = ToadLightningModule(control_fixture_config())
+    local = module.compute_report(
+        control_fixture_batch(load_control_fixture())
+    ).provenance
+    bad = NonFiniteProvenance.from_dict(
+        local.as_dict() | {"game_ids": (99,), "actor_version": 7}
+    )
+    module.trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(world_size=2, global_rank=0),
+    )
+    monkeypatch.setattr(
+        module, "_reduce_tensor", lambda *_args, **_kwargs: torch.tensor(1)
+    )
+    details = (
+        None,
+        {
+            "rank": 1,
+            "tensor_names": ("input/board",),
+            "provenance": bad.as_dict(),
+        },
+    )
+    monkeypatch.setattr(
+        toad_lightning, "_all_gather_objects", lambda *_args, **_kwargs: details
+    )
+
+    with pytest.raises(NonFiniteTrainingError) as caught:
+        module._synchronize_nonfinite([], local)
+
+    assert caught.value.game_ids == (99,)
+    assert caught.value.actor_version == 7
+    assert caught.value.distributed_details == details
+
+
+def test_all_bad_ranks_choose_rank_zero_provenance_canonically() -> None:
+    """Every caller renders an identical error when every rank is bad."""
+    first = NonFiniteProvenance(
+        batch_kind="scripted",
+        game_ids=(10,),
+        opponent_digests=(),
+        actor_version=2,
+        precision="32-true",
+        state_norms={},
+    )
+    second = NonFiniteProvenance.from_dict(
+        first.as_dict() | {"game_ids": (11,), "actor_version": 3}
+    )
+    details = (
+        {"rank": 0, "tensor_names": ("loss/total",), "provenance": first.as_dict()},
+        {"rank": 1, "tensor_names": ("grad/stem",), "provenance": second.as_dict()},
+    )
+
+    left = NonFiniteTrainingError.render_distributed(details, second)
+    right = NonFiniteTrainingError.render_distributed(details, first)
+
+    assert str(left) == str(right)
+    assert left.game_ids == right.game_ids == (10,)
+    assert left.tensor_names == right.tensor_names == ("loss/total",)
+
+
+def test_rank_local_collection_failure_is_gathered_before_batch_collectives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed collector must make successful peers leave with the same error."""
+    config = _stream_config()
+    source = data.ReferenceRoundSource(
+        config,
+        collect_assignment=lambda assignment: (_trajectory(),),
+    )
+    source.configure_distributed(rank=0, world_size=2)
+    source.publish_actor({}, 0)
+    peer = {
+        "ok": False,
+        "rank": 1,
+        "type": "CollectionError",
+        "message": "collection failed for game_id=2 seed=2 opponent=economic",
+        "traceback": "peer traceback sentinel",
+    }
+
+    def gather(local: object, _world: int, **_kwargs: object) -> tuple[object, object]:
+        return local, peer
+
+    monkeypatch.setattr(data, "_all_gather_objects", gather)
+
+    with pytest.raises(data.DistributedCollectionError) as caught:
+        list(source)
+
+    assert "game_id=2 seed=2" in str(caught.value)
+    assert "peer traceback sentinel" in str(caught.value)
+
+
 def test_round_metrics_reduce_numerators_before_means_and_keep_rank_timings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -498,6 +621,38 @@ def test_round_metrics_reduce_numerators_before_means_and_keep_rank_timings(
     }
 
 
+def test_opponent_return_carries_true_sum_and_count_for_unequal_ranks() -> None:
+    """Per-opponent global means must weight ranks by their trajectory counts."""
+    name = "economic"
+    first = toad_lightning.RoundMetricAccumulator()
+    first.reset(
+        {
+            f"collection/return_by_opponent/{name}": 10.0,
+            f"collection/return_sum_by_opponent/{name}": 10.0,
+            f"collection/return_count_by_opponent/{name}": 1,
+        }
+    )
+    second = toad_lightning.RoundMetricAccumulator()
+    second.reset(
+        {
+            f"collection/return_by_opponent/{name}": 20.0,
+            f"collection/return_sum_by_opponent/{name}": 60.0,
+            f"collection/return_count_by_opponent/{name}": 3,
+        }
+    )
+
+    left = first.reducible_values(torch.device("cpu"))[
+        f"collection/return_by_opponent/{name}"
+    ]
+    right = second.reducible_values(torch.device("cpu"))[
+        f"collection/return_by_opponent/{name}"
+    ]
+
+    assert (left.total + right.total).item() == 70.0
+    assert (left.count + right.count).item() == 4
+    assert ((left.total + right.total) / (left.count + right.count)).item() == 17.5
+
+
 class _RecordingStrategy:
     """Replay rank-zero object broadcasts for one simulated sibling rank."""
 
@@ -529,10 +684,133 @@ class _RecordingStrategy:
         torch.save(checkpoint, path)
 
 
-def test_boundary_checkpoint_is_rank_zero_write_then_barrier_and_broadcast(
+def test_fit_start_materializes_initial_file_and_actor_once_on_rank_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All bootstrap sources become one rank-zero generation before collection."""
+    initial_policy = ToadLightningModule(_stream_config()).policy.state_dict()
+    initial_path = tmp_path / "initial.pt"
+    torch.save(initial_policy, initial_path)
+    config = _stream_config().model_copy(
+        update={
+            "population": _stream_config().population.model_copy(
+                update={
+                    "initial_snapshots": (initial_path,),
+                    "snapshot_at_start": True,
+                    "pool_capacity": 4,
+                }
+            ),
+            "runtime": _stream_config().runtime.model_copy(
+                update={"output_dir": tmp_path}
+            ),
+        }
+    )
+    rank0_module = ToadLightningModule(config)
+    rank0_data = data.ToadDataModule(config, data.ReferenceRoundSource(config))
+    writes: list[str] = []
+    rank0_strategy = _RecordingStrategy(checkpoint_writes=writes)
+    rank0_trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(
+            datamodule=rank0_data,
+            is_global_zero=True,
+            global_rank=0,
+            world_size=2,
+            strategy=rank0_strategy,
+            _checkpoint_connector=SimpleNamespace(dump_checkpoint=lambda: {}),
+        ),
+    )
+    monkeypatch.setattr(
+        toad_callbacks,
+        "_all_gather_objects",
+        lambda local, _world, **_kwargs: (
+            local,
+            {"ok": True, "rank": 1, "type": None, "message": None},
+        ),
+    )
+    PopulationSnapshotCallback().on_fit_start(rank0_trainer, rank0_module)
+
+    rank1_module = ToadLightningModule(config)
+    rank1_data = data.ToadDataModule(config, data.ReferenceRoundSource(config))
+    rank1_strategy = _RecordingStrategy(rank0_strategy.payloads)
+    rank1_trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(
+            datamodule=rank1_data,
+            is_global_zero=False,
+            global_rank=1,
+            world_size=2,
+            strategy=rank1_strategy,
+        ),
+    )
+    PopulationSnapshotCallback().on_fit_start(rank1_trainer, rank1_module)
+
+    snapshots = list((tmp_path / "population").glob("snapshot-*.pt"))
+    assert len(snapshots) == 2
+    assert len(rank0_module.population_manifest.entries) == 2
+    assert rank1_module.population_manifest == rank0_module.population_manifest
+    assert rank0_data.source.pool is not None
+    assert rank1_data.source.pool is not None
+
+
+def test_boundary_install_failure_is_acknowledged_by_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """A peer that cannot install the payload stops all ranks before collection."""
+    config = _stream_config().model_copy(
+        update={
+            "runtime": _stream_config().runtime.model_copy(
+                update={"output_dir": tmp_path}
+            )
+        }
+    )
+    module = ToadLightningModule(config)
+    data_module = data.ToadDataModule(config, data.ReferenceRoundSource(config))
+    strategy = _RecordingStrategy()
+    trainer = cast(
+        lightning.Trainer,
+        SimpleNamespace(
+            datamodule=data_module,
+            is_global_zero=True,
+            global_rank=0,
+            world_size=2,
+            strategy=strategy,
+        ),
+    )
+    peer_failure = {
+        "ok": False,
+        "rank": 1,
+        "type": "SnapshotIntegrityError",
+        "message": "peer install failed",
+    }
+    monkeypatch.setattr(
+        toad_callbacks,
+        "_all_gather_objects",
+        lambda local, _world, **_kwargs: (local, peer_failure),
+        raising=False,
+    )
+
+    with pytest.raises(DistributedBoundaryError, match="peer install failed"):
+        toad_callbacks._run_rank_zero_boundary(
+            trainer,
+            module,
+            lambda: None,
+            include_manifest=False,
+        )
+
+
+def test_boundary_checkpoint_is_rank_zero_write_then_barrier_and_broadcast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Nonzero ranks enter the callback but cannot publish a second checkpoint."""
+    monkeypatch.setattr(
+        toad_callbacks,
+        "_all_gather_objects",
+        lambda local, world_size, **_kwargs: (local,) * world_size,
+    )
     path = tmp_path / "ddp-boundary"
     config = ToadConfig.model_validate(
         {
@@ -625,16 +903,21 @@ class _StopAfterOneRound(lightning.Callback):
             trainer.should_stop = True
 
 
-def _parameter_digest(module: ToadLightningModule) -> str:
+def _state_digest(state_dict: dict[str, torch.Tensor]) -> str:
     """Hash canonical tensor content without depending on serialization bytes."""
     digest = hashlib.sha256()
-    for name, tensor in sorted(module.policy.state_dict().items()):
+    for name, tensor in sorted(state_dict.items()):
         value = tensor.detach().cpu().contiguous()
         digest.update(name.encode())
         digest.update(str(value.dtype).encode())
         digest.update(str(tuple(value.shape)).encode())
         digest.update(value.numpy().tobytes())
     return digest.hexdigest()
+
+
+def _parameter_digest(module: ToadLightningModule) -> str:
+    """Hash a module's policy parameters in their canonical tensor form."""
+    return _state_digest(dict(module.policy.state_dict()))
 
 
 class _DdpProbe(lightning.Callback):
@@ -647,6 +930,18 @@ class _DdpProbe(lightning.Callback):
         self.batch_count = 0
         self.first_markers = 0
         self.end_markers = 0
+        self.initial_parameter_digest: str | None = None
+
+    def on_fit_start(
+        self,
+        trainer: lightning.Trainer,
+        pl_module: lightning.LightningModule,
+    ) -> None:
+        """Capture the restored pre-update policy identically on every rank."""
+        del trainer
+        self.initial_parameter_digest = _parameter_digest(
+            cast(ToadLightningModule, pl_module)
+        )
 
     def on_train_batch_end(
         self,
@@ -669,18 +964,48 @@ class _DdpProbe(lightning.Callback):
     ) -> None:
         module = cast(ToadLightningModule, pl_module)
         source = _data_module_for_probe(trainer).source
+        optimizer = trainer.optimizers[0]
         payload = {
             "rank": trainer.global_rank,
             "game_ids": self.seen_game_ids,
             "batch_count": self.batch_count,
             "first_markers": self.first_markers,
             "end_markers": self.end_markers,
+            "initial_parameter_digest": self.initial_parameter_digest,
             "parameter_digest": _parameter_digest(module),
             "environment_steps": module.environment_steps,
             "collection_round": module.collection_round,
             "next_game_id": source.next_game_id,
             "next_round_id": source._next_round_id,
             "manifest_entries": len(module.population_manifest.entries),
+            "manifest": [
+                {
+                    "state_digest": _state_digest(
+                        cast(
+                            dict[str, torch.Tensor],
+                            torch.load(
+                                entry.path,
+                                map_location="cpu",
+                                weights_only=True,
+                            ),
+                        )
+                    ),
+                    "environment_steps": entry.environment_steps,
+                    "round_id": entry.round_id,
+                }
+                for entry in module.population_manifest.entries
+            ],
+            "actor_version": module.actor_version,
+            "actor_source_global_step": module.actor_source_global_step,
+            "entropy_state": {
+                name: {
+                    "target": state.target,
+                    "multiplier": state.multiplier,
+                    "last_steps": state.last_steps,
+                }
+                for name, state in module.entropy_state.items()
+            },
+            "lr": [group["lr"] for group in optimizer.param_groups],
         }
         final = self.output_dir / f"{self.phase}-rank-{trainer.global_rank}.json"
         temporary = final.with_suffix(".tmp")
@@ -708,6 +1033,7 @@ def _ddp_fixture_config(output_dir: Path, resume: Path | None) -> ToadConfig:
                 "collection_processes": 1,
                 "actor_sync_every_rounds": 1,
                 "snapshot_every_environment_steps": 8,
+                "initial_snapshots": [output_dir / "bootstrap.pt"],
             },
             "optimizer": {
                 "unroll_length": 2,
@@ -753,6 +1079,7 @@ def _ddp_fixture_trajectory(game_id: int) -> Trajectory:
 def _run_ddp_fixture(output_dir: Path, phase: str, resume: Path | None) -> None:
     """Run inside Lightning's parent and child subprocesses."""
     torch.set_num_threads(1)
+    lightning.seed_everything(117, workers=True)
     data.EPISODE_STEPS = 5  # ty: ignore[invalid-assignment]
     config = _ddp_fixture_config(output_dir, resume)
     seen_game_ids: list[int] = []
@@ -797,6 +1124,14 @@ def _launch_ddp_fixture(
     output_dir: Path, phase: str, resume: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Launch a clean script so Lightning can re-exec it for rank one."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bootstrap = output_dir / "bootstrap.pt"
+    if not bootstrap.exists():
+        torch.manual_seed(314)
+        bootstrap_config = ToadConfig.model_validate(
+            {"model": {"blocks": 1, "channels": 4}}
+        )
+        torch.save(ToadLightningModule(bootstrap_config).policy.state_dict(), bootstrap)
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -846,15 +1181,17 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
     assert [payload["first_markers"] for payload in first] == [1, 1]
     assert [payload["end_markers"] for payload in first] == [1, 1]
     assert len({payload["parameter_digest"] for payload in first}) == 1
+    assert len({payload["initial_parameter_digest"] for payload in first}) == 1
+    assert first[0]["parameter_digest"] != first[0]["initial_parameter_digest"]
     assert [payload["environment_steps"] for payload in first] == [8, 8]
     assert [payload["next_game_id"] for payload in first] == [2, 2]
-    assert [payload["manifest_entries"] for payload in first] == [1, 1]
+    assert [payload["manifest_entries"] for payload in first] == [2, 2]
     checkpoints = sorted(tmp_path.glob("step-*.ckpt"))
     snapshots = sorted((tmp_path / "population").glob("snapshot-*.pt"))
-    assert [path.name for path in checkpoints] == ["step-8.ckpt"]
-    assert len(snapshots) == 1
+    assert [path.name for path in checkpoints] == ["step-0.ckpt", "step-8.ckpt"]
+    assert len(snapshots) == 2
 
-    resumed = _launch_ddp_fixture(tmp_path, "resume", checkpoints[0])
+    resumed = _launch_ddp_fixture(tmp_path, "resume", checkpoints[-1])
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr
     second = _probe_payloads(tmp_path, "resume")
 
@@ -864,7 +1201,37 @@ def test_real_two_process_cpu_ddp_is_disjoint_durable_and_resumable(
     assert [payload["environment_steps"] for payload in second] == [16, 16]
     assert [payload["collection_round"] for payload in second] == [2, 2]
     assert [payload["next_game_id"] for payload in second] == [4, 4]
-    assert [payload["manifest_entries"] for payload in second] == [2, 2]
+    assert [payload["manifest_entries"] for payload in second] == [3, 3]
+
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    uninterrupted = _launch_ddp_fixture(uninterrupted_dir, "uninterrupted")
+    assert uninterrupted.returncode == 0, uninterrupted.stdout + uninterrupted.stderr
+    full = _probe_payloads(uninterrupted_dir, "uninterrupted")
+
+    assert [payload["game_ids"] for payload in full] == [[0, 2], [1, 3]]
+    assert [payload["batch_count"] for payload in full] == [4, 4]
+    assert [payload["first_markers"] for payload in full] == [2, 2]
+    assert [payload["end_markers"] for payload in full] == [2, 2]
+    for resumed_rank, uninterrupted_rank in zip(second, full, strict=True):
+        assert (
+            resumed_rank["parameter_digest"] == uninterrupted_rank["parameter_digest"]
+        )
+        assert (
+            resumed_rank["environment_steps"] == uninterrupted_rank["environment_steps"]
+        )
+        assert (
+            resumed_rank["collection_round"] == uninterrupted_rank["collection_round"]
+        )
+        assert resumed_rank["next_game_id"] == uninterrupted_rank["next_game_id"]
+        assert resumed_rank["next_round_id"] == uninterrupted_rank["next_round_id"]
+        assert resumed_rank["manifest"] == uninterrupted_rank["manifest"]
+        assert resumed_rank["actor_version"] == uninterrupted_rank["actor_version"]
+        assert (
+            resumed_rank["actor_source_global_step"]
+            == uninterrupted_rank["actor_source_global_step"]
+        )
+        assert resumed_rank["entropy_state"] == uninterrupted_rank["entropy_state"]
+        assert resumed_rank["lr"] == uninterrupted_rank["lr"]
 
 
 if __name__ == "__main__" and len(sys.argv) >= 4 and sys.argv[1] == "--ddp-fixture":

@@ -528,7 +528,7 @@ def test_actor_and_learner_outputs_agree_across_a_reset_segment_boundary() -> No
 
 
 def test_lightning_training_step_matches_control_fixture(tmp_path: Path) -> None:
-    """Automatic optimization must reproduce the frozen Adam step exactly."""
+    """Automatic optimization preserves Adam while LR follows global samples."""
     fixture = load_control_fixture()
     module = ToadLightningModule(control_fixture_config())
     module.policy.load_state_dict(
@@ -557,8 +557,13 @@ def test_lightning_training_step_matches_control_fixture(tmp_path: Path) -> None
         expected_optimizer = cast(dict[str, object], fixture["updated_optimizer"])
         _assert_state_equal(actual_optimizer["state"], expected_optimizer["state"])
         scheduler = trainer.lr_scheduler_configs[0].scheduler
-        _assert_state_equal(scheduler.state_dict(), fixture["scheduler_state"])
-        assert scheduler.get_last_lr() == fixture["scheduler_last_lr"]
+        assert scheduler.last_epoch == module.environment_steps
+        assert scheduler.get_last_lr() == pytest.approx(
+            [
+                config_lr * round_decay(module.config)(module.environment_steps)
+                for config_lr in scheduler.base_lrs
+            ]
+        )
 
 
 def test_frozen_opponent_training_step_logs_all_population_kinds(
@@ -1123,22 +1128,8 @@ def test_module_loads_policy_from_legacy_runner_envelope(tmp_path: Path) -> None
         assert torch.equal(module.policy.state_dict()[name], value), name
 
 
-def test_round_decay_uses_typed_mixture_and_environment_quota(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Scheduler round sizing must describe the games collection actually runs."""
-    seen: list[tuple[float, int, int, float]] = []
-
-    def fake_decay(
-        fraction: float,
-        total_steps: int,
-        environments: int,
-        min_lr_multiplier: float,
-    ) -> object:
-        seen.append((fraction, total_steps, environments, min_lr_multiplier))
-        return lambda _: 1.0
-
-    monkeypatch.setattr(toad, "_decay", fake_decay)
+def test_round_decay_uses_reduced_global_environment_steps() -> None:
+    """LR identity is independent of per-rank quota and resolved world size."""
     base = control_fixture_config()
     config = base.model_copy(
         update={
@@ -1152,16 +1143,32 @@ def test_round_decay_uses_typed_mixture_and_environment_quota(
         }
     )
 
-    round_decay(config)
+    decay = round_decay(config)
 
-    assert seen == [
-        (
-            0.25,
-            config.runtime.total_environment_steps,
-            4,
-            config.optimizer.final_lr_multiplier,
-        )
-    ]
+    assert decay(0) == 1.0
+    assert decay(config.runtime.total_environment_steps // 2) == pytest.approx(0.5)
+    assert decay(config.runtime.total_environment_steps) == pytest.approx(
+        config.optimizer.final_lr_multiplier
+    )
+
+
+def test_lr_scheduler_resume_uses_global_boundary_not_scheduler_epoch() -> None:
+    """Changed world size cannot perturb LR at the same restored global step."""
+    config = control_fixture_config()
+    modules = [ToadLightningModule(config), ToadLightningModule(config)]
+    observed: list[float] = []
+    for module, scheduler_epoch in zip(modules, (1, 99), strict=True):
+        optimizer = torch.optim.Adam(module.policy.parameters(), lr=config.optimizer.lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, round_decay(config))
+        scheduler.last_epoch = scheduler_epoch
+        module.environment_steps = config.runtime.total_environment_steps // 2
+        module._round_ended = True
+
+        module.lr_scheduler_step(scheduler, None)
+        observed.append(float(scheduler.get_last_lr()[0]))
+
+    assert observed[0] == pytest.approx(observed[1])
+    assert observed[0] == pytest.approx(config.optimizer.lr * 0.5)
 
 
 def test_scheduler_steps_only_after_the_batch_that_closes_a_round(
@@ -1204,8 +1211,13 @@ def test_scheduler_steps_only_after_the_batch_that_closes_a_round(
     assert trainer.global_step == 2
     assert module.environment_steps == fixture["collected_steps"]
     assert module.collection_round == fixture["collection_rounds"]
-    assert scheduler.last_epoch == fixture["scheduler_steps"]
-    assert scheduler.get_last_lr() == fixture["scheduler_last_lr"]
+    assert scheduler.last_epoch == module.environment_steps
+    assert scheduler.get_last_lr() == pytest.approx(
+        [
+            config_lr * round_decay(config)(module.environment_steps)
+            for config_lr in scheduler.base_lrs
+        ]
+    )
 
 
 def test_cpu_fast_dev_run_uses_automatic_optimization(tmp_path: Path) -> None:

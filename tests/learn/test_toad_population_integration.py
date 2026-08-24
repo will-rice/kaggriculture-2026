@@ -614,7 +614,8 @@ def test_four_kind_round_trains_and_reports_actual_mix(
 
     # Manual ``training_step`` calls do not run an optimizer. Represent the
     # parameter update that precedes a real boundary snapshot so the next
-    # population round contains two distinct policies.
+    # population round contains two distinct policies across three provenance
+    # entries (the external seed and actor-at-start intentionally share weights).
     with torch.no_grad():
         next(module.policy.parameters()).add_(1e-4)
     snapshot_callback.on_train_batch_end(
@@ -627,7 +628,8 @@ def test_four_kind_round_trains_and_reports_actual_mix(
     checkpoint: dict[str, object] = {}
     module.on_save_checkpoint(checkpoint)
     data_state = data.state_dict()
-    assert len(module.population_manifest.entries) == 2
+    assert len(module.population_manifest.entries) == 3
+    assert len({entry.sha256 for entry in module.population_manifest.entries}) == 2
 
     resumed_module = ToadLightningModule(config)
     # Lightning restores module weights before invoking ``on_load_checkpoint``.
