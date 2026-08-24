@@ -24,13 +24,16 @@ from kaggriculture.learn.toad.callbacks import ActorSyncCallback, BoundaryCheckp
 from kaggriculture.learn.toad.config import ToadConfig, structural_fingerprint
 from kaggriculture.learn.toad.data import (
     CollectionAssignment,
+    LearnerBatch,
     ReferenceRoundSource,
     ToadDataModule,
 )
 from kaggriculture.learn.toad.lightning import (
     ResumeConfigError,
     ToadLightningModule,
+    load_checkpoint_policy,
 )
+from kaggriculture.learn.toad.model import StatefulPolicy
 from kaggriculture.learn.toad_loss import (
     ADAM_EPS,
     LEARNING_RATE,
@@ -42,6 +45,11 @@ from tests.learn.test_toad_control_fixture import (
     control_fixture_config,
     control_fixture_threads,
     load_control_fixture,
+)
+from tests.learn.test_toad_model_integration import (
+    _all_feature_config,
+    _initial_policy_state,
+    _synthetic_trajectory,
 )
 
 # The arm's own mix, so the schedule under test is the one that runs.
@@ -184,6 +192,48 @@ def test_native_checkpoint_extends_lightning_with_all_foundation_counters() -> N
         "warmup_remaining": 8,
         "teacher": {"present": False, "blocks": None, "quantity": None},
     }
+
+
+def test_full_enabled_lightning_policy_extraction_is_structurally_strict(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Extraction must load every optional weight and reject partial/control sets."""
+    config = _all_feature_config()
+    expected = _initial_policy_state(config)
+    exact_path = tmp_path / "all-feature.ckpt"
+    torch.save(
+        {"state_dict": {f"policy.{name}": value for name, value in expected.items()}},
+        exact_path,
+    )
+    restored = StatefulPolicy(config.model)
+
+    missing_path = tmp_path / "missing-enabled.ckpt"
+    missing = dict(expected)
+    del missing["interaction_value.value_projection.weight"]
+    torch.save(
+        {"state_dict": {f"policy.{name}": value for name, value in missing.items()}},
+        missing_path,
+    )
+    control_path = tmp_path / "control-only.ckpt"
+    control = Policy(blocks=1, channels=4, value_bound=1.0)
+    torch.save(
+        {
+            "state_dict": {
+                f"policy.{name}": value for name, value in control.state_dict().items()
+            }
+        },
+        control_path,
+    )
+
+    assert load_checkpoint_policy(restored, exact_path) == []
+    for name, value in expected.items():
+        assert torch.equal(restored.state_dict()[name], value), name
+    with pytest.raises(
+        RuntimeError, match="interaction_value[.]value_projection[.]weight"
+    ):
+        load_checkpoint_policy(StatefulPolicy(config.model), missing_path)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        load_checkpoint_policy(StatefulPolicy(config.model), control_path)
 
 
 def test_native_resume_allows_operational_overrides_and_restores_counters(
@@ -429,6 +479,209 @@ def test_lightning_resume_matches_uninterrupted_full_state(
     assert resumed_source.next_game_id == 2
     for name, value in resumed_module.policy.state_dict().items():
         assert torch.equal(value, uninterrupted_module.policy.state_dict()[name])
+    _assert_state_equal(
+        resumed_trainer.optimizers[0].state_dict(),
+        uninterrupted_trainer.optimizers[0].state_dict(),
+    )
+    resumed_scheduler = resumed_trainer.lr_scheduler_configs[0].scheduler
+    uninterrupted_scheduler = uninterrupted_trainer.lr_scheduler_configs[0].scheduler
+    _assert_state_equal(
+        resumed_scheduler.state_dict(), uninterrupted_scheduler.state_dict()
+    )
+    assert resumed_scheduler.get_last_lr() == uninterrupted_scheduler.get_last_lr()
+
+
+def test_recurrent_boundary_resume_reproduces_the_next_optimizer_update(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The authoritative all-feature boundary must replay the next update exactly."""
+    teacher = Policy(blocks=1, channels=4, value_bound=1.0)
+    teacher_path = tmp_path / "teacher.pt"
+    torch.save(teacher.state_dict(), teacher_path)
+    config = _all_feature_config(
+        output_dir=tmp_path / "checkpoints",
+        teacher_checkpoint=teacher_path,
+        value_warmup_batches=3,
+    )
+    initial_model = _initial_policy_state(config)
+    trajectories = {
+        game_id: _synthetic_trajectory(
+            config,
+            initial_model,
+            game_id=game_id,
+        ).trajectory
+        for game_id in (0, 1)
+    }
+
+    def make_source(
+        records: list[tuple[int, int, float, bool]],
+    ) -> ReferenceRoundSource:
+        source: ReferenceRoundSource
+
+        def collect(assignment: CollectionAssignment) -> tuple[Trajectory]:
+            actor_matches = set(source.actor_state) == set(initial_model) and all(
+                torch.equal(source.actor_state[name], value)
+                for name, value in initial_model.items()
+            )
+            records.append(
+                (
+                    assignment.game_id,
+                    source.actor_version,
+                    source.rng.random(),
+                    actor_matches,
+                )
+            )
+            return (trajectories[assignment.game_id],)
+
+        source = ReferenceRoundSource(config, collect_assignment=collect)
+        return source
+
+    class BatchEntryRecorder(lightning.Callback):
+        def __init__(self) -> None:
+            self.entries: list[
+                tuple[int, tuple[int, ...], torch.Tensor, torch.Tensor, torch.Tensor]
+            ] = []
+
+        def on_train_batch_start(
+            self,
+            trainer: lightning.Trainer,
+            pl_module: lightning.LightningModule,
+            batch: object,
+            batch_idx: int,
+        ) -> None:
+            learner_batch = cast(LearnerBatch, batch)
+            if not learner_batch.first_of_round:
+                return
+            segment = learner_batch.segments[0]
+            self.entries.append(
+                (
+                    learner_batch.round_id,
+                    learner_batch.game_ids,
+                    segment["initial_hidden"].clone(),
+                    segment["initial_cell"].clone(),
+                    segment["initial_belief"].clone(),
+                )
+            )
+
+    def trainer(
+        root: pathlib.Path,
+        *,
+        max_steps: int,
+        callbacks: list[lightning.Callback],
+    ) -> lightning.Trainer:
+        return lightning.Trainer(
+            accelerator="cpu",
+            devices=1,
+            precision="32-true",
+            max_steps=max_steps,
+            logger=False,
+            enable_checkpointing=False,
+            enable_model_summary=False,
+            default_root_dir=root,
+            gradient_clip_val=config.optimizer.clip_grad_norm,
+            gradient_clip_algorithm="norm",
+            deterministic=True,
+            callbacks=callbacks,
+            use_distributed_sampler=False,
+        )
+
+    uninterrupted_records: list[tuple[int, int, float, bool]] = []
+    uninterrupted_source = make_source(uninterrupted_records)
+    uninterrupted_data = ToadDataModule(config, uninterrupted_source)
+    uninterrupted_module = ToadLightningModule(config)
+    uninterrupted_module.policy.load_state_dict(initial_model, strict=True)
+    uninterrupted_entries = BatchEntryRecorder()
+    uninterrupted_trainer = trainer(
+        tmp_path / "uninterrupted",
+        max_steps=3,
+        callbacks=[
+            uninterrupted_entries,
+            ActorSyncCallback(every_rounds=1),
+        ],
+    )
+
+    split_records: list[tuple[int, int, float, bool]] = []
+    split_source = make_source(split_records)
+    split_data = ToadDataModule(config, split_source)
+    split_module = ToadLightningModule(config)
+    split_module.policy.load_state_dict(initial_model, strict=True)
+    split_trainer = trainer(
+        tmp_path / "split",
+        max_steps=2,
+        callbacks=[
+            ActorSyncCallback(every_rounds=1),
+            BoundaryCheckpoint(config.runtime.output_dir),
+        ],
+    )
+
+    uninterrupted_trainer.fit(uninterrupted_module, datamodule=uninterrupted_data)
+    split_trainer.fit(split_module, datamodule=split_data)
+
+    checkpoint_path = config.runtime.output_dir / "step-32.ckpt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_toad = cast(dict[str, object], checkpoint["toad"])
+    assert checkpoint["global_step"] == 2
+    assert checkpoint["optimizer_states"]
+    assert checkpoint["lr_schedulers"]
+    assert checkpoint_toad["config"] == config.model_dump(mode="json")
+    assert checkpoint_toad["fingerprint"] == structural_fingerprint(config)
+    assert checkpoint_toad["environment_steps"] == 32
+    assert checkpoint_toad["collection_round"] == 1
+    assert checkpoint_toad["actor_version"] == 0
+    assert checkpoint_toad["warmup_remaining"] == 1
+    assert checkpoint_toad["teacher"] == {
+        "present": True,
+        "blocks": 1,
+        "quantity": True,
+    }
+
+    resumed_records: list[tuple[int, int, float, bool]] = []
+    resumed_source = make_source(resumed_records)
+    resumed_data = ToadDataModule(config, resumed_source)
+    resumed_module = ToadLightningModule(config)
+    resumed_entries = BatchEntryRecorder()
+    resumed_trainer = trainer(
+        tmp_path / "resumed",
+        max_steps=3,
+        callbacks=[resumed_entries, ActorSyncCallback(every_rounds=1)],
+    )
+
+    resumed_trainer.fit(
+        resumed_module,
+        datamodule=resumed_data,
+        ckpt_path=checkpoint_path,
+    )
+
+    assert [record[0] for record in uninterrupted_records] == [0, 1]
+    assert [record[0] for record in split_records] == [0]
+    assert [record[0] for record in resumed_records] == [1]
+    assert split_records[0][2:] == uninterrupted_records[0][2:]
+    assert resumed_records[0][1:] == uninterrupted_records[1][1:]
+    assert all(record[3] for record in uninterrupted_records + resumed_records)
+    uninterrupted_next = next(
+        entry for entry in uninterrupted_entries.entries if entry[0] == 1
+    )
+    assert resumed_entries.entries[0][:2] == uninterrupted_next[:2] == (1, (1,))
+    for resumed_state, uninterrupted_state in zip(
+        resumed_entries.entries[0][2:], uninterrupted_next[2:], strict=True
+    ):
+        assert torch.equal(resumed_state, uninterrupted_state)
+        assert not torch.count_nonzero(resumed_state)
+
+    assert resumed_trainer.global_step == uninterrupted_trainer.global_step == 3
+    assert resumed_module.environment_steps == uninterrupted_module.environment_steps
+    assert resumed_module.collection_round == uninterrupted_module.collection_round
+    assert resumed_module.actor_version == uninterrupted_module.actor_version
+    assert resumed_module.actor_source_global_step == (
+        uninterrupted_module.actor_source_global_step
+    )
+    assert resumed_module.warmup_remaining == uninterrupted_module.warmup_remaining == 0
+    assert resumed_source.next_game_id == uninterrupted_source.next_game_id == 2
+    assert resumed_source.actor_version == uninterrupted_source.actor_version == 0
+    for name, value in uninterrupted_source.actor_state.items():
+        assert torch.equal(resumed_source.actor_state[name], value), name
+    for name, value in uninterrupted_module.policy.state_dict().items():
+        assert torch.equal(resumed_module.policy.state_dict()[name], value), name
     _assert_state_equal(
         resumed_trainer.optimizers[0].state_dict(),
         uninterrupted_trainer.optimizers[0].state_dict(),

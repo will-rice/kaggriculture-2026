@@ -163,7 +163,11 @@ def test_patch_extraction_rejects_unsupported_sizes(
     features = torch.zeros(1, 1, BOARD_SIZE, BOARD_SIZE)
 
     with pytest.raises(ValueError, match=message):
-        extract_unit_patches(features, torch.zeros(1, 1, dtype=torch.int64), size)
+        extract_unit_patches(
+            features,
+            torch.zeros(1, 1, dtype=torch.int64),
+            size,  # ty: ignore[invalid-argument-type]
+        )
 
 
 def test_local_unit_head_outputs_encoding_derived_dimensions() -> None:
@@ -176,6 +180,16 @@ def test_local_unit_head_outputs_encoding_derived_dimensions() -> None:
 
     assert unit_logits.shape == (2, 3, len(UNIT_OPS))
     assert quantity_logits.shape == (2, 3, len(QUANTITIES))
+
+
+def test_local_unit_head_rejects_a_feature_channel_mismatch() -> None:
+    """A standalone wiring error must fail at the local-head boundary."""
+    head = LocalUnitHead(channels=8, blocks=1, patch_size=7)
+    features = torch.randn(2, 7, BOARD_SIZE, BOARD_SIZE)
+    positions = torch.tensor([[0, 54, 99], [99, 45, 0]])
+
+    with pytest.raises(ValueError, match="expected 8 feature channels, got 7"):
+        head(features, positions)
 
 
 def test_local_operation_and_quantity_projections_are_independent() -> None:

@@ -92,6 +92,7 @@ class LocalUnitHead(torch.nn.Module):
         if blocks < 0:
             raise ValueError("local patch blocks must be nonnegative")
         _validate_local_patch_size(patch_size)
+        self.channels = channels
         self.patch_size = patch_size
         self.preprocess = torch.nn.Sequential(
             torch.nn.Conv2d(channels + 1, channels, kernel_size=3, padding=1),
@@ -105,6 +106,11 @@ class LocalUnitHead(torch.nn.Module):
         self, features: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return operation and quantity logits for every supplied unit slot."""
+        if features.ndim == 4 and features.shape[1] != self.channels:
+            raise ValueError(
+                f"local unit head expected {self.channels} feature channels, "
+                f"got {features.shape[1]}"
+            )
         patches = extract_unit_patches(features, positions, self.patch_size)
         batch, units = patches.shape[:2]
         local = self.preprocess(patches.flatten(0, 1))
