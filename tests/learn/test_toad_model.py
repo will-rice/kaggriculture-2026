@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from kaggriculture.learn.encoding import MAX_UNITS, SCALARS, TILE_PLANES
 from kaggriculture.learn.model import Policy
-from kaggriculture.learn.toad.config import ModelConfig
+from kaggriculture.learn.toad.config import ModelConfig, ToadConfig
 from kaggriculture.learn.toad.model import PolicyState, StatefulPolicy
 
 
@@ -66,7 +66,17 @@ def test_initial_state_is_typed_and_detachable() -> None:
     assert state.cell.shape == (3, 12, 10, 10)
     assert state.prior_belief.shape == (3, 9)
     assert state.hidden.dtype == like.dtype
-    assert state.detach().hidden.grad_fn is None
+
+    source = torch.randn(2, requires_grad=True)
+    tracked = PolicyState(
+        hidden=source * 2,
+        cell=source.square(),
+        prior_belief=source.sigmoid(),
+    )
+    detached = tracked.detach()
+    for tensor in (detached.hidden, detached.cell, detached.prior_belief):
+        assert tensor.grad_fn is None
+        assert not tensor.requires_grad
 
 
 def test_loading_control_weights_cannot_initialize_enabled_components() -> None:
@@ -101,3 +111,23 @@ def test_optional_model_dimensions_are_validated(
     """Invalid optional paths fail before constructing any torch module."""
     with pytest.raises(ValidationError, match=message):
         ModelConfig.model_validate(override)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"recurrent": True},
+        {"transformer": True},
+        {"local_patch": True},
+        {"belief": True},
+        {"belief": True, "belief_loss_weight": 0.5},
+        {"belief": True, "belief_feedback": True},
+        {"interaction_value": True},
+    ],
+)
+def test_active_trainer_rejects_unimplemented_optional_model_paths(
+    model: dict[str, object],
+) -> None:
+    """Inactive architecture paths cannot be silently ignored by Lightning."""
+    with pytest.raises(ValidationError, match="not implemented in the active trainer"):
+        ToadConfig.model_validate({"model": model})

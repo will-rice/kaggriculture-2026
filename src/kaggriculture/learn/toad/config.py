@@ -215,6 +215,7 @@ class ToadConfig(BaseModel):
             raise ValueError(
                 "population probabilities must be nonnegative and sum to one"
             )
+        _validate_active_model(self.model)
         _validate_foundation_population(self.population)
         _validate_foundation_optimizer(self.optimizer)
         if (
@@ -245,6 +246,22 @@ class ToadConfig(BaseModel):
                 "conversion is scheduled for Stage 9"
             )
         return self
+
+
+def _validate_active_model(model: ModelConfig) -> None:
+    """Reject architecture paths not yet consumed by the active trainer."""
+    unsupported = {
+        "recurrent": model.recurrent,
+        "transformer": model.transformer,
+        "local_patch": model.local_patch,
+        "belief": model.belief,
+        "belief_loss_weight": model.belief_loss_weight > 0,
+        "belief_feedback": model.belief_feedback,
+        "interaction_value": model.interaction_value,
+    }
+    for name, enabled in unsupported.items():
+        if enabled:
+            raise ValueError(f"{name} is not implemented in the active trainer")
 
 
 def _validate_foundation_population(population: PopulationConfig) -> None:
