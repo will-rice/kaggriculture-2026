@@ -242,6 +242,29 @@ def test_boundary_checkpoint_is_atomic_and_due_only_after_a_round(
     assert trainer.saved[0].parent == tmp_path
     assert trainer.saved[0] != checkpoints[0]
 
+    callback.on_fit_end(_lightning_trainer(trainer), _lightning_module(module))
+
+    assert len(trainer.saved) == 1
+    assert callback.final_checkpoint == tmp_path / "step-100.ckpt"
+
+
+def test_fit_end_saves_the_exact_terminal_boundary_below_cadence(
+    tmp_path: Path,
+) -> None:
+    """A successful short phase must return current state, not an older file."""
+    callback = BoundaryCheckpoint(tmp_path, every_environment_steps=1_000)
+    trainer, module, _ = _callback_fixture(environment_steps=0)
+    callback.on_fit_start(_lightning_trainer(trainer), _lightning_module(module))
+    stale = tmp_path / "step-999.ckpt"
+    stale.write_text("stale")
+    module.environment_steps = 40
+
+    callback.on_fit_end(_lightning_trainer(trainer), _lightning_module(module))
+
+    assert (tmp_path / "step-40.ckpt").read_text() == "complete"
+    assert callback.final_checkpoint == tmp_path / "step-40.ckpt"
+    assert stale.read_text() == "stale"
+
 
 def test_boundary_checkpoint_resume_waits_for_the_next_global_threshold(
     tmp_path: Path,

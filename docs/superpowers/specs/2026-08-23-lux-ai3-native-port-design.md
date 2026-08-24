@@ -228,9 +228,11 @@ Native `step-N.ckpt` evaluation reconstructs the policy from its stored
 control layouts use the same checkpoint-to-policy factory. Evaluators carry a
 separate `PolicyState` for every environment/seat and reset it at episode
 boundaries. When `CurriculumConfig.gate` is present, the curriculum runner
-plays its fixed held-out seeds after training, atomically records `gate.json`
-in the phase output directory, and raises on the declared `stop` policy if the
-threshold is missed.
+unconditionally publishes the successful fit's exact terminal checkpoint,
+passes that identity directly to the gate, and never infers the boundary from
+other files in the output directory. Global rank zero alone plays the fixed
+held-out seeds, atomically records `gate.json` in the phase output directory,
+and raises on the declared `stop` policy if the threshold is missed.
 
 Hardware availability is checked in a runtime preflight after Lightning has
 resolved the accelerator. Requesting BF16, DDP, compile, or a native rollout

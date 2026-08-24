@@ -37,16 +37,19 @@ def _save_authoritative_checkpoint(
     trainer: lightning.Trainer,
     module: ToadLightningModule,
     output_dir: Path,
-) -> None:
+) -> Path:
     """Atomically save the sole resumable state for this manifest generation."""
     identity = (
         module.environment_steps,
         module.population_manifest.model_dump_json(),
     )
-    if getattr(module, "_authoritative_checkpoint_identity", None) == identity:
-        return
-    output_dir.mkdir(parents=True, exist_ok=True)
     final_path = output_dir / f"step-{module.environment_steps}.ckpt"
+    if (
+        getattr(module, "_authoritative_checkpoint_identity", None) == identity
+        and final_path.is_file()
+    ):
+        return final_path
+    output_dir.mkdir(parents=True, exist_ok=True)
     temporary_path = final_path.with_suffix(".tmp")
     try:
         if int(getattr(trainer, "world_size", 1)) > 1:
@@ -63,6 +66,7 @@ def _save_authoritative_checkpoint(
         raise
     os.replace(temporary_path, final_path)  # noqa: PTH105
     module._authoritative_checkpoint_identity = identity
+    return final_path
 
 
 def _data_module(trainer: lightning.Trainer) -> ToadDataModule:
@@ -139,7 +143,7 @@ def _apply_boundary_payload(
 def _run_rank_zero_boundary(
     trainer: lightning.Trainer,
     module: ToadLightningModule,
-    action: Callable[[], None],
+    action: Callable[[], object],
     *,
     include_manifest: bool,
 ) -> None:
@@ -436,6 +440,7 @@ class BoundaryCheckpoint(lightning.Callback):
         self.output_dir = output_dir
         self.every_environment_steps = every_environment_steps
         self._next_environment_steps: int | None = None
+        self.final_checkpoint: Path | None = None
 
     def on_fit_start(
         self,
@@ -448,6 +453,22 @@ class BoundaryCheckpoint(lightning.Callback):
         self._next_environment_steps = (
             module.environment_steps // interval + 1
         ) * interval
+
+    def on_fit_end(
+        self,
+        trainer: lightning.Trainer,
+        pl_module: lightning.LightningModule,
+    ) -> None:
+        """Publish the exact terminal phase state, even below the cadence."""
+        module = cast(ToadLightningModule, pl_module)
+        final_path = self.output_dir / f"step-{module.environment_steps}.ckpt"
+        _run_rank_zero_boundary(
+            trainer,
+            module,
+            lambda: _save_authoritative_checkpoint(trainer, module, self.output_dir),
+            include_manifest=False,
+        )
+        self.final_checkpoint = final_path
 
     def on_train_batch_end(
         self,

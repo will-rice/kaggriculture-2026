@@ -7,9 +7,13 @@ games against the real economic opponent; it is not covered by the repository's
 default `not slow` exclusion.
 
 A configured curriculum phase gate is a separate post-training measurement.
-It loads the newest numeric `step-N.ckpt`, plays the configured held-out seed
-count against the external opponent, and atomically writes `gate.json` beside
-the phase checkpoints. The artifact records all three terminal summaries
+Every successful fit publishes its exact terminal `step-N.ckpt`, including
+phases that finish below the periodic checkpoint cadence. The trainer returns
+that identity directly to the curriculum runner; only global rank zero loads
+that exact checkpoint, plays the configured held-out seed count against the
+external opponent, and atomically writes `gate.json` beside the phase
+checkpoints. Older or higher-numbered files in the directory are never selected
+for this boundary. The artifact records all three terminal summaries
 (`win_rate`, `mean_terminal_bank`, and `mean_terminal_margin`), the selected
 threshold, checkpoint, opponent, seed block, and pass/fail verdict. A failed
 gate is durable evidence and stops the curriculum command; it is not a W&B-only

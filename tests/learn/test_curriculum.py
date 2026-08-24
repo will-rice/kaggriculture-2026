@@ -183,13 +183,21 @@ def test_failing_phase_gate_records_result_and_stops_production_path(
     monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
     events: list[str] = []
 
-    def train(config: ToadConfig) -> None:
+    def train(config: ToadConfig) -> SimpleNamespace:
         events.append("train")
         config.runtime.output_dir.mkdir(parents=True)
         module = ToadLightningModule(config)
         checkpoint: dict[str, object] = {"state_dict": module.state_dict()}
         module.on_save_checkpoint(checkpoint)
-        torch.save(checkpoint, config.runtime.output_dir / "step-12.ckpt")
+        exact = config.runtime.output_dir / "step-12.ckpt"
+        torch.save(checkpoint, exact)
+        torch.save(checkpoint, config.runtime.output_dir / "step-999.ckpt")
+        return SimpleNamespace(
+            checkpoint=exact,
+            global_rank=0,
+            world_size=1,
+            is_global_zero=True,
+        )
 
     def fail_rollout(
         policy: object, opponent: object, seeds: object
@@ -242,6 +250,46 @@ def test_failing_phase_gate_records_result_and_stops_production_path(
     assert result["value"] == 0.0
     assert result["minimum"] == 0.5
     assert result["checkpoint"] == "step-12.ckpt"
+
+
+def test_nonzero_curriculum_rank_does_not_evaluate_or_write_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lightning child ranks stop at the completed fit boundary."""
+    monkeypatch.setattr(curriculum, "OUTPUT_ROOT", tmp_path)
+    checkpoint = tmp_path / "phase1" / "step-12.ckpt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    monkeypatch.setattr(
+        toad,
+        "run",
+        lambda _config: SimpleNamespace(
+            checkpoint=checkpoint,
+            global_rank=1,
+            world_size=2,
+            is_global_zero=False,
+        ),
+    )
+    evaluations: list[object] = []
+    monkeypatch.setattr(
+        curriculum,
+        "run_phase_gate",
+        lambda *args: evaluations.append(args),
+    )
+    gate = json.dumps(
+        {
+            "metric": "win_rate",
+            "minimum": 0.5,
+            "opponent": "economic",
+            "seeds": 2,
+        },
+        separators=(",", ":"),
+    )
+
+    curriculum.main(["phase1", "--set", f"curriculum.gate={gate}"])
+
+    assert evaluations == []
+    assert not (checkpoint.parent / "gate.json").exists()
 
 
 def test_a_phase_refuses_to_start_without_its_teacher(

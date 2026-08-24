@@ -106,6 +106,20 @@ class RuntimePreflightError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ToadRunResult:
+    """Exact terminal checkpoint and distributed identity of a completed fit."""
+
+    checkpoint: Path
+    global_rank: int
+    world_size: int
+
+    @property
+    def is_global_zero(self) -> bool:
+        """Return whether this process owns post-fit external orchestration."""
+        return self.global_rank == 0
+
+
+@dataclass(frozen=True)
 class CudaCapabilities:
     """CUDA facts returned by one disposable child-process probe."""
 
@@ -940,8 +954,8 @@ def build_trainer(config: ToadConfig) -> lightning.Trainer:
     )
 
 
-def run(config: ToadConfig) -> None:
-    """Seed once and hand the complete native control path to Lightning."""
+def run(config: ToadConfig) -> ToadRunResult:
+    """Train and return the exact terminal checkpoint plus process rank."""
     validate_effective_resume(config)
     runtime_preflight(config)
     seed_everything(config.runtime.seed, workers=True)
@@ -950,10 +964,25 @@ def run(config: ToadConfig) -> None:
     if effective.runtime.compile.enabled:
         module.policy = maybe_compile(module.policy, effective)
     data = build_reference_data_module(effective)
-    build_trainer(effective).fit(
+    trainer = build_trainer(effective)
+    trainer.fit(
         module,
         datamodule=data,
         ckpt_path=effective.runtime.resume,
+    )
+    callbacks = cast(
+        Sequence[lightning.Callback],
+        getattr(trainer, "callbacks", ()),
+    )
+    boundaries = [
+        callback for callback in callbacks if isinstance(callback, BoundaryCheckpoint)
+    ]
+    if len(boundaries) != 1 or boundaries[0].final_checkpoint is None:
+        raise RuntimeError("successful Toad fit did not publish its final checkpoint")
+    return ToadRunResult(
+        checkpoint=boundaries[0].final_checkpoint,
+        global_rank=int(trainer.global_rank),
+        world_size=int(trainer.world_size),
     )
 
 

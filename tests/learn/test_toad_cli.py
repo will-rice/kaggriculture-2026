@@ -634,8 +634,15 @@ def test_run_seeds_builds_native_components_and_passes_resume(
     module = _Module(config)
     data = object()
     built: list[tuple[str, ToadConfig]] = []
+    boundary = BoundaryCheckpoint(effective.runtime.output_dir)
+    final_checkpoint = effective.runtime.output_dir / "step-123.ckpt"
+    boundary.final_checkpoint = final_checkpoint
 
     class _Trainer:
+        callbacks = [boundary]
+        global_rank = 0
+        world_size = 1
+
         def fit(self, fitted: object, **kwargs: object) -> None:
             events.append(("fit", fitted, kwargs))
 
@@ -656,13 +663,17 @@ def test_run_seeds_builds_native_components_and_passes_resume(
         lambda received: built.append(("trainer", received)) or _Trainer(),
     )
 
-    toad.run(config)
+    result = toad.run(config)
 
     assert events == [
         ("seed", config.runtime.seed, True),
         ("fit", module, {"datamodule": data, "ckpt_path": effective.runtime.resume}),
     ]
     assert built == [("data", effective), ("trainer", effective)]
+    assert result.checkpoint == final_checkpoint
+    assert result.global_rank == 0
+    assert result.world_size == 1
+    assert result.is_global_zero
 
 
 def test_run_rechecks_resume_before_runtime_or_training_side_effects(

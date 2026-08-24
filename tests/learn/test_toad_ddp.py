@@ -960,6 +960,77 @@ def test_boundary_checkpoint_is_rank_zero_write_then_barrier_and_broadcast(
     assert rank1_module.environment_steps == rank0_module.environment_steps == 1
 
 
+def test_terminal_checkpoint_is_exact_and_rank_zero_owned_below_cadence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fit-end publishes one exact boundary and gives every rank its identity."""
+    monkeypatch.setattr(
+        toad_callbacks,
+        "_all_gather_objects",
+        lambda local, world_size, **_kwargs: (local,) * world_size,
+    )
+    path = tmp_path / "ddp-terminal"
+    config = ToadConfig.model_validate(
+        {
+            "runtime": {
+                "output_dir": path,
+                "checkpoint_every_environment_steps": 100,
+            }
+        }
+    )
+    stale = path / "step-999.ckpt"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+
+    rank0_module = ToadLightningModule(config)
+    rank0_module.environment_steps = 40
+    rank0_module.collection_round = 1
+    rank0_data = data.ToadDataModule(config, data.ReferenceRoundSource(config))
+    writes: list[str] = []
+    rank0_strategy = _RecordingStrategy(checkpoint_writes=writes)
+    rank0_trainer = SimpleNamespace(
+        datamodule=rank0_data,
+        is_global_zero=True,
+        global_rank=0,
+        world_size=2,
+        strategy=rank0_strategy,
+        _checkpoint_connector=SimpleNamespace(dump_checkpoint=lambda: {"rank": 0}),
+    )
+    rank0_callback = BoundaryCheckpoint(path, every_environment_steps=100)
+    rank0_callback.on_fit_end(
+        rank0_trainer,  # ty: ignore[invalid-argument-type]
+        rank0_module,
+    )
+
+    rank1_module = ToadLightningModule(config)
+    rank1_module.environment_steps = 40
+    rank1_module.collection_round = 1
+    rank1_data = data.ToadDataModule(config, data.ReferenceRoundSource(config))
+    rank1_strategy = _RecordingStrategy(rank0_strategy.payloads)
+    rank1_trainer = SimpleNamespace(
+        datamodule=rank1_data,
+        is_global_zero=False,
+        global_rank=1,
+        world_size=2,
+        strategy=rank1_strategy,
+    )
+    rank1_callback = BoundaryCheckpoint(path, every_environment_steps=100)
+    rank1_callback.on_fit_end(
+        rank1_trainer,  # ty: ignore[invalid-argument-type]
+        rank1_module,
+    )
+
+    exact = path / "step-40.ckpt"
+    assert writes == [str(exact.with_suffix(".tmp"))]
+    assert exact.is_file()
+    assert stale.read_bytes() == b"stale"
+    assert rank0_callback.final_checkpoint == exact
+    assert rank1_callback.final_checkpoint == exact
+    assert rank0_strategy.events == ["broadcast", "barrier", "broadcast"]
+    assert rank1_strategy.events == ["broadcast", "barrier", "broadcast"]
+
+
 class _StopAfterOneRound(lightning.Callback):
     """End the first integration phase at its first durable boundary."""
 

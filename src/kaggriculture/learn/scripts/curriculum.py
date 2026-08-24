@@ -329,20 +329,6 @@ def phase_config(phase: Phase) -> ToadConfig:
     )
 
 
-def _latest_native_checkpoint(output_dir: Path) -> Path:
-    """Return the newest numeric Lightning checkpoint in one phase output."""
-    checkpoints = [
-        path
-        for path in output_dir.glob("step-*.ckpt")
-        if path.is_file() and re.fullmatch(r"step-[0-9]+[.]ckpt", path.name)
-    ]
-    if not checkpoints:
-        raise FileNotFoundError(
-            f"completed phase has no checkpoint matching {output_dir}/step-*.ckpt"
-        )
-    return max(checkpoints, key=lambda path: int(path.stem.removeprefix("step-")))
-
-
 def _gate_metrics(trajectories: Sequence[Trajectory]) -> dict[str, float]:
     """Reduce terminal held-out results into the declared gate metric domain."""
     if not trajectories:
@@ -379,12 +365,11 @@ def _record_gate_result(output_dir: Path, result: dict[str, object]) -> Path:
     return destination
 
 
-def run_phase_gate(config: ToadConfig) -> dict[str, object]:
+def run_phase_gate(config: ToadConfig, checkpoint: Path) -> dict[str, object]:
     """Evaluate, persist, and enforce one configured phase-boundary gate."""
     gate = config.curriculum.gate
     if gate is None:
         raise ValueError("run_phase_gate requires curriculum.gate")
-    checkpoint = _latest_native_checkpoint(config.runtime.output_dir)
     policy = policy_from_checkpoint(checkpoint)
     seeds = tuple(GATE_SEED_BASE + index for index in range(gate.seeds))
     opponent = (
@@ -457,9 +442,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = apply_overrides(phase_config(phase), arguments.overrides)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     LOGGER.info("curriculum: running %s", phase.name)
-    toad.run(config)
-    if config.curriculum.gate is not None:
-        run_phase_gate(config)
+    result = toad.run(config)
+    if config.curriculum.gate is not None and result.is_global_zero:
+        run_phase_gate(config, result.checkpoint)
 
 
 if __name__ == "__main__":
