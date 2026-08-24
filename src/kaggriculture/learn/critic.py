@@ -44,7 +44,7 @@ def monte_carlo(
     return td_lambda.td_lambda(
         rewards=rewards,
         values=torch.zeros_like(rewards),
-        bootstrap_value=torch.zeros(()),
+        bootstrap_value=rewards.new_zeros(()),
         discounts=(~dones).float() * discounting,
         lmb=1.0,
     ).vs

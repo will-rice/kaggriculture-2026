@@ -195,6 +195,18 @@ def test_the_terminal_payoff_reaches_turn_zero_with_their_retention() -> None:
     assert float(monte_carlo(rewards, dones)[0]) == pytest.approx(theirs, abs=0.005)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_monte_carlo_keeps_its_bootstrap_on_the_reward_device() -> None:
+    """Native CUDA rollout metrics must not introduce a CPU bootstrap tensor."""
+    rewards = torch.tensor([1.0, 2.0], device="cuda")
+    dones = torch.tensor([False, True], device="cuda")
+
+    returns = monte_carlo(rewards, dones)
+
+    assert returns.device == rewards.device
+    assert torch.isfinite(returns).all()
+
+
 def test_every_segment_covers_a_turn_and_the_last_one_ends_the_season() -> None:
     """The terminal turn must be an acted row, or no target ever sees a done."""
     segments = toad._segments(_episode())
