@@ -773,16 +773,19 @@ def joint_log_prob(
     Returns:
         ``(rows,)`` joint log-probabilities.
     """
-    valid = unit_actions != IGNORE if unit_valid is None else unit_valid
-    chosen = units.gather(2, unit_actions.clamp(min=0)[:, :, None]).squeeze(-1)
+    slot_valid = unit_actions != IGNORE if unit_valid is None else unit_valid
+    action_in_range = (unit_actions >= 0) & (unit_actions < units.shape[-1])
+    action_taken = (unit_actions != IGNORE) & action_in_range
+    safe_actions = unit_actions.clamp(min=0, max=units.shape[-1] - 1)
+    chosen = units.gather(2, safe_actions[:, :, None]).squeeze(-1)
     transferred = unit_quantities.gather(2, unit_quantity_actions[:, :, None]).squeeze(
         -1
     )
     return (
-        chosen.masked_fill(~valid, 0.0).sum(dim=1)
-        + transferred.masked_fill(~(transfer_slots(unit_actions) & valid), 0.0).sum(
-            dim=1
-        )
+        chosen.masked_fill(~(slot_valid & action_taken), 0.0).sum(dim=1)
+        + transferred.masked_fill(
+            ~(transfer_slots(safe_actions) & slot_valid & action_taken), 0.0
+        ).sum(dim=1)
         + market.gather(2, market_actions[:, :, None]).squeeze(-1).sum(dim=1)
     )
 
