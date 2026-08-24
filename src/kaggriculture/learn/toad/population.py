@@ -7,9 +7,10 @@ import os
 import random
 import re
 import tempfile
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, cast
+from typing import cast
 
 import torch
 from pydantic import (
@@ -59,6 +60,18 @@ class SnapshotManifest(BaseModel):
     def load(cls, path: Path) -> SnapshotManifest:
         """Deserialize one manifest without accepting unrecognised fields."""
         return cls.model_validate_json(path.read_text())
+
+
+class SnapshotPoolIdentity(BaseModel):
+    """Checkpoint-safe identity for reopening one exact verified store view."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    directory: Path
+    structure: str
+    seed: int
+    capacity: int
+    manifest: SnapshotManifest
 
 
 def sha256_file(path: Path) -> str:
@@ -140,9 +153,14 @@ class SnapshotStore:
 
     def _validate_existing_members(self) -> None:
         """Refuse to replace a member that is invalid, missing, or corrupt."""
+        verified: set[tuple[Path, str, str]] = set()
         for entry in self.manifest.entries:
             self._validate_entry_path(entry)
+            identity = (entry.path, entry.sha256, entry.structure)
+            if identity in verified:
+                continue
             _verify_entry(entry, self.structure)
+            verified.add(identity)
 
     def _validate_entry_path(self, entry: SnapshotEntry) -> None:
         """Require an entry to name one canonical content-addressed pool file."""
@@ -228,6 +246,72 @@ class SnapshotPool:
             store=store,
         )
 
+    def rebind(self, *, structure: str, seed: int) -> SnapshotPool:
+        """Bind selection to resolved config identity, rejecting foreign stores."""
+        if not self.manifest.entries and self._store is None:
+            return SnapshotPool.empty(seed=seed, structure=structure)
+        if self._store is None:
+            raise SnapshotIntegrityError(
+                "nonempty snapshot pool has no store directory for validation"
+            )
+        if self.structure != structure or self._store.structure != structure:
+            raise SnapshotIntegrityError(
+                "snapshot pool structure does not match resolved config: "
+                f"expected {structure}, found {self.structure}"
+            )
+        if self.manifest != self._store.manifest:
+            raise SnapshotIntegrityError(
+                "snapshot pool manifest does not match its bound store"
+            )
+        return SnapshotPool.from_store(self._store, seed=seed)
+
+    def identity(self) -> SnapshotPoolIdentity:
+        """Return the exact store view required to resume without republishing."""
+        if self._store is None:
+            raise SnapshotIntegrityError(
+                "snapshot pool has no store directory for checkpoint identity"
+            )
+        if self.manifest != self._store.manifest:
+            raise SnapshotIntegrityError(
+                "snapshot pool manifest does not match its bound store"
+            )
+        return SnapshotPoolIdentity(
+            directory=self._store.directory,
+            structure=self._store.structure,
+            seed=self.seed,
+            capacity=self._store.capacity,
+            manifest=self.manifest,
+        )
+
+    @classmethod
+    def reopen(
+        cls,
+        identity: SnapshotPoolIdentity,
+        *,
+        structure: str,
+        seed: int,
+        capacity: int,
+    ) -> SnapshotPool:
+        """Reopen the exact checkpointed manifest without publishing entries."""
+        if (
+            identity.structure != structure
+            or identity.seed != seed
+            or identity.capacity != capacity
+        ):
+            raise SnapshotIntegrityError(
+                "checkpointed snapshot pool identity does not match resolved config"
+            )
+        store = SnapshotStore(
+            identity.directory,
+            capacity=capacity,
+            structure=structure,
+        )
+        if store.manifest != identity.manifest:
+            raise SnapshotIntegrityError(
+                "checkpointed snapshot manifest does not match the durable store"
+            )
+        return cls.from_store(store, seed=seed)
+
     def sample(self, game_id: int) -> SnapshotEntry:
         """Select one entry solely from the configured seed and global game ID."""
         if not self.manifest.entries:
@@ -239,6 +323,12 @@ class SnapshotPool:
 
     def load(self, entry: SnapshotEntry) -> dict[str, torch.Tensor]:
         """Fail closed if the selected entry is incompatible or byte-corrupt."""
+        return self.load_many((entry,))[entry.sha256]
+
+    def load_many(
+        self, entries: Sequence[SnapshotEntry]
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Verify the full manifest once, then materialize each selected digest once."""
         if self.structure is None:
             raise SnapshotIntegrityError(
                 "snapshot pool has no structural fingerprint for validation"
@@ -247,8 +337,27 @@ class SnapshotPool:
             raise SnapshotIntegrityError(
                 "snapshot pool has no store directory for path validation"
             )
+        if self.manifest != self._store.manifest:
+            raise SnapshotIntegrityError(
+                "snapshot pool manifest does not match its bound store"
+            )
         self._store._validate_existing_members()
-        return self._store.load(entry)
+        loaded: dict[str, dict[str, torch.Tensor]] = {}
+        selected_by_digest: dict[str, SnapshotEntry] = {}
+        for entry in entries:
+            if entry not in self._store.manifest.entries:
+                raise SnapshotIntegrityError(
+                    f"selected snapshot is not in the bound store: {entry.path}"
+                )
+            previous = selected_by_digest.get(entry.sha256)
+            if previous is not None and previous != entry:
+                raise SnapshotIntegrityError(
+                    f"selected digest has inconsistent manifest entries: {entry.sha256}"
+                )
+            selected_by_digest[entry.sha256] = entry
+        for digest, entry in selected_by_digest.items():
+            loaded[digest] = _load_state_dict(entry)
+        return loaded
 
 
 def _verify_entry(entry: SnapshotEntry, expected_structure: str) -> None:

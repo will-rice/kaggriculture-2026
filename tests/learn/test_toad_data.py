@@ -19,7 +19,7 @@ from kaggriculture.learn.encoding import (
 )
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
-from kaggriculture.learn.toad.config import ToadConfig
+from kaggriculture.learn.toad.config import ToadConfig, structural_fingerprint
 from kaggriculture.learn.toad.data import (
     BatchKind,
     CollectionAssignment,
@@ -123,7 +123,11 @@ def test_round_allocator_realizes_largest_remainder_quotas_and_contiguous_ids(
         environments=7,
         teacher_checkpoint=tmp_path / "teacher.pt",
     )
-    store = SnapshotStore(tmp_path / "pool", capacity=1, structure="model-v1")
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(config),
+    )
     store.add(
         {"weight": torch.ones(1)},
         environment_steps=1,
@@ -190,6 +194,216 @@ def test_round_allocator_asserts_zero_and_uneven_quotas_exactly() -> None:
     }
 
 
+def test_supplied_pool_semantic_structure_mismatch_fails_before_sampling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same-shaped weights cannot cross a different resolved model fingerprint."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4, "activation": "leaky_relu"},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 1,
+            },
+        }
+    )
+    foreign = config.model_copy(
+        update={"model": config.model.model_copy(update={"activation": "relu"})}
+    )
+    policy = toad.Policy(
+        blocks=1,
+        channels=4,
+        value_bound=toad.VALUE_BOUND,
+        activation="leaky_relu",
+    )
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(foreign),
+    )
+    store.add(policy.state_dict(), environment_steps=1, round_id=0, run_id="run")
+    pool = SnapshotPool.from_store(store, seed=config.population.population_seed)
+    manifest_path = tmp_path / "pool" / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    sampled: list[int] = []
+    collected: list[int] = []
+    real_sample = pool.sample
+
+    def sample(game_id: int) -> SnapshotEntry:
+        sampled.append(game_id)
+        return real_sample(game_id)
+
+    monkeypatch.setattr(pool, "sample", sample)
+    source = ReferenceRoundSource(
+        config,
+        pool=pool,
+        collect_assignment=lambda assignment: (
+            collected.append(assignment.game_id) or (_trajectory(64),)
+        ),
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="structure.*config"):
+        list(source)
+
+    assert sampled == []
+    assert collected == []
+    assert source.next_game_id == 0
+    assert source._next_round_id == 0
+    assert manifest_path.read_bytes() == manifest_before
+
+
+def test_allocator_rebinds_external_pool_seed_to_population_seed(
+    tmp_path: Path,
+) -> None:
+    """Pool-construction seed cannot alter configured frozen selections."""
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 8,
+                "population_seed": 17,
+            },
+        }
+    )
+    policy = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=3,
+        structure=structural_fingerprint(config),
+    )
+    for index in range(3):
+        state = {name: value.clone() for name, value in policy.state_dict().items()}
+        first = next(iter(state.values()))
+        first.view(-1)[0] = index
+        store.add(
+            state,
+            environment_steps=index,
+            round_id=0,
+            run_id=f"run-{index}",
+        )
+
+    left = allocate_round(
+        config,
+        100,
+        3,
+        SnapshotPool.from_store(store, seed=1),
+    )
+    right = allocate_round(
+        config,
+        100,
+        3,
+        SnapshotPool.from_store(store, seed=999),
+    )
+
+    assert [item.checkpoint_sha256 for item in left] == [
+        item.checkpoint_sha256 for item in right
+    ]
+
+
+def test_failed_collection_does_not_commit_ids_and_retry_is_identical() -> None:
+    """A worker failure cannot consume the global stream or logical round clock."""
+    base = ToadConfig.control()
+    config = base.model_copy(
+        update={
+            "population": base.population.model_copy(
+                update={"environments_per_rank": 2}
+            )
+        }
+    )
+    seen: list[CollectionAssignment] = []
+    failed = False
+
+    def collect(assignment: CollectionAssignment) -> tuple[Trajectory]:
+        nonlocal failed
+        seen.append(assignment)
+        if not failed and len(seen) == 2:
+            failed = True
+            raise RuntimeError("simulated worker failure")
+        return (_trajectory(64),)
+
+    source = ReferenceRoundSource(config, collect_assignment=collect)
+
+    with pytest.raises(CollectionError, match="game_id"):
+        list(source)
+    first_attempt = tuple(seen)
+    assert source.next_game_id == 0
+    assert source._next_round_id == 0
+
+    seen.clear()
+    batches = list(source)
+
+    assert tuple(seen) == first_attempt
+    assert source.next_game_id == 2
+    assert source._next_round_id == 1
+    assert {batch.round_id for batch in batches} == {0}
+
+
+def test_empty_pool_failure_does_not_consume_round_identity(tmp_path: Path) -> None:
+    """An empty frozen pool leaves both collection clocks at their retry point."""
+    config = ToadConfig.model_validate(
+        {
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 1,
+            }
+        }
+    )
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(config),
+    )
+    manifest_path = tmp_path / "pool" / "manifest.json"
+    assert not manifest_path.exists()
+    source = ReferenceRoundSource(
+        config,
+        pool=SnapshotPool.from_store(store, seed=config.population.population_seed),
+    )
+
+    with pytest.raises(EmptySnapshotPoolError):
+        list(source)
+
+    assert source.next_game_id == 0
+    assert source._next_round_id == 0
+    assert not manifest_path.exists()
+
+
+def test_teacher_checkpoint_identity_is_hashed_once_per_round_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multiple teacher slots share one precomputed byte identity."""
+    checkpoint = tmp_path / "teacher.pt"
+    torch.save({"weight": torch.ones(1)}, checkpoint)
+    config = _allocation_config(
+        selfplay=0.0,
+        scripted=0.0,
+        frozen=0.0,
+        teacher=1.0,
+        environments=4,
+        teacher_checkpoint=checkpoint,
+    )
+    calls: list[Path] = []
+    real_hash = sha256_file
+
+    def counted_hash(path: Path) -> str:
+        calls.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr("kaggriculture.learn.toad.data.sha256_file", counted_hash)
+
+    assignments = allocate_round(config, 0, 0)
+
+    assert len(assignments) == 4
+    assert calls == [checkpoint]
+
+
 def test_opponent_assignment_uses_the_population_stage_positional_order() -> None:
     """The public assignment API orders kind before opponent identity."""
     assignment = OpponentAssignment(
@@ -245,7 +459,11 @@ def test_round_source_loads_one_selected_frozen_digest_once(
         }
     )
     opponent = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
-    store = SnapshotStore(tmp_path / "pool", capacity=1, structure="model-v1")
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(config),
+    )
     entry = store.add(
         opponent.state_dict(),
         environment_steps=9,
@@ -253,14 +471,16 @@ def test_round_source_loads_one_selected_frozen_digest_once(
         run_id="frozen-run",
     )
     pool = SnapshotPool.from_store(store, seed=3)
-    loads: list[str] = []
-    real_load = pool.load
+    loads: list[tuple[str, ...]] = []
+    real_load_many = SnapshotPool.load_many
 
-    def counted_load(selected: SnapshotEntry) -> dict[str, torch.Tensor]:
-        loads.append(entry.sha256)
-        return real_load(selected)
+    def counted_load_many(
+        selected_pool: SnapshotPool, selected: Sequence[SnapshotEntry]
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        loads.append(tuple(item.sha256 for item in selected))
+        return real_load_many(selected_pool, selected)
 
-    monkeypatch.setattr(pool, "load", counted_load)
+    monkeypatch.setattr(SnapshotPool, "load_many", counted_load_many)
     seen: list[CollectionAssignment] = []
 
     def collect(assignment: CollectionAssignment) -> tuple[Trajectory]:
@@ -270,7 +490,7 @@ def test_round_source_loads_one_selected_frozen_digest_once(
     source = ReferenceRoundSource(config, pool=pool, collect_assignment=collect)
     batches = list(source)
 
-    assert loads == [entry.sha256]
+    assert loads == [(entry.sha256,)]
     assert {assignment.checkpoint_sha256 for assignment in seen} == {entry.sha256}
     assert all(batch.kind is BatchKind.FROZEN_OPPONENT for batch in batches)
     assert all(set(batch.opponent_digests) == {entry.sha256} for batch in batches)
@@ -307,10 +527,15 @@ def test_selected_corrupt_frozen_member_aborts_before_collection(
         channels=config.model.channels,
         value_bound=toad.VALUE_BOUND,
     )
-    store = SnapshotStore(tmp_path / "pool", capacity=1, structure="model-v1")
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(config),
+    )
     entry = store.add(actor.state_dict(), environment_steps=1, round_id=0, run_id="run")
     pool = SnapshotPool.from_store(store, seed=0)
     entry.path.write_bytes(b"corrupt")
+    manifest_before = (tmp_path / "pool" / "manifest.json").read_bytes()
     collected: list[int] = []
 
     def collect_unexpected(assignment: CollectionAssignment) -> tuple[Trajectory, ...]:
@@ -327,6 +552,9 @@ def test_selected_corrupt_frozen_member_aborts_before_collection(
         list(source)
 
     assert collected == []
+    assert source.next_game_id == 0
+    assert source._next_round_id == 0
+    assert (tmp_path / "pool" / "manifest.json").read_bytes() == manifest_before
 
 
 def test_reference_worker_strictly_builds_a_frozen_neural_opponent(
@@ -404,6 +632,128 @@ def test_snapshot_at_start_populates_before_first_frozen_selection(
     assert len(source.pool.manifest.entries) == 1
     assert seen[0].checkpoint_sha256 == source.pool.manifest.entries[0].sha256
     assert batches[0].actor_version == 5
+
+
+@pytest.mark.parametrize("bootstrap", ["snapshot_at_start", "initial_snapshot"])
+def test_snapshot_bootstrap_resume_reopens_exact_pool_without_republication(
+    tmp_path: Path, bootstrap: str
+) -> None:
+    """Resume restores one bootstrapped manifest and the next frozen assignment."""
+    actor = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    initial = tmp_path / "initial.pt"
+    torch.save(actor.state_dict(), initial)
+    bootstrap_config = (
+        {"snapshot_at_start": True}
+        if bootstrap == "snapshot_at_start"
+        else {"initial_snapshots": [initial]}
+    )
+    config = ToadConfig.model_validate(
+        {
+            "model": {"blocks": 1, "channels": 4},
+            "population": {
+                "selfplay": 0.0,
+                "scripted": 0.0,
+                "frozen_opponent": 1.0,
+                "environments_per_rank": 1,
+                "pool_capacity": 3,
+                "population_seed": 29,
+                **bootstrap_config,
+            },
+            "runtime": {"output_dir": tmp_path / "run"},
+        }
+    )
+    uninterrupted_seen: list[CollectionAssignment] = []
+    source = ReferenceRoundSource(
+        config,
+        collect_assignment=lambda assignment: (
+            uninterrupted_seen.append(assignment) or (_trajectory(64),)
+        ),
+    )
+    data = ToadDataModule(config, source)
+    data.publish_actor(actor.state_dict(), version=4)
+    list(source)
+    state = data.state_dict()
+    manifest_path = tmp_path / "run" / "population" / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    list(source)
+    expected = uninterrupted_seen[-1]
+
+    resumed_seen: list[CollectionAssignment] = []
+    resumed_source = ReferenceRoundSource(
+        config,
+        collect_assignment=lambda assignment: (
+            resumed_seen.append(assignment) or (_trajectory(64),)
+        ),
+    )
+    resumed = ToadDataModule(config, resumed_source)
+    resumed.load_state_dict(state)
+
+    list(resumed_source)
+
+    assert resumed_seen == [expected]
+    assert manifest_path.read_bytes() == manifest_before
+    assert resumed_source.pool is not None
+    assert len(resumed_source.pool.manifest.entries) == 1
+
+
+def test_inconsistent_same_digest_binding_fails_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Digest caching cannot conceal a second assignment with a different kind."""
+    config = ToadConfig.model_validate({"model": {"blocks": 1, "channels": 4}})
+    policy = toad.Policy(blocks=1, channels=4, value_bound=toad.VALUE_BOUND)
+    store = SnapshotStore(
+        tmp_path / "pool",
+        capacity=1,
+        structure=structural_fingerprint(config),
+    )
+    entry = store.add(
+        policy.state_dict(), environment_steps=1, round_id=0, run_id="run"
+    )
+    pool = SnapshotPool.from_store(store, seed=config.population.population_seed)
+    loads: list[tuple[str, ...]] = []
+    real_load_many = SnapshotPool.load_many
+
+    def load_many(
+        selected_pool: SnapshotPool, selected: Sequence[SnapshotEntry]
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        loads.append(tuple(item.sha256 for item in selected))
+        return real_load_many(selected_pool, selected)
+
+    monkeypatch.setattr(SnapshotPool, "load_many", load_many)
+    assignments = (
+        OpponentAssignment(
+            0,
+            0,
+            BatchKind.FROZEN_OPPONENT,
+            "snapshot",
+            entry.path,
+            entry.sha256,
+        ),
+        OpponentAssignment(
+            1,
+            1,
+            BatchKind.TEACHER_DISTILL,
+            "teacher",
+            entry.path,
+            entry.sha256,
+        ),
+    )
+    collected: list[int] = []
+    source = ReferenceRoundSource(
+        config,
+        assignments=assignments,
+        pool=pool,
+        collect_assignment=lambda assignment: (
+            collected.append(assignment.game_id) or (_trajectory(64),)
+        ),
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="inconsistent.*digest"):
+        list(source)
+
+    assert loads == []
+    assert collected == []
 
 
 def test_initial_snapshot_is_strictly_checked_before_pool_publication(

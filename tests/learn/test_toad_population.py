@@ -292,6 +292,30 @@ def test_population_sampling_is_deterministic_by_game_id(tmp_path: Path) -> None
     assert pool.sample(game_id=91) == pool.sample(game_id=91)
 
 
+def test_pool_load_verifies_each_manifest_digest_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One store-bound load checks every member once and materializes the selection."""
+    store = SnapshotStore(tmp_path, capacity=2, structure="model-v1")
+    first = store.add(state_dict(1.0), environment_steps=1, round_id=0, run_id="run")
+    second = store.add(state_dict(2.0), environment_steps=2, round_id=0, run_id="run")
+    pool = SnapshotPool.from_store(store, seed=17)
+    calls: list[Path] = []
+    real_hash = sha256_file
+
+    def counted_hash(path: Path) -> str:
+        calls.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr("kaggriculture.learn.toad.population.sha256_file", counted_hash)
+
+    loaded = pool.load(first)
+
+    assert torch.equal(loaded["weight"], torch.tensor([1.0]))
+    assert calls.count(first.path) == 1
+    assert calls.count(second.path) == 1
+
+
 def test_empty_population_refuses_a_frozen_opponent_request(tmp_path: Path) -> None:
     """No arbitrary fallback policy replaces an empty frozen pool."""
     pool = SnapshotPool(SnapshotManifest(), seed=17)

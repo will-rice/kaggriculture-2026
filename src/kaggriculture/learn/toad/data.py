@@ -26,6 +26,7 @@ from kaggriculture.learn.toad.population import (
     SnapshotEntry,
     SnapshotIntegrityError,
     SnapshotPool,
+    SnapshotPoolIdentity,
     SnapshotStore,
     sha256_file,
 )
@@ -171,18 +172,8 @@ _ONLINE_KINDS = (
 )
 
 
-def allocate_round(
-    config: ToadConfig,
-    start_game_id: int,
-    round_id: int,
-    pool: SnapshotPool | None = None,
-    teacher: SnapshotEntry | None = None,
-) -> tuple[OpponentAssignment, ...]:
-    """Allocate one deterministic, quota-exact collection round.
-
-    Kind slots are shuffled before monotonically increasing game IDs are bound,
-    preserving contiguous global identity while varying opponent order by round.
-    """
+def _round_counts(config: ToadConfig) -> dict[BatchKind, int]:
+    """Allocate exact environment quotas by deterministic largest remainder."""
     environments = config.population.environments_per_rank
     probabilities = {
         BatchKind.SELFPLAY: config.population.selfplay,
@@ -203,47 +194,94 @@ def allocate_round(
         counts[kind] += 1
     if sum(counts.values()) != environments:
         raise AssertionError("population quotas must allocate every environment")
+    return counts
+
+
+def _teacher_identity(
+    config: ToadConfig, teacher: SnapshotEntry | None
+) -> tuple[Path, str, str]:
+    """Resolve and hash one teacher checkpoint once for a whole allocation."""
+    teacher_path = (
+        teacher.path if teacher is not None else config.population.teacher_checkpoint
+    )
+    if teacher_path is None:
+        raise ValueError("teacher-distill allocation requires a checkpoint")
+    teacher_digest = (
+        teacher.sha256 if teacher is not None else sha256_file(teacher_path)
+    )
+    return (
+        teacher_path,
+        teacher_digest,
+        f"teacher:{teacher_path.name}:{teacher_digest[:12]}",
+    )
+
+
+def _round_opponent(
+    config: ToadConfig,
+    kind: BatchKind,
+    game_id: int,
+    pool: SnapshotPool | None,
+    teacher_identity: tuple[Path, str, str] | None,
+) -> tuple[str, Path | None, str | None]:
+    """Resolve one already-validated kind slot to an auditable opponent."""
+    if kind is BatchKind.SELFPLAY:
+        return "self", None, None
+    if kind is BatchKind.SCRIPTED:
+        return config.population.scripted_opponent, None, None
+    if kind is BatchKind.FROZEN_OPPONENT:
+        if pool is None:
+            raise AssertionError("frozen quota requires a rebound collection pool")
+        selected = pool.sample(game_id)
+        opponent_id = (
+            f"snapshot:{selected.run_id}:{selected.environment_steps}:"
+            f"{selected.sha256[:12]}"
+        )
+        return opponent_id, selected.path, selected.sha256
+    if teacher_identity is None:
+        raise AssertionError("teacher quota requires a precomputed identity")
+    checkpoint, digest, opponent_id = teacher_identity
+    return opponent_id, checkpoint, digest
+
+
+def allocate_round(
+    config: ToadConfig,
+    start_game_id: int,
+    round_id: int,
+    pool: SnapshotPool | None = None,
+    teacher: SnapshotEntry | None = None,
+) -> tuple[OpponentAssignment, ...]:
+    """Allocate one deterministic, quota-exact collection round.
+
+    Kind slots are shuffled before monotonically increasing game IDs are bound,
+    preserving contiguous global identity while varying opponent order by round.
+    """
+    counts = _round_counts(config)
 
     kinds = [kind for kind in _ONLINE_KINDS for _ in range(counts[kind])]
     population_seed = config.runtime.seed + config.population.population_seed
     random.Random(population_seed ^ round_id).shuffle(kinds)
 
+    collection_pool = pool
+    if counts[BatchKind.FROZEN_OPPONENT]:
+        if pool is None:
+            raise EmptySnapshotPoolError(
+                "frozen opponent requested before pool population"
+            )
+        collection_pool = pool.rebind(
+            structure=structural_fingerprint(config),
+            seed=config.population.population_seed,
+        )
+
+    teacher_identity: tuple[Path, str, str] | None = None
+    if counts[BatchKind.TEACHER_DISTILL]:
+        teacher_identity = _teacher_identity(config, teacher)
+
     assignments: list[OpponentAssignment] = []
     for offset, kind in enumerate(kinds):
         game_id = start_game_id + offset
-        checkpoint: Path | None = None
-        checkpoint_sha256: str | None = None
-        if kind is BatchKind.SELFPLAY:
-            opponent_id = "self"
-        elif kind is BatchKind.SCRIPTED:
-            opponent_id = config.population.scripted_opponent
-        elif kind is BatchKind.FROZEN_OPPONENT:
-            if pool is None:
-                raise EmptySnapshotPoolError(
-                    "frozen opponent requested before pool population"
-                )
-            selected = pool.sample(game_id)
-            checkpoint = selected.path
-            checkpoint_sha256 = selected.sha256
-            opponent_id = (
-                f"snapshot:{selected.run_id}:{selected.environment_steps}:"
-                f"{selected.sha256[:12]}"
-            )
-        else:
-            selected_teacher = teacher
-            checkpoint = (
-                selected_teacher.path
-                if selected_teacher is not None
-                else config.population.teacher_checkpoint
-            )
-            if checkpoint is None:
-                raise ValueError("teacher-distill allocation requires a checkpoint")
-            checkpoint_sha256 = (
-                selected_teacher.sha256
-                if selected_teacher is not None
-                else sha256_file(checkpoint)
-            )
-            opponent_id = f"teacher:{checkpoint.name}:{checkpoint_sha256[:12]}"
+        opponent_id, checkpoint, checkpoint_sha256 = _round_opponent(
+            config, kind, game_id, collection_pool, teacher_identity
+        )
         assignments.append(
             OpponentAssignment(
                 game_id=game_id,
@@ -590,9 +628,14 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
 
     def _ensure_initial_pool(self) -> None:
         """Materialize declared first-round snapshots before opponent selection."""
-        if self.pool is not None and self.pool.manifest.entries:
-            return
         population = self.config.population
+        structure = structural_fingerprint(self.config)
+        if self.pool is not None and self.pool.manifest.entries:
+            self.pool = self.pool.rebind(
+                structure=structure,
+                seed=population.population_seed,
+            )
+            return
         if not population.initial_snapshots and not population.snapshot_at_start:
             return
 
@@ -612,7 +655,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         store = SnapshotStore(
             self.config.runtime.output_dir / "population",
             capacity=population.pool_capacity,
-            structure=structural_fingerprint(self.config),
+            structure=structure,
         )
         for index, (state, run_id) in enumerate(initial):
             store.add(
@@ -623,7 +666,7 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             )
         self.pool = SnapshotPool.from_store(
             store,
-            seed=self.config.runtime.seed + population.population_seed,
+            seed=population.population_seed,
         )
 
     def publish_actor(
@@ -682,52 +725,107 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         self, assignments: Sequence[CollectionAssignment]
     ) -> dict[str, tuple[dict[str, torch.Tensor], ModelConfig]]:
         """Validate and load each selected neural-opponent digest exactly once."""
+        validated: dict[
+            str, tuple[BatchKind, Path, str, ModelConfig, SnapshotEntry | None]
+        ] = {}
+        for digest, group in self._group_opponent_assignments(assignments).items():
+            validated[digest] = self._validate_opponent_group(digest, group)
+
+        frozen_entries = [
+            entry
+            for _kind, _path, _opponent_id, _model, entry in validated.values()
+            if entry is not None
+        ]
+        frozen_states = (
+            self.pool.load_many(frozen_entries)
+            if frozen_entries and self.pool is not None
+            else {}
+        )
         materialized: dict[str, tuple[dict[str, torch.Tensor], ModelConfig]] = {}
-        for assignment in assignments:
-            digest = assignment.checkpoint_sha256
-            if digest is None or digest in materialized:
-                continue
-            if assignment.checkpoint is None:
-                raise SnapshotIntegrityError(
-                    f"opponent digest {digest} has no checkpoint path"
-                )
-            if assignment.kind is BatchKind.FROZEN_OPPONENT:
-                if self.pool is None:
-                    raise EmptySnapshotPoolError(
-                        "frozen opponent requested before pool population"
-                    )
-                matches = [
-                    entry
-                    for entry in self.pool.manifest.entries
-                    if entry.sha256 == digest and entry.path == assignment.checkpoint
-                ]
-                if len(matches) != 1:
-                    raise SnapshotIntegrityError(
-                        f"selected frozen opponent is not in the bound pool: {digest}"
-                    )
-                state = self.pool.load(matches[0])
-                model = self.config.model
-            elif assignment.kind is BatchKind.TEACHER_DISTILL:
-                actual = sha256_file(assignment.checkpoint)
+        for digest, (kind, path, _opponent_id, model, _entry) in validated.items():
+            if kind is BatchKind.FROZEN_OPPONENT:
+                state = frozen_states[digest]
+            else:
+                actual = sha256_file(path)
                 if actual != digest:
                     raise SnapshotIntegrityError(
                         "teacher checkpoint digest mismatch for "
-                        f"{assignment.checkpoint}: expected {digest}, found {actual}"
+                        f"{path}: expected {digest}, found {actual}"
                     )
-                state = _checkpoint_policy_state(assignment.checkpoint)
-                blocks = self.config.population.teacher_blocks
-                model = (
-                    self.config.model
-                    if blocks is None
-                    else self.config.model.model_copy(update={"blocks": blocks})
-                )
-            else:
-                raise ValueError(
-                    "non-neural assignment unexpectedly carries a digest: "
-                    f"{assignment.kind}"
-                )
+                state = _checkpoint_policy_state(path)
             materialized[digest] = (state, model)
         return materialized
+
+    @staticmethod
+    def _group_opponent_assignments(
+        assignments: Sequence[CollectionAssignment],
+    ) -> dict[str, list[CollectionAssignment]]:
+        """Group neural assignments while rejecting unbound checkpoint paths."""
+        groups: dict[str, list[CollectionAssignment]] = {}
+        for assignment in assignments:
+            digest = assignment.checkpoint_sha256
+            if digest is None:
+                if assignment.checkpoint is not None:
+                    raise SnapshotIntegrityError(
+                        "opponent checkpoint path has no digest binding"
+                    )
+                continue
+            groups.setdefault(digest, []).append(assignment)
+        return groups
+
+    def _validate_opponent_group(
+        self, digest: str, group: Sequence[CollectionAssignment]
+    ) -> tuple[BatchKind, Path, str, ModelConfig, SnapshotEntry | None]:
+        """Require every same-digest slot to carry one exact semantic binding."""
+        bindings = {
+            (assignment.kind, assignment.checkpoint, assignment.opponent_id)
+            for assignment in group
+        }
+        if len(bindings) != 1:
+            raise SnapshotIntegrityError(
+                f"inconsistent assignment binding for digest {digest}"
+            )
+        assignment = group[0]
+        if assignment.checkpoint is None:
+            raise SnapshotIntegrityError(
+                f"opponent digest {digest} has no checkpoint path"
+            )
+        if assignment.kind is BatchKind.FROZEN_OPPONENT:
+            if self.pool is None:
+                raise EmptySnapshotPoolError(
+                    "frozen opponent requested before pool population"
+                )
+            matches = [
+                entry
+                for entry in self.pool.manifest.entries
+                if entry.sha256 == digest and entry.path == assignment.checkpoint
+            ]
+            if len(matches) != 1:
+                raise SnapshotIntegrityError(
+                    f"selected frozen opponent is not in the bound pool: {digest}"
+                )
+            model = self.config.model
+            entry: SnapshotEntry | None = matches[0]
+        elif assignment.kind is BatchKind.TEACHER_DISTILL:
+            blocks = self.config.population.teacher_blocks
+            model = (
+                self.config.model
+                if blocks is None
+                else self.config.model.model_copy(update={"blocks": blocks})
+            )
+            entry = None
+        else:
+            raise ValueError(
+                "non-neural assignment unexpectedly carries a digest: "
+                f"{assignment.kind}"
+            )
+        return (
+            assignment.kind,
+            assignment.checkpoint,
+            assignment.opponent_id,
+            model,
+            entry,
+        )
 
     def _collect_round(
         self, assignments: Sequence[CollectionAssignment]
@@ -778,16 +876,16 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
 
     def __iter__(self) -> Iterator[LearnerBatch]:
         """Collect one assignment set, then expose it as one logical round."""
+        self._ensure_initial_pool()
         assignments = self._assignments
+        generated = assignments is None
+        first_game_id = self.next_game_id
+        round_id = self._next_round_id
         if assignments is None:
-            self._ensure_initial_pool()
-            first_game_id = self.next_game_id
-            environments = self.config.population.environments_per_rank
-            self.next_game_id += environments
             assignments = allocate_round(
                 self.config,
                 first_game_id,
-                self._next_round_id,
+                round_id,
                 self.pool,
                 self.teacher,
             )
@@ -798,8 +896,6 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
             collected,
             key=lambda entry: _ONLINE_KINDS.index(entry[0].kind),
         )
-        round_id = self._next_round_id
-        self._next_round_id += 1
         expander = RoundBatchExpander(
             batch_segments=self.config.optimizer.batch_segments,
             unroll_length=self.config.optimizer.unroll_length,
@@ -869,16 +965,28 @@ class ReferenceRoundSource(Iterable[LearnerBatch]):
         ]
         from kaggriculture.learn.scripts.toad import _collection_metrics
 
-        yield from expander.expand(
-            trajectories,
-            meta,
-            trajectory_kinds=trajectory_kinds,
-            trajectory_assignments=trajectory_assignments,
-            kind_metas=kind_metas,
-            round_metrics=_collection_metrics(
-                mirror, opponents, self.config.curriculum.reward_field
-            ),
+        batches = tuple(
+            expander.expand(
+                trajectories,
+                meta,
+                trajectory_kinds=trajectory_kinds,
+                trajectory_assignments=trajectory_assignments,
+                kind_metas=kind_metas,
+                round_metrics=_collection_metrics(
+                    mirror, opponents, self.config.curriculum.reward_field
+                ),
+            )
         )
+        if not batches:
+            raise CollectionError(
+                f"collection round {round_id} produced no complete learner batches"
+            )
+        if generated:
+            self.next_game_id = (
+                first_game_id + self.config.population.environments_per_rank
+            )
+        self._next_round_id = round_id + 1
+        yield from batches
 
 
 class RoundIterableDataset(IterableDataset[LearnerBatch]):
@@ -924,31 +1032,61 @@ class ToadDataModule(lightning.LightningDataModule):
 
     def state_dict(self) -> dict[str, object]:
         """Serialize the stream position needed for the next collection."""
+        pool_identity = (
+            self.source.pool.identity().model_dump(mode="json")
+            if self.source.pool is not None and self.source.pool.manifest.entries
+            else None
+        )
         return {
             "next_game_id": self.source.next_game_id,
+            "next_round_id": self.source._next_round_id,
             "collector_rng": self.source.rng.getstate(),
             "published_actor_version": self.source.actor_version,
             "published_actor_state": {
                 name: tensor.detach().to("cpu", copy=True)
                 for name, tensor in self.source.actor_state.items()
             },
+            "population_pool": pool_identity,
         }
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
         """Restore the collector stream without retaining stale actor weights."""
-        self.source.next_game_id = cast(int, state_dict["next_game_id"])
-        self.source._next_round_id = (
-            self.source.next_game_id // self.config.population.environments_per_rank
+        next_game_id = cast(int, state_dict["next_game_id"])
+        next_round_id = cast(
+            int,
+            state_dict.get(
+                "next_round_id",
+                next_game_id // self.config.population.environments_per_rank,
+            ),
         )
-        self.source.rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))
-        self.source.actor_version = cast(int, state_dict["published_actor_version"])
+        restored_rng = random.Random()
+        restored_rng.setstate(cast(tuple[Any, ...], state_dict["collector_rng"]))
+        actor_version = cast(int, state_dict["published_actor_version"])
         actor_state = cast(
             Mapping[str, torch.Tensor], state_dict["published_actor_state"]
         )
-        self.source.actor_state = {
+        restored_actor_state = {
             name: tensor.detach().to("cpu", copy=True)
             for name, tensor in actor_state.items()
         }
+        restored_pool = self.source.pool
+        if "population_pool" in state_dict:
+            pool_payload = state_dict["population_pool"]
+            restored_pool = None
+            if pool_payload is not None:
+                identity = SnapshotPoolIdentity.model_validate(pool_payload)
+                restored_pool = SnapshotPool.reopen(
+                    identity,
+                    structure=structural_fingerprint(self.config),
+                    seed=self.config.population.population_seed,
+                    capacity=self.config.population.pool_capacity,
+                )
+        self.source.next_game_id = next_game_id
+        self.source._next_round_id = next_round_id
+        self.source.rng = restored_rng
+        self.source.actor_version = actor_version
+        self.source.actor_state = restored_actor_state
+        self.source.pool = restored_pool
         self.source._restored_actor = True
 
     def consume_restored_actor(self) -> bool:
