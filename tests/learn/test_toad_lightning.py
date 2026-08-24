@@ -14,6 +14,7 @@ import kaggriculture.learn.rollout as rollout_module
 import kaggriculture.learn.toad.lightning as lightning_module
 from kaggriculture.constants import BOARD_SIZE, ENVIRONMENT
 from kaggriculture.learn import toad_loss
+from kaggriculture.learn.encoding import TRANSFER_OPS
 from kaggriculture.learn.scripts import toad
 from kaggriculture.learn.toad.config import ModelConfig, TeacherSpec, ToadConfig
 from kaggriculture.learn.toad.data import BatchKind, LearnerBatch, segments
@@ -283,7 +284,9 @@ def test_padded_local_slots_cannot_change_loss_or_parameter_gradients() -> None:
         quantity_masks[:, -1] = False
         quantity_masks[:, -1, 0] = True
         unit_actions = segment["unit_actions"].clone()
-        unit_actions[:, -1] = 0
+        unit_actions[:, -1] = TRANSFER_OPS.index(True)
+        unit_valid = segment["unit_valid"].clone()
+        unit_valid[:, -1] = False
         unit_quantities = segment["unit_quantities"].clone()
         unit_quantities[:, -1] = 0
         padded_segments.append(
@@ -292,6 +295,7 @@ def test_padded_local_slots_cannot_change_loss_or_parameter_gradients() -> None:
                 "unit_masks": unit_masks,
                 "unit_quantity_masks": quantity_masks,
                 "unit_actions": unit_actions,
+                "unit_valid": unit_valid,
                 "unit_quantities": unit_quantities,
             }
         )

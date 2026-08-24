@@ -15,6 +15,7 @@ import lightning
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
+from kaggriculture.learn.encoding import IGNORE
 from kaggriculture.learn.rollout import Trajectory, segment_starts
 from kaggriculture.learn.toad.config import (
     ModelConfig,
@@ -127,6 +128,27 @@ class LearnerBatch:
     segment_game_ids: tuple[int, ...] = ()
     segment_seeds: tuple[int, ...] = ()
     round_metrics: Mapping[str, float | int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Freeze observation-derived unit padding for legacy segment inputs.
+
+        New segments carry ``unit_valid`` directly. This narrow construction
+        fallback admits historical fixtures once, before learner-side tests or
+        transformations can edit action labels; entropy and action scoring
+        never infer padding from those mutable labels.
+        """
+        normalized = []
+        for segment in self.segments:
+            if "unit_valid" in segment:
+                normalized.append(segment)
+                continue
+            normalized.append(
+                {
+                    **segment,
+                    "unit_valid": segment["unit_actions"] != IGNORE,
+                }
+            )
+        object.__setattr__(self, "segments", tuple(normalized))
 
 
 @dataclass(frozen=True, init=False)
@@ -439,6 +461,8 @@ def segments(
                 name: getattr(trajectory, name)[start : start + unroll_length]
                 for name in ACTED_FIELDS
             },
+            "unit_valid": trajectory.unit_actions[start : start + unroll_length]
+            != IGNORE,
             **{
                 name: getattr(trajectory, name)[start : start + unroll_length]
                 for name in BELIEF_FIELDS

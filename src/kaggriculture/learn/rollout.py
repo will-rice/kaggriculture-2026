@@ -226,16 +226,17 @@ class Trajectory:
         scalars: ``(turns, SCALARS)`` market and phase features.
         positions: ``(turns, MAX_UNITS)`` flattened tile indices per unit.
         unit_actions: ``(turns, MAX_UNITS)`` sampled op indices, ``IGNORE``
-            in the slots no unit was standing in. That padding is the update's
-            only statement of which slots were real, and it is the same
-            sentinel ``encode_units`` writes, so the behaviour-cloning loss and
-            the PPO loss mask the same slots the same way.
+            in the slots no unit was standing in. ``toad.data.segments``
+            freezes that observation-bounded fact into ``unit_valid`` at the
+            learner boundary, before any test or learner transformation can
+            edit action labels. The sentinel remains the source encoding's
+            statement of absent slots and is shared with behaviour cloning.
         unit_quantities: ``(turns, MAX_UNITS)`` the bucket each unit's quantity
             head sampled, into ``QUANTITIES``. Every slot carries one, padded
             slots included, because the head emits a row for every slot and a
-            masked-out row would softmax to NaN; the padding is stated once, on
-            ``unit_actions``, and a slot spends its bucket only where the op
-            beside it is a ``PICKUP`` or a ``PLACE``.
+            masked-out row would softmax to NaN. Learner-side padding comes
+            from the frozen ``unit_valid`` mask, and a real slot spends its
+            bucket only where the op beside it is a ``PICKUP`` or a ``PLACE``.
         market_actions: ``(turns, len(MARKET_SLOTS) + 2)`` sampled quantity
             buckets. No slot is ever padding here -- bucket 0 is "trade
             nothing", a decision the engine acts on by emitting no order.

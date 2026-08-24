@@ -16,7 +16,6 @@ from torch.optim.lr_scheduler import LRScheduler
 from kaggriculture.learn import toad_loss
 from kaggriculture.learn.encoding import (
     CROP_NAMES,
-    IGNORE,
     PRODUCT_NAMES,
     SHED_NAMES,
     transfer_slots,
@@ -72,7 +71,7 @@ class HeadEntropy:
         )
 
 
-def _entropy_by_row(
+def _entropy_by_row(  # noqa: C901
     *,
     unit_log_probs: torch.Tensor,
     quantity_log_probs: torch.Tensor,
@@ -81,10 +80,47 @@ def _entropy_by_row(
     quantity_masks: torch.Tensor,
     market_masks: torch.Tensor,
     unit_actions: torch.Tensor,
+    unit_valid: torch.Tensor,
 ) -> HeadEntropy:
     """Return FP32 entropy sum/count pairs retaining every leading row."""
-    padded_units = unit_actions == IGNORE
-    operation_valid = ~padded_units
+    if unit_valid.dtype is not torch.bool:
+        raise ValueError("unit_valid must be boolean")
+    if unit_valid.shape != unit_actions.shape:
+        raise ValueError("unit_valid must match unit_actions exactly")
+    if unit_valid.device != unit_actions.device:
+        raise ValueError("unit_valid and unit_actions must share a device")
+    if any(
+        tensor.device != unit_valid.device
+        for tensor in (
+            unit_log_probs,
+            quantity_log_probs,
+            market_log_probs,
+            unit_masks,
+            quantity_masks,
+            market_masks,
+        )
+    ):
+        raise ValueError("entropy logits, masks, and unit_valid must share a device")
+    if any(
+        mask.dtype is not torch.bool
+        for mask in (unit_masks, quantity_masks, market_masks)
+    ):
+        raise ValueError("entropy masks must be boolean")
+    if (
+        unit_log_probs.shape[:-1] != unit_valid.shape
+        or unit_masks.shape != unit_log_probs.shape
+    ):
+        raise ValueError("unit operation logits and masks must match unit_valid")
+    if (
+        quantity_log_probs.shape[:-1] != unit_valid.shape
+        or quantity_masks.shape != quantity_log_probs.shape
+    ):
+        raise ValueError("unit quantity logits and masks must match unit_valid")
+    if market_masks.shape != market_log_probs.shape:
+        raise ValueError("market logits and masks must match")
+    if market_log_probs.shape[:-2] != unit_valid.shape[:-1]:
+        raise ValueError("market leading dimensions must match unit_valid")
+    operation_valid = unit_valid
     quantity_valid = transfer_slots(unit_actions) & operation_valid
     market_valid = torch.ones_like(market_masks[..., 0], dtype=torch.bool)
 
@@ -127,13 +163,15 @@ def compute_head_entropy(
     quantity_masks: torch.Tensor,
     market_masks: torch.Tensor,
     unit_actions: torch.Tensor,
+    unit_valid: torch.Tensor,
 ) -> HeadEntropy:
     """Measure differentiable, positive entropy by action head.
 
-    Padded unit rows are identified by the recorded operation action, rather
-    than a placeholder logit or mask. Quantity rows additionally require that
-    operation to spend a quantity. Market slots have no such padding and are
-    counted from their actual tensor shape.
+    ``unit_valid`` is frozen from the original observation-bounded encoded
+    labels, rather than inferred from mutable learner action values or masks.
+    Quantity rows additionally require the current operation to spend a
+    quantity. Market slots have no such padding and are counted from their
+    actual tensor shape.
     """
     by_row = _entropy_by_row(
         unit_log_probs=unit_log_probs,
@@ -143,6 +181,7 @@ def compute_head_entropy(
         quantity_masks=quantity_masks,
         market_masks=market_masks,
         unit_actions=unit_actions,
+        unit_valid=unit_valid,
     )
     return _reduce_head_entropy(by_row)
 
@@ -359,6 +398,7 @@ def compute_loss(  # noqa: C901
     scalars = stacked("scalars")
     positions = stacked("positions")
     unit_actions = stacked("unit_actions")
+    unit_valid = stacked("unit_valid")
     unit_quantity_actions = stacked("unit_quantities")
     market_actions = stacked("market_actions")
     unit_masks = stacked("unit_masks")
@@ -425,6 +465,7 @@ def compute_loss(  # noqa: C901
     if belief_enabled:
         belief_terms = _belief_loss_terms(output, segments)
     flat_unit_actions = unit_actions.flatten(0, 1)
+    flat_unit_valid = unit_valid.flatten(0, 1)
     flat_unit_masks = unit_masks.flatten(0, 1)
     flat_quantity_masks = unit_quantity_masks.flatten(0, 1)
     flat_market_masks = market_masks.flatten(0, 1)
@@ -444,6 +485,7 @@ def compute_loss(  # noqa: C901
         flat_unit_actions,
         unit_quantity_actions.flatten(0, 1),
         market_actions.flatten(0, 1),
+        unit_valid=flat_unit_valid,
     ).view(turns, width)
     entropy_by_row = _entropy_by_row(
         unit_log_probs=units,
@@ -453,6 +495,7 @@ def compute_loss(  # noqa: C901
         quantity_masks=flat_quantity_masks,
         market_masks=flat_market_masks,
         unit_actions=flat_unit_actions,
+        unit_valid=flat_unit_valid,
     )
     head_entropy = _reduce_head_entropy(entropy_by_row)
     # Keep the fixed-coefficient control path byte-for-byte shaped as the

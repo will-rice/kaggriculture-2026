@@ -731,6 +731,7 @@ def joint_log_prob(
     unit_actions: torch.Tensor,
     unit_quantity_actions: torch.Tensor,
     market_actions: torch.Tensor,
+    unit_valid: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return the log-probability of each whole turn, summed over its decisions.
 
@@ -761,23 +762,27 @@ def joint_log_prob(
         unit_quantities: ``(rows, MAX_UNITS, len(QUANTITIES))`` likewise, from
             the per-unit quantity head.
         market: ``(rows, len(MARKET_SLOTS) + 2, len(QUANTITIES))`` likewise.
-        unit_actions: ``(rows, MAX_UNITS)`` op indices, ``IGNORE`` where padded.
+        unit_actions: ``(rows, MAX_UNITS)`` op indices.
         unit_quantity_actions: ``(rows, MAX_UNITS)`` bucket indices, one per
-            slot and never ``IGNORE``. Padding is stated once, on
-            ``unit_actions``, and a padded slot is not a transfer, so its
-            bucket drops out through the same condition the unspent ones do.
+            slot and never ``IGNORE``.
         market_actions: ``(rows, len(MARKET_SLOTS) + 2)`` bucket indices.
+        unit_valid: optional observation-derived bool mask for real unit slots.
+            Omitted only for legacy callers, where the historical ``IGNORE``
+            sentinel supplies the same mask.
 
     Returns:
         ``(rows,)`` joint log-probabilities.
     """
+    valid = unit_actions != IGNORE if unit_valid is None else unit_valid
     chosen = units.gather(2, unit_actions.clamp(min=0)[:, :, None]).squeeze(-1)
     transferred = unit_quantities.gather(2, unit_quantity_actions[:, :, None]).squeeze(
         -1
     )
     return (
-        chosen.masked_fill(unit_actions == IGNORE, 0.0).sum(dim=1)
-        + transferred.masked_fill(~transfer_slots(unit_actions), 0.0).sum(dim=1)
+        chosen.masked_fill(~valid, 0.0).sum(dim=1)
+        + transferred.masked_fill(~(transfer_slots(unit_actions) & valid), 0.0).sum(
+            dim=1
+        )
         + market.gather(2, market_actions[:, :, None]).squeeze(-1).sum(dim=1)
     )
 

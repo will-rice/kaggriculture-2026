@@ -11,6 +11,7 @@ import torch
 
 import kaggriculture.learn.rollout as rollout_module
 from kaggriculture.learn.encoding import (
+    IGNORE,
     MARKET_SLOTS,
     MAX_UNITS,
     QUANTITIES,
@@ -84,6 +85,19 @@ def _trajectory(turns: int) -> Trajectory:
         realisation=0.0,
         bought=0.0,
     )
+
+
+def test_segments_freeze_unit_valid_from_original_encoded_actions() -> None:
+    """Later learner action edits cannot redefine which observed slots existed."""
+    trajectory = _trajectory(4)
+    actions = trajectory.unit_actions.clone()
+    actions[:, -1] = IGNORE
+
+    segment = segments(replace(trajectory, unit_actions=actions), 4)[0]
+
+    assert segment["unit_valid"].dtype is torch.bool
+    assert not segment["unit_valid"][:, -1].any()
+    assert segment["unit_valid"][:, :-1].all()
 
 
 def _allocation_config(

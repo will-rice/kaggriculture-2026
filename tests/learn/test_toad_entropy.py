@@ -16,6 +16,7 @@ def _log_probs(shape: tuple[int, ...]) -> torch.Tensor:
 def _entropy(
     *,
     unit_actions: torch.Tensor,
+    unit_valid: torch.Tensor | None = None,
     unit_mask: torch.Tensor | None = None,
     quantity_mask: torch.Tensor | None = None,
     market_mask: torch.Tensor | None = None,
@@ -45,6 +46,7 @@ def _entropy(
                 else market_mask
             ),
             unit_actions=unit_actions,
+            unit_valid=(unit_actions != IGNORE if unit_valid is None else unit_valid),
         ),
         (units, quantities, market),
     )
@@ -86,6 +88,38 @@ def test_padded_unit_slots_do_not_count_toward_operation_or_quantity_entropy() -
     assert padded_logits[1].grad is None
 
 
+def test_explicit_unit_valid_ignores_a_mutated_padded_transfer_action() -> None:
+    """A mutable action label cannot turn an absent slot into a decision."""
+    transfer = TRANSFER_OPS.index(True)
+    unit_valid = torch.tensor([[True, False]])
+    baseline, _ = _entropy(
+        unit_actions=torch.tensor([[0, IGNORE]]), unit_valid=unit_valid
+    )
+    changed, (units, quantities, _market) = _entropy(
+        unit_actions=torch.tensor([[0, transfer]]), unit_valid=unit_valid
+    )
+
+    for before, after in zip(baseline.items(), changed.items(), strict=True):
+        assert before[1].valid.item() == after[1].valid.item()
+        torch.testing.assert_close(before[1].sum, after[1].sum)
+    (changed.operation.sum + changed.quantity.sum).backward()
+    assert units.grad is not None
+    assert quantities.grad is not None
+    assert not units.grad[:, 1].any()
+    assert not quantities.grad[:, 1].any()
+
+
+def test_real_unit_with_ignore_action_remains_an_operation_entropy_decision() -> None:
+    """Only unit_valid denotes padding; IGNORE is not an entropy sentinel."""
+    entropy, _logits = _entropy(
+        unit_actions=torch.tensor([[IGNORE]]),
+        unit_valid=torch.tensor([[True]]),
+    )
+
+    assert entropy.operation.valid.item() == 1
+    assert entropy.quantity.valid.item() == 0
+
+
 def test_all_padding_and_empty_market_have_exact_safe_zero_statistics() -> None:
     """Empty reductions neither leak NaNs nor manufacture valid decisions."""
     unit_actions = torch.full((2, 3), IGNORE, dtype=torch.int64)
@@ -100,6 +134,7 @@ def test_all_padding_and_empty_market_have_exact_safe_zero_statistics() -> None:
         quantity_masks=torch.zeros_like(quantities, dtype=torch.bool),
         market_masks=torch.zeros_like(market, dtype=torch.bool),
         unit_actions=unit_actions,
+        unit_valid=torch.zeros_like(unit_actions, dtype=torch.bool),
     )
 
     for stat in (entropy.operation, entropy.quantity, entropy.market):
@@ -130,6 +165,7 @@ def test_masked_illegal_logits_are_irrelevant_to_entropy_and_gradients() -> None
         quantity_masks=torch.ones_like(quantities, dtype=torch.bool),
         market_masks=torch.ones_like(market, dtype=torch.bool),
         unit_actions=unit_actions,
+        unit_valid=torch.ones_like(unit_actions, dtype=torch.bool),
     )
 
     assert entropy.operation.sum.item() == 0.0
@@ -156,6 +192,7 @@ def test_entropy_flattens_batch_and_time_dimensions_in_fp32() -> None:
             quantity_masks=torch.ones_like(quantities, dtype=torch.bool),
             market_masks=torch.ones_like(market, dtype=torch.bool),
             unit_actions=actions,
+            unit_valid=actions != IGNORE,
         )
 
     assert entropy.operation.valid.item() == 3

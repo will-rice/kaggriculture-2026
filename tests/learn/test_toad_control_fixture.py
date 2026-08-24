@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 import torch
 
+from kaggriculture.learn.encoding import IGNORE
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.rollout import Trajectory
 from kaggriculture.learn.scripts import toad
@@ -152,7 +153,9 @@ def test_control_fixture_preserves_tensor_layout_and_fp32() -> None:
     assert tuple(segments[0]) == cast(tuple[str, ...], fixture["segment_keys"])
     assert len(regenerated) == len(segments)
     for captured, current in zip(segments, regenerated, strict=True):
-        assert captured.keys() == current.keys()
+        assert current.keys() == captured.keys() | {"unit_valid"}
+        assert current["unit_valid"].dtype is torch.bool
+        assert torch.equal(current["unit_valid"], captured["unit_actions"] != IGNORE)
         for name in toad.ACTED_FIELDS:
             assert captured[name].shape[0] == unroll_length
             assert torch.equal(captured[name], current[name])
