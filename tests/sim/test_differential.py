@@ -6,14 +6,10 @@ from dataclasses import replace
 import pytest
 import torch
 from kaggle_environments import make
+from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
-from kaggriculture.learn.encoding import (
-    encode_board,
-    encode_positions,
-    encode_private_belief_target,
-    encode_scalars,
-)
-from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
+from kaggriculture.features import encode_observation
+from kaggriculture.learn.encoding import encode_private_belief_target, to_torch
 from kaggriculture.sim.engine import MarketActions, step, unit_quantity_ones
 from kaggriculture.sim.legality import legal
 from kaggriculture.sim.observe import observe
@@ -70,20 +66,13 @@ def test_fixed_legal_tape_matches_bulk_pickup_and_place_end_to_end() -> None:
         native_beliefs = belief_targets(state)
         for seat in range(2):
             observation = environment.state[seat].observation
-            assert torch.equal(
-                native_observations[seat][0], encode_board(observation, seat)
-            )
-            assert torch.equal(
-                native_observations[seat][1], encode_scalars(observation, seat)
-            )
-            assert torch.equal(
-                native_observations[seat][2], encode_positions(observation, seat)
-            )
-            assert torch.equal(native_masks[seat][0], unit_mask(observation, seat))
-            assert torch.equal(
-                native_masks[seat][1], unit_quantity_mask(observation, seat)
-            )
-            assert torch.equal(native_masks[seat][2], market_mask(observation, seat))
+            canonical = to_torch(encode_observation(observation, seat))
+            assert torch.equal(native_observations[seat][0], canonical.board)
+            assert torch.equal(native_observations[seat][1], canonical.scalars)
+            assert torch.equal(native_observations[seat][2], canonical.positions)
+            assert torch.equal(native_masks[seat][0], canonical.unit_mask)
+            assert torch.equal(native_masks[seat][1], canonical.quantity_mask)
+            assert torch.equal(native_masks[seat][2], canonical.market_mask)
             opposing_private = environment.state[1 - seat].observation
             assert torch.equal(
                 native_beliefs[0, seat],
@@ -119,3 +108,32 @@ def test_fixed_legal_tape_matches_bulk_pickup_and_place_end_to_end() -> None:
     assert torch.equal(before_banks[0], after_banks[-1])
     assert environment.state[0].observation.private.shed["WHEAT"] == 3
     assert environment.state[0].observation.private.inventories[0] == {}
+
+
+def test_crop_animal_and_live_market_state_matches_every_canonical_field() -> None:
+    """The native backend follows canonical identity, yield and market channels."""
+    environment = make("kaggriculture", configuration={"seed": 179}, debug=True)
+    environment.reset(2)
+    for agent in environment.state:
+        observation = agent.observation
+        observation.farms[0].tiles[2][3] = engine._new_plant("MELON", 0, 24)
+        observation.farms[0].tiles[2][3]["consecutive_unwatered"] = 2
+        observation.farms[1].tiles[6][7] = engine._new_animal("GOOSE", 0)
+        observation.farms[1].tiles[6][7]["yield_units"] = 3
+        observation.farms[1].tiles[6][7]["consecutive_unfed"] = 1
+        observation.market.prices["WHEAT"] += 17
+        observation.market.inventory["WHEAT"] -= 23
+    state = pack([environment])
+
+    for seat in range(2):
+        observation = environment.state[seat].observation
+        canonical = to_torch(encode_observation(observation, seat))
+        native = observe(state, seat)
+        masks = legal(state, seat)
+
+        assert torch.equal(native[0], canonical.board)
+        assert torch.equal(native[1], canonical.scalars)
+        assert torch.equal(native[2], canonical.positions)
+        assert torch.equal(masks[0], canonical.unit_mask)
+        assert torch.equal(masks[1], canonical.quantity_mask)
+        assert torch.equal(masks[2], canonical.market_mask)

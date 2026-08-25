@@ -11,29 +11,32 @@ from kaggriculture.constants import (
     SHED_CAPACITY,
     TURNS_PER_DAY,
 )
-from kaggriculture.learn.encoding import (
+from kaggriculture.features import (
+    ANIMAL_NAMES,
     CARE_BONUS_SCALE,
     CARRIED_SCALE,
+    CROP_NAMES,
     MAX_UNITS,
     NO_DEATH_SCHEDULED,
+    PER_FARM_PLANES,
+    PLANE_INDEX,
+    PRODUCT_NAMES,
+    SCALARS,
     SEED_SCALE,
+    SHED_NAMES,
+    SHOP_NAMES,
     TILE_PLANES,
     UNIT_CARRIED_SCALE,
 )
 from kaggriculture.sim.state import (
-    ANIMAL_NAMES,
-    CROP_NAMES,
-    PRODUCT_NAMES,
-    SHED_NAMES,
-    SHOP_NAMES,
     SimState,
 )
 from kaggriculture.sim.tensors import tensor_constant
 
-_PER_FARM_PLANES = TILE_PLANES // 2
-_STATE_BASE = len(CROP_NAMES) + len(ANIMAL_NAMES)
-_FEATURE_BASE = _STATE_BASE + 5
-_UNIT_BASE = _FEATURE_BASE + 8
+_PER_FARM_PLANES = PER_FARM_PLANES
+_STATE_BASE = PLANE_INDEX["state:WEED"]
+_FEATURE_BASE = PLANE_INDEX["feature:ACTIVE_TODAY"]
+_UNIT_BASE = PLANE_INDEX["unit:FARMER"]
 _PRODUCT_SHED_INDICES = tuple(SHED_NAMES.index(name) for name in PRODUCT_NAMES)
 
 
@@ -211,7 +214,12 @@ def _scalars(state: SimState, seat: int) -> torch.Tensor:
             dim=-1,
         ).to(torch.float64),
     ]
-    return torch.cat(parts, dim=-1).to(torch.float32)
+    scalars = torch.cat(parts, dim=-1).to(torch.float32)
+    if scalars.shape[-1] != SCALARS:
+        raise AssertionError(
+            f"native scalar width {scalars.shape[-1]} != canonical {SCALARS}"
+        )
+    return scalars
 
 
 def observe(

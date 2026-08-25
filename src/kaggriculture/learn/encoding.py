@@ -67,21 +67,14 @@ from typing import Any, Mapping, cast
 import torch
 
 from kaggriculture import action_codec
+from kaggriculture import features as canonical_features
 from kaggriculture.constants import (
-    ANIMALS,
-    BOARD_SIZE,
-    CROPS,
-    EPISODE_STEPS,
-    LAND_ORDER,
-    MARKET_PARAMS,
-    SEASON_DAYS,
     SHED_CAPACITY,
     SHOPS,
-    TURNS_PER_DAY,
 )
-from kaggriculture.observation import Tile
+from kaggriculture.features import EncodedObservation, encode_observation
 
-BOARD = BOARD_SIZE
+BOARD = canonical_features.BOARD
 
 # Re-export the shared action boundary during the compatibility release.
 ANIMAL_NAMES = action_codec.ANIMAL_NAMES
@@ -111,7 +104,7 @@ SHOP_NAMES = sorted(SHOPS)
 # above that observed value, and encode_units/encode_positions/decode_units
 # raise rather than silently drop a real unit if it is ever exceeded, so a
 # wider hand count can never become a misaligned label.
-MAX_UNITS = 20
+MAX_UNITS = canonical_features.MAX_UNITS
 
 # Per farm, in order: one plane per crop, one per animal, the mutually
 # exclusive tile states, the continuous per-tile features, then the unit
@@ -133,26 +126,17 @@ MAX_UNITS = 20
 # [[4, 3], [4, 3]] occurs in the corpus. The hands plane is therefore a count,
 # scaled by MAX_UNITS so it shares the range of the other continuous features.
 # CARRIED accumulates for the same reason.
-_STRUCTURE_KINDS = tuple(sorted({str(data["structure"]) for data in ANIMALS.values()}))
-_TILE_STATES = ("WEED", "LOCKED", "EMPTY") + _STRUCTURE_KINDS
-_TILE_FEATURES = (
-    "ACTIVE_TODAY",
-    "CARED_TODAY",
-    "CARE_BONUS",
-    "DISTRESS",
-    "YIELD_FRACTION",
-    "BONUS_READY",
-    "AGE",
-    "LIFESPAN_LEFT",
-)
-_UNIT_PLANES = ("FARMER", "HANDS", "CARRIED")
+_STRUCTURE_KINDS = canonical_features.STRUCTURE_KINDS
+_TILE_STATES = canonical_features.TILE_STATES
+_TILE_FEATURES = canonical_features.TILE_FEATURES
+_UNIT_PLANES = canonical_features.UNIT_PLANES
 
 # How much one unit is holding, over the same 28-episode sample the scalar
 # divisors were measured on: p50 1, p95 10, p99 14, max 36. Divided by 16, the
 # next power of two above the p99, so almost every unit lands inside [0, 1]
 # alongside the other continuous planes and a full hand stays legible rather
 # than clipped.
-UNIT_CARRIED_SCALE = 16.0
+UNIT_CARRIED_SCALE = canonical_features.UNIT_CARRIED_SCALE
 
 # CARE is a unit op with a delayed payoff, and both halves of it are here.
 # CARED_TODAY says whether the day's CARE has already landed -- the engine
@@ -161,7 +145,7 @@ UNIT_CARRIED_SCALE = 16.0
 # Measured over 28 episodes spanning all seven archives, both seats, every
 # 7th turn: pending_care_bonus p50 2, p95 5, p99 7, max 7. Divided by 8 so the
 # whole observed range lands inside [0, 1] like the other tile features.
-CARE_BONUS_SCALE = 8.0
+CARE_BONUS_SCALE = canonical_features.CARE_BONUS_SCALE
 
 # `max_lifespan_step` is the step a one-time crop starts decaying on, and an
 # ongoing crop carries -1 until its final scheduled production sets one. -1
@@ -172,15 +156,15 @@ CARE_BONUS_SCALE = 8.0
 # above everything a scheduled death can produce: over the same sample, a
 # plant with a real death step reads between -0.014 and 0.431, and 53.6% of
 # planted tiles carry the sentinel.
-NO_DEATH_SCHEDULED = 1.0
+NO_DEATH_SCHEDULED = canonical_features.NO_DEATH_SCHEDULED
 
 _ANIMAL_BASE = len(CROP_NAMES)
 _STATE_BASE = _ANIMAL_BASE + len(ANIMAL_NAMES)
 _FEATURE_BASE = _STATE_BASE + len(_TILE_STATES)
 _UNIT_BASE = _FEATURE_BASE + len(_TILE_FEATURES)
-_PER_FARM_PLANES = _UNIT_BASE + len(_UNIT_PLANES)
+_PER_FARM_PLANES = canonical_features.PER_FARM_PLANES
 
-TILE_PLANES = 2 * _PER_FARM_PLANES
+TILE_PLANES = canonical_features.TILE_PLANES
 
 # Both a price and an inventory signal per product, our money and the
 # opponent's, the day/hour/step phase of the season, how much land, town shops
@@ -202,14 +186,7 @@ TILE_PLANES = 2 * _PER_FARM_PLANES
 # and the shed. And a flag per town shop rather than only the count of them --
 # each shop consumes a specific list of products every few turns, so *which*
 # shops are open is what decides where the demand actually is.
-SCALARS = (
-    2 * len(PRODUCT_NAMES)  # market price and inventory, per product
-    + 12  # money, phase, land, shop count, hands and hires, both seats
-    + len(SHED_NAMES)  # our shed, per product and per animal awaiting placement
-    + len(CROP_NAMES)  # our unplanted seeds, per crop
-    + len(PRODUCT_NAMES)  # carried across our units, per product
-    + len(SHOP_NAMES)  # which shops the town has opened
-)
+SCALARS = canonical_features.SCALARS
 
 # Divisors for the private counts, so each shares the roughly-unit range the
 # rest of this vector sits in. Measured over 28 episodes spanning all seven
@@ -230,8 +207,34 @@ SCALARS = (
 # inside [0, 1] and the tail stays legible rather than clipped. This is the
 # `len(hands) / 8.0` mistake not repeated -- that divisor is exceeded by 59% of
 # training rows and carries nothing to say whether that was ever intended.
-SEED_SCALE = 32.0
-CARRIED_SCALE = 32.0
+SEED_SCALE = canonical_features.SEED_SCALE
+CARRIED_SCALE = canonical_features.CARRIED_SCALE
+
+
+@dataclass(frozen=True)
+class TorchObservation:
+    """Tensor compatibility view of one canonical encoded observation."""
+
+    board: torch.Tensor
+    scalars: torch.Tensor
+    positions: torch.Tensor
+    unit_mask: torch.Tensor
+    quantity_mask: torch.Tensor
+    market_mask: torch.Tensor
+
+
+def to_torch(encoded: EncodedObservation) -> TorchObservation:
+    """Convert canonical Python storage without recalculating any feature."""
+    return TorchObservation(
+        board=torch.tensor(encoded.board, dtype=torch.float32).unsqueeze(0),
+        scalars=torch.tensor(encoded.scalars, dtype=torch.float32).unsqueeze(0),
+        positions=torch.tensor(encoded.positions, dtype=torch.int64).unsqueeze(0),
+        unit_mask=torch.tensor(encoded.unit_mask, dtype=torch.bool).unsqueeze(0),
+        quantity_mask=torch.tensor(encoded.quantity_mask, dtype=torch.bool).unsqueeze(
+            0
+        ),
+        market_mask=torch.tensor(encoded.market_mask, dtype=torch.bool).unsqueeze(0),
+    )
 
 
 @dataclass(frozen=True)
@@ -273,447 +276,39 @@ def encode_private_belief_target(observation: Mapping[str, Any]) -> BeliefTarget
     )
 
 
-_MAX_QUADRANTS = 1 + len(LAND_ORDER)
-
-# Every key this module reads, by the mapping it appears in. This exists so
-# that an unencoded field has to be an argued decision rather than an absence:
-# the shed, the seeds and the carried inventories went unencoded for a whole
-# training run precisely because a field nobody encodes is a field nobody sees.
-# ``test_every_field_the_corpus_carries_is_either_encoded_or_argued_away``
-# sweeps every archive and fails on any key that appears in neither this table
-# nor NOT_ENCODED, so an upstream addition is loud in CI instead of silent in
-# a shard.
-#
-# "tile" is the union over every tile kind -- PLANT, WEED and the bare and
-# occupied structures each carry a subset -- because they share one block of
-# planes and one dispatch in ``_write_tile``.
-ENCODED_FIELDS: dict[str, frozenset[str]] = {
-    "observation": frozenset(
-        {"day", "hour", "player", "farms", "market", "town", "private"}
-    ),
-    "farm": frozenset(
-        {"tiles", "farmer", "hands", "money", "unlocked_quadrants", "hires_today"}
-    ),
-    "market": frozenset({"prices", "inventory"}),
-    "town": frozenset({"unlocked_shops"}),
-    "private": frozenset({"shed", "seeds", "inventories"}),
-    "tile": frozenset(
-        {
-            "kind",
-            "crop",
-            "animal",
-            "planted_day",
-            "placed_day",
-            "watered_today",
-            "fed_today",
-            "cared_today",
-            "pending_care_bonus",
-            "consecutive_unwatered",
-            "consecutive_unfed",
-            "yield_units",
-            "fertilized_until_day",
-            "fertilizer_available",
-            "max_lifespan_step",
-        }
-    ),
-}
-
-# The two keys a real observation carries that nothing here reads, each on
-# purpose.
-#
-# `step` is derived from `day` and `hour` instead: kaggle_environments' core
-# loop only ever writes it onto agent 0's observation, so a real seat-1
-# observation has no `step` key at all and reading it would encode one seat
-# and not the other. See `encode_scalars`.
-#
-# `remainingOverageTime` is not game state. It is how much of the compute
-# budget is left, it moves with whatever machine the episode ran on, and the
-# corpus was produced on other people's hardware. Its distribution at
-# inference has nothing to do with its distribution in training, so a model
-# that learned anything from it learned about the runner rather than the game.
-NOT_ENCODED = frozenset({"step", "remainingOverageTime"})
+# Re-export the canonical schema during the compatibility release.
+ENCODED_FIELDS = canonical_features.ENCODED_FIELDS
+NOT_ENCODED = canonical_features.NOT_ENCODED
+PLANE_INDEX = canonical_features.PLANE_INDEX
+PLANE_NAMES = canonical_features.PLANE_NAMES
+PER_FARM_PLANES = canonical_features.PER_FARM_PLANES
+SCALAR_INDEX = canonical_features.SCALAR_INDEX
+SCALAR_NAMES = canonical_features.SCALAR_NAMES
 
 
 def encode_board(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
-    """Return the board planes for one seat.
-
-    ``seat``'s own farm occupies the first ``TILE_PLANES // 2`` planes and the
-    opponent's farm occupies the rest. Keeping the two farms in separate
-    planes, rather than overlaying them on one shared set, means a crop on the
-    opponent's board can never silently overwrite one of ours at the same
-    coordinate.
-
-    Only the first block gets a carried-inventory plane. ``private`` belongs to
-    whoever's observation this is, so the opponent's inventories are not
-    knowable and their plane stays zero -- meaning *unknown* there, not
-    *empty*.
-
-    The step is derived from ``day`` and ``hour`` for the same reason
-    ``encode_scalars`` derives it: ``observation["step"]`` exists only on seat
-    0's observation.
-
-    Args:
-        observation: One turn's observation.
-        seat: Which player's farm goes in the first block of planes.
-
-    Returns:
-        A ``(1, TILE_PLANES, BOARD, BOARD)`` float32 tensor.
-    """
-    day = observation["day"]
-    step = day * TURNS_PER_DAY + observation["hour"]
-    farms = observation["farms"]
-    planes = torch.zeros(1, TILE_PLANES, BOARD, BOARD, dtype=torch.float32)
-    for block, farm in enumerate((farms[seat], farms[1 - seat])):
-        base = block * _PER_FARM_PLANES
-        for y, row in enumerate(farm["tiles"]):
-            for x, tile in enumerate(row):
-                _write_tile(planes, base, tile, y, x, day, step)
-        _write_units(planes, base, farm)
-    _write_carried(planes, farms[seat], observation["private"]["inventories"])
-    return planes
-
-
-def _write_tile(
-    planes: torch.Tensor, base: int, tile: Tile, y: int, x: int, day: int, step: int
-) -> None:
-    """Write one farm's tile into its block of planes, in place."""
-    if tile is None:
-        planes[0, base + _STATE_BASE + _TILE_STATES.index("EMPTY"), y, x] = 1.0
-        return
-    if tile == "LOCKED":
-        planes[0, base + _STATE_BASE + _TILE_STATES.index("LOCKED"), y, x] = 1.0
-        return
-    kind = tile["kind"]
-    if kind == "WEED":
-        planes[0, base + _STATE_BASE + _TILE_STATES.index("WEED"), y, x] = 1.0
-        return
-    if kind == "PLANT":
-        crop = tile["crop"]
-        death = tile["max_lifespan_step"]
-        planes[0, base + CROP_NAMES.index(crop), y, x] = 1.0
-        _write_features(
-            planes,
-            base,
-            y,
-            x,
-            active_today=tile["watered_today"],
-            cared_today=False,
-            care_bonus=0,
-            distress=tile["consecutive_unwatered"],
-            yield_units=tile["yield_units"],
-            yield_capacity=int(CROPS[crop]["max_yield"]),
-            bonus_ready=tile["fertilized_until_day"] >= day,
-            age=day - tile["planted_day"],
-            lifespan_left=(
-                NO_DEATH_SCHEDULED if death < 0 else (death - step) / EPISODE_STEPS
-            ),
-        )
-        return
-    animal = tile.get("animal")
-    if animal is None:
-        planes[0, base + _STATE_BASE + _TILE_STATES.index(kind), y, x] = 1.0
-        return
-    planes[0, base + _ANIMAL_BASE + ANIMAL_NAMES.index(animal), y, x] = 1.0
-    _write_features(
-        planes,
-        base,
-        y,
-        x,
-        active_today=tile["fed_today"],
-        cared_today=tile["cared_today"],
-        care_bonus=tile["pending_care_bonus"],
-        distress=tile["consecutive_unfed"],
-        yield_units=tile["yield_units"],
-        yield_capacity=int(ANIMALS[animal]["max_held"]),
-        bonus_ready=tile["fertilizer_available"],
-        age=day - tile["placed_day"],
-        lifespan_left=0.0,
-    )
-
-
-def _write_features(
-    planes: torch.Tensor,
-    base: int,
-    y: int,
-    x: int,
-    *,
-    active_today: bool,
-    cared_today: bool,
-    care_bonus: int,
-    distress: int,
-    yield_units: int,
-    yield_capacity: int,
-    bonus_ready: bool,
-    age: int,
-    lifespan_left: float,
-) -> None:
-    """Write the continuous features shared by plants and animals, in place.
-
-    A plant's ``watered_today`` / ``consecutive_unwatered`` and an animal's
-    ``fed_today`` / ``consecutive_unfed`` are the same shape of feature (did
-    the day's required care happen, how many days running has it been
-    missed), so they share one set of planes rather than four kind-specific
-    ones.
-
-    The remaining three are one-sided, and the side that does not have them
-    writes a zero rather than getting planes of its own: only an animal can be
-    ``CARE``d, so a plant writes ``cared_today=False`` and ``care_bonus=0``,
-    and only a plant has a scheduled death, so an animal writes
-    ``lifespan_left=0.0``. The crop and animal planes already say which kind of
-    tile this is, so the shared zero is never ambiguous about what it means.
-
-    The features are keyword-only. There are eight of them, several adjacent
-    and same-typed, and a positional swap between two of those -- ``distress``
-    for ``care_bonus``, say -- would train the model on a different game
-    without anything raising.
-    """
-    offset = base + _FEATURE_BASE
-    planes[0, offset + _TILE_FEATURES.index("ACTIVE_TODAY"), y, x] = float(active_today)
-    planes[0, offset + _TILE_FEATURES.index("CARED_TODAY"), y, x] = float(cared_today)
-    planes[0, offset + _TILE_FEATURES.index("CARE_BONUS"), y, x] = (
-        care_bonus / CARE_BONUS_SCALE
-    )
-    planes[0, offset + _TILE_FEATURES.index("DISTRESS"), y, x] = distress / 2.0
-    planes[0, offset + _TILE_FEATURES.index("YIELD_FRACTION"), y, x] = (
-        yield_units / yield_capacity
-    )
-    planes[0, offset + _TILE_FEATURES.index("BONUS_READY"), y, x] = float(bonus_ready)
-    planes[0, offset + _TILE_FEATURES.index("AGE"), y, x] = age / SEASON_DAYS
-    planes[0, offset + _TILE_FEATURES.index("LIFESPAN_LEFT"), y, x] = lifespan_left
-
-
-def _write_units(planes: torch.Tensor, base: int, farm: Mapping[str, Any]) -> None:
-    """Write one farm's unit occupancy into its block of planes, in place.
-
-    The hands plane accumulates rather than sets: several hands may stand on
-    one tile, and a flag would report a crowd of five the same as a lone hand.
-
-    Positions are ``[x, y]`` and the planes are indexed ``[y, x]``, per the
-    module docstring.
-    """
-    farmer_x, farmer_y = farm["farmer"]
-    planes[0, base + _UNIT_BASE + _UNIT_PLANES.index("FARMER"), farmer_y, farmer_x] = (
-        1.0
-    )
-    hands = base + _UNIT_BASE + _UNIT_PLANES.index("HANDS")
-    for x, y in farm["hands"]:
-        planes[0, hands, y, x] += 1.0 / MAX_UNITS
-
-
-def _write_carried(
-    planes: torch.Tensor, farm: Mapping[str, Any], inventories: list[Mapping[str, int]]
-) -> None:
-    """Write what each of our units is holding, at the tile it stands on, in place.
-
-    Written into the first farm block only, and by this function rather than by
-    ``_write_units``, because it is the one per-unit fact that is not public:
-    the opponent's ``private`` is hidden, so their plane is left at zero and a
-    zero there means *unknown*. Passing their farm through the same code path
-    would invite someone to reach for a ``private`` that is not theirs to read.
-
-    Accumulates for the same reason the hands plane does -- several units share
-    a tile routinely, and one carrying nothing next to one carrying nine is not
-    the same tile as two empty-handed units.
-
-    ``inventories`` is indexed exactly as the units are, ``[farmer, *hands]``
-    -- the same order ``encode_positions`` and ``encode_units`` use -- because
-    the engine's ``_do_hire`` appends an inventory as it appends a hand. It is
-    read by unit index rather than zipped so that a list shorter than the crew
-    raises here instead of silently dropping the last hand's load. A longer one
-    is fine and does occur: ``_farmer_inventory`` grows the list when an action
-    orders a hand the farm does not have, and that entry belongs to no unit and
-    stays empty, since the engine no-ops the op that created it.
-
-    Positions are ``[x, y]`` and the planes are indexed ``[y, x]``, per the
-    module docstring.
-    """
-    offset = _UNIT_BASE + _UNIT_PLANES.index("CARRIED")
-    for index, (x, y) in enumerate([farm["farmer"], *farm["hands"]]):
-        planes[0, offset, y, x] += sum(inventories[index].values()) / UNIT_CARRIED_SCALE
+    """Return the legacy batched board tensor from one canonical bundle."""
+    return to_torch(encode_observation(observation, seat)).board
 
 
 def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
-    """Return the non-spatial features for one seat.
-
-    Both a price and an inventory signal are kept per product: the price says
-    what the next unit fetches right now, and the inventory says how far
-    already-committed supply -- ours or the opponent's -- has pushed it from
-    baseline, which is what decides where the price goes next. Land, town
-    shops and hired hands are included for both seats, since the opponent's
-    farm is public.
-
-    Then our own private state, which nothing else in this module carries into
-    the market branch: the shed, because ``SELL`` is the engine's only
-    money-increasing operation and it draws from there; the unplanted seeds,
-    because ``PLANT`` consumes one and the engine drops every ``PLANT`` for a
-    crop whose seeds a turn overspends; and the produce our units are carrying,
-    which is on its way to the shed and is the difference between a sale the
-    farm can make this turn and one it cannot. ``observation["private"]`` is
-    already this seat's own -- the opponent's is hidden and never in hand --
-    so it is read directly and never indexed by seat.
-
-    Which shops the town has opened is a flag each, not only the count that was
-    here before. Each shop consumes a specific list of products every few
-    turns, so the identities are what say where the demand is; two towns with
-    four shops open can be buying disjoint things.
-
-    The global step is derived from ``day`` and ``hour`` rather than read from
-    ``observation["step"]``: kaggle_environments' own core loop only ever
-    writes ``step`` onto agent 0's observation (``new_state[0].observation.step
-    = ...`` in its ``core.py``), so any other seat's real observation has no
-    ``step`` key at all. ``day`` and ``hour`` are mirrored onto every agent by
-    the game's interpreter, and reconstruct ``step`` exactly, since the
-    interpreter itself derives them as ``next_step // turns_per_day`` and
-    ``next_step % turns_per_day``.
-
-    Args:
-        observation: One turn's observation.
-        seat: Which player to encode for.
-
-    Returns:
-        A ``(1, SCALARS)`` float32 tensor.
-    """
-    market = observation["market"]
-    prices = market["prices"]
-    inventory = market["inventory"]
-    farms = observation["farms"]
-    ours, theirs = farms[seat], farms[1 - seat]
-    private = observation["private"]
-    unlocked_shops = observation["town"]["unlocked_shops"]
-
-    # Summed across our units rather than read per unit: the market decision
-    # is about the farm's whole holding, and the board already carries who is
-    # standing where with what. Inventories are sparse -- the engine deletes an
-    # item's key the moment its count reaches zero -- so this accumulates what
-    # is there instead of reading a key per product that may not exist.
-    carried: dict[str, int] = {}
-    for held in private["inventories"]:
-        for item, count in held.items():
-            carried[item] = carried.get(item, 0) + count
-
-    values = [
-        (prices[item] - MARKET_PARAMS[item]["base"]) / MARKET_PARAMS[item]["base"]
-        for item in PRODUCT_NAMES
-    ]
-    values += [
-        (inventory[item] - MARKET_PARAMS[item]["I0"]) / MARKET_PARAMS[item]["T"]
-        for item in PRODUCT_NAMES
-    ]
-    values += [
-        ours["money"] / 10_000.0,
-        theirs["money"] / 10_000.0,
-        observation["day"] / SEASON_DAYS,
-        observation["hour"] / TURNS_PER_DAY,
-        (observation["day"] * TURNS_PER_DAY + observation["hour"]) / EPISODE_STEPS,
-        len(unlocked_shops) / len(SHOP_NAMES),
-        len(ours["unlocked_quadrants"]) / _MAX_QUADRANTS,
-        len(theirs["unlocked_quadrants"]) / _MAX_QUADRANTS,
-        len(ours["hands"]) / 8.0,
-        len(theirs["hands"]) / 8.0,
-        ours["hires_today"] / MAX_UNITS,
-        theirs["hires_today"] / MAX_UNITS,
-    ]
-    values += [private["shed"][item] / SHED_CAPACITY for item in SHED_NAMES]
-    values += [private["seeds"][crop] / SEED_SCALE for crop in CROP_NAMES]
-    values += [carried.get(item, 0) / CARRIED_SCALE for item in PRODUCT_NAMES]
-    values += [float(shop in unlocked_shops) for shop in SHOP_NAMES]
-    return torch.tensor(values, dtype=torch.float32).reshape(1, SCALARS)
+    """Return the legacy batched scalar tensor from one canonical bundle."""
+    return to_torch(encode_observation(observation, seat)).scalars
 
 
-# torch's cross entropy ignores this index, so padded units contribute no loss.
+# Torch cross entropy ignores this index, so padded units contribute no loss.
 IGNORE = -100
-
-
-class TooManyUnitsError(ValueError):
-    """Raised when a turn has more acting units than ``MAX_UNITS`` covers.
-
-    Kept distinct from the plain ``ValueError`` that ``_label`` raises for an
-    op outside ``UNIT_OPS`` (``tuple.index(x): x not in tuple``), so a caller
-    that wants to tolerate an oversized turn -- an empirical, not proven,
-    bound -- can catch exactly this and let an unknown-op bug propagate
-    instead of being silently counted as the same kind of failure.
-    """
+TooManyUnitsError = canonical_features.TooManyUnitsError
 
 
 def unit_count(observation: Mapping[str, Any], seat: int) -> int:
-    """Return how many units act for ``seat`` from this observation.
-
-    The single definition of how many slots are real, so positions and labels
-    cannot disagree about it. The observation, not the action, is authoritative:
-    the engine walks ``[farmer, *farm["hands"]]`` and its ``_farmer_position``
-    returns ``None`` past the end of ``hands``, making any further op in the
-    action a silent no-op.
-
-    The counts do diverge, on 2.4% of correctly paired turns overall, and the
-    rate depends entirely on which day's archive you look at: 0% across
-    2026-07-30 through 08-01, then 1.7%, 8.1% and 4.4% on 08-02 through 08-04.
-    Measuring one archive and generalising is how this docstring previously came
-    to claim the disagreement did not exist at all. Usually the action carries
-    one to five hand ops more than the farm has hands; occasionally, on 08-04,
-    one fewer.
-
-    Truncating to ``units`` is safe in both directions. The engine applies unit
-    ops before ``_process_market``, where HIRE lands, so a hand hired this turn
-    cannot act this turn; surplus ops address units that do not exist yet and
-    the engine no-ops them identically. A short action simply leaves the trailing
-    slots at ``IGNORE``, training nothing rather than training something wrong.
-
-    That is the secondary reason for this function. The primary one is that
-    ``encode_positions`` and ``encode_units`` must agree about how many slots are
-    real -- if they drift apart, every unit is trained on another unit's
-    surroundings and nothing raises.
-
-    Args:
-        observation: One turn's observation.
-        seat: Which player's units to count.
-
-    Returns:
-        The farmer plus the hands standing on ``seat``'s farm.
-    """
-    return 1 + len(observation["farms"][seat]["hands"])
+    """Return how many units act for the requested seat."""
+    return canonical_features.unit_count(observation, seat)
 
 
 def encode_positions(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
-    """Return the tile each acting unit occupies, padded to ``MAX_UNITS``.
-
-    Slots are ordered exactly as ``encode_units`` labels them -- slot 0 the
-    farmer, slot *k* the *k*-th hand -- because the head reads slot *k*'s trunk
-    column at slot *k*'s position and scores it against slot *k*'s label. If
-    the two orders diverged, every unit would be trained on another unit's
-    surroundings and nothing would raise.
-
-    Padded slots take tile index 0. That is deliberate, not a fallback: the
-    head gathers at these indices unconditionally, so every slot needs a valid
-    one, and a padded slot's label is ``IGNORE``, so its logits never reach the
-    loss and the tile it nominally read is never learned from.
-
-    A unit's position is ``[x, y]`` and ``encode_board`` lays its planes out as
-    ``[y][x]``, so the flat index is ``y * BOARD + x``. Unpacking the position
-    the other way round returns the mirrored tile, which is a valid index into
-    a valid plane and therefore raises nothing: the head simply gathers the
-    wrong column and scores it against this unit's label.
-
-    Args:
-        observation: One turn's observation -- the state the decision was made
-            from, so it must be the same observation the row's board encodes.
-        seat: Which player's units to locate.
-
-    Returns:
-        A ``(1, MAX_UNITS)`` int64 tensor of flattened ``y * BOARD + x`` tile
-        indices.
-
-    Raises:
-        TooManyUnitsError: If more units are on the board than ``MAX_UNITS``
-            covers.
-    """
-    units = unit_count(observation, seat)
-    if units > MAX_UNITS:
-        raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
-    farm = observation["farms"][seat]
-    positions = torch.zeros(1, MAX_UNITS, dtype=torch.int64)
-    for index, (x, y) in enumerate([farm["farmer"], *farm["hands"]]):
-        positions[0, index] = y * BOARD + x
-    return positions
+    """Return the legacy batched position tensor from one canonical bundle."""
+    return to_torch(encode_observation(observation, seat)).positions
 
 
 def encode_units(action: Mapping[str, Any], units: int) -> torch.Tensor:

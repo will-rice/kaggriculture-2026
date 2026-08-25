@@ -2,6 +2,15 @@
 
 import torch
 
+from kaggriculture.action_codec import (
+    HIRE_SLOT,
+    LAND_SLOT,
+    MARKET_SLOTS,
+    MAX_ORDERS,
+    MAX_TRANSFER,
+    QUANTITIES,
+    UNIT_OPS,
+)
 from kaggriculture.constants import (
     ANIMALS,
     CROPS,
@@ -9,16 +18,7 @@ from kaggriculture.constants import (
     LAND_PRICES,
     SHED_CAPACITY,
 )
-from kaggriculture.learn.encoding import (
-    HIRE_SLOT,
-    LAND_SLOT,
-    MARKET_SLOTS,
-    MAX_ORDERS,
-    MAX_TRANSFER,
-    MAX_UNITS,
-    QUANTITIES,
-    UNIT_OPS,
-)
+from kaggriculture.features import MAX_UNITS
 from kaggriculture.sim.market import QUANTITY_AXIS
 from kaggriculture.sim.pricing import market_prices
 from kaggriculture.sim.state import (

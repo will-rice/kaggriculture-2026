@@ -29,16 +29,13 @@ from typing import Any, Mapping
 
 import torch
 
+from kaggriculture.features import encode_observation
 from kaggriculture.learn import CHECKPOINT
 from kaggriculture.learn.encoding import (
     decode_market,
     decode_units,
-    encode_board,
-    encode_positions,
-    encode_scalars,
-    unit_count,
+    to_torch,
 )
-from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.learn.model import Policy, load_policy_weights
 
 # The sandbox has two cores. Timing at 64 flatters it by an order of magnitude,
@@ -122,18 +119,20 @@ def agent(raw_obs: Mapping[str, Any]) -> dict[str, Any]:
         this turn's market orders.
     """
     seat = int(raw_obs["player"])
+    encoded = encode_observation(raw_obs, seat)
+    tensors = to_torch(encoded)
     with torch.no_grad():
         unit_logits, quantity_logits, market_logits, _value = model()(
-            encode_board(raw_obs, seat),
-            encode_scalars(raw_obs, seat),
-            encode_positions(raw_obs, seat),
+            tensors.board,
+            tensors.scalars,
+            tensors.positions,
         )
     action = decode_units(
         unit_logits,
         quantity_logits,
-        unit_count(raw_obs, seat),
-        unit_mask(raw_obs, seat),
-        unit_quantity_mask(raw_obs, seat),
+        encoded.units,
+        tensors.unit_mask,
+        tensors.quantity_mask,
     )
-    action["market"] = decode_market(market_logits, market_mask(raw_obs, seat))
+    action["market"] = decode_market(market_logits, tensors.market_mask)
     return action

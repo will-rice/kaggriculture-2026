@@ -150,18 +150,15 @@ from kaggle_environments.agent import build_agent
 from kaggle_environments.core import Environment
 
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
+from kaggriculture.features import encode_observation
 from kaggriculture.learn.encoding import (
     IGNORE,
     decode_market,
     decode_units,
-    encode_board,
-    encode_positions,
     encode_private_belief_target,
-    encode_scalars,
+    to_torch,
     transfer_slots,
-    unit_count,
 )
-from kaggriculture.learn.mask import market_mask, unit_mask, unit_quantity_mask
 from kaggriculture.learn.model import Policy
 from kaggriculture.learn.progress import potential
 from kaggriculture.learn.sales import buy_units, sale_metrics
@@ -855,12 +852,14 @@ def _decide(
     Returns:
         One ``Turn`` and next policy state per request, in request order.
     """
-    board = torch.cat([encode_board(*request) for request in requests])
-    scalars = torch.cat([encode_scalars(*request) for request in requests])
-    positions = torch.cat([encode_positions(*request) for request in requests])
-    units = torch.cat([unit_mask(*request) for request in requests])
-    counts = torch.cat([unit_quantity_mask(*request) for request in requests])
-    trades = torch.cat([market_mask(*request) for request in requests])
+    encoded = [encode_observation(*request) for request in requests]
+    tensors = [to_torch(row) for row in encoded]
+    board = torch.cat([row.board for row in tensors])
+    scalars = torch.cat([row.scalars for row in tensors])
+    positions = torch.cat([row.positions for row in tensors])
+    units = torch.cat([row.unit_mask for row in tensors])
+    counts = torch.cat([row.quantity_mask for row in tensors])
+    trades = torch.cat([row.market_mask for row in tensors])
     if belief_observations is not None and (
         not isinstance(policy, StatefulPolicy) or not policy.config.belief
     ):
@@ -914,8 +913,8 @@ def _decide(
     transferred = transfer_slots(chosen_units)
 
     turns: list[Turn] = []
-    for row, request in enumerate(requests):
-        count = unit_count(*request)
+    for row, _request in enumerate(requests):
+        count = encoded[row].units
         rows = slice(row, row + 1)
         used_state = used_states[row]
         action = decode_units(
