@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Iterable
 
 from kaggriculture.action_codec import MAX_TRANSFER, QUANTITIES, UNIT_OPS
-from kaggriculture.actions import distance, step_toward
+from kaggriculture.actions import distance, ranked_steps_toward
 from kaggriculture.constants import (
     ANIMALS,
     BOARD_SIZE,
@@ -27,7 +27,6 @@ from kaggriculture.hybrid.opening import OpeningTargets
 from kaggriculture.hybrid.runtime import RuntimeConfig
 
 _OP = {name: index for index, name in enumerate(UNIT_OPS)}
-_MOVES = tuple(name for name in ("NORTH", "SOUTH", "EAST", "WEST"))
 _SHED_ACCESS = ((4, 4), (5, 4), (4, 5), (5, 5))
 
 _FINAL_HAUL = 0
@@ -121,7 +120,6 @@ def _priority(score: float, *, final: bool = False, risk: bool = False) -> float
 
 def _job(
     encoded: EncodedObservation,
-    config: RuntimeConfig,
     *,
     kind: int,
     position: tuple[int, int],
@@ -135,8 +133,7 @@ def _job(
     yx_kind = ((position[1] * BOARD_SIZE + position[0]) * _KINDS) + kind
     locality = _nearest_distance(encoded, position, bound_unit)
     return Job(
-        priority=_priority(score, final=final, risk=risk)
-        + config.jobs.distance_penalty * locality,
+        priority=_priority(score, final=final, risk=risk),
         distance=locality,
         stable_order=yx_kind,
         position=position,
@@ -228,7 +225,6 @@ def _animal_recovery_jobs(
         jobs.append(
             _job(
                 encoded,
-                config,
                 kind=_PLACE_ANIMAL,
                 position=home,
                 operation=f"PLACE:{animal}",
@@ -246,7 +242,6 @@ def _animal_recovery_jobs(
             jobs.append(
                 _job(
                     encoded,
-                    config,
                     kind=_PICKUP_ANIMAL,
                     position=access,
                     operation=f"PICKUP:{animal}",
@@ -274,7 +269,6 @@ def _animal_work_jobs(
                 jobs.append(
                     _job(
                         encoded,
-                        config,
                         kind=_HARVEST,
                         position=position,
                         operation="HARVEST",
@@ -289,7 +283,6 @@ def _animal_work_jobs(
                 jobs.append(
                     _job(
                         encoded,
-                        config,
                         kind=_CARE,
                         position=position,
                         operation="CARE",
@@ -301,7 +294,6 @@ def _animal_work_jobs(
                 jobs.append(
                     _job(
                         encoded,
-                        config,
                         kind=_COLLECT,
                         position=position,
                         operation="COLLECT_FERTILIZER",
@@ -330,7 +322,6 @@ def _animal_work_jobs(
         jobs.append(
             _job(
                 encoded,
-                config,
                 kind=_RISK_FEED if distress > 0.0 else _FEED,
                 position=position,
                 operation="FEED",
@@ -348,7 +339,6 @@ def _animal_work_jobs(
         jobs.append(
             _job(
                 encoded,
-                config,
                 kind=_RISK_FEED if any(risk > 0.0 for _, risk in unfed) else _FEED,
                 position=_SHED_ACCESS[0],
                 operation="PICKUP:WHEAT",
@@ -380,7 +370,6 @@ def _crop_work_jobs(encoded: EncodedObservation, config: RuntimeConfig) -> list[
                 jobs.append(
                     _job(
                         encoded,
-                        config,
                         kind=_RISK_WATER if distress > 0.0 else _WATER,
                         position=position,
                         operation="WATER",
@@ -393,7 +382,6 @@ def _crop_work_jobs(encoded: EncodedObservation, config: RuntimeConfig) -> list[
                 jobs.append(
                     _job(
                         encoded,
-                        config,
                         kind=_FINAL_HARVEST if final_day else _HARVEST,
                         position=position,
                         operation="HARVEST",
@@ -431,7 +419,6 @@ def _transport_jobs(encoded: EncodedObservation, config: RuntimeConfig) -> list[
             jobs.append(
                 _job(
                     encoded,
-                    config,
                     kind=_FINAL_HAUL if final_day else _TRANSPORT,
                     position=access,
                     operation=f"PLACE:{product}",
@@ -462,7 +449,6 @@ def _development_jobs(
             jobs.append(
                 _job(
                     encoded,
-                    config,
                     kind=_BUILD,
                     position=position,
                     operation=f"BUILD_{kind}",
@@ -480,7 +466,6 @@ def _development_jobs(
             jobs.append(
                 _job(
                     encoded,
-                    config,
                     kind=_PLANT,
                     position=position,
                     operation=f"PLANT:{crop}",
@@ -501,7 +486,6 @@ def collect_jobs(
         jobs.append(
             _job(
                 encoded,
-                config,
                 kind=_WEED,
                 position=position,
                 operation="DIG",
@@ -521,23 +505,11 @@ def _legal_move_choices(
     encoded: EncodedObservation, unit: int, target: tuple[int, int]
 ) -> tuple[int, ...]:
     source = encoded.unit_position(unit)
-    preferred = step_toward(source, target)[0]
-    candidates: list[tuple[int, int, int]] = []
-    for name in _MOVES:
-        operation = _OP[name]
-        if not encoded.unit_mask[unit][operation]:
-            continue
-        x, y = source
-        if name == "NORTH":
-            y -= 1
-        elif name == "SOUTH":
-            y += 1
-        elif name == "EAST":
-            x += 1
-        else:
-            x -= 1
-        candidates.append((distance((x, y), target), name != preferred, operation))
-    return tuple(operation for _, _, operation in sorted(candidates))
+    return tuple(
+        _OP[step[0]]
+        for step in ranked_steps_toward(source, target)
+        if encoded.unit_mask[unit][_OP[step[0]]]
+    )
 
 
 def _unit_can_take(encoded: EncodedObservation, unit: int, job: Job) -> bool:
@@ -551,28 +523,39 @@ def _unit_can_take(encoded: EncodedObservation, unit: int, job: Job) -> bool:
 
 
 def assign_nearest_legal(
-    encoded: EncodedObservation, jobs: Iterable[Job]
+    encoded: EncodedObservation,
+    jobs: Iterable[Job],
+    distance_penalty: float = 0.0,
 ) -> dict[int, Job]:
-    """Greedily bind ranked jobs to the nearest available capable unit."""
+    """Bind the best live job/unit pair, then recompute over remaining pairs."""
     assigned: dict[int, Job] = {}
-    for job in jobs:
-        candidates = [
-            unit
-            for unit in range(encoded.units)
-            if unit not in assigned and _unit_can_take(encoded, unit, job)
-        ]
-        if not candidates:
-            continue
-        unit = min(
-            candidates,
-            key=lambda candidate: (
-                distance(encoded.unit_position(candidate), job.position),
-                candidate,
-            ),
-        )
+    available = set(range(encoded.units))
+    remaining = list(jobs)
+    while available and remaining:
+        pairs: list[tuple[tuple[float, int, int, int, int, int, int], int, int]] = []
+        for job_index, job in enumerate(remaining):
+            for unit in available:
+                if not _unit_can_take(encoded, unit, job):
+                    continue
+                current_distance = distance(encoded.unit_position(unit), job.position)
+                key = (
+                    job.priority + distance_penalty * current_distance,
+                    current_distance,
+                    job.position[1],
+                    job.position[0],
+                    job.stable_order % _KINDS,
+                    unit,
+                    job_index,
+                )
+                pairs.append((key, job_index, unit))
+        if not pairs:
+            break
+        _, job_index, unit = min(pairs)
+        job = remaining.pop(job_index)
         assigned[unit] = replace(
             job, distance=distance(encoded.unit_position(unit), job.position)
         )
+        available.remove(unit)
     return assigned
 
 
@@ -591,7 +574,11 @@ def select_units(
     config: RuntimeConfig,
 ) -> UnitSelection:
     """Select one deterministic legal operation and quantity for every unit."""
-    assignments = assign_nearest_legal(encoded, collect_jobs(encoded, targets, config))
+    assignments = assign_nearest_legal(
+        encoded,
+        collect_jobs(encoded, targets, config),
+        config.jobs.distance_penalty,
+    )
     operations: list[int] = []
     quantities: list[int] = []
     for unit in range(encoded.units):

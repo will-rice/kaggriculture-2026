@@ -8,7 +8,7 @@ place so a policy cannot emit a malformed action dict.
 from dataclasses import dataclass, field
 from typing import Any
 
-from kaggriculture.constants import MAX_MARKET_ORDERS_PER_TURN
+from kaggriculture.constants import BOARD_SIZE, MAX_MARKET_ORDERS_PER_TURN, MOVES
 from kaggriculture.observation import Position
 
 Op = list[Any]
@@ -51,6 +51,25 @@ def step_toward(src: Position, dst: Position) -> Op:
     if dy:
         return ["SOUTH"] if dy > 0 else ["NORTH"]
     return list(PASS)
+
+
+def ranked_steps_toward(src: Position, dst: Position) -> tuple[Op, ...]:
+    """Return every in-bounds move ranked by resulting distance to ``dst``."""
+    preferred = step_toward(src, dst)[0]
+    candidates: list[tuple[int, bool, int, str]] = []
+    for stable_order, (name, (dx, dy)) in enumerate(MOVES.items()):
+        next_position = (src[0] + dx, src[1] + dy)
+        if not all(0 <= coordinate < BOARD_SIZE for coordinate in next_position):
+            continue
+        candidates.append(
+            (
+                distance(next_position, dst),
+                name != preferred,
+                stable_order,
+                name,
+            )
+        )
+    return tuple([name] for _, _, _, name in sorted(candidates))
 
 
 def distance(src: Position, dst: Position) -> int:

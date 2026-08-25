@@ -101,7 +101,6 @@ def encoded_fixture(
     seeds: dict[str, int] | None = None,
     shed: dict[str, int] | None = None,
     inventories: tuple[dict[str, int], ...] | None = None,
-    unit_legal: tuple[str, ...] | None = None,
 ) -> EncodedObservation:
     observation = deepcopy(rich_observation())
     farm = observation["farms"][0]
@@ -128,11 +127,7 @@ def encoded_fixture(
         farm["tiles"][y][x] = tile
     for (x, y), kind in (structures or {}).items():
         farm["tiles"][y][x] = {"kind": kind}
-    encoded = encode_observation(observation, 0)
-    if unit_legal is None:
-        return encoded
-    row = tuple(name in unit_legal for name in UNIT_OPS)
-    return replace(encoded, unit_mask=(row, *encoded.unit_mask[1:]))
+    return encode_observation(observation, 0)
 
 
 def _ops(selected: UnitSelection) -> tuple[str, ...]:
@@ -158,16 +153,6 @@ def test_weeds_and_at_risk_animals_preempt_new_planting() -> None:
     assert _ops(selected) == ("DIG", "FEED")
 
 
-def test_illegal_top_choice_falls_through_to_next_ranked_legal_choice() -> None:
-    encoded = encoded_fixture(
-        units=((4, 4),), weeds=((4, 3),), unit_legal=("PASS", "EAST")
-    )
-
-    selected = select_units(encoded, targets_fixture(), runtime_config())
-
-    assert _ops(selected) == ("EAST",)
-
-
 def test_assignment_is_nearest_unit_then_stable_unit_index() -> None:
     encoded = encoded_fixture(units=((0, 0), (2, 0)), weeds=((1, 0),))
 
@@ -175,6 +160,33 @@ def test_assignment_is_nearest_unit_then_stable_unit_index() -> None:
 
     assert first == select_units(encoded, targets_fixture(), runtime_config())
     assert _ops(first) == ("EAST", "PASS")
+
+
+def test_assignment_recomputes_nearest_pair_after_each_unit_claim() -> None:
+    encoded = encoded_fixture(
+        units=((0, 0), (9, 9)),
+        weeds=((0, 0), (1, 0), (9, 8)),
+    )
+
+    selected = select_units(encoded, targets_fixture(), runtime_config())
+
+    assert _ops(selected) == ("DIG", "NORTH")
+
+
+def test_ranked_steps_at_board_boundary_keep_only_in_bounds_fallbacks() -> None:
+    from kaggriculture.actions import ranked_steps_toward
+
+    encoded = encoded_fixture(units=((0, 0),), weeds=((0, 2),))
+    choices = tuple(choice[0] for choice in ranked_steps_toward((0, 0), (0, 2)))
+    canonical_legal = tuple(
+        name for name in choices if encoded.unit_mask[0][UNIT_OPS.index(name)]
+    )
+
+    assert choices == ("SOUTH", "EAST")
+    assert canonical_legal == choices
+    assert _ops(select_units(encoded, targets_fixture(), runtime_config())) == (
+        "SOUTH",
+    )
 
 
 def test_bulk_feed_pickup_uses_need_without_spending_protected_inventory() -> None:
