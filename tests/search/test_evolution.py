@@ -28,7 +28,7 @@ from kaggriculture.search.evolution import (
     evolve,
     top_eligible,
 )
-from kaggriculture.search.fitness import StrengthWeights
+from kaggriculture.search.fitness import StrengthWeights, score_fitness
 from kaggriculture.search.frontier import (
     FrontierArtifact,
     FrontierManifest,
@@ -561,6 +561,52 @@ def test_resume_rejects_a_forged_rng_state(
     )
 
 
+def test_resume_rejects_internally_consistent_telemetry_without_chain_update(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Local telemetry edits cannot silently replace a saved generation."""
+    codec, config, state = _state_for_history_forgery(monkeypatch, tmp_path)
+    record = state.history[-1]
+    candidate = record.developed[0]
+    rates = dict.fromkeys(_league(), 0.25)
+    changed = replace(
+        candidate,
+        matchup_rates=rates,
+        fitness=score_fitness(rates, _weights()),
+        paired_normalized_margin=candidate.paired_normalized_margin + 0.001,
+    )
+    developed = (changed, *record.developed[1:])
+    changed_elites = top_eligible(developed, count=config.elites)
+    forged_record = replace(record, developed=developed, elites=changed_elites)
+    forged = replace(
+        state,
+        history=(*state.history[:-1], forged_record),
+        elites=changed_elites,
+    )
+
+    _assert_forged_resume_is_atomic(
+        codec=codec,
+        config=config,
+        state=forged,
+        output=tmp_path / "telemetry-chain-forgery.json",
+        message="integrity digest",
+    )
+
+
+def test_noncertifying_state_cannot_flip_status_to_write_finalists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The finalist boundary checks config identity, not one mutable status bit."""
+    _, _, state = _state_for_history_forgery(monkeypatch, tmp_path)
+    forged = replace(state, identity=replace(state.identity, certified=True))
+    output = tmp_path / "status-bit-finalists.json"
+
+    with pytest.raises(ValueError, match="artifact mode|certification"):
+        evolution.write_finalists(forged, output)
+
+    assert not output.exists()
+
+
 def test_resume_rejects_every_changed_search_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -736,7 +782,7 @@ def _run_hybrid_cli(
     monkeypatch.setattr(
         hybrid_search, "evolve", lambda **kwargs: captured.update(kwargs)
     )
-    monkeypatch.setattr(hybrid_search, "write_finalists", lambda *args: None)
+    monkeypatch.setattr(hybrid_search, "write_finalists", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -757,34 +803,146 @@ def _run_hybrid_cli(
     return captured
 
 
-def test_verified_certification_can_write_a_certified_finalist(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The guarded production path remains usable after source re-verification."""
+def _completed_verified_search(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    generations: int = 1,
+) -> tuple[SearchState, object, EvolutionConfig]:
     manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
     frontier = verify_frontier(manifest, artifact_root)
+    certification = evolution.certify_frontier(frontier)
     config = EvolutionConfig(
         artifact_mode="certified",
         manifest_sha256=frontier.manifest_sha256,
-        population=1,
+        population=4,
         elites=1,
-        generations=0,
+        generations=generations,
+        seed=73,
         workers=1,
         engine=frontier.engine,
     )
-    state = evolution.initial_state(
-        GenomeCodec.default(),
-        (HybridConfig.default(),),
-        frontier.opponents,
-        _weights(),
-        config,
-        evolution.certify_frontier(frontier),
+    codec = GenomeCodec.default()
+    monkeypatch.setattr(evolution.arena, "outcomes", _deterministic_arena(codec, []))
+    state = evolve(
+        codec=codec,
+        initial_configs=(HybridConfig.default(),),
+        league=frontier.opponents,
+        weights=_weights(),
+        config=config,
+        output=tmp_path / "verified-state.json",
+        certification=certification,
     )
+    return state, certification, config
+
+
+def test_verified_certification_can_write_a_certified_finalist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a completed evaluated production state may emit finalists."""
+    state, certification, _ = _completed_verified_search(monkeypatch, tmp_path)
     output = tmp_path / "certified-finalists.json"
 
-    evolution.write_finalists(state, output)
+    evolution.write_finalists(state, output, certification=certification)
 
     assert json.loads(output.read_text())["identity"]["certified"] is True
+
+
+def test_generation_zero_cannot_emit_finalists_even_with_verified_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unevaluated seed config is not a finalist."""
+    state, certification, config = _completed_verified_search(
+        monkeypatch, tmp_path, generations=0
+    )
+    output = tmp_path / "unevaluated-finalists.json"
+
+    with pytest.raises(ValueError, match="nonzero evaluated history"):
+        evolution.write_finalists(state, output, certification=certification)
+
+    assert state.generation == config.generations == 0
+    assert not output.exists()
+
+
+def test_incomplete_generation_target_cannot_emit_finalists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A structurally complete checkpoint is not final before its configured target."""
+    state, certification, config = _completed_verified_search(
+        monkeypatch, tmp_path, generations=2
+    )
+    first = state.history[0]
+    partial = replace(
+        state,
+        generation=1,
+        history=(first,),
+        elites=first.elites,
+        rng_state=first.rng_state,
+        integrity_digest=first.integrity_digest,
+    )
+    output = tmp_path / "partial-finalists.json"
+
+    with pytest.raises(ValueError, match="configured generation"):
+        evolution.write_finalists(partial, output, certification=certification)
+
+    assert partial.generation < config.generations
+    assert not output.exists()
+
+
+def test_finalist_write_rechecks_history_integrity_and_is_atomic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A locally consistent telemetry edit cannot reach finalist output."""
+    state, certification, config = _completed_verified_search(monkeypatch, tmp_path)
+    record = state.history[-1]
+    candidate = record.developed[0]
+    rates = dict.fromkeys(_league(), 0.25)
+    changed = replace(
+        candidate,
+        matchup_rates=rates,
+        fitness=score_fitness(rates, _weights()),
+        paired_normalized_margin=candidate.paired_normalized_margin + 0.001,
+    )
+    developed = (changed, *record.developed[1:])
+    changed_elites = top_eligible(developed, count=config.elites)
+    forged_record = replace(record, developed=developed, elites=changed_elites)
+    forged = replace(
+        state,
+        history=(*state.history[:-1], forged_record),
+        elites=changed_elites,
+    )
+    output = tmp_path / "previous-finalists.json"
+    output.write_bytes(b"previous-finalists\n")
+
+    with pytest.raises(ValueError, match="integrity digest"):
+        evolution.write_finalists(forged, output, certification=certification)
+
+    assert output.read_bytes() == b"previous-finalists\n"
+
+
+@pytest.mark.parametrize(
+    ("identity_change", "message"),
+    (
+        ({"certified": True}, "artifact mode|certification"),
+        ({"manifest_sha256": "b" * 64}, "manifest"),
+        ({"engine": "1.32.8"}, "engine"),
+    ),
+)
+def test_deserialization_rejects_cross_field_identity_forgery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identity_change: dict[str, object],
+    message: str,
+) -> None:
+    """A status bit cannot contradict the config-bound production identity."""
+    codec, _, state = _state_for_history_forgery(monkeypatch, tmp_path)
+    del codec
+    payload = state.to_payload()
+    identity = cast(dict[str, object], payload["identity"])
+    identity.update(identity_change)
+
+    with pytest.raises(ValueError, match=message):
+        SearchState.from_payload(payload)
 
 
 def test_cli_accepts_a_complete_report_bound_to_verified_sources(
@@ -867,6 +1025,58 @@ def test_cli_rejects_a_frontier_matchup_with_the_wrong_game_count(
         _run_hybrid_cli(monkeypatch, tmp_path, manifest, artifact_root, report)
 
 
+def test_cli_rejects_negative_counts_and_out_of_range_frontier_rates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Counts that sum correctly cannot use negative losses to exceed one point."""
+    manifest, artifact_root, report, payload = _frontier_cli_fixture(
+        monkeypatch, tmp_path
+    )
+    rows = cast(list[dict[str, Any]], payload["rows"])
+    first = cast(list[dict[str, Any]], rows[0]["matchup_results"])[0]
+    second = cast(list[dict[str, Any]], rows[1]["matchup_results"])[0]
+    first.update(wins=129, draws=0, losses=-1, win_points=129 / 128)
+    second.update(wins=-1, draws=0, losses=129, win_points=-1 / 128)
+    for row, points in zip(rows, (129 / 128, -1 / 128), strict=True):
+        opponent = cast(list[dict[str, Any]], row["matchup_results"])[0]["opponent"]
+        cast(dict[str, float], row["matchups"])[opponent] = points
+        row["field_win_points"] = points
+        row["worst_matchup_win_points"] = points
+    report.write_text(json.dumps(payload))
+
+    with pytest.raises(SystemExit, match="non-negative|between zero and one"):
+        _run_hybrid_cli(monkeypatch, tmp_path, manifest, artifact_root, report)
+
+
+@pytest.mark.parametrize("runtime", (-1.0, float("nan")))
+def test_cli_rejects_negative_or_nonfinite_frontier_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime: float
+) -> None:
+    """Runtime is diagnostic but must still have valid finite semantics."""
+    manifest, artifact_root, report, payload = _frontier_cli_fixture(
+        monkeypatch, tmp_path
+    )
+    payload["runtime_seconds"] = runtime
+    report.write_text(json.dumps(payload))
+
+    with pytest.raises(SystemExit, match="runtime.*finite and non-negative"):
+        _run_hybrid_cli(monkeypatch, tmp_path, manifest, artifact_root, report)
+
+
+def test_cli_rejects_a_mismatched_frontier_runtime_aggregate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Top-level runtime must equal the once-per-pair matchup total."""
+    manifest, artifact_root, report, payload = _frontier_cli_fixture(
+        monkeypatch, tmp_path
+    )
+    payload["runtime_seconds"] += 1.0
+    report.write_text(json.dumps(payload))
+
+    with pytest.raises(SystemExit, match="runtime aggregate"):
+        _run_hybrid_cli(monkeypatch, tmp_path, manifest, artifact_root, report)
+
+
 def test_cli_caps_workers_lowers_priority_and_serializes_exact_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -880,7 +1090,7 @@ def test_cli_caps_workers_lowers_priority_and_serializes_exact_identity(
     monkeypatch.setattr(
         hybrid_search, "evolve", lambda **kwargs: captured.update(kwargs)
     )
-    monkeypatch.setattr(hybrid_search, "write_finalists", lambda *args: None)
+    monkeypatch.setattr(hybrid_search, "write_finalists", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "sys.argv",
         [

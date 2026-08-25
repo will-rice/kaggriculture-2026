@@ -34,7 +34,7 @@ assert all(
     for right in _SEED_SETS[index + 1 :]
 ), "frontier, screening, development, and promotion seeds must be disjoint"
 
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -115,6 +115,9 @@ class CandidateEvaluation:
     failures: tuple[str, ...]
 
 
+RandomState = tuple[int, tuple[int, ...], float | None]
+
+
 @dataclass(frozen=True)
 class GenerationRecord:
     """Every screening result and every developed survivor in one generation."""
@@ -122,6 +125,12 @@ class GenerationRecord:
     generation: int
     screened: tuple[CandidateEvaluation, ...]
     developed: tuple[CandidateEvaluation, ...]
+    parent_digest: str
+    spawned_population: tuple[tuple[float, ...], ...]
+    survivor_genomes: tuple[tuple[float, ...], ...]
+    elites: tuple[CandidateEvaluation, ...]
+    rng_state: RandomState
+    integrity_digest: str
 
 
 @dataclass(frozen=True)
@@ -151,9 +160,6 @@ class _SearchCertification:
     league_identity: tuple[tuple[str, str, str], ...]
 
 
-RandomState = tuple[int, tuple[int, ...], float | None]
-
-
 @dataclass(frozen=True)
 class SearchState:
     """Canonical resumable state after zero or more complete generations."""
@@ -163,6 +169,7 @@ class SearchState:
     rng_state: RandomState
     elites: tuple[CandidateEvaluation, ...]
     history: tuple[GenerationRecord, ...]
+    integrity_digest: str
 
     def advance(
         self,
@@ -178,13 +185,40 @@ class SearchState:
         elites = top_eligible(developed, count=elite_count)
         if not elites:
             raise RuntimeError("generation produced no eligible development survivor")
-        record = GenerationRecord(generation, tuple(screened), tuple(developed))
+        screened_tuple = tuple(screened)
+        developed_tuple = tuple(developed)
+        terminal_rng = _validate_random_state(rng_state)
+        spawned_population = tuple(candidate.genome for candidate in screened_tuple)
+        survivor_genomes = tuple(candidate.genome for candidate in developed_tuple)
+        digest = _generation_integrity_digest(
+            identity=self.identity,
+            generation=generation,
+            parent_digest=self.integrity_digest,
+            spawned_population=spawned_population,
+            screened=screened_tuple,
+            survivor_genomes=survivor_genomes,
+            developed=developed_tuple,
+            elites=elites,
+            rng_state=terminal_rng,
+        )
+        record = GenerationRecord(
+            generation=generation,
+            screened=screened_tuple,
+            developed=developed_tuple,
+            parent_digest=self.integrity_digest,
+            spawned_population=spawned_population,
+            survivor_genomes=survivor_genomes,
+            elites=elites,
+            rng_state=terminal_rng,
+            integrity_digest=digest,
+        )
         return SearchState(
             identity=self.identity,
             generation=generation + 1,
-            rng_state=_validate_random_state(rng_state),
+            rng_state=terminal_rng,
             elites=elites,
             history=(*self.history, record),
+            integrity_digest=digest,
         )
 
     def to_payload(self) -> dict[str, object]:
@@ -196,6 +230,7 @@ class SearchState:
             "rng_state": _random_state_payload(self.rng_state),
             "elites": [_candidate_payload(candidate) for candidate in self.elites],
             "history": [_generation_payload(record) for record in self.history],
+            "integrity_digest": self.integrity_digest,
         }
 
     def to_json(self) -> str:
@@ -222,6 +257,7 @@ class SearchState:
                 "rng_state",
                 "elites",
                 "history",
+                "integrity_digest",
             },
             "search state",
         )
@@ -248,6 +284,9 @@ class SearchState:
             rng_state=_random_state_from_payload(payload["rng_state"]),
             elites=elites,
             history=history,
+            integrity_digest=_sha256_string(
+                payload["integrity_digest"], "search integrity digest"
+            ),
         )
 
     @classmethod
@@ -296,14 +335,16 @@ def initial_state(
         )
         for genome, candidate in zip(genomes, initial_configs, strict=True)
     )
+    identity = _search_identity(
+        codec, initial_configs, league, weights, config, certification
+    )
     return SearchState(
-        identity=_search_identity(
-            codec, initial_configs, league, weights, config, certification
-        ),
+        identity=identity,
         generation=0,
         rng_state=_validate_random_state(random.Random(config.seed).getstate()),
         elites=parents[: config.population],
         history=(),
+        integrity_digest=_initial_integrity_digest(identity),
     )
 
 
@@ -421,7 +462,7 @@ def evaluate_population(
 def top_eligible(
     candidates: Sequence[CandidateEvaluation], count: int
 ) -> tuple[CandidateEvaluation, ...]:
-    """Rank by fitness, normalized margin, runtime, then canonical genome."""
+    """Rank by fitness, normalized margin, then canonical genome."""
     if type(count) is not int or count < 0:
         raise ValueError("eligible count must be a non-negative integer")
     eligible = tuple(
@@ -501,15 +542,32 @@ def save_state_atomic(state: SearchState, output: Path) -> None:
     _write_atomic(output, state.to_json())
 
 
-def write_finalists(state: SearchState, output: Path) -> None:
-    """Write decoded finalist configurations with the exact search identity."""
-    if not state.identity.certified:
-        raise ValueError("non-certifying search state cannot write finalists")
+def write_finalists(
+    state: SearchState,
+    output: Path,
+    *,
+    certification: object | None = None,
+    codec: GenomeCodec | None = None,
+) -> None:
+    """Validate a completed production state before writing its finalists."""
+    _validate_identity_cross_fields(state.identity)
+    _validate_certification(state.identity, certification)
+    config = state.identity.evolution_config
+    if state.generation == 0 or not state.history:
+        raise ValueError("finalists require a nonzero evaluated history")
+    if state.generation != config.generations:
+        raise ValueError("finalists require the configured generation to be complete")
+    finalist_codec = GenomeCodec.default() if codec is None else codec
+    if genome_schema_sha256(finalist_codec) != state.identity.genome_schema_sha256:
+        raise ValueError("finalist codec differs from the search genome schema")
+    weights = StrengthWeights(dict(state.identity.strength_weights))
+    _validate_resume_contents(state, finalist_codec, weights)
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "identity": _identity_payload(state.identity),
         "generation": state.generation,
         "finalists": [_candidate_payload(candidate) for candidate in state.elites],
+        "integrity_digest": state.integrity_digest,
     }
     source = (
         json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True)
@@ -538,6 +596,48 @@ def genome_schema_sha256(codec: GenomeCodec) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _integrity_sha256(payload: Mapping[str, object]) -> str:
+    """Hash canonical structural evidence; this is tamper-evident, not signed."""
+    source = json.dumps(
+        payload, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    return hashlib.sha256(source).hexdigest()
+
+
+def _initial_integrity_digest(identity: SearchIdentity) -> str:
+    return _integrity_sha256(
+        {"kind": "hybrid-search-initial", "identity": _identity_payload(identity)}
+    )
+
+
+def _generation_integrity_digest(
+    *,
+    identity: SearchIdentity,
+    generation: int,
+    parent_digest: str,
+    spawned_population: Sequence[Sequence[float]],
+    screened: Sequence[CandidateEvaluation],
+    survivor_genomes: Sequence[Sequence[float]],
+    developed: Sequence[CandidateEvaluation],
+    elites: Sequence[CandidateEvaluation],
+    rng_state: RandomState,
+) -> str:
+    return _integrity_sha256(
+        {
+            "kind": "hybrid-search-generation",
+            "static_identity_digest": _initial_integrity_digest(identity),
+            "generation": generation,
+            "parent_digest": parent_digest,
+            "spawned_population": [list(genome) for genome in spawned_population],
+            "screened": [_candidate_payload(candidate) for candidate in screened],
+            "survivor_genomes": [list(genome) for genome in survivor_genomes],
+            "developed": [_candidate_payload(candidate) for candidate in developed],
+            "elites": [_candidate_payload(candidate) for candidate in elites],
+            "terminal_rng_state": _random_state_payload(rng_state),
+        }
+    )
+
+
 def certify_frontier(frontier: VerifiedFrontier) -> _SearchCertification:
     """Bind a production search to a freshly verified manifest and source set."""
     if frontier.manifest_sha256 is None:
@@ -558,6 +658,22 @@ def certify_frontier(frontier: VerifiedFrontier) -> _SearchCertification:
     object.__setattr__(certification, "engine", frontier.engine)
     object.__setattr__(certification, "league_identity", league_identity)
     return certification
+
+
+def _validate_certification(
+    identity: SearchIdentity, certification: object | None
+) -> None:
+    if not identity.certified or identity.evolution_config.artifact_mode != "certified":
+        raise ValueError("non-certifying search state cannot write finalists")
+    if type(certification) is not _SearchCertification:
+        raise ValueError("finalists require verified production certification")
+    verified = certification
+    if (
+        identity.manifest_sha256 != verified.manifest_sha256
+        or identity.engine != verified.engine
+        or identity.league_identity != verified.league_identity
+    ):
+        raise ValueError("finalist certification differs from search identity")
 
 
 def _search_identity(
@@ -593,7 +709,7 @@ def _search_identity(
     ]
     if not initial_genomes:
         raise ValueError("initial_configs must contain at least one candidate")
-    return SearchIdentity(
+    identity = SearchIdentity(
         certified=certification is not None,
         manifest_sha256=config.manifest_sha256,
         engine=config.engine,
@@ -607,6 +723,19 @@ def _search_identity(
         initial_genomes=initial_genomes,
         evolution_config=config,
     )
+    _validate_identity_cross_fields(identity)
+    return identity
+
+
+def _validate_identity_cross_fields(identity: SearchIdentity) -> None:
+    config = identity.evolution_config
+    if identity.engine != config.engine:
+        raise ValueError("search identity engine differs from evolution config")
+    if identity.manifest_sha256 != config.manifest_sha256:
+        raise ValueError("search identity manifest differs from evolution config")
+    production_mode = config.artifact_mode == "certified"
+    if identity.certified != production_mode:
+        raise ValueError("search identity certification differs from artifact mode")
 
 
 def _opponent_identity(opponent: Opponent) -> tuple[str, str]:
@@ -668,7 +797,8 @@ def _validate_resume(state: SearchState, expected: SearchIdentity) -> None:
 def _validate_resume_contents(
     state: SearchState, codec: GenomeCodec, weights: StrengthWeights
 ) -> None:
-    """Reject internally inconsistent candidates before restoring the RNG."""
+    """Reject inconsistent or locally tampered state before external effects."""
+    _validate_identity_cross_fields(state.identity)
     if state.generation != len(state.history):
         raise ValueError("resume generation differs from its history length")
     if tuple(record.generation for record in state.history) != tuple(
@@ -699,6 +829,30 @@ def _validate_resume_contents(
     expected_rng_state = _validate_random_state(rng.getstate())
     if state.rng_state != expected_rng_state:
         raise ValueError("resume RNG state differs from replayed history")
+    _validate_integrity_chain(state)
+
+
+def _validate_integrity_chain(state: SearchState) -> None:
+    parent_digest = _initial_integrity_digest(state.identity)
+    for record in state.history:
+        if record.parent_digest != parent_digest:
+            raise ValueError("resume generation parent integrity digest differs")
+        expected = _generation_integrity_digest(
+            identity=state.identity,
+            generation=record.generation,
+            parent_digest=record.parent_digest,
+            spawned_population=record.spawned_population,
+            screened=record.screened,
+            survivor_genomes=record.survivor_genomes,
+            developed=record.developed,
+            elites=record.elites,
+            rng_state=record.rng_state,
+        )
+        if record.integrity_digest != expected:
+            raise ValueError("resume generation integrity digest differs")
+        parent_digest = expected
+    if state.integrity_digest != parent_digest:
+        raise ValueError("resume terminal integrity digest differs")
 
 
 def _validate_generation_record(
@@ -710,12 +864,34 @@ def _validate_generation_record(
     rng: random.Random,
 ) -> tuple[tuple[float, ...], ...]:
     config = identity.evolution_config
+    _validate_generation_spawn(record, parent_genomes, config, rng)
+    return _validate_generation_outcomes(record, identity, codec, weights, rng)
+
+
+def _validate_generation_spawn(
+    record: GenerationRecord,
+    parent_genomes: tuple[tuple[float, ...], ...],
+    config: EvolutionConfig,
+    rng: random.Random,
+) -> None:
     expected_spawn = _spawn_population_genomes(parent_genomes, config, rng)
+    if record.spawned_population != expected_spawn:
+        raise ValueError("resume recorded spawned population differs from RNG replay")
     actual_spawn = tuple(candidate.genome for candidate in record.screened)
-    if actual_spawn != expected_spawn:
+    if actual_spawn != record.spawned_population:
         raise ValueError("resume spawned population differs from RNG replay")
     if len(record.screened) != config.population:
         raise ValueError("resume screening population differs from evolution config")
+
+
+def _validate_generation_outcomes(
+    record: GenerationRecord,
+    identity: SearchIdentity,
+    codec: GenomeCodec,
+    weights: StrengthWeights,
+    rng: random.Random,
+) -> tuple[tuple[float, ...], ...]:
+    config = identity.evolution_config
     for candidate in record.screened:
         _validate_resume_candidate(
             candidate,
@@ -725,6 +901,9 @@ def _validate_generation_record(
             seeds=identity.screening_seeds,
         )
     survivors = top_eligible(record.screened, count=config.elites * 2)
+    survivor_genomes = tuple(candidate.genome for candidate in survivors)
+    if record.survivor_genomes != survivor_genomes:
+        raise ValueError("resume survivor lineage differs from screening ranking")
     for candidate in record.developed:
         _validate_resume_candidate(
             candidate,
@@ -733,8 +912,8 @@ def _validate_generation_record(
             stage="development",
             seeds=identity.development_seeds,
         )
-    if tuple(candidate.genome for candidate in record.developed) != tuple(
-        candidate.genome for candidate in survivors
+    if tuple(candidate.genome for candidate in record.developed) != (
+        record.survivor_genomes
     ):
         raise ValueError(
             "resume development survivor set differs from screening ranking"
@@ -742,6 +921,10 @@ def _validate_generation_record(
     parents = top_eligible(record.developed, count=config.elites)
     if not parents:
         raise ValueError("resume development contains no eligible parent")
+    if record.elites != parents:
+        raise ValueError("resume generation elites differ from development ranking")
+    if record.rng_state != _validate_random_state(rng.getstate()):
+        raise ValueError("resume generation RNG transition differs from replay")
     return tuple(candidate.genome for candidate in parents)
 
 
@@ -924,7 +1107,7 @@ def _identity_from_payload(value: object) -> SearchIdentity:
         "evolution config",
     )
     config = EvolutionConfig(**cast(dict[str, Any], config_payload))
-    return SearchIdentity(
+    identity = SearchIdentity(
         certified=certified,
         manifest_sha256=manifest_sha256,
         engine=engine,
@@ -946,6 +1129,8 @@ def _identity_from_payload(value: object) -> SearchIdentity:
         ),
         evolution_config=config,
     )
+    _validate_identity_cross_fields(identity)
+    return identity
 
 
 def _candidate_payload(candidate: CandidateEvaluation) -> dict[str, object]:
@@ -1057,12 +1242,30 @@ def _generation_payload(record: GenerationRecord) -> dict[str, object]:
         "generation": record.generation,
         "screened": [_candidate_payload(candidate) for candidate in record.screened],
         "developed": [_candidate_payload(candidate) for candidate in record.developed],
+        "parent_digest": record.parent_digest,
+        "spawned_population": [list(genome) for genome in record.spawned_population],
+        "survivor_genomes": [list(genome) for genome in record.survivor_genomes],
+        "elites": [_candidate_payload(candidate) for candidate in record.elites],
+        "rng_state": _random_state_payload(record.rng_state),
+        "integrity_digest": record.integrity_digest,
     }
 
 
 def _generation_from_payload(value: object) -> GenerationRecord:
     payload = _dictionary(
-        value, {"generation", "screened", "developed"}, "generation record"
+        value,
+        {
+            "generation",
+            "screened",
+            "developed",
+            "parent_digest",
+            "spawned_population",
+            "survivor_genomes",
+            "elites",
+            "rng_state",
+            "integrity_digest",
+        },
+        "generation record",
     )
     return GenerationRecord(
         generation=_integer(payload["generation"], "generation", minimum=0),
@@ -1074,6 +1277,31 @@ def _generation_from_payload(value: object) -> GenerationRecord:
             _candidate_from_payload(candidate)
             for candidate in _list(payload["developed"], "developed candidates")
         ),
+        parent_digest=_sha256_string(
+            payload["parent_digest"], "generation parent digest"
+        ),
+        spawned_population=_genome_rows(
+            payload["spawned_population"], "spawned population"
+        ),
+        survivor_genomes=_genome_rows(payload["survivor_genomes"], "survivor genomes"),
+        elites=tuple(
+            _candidate_from_payload(candidate)
+            for candidate in _list(payload["elites"], "generation elites")
+        ),
+        rng_state=_random_state_from_payload(payload["rng_state"]),
+        integrity_digest=_sha256_string(
+            payload["integrity_digest"], "generation integrity digest"
+        ),
+    )
+
+
+def _genome_rows(value: object, label: str) -> tuple[tuple[float, ...], ...]:
+    return tuple(
+        tuple(
+            _finite_float(item, f"{label} value")
+            for item in _list(row, f"{label} genome")
+        )
+        for row in _list(value, label)
     )
 
 
@@ -1157,6 +1385,15 @@ def _string(value: object, label: str) -> str:
     if type(value) is not str or not value:
         raise TypeError(f"{label} must be a non-empty string")
     return value
+
+
+def _sha256_string(value: object, label: str) -> str:
+    digest = _string(value, label)
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{label} must be 64 lowercase hexadecimal digits")
+    return digest
 
 
 def _string_row(value: object, length: int, label: str) -> tuple[str, ...]:

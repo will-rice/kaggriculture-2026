@@ -60,6 +60,16 @@ def _close(actual: float, expected: float) -> bool:
     return math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
 
 
+def _require_finite_nonnegative(value: float, label: str) -> None:
+    if not math.isfinite(value) or value < 0.0:
+        raise SystemExit(f"frontier report {label} must be finite and non-negative")
+
+
+def _require_unit_interval(value: float, label: str) -> None:
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise SystemExit(f"frontier report {label} must be between zero and one")
+
+
 def _validate_frontier_report(
     report: FrontierReport, frontier: VerifiedFrontier
 ) -> None:
@@ -78,6 +88,7 @@ def _validate_frontier_report(
         )
     if report.seeds != FRONTIER_SEEDS:
         raise SystemExit("frontier report does not use the fixed 64 frontier seeds")
+    _require_finite_nonnegative(report.runtime_seconds, "runtime_seconds")
     if report.failures or any(row.failures for row in report.rows):
         raise SystemExit("frontier report contains failures and cannot seed search")
     names = tuple(frontier.opponents)
@@ -103,6 +114,12 @@ def _validate_frontier_report(
     by_pair: dict[tuple[str, str], FrontierMatchup] = {}
     for row in report.rows:
         _validate_report_row(row, names, by_pair)
+    unique_pair_runtimes = {
+        tuple(sorted((candidate, opponent))): result.runtime_seconds
+        for (candidate, opponent), result in by_pair.items()
+    }
+    if not _close(report.runtime_seconds, sum(unique_pair_runtimes.values())):
+        raise SystemExit("frontier report runtime aggregate is inconsistent")
 
 
 def _validate_report_row(
@@ -110,6 +127,15 @@ def _validate_report_row(
     names: tuple[str, ...],
     by_pair: dict[tuple[str, str], FrontierMatchup],
 ) -> None:
+    _require_finite_nonnegative(row.runtime_seconds, f"{row.name} runtime_seconds")
+    _require_unit_interval(row.field_win_points, f"{row.name} field win points")
+    _require_unit_interval(
+        row.worst_matchup_win_points, f"{row.name} worst matchup win points"
+    )
+    if not math.isfinite(row.paired_margin):
+        raise SystemExit(f"frontier report {row.name} paired margin must be finite")
+    for opponent, rate in row.matchups.items():
+        _require_unit_interval(rate, f"{row.name} vs {opponent} win points")
     opponents = set(names) - {row.name}
     if (
         set(row.matchups) != opponents
@@ -139,6 +165,10 @@ def _validate_report_row(
         or not _close(row.field_win_points, field_points)
         or not _close(row.worst_matchup_win_points, worst)
         or not _close(row.paired_margin, margin)
+        or not _close(
+            row.runtime_seconds,
+            sum(result.runtime_seconds for result in row.matchup_results),
+        )
     ):
         raise SystemExit("frontier report row aggregates are inconsistent")
 
@@ -153,6 +183,17 @@ def _validate_matchup(
         raise SystemExit(
             f"frontier report matchup must contain {games_per_matchup} games"
         )
+    for count, label in (
+        (result.wins, "wins"),
+        (result.draws, "draws"),
+        (result.losses, "losses"),
+    ):
+        if count < 0:
+            raise SystemExit(f"frontier report matchup {label} must be non-negative")
+    _require_unit_interval(result.win_points, "matchup win points")
+    _require_finite_nonnegative(result.runtime_seconds, "matchup runtime_seconds")
+    if not math.isfinite(result.paired_margin):
+        raise SystemExit("frontier report matchup paired margin must be finite")
     if result.failures:
         raise SystemExit("frontier report contains failures and cannot seed search")
     if result.wins + result.draws + result.losses != result.games:
@@ -168,6 +209,7 @@ def _validate_matchup(
         or reverse.wins != result.losses
         or reverse.draws != result.draws
         or reverse.losses != result.wins
+        or not _close(reverse.runtime_seconds, result.runtime_seconds)
         or not _close(reverse.win_points + result.win_points, 1.0)
         or not _close(reverse.paired_margin, -result.paired_margin)
     ):
@@ -199,17 +241,19 @@ def main() -> None:
         seed=args.seed,
         engine=frontier.engine,
     )
+    certification = certify_frontier(frontier)
+    codec = GenomeCodec.default()
     state = evolve(
-        codec=GenomeCodec.default(),
+        codec=codec,
         initial_configs=seed_configs(),
         league=frontier.opponents,
         weights=strength_weights(report),
         config=config,
         output=args.output,
         resume=resume,
-        certification=certify_frontier(frontier),
+        certification=certification,
     )
-    write_finalists(state, args.finalists)
+    write_finalists(state, args.finalists, certification=certification, codec=codec)
 
 
 if __name__ == "__main__":
