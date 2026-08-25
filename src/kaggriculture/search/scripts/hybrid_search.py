@@ -15,6 +15,8 @@ from kaggriculture.search.evolution import (
     SearchState,
     certify_frontier,
     evolve,
+    restore_snapshot_frontier,
+    snapshot_frontier,
     write_finalists,
 )
 from kaggriculture.search.fitness import strength_weights
@@ -222,7 +224,18 @@ def main() -> None:
     if not 1 <= args.workers <= 16:
         raise SystemExit("--workers must be between 1 and 16 while Toad is running")
     os.nice(10)
-    frontier = verify_frontier(args.manifest, args.artifact_root)
+    resume_path = args.resume
+    if resume_path is None and args.output.exists():
+        resume_path = args.output
+    resume = SearchState.load(resume_path) if resume_path is not None else None
+    if resume is None:
+        frontier = verify_frontier(args.manifest, args.artifact_root)
+        snapshot = None
+        certification = None
+    else:
+        frontier, snapshot, certification = restore_snapshot_frontier(
+            args.manifest, args.artifact_root, resume, args.output
+        )
     try:
         report = TypeAdapter(FrontierReport).validate_json(
             args.frontier_report.read_text()
@@ -230,10 +243,9 @@ def main() -> None:
     except (OSError, ValidationError, ValueError) as error:
         raise SystemExit(f"invalid frontier report: {error}") from error
     _validate_frontier_report(report, frontier)
-    resume_path = args.resume
-    if resume_path is None and args.output.exists():
-        resume_path = args.output
-    resume = SearchState.load(resume_path) if resume_path is not None else None
+    if snapshot is None:
+        snapshot = snapshot_frontier(frontier, args.output)
+        certification = certify_frontier(frontier, snapshot)
     config = EvolutionConfig(
         artifact_mode="certified",
         manifest_sha256=frontier.manifest_sha256,
@@ -241,12 +253,11 @@ def main() -> None:
         seed=args.seed,
         engine=frontier.engine,
     )
-    certification = certify_frontier(frontier)
     codec = GenomeCodec.default()
     state = evolve(
         codec=codec,
         initial_configs=seed_configs(),
-        league=frontier.opponents,
+        league=snapshot.opponents,
         weights=strength_weights(report),
         config=config,
         output=args.output,

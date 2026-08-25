@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import subprocess
 import sys
@@ -776,6 +777,7 @@ def _run_hybrid_cli(
     manifest: Path,
     artifact_root: Path,
     report: Path,
+    output: Path | None = None,
 ) -> dict[str, object]:
     captured: dict[str, object] = {}
     monkeypatch.setattr(hybrid_search.os, "nice", lambda value: None)
@@ -794,13 +796,245 @@ def _run_hybrid_cli(
             "--frontier-report",
             str(report),
             "--output",
-            str(tmp_path / "state.json"),
+            str(tmp_path / "state.json" if output is None else output),
             "--finalists",
             str(tmp_path / "finalists.json"),
         ],
     )
     hybrid_search.main()
     return captured
+
+
+def test_cli_routes_every_worker_to_content_addressed_snapshot_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The production CLI cannot pass mutable artifact paths into evolution."""
+    manifest, artifact_root, report, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+
+    captured = _run_hybrid_cli(monkeypatch, tmp_path, manifest, artifact_root, report)
+
+    league = cast(Mapping[str, str], captured["league"])
+    assert all(Path(path).parent != artifact_root for path in league.values())
+    for name, path in league.items():
+        snapshot = Path(path)
+        source = artifact_root / f"{name}.py"
+        original = snapshot.read_bytes()
+        source.write_text("# changed after snapshot\n")
+        assert snapshot.read_bytes() == original
+        assert snapshot.is_symlink() is False
+        assert snapshot.stat().st_nlink == 1
+
+
+def _completed_snapshot_search(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[SearchState, Any, EvolutionConfig, evolution.SnapshotLeague, Path]:
+    manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+    frontier = verify_frontier(manifest, artifact_root)
+    output = tmp_path / "run" / "state.json"
+    snapshot = evolution.snapshot_frontier(frontier, output)
+    certification = evolution.certify_frontier(frontier, snapshot)
+    config = EvolutionConfig(
+        artifact_mode="certified",
+        manifest_sha256=frontier.manifest_sha256,
+        population=4,
+        elites=1,
+        generations=1,
+        seed=73,
+        workers=1,
+        engine=frontier.engine,
+    )
+    codec = GenomeCodec.default()
+    monkeypatch.setattr(evolution.arena, "outcomes", _deterministic_arena(codec, []))
+    state = evolve(
+        codec=codec,
+        initial_configs=(HybridConfig.default(),),
+        league=snapshot.opponents,
+        weights=_weights(),
+        config=config,
+        output=output,
+        certification=certification,
+    )
+    return state, certification, config, snapshot, output
+
+
+def test_original_source_mutation_cannot_change_snapshot_evaluation_or_finalists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Workers and finalist validation use copied bytes after originals mutate."""
+    manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+    frontier = verify_frontier(manifest, artifact_root)
+    output = tmp_path / "run" / "state.json"
+    snapshot = evolution.snapshot_frontier(frontier, output)
+    certification = evolution.certify_frontier(frontier, snapshot)
+    original_snapshot_bytes = {
+        name: Path(path).read_bytes() for name, path in snapshot.opponents.items()
+    }
+    for source in artifact_root.iterdir():
+        source.write_text("# mutable original changed\n")
+    seen_paths: list[Path] = []
+
+    def outcomes(
+        candidate: HybridOpponent,
+        league: dict[str, str],
+        seeds: tuple[int, ...],
+        workers: int | None,
+    ) -> MeasuredScores:
+        del candidate, workers
+        name, path = next(iter(league.items()))
+        snapshot_path = Path(path)
+        seen_paths.append(snapshot_path)
+        assert snapshot_path.read_bytes() == original_snapshot_bytes[name]
+        return MeasuredScores([0.5] * (2 * len(seeds)), 0.0)
+
+    monkeypatch.setattr(evolution.arena, "outcomes", outcomes)
+    config = EvolutionConfig(
+        artifact_mode="certified",
+        manifest_sha256=frontier.manifest_sha256,
+        population=2,
+        elites=1,
+        generations=1,
+        seed=73,
+        workers=1,
+        engine=frontier.engine,
+    )
+    codec = GenomeCodec.default()
+    state = evolve(
+        codec=codec,
+        initial_configs=(HybridConfig.default(),),
+        league=snapshot.opponents,
+        weights=_weights(),
+        config=config,
+        output=output,
+        certification=certification,
+    )
+    finalists = tmp_path / "run" / "finalists.json"
+
+    evolution.write_finalists(
+        state, finalists, certification=certification, codec=codec
+    )
+
+    assert seen_paths
+    assert set(seen_paths) == {Path(path) for path in snapshot.opponents.values()}
+    assert state.identity.league_snapshots == tuple(
+        (
+            source.name,
+            source.source_path,
+            source.snapshot_path,
+            source.sha256,
+        )
+        for source in snapshot.sources
+    )
+    assert finalists.exists()
+
+
+@pytest.mark.parametrize("damage", ("changed", "missing", "hardlink"))
+def test_snapshot_damage_fails_resume_and_finalists_atomically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, damage: str
+) -> None:
+    """Certified boundaries rehash and revalidate every immutable snapshot path."""
+    state, certification, config, snapshot, output = _completed_snapshot_search(
+        monkeypatch, tmp_path
+    )
+    source = snapshot.sources[0]
+    snapshot_path = Path(source.snapshot_path)
+    if damage == "changed":
+        snapshot_path.chmod(0o644)
+        snapshot_path.write_text("# changed snapshot bytes\n")
+    elif damage == "missing":
+        snapshot_path.unlink()
+    else:
+        snapshot_path.unlink()
+        os.link(source.source_path, snapshot_path)
+    output.write_bytes(b"previous-state\n")
+
+    with pytest.raises(ValueError, match="snapshot"):
+        evolve(
+            codec=GenomeCodec.default(),
+            initial_configs=(HybridConfig.default(),),
+            league=snapshot.opponents,
+            weights=_weights(),
+            config=config,
+            output=output,
+            resume=state,
+            certification=certification,
+        )
+    assert output.read_bytes() == b"previous-state\n"
+
+    finalists = tmp_path / f"{damage}-finalists.json"
+    finalists.write_bytes(b"previous-finalists\n")
+    with pytest.raises(ValueError, match="snapshot"):
+        evolution.write_finalists(
+            state,
+            finalists,
+            certification=certification,
+            codec=GenomeCodec.default(),
+        )
+    assert finalists.read_bytes() == b"previous-finalists\n"
+
+
+def test_cli_resume_ignores_mutated_originals_and_reuses_bound_snapshots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A later process restores from snapshots without reopening original bytes."""
+    state, _, _, snapshot, output = _completed_snapshot_search(monkeypatch, tmp_path)
+    artifact_root = tmp_path / "artifacts"
+    for source in artifact_root.iterdir():
+        source.write_text("# original changed after completed checkpoint\n")
+
+    captured = _run_hybrid_cli(
+        monkeypatch,
+        tmp_path,
+        tmp_path / "manifest.json",
+        artifact_root,
+        tmp_path / "frontier.json",
+        output,
+    )
+
+    assert captured["resume"] == state
+    assert dict(cast(Mapping[str, str], captured["league"])) == dict(snapshot.opponents)
+
+
+def test_snapshot_creation_is_atomic_and_failure_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A changed source during copying leaves no partial snapshot league."""
+    manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+    frontier = verify_frontier(manifest, artifact_root)
+    changed = artifact_root / "boatlee_v14_current.py"
+    changed.write_text("# changed between verification and snapshot\n")
+    output = tmp_path / "failed-run" / "state.json"
+
+    with pytest.raises(ValueError, match="source.*changed|sha256"):
+        evolution.snapshot_frontier(frontier, output)
+
+    assert output.parent.exists()
+    assert not tuple(output.parent.iterdir())
+
+
+def test_snapshot_publish_failure_removes_the_just_published_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A durability failure after rename cannot leave a partial successful run."""
+    manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+    frontier = verify_frontier(manifest, artifact_root)
+    output = tmp_path / "publish-failed-run" / "state.json"
+    real_fsync = evolution._fsync_directory
+    calls = 0
+
+    def fail_parent_fsync(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("parent directory fsync failed")
+        real_fsync(path)
+
+    monkeypatch.setattr(evolution, "_fsync_directory", fail_parent_fsync)
+
+    with pytest.raises(OSError, match="parent directory fsync failed"):
+        evolution.snapshot_frontier(frontier, output)
+
+    assert output.parent.exists()
+    assert not tuple(output.parent.iterdir())
 
 
 def _completed_verified_search(
@@ -811,7 +1045,9 @@ def _completed_verified_search(
 ) -> tuple[SearchState, object, EvolutionConfig]:
     manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
     frontier = verify_frontier(manifest, artifact_root)
-    certification = evolution.certify_frontier(frontier)
+    output = tmp_path / "verified-state.json"
+    snapshot = evolution.snapshot_frontier(frontier, output)
+    certification = evolution.certify_frontier(frontier, snapshot)
     config = EvolutionConfig(
         artifact_mode="certified",
         manifest_sha256=frontier.manifest_sha256,
@@ -827,10 +1063,10 @@ def _completed_verified_search(
     state = evolve(
         codec=codec,
         initial_configs=(HybridConfig.default(),),
-        league=frontier.opponents,
+        league=snapshot.opponents,
         weights=_weights(),
         config=config,
-        output=tmp_path / "verified-state.json",
+        output=output,
         certification=certification,
     )
     return state, certification, config

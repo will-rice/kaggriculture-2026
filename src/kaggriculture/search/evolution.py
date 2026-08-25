@@ -7,6 +7,8 @@ import json
 import math
 import os
 import random
+import shutil
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -20,7 +22,7 @@ from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.search import arena
 from kaggriculture.search.arena import HybridOpponent, Opponent
 from kaggriculture.search.fitness import Fitness, StrengthWeights, score_fitness
-from kaggriculture.search.frontier import VerifiedFrontier
+from kaggriculture.search.frontier import FrontierManifest, VerifiedFrontier
 from kaggriculture.search.genome import GenomeCodec
 from kaggriculture.search.scripts.frontier_round_robin import FRONTIER_SEEDS
 
@@ -34,7 +36,7 @@ assert all(
     for right in _SEED_SETS[index + 1 :]
 ), "frontier, screening, development, and promotion seeds must be disjoint"
 
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,7 @@ class SearchIdentity:
     promotion_seeds: tuple[int, ...]
     genome_schema_sha256: str
     league_identity: tuple[tuple[str, str, str], ...]
+    league_snapshots: tuple[tuple[str, str, str, str], ...]
     strength_weights: tuple[tuple[str, int], ...]
     initial_genomes: tuple[tuple[float, ...], ...]
     evolution_config: EvolutionConfig
@@ -158,6 +161,31 @@ class _SearchCertification:
     manifest_sha256: str
     engine: str
     league_identity: tuple[tuple[str, str, str], ...]
+    league_snapshots: tuple[tuple[str, str, str, str], ...]
+    snapshot: SnapshotLeague
+
+
+@dataclass(frozen=True)
+class SnapshotSource:
+    """One immutable source copy and its original-to-snapshot mapping."""
+
+    name: str
+    source_path: str
+    snapshot_path: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SnapshotLeague:
+    """Content-addressed runnable sources rooted beside a search output."""
+
+    root: str
+    sources: tuple[SnapshotSource, ...]
+
+    @property
+    def opponents(self) -> Mapping[str, str]:
+        """Return the exact worker league rooted only in snapshot paths."""
+        return {source.name: source.snapshot_path for source in self.sources}
 
 
 @dataclass(frozen=True)
@@ -638,26 +666,209 @@ def _generation_integrity_digest(
     )
 
 
-def certify_frontier(frontier: VerifiedFrontier) -> _SearchCertification:
-    """Bind a production search to a freshly verified manifest and source set."""
+def snapshot_frontier(
+    frontier: VerifiedFrontier,
+    output: Path,
+    *,
+    require_existing: bool = False,
+) -> SnapshotLeague:
+    """Atomically copy verified sources into a content-addressed run league."""
     if frontier.manifest_sha256 is None:
         raise ValueError("frontier has no verified manifest sha256")
     artifact_names = tuple(artifact.name for artifact in frontier.artifacts)
     if artifact_names != tuple(frontier.opponents):
         raise ValueError("frontier artifacts and opponents must have identical order")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    root = output.with_name(f"{output.name}.league").absolute()
+    sources = tuple(
+        SnapshotSource(
+            name=artifact.name,
+            source_path=str(Path(frontier.opponents[artifact.name]).absolute()),
+            snapshot_path=str(
+                root
+                / (
+                    f"{artifact.name}-{artifact.sha256}"
+                    f"{artifact.relative_path.suffix or '.py'}"
+                )
+            ),
+            sha256=artifact.sha256,
+        )
+        for artifact in frontier.artifacts
+    )
+    snapshot = SnapshotLeague(str(root), sources)
+    if root.exists() or root.is_symlink():
+        _verify_snapshot_league(snapshot)
+        return snapshot
+    if require_existing:
+        raise ValueError(f"snapshot league is missing: {root}")
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.", suffix=".tmp", dir=root.parent)
+    )
+    published = False
+    try:
+        for source in sources:
+            original = Path(source.source_path).read_bytes()
+            digest = hashlib.sha256(original).hexdigest()
+            if digest != source.sha256:
+                raise ValueError(
+                    f"{source.name}: source sha256 changed before snapshot"
+                )
+            destination = temporary / Path(source.snapshot_path).name
+            with destination.open("xb") as stream:
+                stream.write(original)
+                stream.flush()
+                os.fsync(stream.fileno())
+            destination.chmod(0o444)
+        _fsync_directory(temporary)
+        temporary.replace(root)
+        published = True
+        _fsync_directory(root.parent)
+    except BaseException:
+        cleanup = root if published else temporary
+        shutil.rmtree(cleanup, ignore_errors=True)
+        if published:
+            try:
+                _fsync_directory(root.parent)
+            except OSError:
+                pass
+        raise
+    _verify_snapshot_league(snapshot)
+    return snapshot
+
+
+def restore_snapshot_frontier(
+    manifest_path: Path,
+    artifact_root: Path,
+    state: SearchState,
+    output: Path,
+) -> tuple[VerifiedFrontier, SnapshotLeague, _SearchCertification]:
+    """Restore a certified league without trusting mutable original bytes."""
+    _validate_identity_cross_fields(state.identity)
+    manifest_source = manifest_path.read_bytes()
+    manifest_sha256 = hashlib.sha256(manifest_source).hexdigest()
+    manifest = FrontierManifest.model_validate_json(manifest_source)
+    if manifest_sha256 != state.identity.manifest_sha256:
+        raise ValueError("resume manifest sha256 differs from search identity")
+    if (
+        manifest.engine != state.identity.engine
+        or manifest.engine != kaggle_environments.__version__
+    ):
+        raise ValueError("resume manifest engine differs from search identity")
+    root = artifact_root.resolve()
+    opponents: dict[str, str] = {}
+    for artifact in manifest.artifacts:
+        source = (root / artifact.relative_path).resolve()
+        if root not in source.parents:
+            raise ValueError(
+                f"{artifact.name}: resume source path escapes artifact root"
+            )
+        opponents[artifact.name] = str(source)
+    frontier = VerifiedFrontier(
+        manifest.engine, opponents, manifest.artifacts, manifest_sha256
+    )
+    snapshot = SnapshotLeague(
+        str(output.with_name(f"{output.name}.league").absolute()),
+        tuple(SnapshotSource(*row) for row in state.identity.league_snapshots),
+    )
+    certification = certify_frontier(frontier, snapshot)
+    if certification.league_snapshots != state.identity.league_snapshots:
+        raise ValueError("resume snapshot mapping differs from search identity")
+    return frontier, snapshot, certification
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _verify_snapshot_league(snapshot: SnapshotLeague) -> None:
+    root = Path(snapshot.root)
+    try:
+        root_status = root.lstat()
+    except OSError as error:
+        raise ValueError(f"snapshot league is missing: {root}") from error
+    if root.is_symlink() or not stat.S_ISDIR(root_status.st_mode):
+        raise ValueError(f"snapshot league root is not a regular directory: {root}")
+    expected_paths = {Path(source.snapshot_path) for source in snapshot.sources}
+    try:
+        actual_paths = set(root.iterdir())
+    except OSError as error:
+        raise ValueError(f"snapshot league cannot be read: {root}") from error
+    if actual_paths != expected_paths:
+        raise ValueError("snapshot league paths differ from certified mapping")
+    for source in snapshot.sources:
+        path = Path(source.snapshot_path)
+        if path.parent != root or source.sha256 not in path.name:
+            raise ValueError(f"{source.name}: snapshot path is not content-addressed")
+        try:
+            status = path.lstat()
+            content = path.read_bytes()
+        except OSError as error:
+            raise ValueError(
+                f"{source.name}: snapshot is missing or unreadable"
+            ) from error
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or status.st_mode & 0o222
+        ):
+            raise ValueError(
+                f"{source.name}: snapshot must be a read-only unaliased regular file"
+            )
+        if hashlib.sha256(content).hexdigest() != source.sha256:
+            raise ValueError(f"{source.name}: snapshot sha256 changed")
+
+
+def certify_frontier(
+    frontier: VerifiedFrontier, snapshot: SnapshotLeague
+) -> _SearchCertification:
+    """Bind a production search to freshly reverified snapshot bytes."""
+    if frontier.manifest_sha256 is None:
+        raise ValueError("frontier has no verified manifest sha256")
+    _verify_snapshot_league(snapshot)
+    expected_sources = tuple(
+        (
+            artifact.name,
+            str(Path(frontier.opponents[artifact.name]).absolute()),
+            artifact.sha256,
+        )
+        for artifact in frontier.artifacts
+    )
+    actual_sources = tuple(
+        (source.name, source.source_path, source.sha256) for source in snapshot.sources
+    )
+    if actual_sources != expected_sources:
+        raise ValueError("snapshot source mapping differs from verified frontier")
     league_identity = tuple(
         (name, *_opponent_identity(opponent))
-        for name, opponent in frontier.opponents.items()
+        for name, opponent in snapshot.opponents.items()
     )
-    declared = {artifact.name: artifact.sha256 for artifact in frontier.artifacts}
-    for name, kind, digest in league_identity:
-        if kind != "agent_source" or declared[name] != digest:
-            raise ValueError(f"{name}: verified frontier source identity changed")
+    league_snapshots = _snapshot_identity(snapshot)
     certification = object.__new__(_SearchCertification)
     object.__setattr__(certification, "manifest_sha256", frontier.manifest_sha256)
     object.__setattr__(certification, "engine", frontier.engine)
     object.__setattr__(certification, "league_identity", league_identity)
+    object.__setattr__(certification, "league_snapshots", league_snapshots)
+    object.__setattr__(certification, "snapshot", snapshot)
     return certification
+
+
+def _snapshot_identity(
+    snapshot: SnapshotLeague,
+) -> tuple[tuple[str, str, str, str], ...]:
+    return tuple(
+        (
+            source.name,
+            source.source_path,
+            source.snapshot_path,
+            source.sha256,
+        )
+        for source in snapshot.sources
+    )
 
 
 def _validate_certification(
@@ -668,10 +879,12 @@ def _validate_certification(
     if type(certification) is not _SearchCertification:
         raise ValueError("finalists require verified production certification")
     verified = certification
+    _verify_snapshot_league(verified.snapshot)
     if (
         identity.manifest_sha256 != verified.manifest_sha256
         or identity.engine != verified.engine
         or identity.league_identity != verified.league_identity
+        or identity.league_snapshots != verified.league_snapshots
     ):
         raise ValueError("finalist certification differs from search identity")
 
@@ -694,10 +907,12 @@ def _search_identity(
     if config.artifact_mode == "certified":
         if certification is None:
             raise ValueError("certified evolution requires verified certification")
+        _verify_snapshot_league(certification.snapshot)
         if (
             config.manifest_sha256 != certification.manifest_sha256
             or config.engine != certification.engine
             or league_identity != certification.league_identity
+            or dict(league) != dict(certification.snapshot.opponents)
         ):
             raise ValueError(
                 "verified certification differs from current search inputs"
@@ -719,6 +934,9 @@ def _search_identity(
         promotion_seeds=tuple(PROMOTION_SEEDS),
         genome_schema_sha256=genome_schema_sha256(codec),
         league_identity=league_identity,
+        league_snapshots=(
+            certification.league_snapshots if certification is not None else ()
+        ),
         strength_weights=tuple(weights.values.items()),
         initial_genomes=initial_genomes,
         evolution_config=config,
@@ -736,6 +954,14 @@ def _validate_identity_cross_fields(identity: SearchIdentity) -> None:
     production_mode = config.artifact_mode == "certified"
     if identity.certified != production_mode:
         raise ValueError("search identity certification differs from artifact mode")
+    snapshot_names = tuple(row[0] for row in identity.league_snapshots)
+    league_names = tuple(row[0] for row in identity.league_identity)
+    if production_mode and (
+        not identity.league_snapshots or snapshot_names != league_names
+    ):
+        raise ValueError("certified search identity has no complete snapshot mapping")
+    if not production_mode and identity.league_snapshots:
+        raise ValueError("test search identity cannot contain snapshot mapping")
 
 
 def _opponent_identity(opponent: Opponent) -> tuple[str, str]:
@@ -777,6 +1003,11 @@ def _validate_resume(state: SearchState, expected: SearchIdentity) -> None:
             expected.genome_schema_sha256,
         ),
         ("league identity", state.identity.league_identity, expected.league_identity),
+        (
+            "league snapshots",
+            state.identity.league_snapshots,
+            expected.league_snapshots,
+        ),
         (
             "strength weights",
             state.identity.strength_weights,
@@ -1038,6 +1269,7 @@ def _identity_payload(identity: SearchIdentity) -> dict[str, object]:
         "promotion_seeds": list(identity.promotion_seeds),
         "genome_schema_sha256": identity.genome_schema_sha256,
         "league_identity": [list(item) for item in identity.league_identity],
+        "league_snapshots": [list(item) for item in identity.league_snapshots],
         "strength_weights": [list(item) for item in identity.strength_weights],
         "initial_genomes": [list(genome) for genome in identity.initial_genomes],
         "evolution_config": asdict(identity.evolution_config),
@@ -1057,6 +1289,7 @@ def _identity_from_payload(value: object) -> SearchIdentity:
             "promotion_seeds",
             "genome_schema_sha256",
             "league_identity",
+            "league_snapshots",
             "strength_weights",
             "initial_genomes",
             "evolution_config",
@@ -1079,6 +1312,18 @@ def _identity_from_payload(value: object) -> SearchIdentity:
             _string_row(item, 3, "league identity")[2],
         )
         for item in _list(payload["league_identity"], "league identity")
+    )
+    league_snapshots = tuple(
+        (
+            _string_row(item, 4, "league snapshot")[0],
+            _string_row(item, 4, "league snapshot")[1],
+            _string_row(item, 4, "league snapshot")[2],
+            _sha256_string(
+                _string_row(item, 4, "league snapshot")[3],
+                "league snapshot sha256",
+            ),
+        )
+        for item in _list(payload["league_snapshots"], "league snapshots")
     )
     weight_rows = _list(payload["strength_weights"], "strength weights")
     weight_mapping: dict[str, int] = {}
@@ -1119,6 +1364,7 @@ def _identity_from_payload(value: object) -> SearchIdentity:
         promotion_seeds=_integer_tuple(payload["promotion_seeds"], "promotion seeds"),
         genome_schema_sha256=schema,
         league_identity=league_identity,
+        league_snapshots=league_snapshots,
         strength_weights=tuple(weights.values.items()),
         initial_genomes=tuple(
             tuple(
