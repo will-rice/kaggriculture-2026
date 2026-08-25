@@ -1,0 +1,24 @@
+{
+  "corpus": {
+    "board": "04acb217b4d9d94a35a5f8751d7e9725b01f7badc94be169f27294d558c6dc1d",
+    "market_mask": "470be4b954abaaaead9e79fe6d481d66c5b997a27bd9cf8dfaf06804f42862b2",
+    "positions": "9bd1110b1cf24e4ff8f7e0152ac648b04e09a678da70c81e11a2047d26c5a130",
+    "quantity_mask": "6be7e7790e9ad327b167890d9fa4528ae4e36e485bd3ba38c4e38f8202da120e",
+    "scalars": "4b73cb83f08a0aea5594fd7d5bfd9add701bca928017171e65efb4a7601f95f0",
+    "unit_mask": "6cc58610cc0ad8d258a1bc1b57e1d6c0ee53b6b43bb119fcf8f3f987d721b9aa"
+  },
+  "provenance": {
+    "archives": ["kaggriculture-episodes-2026-07-30.zip"],
+    "base_commit": "f0fcc55b1179e2389c75fb97a9a30298ee4fa0e8",
+    "corpus_limit": 2048,
+    "generator": "tests/feature_golden_generator.py"
+  },
+  "rich": {
+    "board": "16be5821d1690888c2ab70140d98c888a2a0580118fc41a78af35d9767aa0f83",
+    "market_mask": "c234fb266929d976221aa85392401b7708f3e6193618f60b0097efa519639fae",
+    "positions": "bad0172e7af92eb6d75daa0c95a179cb1db92879e9a26ea27742c3acec0f8e42",
+    "quantity_mask": "56624eda454879682257a619c89a99914d2c7fb7508e344b6a841f2fd9cf8593",
+    "scalars": "bad8f80370660fe19320548e56b9bd517bdaef5441d17d515ff39f6d0a5b9020",
+    "unit_mask": "8d95844a8a390b640d8e1aa713cf1e2e010a46336d0148ed6e8b96c13f9477b9"
+  }
+}
