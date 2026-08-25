@@ -33,10 +33,10 @@ def select_phase(
 ) -> RuntimeOpeningPhase:
     """Return the latest scheduled phase whose start day has arrived."""
     day = encoded.day_count()
-    for phase in reversed(config.phases):
-        if phase.start_day <= day:
-            return phase
-    raise ValueError("runtime opening schedule has no phase active on the current day")
+    active = tuple(phase for phase in config.phases if phase.start_day <= day)
+    if not active:
+        raise RuntimeError("validated runtime must include an active day-zero phase")
+    return max(active, key=lambda phase: phase.start_day)
 
 
 def opening_targets(

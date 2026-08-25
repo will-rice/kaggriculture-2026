@@ -143,9 +143,9 @@ def test_opening_targets_are_state_deficits_not_taped_actions() -> None:
 
 
 def test_latest_phase_does_not_replay_already_satisfied_work() -> None:
-    encoded = encoded_fixture(day=8, hands=5, crops={"WHEAT": 8})
+    encoded = encoded_fixture(day=12, hands=5, crops={"WHEAT": 8})
     first = phase(start_day=0, target_hands=3, crops={"WHEAT": 4})
-    expected = phase(start_day=7, target_hands=5, crops={"WHEAT": 8})
+    expected = phase(start_day=10, target_hands=5, crops={"WHEAT": 8})
     config = runtime_config(phases=(first, expected, phase(start_day=20)))
 
     targets = opening_targets(encoded, config)
@@ -155,19 +155,31 @@ def test_latest_phase_does_not_replay_already_satisfied_work() -> None:
     assert targets.crop_deficits["WHEAT"] == 0
 
 
+def test_select_phase_defensively_uses_the_largest_active_start_day() -> None:
+    """Select by start day even if an invalid runtime tuple was corrupted."""
+    encoded = encoded_fixture(day=15)
+    early = phase(start_day=0)
+    expected = phase(start_day=10)
+    future = phase(start_day=20)
+    config = object.__new__(RuntimeConfig)
+    object.__setattr__(config, "phases", (expected, future, early))
+
+    assert select_phase(encoded, config) == expected
+
+
 def test_delayed_land_target_counts_already_unlocked_quadrants() -> None:
-    encoded = encoded_fixture(day=8, land=2)
+    encoded = encoded_fixture(day=12, land=2)
     config = runtime_config(
         phases=(
             phase(start_day=0, target_quadrants=1),
-            phase(start_day=7, target_quadrants=3),
+            phase(start_day=10, target_quadrants=3),
             phase(start_day=20),
         )
     )
 
     targets = opening_targets(encoded, config)
 
-    assert targets.phase_start_day == 7
+    assert targets.phase_start_day == 10
     assert targets.quadrants_needed == 1
 
 

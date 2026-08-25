@@ -3,6 +3,10 @@
 from dataclasses import asdict, dataclass
 from typing import Mapping, Self, cast
 
+from kaggriculture.hybrid.schema import PHASE_START_DAYS
+
+_PHASE_DAY_VALUES = frozenset(day for days in PHASE_START_DAYS for day in days)
+
 
 @dataclass(frozen=True)
 class RuntimeOpeningPhase:
@@ -17,6 +21,12 @@ class RuntimeOpeningPhase:
     structure_targets: tuple[int, int]
     cash_reserve: int
     inventory_reserve: int
+
+    def __post_init__(self) -> None:
+        """Reject direct phase construction outside the fixed schedule domains."""
+        start_day = _require_int(self.start_day, "phase start_day")
+        if start_day not in _PHASE_DAY_VALUES:
+            raise ValueError("phase start_day is outside the fixed schedule domains")
 
 
 @dataclass(frozen=True)
@@ -169,6 +179,23 @@ class RuntimeConfig:
     jobs: RuntimeJobWeights
     market: RuntimeMarketWeights
     liquidation_start_day: int
+
+    def __post_init__(self) -> None:
+        """Validate the fixed ordered phase schedule for every construction path."""
+        if type(self.phases) is not tuple:
+            raise TypeError("phases must be a tuple of runtime opening phases")
+        if len(self.phases) != len(PHASE_START_DAYS):
+            raise ValueError("runtime config must hold exactly three opening phases")
+        for index, (phase, allowed_days) in enumerate(
+            zip(self.phases, PHASE_START_DAYS, strict=True)
+        ):
+            if type(phase) is not RuntimeOpeningPhase:
+                raise TypeError("phases must contain runtime opening phases")
+            if phase.start_day not in allowed_days:
+                raise ValueError(
+                    f"phase {index} start_day is outside its fixed position domain"
+                )
+        _require_int(self.liquidation_start_day, "liquidation_start_day")
 
     def to_payload(self) -> dict[str, object]:
         """Return the exact literal payload accepted by ``from_payload``."""

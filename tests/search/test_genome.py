@@ -25,6 +25,19 @@ def test_every_integer_and_category_decodes_from_one_argmax_group() -> None:
     assert all(gene.path[0] in {"jobs", "market"} for gene in codec.continuous_genes)
 
 
+def test_fixed_first_phase_day_is_not_an_optimizer_parameter() -> None:
+    """Keep the invariant day-zero phase out of the one-hot search surface."""
+    codec = GenomeCodec.default()
+
+    assert codec.decode([0.0] * codec.width).opening.phases[0].start_day == 0
+    assert (
+        "opening",
+        "phases",
+        0,
+        "start_day",
+    ) not in {group.path for group in codec.discrete_groups}
+
+
 def test_codec_is_exact_for_one_hots_and_continuous_inverse_mapping() -> None:
     """Round-trip 100 deterministic valid candidates through the flat genome."""
     codec = GenomeCodec.default()

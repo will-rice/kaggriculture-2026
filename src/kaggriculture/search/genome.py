@@ -151,7 +151,9 @@ class GenomeCodec:
             raise ValueError("default template must hold three opening phases")
         for phase_index in range(len(phases)):
             prefix: tuple[str | int, ...] = ("opening", "phases", phase_index)
-            add((*prefix, "start_day"), PHASE_START_DAYS[phase_index])
+            start_days = PHASE_START_DAYS[phase_index]
+            if len(start_days) > 1:
+                add((*prefix, "start_day"), start_days)
             add((*prefix, "target_hands"), HAND_TARGETS)
             add((*prefix, "target_quadrants"), QUADRANT_TARGETS)
             add((*prefix, "primary_crop"), tuple(CROP_NAMES))

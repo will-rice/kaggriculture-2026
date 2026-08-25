@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from itertools import product
 from types import MappingProxyType
 from typing import Any
@@ -76,6 +77,14 @@ def test_hybrid_config_rejects_invalid_phase_schemas_and_order() -> None:
         phases[0],
         {**phases[1], "start_day": 9},
         phases[2],
+    )
+    with pytest.raises(ValidationError, match="fixed position domain"):
+        HybridConfig.model_validate(payload)
+
+    payload = HybridConfig.default().model_dump(mode="python")
+    payload["opening"]["phases"] = (
+        {**payload["opening"]["phases"][0], "start_day": 1},
+        *payload["opening"]["phases"][1:],
     )
     with pytest.raises(ValidationError, match="fixed position domain"):
         HybridConfig.model_validate(payload)
@@ -157,3 +166,29 @@ def test_runtime_payload_rejects_wrong_keys_and_containers() -> None:
     malformed = {**payload, "jobs": {"recovery": 1.0}}
     with pytest.raises(ValueError, match="job"):
         RuntimeConfig.from_payload(malformed)
+
+
+def test_runtime_construction_rejects_invalid_first_and_unordered_phases() -> None:
+    """Keep direct dependency-free construction inside the fixed phase schema."""
+    runtime = to_runtime(HybridConfig.default())
+
+    with pytest.raises(ValueError, match="phase start_day"):
+        replace(runtime.phases[0], start_day=1)
+    with pytest.raises(ValueError, match="phase 0"):
+        RuntimeConfig(
+            phases=(runtime.phases[1], runtime.phases[0], runtime.phases[2]),
+            jobs=runtime.jobs,
+            market=runtime.market,
+            liquidation_start_day=runtime.liquidation_start_day,
+        )
+
+
+def test_runtime_payload_rejects_unordered_phase_schedules() -> None:
+    """Apply fixed position day domains again at the generated-payload boundary."""
+    payload: dict[str, Any] = to_runtime(HybridConfig.default()).to_payload()
+    phases = payload["phases"]
+    assert type(phases) is list
+    phases[0], phases[1] = phases[1], phases[0]
+
+    with pytest.raises(ValueError, match="phase 0"):
+        RuntimeConfig.from_payload(payload)
