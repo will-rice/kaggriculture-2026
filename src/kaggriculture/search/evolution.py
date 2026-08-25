@@ -525,6 +525,7 @@ def evolve(
     expected_identity = _search_identity(
         codec, initial_configs, league, weights, config, certification
     )
+    _validate_output_outside_snapshot(expected_identity, output)
     if resume is None:
         state = initial_state(
             codec, initial_configs, league, weights, config, certification
@@ -567,6 +568,7 @@ def evolve(
 
 def save_state_atomic(state: SearchState, output: Path) -> None:
     """Replace a state only after its complete canonical bytes reach disk."""
+    _validate_output_outside_snapshot(state.identity, output)
     _write_atomic(output, state.to_json())
 
 
@@ -579,6 +581,7 @@ def write_finalists(
 ) -> None:
     """Validate a completed production state before writing its finalists."""
     _validate_identity_cross_fields(state.identity)
+    _validate_output_outside_snapshot(state.identity, output)
     _validate_certification(state.identity, certification)
     config = state.identity.evolution_config
     if state.generation == 0 or not state.history:
@@ -723,6 +726,7 @@ def snapshot_frontier(
         temporary.replace(root)
         published = True
         _fsync_directory(root.parent)
+        _verify_snapshot_league(snapshot)
     except BaseException:
         cleanup = root if published else temporary
         shutil.rmtree(cleanup, ignore_errors=True)
@@ -732,7 +736,6 @@ def snapshot_frontier(
             except OSError:
                 pass
         raise
-    _verify_snapshot_league(snapshot)
     return snapshot
 
 
@@ -744,6 +747,7 @@ def restore_snapshot_frontier(
 ) -> tuple[VerifiedFrontier, SnapshotLeague, _SearchCertification]:
     """Restore a certified league without trusting mutable original bytes."""
     _validate_identity_cross_fields(state.identity)
+    _validate_output_outside_snapshot(state.identity, output)
     manifest_source = manifest_path.read_bytes()
     manifest_sha256 = hashlib.sha256(manifest_source).hexdigest()
     manifest = FrontierManifest.model_validate_json(manifest_source)
@@ -766,10 +770,9 @@ def restore_snapshot_frontier(
     frontier = VerifiedFrontier(
         manifest.engine, opponents, manifest.artifacts, manifest_sha256
     )
-    snapshot = SnapshotLeague(
-        str(output.with_name(f"{output.name}.league").absolute()),
-        tuple(SnapshotSource(*row) for row in state.identity.league_snapshots),
-    )
+    snapshot = _snapshot_league_from_identity(state.identity)
+    if snapshot is None:
+        raise ValueError("certified resume identity has no snapshot league")
     certification = certify_frontier(frontier, snapshot)
     if certification.league_snapshots != state.identity.league_snapshots:
         raise ValueError("resume snapshot mapping differs from search identity")
@@ -869,6 +872,53 @@ def _snapshot_identity(
         )
         for source in snapshot.sources
     )
+
+
+def _snapshot_league_from_identity(
+    identity: SearchIdentity,
+) -> SnapshotLeague | None:
+    """Reconstruct the one immutable league root bound into an identity."""
+    if not identity.league_snapshots:
+        return None
+    sources = tuple(SnapshotSource(*row) for row in identity.league_snapshots)
+    roots = {Path(source.snapshot_path).parent for source in sources}
+    if len(roots) != 1:
+        raise ValueError("certified snapshot mapping has multiple league roots")
+    return SnapshotLeague(str(roots.pop()), sources)
+
+
+def _same_or_below(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _validate_output_outside_snapshot(identity: SearchIdentity, output: Path) -> None:
+    """Reject lexical, canonical, and inode aliases into a bound snapshot league."""
+    snapshot = _snapshot_league_from_identity(identity)
+    if snapshot is None:
+        return
+    # Keep a lexical normalized form as well as the canonical symlink-resolved
+    # form below; ``Path.resolve`` would collapse the two checks into one.
+    root = Path(os.path.abspath(snapshot.root))  # noqa: PTH100
+    candidate = Path(os.path.abspath(output))  # noqa: PTH100
+    canonical_root = Path(os.path.realpath(root))
+    canonical_candidate = Path(os.path.realpath(candidate))
+    if _same_or_below(candidate, root) or _same_or_below(
+        canonical_candidate, canonical_root
+    ):
+        raise ValueError("output path must be outside the certified snapshot league")
+    try:
+        candidate_status = candidate.lstat()
+    except OSError:
+        return
+    if not stat.S_ISREG(candidate_status.st_mode):
+        return
+    for source in snapshot.sources:
+        try:
+            snapshot_status = Path(source.snapshot_path).lstat()
+        except OSError:
+            continue
+        if os.path.samestat(candidate_status, snapshot_status):
+            raise ValueError("output path aliases a certified snapshot file")
 
 
 def _validate_certification(

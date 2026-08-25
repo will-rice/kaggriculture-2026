@@ -857,6 +857,115 @@ def _completed_snapshot_search(
     return state, certification, config, snapshot, output
 
 
+def _snapshot_tree(snapshot: evolution.SnapshotLeague) -> tuple[object, ...]:
+    """Capture every snapshot byte and mode without following aliases."""
+    root = Path(snapshot.root)
+    return (
+        root.lstat().st_mode,
+        tuple(
+            (
+                path.relative_to(root).as_posix(),
+                path.lstat().st_mode,
+                path.lstat().st_nlink,
+                path.read_bytes(),
+            )
+            for path in sorted(root.iterdir())
+        ),
+    )
+
+
+def test_evolve_rejects_state_output_below_its_snapshot_root_before_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Even a completed resume cannot place state anywhere in its bound league."""
+    state, certification, config, snapshot, _ = _completed_snapshot_search(
+        monkeypatch, tmp_path
+    )
+    before = _snapshot_tree(snapshot)
+    output = Path(snapshot.root) / "nested" / "state.json"
+
+    with pytest.raises(ValueError, match="snapshot"):
+        evolve(
+            codec=GenomeCodec.default(),
+            initial_configs=(HybridConfig.default(),),
+            league=snapshot.opponents,
+            weights=_weights(),
+            config=config,
+            output=output,
+            resume=state,
+            certification=certification,
+        )
+
+    assert _snapshot_tree(snapshot) == before
+    assert not output.parent.exists()
+
+
+def test_atomic_state_write_rejects_a_snapshot_file_without_changing_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The public state writer cannot replace a read-only certified source."""
+    state, _, _, snapshot, _ = _completed_snapshot_search(monkeypatch, tmp_path)
+    before = _snapshot_tree(snapshot)
+
+    with pytest.raises(ValueError, match="snapshot"):
+        evolution.save_state_atomic(state, Path(snapshot.sources[0].snapshot_path))
+
+    assert _snapshot_tree(snapshot) == before
+
+
+def test_finalists_reject_a_symlink_alias_into_the_snapshot_root_without_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Canonical containment catches an outside path whose parent aliases the league."""
+    state, certification, _, snapshot, _ = _completed_snapshot_search(
+        monkeypatch, tmp_path
+    )
+    alias = tmp_path / "league-alias"
+    alias.symlink_to(snapshot.root, target_is_directory=True)
+    before = _snapshot_tree(snapshot)
+    alias_mode = alias.lstat().st_mode
+
+    with pytest.raises(ValueError, match="snapshot"):
+        evolution.write_finalists(
+            state,
+            alias / "finalists.json",
+            certification=certification,
+            codec=GenomeCodec.default(),
+        )
+
+    assert _snapshot_tree(snapshot) == before
+    assert alias.lstat().st_mode == alias_mode
+    assert alias.readlink() == Path(snapshot.root)
+
+
+@pytest.mark.parametrize("target_kind", ("root", "dotdot", "file-symlink", "hardlink"))
+def test_state_output_rejects_snapshot_path_alias_forms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target_kind: str
+) -> None:
+    """Root equality, lexical traversal, and final symlinks are all excluded."""
+    state, _, _, snapshot, _ = _completed_snapshot_search(monkeypatch, tmp_path)
+    root = Path(snapshot.root)
+    if target_kind == "root":
+        output = root
+    elif target_kind == "dotdot":
+        output = root / "unused" / ".." / "state.json"
+    elif target_kind == "file-symlink":
+        output = tmp_path / "snapshot-file-alias"
+        output.symlink_to(snapshot.sources[0].snapshot_path)
+    else:
+        output = tmp_path / "snapshot-file-hardlink"
+        os.link(snapshot.sources[0].snapshot_path, output)
+    before = _snapshot_tree(snapshot)
+    output_status = output.lstat() if output.is_symlink() else None
+
+    with pytest.raises(ValueError, match="snapshot"):
+        evolution.save_state_atomic(state, output)
+
+    assert _snapshot_tree(snapshot) == before
+    if output_status is not None:
+        assert output.lstat() == output_status
+
+
 def test_original_source_mutation_cannot_change_snapshot_evaluation_or_finalists(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -994,6 +1103,106 @@ def test_cli_resume_ignores_mutated_originals_and_reuses_bound_snapshots(
     assert dict(cast(Mapping[str, str], captured["league"])) == dict(snapshot.opponents)
 
 
+def test_explicit_cli_resume_can_move_state_output_without_moving_bound_snapshots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A new process can resume A into B and reproduce uninterrupted bytes exactly."""
+    manifest, artifact_root, report_path, _ = _frontier_cli_fixture(
+        monkeypatch, tmp_path
+    )
+    frontier = verify_frontier(manifest, artifact_root)
+    output_a = tmp_path / "process-a" / "state.json"
+    output_b = tmp_path / "process-b" / "state.json"
+    full_output = tmp_path / "reference" / "state.json"
+    finalists = tmp_path / "process-b" / "finalists.json"
+    snapshot = evolution.snapshot_frontier(frontier, output_a)
+    certification = evolution.certify_frontier(frontier, snapshot)
+    report = hybrid_search.TypeAdapter(hybrid_search.FrontierReport).validate_json(
+        report_path.read_text()
+    )
+    weights = hybrid_search.strength_weights(report)
+    config = EvolutionConfig(
+        artifact_mode="certified",
+        manifest_sha256=frontier.manifest_sha256,
+        population=4,
+        elites=1,
+        generations=2,
+        seed=73,
+        workers=1,
+        engine=frontier.engine,
+    )
+    codec = GenomeCodec.default()
+    monkeypatch.setattr(evolution.arena, "outcomes", _deterministic_arena(codec, []))
+
+    evolve(
+        codec=codec,
+        initial_configs=(HybridConfig.default(),),
+        league=snapshot.opponents,
+        weights=weights,
+        config=config,
+        output=full_output,
+        certification=certification,
+    )
+    real_save = evolution.save_state_atomic
+
+    def interrupt_after_first_save(state: SearchState, output: Path) -> None:
+        real_save(state, output)
+        if state.generation == 1:
+            raise InterruptedError("new-process boundary")
+
+    monkeypatch.setattr(evolution, "save_state_atomic", interrupt_after_first_save)
+    with pytest.raises(InterruptedError, match="new-process boundary"):
+        evolve(
+            codec=codec,
+            initial_configs=(HybridConfig.default(),),
+            league=snapshot.opponents,
+            weights=weights,
+            config=config,
+            output=output_a,
+            certification=certification,
+        )
+    assert SearchState.load(output_a).generation == 1
+
+    monkeypatch.setattr(evolution, "save_state_atomic", real_save)
+    monkeypatch.setattr(hybrid_search.os, "nice", lambda value: None)
+    monkeypatch.setattr(
+        hybrid_search,
+        "EvolutionConfig",
+        lambda **kwargs: replace(config, **kwargs),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hybrid_search",
+            "--manifest",
+            str(manifest),
+            "--artifact-root",
+            str(artifact_root),
+            "--frontier-report",
+            str(report_path),
+            "--workers",
+            "1",
+            "--seed",
+            "73",
+            "--resume",
+            str(output_a),
+            "--output",
+            str(output_b),
+            "--finalists",
+            str(finalists),
+        ],
+    )
+
+    hybrid_search.main()
+
+    assert output_b.read_bytes() == full_output.read_bytes()
+    assert finalists.exists()
+    assert tuple(Path(path).parent for path in snapshot.opponents.values()) == (
+        Path(snapshot.root),
+    ) * len(snapshot.sources)
+    assert not output_b.with_name(f"{output_b.name}.league").exists()
+
+
 def test_snapshot_creation_is_atomic_and_failure_clean(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1035,6 +1244,60 @@ def test_snapshot_publish_failure_removes_the_just_published_directory(
 
     assert output.parent.exists()
     assert not tuple(output.parent.iterdir())
+
+
+@pytest.mark.parametrize("damage", ("removed", "corrupted"))
+def test_post_publish_verification_failure_removes_new_league_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, damage: str
+) -> None:
+    """A final verification failure rolls back the directory published by this call."""
+    manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+    frontier = verify_frontier(manifest, artifact_root)
+    output = tmp_path / "verification-failed-run" / "state.json"
+    snapshot_root = output.with_name(f"{output.name}.league").absolute()
+    real_verify = evolution._verify_snapshot_league
+
+    def fail_final_verification(snapshot: evolution.SnapshotLeague) -> None:
+        target = Path(snapshot.sources[0].snapshot_path)
+        if damage == "removed":
+            target.unlink()
+        else:
+            target.chmod(0o644)
+            target.write_text("# injected corruption after publication\n")
+        real_verify(snapshot)
+
+    monkeypatch.setattr(evolution, "_verify_snapshot_league", fail_final_verification)
+    with pytest.raises(ValueError, match="snapshot"):
+        evolution.snapshot_frontier(frontier, output)
+
+    assert not snapshot_root.exists()
+    assert not snapshot_root.is_symlink()
+
+    monkeypatch.setattr(evolution, "_verify_snapshot_league", real_verify)
+    retried = evolution.snapshot_frontier(frontier, output)
+    real_verify(retried)
+
+
+def test_failed_reverification_never_removes_a_preexisting_snapshot_league(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a directory newly published by the failing call is eligible for cleanup."""
+    manifest, artifact_root, _, _ = _frontier_cli_fixture(monkeypatch, tmp_path)
+    frontier = verify_frontier(manifest, artifact_root)
+    output = tmp_path / "existing-run" / "state.json"
+    snapshot = evolution.snapshot_frontier(frontier, output)
+    before = _snapshot_tree(snapshot)
+    real_verify = evolution._verify_snapshot_league
+
+    def fail_reverification(candidate: evolution.SnapshotLeague) -> None:
+        real_verify(candidate)
+        raise ValueError("injected existing snapshot verification failure")
+
+    monkeypatch.setattr(evolution, "_verify_snapshot_league", fail_reverification)
+    with pytest.raises(ValueError, match="injected existing snapshot"):
+        evolution.snapshot_frontier(frontier, output)
+
+    assert _snapshot_tree(snapshot) == before
 
 
 def _completed_verified_search(
