@@ -1,16 +1,80 @@
 """Replaying a real episode's own actions must reproduce its own result."""
 
 import json
+import pickle
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.search import arena
-from kaggriculture.search.arena import evaluate, outcomes, play, summarize
+from kaggriculture.search.arena import (
+    HybridOpponent,
+    evaluate,
+    outcomes,
+    play,
+    summarize,
+)
 from kaggriculture.search.route import Route, from_episode
+from tests.feature_golden_generator import rich_observation
 
 ARCHIVE = Path("/data/kaggriculture/episodes/kaggriculture-episodes-2026-08-15.zip")
+
+
+def test_arena_can_build_an_agent_from_a_picklable_hybrid_runtime() -> None:
+    """Workers receive data, then construct the non-picklable closure locally."""
+    opponent = HybridOpponent(to_runtime(HybridConfig.default()))
+
+    restored = pickle.loads(pickle.dumps(opponent))
+    side = arena._side(restored)
+
+    assert restored == opponent
+    assert not isinstance(side, str)
+    assert side(rich_observation(), None)["farmer"]
+
+
+def test_outcomes_records_normalized_margins_for_fitness_tie_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bank-scale differences are normalized before evolutionary tie-breaking."""
+    candidate: Route = [{"marker": "candidate"}]
+
+    monkeypatch.setattr(
+        arena,
+        "play",
+        lambda seat_zero, seat_one, seeds, workers=None: (
+            [(300, 100)] if seat_zero is candidate else [(50, 150)]
+        ),
+    )
+
+    result = outcomes(candidate, {"other": "other-agent"}, (7,))
+
+    assert result.margins == [200, 100]
+    assert result.normalized_margins == pytest.approx([0.5, 0.5])
+
+
+def test_non_done_status_is_a_failure_even_when_the_engine_supplies_rewards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ERROR/INVALID/forfeit can never enter fitness as an ordinary loss."""
+
+    class Seat:
+        def __init__(self, reward: int, status: str) -> None:
+            self.reward = reward
+            self.status = status
+
+    class Environment:
+        steps = [[Seat(0, "ERROR"), Seat(1, "DONE")]]
+
+        def run(self, agents: object) -> None:
+            return None
+
+    monkeypatch.setattr(arena, "make", lambda *args, **kwargs: Environment())
+    route: Route = [{"farmer": ["PASS"], "hands": [], "market": []}]
+
+    with pytest.raises(RuntimeError, match="statuses=.*ERROR"):
+        arena._one((route, route, 11))
 
 
 def test_a_route_against_itself_scores_exactly_half() -> None:

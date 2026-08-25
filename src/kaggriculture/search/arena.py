@@ -6,8 +6,8 @@ property the arena rests on, and it is why the arena runs on the reference
 engine rather than on the batched simulator: the simulator's action encoding
 carries no quantity for PICKUP/PLACE, which 78% of a real route's transfers use.
 
-An opponent is either a route (a recording, replayed by our own closure) or a
-path to an agent file (a policy, loaded and run by the engine itself). The
+An opponent is a route (replayed by our own closure), a path to an agent file,
+or immutable hybrid runtime data whose closure is built inside the worker. The
 reference engine runs agents, not just tapes, so it can host an opponent that
 reacts to the candidate -- the one check a frozen-recording league cannot give.
 
@@ -18,12 +18,15 @@ plain strings, both of which pickle without help.
 
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
 from kaggle_environments import make
 
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
+from kaggriculture.hybrid.policy import build_agent
+from kaggriculture.hybrid.runtime import RuntimeConfig
 from kaggriculture.search.route import Route
 
 _Action = dict[str, Any]
@@ -31,7 +34,15 @@ _Observation = Mapping[str, Any]
 _Configuration = Mapping[str, Any] | None
 _Agent = Callable[[_Observation, _Configuration], _Action]
 
-Opponent = Route | str
+
+@dataclass(frozen=True)
+class HybridOpponent:
+    """Picklable runtime data for constructing a hybrid agent in a worker."""
+
+    runtime: RuntimeConfig
+
+
+Opponent = Route | str | HybridOpponent
 
 
 class OutcomeScores(list[float]):
@@ -40,6 +51,8 @@ class OutcomeScores(list[float]):
     def __init__(self) -> None:
         super().__init__()
         self.margins: list[int] = []
+        self.normalized_margins: list[float] = []
+        self.failures: list[str] = []
         self.runtime_seconds = 0.0
 
 
@@ -72,7 +85,7 @@ def outcomes(
     league: Mapping[str, Opponent],
     seeds: Sequence[int],
     workers: int | None = None,
-) -> list[float]:
+) -> OutcomeScores:
     """Return one score per game the candidate plays against the league.
 
     Every seed is played twice, once with the candidate in each seat, because
@@ -111,6 +124,12 @@ def outcomes(
             scores.append(_win(ours_second, theirs_second))
             scores.margins.append(ours_first - theirs_first)
             scores.margins.append(ours_second - theirs_second)
+            scores.normalized_margins.append(
+                _normalized_margin(ours_first, theirs_first)
+            )
+            scores.normalized_margins.append(
+                _normalized_margin(ours_second, theirs_second)
+            )
     scores.runtime_seconds = perf_counter() - started
     return scores
 
@@ -164,13 +183,19 @@ def _win(ours: int, theirs: int) -> float:
     return 1.0 if ours > theirs else 0.5 if ours == theirs else 0.0
 
 
+def _normalized_margin(ours: int, theirs: int) -> float:
+    """Scale a paired bank margin without changing its sign."""
+    return (ours - theirs) / max(abs(ours) + abs(theirs), 1)
+
+
 def _side(opponent: Opponent) -> str | _Agent:
     """Return what ``env.run`` should be handed for one seat.
 
-    A ``str`` is a path to an agent file, which the engine loads and runs
-    itself; a route is replayed by our own closure. Both occupy the same
-    position in ``run``.
+    A ``HybridOpponent`` becomes a closure only after its runtime data reaches
+    the worker. A ``str`` is a path the engine loads; a route is replayed.
     """
+    if isinstance(opponent, HybridOpponent):
+        return build_agent(opponent.runtime)
     return opponent if isinstance(opponent, str) else _replay(opponent)
 
 
@@ -182,12 +207,17 @@ def _one(work: tuple[Opponent, Opponent, int]) -> tuple[int, int]:
     )
     environment.run([_side(seat_zero), _side(seat_one)])
     final = environment.steps[-1]
-    if final[0].reward is None or final[1].reward is None:
-        statuses = (final[0].status, final[1].status)
+    statuses = (final[0].status, final[1].status)
+    if (
+        statuses != ("DONE", "DONE")
+        or final[0].reward is None
+        or final[1].reward is None
+    ):
         raise RuntimeError(
-            f"seed {seed} finished with a missing reward (statuses={statuses}); "
+            f"seed {seed} did not finish cleanly (statuses={statuses}, "
+            f"rewards={(final[0].reward, final[1].reward)}); "
             "a route that no longer matches the episode it plays against, or a "
-            "run that timed out or errored, is not a 0-0 result."
+            "run that timed out, errored, or forfeited, is not an ordinary result."
         )
     return (int(final[0].reward), int(final[1].reward))
 
