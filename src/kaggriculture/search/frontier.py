@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Self
@@ -74,6 +74,7 @@ class VerifiedFrontier:
     engine: str
     opponents: Mapping[str, str]
     artifacts: tuple[FrontierArtifact, ...]
+    manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,11 +117,14 @@ class FrontierReport:
     failures: tuple[str, ...]
     runtime_seconds: float
     rows: tuple[FrontierRow, ...]
+    manifest_sha256: str | None = None
+    source_sha256: Mapping[str, str] = field(default_factory=dict)
 
 
 def verify_frontier(manifest_path: Path, artifact_root: Path) -> VerifiedFrontier:
     """Load a manifest only when every runnable source has its declared digest."""
-    manifest = FrontierManifest.model_validate_json(manifest_path.read_text())
+    manifest_source = manifest_path.read_bytes()
+    manifest = FrontierManifest.model_validate_json(manifest_source)
     installed_engine = kaggle_environments.__version__
     if manifest.engine != installed_engine:
         raise FrontierIntegrityError(
@@ -143,7 +147,12 @@ def verify_frontier(manifest_path: Path, artifact_root: Path) -> VerifiedFrontie
                 f"{artifact.name}: sha256 {digest} != {artifact.sha256}"
             )
         resolved[artifact.name] = str(source)
-    return VerifiedFrontier(manifest.engine, resolved, manifest.artifacts)
+    return VerifiedFrontier(
+        manifest.engine,
+        resolved,
+        manifest.artifacts,
+        hashlib.sha256(manifest_source).hexdigest(),
+    )
 
 
 def rank_frontier(
@@ -256,6 +265,10 @@ def rank_frontier(
         failures=tuple(report_failures),
         runtime_seconds=report_runtime_seconds,
         rows=ordered,
+        manifest_sha256=frontier.manifest_sha256,
+        source_sha256={
+            artifact.name: artifact.sha256 for artifact in frontier.artifacts
+        },
     )
 
 

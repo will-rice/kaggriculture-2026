@@ -12,7 +12,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import fmean
-from time import perf_counter
 from typing import Any, Self, cast
 
 import kaggle_environments
@@ -21,6 +20,7 @@ from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.search import arena
 from kaggriculture.search.arena import HybridOpponent, Opponent
 from kaggriculture.search.fitness import Fitness, StrengthWeights, score_fitness
+from kaggriculture.search.frontier import VerifiedFrontier
 from kaggriculture.search.genome import GenomeCodec
 from kaggriculture.search.scripts.frontier_round_robin import FRONTIER_SEEDS
 
@@ -34,14 +34,15 @@ assert all(
     for right in _SEED_SETS[index + 1 :]
 ), "frontier, screening, development, and promotion seeds must be disjoint"
 
-STATE_SCHEMA_VERSION = 1
-_UNSPECIFIED_MANIFEST_SHA256 = "0" * 64
+STATE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
 class EvolutionConfig:
     """Validated resource limits and mutation settings for one search run."""
 
+    artifact_mode: str
+    manifest_sha256: str | None
     population: int = 32
     elites: int = 4
     generations: int = 40
@@ -49,7 +50,6 @@ class EvolutionConfig:
     seed: int = 20_260_825
     workers: int = 16
     engine: str = kaggle_environments.__version__
-    manifest_sha256: str = _UNSPECIFIED_MANIFEST_SHA256
 
     def __post_init__(self) -> None:
         """Reject unsafe CPU settings and ambiguous optimizer shapes."""
@@ -79,15 +79,25 @@ class EvolutionConfig:
             raise ValueError("workers must be between 1 and 16 while Toad is running")
         if type(self.engine) is not str or not self.engine:
             raise ValueError("engine must be a non-empty string")
-        if (
-            type(self.manifest_sha256) is not str
-            or len(self.manifest_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.manifest_sha256
-            )
-        ):
-            raise ValueError("manifest_sha256 must be 64 lowercase hexadecimal digits")
+        _validate_artifact_identity(self.artifact_mode, self.manifest_sha256)
+
+
+def _validate_artifact_identity(mode: str, manifest_sha256: str | None) -> None:
+    if mode not in {"certified", "test"}:
+        raise ValueError("artifact_mode must be 'certified' or 'test'")
+    if mode == "test":
+        if manifest_sha256 is not None:
+            raise ValueError("test artifact mode cannot assert a manifest sha256")
+        return
+    if (
+        type(manifest_sha256) is not str
+        or len(manifest_sha256) != 64
+        or manifest_sha256 == "0" * 64
+        or any(character not in "0123456789abcdef" for character in manifest_sha256)
+    ):
+        raise ValueError(
+            "certified manifest_sha256 must be 64 nonzero lowercase hexadecimal digits"
+        )
 
 
 @dataclass(frozen=True)
@@ -96,11 +106,13 @@ class CandidateEvaluation:
 
     genome: tuple[float, ...]
     config: HybridConfig
+    stage: str
+    seeds: tuple[int, ...]
     matchup_rates: Mapping[str, float]
+    matchup_games: Mapping[str, int]
     fitness: Fitness | None
     paired_normalized_margin: float
     failures: tuple[str, ...]
-    runtime_seconds: float
 
 
 @dataclass(frozen=True)
@@ -116,7 +128,8 @@ class GenerationRecord:
 class SearchIdentity:
     """Every immutable input that gives a search state meaning."""
 
-    manifest_sha256: str
+    certified: bool
+    manifest_sha256: str | None
     engine: str
     frontier_seeds: tuple[int, ...]
     screening_seeds: tuple[int, ...]
@@ -125,7 +138,17 @@ class SearchIdentity:
     genome_schema_sha256: str
     league_identity: tuple[tuple[str, str, str], ...]
     strength_weights: tuple[tuple[str, int], ...]
+    initial_genomes: tuple[tuple[float, ...], ...]
     evolution_config: EvolutionConfig
+
+
+@dataclass(frozen=True, init=False)
+class _SearchCertification:
+    """Verified production provenance accepted by evolution."""
+
+    manifest_sha256: str
+    engine: str
+    league_identity: tuple[tuple[str, str, str], ...]
 
 
 RandomState = tuple[int, tuple[int, ...], float | None]
@@ -253,6 +276,7 @@ def initial_state(
     league: Mapping[str, Opponent],
     weights: StrengthWeights,
     config: EvolutionConfig,
+    certification: _SearchCertification | None = None,
 ) -> SearchState:
     """Create the unevaluated generation-zero state and bind all run identity."""
     if not initial_configs:
@@ -262,16 +286,20 @@ def initial_state(
         CandidateEvaluation(
             genome=genome,
             config=candidate,
+            stage="initial",
+            seeds=(),
             matchup_rates={},
+            matchup_games={},
             fitness=None,
             paired_normalized_margin=0.0,
             failures=(),
-            runtime_seconds=0.0,
         )
         for genome, candidate in zip(genomes, initial_configs, strict=True)
     )
     return SearchState(
-        identity=_search_identity(codec, league, weights, config),
+        identity=_search_identity(
+            codec, initial_configs, league, weights, config, certification
+        ),
         generation=0,
         rng_state=_validate_random_state(random.Random(config.seed).getstate()),
         elites=parents[: config.population],
@@ -287,10 +315,26 @@ def spawn_population(
     """Keep current parents and fill the population with deterministic mutations."""
     if not parents:
         raise ValueError("at least one parent is required to spawn a population")
-    genomes = [parent.genome for parent in parents[: config.population]]
+    return _spawn_population_genomes(
+        tuple(parent.genome for parent in parents), config, rng
+    )
+
+
+def _spawn_population_genomes(
+    parents: Sequence[Sequence[float]],
+    config: EvolutionConfig,
+    rng: random.Random,
+) -> tuple[tuple[float, ...], ...]:
+    """Replayable population spawn over canonical parent genomes."""
+    if not parents:
+        raise ValueError("at least one parent is required to spawn a population")
+    parent_genomes = tuple(
+        tuple(float(value) for value in parent) for parent in parents
+    )
+    genomes = list(parent_genomes[: config.population])
     while len(genomes) < config.population:
-        parent = parents[rng.randrange(len(parents))]
-        genomes.append(mutate_genome(parent.genome, config.mutation_sigma, rng))
+        parent = parent_genomes[rng.randrange(len(parent_genomes))]
+        genomes.append(mutate_genome(parent, config.mutation_sigma, rng))
     return tuple(genomes)
 
 
@@ -301,9 +345,19 @@ def evaluate_population(
     league: Mapping[str, Opponent],
     weights: StrengthWeights,
     workers: int,
+    *,
+    stage: str,
 ) -> tuple[CandidateEvaluation, ...]:
     """Evaluate each candidate against every member, continuing after failures."""
     seed_tuple = tuple(int(seed) for seed in seeds)
+    expected_seeds = {
+        "screening": SCREENING_SEEDS,
+        "development": DEVELOPMENT_SEEDS,
+    }
+    if stage not in expected_seeds:
+        raise ValueError("evaluation stage must be screening or development")
+    if seed_tuple != expected_seeds[stage]:
+        raise ValueError(f"{stage} evaluation must use its fixed seed set")
     expected_games = 2 * len(seed_tuple)
     evaluated: list[CandidateEvaluation] = []
     for raw_genome in genomes:
@@ -311,23 +365,20 @@ def evaluate_population(
         candidate_config = codec.decode(genome)
         candidate = HybridOpponent(to_runtime(candidate_config))
         rates: dict[str, float] = {}
+        matchup_games: dict[str, int] = {}
         normalized_margins: list[float] = []
         failures: list[str] = []
-        runtime_seconds = 0.0
         for name, opponent in league.items():
-            started = perf_counter()
             try:
                 scores = arena.outcomes(
                     candidate, {name: opponent}, seed_tuple, workers
                 )
             except Exception as error:
                 rates[name] = 0.0
+                matchup_games[name] = 0
                 failures.append(f"{name}: {type(error).__name__}: {error}")
-                runtime_seconds += perf_counter() - started
                 continue
-            runtime_seconds += float(
-                getattr(scores, "runtime_seconds", perf_counter() - started)
-            )
+            matchup_games[name] = len(scores)
             matchup_failures = tuple(getattr(scores, "failures", ()))
             failures.extend(f"{name}: {failure}" for failure in matchup_failures)
             if len(scores) != expected_games:
@@ -353,13 +404,15 @@ def evaluate_population(
             CandidateEvaluation(
                 genome=genome,
                 config=candidate_config,
+                stage=stage,
+                seeds=seed_tuple,
                 matchup_rates=rates,
+                matchup_games=matchup_games,
                 fitness=fitness,
                 paired_normalized_margin=(
                     fmean(normalized_margins) if normalized_margins else 0.0
                 ),
                 failures=tuple(failures),
-                runtime_seconds=runtime_seconds,
             )
         )
     return tuple(evaluated)
@@ -382,7 +435,6 @@ def top_eligible(
             key=lambda candidate: (
                 -cast(Fitness, candidate.fitness).value,
                 -candidate.paired_normalized_margin,
-                candidate.runtime_seconds,
                 candidate.genome,
             ),
         )[:count]
@@ -398,11 +450,16 @@ def evolve(
     config: EvolutionConfig,
     output: Path,
     resume: SearchState | None = None,
+    certification: _SearchCertification | None = None,
 ) -> SearchState:
     """Run progressive evolution, atomically saving every complete generation."""
-    expected_identity = _search_identity(codec, league, weights, config)
+    expected_identity = _search_identity(
+        codec, initial_configs, league, weights, config, certification
+    )
     if resume is None:
-        state = initial_state(codec, initial_configs, league, weights, config)
+        state = initial_state(
+            codec, initial_configs, league, weights, config, certification
+        )
     else:
         _validate_resume(resume, expected_identity)
         _validate_resume_contents(resume, codec, weights)
@@ -414,7 +471,13 @@ def evolve(
     for generation in range(state.generation, config.generations):
         genomes = spawn_population(state.elites, config, rng)
         screened = evaluate_population(
-            genomes, codec, SCREENING_SEEDS, league, weights, config.workers
+            genomes,
+            codec,
+            SCREENING_SEEDS,
+            league,
+            weights,
+            config.workers,
+            stage="screening",
         )
         survivors = top_eligible(screened, count=config.elites * 2)
         if not survivors:
@@ -426,6 +489,7 @@ def evolve(
             league,
             weights,
             config.workers,
+            stage="development",
         )
         state = state.advance(generation, screened, developed, rng.getstate())
         save_state_atomic(state, output)
@@ -439,6 +503,8 @@ def save_state_atomic(state: SearchState, output: Path) -> None:
 
 def write_finalists(state: SearchState, output: Path) -> None:
     """Write decoded finalist configurations with the exact search identity."""
+    if not state.identity.certified:
+        raise ValueError("non-certifying search state cannot write finalists")
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "identity": _identity_payload(state.identity),
@@ -472,17 +538,63 @@ def genome_schema_sha256(codec: GenomeCodec) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def certify_frontier(frontier: VerifiedFrontier) -> _SearchCertification:
+    """Bind a production search to a freshly verified manifest and source set."""
+    if frontier.manifest_sha256 is None:
+        raise ValueError("frontier has no verified manifest sha256")
+    artifact_names = tuple(artifact.name for artifact in frontier.artifacts)
+    if artifact_names != tuple(frontier.opponents):
+        raise ValueError("frontier artifacts and opponents must have identical order")
+    league_identity = tuple(
+        (name, *_opponent_identity(opponent))
+        for name, opponent in frontier.opponents.items()
+    )
+    declared = {artifact.name: artifact.sha256 for artifact in frontier.artifacts}
+    for name, kind, digest in league_identity:
+        if kind != "agent_source" or declared[name] != digest:
+            raise ValueError(f"{name}: verified frontier source identity changed")
+    certification = object.__new__(_SearchCertification)
+    object.__setattr__(certification, "manifest_sha256", frontier.manifest_sha256)
+    object.__setattr__(certification, "engine", frontier.engine)
+    object.__setattr__(certification, "league_identity", league_identity)
+    return certification
+
+
 def _search_identity(
     codec: GenomeCodec,
+    initial_configs: Sequence[HybridConfig],
     league: Mapping[str, Opponent],
     weights: StrengthWeights,
     config: EvolutionConfig,
+    certification: _SearchCertification | None,
 ) -> SearchIdentity:
     if not league:
         raise ValueError("league must contain at least one opponent")
     if set(league) != set(weights.values):
         raise ValueError("league names must exactly match strength weight names")
+    league_identity = tuple(
+        (name, *_opponent_identity(opponent)) for name, opponent in league.items()
+    )
+    if config.artifact_mode == "certified":
+        if certification is None:
+            raise ValueError("certified evolution requires verified certification")
+        if (
+            config.manifest_sha256 != certification.manifest_sha256
+            or config.engine != certification.engine
+            or league_identity != certification.league_identity
+        ):
+            raise ValueError(
+                "verified certification differs from current search inputs"
+            )
+    elif certification is not None:
+        raise ValueError("test artifact mode cannot accept production certification")
+    initial_genomes = tuple(codec.encode(candidate) for candidate in initial_configs)[
+        : config.population
+    ]
+    if not initial_genomes:
+        raise ValueError("initial_configs must contain at least one candidate")
     return SearchIdentity(
+        certified=certification is not None,
         manifest_sha256=config.manifest_sha256,
         engine=config.engine,
         frontier_seeds=tuple(FRONTIER_SEEDS),
@@ -490,10 +602,9 @@ def _search_identity(
         development_seeds=tuple(DEVELOPMENT_SEEDS),
         promotion_seeds=tuple(PROMOTION_SEEDS),
         genome_schema_sha256=genome_schema_sha256(codec),
-        league_identity=tuple(
-            (name, *_opponent_identity(opponent)) for name, opponent in league.items()
-        ),
+        league_identity=league_identity,
         strength_weights=tuple(weights.values.items()),
+        initial_genomes=initial_genomes,
         evolution_config=config,
     )
 
@@ -520,6 +631,7 @@ def _opponent_identity(opponent: Opponent) -> tuple[str, str]:
 def _validate_resume(state: SearchState, expected: SearchIdentity) -> None:
     """Name the first identity mismatch instead of accepting a partial resume."""
     checks = (
+        ("certification", state.identity.certified, expected.certified),
         ("manifest sha256", state.identity.manifest_sha256, expected.manifest_sha256),
         ("engine", state.identity.engine, expected.engine),
         ("frontier seeds", state.identity.frontier_seeds, expected.frontier_seeds),
@@ -541,6 +653,7 @@ def _validate_resume(state: SearchState, expected: SearchIdentity) -> None:
             state.identity.strength_weights,
             expected.strength_weights,
         ),
+        ("initial genomes", state.identity.initial_genomes, expected.initial_genomes),
         (
             "evolution config",
             state.identity.evolution_config,
@@ -562,10 +675,74 @@ def _validate_resume_contents(
         range(state.generation)
     ):
         raise ValueError("resume history generations are not contiguous")
+    config = state.identity.evolution_config
+    rng = random.Random(config.seed)
+    parent_genomes = state.identity.initial_genomes
     if state.generation == 0:
         _validate_initial_resume(state, codec, weights)
-        return
-    _validate_evaluated_resume(state, codec, weights)
+    for record in state.history:
+        parent_genomes = _validate_generation_record(
+            record, parent_genomes, state.identity, codec, weights, rng
+        )
+    if state.history:
+        for candidate in state.elites:
+            _validate_resume_candidate(
+                candidate,
+                codec,
+                weights,
+                stage="development",
+                seeds=state.identity.development_seeds,
+            )
+        expected_elites = top_eligible(state.history[-1].developed, count=config.elites)
+        if state.elites != expected_elites:
+            raise ValueError("resume elites differ from the last development ranking")
+    expected_rng_state = _validate_random_state(rng.getstate())
+    if state.rng_state != expected_rng_state:
+        raise ValueError("resume RNG state differs from replayed history")
+
+
+def _validate_generation_record(
+    record: GenerationRecord,
+    parent_genomes: tuple[tuple[float, ...], ...],
+    identity: SearchIdentity,
+    codec: GenomeCodec,
+    weights: StrengthWeights,
+    rng: random.Random,
+) -> tuple[tuple[float, ...], ...]:
+    config = identity.evolution_config
+    expected_spawn = _spawn_population_genomes(parent_genomes, config, rng)
+    actual_spawn = tuple(candidate.genome for candidate in record.screened)
+    if actual_spawn != expected_spawn:
+        raise ValueError("resume spawned population differs from RNG replay")
+    if len(record.screened) != config.population:
+        raise ValueError("resume screening population differs from evolution config")
+    for candidate in record.screened:
+        _validate_resume_candidate(
+            candidate,
+            codec,
+            weights,
+            stage="screening",
+            seeds=identity.screening_seeds,
+        )
+    survivors = top_eligible(record.screened, count=config.elites * 2)
+    for candidate in record.developed:
+        _validate_resume_candidate(
+            candidate,
+            codec,
+            weights,
+            stage="development",
+            seeds=identity.development_seeds,
+        )
+    if tuple(candidate.genome for candidate in record.developed) != tuple(
+        candidate.genome for candidate in survivors
+    ):
+        raise ValueError(
+            "resume development survivor set differs from screening ranking"
+        )
+    parents = top_eligible(record.developed, count=config.elites)
+    if not parents:
+        raise ValueError("resume development contains no eligible parent")
+    return tuple(candidate.genome for candidate in parents)
 
 
 def _validate_initial_resume(
@@ -573,28 +750,12 @@ def _validate_initial_resume(
 ) -> None:
     if state.history or not state.elites:
         raise ValueError("resume generation zero must hold only initial parents")
-    for candidate in state.elites:
-        _validate_resume_candidate(candidate, codec, weights, evaluated=False)
-
-
-def _validate_evaluated_resume(
-    state: SearchState, codec: GenomeCodec, weights: StrengthWeights
-) -> None:
-    config = state.identity.evolution_config
-    if any(len(record.screened) != config.population for record in state.history):
-        raise ValueError("resume screening population differs from evolution config")
-    if any(
-        not 1 <= len(record.developed) <= config.elites * 2 for record in state.history
+    if tuple(candidate.genome for candidate in state.elites) != (
+        state.identity.initial_genomes
     ):
-        raise ValueError("resume development population differs from evolution config")
-    for record in state.history:
-        for candidate in (*record.screened, *record.developed):
-            _validate_resume_candidate(candidate, codec, weights, evaluated=True)
+        raise ValueError("resume initial parents differ from initial genomes")
     for candidate in state.elites:
-        _validate_resume_candidate(candidate, codec, weights, evaluated=True)
-    expected_elites = top_eligible(state.history[-1].developed, count=config.elites)
-    if state.elites != expected_elites:
-        raise ValueError("resume elites differ from the last development ranking")
+        _validate_resume_candidate(candidate, codec, weights, stage="initial", seeds=())
 
 
 def _validate_resume_candidate(
@@ -602,7 +763,8 @@ def _validate_resume_candidate(
     codec: GenomeCodec,
     weights: StrengthWeights,
     *,
-    evaluated: bool,
+    stage: str,
+    seeds: tuple[int, ...],
 ) -> None:
     try:
         decoded = codec.decode(candidate.genome)
@@ -610,16 +772,47 @@ def _validate_resume_candidate(
         raise ValueError("resume candidate genome/config is invalid") from error
     if decoded != candidate.config:
         raise ValueError("resume candidate genome/config do not match")
-    if not evaluated:
-        if (
-            candidate.fitness is not None
-            or candidate.matchup_rates
-            or candidate.failures
-            or candidate.paired_normalized_margin != 0.0
-            or candidate.runtime_seconds != 0.0
-        ):
-            raise ValueError("resume initial parent contains evaluation telemetry")
+    if candidate.stage != stage:
+        raise ValueError(f"resume candidate differs from {stage} stage")
+    if candidate.seeds != seeds:
+        raise ValueError(f"resume candidate differs from {stage} seeds")
+    if stage == "initial":
+        _validate_initial_candidate_telemetry(candidate)
         return
+    _validate_evaluated_candidate(candidate, weights, seeds)
+
+
+def _validate_initial_candidate_telemetry(candidate: CandidateEvaluation) -> None:
+    if (
+        candidate.fitness is not None
+        or candidate.matchup_rates
+        or candidate.matchup_games
+        or candidate.failures
+        or candidate.paired_normalized_margin != 0.0
+    ):
+        raise ValueError("resume initial parent contains evaluation telemetry")
+
+
+def _validate_evaluated_candidate(
+    candidate: CandidateEvaluation,
+    weights: StrengthWeights,
+    seeds: tuple[int, ...],
+) -> None:
+    if set(candidate.matchup_rates) != set(weights.values):
+        raise ValueError("resume candidate matchup names differ from strength weights")
+    if set(candidate.matchup_games) != set(weights.values):
+        raise ValueError(
+            "resume candidate game-count names differ from strength weights"
+        )
+    expected_games = 2 * len(seeds)
+    for name, games in candidate.matchup_games.items():
+        if type(games) is not int or games < 0 or games > expected_games:
+            raise ValueError(f"resume candidate {name} game count is invalid")
+        failed = any(failure.startswith(f"{name}:") for failure in candidate.failures)
+        if not failed and games != expected_games:
+            raise ValueError(
+                f"resume candidate {name} game count must be {expected_games}"
+            )
     if candidate.fitness is None:
         raise ValueError("resume evaluated candidate has no fitness")
     try:
@@ -630,14 +823,8 @@ def _validate_resume_candidate(
         raise ValueError("resume candidate fitness inputs are invalid") from error
     if candidate.fitness != expected:
         raise ValueError("resume candidate fitness differs from its matchups")
-    if (
-        not math.isfinite(candidate.paired_normalized_margin)
-        or not math.isfinite(candidate.runtime_seconds)
-        or candidate.runtime_seconds < 0.0
-    ):
-        raise ValueError(
-            "resume candidate telemetry must be finite and runtime non-negative"
-        )
+    if not math.isfinite(candidate.paired_normalized_margin):
+        raise ValueError("resume candidate normalized margin must be finite")
 
 
 def _write_atomic(output: Path, source: str) -> None:
@@ -659,6 +846,7 @@ def _write_atomic(output: Path, source: str) -> None:
 
 def _identity_payload(identity: SearchIdentity) -> dict[str, object]:
     return {
+        "certified": identity.certified,
         "manifest_sha256": identity.manifest_sha256,
         "engine": identity.engine,
         "frontier_seeds": list(identity.frontier_seeds),
@@ -668,6 +856,7 @@ def _identity_payload(identity: SearchIdentity) -> dict[str, object]:
         "genome_schema_sha256": identity.genome_schema_sha256,
         "league_identity": [list(item) for item in identity.league_identity],
         "strength_weights": [list(item) for item in identity.strength_weights],
+        "initial_genomes": [list(genome) for genome in identity.initial_genomes],
         "evolution_config": asdict(identity.evolution_config),
     }
 
@@ -676,6 +865,7 @@ def _identity_from_payload(value: object) -> SearchIdentity:
     payload = _dictionary(
         value,
         {
+            "certified",
             "manifest_sha256",
             "engine",
             "frontier_seeds",
@@ -685,11 +875,18 @@ def _identity_from_payload(value: object) -> SearchIdentity:
             "genome_schema_sha256",
             "league_identity",
             "strength_weights",
+            "initial_genomes",
             "evolution_config",
         },
         "search identity",
     )
-    manifest_sha256 = _string(payload["manifest_sha256"], "manifest sha256")
+    certified = payload["certified"]
+    if type(certified) is not bool:
+        raise TypeError("certified must be a boolean")
+    manifest_value = payload["manifest_sha256"]
+    manifest_sha256 = (
+        None if manifest_value is None else _string(manifest_value, "manifest sha256")
+    )
     engine = _string(payload["engine"], "engine")
     schema = _string(payload["genome_schema_sha256"], "genome schema sha256")
     league_identity = tuple(
@@ -714,6 +911,8 @@ def _identity_from_payload(value: object) -> SearchIdentity:
     config_payload = _dictionary(
         payload["evolution_config"],
         {
+            "artifact_mode",
+            "manifest_sha256",
             "population",
             "elites",
             "generations",
@@ -721,12 +920,12 @@ def _identity_from_payload(value: object) -> SearchIdentity:
             "seed",
             "workers",
             "engine",
-            "manifest_sha256",
         },
         "evolution config",
     )
     config = EvolutionConfig(**cast(dict[str, Any], config_payload))
     return SearchIdentity(
+        certified=certified,
         manifest_sha256=manifest_sha256,
         engine=engine,
         frontier_seeds=_integer_tuple(payload["frontier_seeds"], "frontier seeds"),
@@ -738,6 +937,13 @@ def _identity_from_payload(value: object) -> SearchIdentity:
         genome_schema_sha256=schema,
         league_identity=league_identity,
         strength_weights=tuple(weights.values.items()),
+        initial_genomes=tuple(
+            tuple(
+                _finite_float(item, "initial genome value")
+                for item in _list(genome, "initial genome")
+            )
+            for genome in _list(payload["initial_genomes"], "initial genomes")
+        ),
         evolution_config=config,
     )
 
@@ -747,7 +953,10 @@ def _candidate_payload(candidate: CandidateEvaluation) -> dict[str, object]:
     return {
         "genome": list(candidate.genome),
         "config": candidate.config.model_dump(mode="json"),
+        "stage": candidate.stage,
+        "seeds": list(candidate.seeds),
         "matchup_rates": dict(candidate.matchup_rates),
+        "matchup_games": dict(candidate.matchup_games),
         "fitness": None
         if fitness is None
         else {
@@ -759,7 +968,6 @@ def _candidate_payload(candidate: CandidateEvaluation) -> dict[str, object]:
         },
         "paired_normalized_margin": candidate.paired_normalized_margin,
         "failures": list(candidate.failures),
-        "runtime_seconds": candidate.runtime_seconds,
     }
 
 
@@ -769,11 +977,13 @@ def _candidate_from_payload(value: object) -> CandidateEvaluation:
         {
             "genome",
             "config",
+            "stage",
+            "seeds",
             "matchup_rates",
+            "matchup_games",
             "fitness",
             "paired_normalized_margin",
             "failures",
-            "runtime_seconds",
         },
         "candidate",
     )
@@ -788,6 +998,11 @@ def _candidate_from_payload(value: object) -> CandidateEvaluation:
         _string(name, "matchup name"): _finite_float(rate, "matchup rate")
         for name, rate in rates_payload.items()
     }
+    games_payload = _dictionary_open(payload["matchup_games"], "matchup games")
+    games = {
+        _string(name, "matchup name"): _integer(value, "matchup games", minimum=0)
+        for name, value in games_payload.items()
+    }
     fitness_value = payload["fitness"]
     fitness = None if fitness_value is None else _fitness_from_payload(fitness_value)
     failures = tuple(
@@ -800,13 +1015,15 @@ def _candidate_from_payload(value: object) -> CandidateEvaluation:
             for item in _list(payload["genome"], "candidate genome")
         ),
         config=config,
+        stage=_string(payload["stage"], "candidate stage"),
+        seeds=_integer_tuple(payload["seeds"], "candidate seeds"),
         matchup_rates=rates,
+        matchup_games=games,
         fitness=fitness,
         paired_normalized_margin=_finite_float(
             payload["paired_normalized_margin"], "paired normalized margin"
         ),
         failures=failures,
-        runtime_seconds=_finite_float(payload["runtime_seconds"], "runtime seconds"),
     )
 
 
