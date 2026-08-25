@@ -11,6 +11,7 @@ from kaggriculture.hybrid.runtime import (
     RuntimeMarketWeights,
     RuntimeOpeningPhase,
 )
+from kaggriculture.hybrid.schema import PHASE_START_DAYS
 
 TARGET_COUNT = Annotated[int, Field(ge=0, le=100)]
 
@@ -56,7 +57,15 @@ class OpeningConfig(BaseModel):
         frozen=True, extra="forbid", allow_inf_nan=False, strict=True
     )
 
-    phases: tuple[OpeningPhaseConfig, ...] = Field(min_length=1)
+    phases: tuple[OpeningPhaseConfig, OpeningPhaseConfig, OpeningPhaseConfig]
+
+    @model_validator(mode="after")
+    def has_the_fixed_genome_schedule(self) -> Self:
+        """Require the exact phase count and position-specific day domains."""
+        for phase, allowed_days in zip(self.phases, PHASE_START_DAYS, strict=True):
+            if phase.start_day not in allowed_days:
+                raise ValueError("phase start_day is outside its fixed position domain")
+        return self
 
 
 class JobWeightsConfig(BaseModel):

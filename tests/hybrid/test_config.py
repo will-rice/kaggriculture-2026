@@ -4,6 +4,8 @@
 import json
 import subprocess
 import sys
+from collections.abc import Callable
+from itertools import product
 from types import MappingProxyType
 from typing import Any
 
@@ -12,6 +14,20 @@ from pydantic import ValidationError
 
 from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.hybrid.runtime import RuntimeConfig
+from kaggriculture.hybrid.schema import PHASE_START_DAYS
+from kaggriculture.search.genome import GenomeCodec
+
+PhasePayload = dict[str, object]
+PhaseSchedule = Callable[[tuple[PhasePayload, ...]], tuple[PhasePayload, ...]]
+
+
+def phase_payloads(*, starts: tuple[int, int, int]) -> tuple[dict[str, Any], ...]:
+    """Return the baseline three phases with independently chosen start days."""
+    phases = HybridConfig.default().model_dump(mode="python")["opening"]["phases"]
+    return tuple(
+        {**phase, "start_day": start}
+        for phase, start in zip(phases, starts, strict=True)
+    )
 
 
 def import_in_fresh_process(module: str) -> set[str]:
@@ -55,15 +71,62 @@ def test_hybrid_config_rejects_invalid_phase_schemas_and_order() -> None:
         HybridConfig.model_validate(payload)
 
     payload = HybridConfig.default().model_dump(mode="python")
-    first = payload["opening"]["phases"][0]
-    payload["opening"]["phases"] = (first, {**first, "start_day": 0})
-    with pytest.raises(ValidationError, match="unique increasing"):
+    phases = payload["opening"]["phases"]
+    payload["opening"]["phases"] = (
+        phases[0],
+        {**phases[1], "start_day": 9},
+        phases[2],
+    )
+    with pytest.raises(ValidationError, match="fixed position domain"):
         HybridConfig.model_validate(payload)
 
     payload = HybridConfig.default().model_dump(mode="python")
     payload["opening"]["phases"][0]["crop_targets"] = (0,)
     with pytest.raises(ValidationError, match="fixed crop schema"):
         HybridConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "phases",
+    (
+        lambda baseline: baseline[:1],
+        lambda baseline: baseline[:2],
+        lambda baseline: (*baseline, {**baseline[-1], "start_day": 29}),
+        lambda baseline: (
+            baseline[0],
+            {**baseline[1], "start_day": 9},
+            baseline[2],
+        ),
+    ),
+)
+def test_hybrid_config_rejects_schedules_outside_the_fixed_genome_schema(
+    phases: PhaseSchedule,
+) -> None:
+    """Reject schedules that the fixed codec previously could not round-trip."""
+    payload = HybridConfig.default().model_dump(mode="python")
+    payload["opening"]["phases"] = phases(payload["opening"]["phases"])
+
+    with pytest.raises(ValidationError):
+        HybridConfig.model_validate(payload)
+
+
+def test_every_authoring_phase_day_in_the_fixed_schema_round_trips() -> None:
+    """Every accepted three-position day combination is genome encodable."""
+    codec = GenomeCodec.default()
+    domains = tuple((days[0], days[-1]) for days in PHASE_START_DAYS)
+    template = HybridConfig.default().model_dump(mode="python")
+
+    for starts in product(*domains):
+        config = HybridConfig.model_validate(
+            {
+                **template,
+                "opening": {
+                    "phases": phase_payloads(starts=(starts[0], starts[1], starts[2]))
+                },
+            }
+        )
+
+        assert codec.decode(codec.encode(config)) == config
 
 
 def test_pydantic_to_runtime_round_trip_is_exact_and_dependency_free() -> None:

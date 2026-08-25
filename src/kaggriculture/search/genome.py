@@ -7,9 +7,8 @@ from typing import Sequence, cast
 
 from kaggriculture.features import ANIMAL_NAMES, CROP_NAMES
 from kaggriculture.hybrid.config import HybridConfig
+from kaggriculture.hybrid.schema import PHASE_START_DAYS
 
-START_DAYS = tuple(range(30))
-PHASE_START_DAYS = (tuple(range(0, 10)), tuple(range(10, 20)), tuple(range(20, 30)))
 HAND_TARGETS = tuple(range(20))
 QUADRANT_TARGETS = tuple(range(1, 6))
 TARGET_COUNTS = tuple(range(101))
