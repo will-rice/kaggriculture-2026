@@ -116,9 +116,10 @@ def build_agent(runtime: RuntimeConfig) -> AgentCallable:
     ) -> dict[str, Any]:
         try:
             seat = int(observation.get("player", 0))
-            return controller.decide(encode_observation(observation, seat))
+            encoded = encode_observation(observation, seat)
         except (KeyError, TypeError, ValueError, IndexError):
             return safe_pass_action()
+        return controller.decide(encoded)
 
     return agent
 

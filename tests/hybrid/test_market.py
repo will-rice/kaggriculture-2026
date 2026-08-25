@@ -63,6 +63,7 @@ def encoded_fixture(
     shed: dict[str, int] | None = None,
     seeds: dict[str, int] | None = None,
     inventory_offsets: dict[str, int] | None = None,
+    prices: dict[str, int] | None = None,
     opponent_tomatoes: int = 0,
     unlocked_shops: list[str] | None = None,
 ) -> EncodedObservation:
@@ -92,6 +93,8 @@ def encoded_fixture(
         inventory = int(MARKET_PARAMS[item]["I0"]) + offset
         observation["market"]["inventory"][item] = inventory
         observation["market"]["prices"][item] = market_price(item, inventory)
+    for item, price in (prices or {}).items():
+        observation["market"]["prices"][item] = price
     return encode_observation(observation, 0)
 
 
@@ -109,17 +112,99 @@ def test_market_preserves_cash_before_buying_and_hiring() -> None:
     assert selected.total_cost <= 50
 
 
-def test_live_price_and_opponent_supply_change_the_sale_ranking() -> None:
-    scarce = encoded_fixture(shed={"TOMATO": 8}, inventory_offsets={"TOMATO": -200})
-    flooded = encoded_fixture(
-        shed={"TOMATO": 8},
-        inventory_offsets={"TOMATO": 800},
-        opponent_tomatoes=8,
+def test_live_price_independently_changes_the_sale_quantity() -> None:
+    low = encoded_fixture(shed={"TOMATO": 12}, prices={"TOMATO": 1})
+    high = encoded_fixture(shed={"TOMATO": 12}, prices={"TOMATO": 120})
+    slot = MARKET_SLOTS.index(("SELL", "TOMATO"))
+    weighted = runtime_config()
+    ignored = replace(weighted, market=replace(weighted.market, live_price=0.0))
+
+    assert (
+        select_market(low, targets_fixture(), weighted).indices[slot]
+        != (select_market(high, targets_fixture(), weighted).indices[slot])
+    )
+    assert (
+        select_market(low, targets_fixture(), ignored).indices[slot]
+        == (select_market(high, targets_fixture(), ignored).indices[slot])
     )
 
-    assert select_market(scarce, targets_fixture(), runtime_config()).indices != (
-        select_market(flooded, targets_fixture(), runtime_config()).indices
+
+def test_market_inventory_independently_changes_the_sale_quantity() -> None:
+    balanced = encoded_fixture(shed={"TOMATO": 12}, prices={"TOMATO": 90})
+    flooded = encoded_fixture(
+        shed={"TOMATO": 12},
+        inventory_offsets={"TOMATO": 800},
+        prices={"TOMATO": 90},
     )
+    slot = MARKET_SLOTS.index(("SELL", "TOMATO"))
+    weighted = runtime_config()
+    ignored = replace(weighted, market=replace(weighted.market, opponent_supply=0.0))
+
+    assert (
+        select_market(balanced, targets_fixture(), weighted).indices[slot]
+        != (select_market(flooded, targets_fixture(), weighted).indices[slot])
+    )
+    assert (
+        select_market(balanced, targets_fixture(), ignored).indices[slot]
+        == (select_market(flooded, targets_fixture(), ignored).indices[slot])
+    )
+
+
+def test_opponent_supply_independently_changes_the_sale_quantity() -> None:
+    absent = encoded_fixture(shed={"TOMATO": 12}, prices={"TOMATO": 90})
+    visible = encoded_fixture(
+        shed={"TOMATO": 12},
+        prices={"TOMATO": 90},
+        opponent_tomatoes=8,
+    )
+    slot = MARKET_SLOTS.index(("SELL", "TOMATO"))
+    weighted = runtime_config()
+    ignored = replace(weighted, market=replace(weighted.market, opponent_supply=0.0))
+
+    assert (
+        select_market(absent, targets_fixture(), weighted).indices[slot]
+        != (select_market(visible, targets_fixture(), weighted).indices[slot])
+    )
+    assert (
+        select_market(absent, targets_fixture(), ignored).indices[slot]
+        == (select_market(visible, targets_fixture(), ignored).indices[slot])
+    )
+
+
+def test_town_demand_independently_changes_the_sale_quantity() -> None:
+    no_shop = encoded_fixture(shed={"TOMATO": 12}, prices={"TOMATO": 1})
+    demanded = encoded_fixture(
+        shed={"TOMATO": 12},
+        prices={"TOMATO": 1},
+        unlocked_shops=["FARMERS_MARKET"],
+    )
+    slot = MARKET_SLOTS.index(("SELL", "TOMATO"))
+    weighted = runtime_config()
+    ignored = replace(weighted, market=replace(weighted.market, town_demand=0.0))
+
+    assert (
+        select_market(no_shop, targets_fixture(), weighted).indices[slot]
+        != (select_market(demanded, targets_fixture(), weighted).indices[slot])
+    )
+    assert (
+        select_market(no_shop, targets_fixture(), ignored).indices[slot]
+        == (select_market(demanded, targets_fixture(), ignored).indices[slot])
+    )
+
+
+def test_product_requirement_adds_reserve_and_consumable_target_support() -> None:
+    encoded = encoded_fixture(money=10_000)
+    selected = select_market(
+        encoded,
+        targets_fixture(
+            animal_deficits={"COW": 1, "GOOSE": 1, "SHEEP": 1},
+            protected_inventory={"WHEAT": 2},
+        ),
+        runtime_config(),
+    )
+
+    wheat_slot = MARKET_SLOTS.index(("BUY_PRODUCT", "WHEAT"))
+    assert QUANTITIES[selected.indices[wheat_slot]] == 5
 
 
 def test_final_liquidation_sells_available_stock_despite_normal_reserves() -> None:

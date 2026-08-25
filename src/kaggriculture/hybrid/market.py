@@ -125,14 +125,13 @@ def _acquisition_need(
     if verb == "BUY_ANIMAL":
         return targets.animal_deficits[item]
     if verb == "BUY_PRODUCT":
-        reserve_need = max(
-            targets.protected_inventory[item] - encoded.shed_count(item), 0
-        )
+        target_support = 0
         if item == "WHEAT":
-            reserve_need = max(reserve_need, sum(targets.animal_deficits.values()))
+            target_support = sum(targets.animal_deficits.values())
         elif item == "FERTILIZER":
-            reserve_need = max(reserve_need, sum(targets.crop_deficits.values()))
-        return reserve_need
+            target_support = sum(targets.crop_deficits.values())
+        required_stock = targets.protected_inventory[item] + target_support
+        return max(required_stock - encoded.shed_count(item), 0)
     return 0
 
 
