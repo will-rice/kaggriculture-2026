@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from kaggriculture.action_codec import QUANTITIES, TRANSFER_OPS, UNIT_OPS
 from kaggriculture.constants import (
     ANIMALS,
     CROPS,
@@ -17,10 +18,7 @@ from kaggriculture.learn.encoding import (
     CARRIED_SCALE,
     IGNORE,
     MAX_UNITS,
-    QUANTITIES,
     SEED_SCALE,
-    TRANSFER_OPS,
-    UNIT_OPS,
 )
 from kaggriculture.learn.rollout import segment_starts
 from kaggriculture.learn.toad.model import (

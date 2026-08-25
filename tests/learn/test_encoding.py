@@ -14,6 +14,8 @@ import pytest
 import torch
 from kaggle_environments.envs.kaggriculture import kaggriculture as engine
 
+import kaggriculture.action_codec as action_codec
+import kaggriculture.learn.encoding as encoding
 from kaggriculture.constants import (
     ANIMALS,
     CROPS,
@@ -170,6 +172,16 @@ def _permit(logits: torch.Tensor) -> torch.Tensor:
     rules alone.
     """
     return torch.ones_like(logits, dtype=torch.bool)
+
+
+def test_action_vocabulary_is_reexported_from_the_canonical_codec() -> None:
+    """Legacy encoding imports retain the exact shared vocabulary objects."""
+    assert encoding.UNIT_OPS is action_codec.UNIT_OPS
+    assert encoding.TRANSFER_OPS is action_codec.TRANSFER_OPS
+    assert encoding.QUANTITIES is action_codec.QUANTITIES
+    assert encoding.MARKET_SLOTS is action_codec.MARKET_SLOTS
+    assert encoding.HIRE_SLOT == action_codec.HIRE_SLOT
+    assert encoding.LAND_SLOT == action_codec.LAND_SLOT
 
 
 def test_board_has_the_declared_shape_and_batch_dimension() -> None:

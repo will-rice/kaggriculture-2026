@@ -66,6 +66,7 @@ from typing import Any, Mapping, cast
 
 import torch
 
+from kaggriculture import action_codec
 from kaggriculture.constants import (
     ANIMALS,
     BOARD_SIZE,
@@ -73,8 +74,6 @@ from kaggriculture.constants import (
     EPISODE_STEPS,
     LAND_ORDER,
     MARKET_PARAMS,
-    MAX_MARKET_ORDERS_PER_TURN,
-    PRODUCTS,
     SEASON_DAYS,
     SHED_CAPACITY,
     SHOPS,
@@ -84,14 +83,22 @@ from kaggriculture.observation import Tile
 
 BOARD = BOARD_SIZE
 
-CROP_NAMES = sorted(CROPS)
-# The shed holds bought animals as well as produce -- BUY_ANIMAL puts a COW
-# there and it stays until a unit PICKUPs and PLACEs it. Encoding only the
-# products left that middle step invisible, so the policy could buy an animal
-# and then have no way to see that it owned one.
-SHED_NAMES = sorted(set(PRODUCTS) | set(ANIMALS))
-ANIMAL_NAMES = sorted(ANIMALS)
-PRODUCT_NAMES = sorted(PRODUCTS)
+# Re-export the shared action boundary during the compatibility release.
+ANIMAL_NAMES = action_codec.ANIMAL_NAMES
+CROP_NAMES = action_codec.CROP_NAMES
+HIRE_SLOT = action_codec.HIRE_SLOT
+ITEM_VERBS = action_codec.ITEM_VERBS
+LAND_SLOT = action_codec.LAND_SLOT
+MARKET_SLOTS = action_codec.MARKET_SLOTS
+MAX_ORDERS = action_codec.MAX_ORDERS
+MAX_TRANSFER = action_codec.MAX_TRANSFER
+PRODUCT_NAMES = action_codec.PRODUCT_NAMES
+QUANTITIES = action_codec.QUANTITIES
+SHED_NAMES = action_codec.SHED_NAMES
+TRANSFER_OPS = action_codec.TRANSFER_OPS
+UNIT_OPS = action_codec.UNIT_OPS
+bucket_of = action_codec.bucket_of
+quantity_of = action_codec.quantity_of
 SHOP_NAMES = sorted(SHOPS)
 
 # The main farmer plus enough hands for a full day's hiring. There is no
@@ -613,98 +620,6 @@ def encode_scalars(observation: Mapping[str, Any], seat: int) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32).reshape(1, SCALARS)
 
 
-# One label per distinct decision. PLANT carries its crop because planting melon
-# and planting wheat are different choices, not one op with a detail attached --
-# the crop is the decision that collapsed our own agent's price this morning.
-#
-# PICKUP and PLACE carry their item for a harder reason than that: without one
-# they cannot be played at all. `_apply_unit_action` returns on `len(action) < 2`
-# for both, so a bare ["PICKUP"] is a silent no-op every time it is emitted, and
-# with PLACE dead an animal bought into the shed can never reach a structure --
-# a whole branch of the game was unreachable to a learned policy. They were bare
-# here for exactly as long as nobody checked what the engine did with them.
-#
-# The item list is `SHED_NAMES`, derived from the engine's own `PRODUCTS` and
-# `ANIMALS` tables rather than from what the corpus happens to play. The engine
-# gates neither verb on an item catalogue: PICKUP reads `private["shed"]` and
-# PLACE reads the unit's inventory, and both mappings are keyed by every product
-# and every animal (`_new_private`'s shed is that union, and an animal reaches an
-# inventory only by being picked up out of it). Building this from a two-archive
-# sample instead would have omitted CARROT, EGG and TOMATO, which the sample
-# never places and the engine accepts -- the same way a hand-written list has
-# already dropped an engine verb twice in this repo.
-#
-# DROP is here even though the engine's own JSON action spec never mentions it:
-# the spec text lists seventeen ops, but `_apply_unit_action` in the engine's
-# source implements an eighteenth, DROP, and this project's own policies emit
-# it routinely. The docs are not authoritative; the engine's code is. It stays
-# item-less because the engine's DROP takes no item: it empties the whole
-# inventory, and all 2,267 of the corpus's DROPs are one element long.
-UNIT_OPS: tuple[str, ...] = (
-    (
-        "PASS",
-        "NORTH",
-        "SOUTH",
-        "EAST",
-        "WEST",
-        "WATER",
-        "HARVEST",
-        "DIG",
-        "FEED",
-        "CARE",
-        "COLLECT_FERTILIZER",
-        "FERTILIZE",
-        "BUILD_COOP",
-        "BUILD_PASTURE",
-        "DROP",
-    )
-    + tuple(f"PLANT:{crop}" for crop in CROP_NAMES)
-    + tuple(f"PICKUP:{item}" for item in SHED_NAMES)
-    + tuple(f"PLACE:{item}" for item in SHED_NAMES)
-)
-
-# The verbs whose label is ``VERB:ITEM`` rather than a bare verb. Named once so
-# `_label` and `_op` cannot disagree about which of them carry an item -- a
-# verb this set claims and `UNIT_OPS` does not would raise on the first corpus
-# row, but the reverse is silent: the op would be labelled by its bare verb,
-# which is not in the vocabulary either, and the two failures are only the same
-# because both lists come from here.
-ITEM_VERBS = frozenset({"PLANT", "PICKUP", "PLACE"})
-
-# Which vocabulary indices spend a quantity, one flag per `UNIT_OPS` entry.
-#
-# The engine reads `action[2]` for PICKUP and for PLACE and for nothing else --
-# `_apply_unit_action` clamps a PICKUP to what the shed holds and a shed-bound
-# PLACE to what the unit carries and the shed has room for, while every other
-# verb ignores a third element entirely. So this is the whole set of ops a
-# sampled quantity may reach, and it is derived from the vocabulary rather than
-# written out, because the two lists drifting apart is silent in both
-# directions: an op wrongly flagged puts a count on an action the engine reads
-# as something else, and an op wrongly unflagged drops a decision the policy
-# was scored on.
-#
-# The consumers materialise this as a lookup tensor indexed by the sampled op.
-# `transfer_slots` does that for the learning path; the simulator's collection
-# loop does it through `sim.tensors.tensor_constant` instead, because a CUDA
-# graph capture refuses the per-call host-to-device copy this one costs.
-TRANSFER_OPS: tuple[bool, ...] = tuple(
-    name.startswith(("PICKUP:", "PLACE:")) for name in UNIT_OPS
-)
-
-# The largest transfer the quantity head may ask for.
-#
-# Not a legality bound -- the engine clamps whatever it is given, so nothing
-# here can be *illegal* -- but a sampling range. `QUANTITIES` is exact up to 12
-# and coarse above it (16, 24, 40, 64, ...), and those tail buckets exist for
-# market orders, where a single SELL really does move eighty sacks. A unit's
-# hands are not that: measured across all seven archives (three episodes each,
-# 11,721 PICKUPs), 10,660 took strictly less than the shed held and the
-# item-dependent modes are 1 to 3 -- WHEAT 2 (78%), FERTILIZER 3 (59%), COW 1
-# (80%). Twelve is the top of the exact range and is already four times the
-# largest mode, so every bucket above it would be probability mass spent on a
-# request the engine would clamp back down.
-MAX_TRANSFER = 12
-
 # torch's cross entropy ignores this index, so padded units contribute no loss.
 IGNORE = -100
 
@@ -931,41 +846,13 @@ def decode_units(
     legal_quantity = quantity_logits[0, :units].masked_fill(
         ~quantity_mask[0, :units], -torch.inf
     )
-    ops = [
-        _op(int(label), quantity_of(int(bucket)))
-        for label, bucket in zip(
-            legal.argmax(dim=-1), legal_quantity.argmax(dim=-1), strict=True
-        )
-    ]
-    return {"farmer": ops[0], "hands": ops[1:], "market": []}
-
-
-def _op(label: int, quantity: int) -> list[Any]:
-    """Return the op list for one vocabulary index and one sampled quantity.
-
-    ``PLANT`` is emitted at arity 2 because ``_apply_unit_action`` never reads
-    ``action[2]`` for it -- a crop is planted one tile at a time. ``PICKUP``
-    and ``PLACE`` are emitted at arity 3 carrying ``quantity``, the only two
-    verbs whose ``action[2]`` the engine reads (``TRANSFER_OPS``).
-
-    The quantity is emitted explicitly rather than left to the engine's own
-    two-element default of 1: a default is the engine's to change, and an
-    arity-2 action would silently mean something else if it did.
-
-    Args:
-        label: An index into ``UNIT_OPS``.
-        quantity: The count a transfer asks for, from ``quantity_of`` on the
-            sampled bucket. Ignored for every other verb.
-
-    Returns:
-        The op list, at the arity that verb's engine branch reads.
-    """
-    verb, _, item = UNIT_OPS[label].partition(":")
-    if not item:
-        return [verb]
-    if verb == "PLANT":
-        return [verb, item]
-    return [verb, item, quantity]
+    selected = action_codec.SelectedActions(
+        tuple(int(value) for value in legal.argmax(dim=-1)),
+        tuple(int(value) for value in legal_quantity.argmax(dim=-1)),
+        tuple(0 for _ in range(len(MARKET_SLOTS) + 2)),
+    )
+    decoded = action_codec.decode_selected(selected)
+    return {"farmer": decoded["farmer"], "hands": decoded["hands"], "market": []}
 
 
 def transfer_slots(op_indices: torch.Tensor) -> torch.Tensor:
@@ -1018,30 +905,6 @@ def transfer_slots(op_indices: torch.Tensor) -> torch.Tensor:
 # `test_buy_product_s_item_gate_matches_the_engine_exactly`, which parses the
 # engine's source at test time, in CI, where a mismatch fails loudly and
 # someone can fix it.
-_BUY_PRODUCT_ITEMS = ("FERTILIZER", "WHEAT")
-
-MARKET_SLOTS: tuple[tuple[str, str], ...] = (
-    tuple(("SELL", item) for item in PRODUCT_NAMES)
-    + tuple(("BUY_SEED", item) for item in CROP_NAMES)
-    + tuple(("BUY_PRODUCT", item) for item in _BUY_PRODUCT_ITEMS)
-    + tuple(("BUY_ANIMAL", item) for item in ANIMAL_NAMES)
-)
-
-# HIRE and BUY_LAND are atomic engine ops (`_parse_order` returns them with no
-# item or quantity), so they get their own slots after the (verb, item) pairs
-# rather than a row each in MARKET_SLOTS.
-HIRE_SLOT = len(MARKET_SLOTS)
-LAND_SLOT = len(MARKET_SLOTS) + 1
-
-# The engine truncates a turn's market orders to `maxMarketOrdersPerTurn`
-# before processing them (`_process_market`: `queues.append(q[:max_orders])`),
-# reading it from the environment configuration with a default of 10. The
-# corpus never configures it away from that default, and hits the cap 903
-# times -- more often than it emits exactly 9 orders -- so it is a real,
-# frequently-binding limit on how many orders a turn can carry, not a
-# theoretical one.
-MAX_ORDERS = MAX_MARKET_ORDERS_PER_TURN
-
 # The first thirteen buckets are exact counts: 93.5% of orders in the corpus
 # are 12 or fewer, and lumping that dense range into ranges would blur most of
 # the distribution the model has to predict. The next four buckets summarize
@@ -1062,94 +925,6 @@ MAX_ORDERS = MAX_MARKET_ORDERS_PER_TURN
 # up from the largest *requested* quantities seen in top play (BUY_SEED is not
 # shed-bound, so a request that large is not structurally impossible even
 # though this scan's fills never reached it).
-QUANTITIES: tuple[int, ...] = (
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    16,
-    24,
-    40,
-    64,
-    80,
-    100,
-    130,
-    165,
-)
-
-# The inclusive upper bound of each bounded tail bucket (index 13 through 19);
-# the last tail bucket (index 20, representative 165) is unbounded above.
-# These are not derivable from QUANTITIES itself -- the representative
-# quantities step by a roughly-1.3x progression while the ranges they stand
-# for widen at their own rate (8, 12, 20, 12, 16, 20, 30, then open-ended), so
-# "the next representative minus one" is not this scheme; the ranges are
-# their own design choice and are written out accordingly.
-_TAIL_BUCKET_MAX = (20, 32, 52, 64, 80, 100, 130)
-
-if len(_TAIL_BUCKET_MAX) != len(QUANTITIES) - 14:
-    raise AssertionError(
-        f"len(_TAIL_BUCKET_MAX) ({len(_TAIL_BUCKET_MAX)}) != len(QUANTITIES) "
-        f"- 14 ({len(QUANTITIES) - 14}): bucket_of's tail loop falls back to "
-        "len(QUANTITIES) - 1 for anything past the last bound in "
-        "_TAIL_BUCKET_MAX, so an appended QUANTITIES bucket with no matching "
-        "entry here would silently reroute everything above 130 into it "
-        "instead of the bucket it was meant to distinguish"
-    )
-
-if MAX_TRANSFER not in QUANTITIES:
-    raise AssertionError(
-        f"MAX_TRANSFER ({MAX_TRANSFER}) is not a value in QUANTITIES: "
-        "learn.mask.unit_quantity_mask and sim.legality._quantity_mask both "
-        "gate on `1 <= quantity <= MAX_TRANSFER for quantity in QUANTITIES`, "
-        "so a MAX_TRANSFER that falls between two QUANTITIES entries changes "
-        "neither mask and would silently disagree with itself"
-    )
-
-
-def bucket_of(n: int) -> int:
-    """Return the bucket index that quantity ``n`` falls into.
-
-    The first thirteen buckets are exact: bucket ``k`` is quantity ``k``
-    itself, for ``k`` up to 12. Past that, a quantity falls into whichever
-    bounded tail range in ``_TAIL_BUCKET_MAX`` contains it, or the open-ended
-    166+ bucket if it exceeds all of them.
-
-    Args:
-        n: A non-negative quantity, possibly already summed across repeated
-            orders for the same (verb, item) pair.
-
-    Returns:
-        An index into ``QUANTITIES``.
-    """
-    if n <= 12:
-        return n
-    for offset, upper in enumerate(_TAIL_BUCKET_MAX):
-        if n <= upper:
-            return 13 + offset
-    return len(QUANTITIES) - 1
-
-
-def quantity_of(bucket: int) -> int:
-    """Return the quantity one bucket index represents.
-
-    Args:
-        bucket: An index into ``QUANTITIES``, typically an argmaxed logit.
-
-    Returns:
-        ``QUANTITIES[bucket]``.
-    """
-    return QUANTITIES[bucket]
-
-
 def encode_market(action: Mapping[str, Any]) -> torch.Tensor:
     """Return one bucketed label per market slot.
 
@@ -1241,12 +1016,4 @@ def decode_market(logits: torch.Tensor, mask: torch.Tensor) -> list[list[Any]]:
         A list of order lists, e.g. ``["SELL", "WHEAT", 4]`` or ``["HIRE"]``.
     """
     buckets = logits[0].masked_fill(~mask[0], -torch.inf).argmax(dim=-1)
-    orders: list[list[Any]] = []
-    for slot, (verb, item) in enumerate(MARKET_SLOTS):
-        bucket = int(buckets[slot].item())
-        if bucket != 0:
-            orders.append([verb, item, quantity_of(bucket)])
-    orders.extend([["HIRE"]] * quantity_of(int(buckets[HIRE_SLOT].item())))
-    if int(buckets[LAND_SLOT].item()) != 0:
-        orders.append(["BUY_LAND"])
-    return orders[:MAX_ORDERS]
+    return action_codec.market_orders_of(tuple(int(bucket) for bucket in buckets))

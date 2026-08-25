@@ -72,6 +72,16 @@ from typing import Any, Mapping
 
 import torch
 
+from kaggriculture.action_codec import (
+    HIRE_SLOT,
+    LAND_SLOT,
+    MARKET_SLOTS,
+    MAX_ORDERS,
+    MAX_TRANSFER,
+    QUANTITIES,
+    UNIT_OPS,
+    quantity_of,
+)
 from kaggriculture.constants import (
     ANIMALS,
     BOARD_SIZE,
@@ -86,17 +96,9 @@ from kaggriculture.constants import (
 )
 from kaggriculture.learn.encoding import (
     CROP_NAMES,
-    HIRE_SLOT,
-    LAND_SLOT,
-    MARKET_SLOTS,
-    MAX_ORDERS,
-    MAX_TRANSFER,
     MAX_UNITS,
-    QUANTITIES,
     SHED_NAMES,
-    UNIT_OPS,
     TooManyUnitsError,
-    quantity_of,
     unit_count,
 )
 from kaggriculture.observation import Tile
