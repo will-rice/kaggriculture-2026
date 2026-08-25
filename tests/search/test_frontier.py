@@ -13,6 +13,7 @@ from kaggriculture.search.frontier import (
     rank_frontier,
     verify_frontier,
 )
+from kaggriculture.search.scripts import frontier_round_robin
 
 
 @pytest.fixture
@@ -157,3 +158,85 @@ def test_rank_frontier_plays_each_unordered_pair_once(
     assert calls == [("a", ("b",)), ("a", ("c",)), ("b", ("c",))]
     assert report.rows[0].games == 4
     assert {row.name: row.matchups for row in report.rows}["b"]["a"] == 0.5
+
+
+def test_rank_frontier_serializes_pair_margins_failures_and_runtime(
+    monkeypatch: pytest.MonkeyPatch, verified_frontier: VerifiedFrontier
+) -> None:
+    """The field report retains diagnostics needed to audit a noisy frontier run."""
+
+    class MeasuredScores(list[float]):
+        margins = (120, -20)
+        failures = ("seat zero timeout",)
+        runtime_seconds = 0.125
+
+    monkeypatch.setattr(
+        frontier.arena,
+        "outcomes",
+        lambda candidate, league, seeds, workers: MeasuredScores([1.0, 0.5]),
+    )
+
+    report = rank_frontier(verified_frontier, seeds=(11,), workers=1)
+    matchup = report.rows[0].matchup_results[0]
+
+    assert matchup.paired_margin == pytest.approx(50.0)
+    assert matchup.failures == ("seat zero timeout",)
+    assert matchup.runtime_seconds == pytest.approx(0.125)
+    assert report.rows[0].paired_margin == pytest.approx(50.0)
+    assert report.failures == ("a vs b: seat zero timeout",)
+    assert report.runtime_seconds == pytest.approx(0.125)
+
+
+def test_verify_frontier_rejects_a_manifest_for_another_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sources measured under one engine must not silently run under another."""
+    source = tmp_path / "agent.py"
+    source.write_text("def agent(obs, config=None): return {}\n")
+    manifest = FrontierManifest(
+        engine="1.32.7",
+        artifacts=(
+            FrontierArtifact(
+                name="agent",
+                provenance="test fixture",
+                relative_path=Path("agent.py"),
+                sha256=frontier.hashlib.sha256(source.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+    path = tmp_path / "manifest.json"
+    path.write_text(manifest.model_dump_json())
+    monkeypatch.setattr(frontier.kaggle_environments, "__version__", "1.32.8")
+
+    with pytest.raises(FrontierIntegrityError, match="engine 1.32.7.*1.32.8"):
+        verify_frontier(path, tmp_path)
+
+
+def test_round_robin_cli_lowers_its_own_cpu_priority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A direct CLI invocation protects the active training job by default."""
+    output = tmp_path / "report.json"
+    lowered: list[int] = []
+    monkeypatch.setattr(frontier_round_robin.os, "nice", lowered.append)
+    monkeypatch.setattr(frontier_round_robin, "verify_frontier", lambda *_: object())
+    monkeypatch.setattr(
+        frontier_round_robin,
+        "rank_frontier",
+        lambda *_: frontier.FrontierReport(
+            engine="1.32.7",
+            seeds=(),
+            frontier_name="a",
+            failures=(),
+            runtime_seconds=0.0,
+            rows=(),
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["frontier_round_robin", "--output", str(output)],
+    )
+
+    frontier_round_robin.main()
+
+    assert lowered == [10]

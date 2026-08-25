@@ -18,6 +18,7 @@ plain strings, both of which pickle without help.
 
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from time import perf_counter
 from typing import Any
 
 from kaggle_environments import make
@@ -31,6 +32,15 @@ _Configuration = Mapping[str, Any] | None
 _Agent = Callable[[_Observation, _Configuration], _Action]
 
 Opponent = Route | str
+
+
+class OutcomeScores(list[float]):
+    """Win points with the paired bank margins and duration that produced them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.margins: list[int] = []
+        self.runtime_seconds = 0.0
 
 
 def play(
@@ -89,7 +99,8 @@ def outcomes(
         zero, then candidate in seat one). Each league member contributes
         ``2 * len(seeds)`` consecutive entries.
     """
-    scores: list[float] = []
+    started = perf_counter()
+    scores = OutcomeScores()
     for _, opponent in league.items():
         first = play(candidate, opponent, seeds, workers)
         second = play(opponent, candidate, seeds, workers)
@@ -98,6 +109,9 @@ def outcomes(
         ):
             scores.append(_win(ours_first, theirs_first))
             scores.append(_win(ours_second, theirs_second))
+            scores.margins.append(ours_first - theirs_first)
+            scores.margins.append(ours_second - theirs_second)
+    scores.runtime_seconds = perf_counter() - started
     return scores
 
 

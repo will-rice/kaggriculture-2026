@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 
@@ -29,6 +30,7 @@ def main() -> None:
     args = parser().parse_args()
     if not 1 <= args.workers <= 16:
         raise SystemExit("--workers must be between 1 and 16 while Toad is running")
+    os.nice(10)
     verified = verify_frontier(args.manifest, args.artifact_root)
     report = rank_frontier(verified, FRONTIER_SEEDS, args.workers)
     args.output.parent.mkdir(parents=True, exist_ok=True)

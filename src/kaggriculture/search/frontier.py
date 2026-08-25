@@ -6,8 +6,10 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Self
 
+import kaggle_environments
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -84,6 +86,9 @@ class FrontierMatchup:
     wins: int
     draws: int
     losses: int
+    paired_margin: float
+    failures: tuple[str, ...]
+    runtime_seconds: float
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,9 @@ class FrontierRow:
     games: int
     field_win_points: float
     worst_matchup_win_points: float
+    paired_margin: float
+    failures: tuple[str, ...]
+    runtime_seconds: float
     matchups: Mapping[str, float]
     matchup_results: tuple[FrontierMatchup, ...]
 
@@ -105,12 +113,19 @@ class FrontierReport:
     engine: str
     seeds: tuple[int, ...]
     frontier_name: str
+    failures: tuple[str, ...]
+    runtime_seconds: float
     rows: tuple[FrontierRow, ...]
 
 
 def verify_frontier(manifest_path: Path, artifact_root: Path) -> VerifiedFrontier:
     """Load a manifest only when every runnable source has its declared digest."""
     manifest = FrontierManifest.model_validate_json(manifest_path.read_text())
+    installed_engine = kaggle_environments.__version__
+    if manifest.engine != installed_engine:
+        raise FrontierIntegrityError(
+            f"manifest engine {manifest.engine} != installed engine {installed_engine}"
+        )
     root = artifact_root.resolve()
     resolved: dict[str, str] = {}
     for artifact in manifest.artifacts:
@@ -138,24 +153,55 @@ def rank_frontier(
     seed_tuple = tuple(int(seed) for seed in seeds)
     names = tuple(frontier.opponents)
     matchup_results: dict[str, list[FrontierMatchup]] = {name: [] for name in names}
+    report_failures: list[str] = []
+    report_runtime_seconds = 0.0
     games_per_matchup = 2 * len(seed_tuple)
     for candidate_index, name in enumerate(names):
         candidate = frontier.opponents[name]
         for opponent_name in names[candidate_index + 1 :]:
-            scores = arena.outcomes(
-                candidate,
-                {opponent_name: frontier.opponents[opponent_name]},
-                seed_tuple,
-                workers,
-            )
+            started = perf_counter()
+            try:
+                scores = arena.outcomes(
+                    candidate,
+                    {opponent_name: frontier.opponents[opponent_name]},
+                    seed_tuple,
+                    workers,
+                )
+                failures = tuple(getattr(scores, "failures", ()))
+                runtime_seconds = getattr(
+                    scores, "runtime_seconds", perf_counter() - started
+                )
+                margins = tuple(getattr(scores, "margins", (0,) * len(scores)))
+            except Exception as error:
+                scores = [0.0] * games_per_matchup
+                margins = (0,) * games_per_matchup
+                failures = (f"{type(error).__name__}: {error}",)
+                runtime_seconds = perf_counter() - started
             if len(scores) != games_per_matchup:
                 raise FrontierIntegrityError(
                     f"{name} vs {opponent_name}: arena returned {len(scores)} scores "
                     f"for {games_per_matchup} games"
                 )
-            matchup_results[name].append(_matchup(opponent_name, scores))
+            if len(margins) != games_per_matchup:
+                raise FrontierIntegrityError(
+                    f"{name} vs {opponent_name}: arena returned {len(margins)} margins "
+                    f"for {games_per_matchup} games"
+                )
+            report_runtime_seconds += runtime_seconds
+            report_failures.extend(
+                f"{name} vs {opponent_name}: {failure}" for failure in failures
+            )
+            matchup_results[name].append(
+                _matchup(opponent_name, scores, margins, failures, runtime_seconds)
+            )
             matchup_results[opponent_name].append(
-                _matchup(name, tuple(1.0 - score for score in scores))
+                _matchup(
+                    name,
+                    tuple(1.0 - score for score in scores),
+                    tuple(-margin for margin in margins),
+                    failures,
+                    runtime_seconds,
+                )
             )
     rows: list[FrontierRow] = []
     for name in names:
@@ -168,12 +214,25 @@ def rank_frontier(
             else 0.0
         )
         worst_points = min(matchups.values(), default=0.0)
+        paired_margin = (
+            sum(result.paired_margin * result.games for result in results) / games
+            if games
+            else 0.0
+        )
+        failures = tuple(
+            f"vs {result.opponent}: {failure}"
+            for result in results
+            for failure in result.failures
+        )
         rows.append(
             FrontierRow(
                 name=name,
                 games=games,
                 field_win_points=field_points,
                 worst_matchup_win_points=worst_points,
+                paired_margin=paired_margin,
+                failures=failures,
+                runtime_seconds=sum(result.runtime_seconds for result in results),
                 matchups=matchups,
                 matchup_results=results,
             )
@@ -194,11 +253,19 @@ def rank_frontier(
         engine=frontier.engine,
         seeds=seed_tuple,
         frontier_name=ordered[0].name,
+        failures=tuple(report_failures),
+        runtime_seconds=report_runtime_seconds,
         rows=ordered,
     )
 
 
-def _matchup(opponent: str, scores: Sequence[float]) -> FrontierMatchup:
+def _matchup(
+    opponent: str,
+    scores: Sequence[float],
+    margins: Sequence[int],
+    failures: tuple[str, ...],
+    runtime_seconds: float,
+) -> FrontierMatchup:
     """Summarize one flat, seat-swapped block returned by ``arena.outcomes``."""
     return FrontierMatchup(
         opponent=opponent,
@@ -207,4 +274,7 @@ def _matchup(opponent: str, scores: Sequence[float]) -> FrontierMatchup:
         wins=sum(score == 1.0 for score in scores),
         draws=sum(score == 0.5 for score in scores),
         losses=sum(score == 0.0 for score in scores),
+        paired_margin=sum(margins) / len(margins) if margins else 0.0,
+        failures=failures,
+        runtime_seconds=runtime_seconds,
     )
