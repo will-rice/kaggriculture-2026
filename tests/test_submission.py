@@ -1,5 +1,8 @@
 """Tests for the artefact that actually gets uploaded."""
 
+import os
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -77,6 +80,29 @@ def test_the_submission_ships_nothing_that_needs_torch(tmp_path: Path) -> None:
 
     assert not [name for name in names if "/learn/" in name]
     assert not [name for name in names if name.endswith(".pt")]
+
+
+def test_hybrid_policy_imports_without_training_or_authoring_dependencies() -> None:
+    """The development policy stays safe to package before it is served."""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = "src"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import kaggriculture.hybrid.policy; "
+            "assert 'torch' not in sys.modules; "
+            "assert 'pydantic' not in sys.modules; "
+            "assert 'kaggriculture.search' not in sys.modules; "
+            "assert 'kaggriculture.economic_policy' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_the_submission_carries_the_prototype_store(tmp_path: Path) -> None:
