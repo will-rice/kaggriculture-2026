@@ -58,7 +58,7 @@ def play(
 
 
 def outcomes(
-    candidate: Route,
+    candidate: Opponent,
     league: Mapping[str, Opponent],
     seeds: Sequence[int],
     workers: int | None = None,
@@ -126,7 +126,7 @@ def summarize(
 
 
 def evaluate(
-    candidate: Route,
+    candidate: Opponent,
     league: Mapping[str, Opponent],
     seeds: Sequence[int],
     workers: int | None = None,

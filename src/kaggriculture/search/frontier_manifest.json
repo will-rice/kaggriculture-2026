@@ -1,0 +1,115 @@
+{
+  "engine": "1.32.7",
+  "artifacts": [
+    {
+      "name": "kaito_v27",
+      "source_url": "https://www.kaggle.com/code/kaitofukami/25-27-strict-future-v27-midgame-meta-reset",
+      "notebook_version": 4,
+      "historical_score": 3090.1,
+      "provenance": "Kaggle scriptVersionId 341355723, source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v004__scriptVersionId-341355723/runnable.py",
+      "sha256": "f48c21166eac68d1b05a401f04f94a2eb6154e65415af64893672365ff33c7b8",
+      "archive_sha256": "147a315546192376f4d29548d75ff86b233c3dd4fbcfc28cd04b01bd94d217b6"
+    },
+    {
+      "name": "kaito_v45",
+      "source_url": "https://www.kaggle.com/code/kaitofukami/40-40-early-floor-39-46-top-10-v48-fast-routes",
+      "notebook_version": 2,
+      "historical_score": 3009.0,
+      "provenance": "Kaggle scriptVersionId 341206423, source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v002__scriptVersionId-341206423/runnable.py",
+      "sha256": "9bdfbafb6755067182d88ce594fd46fb1d712713ffd6931e83d5d50e84bc6fb2",
+      "archive_sha256": "7b49446365b106ab10ec72d998713f0fa4739bc1f38133aaa792c15258eb17f3"
+    },
+    {
+      "name": "kaito_v43",
+      "source_url": "https://www.kaggle.com/code/kaitofukami/103-128-fresh-public-v43-sparse-shop-hybrid",
+      "notebook_version": 13,
+      "historical_score": 2882.0,
+      "provenance": "Kaggle scriptVersionId 344404785, exact v43 scored lineage identified from Kaggle version metadata; source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v013__scriptVersionId-344404785/runnable.py",
+      "sha256": "69f06a802b62aa08f28705dab5728eb924bb6a7c23ffe0164f65b104cc3dadf3",
+      "archive_sha256": "b01da7162bcc10c296ed1eba2489ce46f70a9d520d55ee1ef4d114ecb341c7b8"
+    },
+    {
+      "name": "kaito_v48",
+      "source_url": "https://www.kaggle.com/code/kaitofukami/40-40-early-floor-39-46-top-10-v48-fast-routes",
+      "notebook_version": 8,
+      "historical_score": 2270.4,
+      "provenance": "Kaggle scriptVersionId 344712611, source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v008__scriptVersionId-344712611/runnable.py",
+      "sha256": "dadee25a9840313218384208c53b2c4752f82c3209cc654632e0b96c65e2664a",
+      "archive_sha256": "55827b7ba536967ae89779cebcbdfc44511cefe935c8f157e7a98c4f1f70580f"
+    },
+    {
+      "name": "boatlee_v14_public",
+      "source_url": "https://www.kaggle.com/code/boatlee/84-84-base-public-holdout-v14-clone-preemption",
+      "notebook_version": 4,
+      "historical_score": 2844.1,
+      "provenance": "Kaggle scriptVersionId 340940337, source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v004__scriptVersionId-340940337/runnable.py",
+      "sha256": "a7f827b9438885b34b7fd5bf8165458a72f8bb83031a288dd4640f21ade3294b",
+      "archive_sha256": "87e10ad0d2c6f310326bcd39ce731a1fb124fdfe4057e413202edba648c0a51b"
+    },
+    {
+      "name": "boatlee_v16",
+      "source_url": "https://www.kaggle.com/code/boatlee/v16-rc5-high-score-8c-4s-premium-market-lead",
+      "notebook_version": 2,
+      "historical_score": 2913.3,
+      "provenance": "Kaggle scriptVersionId 341905759, source.ipynb archived 2026-08-25; Jupyter %%writefile main.py body copied byte-for-byte to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v002__scriptVersionId-341905759/runnable.py",
+      "sha256": "f029fa0cb66a9eb509afbe44e3f59b800332d0419db91607183410e4089c4d19",
+      "archive_sha256": "4d036970799c077a687e9a6479b8f4edfecc02582ed45bc38dd9971e7a8f21da"
+    },
+    {
+      "name": "boatlee_v20",
+      "source_url": "https://www.kaggle.com/code/boatlee/v20-adaptive-r1-multi-route-agent",
+      "notebook_version": 1,
+      "historical_score": 2578.2,
+      "provenance": "Kaggle scriptVersionId 342519518, source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v001__scriptVersionId-342519518/runnable.py",
+      "sha256": "8ac34abce129cf5c9456776c90edf7d2233b3a280bbdcf7622628825ef3669a0",
+      "archive_sha256": "93d779240ce00a2563711f0305a13d902e7782becdd61889825e8445852b8307"
+    },
+    {
+      "name": "boatlee_v21",
+      "source_url": "https://www.kaggle.com/code/boatlee/v21-r1-public-state-route-portfolio",
+      "notebook_version": 2,
+      "historical_score": 2467.9,
+      "provenance": "Kaggle scriptVersionId 343964116, source.ipynb archived 2026-08-25; whitelist-only static base64/base85+zlib payload extraction to runnable.py; get_last_callable pending explicit execution approval.",
+      "relative_path": "v002__scriptVersionId-343964116/runnable.py",
+      "sha256": "c6f96a8521dc9aa369b6f27e5b36b9d481e5c1688f50c8ca215c3bb53f1f9eb8",
+      "archive_sha256": "67395d406ce62987da564698ee1dfec2bad84f28330f7276f0dd5aeb010f90e5"
+    },
+    {
+      "name": "economic_policy",
+      "source_url": null,
+      "notebook_version": null,
+      "historical_score": null,
+      "provenance": "Repository source src/kaggriculture/economic_policy.py copied byte-for-byte into the untracked local artifact archive on 2026-08-25.",
+      "relative_path": "local/economic_policy.py",
+      "sha256": "8fd069fddbaea137ea51d2d2ccf4b88ae5aec6e4f40988e8aa1295dc9689bc3e",
+      "archive_sha256": null
+    },
+    {
+      "name": "searched_route_policy",
+      "source_url": null,
+      "notebook_version": null,
+      "historical_score": null,
+      "provenance": "Repository source src/kaggriculture/searched_route_policy.py copied byte-for-byte into the untracked local artifact archive on 2026-08-25.",
+      "relative_path": "local/searched_route_policy.py",
+      "sha256": "170ab53322d6ae68d621915680e549e6db20c84705511588ec1b1c3b400eccc6",
+      "archive_sha256": null
+    },
+    {
+      "name": "boatlee_v14_current",
+      "source_url": null,
+      "notebook_version": null,
+      "historical_score": null,
+      "provenance": "Repository source src/kaggriculture/boatlee_v14_policy.py copied byte-for-byte into the untracked local artifact archive on 2026-08-25.",
+      "relative_path": "local/boatlee_v14_policy.py",
+      "sha256": "7a8e214fb431d5026f2d52c879fc31a63138e1d158915090d13529ed6c74693d",
+      "archive_sha256": null
+    }
+  ]
+}
