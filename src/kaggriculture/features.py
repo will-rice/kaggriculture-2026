@@ -160,6 +160,7 @@ class EncodedObservation:
     market_mask: tuple[tuple[bool, ...], ...]
     carried_items: tuple[float, ...]
     units: int
+    unit_carried_items: tuple[tuple[float, ...], ...] = ()
 
     def scalar(self, name: str) -> float:
         """Return a normalized scalar by stable schema name."""
@@ -213,6 +214,16 @@ class EncodedObservation:
     def carried_item_count(self, item: str) -> int:
         """Recover the crew-wide carried count for any canonical shed item."""
         return round(self.carried_items[SHED_NAMES.index(item)] * CARRIED_SCALE)
+
+    def unit_carried_count(self, unit: int, item: str) -> int:
+        """Recover one acting unit's exact carried count for a canonical item."""
+        if not 0 <= unit < self.units:
+            raise IndexError(f"unit {unit} outside acting crew of {self.units}")
+        if not self.unit_carried_items:
+            return 0
+        return round(
+            self.unit_carried_items[unit][SHED_NAMES.index(item)] * CARRIED_SCALE
+        )
 
     def unit_position(self, unit: int) -> tuple[int, int]:
         """Return an acting unit's ``(x, y)`` position."""
@@ -463,6 +474,23 @@ def _encode_carried_item_values(observation: Mapping[str, Any]) -> tuple[float, 
     return tuple(_float32(carried[item] / CARRIED_SCALE) for item in SHED_NAMES)
 
 
+def _encode_unit_carried_item_values(
+    observation: Mapping[str, Any], seat: int
+) -> tuple[tuple[float, ...], ...]:
+    """Encode exact per-unit inventories as named non-tensor policy facts."""
+    units = unit_count(observation, seat)
+    if units > MAX_UNITS:
+        raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
+    inventories = observation["private"]["inventories"]
+    return tuple(
+        tuple(
+            _float32(inventories[unit].get(item, 0) / CARRIED_SCALE)
+            for item in SHED_NAMES
+        )
+        for unit in range(units)
+    )
+
+
 def _encode_position_values(
     observation: Mapping[str, Any], seat: int
 ) -> tuple[int, ...]:
@@ -650,4 +678,5 @@ def encode_observation(observation: Mapping[str, Any], seat: int) -> EncodedObse
         market_mask=_market_mask_values(observation, seat),
         carried_items=_encode_carried_item_values(observation),
         units=units,
+        unit_carried_items=_encode_unit_carried_item_values(observation, seat),
     )
