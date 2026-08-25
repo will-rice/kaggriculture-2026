@@ -158,6 +158,7 @@ class EncodedObservation:
     unit_mask: tuple[tuple[bool, ...], ...]
     quantity_mask: tuple[tuple[bool, ...], ...]
     market_mask: tuple[tuple[bool, ...], ...]
+    carried_items: tuple[float, ...]
     units: int
 
     def scalar(self, name: str) -> float:
@@ -176,6 +177,18 @@ class EncodedObservation:
     def phase(self) -> tuple[float, float, float]:
         """Return normalized day, hour, and episode step."""
         return (self.scalar("day"), self.scalar("hour"), self.scalar("step"))
+
+    def day_count(self) -> int:
+        """Recover the current integer season day from its normalized scalar."""
+        return round(self.scalar("day") * SEASON_DAYS)
+
+    def hand_count(self) -> int:
+        """Recover the current number of hired hands from its normalized scalar."""
+        return round(self.scalar("our_hands") * 8)
+
+    def quadrant_count(self) -> int:
+        """Recover the number of currently unlocked owned quadrants."""
+        return round(self.scalar("our_land") * (1 + len(LAND_ORDER)))
 
     def live_price(self, product: str) -> float:
         """Return the existing normalized live-price feature."""
@@ -196,6 +209,10 @@ class EncodedObservation:
     def carried_count(self, product: str) -> int:
         """Recover the crew-wide carried product count."""
         return round(self.scalar(f"carried:{product}") * CARRIED_SCALE)
+
+    def carried_item_count(self, item: str) -> int:
+        """Recover the crew-wide carried count for any canonical shed item."""
+        return round(self.carried_items[SHED_NAMES.index(item)] * CARRIED_SCALE)
 
     def unit_position(self, unit: int) -> tuple[int, int]:
         """Return an acting unit's ``(x, y)`` position."""
@@ -236,10 +253,29 @@ class EncodedObservation:
         return round(sum(sum(row) for row in self.board[index]))
 
     def animal_count(self, animal: str, *, opponent: bool = False) -> int:
-        """Return public placed animals, plus our shed stock when requested."""
+        """Return public placed animals plus all private owned stock when ours."""
         index = PLANE_INDEX[f"animal:{animal}"] + (PER_FARM_PLANES if opponent else 0)
         placed = round(sum(sum(row) for row in self.board[index]))
-        return placed if opponent else placed + self.shed_count(animal)
+        if opponent:
+            return placed
+        return placed + self.shed_count(animal) + self.carried_item_count(animal)
+
+    def structure_count(self, structure: str, *, opponent: bool = False) -> int:
+        """Return built structures, including structures currently holding animals."""
+        offset = PER_FARM_PLANES if opponent else 0
+        bare_index = offset + PLANE_INDEX[f"state:{structure}"]
+        bare = round(sum(sum(row) for row in self.board[bare_index]))
+        occupied = sum(
+            round(
+                sum(
+                    sum(row)
+                    for row in self.board[offset + PLANE_INDEX[f"animal:{animal}"]]
+                )
+            )
+            for animal in ANIMAL_NAMES
+            if ANIMALS[animal]["structure"] == structure
+        )
+        return bare + occupied
 
     def opponent_public_supply(self, product: str) -> int:
         """Return currently visible held yield on the opponent's matching tiles."""
@@ -417,6 +453,14 @@ def _encode_scalar_values(
     values += [carried[item] / CARRIED_SCALE for item in PRODUCT_NAMES]
     values += [float(shop in unlocked_shops) for shop in SHOP_NAMES]
     return tuple(_float32(value) for value in values)
+
+
+def _encode_carried_item_values(observation: Mapping[str, Any]) -> tuple[float, ...]:
+    """Encode private carried shed items without changing legacy tensor scalars."""
+    carried: Counter[str] = Counter()
+    for inventory in observation["private"]["inventories"]:
+        carried.update(inventory)
+    return tuple(_float32(carried[item] / CARRIED_SCALE) for item in SHED_NAMES)
 
 
 def _encode_position_values(
@@ -604,5 +648,6 @@ def encode_observation(observation: Mapping[str, Any], seat: int) -> EncodedObse
         unit_mask=_unit_mask_values(observation, seat),
         quantity_mask=_quantity_mask_values(observation, seat),
         market_mask=_market_mask_values(observation, seat),
+        carried_items=_encode_carried_item_values(observation),
         units=units,
     )

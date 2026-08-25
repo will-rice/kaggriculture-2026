@@ -112,6 +112,28 @@ def test_named_accessors_select_the_existing_normalized_layout() -> None:
     assert encoded.opponent_public_supply("EGG") == 3
 
 
+def test_named_facts_recover_opening_counts_without_changing_tensor_features() -> None:
+    from kaggle_environments.envs.kaggriculture import kaggriculture as engine
+
+    from kaggriculture.features import encode_observation
+
+    observation = rich_observation()
+    observation["farms"][0]["unlocked_quadrants"] = ["NW", "NE"]
+    observation["farms"][0]["hands"] = [[2, 3], [3, 3]]
+    observation["private"]["inventories"] = [{"GOOSE": 1}, {}, {}]
+    observation["farms"][0]["tiles"][0][0] = engine._new_animal("GOOSE", 0)
+    observation["farms"][0]["tiles"][0][1] = {"kind": "COOP"}
+
+    encoded = encode_observation(observation, 0)
+
+    assert encoded.day_count() == 3
+    assert encoded.hand_count() == 2
+    assert encoded.quadrant_count() == 2
+    assert encoded.carried_item_count("GOOSE") == 1
+    assert encoded.animal_count("GOOSE") == 2
+    assert encoded.structure_count("COOP") == 2
+
+
 def test_features_imports_without_torch_or_pydantic() -> None:
     script = """
 import sys
