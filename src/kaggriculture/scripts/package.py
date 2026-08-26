@@ -13,8 +13,6 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-from kaggle_environments.agent import get_last_callable
-
 from kaggriculture.routes import STORE
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -106,18 +104,24 @@ def build(
     Raises:
         FileNotFoundError: If a required build artifact has not been produced.
     """
-    for artifact, producer in required.items():
-        if not artifact.is_file():
-            raise FileNotFoundError(
-                f"no {artifact.name} at {artifact} — run "
-                f"`uv run python -m {producer}` first"
-            )
+    validated_required = _validate_required(required)
     with tempfile.TemporaryDirectory() as staging:
         root = Path(staging)
         package = root / PACKAGE_ROOT.name
         shutil.copytree(PACKAGE_ROOT, package, ignore=EXCLUDED)
-        for artifact in required:
-            shutil.copy(artifact, package / artifact.relative_to(PACKAGE_ROOT))
+        staged_root = package.resolve(strict=True)
+        for artifact, relative in validated_required:
+            destination = package / relative
+            canonical_destination = destination.resolve(strict=False)
+            if staged_root not in canonical_destination.parents:
+                raise ValueError(
+                    f"required artifact escapes staged package: {artifact}"
+                )
+            if destination.exists() and (
+                destination.is_symlink() or destination.stat().st_nlink != 1
+            ):
+                raise ValueError(f"unsafe staged package destination: {destination}")
+            shutil.copy(artifact, destination)
         staged_entrypoint = root / "main.py"
         shutil.copy(entrypoint, staged_entrypoint)
         _refuse_a_shadowed_entrypoint(staged_entrypoint)
@@ -125,6 +129,42 @@ def build(
             for path in sorted(root.iterdir()):
                 archive.add(path, arcname=path.name)
     return output
+
+
+def _validate_required(required: Mapping[Path, str]) -> list[tuple[Path, Path]]:
+    """Resolve package-local inputs before any staging directory is created."""
+    validated: list[tuple[Path, Path]] = []
+    package_root = PACKAGE_ROOT.resolve(strict=True)
+    for artifact, producer in required.items():
+        worktree_default = required is REQUIRED and artifact == STORE
+        if not artifact.is_file():
+            raise FileNotFoundError(
+                f"no {artifact.name} at {artifact} — run "
+                f"`uv run python -m {producer}` first"
+            )
+        if artifact.is_symlink() and not worktree_default:
+            raise ValueError(
+                f"required package artifact may not be a symlink: {artifact}"
+            )
+        try:
+            relative = artifact.relative_to(PACKAGE_ROOT)
+        except ValueError as error:
+            raise ValueError(
+                f"required artifact must be inside package root: {artifact}"
+            ) from error
+        if ".." in relative.parts:
+            raise ValueError(
+                f"required artifact contains package traversal: {artifact}"
+            )
+        canonical = artifact.resolve(strict=True)
+        if package_root not in canonical.parents and not worktree_default:
+            raise ValueError(f"required artifact escapes package root: {artifact}")
+        if artifact.stat().st_nlink != 1 and not worktree_default:
+            raise ValueError(
+                f"required package artifact may not be a hardlink: {artifact}"
+            )
+        validated.append((artifact, relative))
+    return validated
 
 
 def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
@@ -154,15 +194,11 @@ def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
     agent = namespace.get("agent")
     if agent is None:
         raise RuntimeError(f"{entrypoint} binds no `agent`; nothing would play")
-    served = get_last_callable(source, path=str(entrypoint))
-    # ``get_last_callable`` executes the source in its own namespace. Imported
-    # callables retain object identity across the two executions, while an
-    # entrypoint that constructs a configured closure creates two equivalent
-    # function objects. Their callable names still identify the same final
-    # binding; an appended helper has a different name and remains rejected.
-    if served is not agent and getattr(served, "__name__", None) != getattr(
-        agent, "__name__", None
-    ):
+    served = next(
+        (value for value in reversed(tuple(namespace.values())) if callable(value)),
+        None,
+    )
+    if served is not agent:
         raise RuntimeError(
             f"{entrypoint} defines {getattr(served, '__name__', served)!r} after "
             "its agent, so the runner would play that instead. Move it above the "

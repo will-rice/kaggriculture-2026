@@ -1,11 +1,13 @@
 """Tests for the packaging guard that keeps offline tooling out of the archive."""
 
+import os
 import tarfile
 from pathlib import Path
 
 import pytest
 
 from kaggriculture.routes import STORE
+from kaggriculture.scripts import package as package_script
 from kaggriculture.scripts.package import build
 
 _needs_prototype_store = pytest.mark.skipif(
@@ -49,3 +51,37 @@ def test_build_accepts_a_self_contained_alternate_entrypoint(tmp_path: Path) -> 
         source = packaged_main.read().decode()
     assert source == entrypoint.read_text()
     assert not any("/search/" in name for name in names)
+
+
+@pytest.mark.parametrize("escape", ["absolute", "dotdot", "symlink", "hardlink"])
+def test_required_artifacts_cannot_escape_the_package_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, escape: str
+) -> None:
+    """Required inputs and staged destinations stay package-local by path and inode."""
+    package_root = tmp_path / "source" / "kaggriculture"
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text("")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    if escape == "absolute":
+        artifact = outside
+    elif escape == "dotdot":
+        artifact = package_root / ".." / ".." / "outside.bin"
+    else:
+        artifact = package_root / f"{escape}.bin"
+        if escape == "symlink":
+            artifact.symlink_to(outside)
+        else:
+            os.link(outside, artifact)
+    entrypoint = tmp_path / "main.py"
+    entrypoint.write_text(
+        "def agent(observation, configuration=None):\n    return {}\n"
+    )
+    monkeypatch.setattr(package_script, "PACKAGE_ROOT", package_root)
+
+    with pytest.raises(ValueError, match="package|symlink|hardlink"):
+        package_script.build(
+            tmp_path / "submission.tar.gz",
+            entrypoint=entrypoint,
+            required={artifact: "producer"},
+        )

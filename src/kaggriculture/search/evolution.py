@@ -321,12 +321,86 @@ class SearchState:
     def from_json(cls, source: str) -> Self:
         """Parse a strict state from JSON without accepting non-finite numbers."""
         return cls.from_payload(
-            json.loads(source, parse_constant=_reject_json_constant)
+            json.loads(
+                source,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_reject_duplicate_json_object,
+            )
         )
 
     @classmethod
     def load(cls, path: Path) -> Self:
         """Load one complete state artifact from disk."""
+        return cls.from_json(path.read_text())
+
+
+@dataclass(frozen=True)
+class FinalistArtifact:
+    """Authoritative, integrity-checked terminal Task 8 search evidence."""
+
+    state: SearchState
+    finalists: tuple[CandidateEvaluation, ...]
+
+    @property
+    def identity(self) -> SearchIdentity:
+        """Expose the validated terminal identity for promotion consumers."""
+        return self.state.identity
+
+    @property
+    def generation(self) -> int:
+        """Expose the completed terminal generation."""
+        return self.state.generation
+
+    @property
+    def integrity_digest(self) -> str:
+        """Expose the recomputed terminal integrity-chain digest."""
+        return self.state.integrity_digest
+
+    @classmethod
+    def from_json(cls, source: str) -> Self:
+        """Parse and fully revalidate the exact terminal state Task 8 emitted."""
+        value = json.loads(
+            source,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_json_object,
+        )
+        payload = _dictionary(
+            value,
+            {
+                "schema_version",
+                "identity",
+                "generation",
+                "finalists",
+                "integrity_digest",
+                "terminal_state",
+            },
+            "finalist artifact",
+        )
+        if payload["schema_version"] != STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"finalist artifact schema_version must be {STATE_SCHEMA_VERSION}"
+            )
+        state = SearchState.from_payload(payload["terminal_state"])
+        finalists = tuple(
+            _candidate_from_payload(item)
+            for item in _list(payload["finalists"], "finalists")
+        )
+        if payload["identity"] != _identity_payload(state.identity):
+            raise ValueError("finalist identity differs from terminal search state")
+        if payload["generation"] != state.generation:
+            raise ValueError("finalist generation differs from terminal search state")
+        if payload["integrity_digest"] != state.integrity_digest:
+            raise ValueError(
+                "finalist integrity digest differs from terminal search state"
+            )
+        if finalists != state.elites:
+            raise ValueError("finalists differ from exact terminal elites")
+        _validate_completed_finalist_state(state)
+        return cls(state=state, finalists=finalists)
+
+    @classmethod
+    def load(cls, path: Path) -> Self:
+        """Load one authoritative Task 8 finalist artifact from disk."""
         return cls.from_json(path.read_text())
 
 
@@ -599,12 +673,56 @@ def write_finalists(
         "generation": state.generation,
         "finalists": [_candidate_payload(candidate) for candidate in state.elites],
         "integrity_digest": state.integrity_digest,
+        "terminal_state": state.to_payload(),
     }
     source = (
         json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True)
         + "\n"
     )
     _write_atomic(output, source)
+
+
+def _validate_completed_finalist_state(state: SearchState) -> None:
+    """Recompute every terminal invariant required at the Task 8/9 boundary."""
+    identity = state.identity
+    config = identity.evolution_config
+    if not identity.certified or config.artifact_mode != "certified":
+        raise ValueError("finalists require certified search evidence")
+    if state.generation == 0 or not state.history:
+        raise ValueError("finalists require a nonzero evaluated history")
+    if state.generation != config.generations:
+        raise ValueError("finalists require the configured generation to be complete")
+    fixed_seeds = (
+        ("frontier", identity.frontier_seeds, FRONTIER_SEEDS),
+        ("screening", identity.screening_seeds, SCREENING_SEEDS),
+        ("development", identity.development_seeds, DEVELOPMENT_SEEDS),
+        ("promotion", identity.promotion_seeds, PROMOTION_SEEDS),
+    )
+    for label, actual, expected in fixed_seeds:
+        if actual != expected:
+            raise ValueError(f"finalist {label} seeds differ from the fixed set")
+    names = tuple(row[0] for row in identity.league_identity)
+    snapshot_names = tuple(row[0] for row in identity.league_snapshots)
+    weight_names = tuple(name for name, _ in identity.strength_weights)
+    if (
+        not names
+        or len(names) != len(set(names))
+        or names != snapshot_names
+        or set(names) != set(weight_names)
+    ):
+        raise ValueError("finalist league provenance names must be unique and complete")
+    if not state.elites or len(state.elites) > config.elites:
+        raise ValueError("finalists must contain the configured terminal elites")
+    codec = GenomeCodec.default()
+    if genome_schema_sha256(codec) != identity.genome_schema_sha256:
+        raise ValueError("finalist codec differs from the search genome schema")
+    _validate_resume_contents(
+        state, codec, StrengthWeights(dict(identity.strength_weights))
+    )
+    snapshot = _snapshot_league_from_identity(identity)
+    if snapshot is None:
+        raise ValueError("finalist identity has no certified snapshot league")
+    _verify_snapshot_league(snapshot)
 
 
 def genome_schema_sha256(codec: GenomeCodec) -> str:
@@ -1701,3 +1819,15 @@ def _string_row(value: object, length: int, label: str) -> tuple[str, ...]:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    """Build one object while refusing every duplicate JSON member name."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key is forbidden: {key}")
+        result[key] = value
+    return result

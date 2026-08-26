@@ -14,11 +14,13 @@ from kaggriculture.search.arena import HybridOpponent, Opponent
 from kaggriculture.search.evolution import DEVELOPMENT_SEEDS, SCREENING_SEEDS
 from kaggriculture.search.fitness import StrengthWeights
 from kaggriculture.search.promotion import (
+    DETERMINISM_SEEDS,
     PROMOTION_SEEDS,
     GameCounts,
     Interval,
     PromotionVerdict,
     bootstrap_interval,
+    check_determinism,
     evaluate_promotion,
 )
 from kaggriculture.search.scripts.frontier_round_robin import FRONTIER_SEEDS
@@ -57,7 +59,12 @@ def opponents() -> _Fixture:
         incumbent="incumbent.py",
         boatlee="boatlee.py",
         frontier="frontier.py",
-        league={"strong": "strong.py", "old_meta": "old.py"},
+        league={
+            "boatlee": "boatlee.py",
+            "frontier": "frontier.py",
+            "strong": "strong.py",
+            "old_meta": "old.py",
+        },
     )
 
 
@@ -143,6 +150,10 @@ def test_holdout_seeds_are_disjoint_from_every_search_seed() -> None:
     assert set(PROMOTION_SEEDS).isdisjoint(DEVELOPMENT_SEEDS)
     assert len(PROMOTION_SEEDS) == 128
     assert len(set(PROMOTION_SEEDS)) == len(PROMOTION_SEEDS)
+    assert set(DETERMINISM_SEEDS).isdisjoint(PROMOTION_SEEDS)
+    assert set(DETERMINISM_SEEDS).isdisjoint(FRONTIER_SEEDS)
+    assert set(DETERMINISM_SEEDS).isdisjoint(SCREENING_SEEDS)
+    assert set(DETERMINISM_SEEDS).isdisjoint(DEVELOPMENT_SEEDS)
 
 
 def test_evaluation_pairs_identical_candidate_and_incumbent_rows(
@@ -170,7 +181,7 @@ def test_evaluation_pairs_identical_candidate_and_incumbent_rows(
         [(name, opponent)] = league.items()
         calls.append((candidate, name, tuple(seeds), int(workers or 0)))
         values = (
-            incumbent_rows[str(opponent)]
+            incumbent_rows.get(str(opponent), (0.0, 0.0, 0.0, 0.0))
             if candidate == opponents.incumbent
             else rows[str(opponent)]
         )
@@ -186,19 +197,54 @@ def test_evaluation_pairs_identical_candidate_and_incumbent_rows(
         opponents.league,
         (7, 9),
         3,
-        weights=StrengthWeights({"strong": 3, "old_meta": 1}),
+        deterministic=True,
+        weights=StrengthWeights(
+            {"boatlee": 1, "frontier": 1, "strong": 3, "old_meta": 1}
+        ),
     )
 
     assert verdict.boatlee.mean == 1.0
     assert verdict.frontier.mean == 1.0
     assert verdict.boatlee_counts == GameCounts(wins=4, draws=0, losses=0)
     assert verdict.frontier_counts == GameCounts(wins=4, draws=0, losses=0)
-    assert verdict.matchup_deltas == {"strong": 0.5, "old_meta": 0.0}
-    assert verdict.league_delta.mean == pytest.approx(0.375)
+    assert verdict.matchup_deltas == {
+        "boatlee": 1.0,
+        "frontier": 1.0,
+        "strong": 0.5,
+        "old_meta": 0.0,
+    }
+    assert verdict.league_delta.mean == pytest.approx(7 / 12)
     assert verdict.failures == 0
     assert verdict.deterministic is True
     assert verdict.passed is True
     assert all(call[2:] == ((7, 9), 3) for call in calls)
+    assert len(calls) == 2 * len(opponents.league)
+    assert len(set(calls)) == len(calls)
+
+
+def test_determinism_compares_exact_actions_and_provenance_off_holdout(
+    monkeypatch: pytest.MonkeyPatch, opponents: _Fixture
+) -> None:
+    """Equal scores cannot hide different action streams on replay."""
+    calls = 0
+
+    def fake_traces(
+        *args: object, **kwargs: object
+    ) -> dict[tuple[str, int, int], tuple[str, ...]]:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        action = '{"type":"PASS"}' if calls == 1 else '{"type":"CONVERT"}'
+        return {("boatlee", 6, seat): (action,) for seat in (0, 1)}
+
+    monkeypatch.setattr(arena, "action_traces", fake_traces)
+
+    assert (
+        check_determinism(
+            opponents.candidate, {"boatlee": opponents.boatlee}, 1, seeds=(6,)
+        )
+        is False
+    )
 
 
 def test_evaluation_retains_direct_and_league_paired_bank_margins(
@@ -225,52 +271,21 @@ def test_evaluation_retains_direct_and_league_paired_bank_margins(
         opponents.incumbent,
         opponents.boatlee,
         opponents.frontier,
-        {"strong": opponents.league["strong"]},
+        {
+            "boatlee": opponents.boatlee,
+            "frontier": opponents.frontier,
+            "strong": opponents.league["strong"],
+        },
         (7,),
         1,
-        weights=StrengthWeights({"strong": 4}),
+        deterministic=True,
+        weights=StrengthWeights({"boatlee": 1, "frontier": 1, "strong": 4}),
     )
 
     assert verdict.boatlee_margin_pairs == ((10.0, 20.0),)
     assert verdict.frontier_margin_pairs == ((10.0, 20.0),)
-    assert verdict.candidate_matchup_margin_pairs == {"strong": ((10.0, 20.0),)}
-    assert verdict.incumbent_matchup_margin_pairs == {"strong": ((3.0, 4.0),)}
-
-
-def test_evaluation_detects_nondeterministic_candidate_rows(
-    monkeypatch: pytest.MonkeyPatch, opponents: _Fixture
-) -> None:
-    """A replay disagreement is a hard gate even if every first run wins."""
-    candidate_call = 0
-
-    def fake_outcomes(
-        candidate: Opponent,
-        league: Mapping[str, Opponent],
-        seeds: Sequence[int],
-        workers: int | None = None,
-    ) -> _Scores:
-        nonlocal candidate_call
-        del league, seeds, workers
-        if candidate == opponents.incumbent:
-            return _Scores((0.0, 0.0))
-        candidate_call += 1
-        return _Scores((1.0, 1.0) if candidate_call % 2 else (1.0, 0.5))
-
-    monkeypatch.setattr(arena, "outcomes", fake_outcomes)
-
-    verdict = evaluate_promotion(
-        opponents.candidate,
-        opponents.incumbent,
-        opponents.boatlee,
-        opponents.frontier,
-        {"strong": "strong.py"},
-        (7,),
-        1,
-        weights=StrengthWeights({"strong": 4}),
-    )
-
-    assert verdict.deterministic is False
-    assert any("nondeterministic" in reason for reason in verdict.reasons)
+    assert verdict.candidate_matchup_margin_pairs["strong"] == ((10.0, 20.0),)
+    assert verdict.incumbent_matchup_margin_pairs["strong"] == ((3.0, 4.0),)
 
 
 @pytest.mark.parametrize("seeds", [(7, 7), ()])
@@ -287,7 +302,10 @@ def test_evaluation_rejects_duplicate_or_missing_seed_provenance(
             opponents.league,
             seeds,
             1,
-            weights=StrengthWeights({"strong": 3, "old_meta": 1}),
+            deterministic=True,
+            weights=StrengthWeights(
+                {"boatlee": 1, "frontier": 1, "strong": 3, "old_meta": 1}
+            ),
         )
 
 
@@ -306,7 +324,10 @@ def test_evaluation_rejects_missing_game_rows(
             opponents.league,
             (7,),
             1,
-            weights=StrengthWeights({"strong": 3, "old_meta": 1}),
+            deterministic=True,
+            weights=StrengthWeights(
+                {"boatlee": 1, "frontier": 1, "strong": 3, "old_meta": 1}
+            ),
         )
 
 
@@ -339,7 +360,10 @@ def test_execution_failure_is_recorded_without_hiding_remaining_matchups(
         opponents.league,
         (7,),
         1,
-        weights=StrengthWeights({"strong": 3, "old_meta": 1}),
+        deterministic=True,
+        weights=StrengthWeights(
+            {"boatlee": 1, "frontier": 1, "strong": 3, "old_meta": 1}
+        ),
     )
 
     assert verdict.passed is False

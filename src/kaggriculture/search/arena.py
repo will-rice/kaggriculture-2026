@@ -16,6 +16,7 @@ runs one whole episode; routes are plain lists of dicts and agent paths are
 plain strings, both of which pickle without help.
 """
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -54,6 +55,50 @@ class OutcomeScores(list[float]):
         self.normalized_margins: list[float] = []
         self.failures: list[str] = []
         self.runtime_seconds = 0.0
+
+
+ActionProvenance = tuple[str, int, int]
+
+
+def action_traces(
+    candidate: HybridOpponent,
+    league: Mapping[str, Opponent],
+    seeds: Sequence[int],
+    workers: int | None = None,
+) -> dict[ActionProvenance, tuple[str, ...]]:
+    """Return exact canonical candidate actions keyed by opponent, seed, and seat."""
+    seed_tuple = tuple(seeds)
+    if not seed_tuple or len(seed_tuple) != len(set(seed_tuple)):
+        raise ValueError("action-trace seeds must be nonempty and unique")
+    if any(type(seed) is not int for seed in seed_tuple):
+        raise TypeError("action-trace seeds must be integers")
+    league_copy = dict(league)
+    if not league_copy or any(
+        type(name) is not str or not name for name in league_copy
+    ):
+        raise ValueError("action-trace league requires unique nonempty names")
+    work = [
+        (name, candidate, opponent, seed, seat)
+        for name, opponent in league_copy.items()
+        for seed in seed_tuple
+        for seat in (0, 1)
+    ]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        rows = list(pool.map(_one_trace, work))
+    evidence: dict[ActionProvenance, tuple[str, ...]] = {}
+    for provenance, trace in rows:
+        if provenance in evidence:
+            raise ValueError(f"duplicate action-trace provenance: {provenance}")
+        evidence[provenance] = trace
+    expected = {
+        (name, seed, seat)
+        for name in league_copy
+        for seed in seed_tuple
+        for seat in (0, 1)
+    }
+    if set(evidence) != expected:
+        raise ValueError("action-trace provenance is missing or unexpected")
+    return evidence
 
 
 def play(
@@ -220,6 +265,39 @@ def _one(work: tuple[Opponent, Opponent, int]) -> tuple[int, int]:
             "run that timed out, errored, or forfeited, is not an ordinary result."
         )
     return (int(final[0].reward), int(final[1].reward))
+
+
+def _one_trace(
+    work: tuple[str, HybridOpponent, Opponent, int, int],
+) -> tuple[ActionProvenance, tuple[str, ...]]:
+    """Play one determinism episode and retain the hybrid's exact action stream."""
+    name, candidate, opponent, seed, seat = work
+    trace: list[str] = []
+    policy = build_agent(candidate.runtime)
+
+    def traced(
+        observation: _Observation, configuration: _Configuration = None
+    ) -> _Action:
+        action = policy(observation, configuration)
+        trace.append(
+            json.dumps(action, allow_nan=False, separators=(",", ":"), sort_keys=True)
+        )
+        return action
+
+    environment = make(
+        ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed}
+    )
+    if seat == 0:
+        environment.run([traced, _side(opponent)])
+    else:
+        environment.run([_side(opponent), traced])
+    final = environment.steps[-1]
+    statuses = (final[0].status, final[1].status)
+    if statuses != ("DONE", "DONE") or any(state.reward is None for state in final):
+        raise RuntimeError(
+            f"determinism seed {seed} did not finish cleanly (statuses={statuses})"
+        )
+    return (name, seed, seat), tuple(trace)
 
 
 def _replay(route: Route) -> _Agent:

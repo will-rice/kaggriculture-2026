@@ -1347,6 +1347,55 @@ def test_verified_certification_can_write_a_certified_finalist(
     assert json.loads(output.read_text())["identity"]["certified"] is True
 
 
+def test_task8_loads_only_a_complete_integrity_checked_finalist_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The public Task 8 loader recomputes the complete terminal search state."""
+    state, certification, _ = _completed_verified_search(monkeypatch, tmp_path)
+    output = tmp_path / "certified-finalists.json"
+    evolution.write_finalists(state, output, certification=certification)
+
+    artifact = evolution.FinalistArtifact.load(output)
+
+    assert artifact.state == state
+    assert artifact.finalists == state.elites
+
+
+def test_task8_finalist_loader_rejects_coherent_mutation_with_stale_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Root finalist edits cannot bypass the schema-v4 history digest chain."""
+    state, certification, _ = _completed_verified_search(monkeypatch, tmp_path)
+    output = tmp_path / "certified-finalists.json"
+    evolution.write_finalists(state, output, certification=certification)
+    payload = json.loads(output.read_text())
+    record = payload["terminal_state"]["history"][0]
+    elite_genome = record["elites"][0]["genome"]
+    for candidate in record["developed"]:
+        if candidate["genome"] == elite_genome:
+            candidate["paired_normalized_margin"] += 0.001
+    record["elites"][0]["paired_normalized_margin"] += 0.001
+    payload["terminal_state"]["elites"] = record["elites"]
+    payload["finalists"] = payload["terminal_state"]["elites"]
+
+    with pytest.raises(ValueError, match="integrity digest"):
+        evolution.FinalistArtifact.from_json(json.dumps(payload))
+
+
+def test_task8_finalist_loader_rejects_duplicate_json_keys_before_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No duplicated JSON key may be collapsed before provenance validation."""
+    state, certification, _ = _completed_verified_search(monkeypatch, tmp_path)
+    output = tmp_path / "certified-finalists.json"
+    evolution.write_finalists(state, output, certification=certification)
+    source = output.read_text().rstrip()
+    duplicate = source[:-1] + ',"schema_version":4}'
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        evolution.FinalistArtifact.from_json(duplicate)
+
+
 def test_generation_zero_cannot_emit_finalists_even_with_verified_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

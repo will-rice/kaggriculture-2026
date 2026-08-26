@@ -11,9 +11,19 @@ from time import perf_counter
 
 from kaggriculture.search import arena
 from kaggriculture.search.arena import HybridOpponent, Opponent
+from kaggriculture.search.evolution import (
+    DEVELOPMENT_SEEDS,
+    PROMOTION_SEEDS,
+    SCREENING_SEEDS,
+)
 from kaggriculture.search.fitness import StrengthWeights
+from kaggriculture.search.scripts.frontier_round_robin import FRONTIER_SEEDS
 
-PROMOTION_SEEDS = tuple(range(840_000, 840_128))
+DETERMINISM_SEEDS = tuple(range(850_100, 850_104))
+assert all(
+    set(DETERMINISM_SEEDS).isdisjoint(seeds)
+    for seeds in (FRONTIER_SEEDS, SCREENING_SEEDS, DEVELOPMENT_SEEDS, PROMOTION_SEEDS)
+), "determinism seeds must be disjoint from all search and promotion seeds"
 
 
 @dataclass(frozen=True)
@@ -193,12 +203,15 @@ def evaluate_promotion(
     seeds: Sequence[int],
     workers: int,
     *,
+    deterministic: bool,
     weights: StrengthWeights | None = None,
 ) -> PromotionVerdict:
     """Build complete paired evidence, then apply every promotion gate at once."""
     seed_tuple = _validated_seeds(seeds)
     if type(workers) is not int or not 1 <= workers <= 16:
         raise ValueError("workers must be between 1 and 16 while Toad is running")
+    if type(deterministic) is not bool:
+        raise TypeError("deterministic evidence must be a boolean")
     league_copy = dict(league)
     if not league_copy:
         raise ValueError("promotion league must not be empty")
@@ -210,29 +223,13 @@ def evaluate_promotion(
 
     failures: list[str] = []
     runtime_seconds = 0.0
-    deterministic = True
-
-    boatlee_run, boatlee_same = _candidate_run(
-        candidate, "boatlee", boatlee, seed_tuple, workers
-    )
-    frontier_run, frontier_same = _candidate_run(
-        candidate, "frontier", frontier, seed_tuple, workers
-    )
-    deterministic = boatlee_same and frontier_same
-    failures.extend(f"boatlee: {item}" for item in boatlee_run.failures)
-    failures.extend(f"frontier: {item}" for item in frontier_run.failures)
-    runtime_seconds += boatlee_run.runtime_seconds + frontier_run.runtime_seconds
-
     candidate_runs: dict[str, _Run] = {}
     incumbent_runs: dict[str, _Run] = {}
     for name, opponent in league_copy.items():
-        candidate_run, same = _candidate_run(
-            candidate, name, opponent, seed_tuple, workers
-        )
+        candidate_run = _arena_run(candidate, name, opponent, seed_tuple, workers)
         incumbent_run = _arena_run(incumbent, name, opponent, seed_tuple, workers)
         candidate_runs[name] = candidate_run
         incumbent_runs[name] = incumbent_run
-        deterministic = deterministic and same
         failures.extend(
             f"candidate vs {name}: {item}" for item in candidate_run.failures
         )
@@ -240,6 +237,11 @@ def evaluate_promotion(
             f"incumbent vs {name}: {item}" for item in incumbent_run.failures
         )
         runtime_seconds += candidate_run.runtime_seconds + incumbent_run.runtime_seconds
+
+    boatlee_name = _league_name(league_copy, boatlee, "Boatlee")
+    frontier_name = _league_name(league_copy, frontier, "frontier")
+    boatlee_run = candidate_runs[boatlee_name]
+    frontier_run = candidate_runs[frontier_name]
 
     matchup_deltas = {
         name: statistics.fmean(
@@ -326,30 +328,48 @@ def _validated_seeds(seeds: Sequence[int]) -> tuple[int, ...]:
     return seed_tuple
 
 
-def _candidate_run(
+def check_determinism(
     candidate: HybridOpponent,
-    name: str,
-    opponent: Opponent,
-    seeds: tuple[int, ...],
+    league: Mapping[str, Opponent],
     workers: int,
-) -> tuple[_Run, bool]:
-    first = _arena_run(candidate, name, opponent, seeds, workers)
-    replay = _arena_run(candidate, name, opponent, seeds, workers)
-    same = (
-        first.pairs == replay.pairs
-        and first.margin_pairs == replay.margin_pairs
-        and first.failures == replay.failures
-    )
-    failures = tuple(dict.fromkeys((*first.failures, *replay.failures)))
-    return (
-        _Run(
-            pairs=first.pairs,
-            margin_pairs=first.margin_pairs,
-            failures=failures,
-            runtime_seconds=first.runtime_seconds + replay.runtime_seconds,
-        ),
-        same,
-    )
+    *,
+    seeds: Sequence[int] = DETERMINISM_SEEDS,
+) -> bool:
+    """Compare exact action/provenance traces on a non-holdout seed bank."""
+    seed_tuple = _validated_seeds(seeds)
+    if type(workers) is not int or not 1 <= workers <= 16:
+        raise ValueError("workers must be between 1 and 16 while Toad is running")
+    first = arena.action_traces(candidate, league, seed_tuple, workers)
+    replay = arena.action_traces(candidate, league, seed_tuple, workers)
+    _validate_trace_bank(first, league, seed_tuple)
+    _validate_trace_bank(replay, league, seed_tuple)
+    return first == replay
+
+
+def _validate_trace_bank(
+    traces: Mapping[arena.ActionProvenance, tuple[str, ...]],
+    league: Mapping[str, Opponent],
+    seeds: Sequence[int],
+) -> None:
+    expected = {
+        (name, seed, seat) for name in league for seed in seeds for seat in (0, 1)
+    }
+    if set(traces) != expected:
+        raise ValueError("determinism action-trace provenance is incomplete")
+    if any(
+        type(trace) is not tuple or any(type(action) is not str for action in trace)
+        for trace in traces.values()
+    ):
+        raise TypeError("determinism action traces must be tuples of canonical actions")
+
+
+def _league_name(league: Mapping[str, Opponent], target: Opponent, label: str) -> str:
+    matches = [name for name, opponent in league.items() if opponent == target]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{label} opponent must occur exactly once in promotion league"
+        )
+    return matches[0]
 
 
 def _arena_run(

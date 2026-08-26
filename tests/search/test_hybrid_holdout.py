@@ -1,161 +1,185 @@
-"""Strict finalist provenance at the untouched holdout CLI boundary."""
+"""Durable single-use holdout orchestration and its Task 8 boundary."""
 
 from __future__ import annotations
 
 import json
-from typing import Any
+import os
+from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import pytest
 
-from kaggriculture.hybrid.config import HybridConfig
 from kaggriculture.search import evolution
-from kaggriculture.search.evolution import (
-    DEVELOPMENT_SEEDS,
-    FRONTIER_SEEDS,
-    PROMOTION_SEEDS,
-    SCREENING_SEEDS,
-    CandidateEvaluation,
-    EvolutionConfig,
-    SearchIdentity,
-    genome_schema_sha256,
-)
-from kaggriculture.search.fitness import StrengthWeights, score_fitness
-from kaggriculture.search.genome import GenomeCodec
 from kaggriculture.search.scripts import hybrid_holdout
 
-
-def _finalist_payload() -> dict[str, Any]:
-    codec = GenomeCodec.default()
-    config = HybridConfig.default()
-    weights = StrengthWeights({"frontier": 4, "boatlee_v14_current": 3})
-    manifest_sha256 = "a" * 64
-    source_rows = (
-        ("frontier", "agent_source", "b" * 64),
-        ("boatlee_v14_current", "agent_source", "c" * 64),
-    )
-    snapshot_rows = (
-        ("frontier", "/sources/frontier.py", "/snapshots/frontier-b.py", "b" * 64),
-        (
-            "boatlee_v14_current",
-            "/sources/boatlee.py",
-            "/snapshots/boatlee-c.py",
-            "c" * 64,
-        ),
-    )
-    evolution_config = EvolutionConfig(
-        artifact_mode="certified",
-        manifest_sha256=manifest_sha256,
-        population=4,
-        elites=1,
-        generations=1,
-        seed=73,
-        workers=1,
-        engine="1.32.7",
-    )
-    identity = SearchIdentity(
-        certified=True,
-        manifest_sha256=manifest_sha256,
-        engine="1.32.7",
-        frontier_seeds=FRONTIER_SEEDS,
-        screening_seeds=SCREENING_SEEDS,
-        development_seeds=DEVELOPMENT_SEEDS,
-        promotion_seeds=PROMOTION_SEEDS,
-        genome_schema_sha256=genome_schema_sha256(codec),
-        league_identity=source_rows,
-        league_snapshots=snapshot_rows,
-        strength_weights=tuple(weights.values.items()),
-        initial_genomes=(codec.encode(config),),
-        evolution_config=evolution_config,
-    )
-    rates = {"frontier": 0.75, "boatlee_v14_current": 0.80}
-    candidate = CandidateEvaluation(
-        genome=codec.encode(config),
-        config=config,
-        stage="development",
-        seeds=DEVELOPMENT_SEEDS,
-        matchup_rates=rates,
-        matchup_games=dict.fromkeys(rates, 2 * len(DEVELOPMENT_SEEDS)),
-        fitness=score_fitness(rates, weights),
-        paired_normalized_margin=0.2,
-        failures=(),
-    )
-    return {
-        "schema_version": evolution.STATE_SCHEMA_VERSION,
-        "identity": evolution._identity_payload(identity),
-        "generation": 1,
-        "finalists": [evolution._candidate_payload(candidate)],
-        "integrity_digest": "d" * 64,
-    }
+FAKE_SEEDS = (901, 903)
 
 
-def test_finalist_loader_accepts_complete_certified_task8_artifact() -> None:
-    """The holdout consumes the exact validated public artifact Task 8 writes."""
-    artifact = hybrid_holdout.FinalistArtifact.from_json(
-        json.dumps(_finalist_payload())
+def _run(
+    tmp_path: Path,
+    *,
+    finalists: tuple[dict[str, object], ...] = ({"index": 0, "genome": [1.0]},),
+    deterministic: Callable[[Mapping[str, object]], bool] = lambda row: True,
+    evaluate: Callable[[Mapping[str, object]], Mapping[str, object]] = lambda row: {
+        **row,
+        "passed": True,
+    },
+) -> dict[str, object]:
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir(exist_ok=True)
+    protected = tmp_path / "finalists.json"
+    protected.write_text("{}")
+    return hybrid_holdout._execute_single_use(
+        output=tmp_path / "promotion.json",
+        run_identity={"seeds": list(FAKE_SEEDS), "frontier": "economic"},
+        finalists=finalists,
+        protected_paths=(protected,),
+        snapshot_root=snapshot,
+        deterministic=deterministic,
+        evaluate=evaluate,
     )
 
-    assert artifact.identity.certified is True
-    assert artifact.identity.promotion_seeds == PROMOTION_SEEDS
-    assert len(artifact.finalists) == 1
+
+def test_holdout_uses_the_authoritative_task8_finalist_loader() -> None:
+    """Task 9 does not maintain an independent finalist parser or validator."""
+    assert hybrid_holdout.FinalistArtifact is evolution.FinalistArtifact
 
 
-def test_finalist_loader_rejects_duplicate_candidate_provenance() -> None:
-    """One finalist cannot masquerade as two independent promotion attempts."""
-    payload = _finalist_payload()
-    payload["finalists"] = [*payload["finalists"], *payload["finalists"]]
+def test_crash_claim_forbids_replay_and_spends_no_second_holdout(
+    tmp_path: Path,
+) -> None:
+    """A crash after the exclusive claim permanently burns that exact attempt."""
+    calls = 0
 
-    with pytest.raises(ValueError, match="duplicate finalist"):
-        hybrid_holdout.FinalistArtifact.from_json(json.dumps(payload))
+    def crash(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("crash after first holdout game")
 
+    with pytest.raises(RuntimeError, match="crash after"):
+        _run(tmp_path, evaluate=crash)
+    with pytest.raises(RuntimeError, match="replay is forbidden"):
+        _run(tmp_path, evaluate=crash)
 
-def test_finalist_loader_rejects_changed_promotion_seed_provenance() -> None:
-    """A finalist artifact cannot choose holdout seeds after search."""
-    payload = _finalist_payload()
-    identity = payload["identity"]
-    assert isinstance(identity, dict)
-    identity["promotion_seeds"] = list(PROMOTION_SEEDS[:-1]) + [999_999]
-
-    with pytest.raises(ValueError, match="promotion seeds"):
-        hybrid_holdout.FinalistArtifact.from_json(json.dumps(payload))
-
-
-def test_finalist_loader_rejects_duplicate_weight_provenance() -> None:
-    """Duplicate rows cannot be collapsed by a mapping before the gate."""
-    payload = _finalist_payload()
-    identity = payload["identity"]
-    assert isinstance(identity, dict)
-    weights = identity["strength_weights"]
-    assert isinstance(weights, list)
-    weights.append(weights[0])
-
-    with pytest.raises(ValueError, match="unique"):
-        hybrid_holdout.FinalistArtifact.from_json(json.dumps(payload))
+    assert calls == 1
 
 
-def test_finalist_loader_rejects_genome_config_drift() -> None:
-    """Promotion runs the config selected by the recorded finalist genome."""
-    payload = _finalist_payload()
-    finalists = payload["finalists"]
-    assert isinstance(finalists, list)
-    candidate = finalists[0]
-    assert isinstance(candidate, dict)
-    candidate["genome"] = [0.0] * len(candidate["genome"])
+def test_completed_result_is_reused_idempotently_without_any_games(
+    tmp_path: Path,
+) -> None:
+    """A completed exact result survives reruns without determinism or holdout play."""
+    first = _run(tmp_path)
 
-    with pytest.raises(ValueError, match="genome/config"):
-        hybrid_holdout.FinalistArtifact.from_json(json.dumps(payload))
+    def forbidden(row: Mapping[str, object]) -> bool:
+        raise AssertionError(f"unexpected game for {row}")
+
+    def forbidden_evaluation(row: Mapping[str, object]) -> Mapping[str, object]:
+        raise AssertionError(f"unexpected holdout for {row}")
+
+    second = _run(tmp_path, deterministic=forbidden, evaluate=forbidden_evaluation)
+
+    assert second == first
+    assert second["status"] == "complete"
+
+
+def test_existing_or_concurrent_claim_is_exclusive(tmp_path: Path) -> None:
+    """The filesystem claim cannot be acquired by a second contender."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    claims = tmp_path / ".promotion.json.claims"
+    identity = {"run_identity": {"seeds": list(FAKE_SEEDS)}, "finalist": {"index": 0}}
+    path = hybrid_holdout._claim_path(claims, {"seeds": list(FAKE_SEEDS)}, {"index": 0})
+
+    assert hybrid_holdout._exclusive_claim(path, identity) is None
+    with pytest.raises(RuntimeError, match="replay is forbidden"):
+        hybrid_holdout._exclusive_claim(path, identity)
+
+
+def test_malformed_or_conflicting_output_is_rejected_before_games(
+    tmp_path: Path,
+) -> None:
+    """Existing output cannot be silently replaced or interpreted leniently."""
+    output = tmp_path / "promotion.json"
+    output.write_text('{"schema_version":2,"schema_version":2}')
+    calls = 0
+
+    def counted(row: Mapping[str, object]) -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        _run(tmp_path, deterministic=counted)
+    assert calls == 0
+
+
+def test_each_finalist_verdict_persists_before_a_later_crash(tmp_path: Path) -> None:
+    """A second-finalist failure cannot erase the first finalist's verdict."""
+    finalists: tuple[dict[str, object], ...] = ({"index": 0}, {"index": 1})
+
+    def evaluate(row: Mapping[str, object]) -> Mapping[str, object]:
+        if row["index"] == 1:
+            raise RuntimeError("second crashed")
+        return {**row, "passed": True}
+
+    with pytest.raises(RuntimeError, match="second crashed"):
+        _run(tmp_path, finalists=finalists, evaluate=evaluate)
+
+    output = json.loads((tmp_path / "promotion.json").read_text())
+    assert output["status"] == "partial"
+    assert output["results"] == [{"index": 0, "passed": True}]
+    assert len(list((tmp_path / ".promotion.json.claims").glob("*.json"))) == 2
+
+
+def test_failed_determinism_claims_and_spends_zero_holdout(tmp_path: Path) -> None:
+    """Action-trace replay is a pre-holdout gate for every finalist."""
+    evaluated = 0
+
+    def evaluate(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal evaluated
+        evaluated += 1
+        return row
+
+    with pytest.raises(RuntimeError, match="nondeterministic"):
+        _run(tmp_path, deterministic=lambda row: False, evaluate=evaluate)
+
+    assert evaluated == 0
+    assert not (tmp_path / ".promotion.json.claims").exists()
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_output_aliases_of_every_input_are_rejected_before_writes(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    """Canonical and inode aliases cannot overwrite holdout input evidence."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    protected = tmp_path / "frontier.json"
+    protected.write_text("evidence")
+    output = tmp_path / "promotion.json"
+    if alias_kind == "symlink":
+        output.symlink_to(protected)
+    else:
+        os.link(protected, output)
+
+    with pytest.raises(ValueError, match="input artifact|symlink"):
+        hybrid_holdout._execute_single_use(
+            output=output,
+            run_identity={"seeds": list(FAKE_SEEDS)},
+            finalists=({"index": 0},),
+            protected_paths=(protected,),
+            snapshot_root=snapshot,
+            deterministic=lambda row: True,
+            evaluate=lambda row: row,
+        )
+    assert protected.read_text() == "evidence"
 
 
 def test_holdout_cli_has_no_seed_override_and_requires_output() -> None:
     """The production command cannot substitute inspected seeds or an implicit path."""
     options = {action.dest for action in hybrid_holdout.parser()._actions}
-
     assert "seeds" not in options
     with pytest.raises(SystemExit):
         hybrid_holdout.parser().parse_args(
-            [
-                "--finalists",
-                "finalists.json",
-                "--frontier-report",
-                "frontier.json",
-            ]
+            ["--finalists", "finalists.json", "--frontier-report", "frontier.json"]
         )

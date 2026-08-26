@@ -11,6 +11,7 @@ import pytest
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
+from kaggriculture.boatlee_v14_policy import agent as boatlee_v14_agent
 from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.scripts.package import (
     ENTRYPOINT,
@@ -36,6 +37,13 @@ def test_entrypoint_exposes_the_agent_last() -> None:
     exec(compile(source, str(ENTRYPOINT), "exec"), namespace)
 
     assert get_last_callable(source, path=str(ENTRYPOINT)) is namespace["agent"]
+
+
+def test_default_entrypoint_is_pinned_to_boatlee_v14() -> None:
+    """Candidate packaging cannot silently change the served default policy."""
+    namespace: dict[str, object] = {}
+    exec(compile(ENTRYPOINT.read_text(), str(ENTRYPOINT), "exec"), namespace)
+    assert namespace["agent"] is boatlee_v14_agent
 
 
 def test_entrypoint_plays_a_full_episode() -> None:
@@ -168,6 +176,25 @@ def test_the_build_refuses_an_entrypoint_with_no_agent(tmp_path: Path) -> None:
     entrypoint.write_text("def helper():\n    return None\n")
 
     with pytest.raises(RuntimeError, match="binds no"):
+        _refuse_a_shadowed_entrypoint(entrypoint)
+
+
+def test_build_refuses_a_same_named_but_different_final_callable(
+    tmp_path: Path,
+) -> None:
+    """Callable names cannot disguise a shadow that the runner would execute."""
+    entrypoint = tmp_path / "main.py"
+    entrypoint.write_text(
+        "def agent(observation=None, configuration=None):\n"
+        "    return {'type': 'PASS'}\n"
+        "real_agent = agent\n"
+        "def shadow(observation=None, configuration=None):\n"
+        "    return {'type': 'CONVERT'}\n"
+        "shadow.__name__ = 'agent'\n"
+        "agent = real_agent\n"
+    )
+
+    with pytest.raises(RuntimeError, match="after its agent"):
         _refuse_a_shadowed_entrypoint(entrypoint)
 
 
