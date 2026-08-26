@@ -15,9 +15,23 @@ from kaggriculture.search.scripts import hybrid_holdout
 FAKE_SEEDS = (901, 903)
 
 
+def _identity(
+    terminal: str = "a", determinism: tuple[int, ...] = (801, 803)
+) -> dict[str, object]:
+    return {
+        "terminal_state_integrity_digest": terminal * 64,
+        "determinism_seeds": list(determinism),
+        "promotion_seeds": list(FAKE_SEEDS),
+        "frontier": "economic",
+    }
+
+
 def _run(
     tmp_path: Path,
     *,
+    output_name: str = "promotion.json",
+    protected_name: str = "finalists.json",
+    run_identity: Mapping[str, object] | None = None,
     finalists: tuple[dict[str, object], ...] = ({"index": 0, "genome": [1.0]},),
     deterministic: Callable[[Mapping[str, object]], bool] = lambda row: True,
     evaluate: Callable[[Mapping[str, object]], Mapping[str, object]] = lambda row: {
@@ -27,17 +41,152 @@ def _run(
 ) -> dict[str, object]:
     snapshot = tmp_path / "snapshots"
     snapshot.mkdir(exist_ok=True)
-    protected = tmp_path / "finalists.json"
+    protected = tmp_path / protected_name
     protected.write_text("{}")
     return hybrid_holdout._execute_single_use(
-        output=tmp_path / "promotion.json",
-        run_identity={"seeds": list(FAKE_SEEDS), "frontier": "economic"},
+        output=tmp_path / output_name,
+        run_identity=run_identity or _identity(),
         finalists=finalists,
         protected_paths=(protected,),
         snapshot_root=snapshot,
         deterministic=deterministic,
         evaluate=evaluate,
     )
+
+
+def test_same_certified_finalist_two_output_paths_reuses_one_claim(
+    tmp_path: Path,
+) -> None:
+    """Changing only aggregate output location cannot spend another holdout."""
+    evaluations = 0
+    determinism_games = 0
+
+    def deterministic(row: Mapping[str, object]) -> bool:
+        nonlocal determinism_games
+        determinism_games += 1
+        return True
+
+    def evaluated(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal evaluations
+        evaluations += 1
+        return {**row, "passed": True}
+
+    _run(
+        tmp_path,
+        output_name="promotion-a.json",
+        deterministic=deterministic,
+        evaluate=evaluated,
+    )
+    _run(
+        tmp_path,
+        output_name="promotion-b.json",
+        deterministic=deterministic,
+        evaluate=evaluated,
+    )
+
+    assert evaluations == 1
+    assert determinism_games == 1
+
+
+def test_copied_finalist_path_and_new_output_reuse_one_claim(tmp_path: Path) -> None:
+    """The finalist filename is not part of certified promotion identity."""
+    evaluations = 0
+
+    def evaluated(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal evaluations
+        evaluations += 1
+        return {**row, "passed": True}
+
+    _run(
+        tmp_path,
+        output_name="promotion-a.json",
+        protected_name="original-finalists.json",
+        evaluate=evaluated,
+    )
+    _run(
+        tmp_path,
+        output_name="promotion-b.json",
+        protected_name="copied-finalists.json",
+        evaluate=evaluated,
+    )
+
+    assert evaluations == 1
+
+
+def test_distinct_certified_terminal_states_never_share_claims(tmp_path: Path) -> None:
+    """The terminal integrity digest separates independent certified searches."""
+    evaluations = 0
+
+    def evaluated(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal evaluations
+        evaluations += 1
+        return row
+
+    _run(
+        tmp_path,
+        output_name="promotion-a.json",
+        run_identity=_identity("a"),
+        evaluate=evaluated,
+    )
+    _run(
+        tmp_path,
+        output_name="promotion-b.json",
+        run_identity=_identity("b"),
+        evaluate=evaluated,
+    )
+
+    claim_dirs = tuple(
+        path
+        for path in (tmp_path / ".hybrid-promotion-claims").iterdir()
+        if path.is_dir()
+    )
+    assert evaluations == 2
+    assert len(claim_dirs) == 2
+
+
+def test_determinism_seed_drift_conflicts_with_existing_terminal_claim(
+    tmp_path: Path,
+) -> None:
+    """Prerequisite seed drift cannot create fresh evidence for one terminal state."""
+    _run(
+        tmp_path,
+        output_name="promotion-a.json",
+        run_identity=_identity(determinism=(801, 803)),
+    )
+
+    with pytest.raises(ValueError, match="conflicting holdout identities"):
+        _run(
+            tmp_path,
+            output_name="promotion-b.json",
+            run_identity=_identity(determinism=(805, 807)),
+        )
+
+
+@pytest.mark.parametrize("target", ["output", "input"])
+def test_outputs_and_copied_inputs_cannot_alias_canonical_claim_tree(
+    tmp_path: Path, target: str
+) -> None:
+    """Aggregate and input paths are both disjoint from durable claim evidence."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    identity = _identity()
+    claim_dir = hybrid_holdout._canonical_claim_dir(snapshot, identity)
+    inside = claim_dir.parent / "alias.json"
+    output = inside if target == "output" else tmp_path / "promotion.json"
+    protected = inside if target == "input" else tmp_path / "finalists.json"
+    protected.parent.mkdir(parents=True, exist_ok=True)
+    protected.write_text("{}")
+
+    with pytest.raises(ValueError, match="canonical claim tree"):
+        hybrid_holdout._execute_single_use(
+            output=output,
+            run_identity=identity,
+            finalists=({"index": 0},),
+            protected_paths=(protected,),
+            snapshot_root=snapshot,
+            deterministic=lambda row: True,
+            evaluate=lambda row: row,
+        )
 
 
 def test_holdout_uses_the_authoritative_task8_finalist_loader() -> None:
@@ -86,9 +235,14 @@ def test_existing_or_concurrent_claim_is_exclusive(tmp_path: Path) -> None:
     """The filesystem claim cannot be acquired by a second contender."""
     snapshot = tmp_path / "snapshots"
     snapshot.mkdir()
-    claims = tmp_path / ".promotion.json.claims"
-    identity = {"run_identity": {"seeds": list(FAKE_SEEDS)}, "finalist": {"index": 0}}
-    path = hybrid_holdout._claim_path(claims, {"seeds": list(FAKE_SEEDS)}, {"index": 0})
+    claims = tmp_path / ".hybrid-promotion-claims" / ("a" * 64)
+    identity = {
+        "run_identity": {"promotion_seeds": list(FAKE_SEEDS)},
+        "finalist": {"index": 0},
+    }
+    path = hybrid_holdout._claim_path(
+        claims, {"promotion_seeds": list(FAKE_SEEDS)}, {"index": 0}
+    )
 
     assert hybrid_holdout._exclusive_claim(path, identity) is None
     with pytest.raises(RuntimeError, match="replay is forbidden"):
@@ -128,7 +282,7 @@ def test_each_finalist_verdict_persists_before_a_later_crash(tmp_path: Path) -> 
     output = json.loads((tmp_path / "promotion.json").read_text())
     assert output["status"] == "partial"
     assert output["results"] == [{"index": 0, "passed": True}]
-    assert len(list((tmp_path / ".promotion.json.claims").glob("*.json"))) == 2
+    assert len(list((tmp_path / ".hybrid-promotion-claims").rglob("*.json"))) == 2
 
 
 def test_failed_determinism_claims_and_spends_zero_holdout(tmp_path: Path) -> None:
@@ -144,7 +298,7 @@ def test_failed_determinism_claims_and_spends_zero_holdout(tmp_path: Path) -> No
         _run(tmp_path, deterministic=lambda row: False, evaluate=evaluate)
 
     assert evaluated == 0
-    assert not (tmp_path / ".promotion.json.claims").exists()
+    assert not (tmp_path / ".hybrid-promotion-claims").exists()
 
 
 @pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
@@ -165,7 +319,7 @@ def test_output_aliases_of_every_input_are_rejected_before_writes(
     with pytest.raises(ValueError, match="input artifact|symlink"):
         hybrid_holdout._execute_single_use(
             output=output,
-            run_identity={"seeds": list(FAKE_SEEDS)},
+            run_identity=_identity(),
             finalists=({"index": 0},),
             protected_paths=(protected,),
             snapshot_root=snapshot,

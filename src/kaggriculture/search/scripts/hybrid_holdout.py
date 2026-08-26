@@ -64,11 +64,11 @@ def main() -> None:
     os.nice(10)
     try:
         frontier = verify_frontier(args.manifest, args.artifact_root)
-        report = TypeAdapter(FrontierReport).validate_json(
-            args.frontier_report.read_text()
-        )
+        report_source = args.frontier_report.read_bytes()
+        report = TypeAdapter(FrontierReport).validate_json(report_source)
         finalists = FinalistArtifact.load(args.finalists)
         snapshot, weights = _bind_frontier(finalists, frontier, report)
+        search_identity = finalists.identity
         league = snapshot.opponents
         incumbent = league["boatlee_v14_current"]
         public_frontier = league[report.frontier_name]
@@ -81,14 +81,25 @@ def main() -> None:
             for index, finalist in enumerate(finalists.finalists)
         )
         run_identity = {
+            "identity_schema_version": 1,
             "engine": frontier.engine,
             "manifest_sha256": frontier.manifest_sha256,
-            "finalist_integrity_digest": finalists.integrity_digest,
-            "seeds": list(PROMOTION_SEEDS),
+            "frontier_report_sha256": hashlib.sha256(report_source).hexdigest(),
+            "terminal_state_integrity_digest": finalists.integrity_digest,
+            "terminal_generation": finalists.generation,
+            "snapshot_lineage": [list(row) for row in search_identity.league_snapshots],
+            "frontier_seeds": list(search_identity.frontier_seeds),
+            "screening_seeds": list(search_identity.screening_seeds),
+            "development_seeds": list(search_identity.development_seeds),
+            "determinism_seeds": list(DETERMINISM_SEEDS),
+            "promotion_seeds": list(PROMOTION_SEEDS),
             "seats": [0, 1],
             "incumbent": "boatlee_v14_current",
             "boatlee": "boatlee_v14_current",
             "frontier": report.frontier_name,
+            "genome_schema_sha256": search_identity.genome_schema_sha256,
+            "evolution_config": asdict(search_identity.evolution_config),
+            "league_identity": [list(row) for row in search_identity.league_identity],
             "league_sha256": {
                 artifact.name: artifact.sha256 for artifact in frontier.artifacts
             },
@@ -202,14 +213,21 @@ def _execute_single_use(
     if not rows:
         raise ValueError("holdout requires at least one finalist")
     identity = _json_copy(dict(run_identity))
-    claims_dir = output.parent / f".{output.name}.claims"
+    _validate_run_identity(identity)
+    claims_dir = _canonical_claim_dir(snapshot_root, identity)
+    claims_tree = claims_dir.parent
     claims = tuple(_claim_path(claims_dir, identity, row) for row in rows)
     if output.exists() and not output.is_file():
         raise ValueError("holdout output must be a regular file")
-    if claims_dir.exists() and not claims_dir.is_dir():
+    if claims_dir.is_symlink() or claims_dir.exists() and not claims_dir.is_dir():
         raise ValueError("holdout claim path must be a directory")
     if any(path.exists() and not path.is_file() for path in claims):
         raise ValueError("holdout claims must be regular files")
+    _preflight_claim_tree(
+        claims_tree=claims_tree,
+        output=output,
+        protected_paths=protected_paths,
+    )
     _preflight_paths(
         write_paths=(output, claims_dir, *claims),
         protected_paths=protected_paths,
@@ -245,6 +263,52 @@ def _execute_single_use(
         payload = _output_payload(identity, rows, results, status)
         _write_atomic(output, _canonical_json(payload))
     return _output_payload(identity, rows, results, "complete")
+
+
+def _canonical_claim_dir(
+    snapshot_root: Path, run_identity: Mapping[str, object]
+) -> Path:
+    """Anchor one terminal state's claims beside its immutable snapshot lineage."""
+    root = snapshot_root.resolve(strict=True)
+    terminal_digest = run_identity.get("terminal_state_integrity_digest")
+    if type(terminal_digest) is not str:
+        raise ValueError("run identity requires terminal state integrity digest")
+    lineage = {
+        "snapshot_root": str(root),
+        "terminal_state_integrity_digest": terminal_digest,
+    }
+    digest = hashlib.sha256(_canonical_json(lineage).encode()).hexdigest()
+    claim_dir = root.parent / ".hybrid-promotion-claims" / digest
+    if claim_dir == root or root in claim_dir.parents:
+        raise ValueError("canonical claim directory must be outside snapshot root")
+    return claim_dir
+
+
+def _validate_run_identity(identity: Mapping[str, object]) -> None:
+    """Require exact terminal and both non-overlapping gate seed banks."""
+    terminal = identity.get("terminal_state_integrity_digest")
+    if (
+        type(terminal) is not str
+        or len(terminal) != 64
+        or any(character not in "0123456789abcdef" for character in terminal)
+    ):
+        raise ValueError("terminal state integrity digest must be lowercase sha256")
+    determinism = _identity_seeds(identity, "determinism_seeds")
+    promotion = _identity_seeds(identity, "promotion_seeds")
+    if not set(determinism).isdisjoint(promotion):
+        raise ValueError("determinism and promotion identity seeds must be disjoint")
+
+
+def _identity_seeds(identity: Mapping[str, object], key: str) -> tuple[int, ...]:
+    value = identity.get(key)
+    if type(value) is not list or not value:
+        raise ValueError(f"run identity requires nonempty {key}")
+    if any(type(seed) is not int for seed in value):
+        raise TypeError(f"run identity {key} must contain integers")
+    seeds = tuple(cast(list[int], value))
+    if len(seeds) != len(set(seeds)):
+        raise ValueError(f"run identity {key} contains duplicate seeds")
+    return seeds
 
 
 def _preflight_existing(
@@ -454,6 +518,34 @@ def _preflight_paths(
                 raise ValueError(f"holdout output aliases input artifact: {target}")
             if target.exists() and os.path.samestat(target.stat(), source.stat()):
                 raise ValueError(f"holdout output hardlinks input artifact: {target}")
+
+
+def _preflight_claim_tree(
+    *, claims_tree: Path, output: Path, protected_paths: Sequence[Path]
+) -> None:
+    """Keep aggregate outputs and all inputs outside canonical claim evidence."""
+    if claims_tree.is_symlink() or claims_tree.exists() and not claims_tree.is_dir():
+        raise ValueError("canonical holdout claim tree must be a regular directory")
+    canonical_tree = claims_tree.resolve(strict=False)
+    candidates = (output, *protected_paths)
+    evidence = (
+        tuple(path for path in claims_tree.rglob("*.json") if path.is_file())
+        if claims_tree.exists()
+        else ()
+    )
+    for candidate in candidates:
+        canonical = candidate.resolve(strict=False)
+        if canonical == canonical_tree or canonical_tree in canonical.parents:
+            raise ValueError(
+                f"holdout input/output aliases canonical claim tree: {candidate}"
+            )
+        if not candidate.exists():
+            continue
+        status = candidate.stat()
+        if any(os.path.samestat(status, item.stat()) for item in evidence):
+            raise ValueError(
+                f"holdout input/output hardlinks canonical claim evidence: {candidate}"
+            )
 
 
 def _strict_object(path: Path) -> dict[str, object]:
