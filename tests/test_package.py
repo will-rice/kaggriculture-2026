@@ -31,3 +31,21 @@ def test_the_archive_does_not_ship_the_search_package(tmp_path: Path) -> None:
     assert not [
         name for name in names if "/search/" in name or name.endswith("/search")
     ]
+
+
+def test_build_accepts_a_self_contained_alternate_entrypoint(tmp_path: Path) -> None:
+    """Candidate packaging can be tested without changing the served default."""
+    entrypoint = tmp_path / "main.py"
+    entrypoint.write_text(
+        "from kaggriculture.hybrid.policy import agent\n\n__all__ = ['agent']\n"
+    )
+
+    archive = build(tmp_path / "hybrid.tar.gz", entrypoint=entrypoint, required={})
+
+    with tarfile.open(archive) as bundle:
+        names = bundle.getnames()
+        packaged_main = bundle.extractfile("main.py")
+        assert packaged_main is not None
+        source = packaged_main.read().decode()
+    assert source == entrypoint.read_text()
+    assert not any("/search/" in name for name in names)

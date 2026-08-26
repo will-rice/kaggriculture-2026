@@ -10,6 +10,7 @@ import logging
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from kaggle_environments.agent import get_last_callable
@@ -72,7 +73,12 @@ def main() -> None:
     )
 
 
-def build(output: Path = SUBMISSION) -> Path:
+def build(
+    output: Path = SUBMISSION,
+    *,
+    entrypoint: Path = ENTRYPOINT,
+    required: Mapping[Path, str] = REQUIRED,
+) -> Path:
     """Write the submission archive and return its path.
 
     The packaging scripts themselves are left out: they import ``argparse`` and
@@ -89,6 +95,10 @@ def build(output: Path = SUBMISSION) -> Path:
 
     Args:
         output: Where to write the archive.
+        entrypoint: Self-contained root ``main.py`` to stage. The default remains
+            the repository's served Boatlee entrypoint.
+        required: Package-local generated artifacts and their producer modules.
+            Tests may pass an empty mapping for a self-contained alternate agent.
 
     Returns:
         ``output``, unchanged.
@@ -96,7 +106,7 @@ def build(output: Path = SUBMISSION) -> Path:
     Raises:
         FileNotFoundError: If a required build artifact has not been produced.
     """
-    for artifact, producer in REQUIRED.items():
+    for artifact, producer in required.items():
         if not artifact.is_file():
             raise FileNotFoundError(
                 f"no {artifact.name} at {artifact} — run "
@@ -106,10 +116,11 @@ def build(output: Path = SUBMISSION) -> Path:
         root = Path(staging)
         package = root / PACKAGE_ROOT.name
         shutil.copytree(PACKAGE_ROOT, package, ignore=EXCLUDED)
-        for artifact in REQUIRED:
+        for artifact in required:
             shutil.copy(artifact, package / artifact.relative_to(PACKAGE_ROOT))
-        shutil.copy(ENTRYPOINT, root / ENTRYPOINT.name)
-        _refuse_a_shadowed_entrypoint(root / ENTRYPOINT.name)
+        staged_entrypoint = root / "main.py"
+        shutil.copy(entrypoint, staged_entrypoint)
+        _refuse_a_shadowed_entrypoint(staged_entrypoint)
         with tarfile.open(output, "w:gz") as archive:
             for path in sorted(root.iterdir()):
                 archive.add(path, arcname=path.name)
@@ -144,7 +155,14 @@ def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
     if agent is None:
         raise RuntimeError(f"{entrypoint} binds no `agent`; nothing would play")
     served = get_last_callable(source, path=str(entrypoint))
-    if served is not agent:
+    # ``get_last_callable`` executes the source in its own namespace. Imported
+    # callables retain object identity across the two executions, while an
+    # entrypoint that constructs a configured closure creates two equivalent
+    # function objects. Their callable names still identify the same final
+    # binding; an appended helper has a different name and remains rejected.
+    if served is not agent and getattr(served, "__name__", None) != getattr(
+        agent, "__name__", None
+    ):
         raise RuntimeError(
             f"{entrypoint} defines {getattr(served, '__name__', served)!r} after "
             "its agent, so the runner would play that instead. Move it above the "

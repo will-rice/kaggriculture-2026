@@ -1,5 +1,6 @@
 """Tests for the artefact that actually gets uploaded."""
 
+import json
 import os
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import pytest
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
+from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.scripts.package import (
     ENTRYPOINT,
     _refuse_a_shadowed_entrypoint,
@@ -167,3 +169,84 @@ def test_the_build_refuses_an_entrypoint_with_no_agent(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="binds no"):
         _refuse_a_shadowed_entrypoint(entrypoint)
+
+
+def test_extracted_hybrid_archive_plays_a_real_episode_with_runtime_headroom(
+    tmp_path: Path,
+) -> None:
+    """The actual alternate archive stays small, pure, complete, and fast."""
+    payload = to_runtime(HybridConfig.default()).to_payload()
+    hybrid_main = tmp_path / "main.py"
+    hybrid_main.write_text(
+        "from kaggriculture.hybrid.policy import build_agent\n"
+        "from kaggriculture.hybrid.runtime import RuntimeConfig\n\n"
+        f"_RUNTIME = RuntimeConfig.from_payload({payload!r})\n"
+        "agent = build_agent(_RUNTIME)\n\n"
+        "__all__ = ['agent']\n"
+    )
+    archive = build(tmp_path / "hybrid.tar.gz", entrypoint=hybrid_main, required={})
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(archive) as bundle:
+        names = bundle.getnames()
+        bundle.extractall(extracted, filter="data")
+
+    script = """
+import json
+import os
+import runpy
+import sys
+from pathlib import Path
+from time import perf_counter
+
+root = Path(sys.argv[1])
+os.nice(10)
+sys.path.insert(0, str(root))
+before = set(sys.modules)
+namespace = runpy.run_path(str(root / "main.py"))
+agent_modules = sorted(set(sys.modules) - before)
+agent = namespace["agent"]
+from kaggle_environments import make
+from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
+from kaggriculture.economic_policy import agent as economic_agent
+
+timings = []
+def timed_agent(observation, configuration=None):
+    started = perf_counter()
+    try:
+        return agent(observation, configuration)
+    finally:
+        timings.append(perf_counter() - started)
+
+environment = make(
+    ENVIRONMENT,
+    configuration={"episodeSteps": EPISODE_STEPS, "seed": 850_000},
+)
+environment.run([timed_agent, economic_agent])
+ordered = sorted(timings)
+p99 = ordered[max(0, min(len(ordered) - 1, (99 * len(ordered) + 99) // 100 - 1))]
+print(json.dumps({
+    "statuses": [str(state.status) for state in environment.steps[-1]],
+    "max_turn": max(timings),
+    "p99_turn": p99,
+    "agent_modules": agent_modules,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(extracted)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout.splitlines()[-1])
+    imported_roots = {name.split(".", 1)[0] for name in evidence["agent_modules"]}
+    assert archive.stat().st_size < 4 * 1024 * 1024
+    assert evidence["statuses"] == ["DONE", "DONE"]
+    assert evidence["max_turn"] < 1.0
+    assert evidence["p99_turn"] < 0.100
+    assert "torch" not in imported_roots
+    assert "pydantic" not in imported_roots
+    assert not any("/search/" in name for name in names)
