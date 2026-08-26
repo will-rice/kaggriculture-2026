@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,7 @@ def _identity(
     terminal: str = "a", determinism: tuple[int, ...] = (801, 803)
 ) -> dict[str, object]:
     return {
+        "promotion_protocol_version": hybrid_holdout._PROMOTION_PROTOCOL_VERSION,
         "terminal_state_integrity_digest": terminal * 64,
         "determinism_seeds": list(determinism),
         "promotion_seeds": list(FAKE_SEEDS),
@@ -154,12 +158,185 @@ def test_determinism_seed_drift_conflicts_with_existing_terminal_claim(
         run_identity=_identity(determinism=(801, 803)),
     )
 
-    with pytest.raises(ValueError, match="conflicting holdout identities"):
+    with pytest.raises(ValueError, match="terminal promotion identity conflicts"):
         _run(
             tmp_path,
             output_name="promotion-b.json",
             run_identity=_identity(determinism=(805, 807)),
         )
+
+
+def test_concurrent_prerequisite_identities_serialize_before_any_games(
+    tmp_path: Path,
+) -> None:
+    """One terminal sentinel wins; a different identity conflicts pre-game."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    protected = tmp_path / "finalists.json"
+    protected.write_text("{}")
+    start = threading.Barrier(2)
+    pregame = threading.Barrier(2)
+    evaluations = 0
+    lock = threading.Lock()
+
+    def deterministic(row: Mapping[str, object]) -> bool:
+        del row
+        try:
+            pregame.wait(timeout=0.2)
+        except threading.BrokenBarrierError:
+            pass
+        return True
+
+    def evaluated(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal evaluations
+        with lock:
+            evaluations += 1
+        return row
+
+    def invoke(index: int) -> object:
+        start.wait()
+        identity = _identity(determinism=(801 + 2 * index, 803 + 2 * index))
+        try:
+            return hybrid_holdout._execute_single_use(
+                output=tmp_path / f"promotion-{index}.json",
+                run_identity=identity,
+                finalists=({"index": 0},),
+                protected_paths=(protected,),
+                snapshot_root=snapshot,
+                deterministic=deterministic,
+                evaluate=evaluated,
+            )
+        except (RuntimeError, ValueError) as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(invoke, (0, 1)))
+
+    errors = tuple(item for item in outcomes if isinstance(item, Exception))
+    sentinels = list((tmp_path / ".hybrid-promotion-claims").rglob("identity.json"))
+    assert len(errors) == 1
+    assert "terminal promotion identity conflicts" in str(errors[0])
+    assert len(sentinels) == 1
+    assert evaluations <= 1
+
+
+def test_same_identity_concurrency_allows_only_one_holdout_evaluation(
+    tmp_path: Path,
+) -> None:
+    """Shared preflight may replay, but the finalist claim stays single-use."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    protected = tmp_path / "finalists.json"
+    protected.write_text("{}")
+    pregame = threading.Barrier(2)
+    evaluations = 0
+    determinism_runs = 0
+    lock = threading.Lock()
+
+    def deterministic(row: Mapping[str, object]) -> bool:
+        nonlocal determinism_runs
+        del row
+        with lock:
+            determinism_runs += 1
+        pregame.wait(timeout=1)
+        return True
+
+    def evaluated(row: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal evaluations
+        with lock:
+            evaluations += 1
+        time.sleep(0.1)
+        return row
+
+    def invoke(index: int) -> object:
+        try:
+            return hybrid_holdout._execute_single_use(
+                output=tmp_path / f"promotion-{index}.json",
+                run_identity=_identity(),
+                finalists=({"index": 0},),
+                protected_paths=(protected,),
+                snapshot_root=snapshot,
+                deterministic=deterministic,
+                evaluate=evaluated,
+            )
+        except RuntimeError as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(invoke, (0, 1)))
+
+    errors = tuple(item for item in outcomes if isinstance(item, RuntimeError))
+    assert determinism_runs == 2
+    assert evaluations == 1
+    assert len(errors) == 1
+    assert "replay is forbidden" in str(errors[0])
+
+
+def test_existing_terminal_sentinel_rejects_duplicate_keys_before_games(
+    tmp_path: Path,
+) -> None:
+    """Malformed terminal identity can neither be collapsed nor replaced."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    identity = _identity()
+    sentinel = hybrid_holdout._canonical_claim_dir(snapshot, identity) / "identity.json"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text('{"schema_version":1,"schema_version":1}')
+    determinism_runs = 0
+
+    def deterministic(row: Mapping[str, object]) -> bool:
+        nonlocal determinism_runs
+        determinism_runs += 1
+        return True
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        hybrid_holdout._execute_single_use(
+            output=tmp_path / "promotion.json",
+            run_identity=identity,
+            finalists=({"index": 0},),
+            protected_paths=(tmp_path / "finalists.json",),
+            snapshot_root=snapshot,
+            deterministic=deterministic,
+            evaluate=lambda row: row,
+        )
+
+    assert determinism_runs == 0
+
+
+@pytest.mark.parametrize("target", ["output", "input"])
+def test_lexical_claim_tree_path_cannot_escape_through_intermediate_symlink(
+    tmp_path: Path, target: str
+) -> None:
+    """Lexical containment is rejected even when resolution lands outside."""
+    snapshot = tmp_path / "snapshots"
+    snapshot.mkdir()
+    identity = _identity()
+    claims_tree = hybrid_holdout._canonical_claim_dir(snapshot, identity).parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "evidence.json"
+    outside_target.write_text("unchanged")
+    claims_tree.mkdir()
+    escape = claims_tree / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    lexical = escape / "evidence.json"
+    output = lexical if target == "output" else tmp_path / "promotion.json"
+    protected = lexical if target == "input" else tmp_path / "finalists.json"
+    if target == "output":
+        protected.write_text("{}")
+
+    with pytest.raises(ValueError, match="lexically aliases canonical claim tree"):
+        hybrid_holdout._execute_single_use(
+            output=output,
+            run_identity=identity,
+            finalists=({"index": 0},),
+            protected_paths=(protected,),
+            snapshot_root=snapshot,
+            deterministic=lambda row: True,
+            evaluate=lambda row: row,
+        )
+
+    assert outside_target.read_text() == "unchanged"
 
 
 @pytest.mark.parametrize("target", ["output", "input"])
@@ -282,7 +459,8 @@ def test_each_finalist_verdict_persists_before_a_later_crash(tmp_path: Path) -> 
     output = json.loads((tmp_path / "promotion.json").read_text())
     assert output["status"] == "partial"
     assert output["results"] == [{"index": 0, "passed": True}]
-    assert len(list((tmp_path / ".hybrid-promotion-claims").rglob("*.json"))) == 2
+    claim_files = list((tmp_path / ".hybrid-promotion-claims").rglob("*.json"))
+    assert sum(path.name != "identity.json" for path in claim_files) == 2
 
 
 def test_failed_determinism_claims_and_spends_zero_holdout(tmp_path: Path) -> None:
@@ -298,7 +476,8 @@ def test_failed_determinism_claims_and_spends_zero_holdout(tmp_path: Path) -> No
         _run(tmp_path, deterministic=lambda row: False, evaluate=evaluate)
 
     assert evaluated == 0
-    assert not (tmp_path / ".hybrid-promotion-claims").exists()
+    evidence = list((tmp_path / ".hybrid-promotion-claims").rglob("*.json"))
+    assert [path.name for path in evidence] == ["identity.json"]
 
 
 @pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])

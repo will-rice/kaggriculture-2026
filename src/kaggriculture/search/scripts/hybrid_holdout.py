@@ -41,6 +41,8 @@ from kaggriculture.search.scripts.hybrid_search import _validate_frontier_report
 
 _CLAIM_SCHEMA_VERSION = 1
 _OUTPUT_SCHEMA_VERSION = 2
+_TERMINAL_IDENTITY_SCHEMA_VERSION = 1
+_PROMOTION_PROTOCOL_VERSION = 3
 _T = TypeVar("_T")
 
 
@@ -81,7 +83,10 @@ def main() -> None:
             for index, finalist in enumerate(finalists.finalists)
         )
         run_identity = {
-            "identity_schema_version": 1,
+            "promotion_protocol_version": _PROMOTION_PROTOCOL_VERSION,
+            "claim_schema_version": _CLAIM_SCHEMA_VERSION,
+            "output_schema_version": _OUTPUT_SCHEMA_VERSION,
+            "terminal_identity_schema_version": _TERMINAL_IDENTITY_SCHEMA_VERSION,
             "engine": frontier.engine,
             "manifest_sha256": frontier.manifest_sha256,
             "frontier_report_sha256": hashlib.sha256(report_source).hexdigest(),
@@ -216,25 +221,23 @@ def _execute_single_use(
     _validate_run_identity(identity)
     claims_dir = _canonical_claim_dir(snapshot_root, identity)
     claims_tree = claims_dir.parent
+    identity_sentinel = claims_dir / "identity.json"
     claims = tuple(_claim_path(claims_dir, identity, row) for row in rows)
-    if output.exists() and not output.is_file():
-        raise ValueError("holdout output must be a regular file")
-    if claims_dir.is_symlink() or claims_dir.exists() and not claims_dir.is_dir():
-        raise ValueError("holdout claim path must be a directory")
-    if any(path.exists() and not path.is_file() for path in claims):
-        raise ValueError("holdout claims must be regular files")
+    _validate_claim_shapes(output, claims_dir, identity_sentinel, claims)
+
     _preflight_claim_tree(
         claims_tree=claims_tree,
         output=output,
         protected_paths=protected_paths,
     )
     _preflight_paths(
-        write_paths=(output, claims_dir, *claims),
+        write_paths=(output, claims_dir, identity_sentinel, *claims),
         protected_paths=protected_paths,
         snapshot_root=snapshot_root,
     )
+    _claim_terminal_identity(identity_sentinel, identity)
     existing_output, existing_claims = _preflight_existing(
-        output, claims_dir, claims, identity, rows
+        output, claims_dir, identity_sentinel, claims, identity, rows
     )
     if existing_output is not None and existing_output["status"] == "complete":
         return existing_output
@@ -265,6 +268,23 @@ def _execute_single_use(
     return _output_payload(identity, rows, results, "complete")
 
 
+def _validate_claim_shapes(
+    output: Path,
+    claims_dir: Path,
+    identity_sentinel: Path,
+    claims: Sequence[Path],
+) -> None:
+    """Reject malformed filesystem objects before identity publication."""
+    if output.exists() and not output.is_file():
+        raise ValueError("holdout output must be a regular file")
+    if claims_dir.is_symlink() or claims_dir.exists() and not claims_dir.is_dir():
+        raise ValueError("holdout claim path must be a directory")
+    if any(path.exists() and not path.is_file() for path in claims):
+        raise ValueError("holdout claims must be regular files")
+    if identity_sentinel.exists() and not identity_sentinel.is_file():
+        raise ValueError("terminal promotion identity must be a regular file")
+
+
 def _canonical_claim_dir(
     snapshot_root: Path, run_identity: Mapping[str, object]
 ) -> Path:
@@ -286,6 +306,8 @@ def _canonical_claim_dir(
 
 def _validate_run_identity(identity: Mapping[str, object]) -> None:
     """Require exact terminal and both non-overlapping gate seed banks."""
+    if identity.get("promotion_protocol_version") != _PROMOTION_PROTOCOL_VERSION:
+        raise ValueError("run identity has an unsupported promotion protocol")
     terminal = identity.get("terminal_state_integrity_digest")
     if (
         type(terminal) is not str
@@ -314,13 +336,17 @@ def _identity_seeds(identity: Mapping[str, object], key: str) -> tuple[int, ...]
 def _preflight_existing(
     output: Path,
     claims_dir: Path,
+    identity_sentinel: Path,
     claims: Sequence[Path],
     identity: Mapping[str, object],
     rows: Sequence[Mapping[str, object]],
 ) -> tuple[dict[str, object] | None, tuple[dict[str, object] | None, ...]]:
     """Validate all existing aggregate and per-finalist evidence before games."""
     if claims_dir.exists():
-        unexpected = set(claims_dir.glob("*.json")) - set(claims)
+        unexpected = set(claims_dir.glob("*.json")) - {
+            identity_sentinel,
+            *claims,
+        }
         if unexpected:
             raise ValueError("claim directory contains conflicting holdout identities")
     aggregate = _load_existing_output(output, identity, rows)
@@ -335,6 +361,35 @@ def _preflight_existing(
     if aggregate is not None:
         _validate_output_claims(aggregate, existing)
     return aggregate, existing
+
+
+def _claim_terminal_identity(path: Path, run_identity: Mapping[str, object]) -> None:
+    """Atomically bind one terminal namespace to exact prerequisite identity."""
+    _mkdir_durable(path.parent)
+    expected = {
+        "schema_version": _TERMINAL_IDENTITY_SCHEMA_VERSION,
+        "run_identity": _json_copy(dict(run_identity)),
+    }
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".identity.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(_canonical_json(expected))
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            actual = _strict_object(path)
+            if actual != expected:
+                raise ValueError("terminal promotion identity conflicts") from None
+        else:
+            _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
 
 
 def _claim_identity(
@@ -526,6 +581,7 @@ def _preflight_claim_tree(
     """Keep aggregate outputs and all inputs outside canonical claim evidence."""
     if claims_tree.is_symlink() or claims_tree.exists() and not claims_tree.is_dir():
         raise ValueError("canonical holdout claim tree must be a regular directory")
+    lexical_tree = Path(os.path.abspath(claims_tree))  # noqa: PTH100
     canonical_tree = claims_tree.resolve(strict=False)
     candidates = (output, *protected_paths)
     evidence = (
@@ -534,6 +590,12 @@ def _preflight_claim_tree(
         else ()
     )
     for candidate in candidates:
+        lexical = Path(os.path.abspath(candidate))  # noqa: PTH100
+        if lexical == lexical_tree or lexical_tree in lexical.parents:
+            raise ValueError(
+                f"holdout input/output lexically aliases canonical claim tree: "
+                f"{candidate}"
+            )
         canonical = candidate.resolve(strict=False)
         if canonical == canonical_tree or canonical_tree in canonical.parents:
             raise ValueError(
