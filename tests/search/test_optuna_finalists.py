@@ -38,6 +38,7 @@ from kaggriculture.search.optuna_protocol import (
     RungEvidence,
     RungSpec,
     build_rung_evidence,
+    rung_summary_attributes,
     write_rung_evidence_atomic,
 )
 from kaggriculture.search.optuna_space import SPACE_SHA256, parameters_for_config
@@ -48,6 +49,7 @@ from kaggriculture.search.optuna_state import (
     SeedBankIdentity,
     StudyIdentity,
     StudyPaths,
+    evaluation_semantics,
 )
 from kaggriculture.search.scripts import hybrid_holdout
 from kaggriculture.search.scripts.frontier_round_robin import FRONTIER_SEEDS
@@ -166,6 +168,7 @@ def _identity(root: Path) -> StudyIdentity:
         snapshot_rows.append((name, str(source), str(snapshot), digest))
     report = _frontier_report(dict(source_rows))
     assert strength_weights(report) == WEIGHTS
+    semantic_sources = evaluation_semantics()
     return StudyIdentity(
         engine="test-engine",
         manifest_sha256="a" * 64,
@@ -177,6 +180,15 @@ def _identity(root: Path) -> StudyIdentity:
         source_sha256=tuple(sorted(source_rows)),
         league_snapshots=tuple(sorted(snapshot_rows)),
         space_sha256=SPACE_SHA256,
+        evaluation_semantics=semantic_sources,
+        evaluation_semantics_sha256=hashlib.sha256(
+            json.dumps(
+                semantic_sources,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest(),
         sampler=SamplerIdentity(),
         pruner=PrunerIdentity(),
         seed_banks=SeedBankIdentity(
@@ -250,19 +262,7 @@ def _games(spec: RungSpec, score: int, runtime: float) -> dict[GameKey, GameResu
 def _summary(
     root: Path, row: RungEvidence, path: Path, digest: str
 ) -> dict[str, object]:
-    return {
-        "config_sha256": row.config_sha256,
-        "rung": row.rung,
-        "resource_step": row.resource_step,
-        "primary": row.primary,
-        "dense_margin": row.dense_margin,
-        "objective": row.objective,
-        "games": len(row.games),
-        "failures": len(row.failures),
-        "runtime_seconds": sum(game.runtime_seconds for game in row.games),
-        "evidence_path": str(path.relative_to(root)),
-        "evidence_sha256": digest,
-    }
+    return rung_summary_attributes(row, path, digest, root)
 
 
 def _build_certified_study(root: Path) -> Path:

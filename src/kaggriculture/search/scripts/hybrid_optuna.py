@@ -16,6 +16,7 @@ from pathlib import Path
 import optuna
 from pydantic import TypeAdapter, ValidationError
 
+from kaggriculture.hybrid.config import HybridConfig
 from kaggriculture.search.arena_pool import PersistentArena
 from kaggriculture.search.evolution import (
     DEVELOPMENT_SEEDS,
@@ -47,10 +48,12 @@ from kaggriculture.search.optuna_search import (
 from kaggriculture.search.optuna_seeds import warm_start_configs
 from kaggriculture.search.optuna_state import (
     StudyIdentity,
+    StudyOwnershipError,
     StudyPaths,
     build_identity,
     open_study,
     reconcile_running_trials,
+    study_root_lock,
     terminal_counts,
     validate_study_evidence,
     validate_study_paths,
@@ -75,6 +78,9 @@ def parser() -> argparse.ArgumentParser:
         "--legacy-state", type=Path, default=Path("run/hybrid/search-state.json")
     )
     arguments.add_argument("--root", type=Path, default=Path("run/hybrid/optuna-v2"))
+    mode = arguments.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--create", action="store_true")
+    mode.add_argument("--resume", action="store_true")
     arguments.add_argument("--workers", type=int, choices=range(1, 33), default=32)
     arguments.add_argument("--stop-after", type=int, choices=range(1, 513), default=512)
     arguments.add_argument("--validate-only", action="store_true")
@@ -88,7 +94,11 @@ def parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse and range-check CLI arguments without touching files or services."""
-    return parser().parse_args(argv)
+    arguments = parser()
+    parsed = arguments.parse_args(argv)
+    if parsed.validate_only and not parsed.resume:
+        arguments.error("--validate-only requires --resume")
+    return parsed
 
 
 def run(args: argparse.Namespace) -> None:
@@ -106,6 +116,32 @@ def run(args: argparse.Namespace) -> None:
     panels, weights = _protocol_inputs(report)
     paths = StudyPaths.from_root(args.root)
     _preflight_output_ownership(paths, frontier, args.legacy_state)
+    try:
+        with study_root_lock(paths.root, exclusive=not args.validate_only):
+            _run_owned(
+                args,
+                paths,
+                frontier,
+                report,
+                panels,
+                weights,
+                warm_starts,
+            )
+    except StudyOwnershipError as error:
+        raise SystemExit(str(error)) from error
+
+
+def _run_owned(
+    args: argparse.Namespace,
+    paths: StudyPaths,
+    frontier: VerifiedFrontier,
+    report: FrontierReport,
+    panels: PanelSet,
+    weights: StrengthWeights,
+    warm_starts: tuple[HybridConfig, ...],
+) -> None:
+    """Hold the study-root lock across every snapshot, SQLite, and service action."""
+    _require_mode_root(args, paths)
     if args.validate_only and (
         not paths.sqlite.is_file() or not paths.identity.is_file()
     ):
@@ -114,7 +150,7 @@ def run(args: argparse.Namespace) -> None:
         snapshot = snapshot_frontier(
             frontier,
             paths.root,
-            require_existing=args.validate_only,
+            require_existing=args.resume,
         )
         identity = build_identity(
             frontier,
@@ -152,7 +188,7 @@ def run(args: argparse.Namespace) -> None:
 
     try:
         study = open_study(paths, identity, preflight)
-        reconcile_running_trials(study)
+        reconcile_running_trials(study, paths, identity)
         validate_study_evidence(study, paths, identity)
     except (OSError, ValueError) as error:
         raise SystemExit(f"invalid existing study: {error}") from error
@@ -198,6 +234,24 @@ def run(args: argparse.Namespace) -> None:
             sort_keys=True,
         )
     )
+
+
+def _require_mode_root(args: argparse.Namespace, paths: StudyPaths) -> None:
+    """Refuse create/resume ambiguity while ownership excludes state changes."""
+    snapshot_root = paths.root.with_name(paths.root.name + ".league")
+    if args.create:
+        if paths.root.exists() or paths.root.is_symlink():
+            raise SystemExit("create requires an absent study root")
+        return
+    if (
+        not paths.root.is_dir()
+        or paths.root.is_symlink()
+        or not paths.identity.is_file()
+        or paths.identity.is_symlink()
+        or not snapshot_root.is_dir()
+        or snapshot_root.is_symlink()
+    ):
+        raise SystemExit("resume requires an existing identity-bound study root")
 
 
 def _write_pilot_verdict(path: Path, verdict: PilotVerdict) -> None:

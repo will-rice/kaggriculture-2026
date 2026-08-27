@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -135,7 +136,7 @@ class RungEvidence(BaseModel):
         frozen=True, extra="forbid", strict=True, allow_inf_nan=False
     )
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     trial_number: int = Field(ge=0)
     rung: Literal[1, 2, 3]
     resource_step: Literal[1, 4, 16]
@@ -145,6 +146,8 @@ class RungEvidence(BaseModel):
     games: tuple[GameEvidence, ...]
     matchups: dict[str, MatchupEvidence]
     strength_weights: tuple[tuple[str, int], ...]
+    arena_wall_seconds: float = Field(ge=0.0)
+    trial_wall_seconds: float = Field(ge=0.0)
     primary: float | None
     dense_margin: float | None
     objective: float | None
@@ -153,6 +156,8 @@ class RungEvidence(BaseModel):
     @model_validator(mode="after")
     def is_derived_from_raw_games(self) -> Self:
         """Reject summaries and scores that diverge from durable raw game evidence."""
+        if self.trial_wall_seconds < self.arena_wall_seconds:
+            raise ValueError("trial wall time cannot be below arena wall time")
         spec = RungSpec(
             self.rung,
             self.resource_step,
@@ -324,6 +329,9 @@ def build_rung_evidence(
     spec: RungSpec,
     completed: Mapping[GameKey, GameResult],
     weights: StrengthWeights,
+    *,
+    arena_wall_seconds: float = 0.0,
+    trial_wall_seconds: float = 0.0,
 ) -> RungEvidence:
     """Derive complete canonical rung evidence from exactly the requested cells."""
     if type(trial_number) is not int or trial_number < 0:
@@ -367,6 +375,8 @@ def build_rung_evidence(
         strength_weights=tuple(
             (name, panel_weights.values[name]) for name in spec.opponents
         ),
+        arena_wall_seconds=arena_wall_seconds,
+        trial_wall_seconds=trial_wall_seconds,
         primary=primary,
         dense_margin=dense_margin,
         objective=objective,
@@ -433,6 +443,53 @@ def evidence_path(root: Path, trial_number: int, rung: int) -> Path:
     if type(rung) is not int or rung not in (1, 2, 3):
         raise ValueError("rung must be 1, 2, or 3")
     return root / "evidence" / f"trial-{trial_number}-rung-{rung}.json"
+
+
+def rung_summary_attributes(
+    evidence: RungEvidence,
+    path: Path,
+    digest: str,
+    root: Path,
+) -> dict[str, object]:
+    """Derive the exact SQLite summary recoverable from one canonical rung."""
+    if not isinstance(evidence, RungEvidence):
+        raise ValueError("evidence must be a RungEvidence")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("evidence digest must be lowercase SHA-256")
+    expected_path = evidence_path(root, evidence.trial_number, evidence.rung)
+    if path != expected_path:
+        raise ValueError("evidence summary path is not canonical")
+    attributes: dict[str, object] = {
+        "config_sha256": evidence.config_sha256,
+        "rung": evidence.rung,
+        "resource_step": evidence.resource_step,
+        "primary": evidence.primary,
+        "dense_margin": evidence.dense_margin,
+        "objective": evidence.objective,
+        "games": len(evidence.games),
+        "failures": len(evidence.failures),
+        "runtime_seconds": sum(game.runtime_seconds for game in evidence.games),
+        "arena_wall_seconds": evidence.arena_wall_seconds,
+        "trial_wall_seconds": evidence.trial_wall_seconds,
+        "evidence_path": str(path.relative_to(root)),
+        "evidence_sha256": digest,
+    }
+    for name, matchup in evidence.matchups.items():
+        prefix = f"opponent/{name}"
+        attributes.update(
+            {
+                f"{prefix}/wins": matchup.wins,
+                f"{prefix}/draws": matchup.draws,
+                f"{prefix}/losses": matchup.losses,
+                f"{prefix}/games": matchup.games,
+                f"{prefix}/win_points": matchup.win_points,
+                f"{prefix}/paired_normalized_margin": (
+                    matchup.paired_normalized_margin
+                ),
+                f"{prefix}/runtime_seconds": matchup.runtime_seconds,
+            }
+        )
+    return attributes
 
 
 def write_rung_evidence_atomic(root: Path, evidence: RungEvidence) -> tuple[Path, str]:

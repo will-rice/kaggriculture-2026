@@ -185,7 +185,15 @@ def _rows(*, failed: bool = False) -> dict[GameKey, GameResult]:
 
 def test_rung_evidence_aggregates_counts_margin_runtime_and_scores() -> None:
     """Wrong raw game aggregation must change the persisted rung evidence."""
-    evidence = build_rung_evidence(7, HybridConfig.default(), RUNG, _rows(), WEIGHTS)
+    evidence = build_rung_evidence(
+        7,
+        HybridConfig.default(),
+        RUNG,
+        _rows(),
+        WEIGHTS,
+        arena_wall_seconds=0.75,
+        trial_wall_seconds=1.25,
+    )
     economic = evidence.matchups["economic_policy"]
 
     assert (economic.wins, economic.draws, economic.losses, economic.games) == (
@@ -197,9 +205,25 @@ def test_rung_evidence_aggregates_counts_margin_runtime_and_scores() -> None:
     assert economic.win_points == pytest.approx(0.625)
     assert economic.paired_normalized_margin == pytest.approx(1 / 12)
     assert economic.runtime_seconds == pytest.approx(1.0)
+    assert evidence.arena_wall_seconds == pytest.approx(0.75)
+    assert evidence.trial_wall_seconds == pytest.approx(1.25)
     assert evidence.failures == ()
     assert (evidence.primary, evidence.dense_margin) == pytest.approx((0.625, 1 / 12))
     assert evidence.objective == pytest.approx(objective_value(0.625, 1 / 12))
+
+
+def test_rung_evidence_rejects_trial_wall_time_below_arena_wall_time() -> None:
+    """Coordinator timing cannot claim less total time than arena execution."""
+    with pytest.raises(ValueError, match="trial wall time"):
+        build_rung_evidence(
+            7,
+            HybridConfig.default(),
+            RUNG,
+            _rows(),
+            WEIGHTS,
+            arena_wall_seconds=2.0,
+            trial_wall_seconds=1.0,
+        )
 
 
 def test_any_failed_game_makes_rung_ineligible() -> None:

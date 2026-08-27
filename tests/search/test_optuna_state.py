@@ -10,6 +10,7 @@ from pathlib import Path
 
 import optuna
 import pytest
+from optuna.storages import RDBStorage
 from optuna.trial import TrialState
 
 from kaggriculture.hybrid.config import HybridConfig
@@ -27,6 +28,8 @@ from kaggriculture.search.optuna_protocol import (
     RungEvidence,
     RungSpec,
     build_rung_evidence,
+    evidence_path,
+    rung_summary_attributes,
     write_rung_evidence_atomic,
 )
 from kaggriculture.search.optuna_space import (
@@ -38,12 +41,15 @@ from kaggriculture.search.optuna_state import (
     StudyEvidenceError,
     StudyIdentity,
     StudyIdentityError,
+    StudyOwnershipError,
     StudyPaths,
     StudyPreflight,
     build_identity,
     close_and_hash_storage,
+    evaluation_semantics,
     open_study,
     reconcile_running_trials,
+    study_root_lock,
     terminal_counts,
     validate_study_evidence,
     validate_study_paths,
@@ -77,6 +83,22 @@ PANELS = PanelSet(
 WEIGHTS = StrengthWeights({name: index % 4 + 1 for index, name in enumerate(NAMES)})
 WARM_STARTS = (HybridConfig.default(),)
 PreflightFactory = Callable[[StudyPaths], StudyPreflight]
+
+
+def test_study_root_lock_is_nonblocking_and_writer_exclusive(tmp_path: Path) -> None:
+    """A second owner must fail immediately on the canonical study-root key."""
+    root = tmp_path / "study"
+    with study_root_lock(root, exclusive=True):
+        with pytest.raises(StudyOwnershipError, match="already owned"):
+            with study_root_lock(root, exclusive=True):
+                pytest.fail("second writer acquired the study")
+        with pytest.raises(StudyOwnershipError, match="already owned"):
+            with study_root_lock(root, exclusive=False):
+                pytest.fail("validator acquired a writer-owned study")
+
+    with study_root_lock(root, exclusive=False):
+        with study_root_lock(root, exclusive=False):
+            pass
 
 
 def _row(name: str) -> FrontierRow:
@@ -176,6 +198,7 @@ def preflight_factory(
 def test_identity_binds_every_semantic_input(identity: StudyIdentity) -> None:
     """The canonical study record includes every field that changes game meaning."""
     assert identity.study_name == "hybrid-optuna-v2"
+    assert identity.schema_version == 2
     assert identity.optuna_version == "4.9.0"
     assert identity.maximum_trials == 512
     assert identity.space_sha256 == SPACE_SHA256
@@ -193,6 +216,29 @@ def test_identity_binds_every_semantic_input(identity: StudyIdentity) -> None:
     assert identity.warm_start_sha256 == tuple(
         config_sha256(item) for item in WARM_STARTS
     )
+    semantic_sources = evaluation_semantics()
+    assert identity.evaluation_semantics == semantic_sources
+    assert {
+        "src/kaggriculture/features.py",
+        "src/kaggriculture/hybrid/config.py",
+        "src/kaggriculture/hybrid/policy.py",
+        "src/kaggriculture/hybrid/runtime.py",
+        "src/kaggriculture/search/arena.py",
+        "src/kaggriculture/search/fitness.py",
+        "src/kaggriculture/search/optuna_protocol.py",
+        "src/kaggriculture/search/optuna_space.py",
+    } <= {name for name, _digest in semantic_sources}
+    assert (
+        identity.evaluation_semantics_sha256
+        == hashlib.sha256(
+            json.dumps(
+                semantic_sources,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+    )
     assert (
         identity.digest
         == hashlib.sha256(
@@ -204,6 +250,27 @@ def test_identity_binds_every_semantic_input(identity: StudyIdentity) -> None:
             ).encode()
         ).hexdigest()
     )
+
+
+def test_executable_semantic_drift_rejects_before_root_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identity: StudyIdentity,
+    identity_inputs: tuple[VerifiedFrontier, SnapshotLeague, FrontierReport, Path],
+) -> None:
+    """Changed executable evaluation bytes invalidate preflight, not SQLite later."""
+    _, snapshot, _, legacy_state = identity_inputs
+    paths = StudyPaths.from_root(tmp_path / "study")
+    changed = (*identity.evaluation_semantics[:-1], ("changed.py", "f" * 64))
+    monkeypatch.setattr(
+        "kaggriculture.search.optuna_state.evaluation_semantics",
+        lambda: changed,
+    )
+
+    with pytest.raises(StudyIdentityError, match="evaluation semantics"):
+        validate_study_paths(paths, snapshot, legacy_state, identity)
+
+    assert not paths.root.exists()
 
 
 def test_resume_rejects_semantic_drift_before_sqlite_mutation(
@@ -300,7 +367,7 @@ def test_preflight_rejects_parent_traversal_and_every_fixed_output_alias(
     identity: StudyIdentity,
     identity_inputs: tuple[VerifiedFrontier, SnapshotLeague, FrontierReport, Path],
 ) -> None:
-    """Lexical traversal and all six fixed outputs are protected before mutation."""
+    """Lexical traversal and all fixed outputs are protected before mutation."""
     _, snapshot, _, legacy_state = identity_inputs
     traversal = StudyPaths.from_root(
         tmp_path / "sibling" / ".." / "snapshot" / "new-study"
@@ -309,7 +376,14 @@ def test_preflight_rejects_parent_traversal_and_every_fixed_output_alias(
         validate_study_paths(traversal, snapshot, legacy_state, identity)
     assert not (Path(snapshot.root) / "new-study").exists()
 
-    for field in ("sqlite", "identity", "evidence", "diagnostic", "finalists"):
+    for field in (
+        "sqlite",
+        "identity",
+        "evidence",
+        "quarantine",
+        "diagnostic",
+        "finalists",
+    ):
         root = tmp_path / f"study-{field}"
         root.mkdir()
         paths = StudyPaths.from_root(root)
@@ -353,6 +427,66 @@ def test_open_rechecks_preflight_external_bytes_before_mutating_root(
         open_study(paths, identity, preflight)
 
     assert not paths.root.exists()
+
+
+def _write_identity_only(paths: StudyPaths, identity: StudyIdentity) -> None:
+    paths.root.mkdir(parents=True)
+    paths.identity.write_bytes(
+        json.dumps(
+            identity.model_dump(mode="json"),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+
+
+def test_first_open_recovers_identity_written_before_sqlite(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """Restart after durable identity publication completes the same empty study."""
+    paths = StudyPaths.from_root(tmp_path / "identity-only")
+    _write_identity_only(paths, identity)
+
+    study = open_study(paths, identity, preflight_factory(paths))
+
+    assert paths.sqlite.is_file()
+    assert study.user_attrs["study_identity_sha256"] == identity.digest
+    assert study.trials == []
+
+
+def test_first_open_recovers_initialized_sqlite_without_named_study(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """Restart after RDB schema initialization creates exactly the named study."""
+    paths = StudyPaths.from_root(tmp_path / "schema-only")
+    _write_identity_only(paths, identity)
+    RDBStorage(f"sqlite:///{paths.sqlite.absolute()}")
+
+    study = open_study(paths, identity, preflight_factory(paths))
+
+    assert study.study_name == identity.study_name
+    assert study.user_attrs["study_identity_sha256"] == identity.digest
+    assert study.trials == []
+
+
+def test_first_open_recovers_named_empty_study_without_identity_attribute(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """Restart after named-study creation installs only the missing identity attr."""
+    paths = StudyPaths.from_root(tmp_path / "missing-attribute")
+    _write_identity_only(paths, identity)
+    storage = RDBStorage(f"sqlite:///{paths.sqlite.absolute()}")
+    optuna.create_study(
+        storage=storage,
+        study_name=identity.study_name,
+        direction="maximize",
+    )
+
+    study = open_study(paths, identity, preflight_factory(paths))
+
+    assert study.user_attrs["study_identity_sha256"] == identity.digest
+    assert study.trials == []
 
 
 def test_resume_reconstructs_exact_sampler_and_pruner(
@@ -440,12 +574,13 @@ def _set_summary(
     trial: optuna.trial.Trial,
     evidence_digest: str,
     evidence: RungEvidence,
+    paths: StudyPaths,
 ) -> None:
-    trial.set_user_attr("config_sha256", evidence.config_sha256)
-    trial.set_user_attr("rung", evidence.rung)
-    trial.set_user_attr("resource_step", evidence.resource_step)
-    trial.set_user_attr("objective", evidence.objective)
-    trial.set_user_attr("evidence_sha256", evidence_digest)
+    path = evidence_path(paths.root, evidence.trial_number, evidence.rung)
+    for key, value in rung_summary_attributes(
+        evidence, path, evidence_digest, paths.root
+    ).items():
+        trial.set_user_attr(key, value)
 
 
 def _frozen_trial_payload(trials: list[optuna.trial.FrozenTrial]) -> list[object]:
@@ -483,7 +618,7 @@ def _complete_trial(
     spec = RungSpec(1, 1, PANELS.rung_1, (860_000, 860_001, 860_002, 860_003))
     evidence = build_rung_evidence(number, config, spec, _rung_rows(spec), WEIGHTS)
     _, digest = write_rung_evidence_atomic(paths.root, evidence)
-    _set_summary(trial, digest, evidence)
+    _set_summary(trial, digest, evidence, paths)
     assert evidence.objective is not None
     trial.report(evidence.objective, step=evidence.resource_step)
     study.tell(trial, evidence.objective)
@@ -503,7 +638,7 @@ def test_resume_marks_only_stale_running_trial_failed(
     running = study.ask()
     before = _frozen_trial_payload(study.trials[:2])
 
-    reconciled = reconcile_running_trials(study)
+    reconciled = reconcile_running_trials(study, paths, identity)
 
     assert reconciled == (running.number,)
     assert study.trials[2].state is TrialState.FAIL
@@ -525,7 +660,109 @@ def test_reconciliation_private_storage_bridge_is_version_guarded(
     monkeypatch.setattr(optuna, "__version__", "9.9.9")
 
     with pytest.raises(RuntimeError, match="private storage bridge"):
-        reconcile_running_trials(study)
+        reconcile_running_trials(study, paths, identity)
+
+    assert study.trials[trial.number].state is TrialState.RUNNING
+
+
+def _running_rung_one(
+    study: optuna.Study,
+    paths: StudyPaths,
+    *,
+    report: bool,
+) -> tuple[optuna.Trial, RungEvidence, Path, str]:
+    trial = study.ask()
+    config = suggest_config(trial)
+    spec = RungSpec(1, 1, PANELS.rung_1, tuple(range(860_000, 860_004)))
+    evidence = build_rung_evidence(
+        trial.number,
+        config,
+        spec,
+        _rung_rows(spec),
+        WEIGHTS,
+        arena_wall_seconds=0.5,
+        trial_wall_seconds=0.75,
+    )
+    path, digest = write_rung_evidence_atomic(paths.root, evidence)
+    if report:
+        assert evidence.objective is not None
+        trial.report(evidence.objective, evidence.resource_step)
+    return trial, evidence, path, digest
+
+
+def test_restart_quarantines_canonical_evidence_without_sqlite_intermediate(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """Published evidence is uncommitted until its exact intermediate is durable."""
+    paths = StudyPaths.from_root(tmp_path / "uncommitted")
+    study = open_study(paths, identity, preflight_factory(paths))
+    trial, _evidence, path, _digest = _running_rung_one(study, paths, report=False)
+
+    reconciled = reconcile_running_trials(study, paths, identity)
+
+    assert reconciled == (trial.number,)
+    assert not path.exists()
+    quarantined = tuple(paths.quarantine.iterdir())
+    assert len(quarantined) == 1
+    assert "uncommitted" in quarantined[0].name
+    validate_study_evidence(study, paths, identity)
+
+
+def test_restart_restores_summary_from_evidence_and_exact_intermediate(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """A reported rung can reconstruct missing attrs before the stale row is failed."""
+    paths = StudyPaths.from_root(tmp_path / "committed")
+    study = open_study(paths, identity, preflight_factory(paths))
+    trial, evidence, path, digest = _running_rung_one(study, paths, report=True)
+    assert study.trials[trial.number].user_attrs == {}
+
+    reconciled = reconcile_running_trials(study, paths, identity)
+
+    frozen = study.trials[trial.number]
+    assert reconciled == (trial.number,)
+    assert frozen.state is TrialState.FAIL
+    assert frozen.user_attrs["evidence_sha256"] == digest
+    assert frozen.user_attrs["evidence_path"] == str(path.relative_to(paths.root))
+    assert frozen.user_attrs["arena_wall_seconds"] == evidence.arena_wall_seconds
+    assert frozen.user_attrs["trial_wall_seconds"] == evidence.trial_wall_seconds
+    validate_study_evidence(study, paths, identity)
+
+
+def test_restart_durably_quarantines_abandoned_atomic_temporary(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """A hard-kill temporary is preserved outside the canonical evidence namespace."""
+    paths = StudyPaths.from_root(tmp_path / "temporary")
+    study = open_study(paths, identity, preflight_factory(paths))
+    trial = study.ask()
+    suggest_config(trial)
+    paths.evidence.mkdir()
+    temporary = paths.evidence / ".trial-0-rung-1.json.deadbeef.tmp"
+    temporary.write_bytes(b'{"incomplete":')
+
+    reconcile_running_trials(study, paths, identity)
+
+    assert not temporary.exists()
+    quarantined = tuple(paths.quarantine.iterdir())
+    assert len(quarantined) == 1
+    assert "temporary" in quarantined[0].name
+    assert quarantined[0].read_bytes() == b'{"incomplete":'
+    validate_study_evidence(study, paths, identity)
+
+
+def test_restart_rejects_intermediate_without_canonical_evidence(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """SQLite reporting alone cannot fabricate the missing canonical game facts."""
+    paths = StudyPaths.from_root(tmp_path / "missing-evidence")
+    study = open_study(paths, identity, preflight_factory(paths))
+    trial = study.ask()
+    suggest_config(trial)
+    trial.report(0.5, 1)
+
+    with pytest.raises(StudyEvidenceError, match="intermediate.*evidence"):
+        reconcile_running_trials(study, paths, identity)
 
     assert study.trials[trial.number].state is TrialState.RUNNING
 
@@ -613,7 +850,7 @@ def test_validation_rejects_orphan_evidence_and_accepts_execution_failed_trial(
     rows[key] = GameResult(key, None, None, 0.01, "engine failed")
     failed = build_rung_evidence(trial.number, config, spec, rows, WEIGHTS)
     _, digest = write_rung_evidence_atomic(paths.root, failed)
-    _set_summary(trial, digest, failed)
+    _set_summary(trial, digest, failed, paths)
     study.tell(trial, state=TrialState.FAIL)
 
     validate_study_evidence(study, paths, identity)
@@ -661,7 +898,7 @@ def test_validation_rejects_extra_intermediate_resource_step(
             WEIGHTS,
         )
         _, digest = write_rung_evidence_atomic(paths.root, evidence)
-        _set_summary(trial, digest, evidence)
+        _set_summary(trial, digest, evidence, paths)
         assert evidence.objective is not None
         trial.report(evidence.objective, resource_step)
         final = evidence
@@ -686,7 +923,7 @@ def test_validation_rejects_tampered_pruned_terminal_value(
         trial.number, config, spec, _rung_rows(spec), WEIGHTS
     )
     _, digest = write_rung_evidence_atomic(paths.root, evidence)
-    _set_summary(trial, digest, evidence)
+    _set_summary(trial, digest, evidence, paths)
     assert evidence.objective is not None
     trial.report(evidence.objective, 1)
     study.tell(trial, state=TrialState.PRUNED)
@@ -757,7 +994,7 @@ def test_validation_accepts_complete_cumulative_evidence(
             trial.number, config, spec, _rung_rows(spec), WEIGHTS
         )
         _, digest = write_rung_evidence_atomic(paths.root, evidence)
-        _set_summary(trial, digest, evidence)
+        _set_summary(trial, digest, evidence, paths)
         assert evidence.objective is not None
         trial.report(evidence.objective, step=resource_step)
         final = evidence

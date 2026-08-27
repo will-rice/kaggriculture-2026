@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 from collections.abc import Sequence
@@ -49,6 +50,7 @@ from kaggriculture.search.optuna_state import (
     SeedBankIdentity,
     StudyIdentity,
     StudyPaths,
+    evaluation_semantics,
     reconcile_running_trials,
     validate_study_evidence,
 )
@@ -178,6 +180,9 @@ def test_objective_writes_each_rung_before_reporting_and_pruning(
     original = __import__(
         "kaggriculture.search.optuna_search", fromlist=["write_rung_evidence_atomic"]
     ).write_rung_evidence_atomic
+    original_summary = __import__(
+        "kaggriculture.search.optuna_search", fromlist=["_set_trial_summary"]
+    )._set_trial_summary
 
     def recording_write(root: Path, evidence: RungEvidence) -> tuple[Path, str]:
         trial.events.append(f"write:rung{evidence.rung}")
@@ -187,15 +192,27 @@ def test_objective_writes_each_rung_before_reporting_and_pruning(
         "kaggriculture.search.optuna_search.write_rung_evidence_atomic",
         recording_write,
     )
+
+    def recording_summary(*args: object, **kwargs: object) -> None:
+        evidence = cast(RungEvidence, args[1])
+        trial.events.append(f"summary:rung{evidence.rung}")
+        original_summary(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "kaggriculture.search.optuna_search._set_trial_summary",
+        recording_summary,
+    )
     with arena:
         with pytest.raises(optuna.TrialPruned, match="rung 2"):
             coordinator.objective(cast(optuna.Trial, trial))
     assert trial.events == [
         "write:rung1",
         "report:1",
+        "summary:rung1",
         "prune:1",
         "write:rung2",
         "report:4",
+        "summary:rung2",
         "prune:4",
     ]
     assert len(arena.requested_keys) == 24 + 168
@@ -236,6 +253,8 @@ def test_completed_rung_three_returns_exact_stored_objective(tmp_path: Path) -> 
     with arena:
         value = coordinator.objective(cast(optuna.Trial, RecordingTrial()))
     assert value == load_evidence(tmp_path, trial=0, rung=3).objective
+    final = load_evidence(tmp_path, trial=0, rung=3)
+    assert final.trial_wall_seconds >= final.arena_wall_seconds > 0.0
     assert len(arena.requested_keys) == 24 + 168 + 512
 
 
@@ -250,6 +269,7 @@ def warm_configs() -> tuple[HybridConfig, ...]:
 
 
 def identity_fixture(warm_starts: Sequence[HybridConfig]) -> StudyIdentity:
+    semantic_sources = evaluation_semantics()
     return StudyIdentity(
         engine="test-engine",
         manifest_sha256="a" * 64,
@@ -257,6 +277,15 @@ def identity_fixture(warm_starts: Sequence[HybridConfig]) -> StudyIdentity:
         source_sha256=(),
         league_snapshots=(),
         space_sha256="c" * 64,
+        evaluation_semantics=semantic_sources,
+        evaluation_semantics_sha256=hashlib.sha256(
+            json.dumps(
+                semantic_sources,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest(),
         sampler=SamplerIdentity(),
         pruner=PrunerIdentity(),
         seed_banks=SeedBankIdentity(
@@ -316,6 +345,28 @@ def test_fresh_study_enqueues_eight_warm_starts_once() -> None:
     enqueue_warm_starts(study, configs)
     enqueue_warm_starts(study, configs)
     assert len(study.trials) == 8
+    assert [trial.system_attrs["fixed_params"] for trial in study.trials] == [
+        parameters_for_config(config) for config in configs
+    ]
+
+
+@pytest.mark.parametrize("prefix_length", range(1, 8))
+def test_restart_completes_an_exact_partial_warm_start_prefix(
+    prefix_length: int,
+) -> None:
+    """A crash after any enqueue boundary resumes without duplicating prior rows."""
+    study = optuna.create_study()
+    configs = warm_configs()
+    for config in configs[:prefix_length]:
+        study.enqueue_trial(
+            parameters_for_config(config),
+            user_attrs={"warm_start_sha256": config_sha256(config)},
+        )
+
+    enqueue_warm_starts(study, configs)
+
+    assert len(study.trials) == 8
+    assert [trial.number for trial in study.trials] == list(range(8))
     assert [trial.system_attrs["fixed_params"] for trial in study.trials] == [
         parameters_for_config(config) for config in configs
     ]
@@ -576,7 +627,7 @@ def test_interrupt_closes_arena_preserves_evidence_and_remains_reconcilable(
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.RUNNING,
     )
-    reconcile_running_trials(study)
+    reconcile_running_trials(study, paths, identity)
     validate_study_evidence(study, paths, identity)
 
 
@@ -640,7 +691,7 @@ def test_interrupt_after_evidence_write_finishes_optuna_commit_boundary(
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.RUNNING,
     )
-    reconcile_running_trials(study)
+    reconcile_running_trials(study, paths, identity)
     validate_study_evidence(study, paths, identity)
 
 
@@ -681,7 +732,7 @@ def test_interrupt_during_arena_entry_closes_it_and_restores_handlers(
     assert {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     } == previous_handlers
-    reconcile_running_trials(study)
+    reconcile_running_trials(study, paths, identity)
     validate_study_evidence(study, paths, identity)
 
 

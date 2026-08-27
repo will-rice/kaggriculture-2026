@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from types import FrameType
 from typing import Iterator, Literal, cast
 
@@ -28,6 +29,7 @@ from kaggriculture.search.optuna_protocol import (
     build_rung_evidence,
     evidence_path,
     missing_game_tasks,
+    rung_summary_attributes,
     write_rung_evidence_atomic,
 )
 from kaggriculture.search.optuna_space import (
@@ -185,6 +187,8 @@ class OptunaCoordinator:
         candidate = HybridOpponent(to_runtime(config))
         completed: dict[GameKey, GameResult] = {}
         evidence: RungEvidence | None = None
+        trial_started = perf_counter()
+        arena_wall_seconds = 0.0
         for spec in self.rungs:
             tasks = missing_game_tasks(
                 candidate,
@@ -193,7 +197,9 @@ class OptunaCoordinator:
                 spec.seeds,
                 completed,
             )
+            arena_started = perf_counter()
             rows = self.arena.run(tasks)
+            arena_wall_seconds += perf_counter() - arena_started
             completed.update((row.key, row) for row in rows)
             evidence = build_rung_evidence(
                 trial.number,
@@ -201,6 +207,8 @@ class OptunaCoordinator:
                 spec,
                 completed,
                 self.weights,
+                arena_wall_seconds=arena_wall_seconds,
+                trial_wall_seconds=perf_counter() - trial_started,
             )
             boundary = (
                 self.interruptions.commit_boundary()
@@ -209,11 +217,11 @@ class OptunaCoordinator:
             )
             with boundary:
                 path, digest = write_rung_evidence_atomic(self.paths.root, evidence)
-                _set_trial_summary(trial, evidence, path, digest, self.paths.root)
                 if not evidence.failures:
                     if evidence.objective is None:
                         raise RuntimeError("clean rung evidence has no objective")
                     trial.report(evidence.objective, step=spec.resource_step)
+                _set_trial_summary(trial, evidence, path, digest, self.paths.root)
             if evidence.failures:
                 raise TrialEvaluationError("; ".join(evidence.failures))
             if trial.should_prune():
@@ -231,35 +239,7 @@ def _set_trial_summary(
     root: Path,
 ) -> None:
     """Persist canonical scalar/count/path facts while raw games stay on disk."""
-    attributes: dict[str, object] = {
-        "config_sha256": evidence.config_sha256,
-        "rung": evidence.rung,
-        "resource_step": evidence.resource_step,
-        "primary": evidence.primary,
-        "dense_margin": evidence.dense_margin,
-        "objective": evidence.objective,
-        "games": len(evidence.games),
-        "failures": len(evidence.failures),
-        "runtime_seconds": sum(game.runtime_seconds for game in evidence.games),
-        "evidence_path": str(path.relative_to(root)),
-        "evidence_sha256": digest,
-    }
-    for name, matchup in evidence.matchups.items():
-        prefix = f"opponent/{name}"
-        attributes.update(
-            {
-                f"{prefix}/wins": matchup.wins,
-                f"{prefix}/draws": matchup.draws,
-                f"{prefix}/losses": matchup.losses,
-                f"{prefix}/games": matchup.games,
-                f"{prefix}/win_points": matchup.win_points,
-                f"{prefix}/paired_normalized_margin": (
-                    matchup.paired_normalized_margin
-                ),
-                f"{prefix}/runtime_seconds": matchup.runtime_seconds,
-            }
-        )
-    for key, value in attributes.items():
+    for key, value in rung_summary_attributes(evidence, path, digest, root).items():
         trial.set_user_attr(key, value)
 
 
@@ -276,33 +256,54 @@ def enqueue_warm_starts(
     if len(expected_digests) != len(set(expected_digests)):
         raise ValueError("warm starts must contain eight distinct configurations")
     trials = study.get_trials(deepcopy=False)
-    if not trials:
-        for config, digest in zip(starts, expected_digests, strict=True):
+    prefix_length = min(len(trials), 8)
+    if tuple(trial.number for trial in trials[:prefix_length]) != tuple(
+        range(prefix_length)
+    ):
+        raise ValueError("warm-start trial numbers are not a contiguous prefix")
+    for number, (trial, config, digest) in enumerate(
+        zip(
+            trials[:prefix_length],
+            starts[:prefix_length],
+            expected_digests[:prefix_length],
+            strict=True,
+        )
+    ):
+        _validate_warm_start_trial(number, trial, config, digest)
+    if prefix_length < 8:
+        if any(trial.state is not TrialState.WAITING for trial in trials):
+            raise ValueError("partial warm-start prefix must contain only WAITING rows")
+        for config, digest in zip(
+            starts[prefix_length:],
+            expected_digests[prefix_length:],
+            strict=True,
+        ):
             study.enqueue_trial(
                 parameters_for_config(config),
                 user_attrs={"warm_start_sha256": digest},
             )
-        return
-    if len(trials) < 8 or tuple(trial.number for trial in trials[:8]) != tuple(
-        range(8)
-    ):
-        raise ValueError("study does not contain the complete trials 0-7 warm start")
-    for number, (trial, config, digest) in enumerate(
-        zip(trials[:8], starts, expected_digests, strict=True)
-    ):
-        expected = parameters_for_config(config)
-        fixed = trial.system_attrs.get("fixed_params")
-        actual = dict(trial.params) if trial.params else fixed
-        if actual != expected:
-            raise ValueError(f"trial {number} parameters differ from warm start")
-        try:
-            rebuilt = suggest_config(FixedTrial(cast(dict[str, object], actual)))
-        except (KeyError, ValueError, ValidationError) as error:
-            raise ValueError(
-                f"trial {number} warm start parameters are invalid"
-            ) from error
-        if config_sha256(rebuilt) != digest:
-            raise ValueError(f"trial {number} config digest differs from warm start")
+
+
+def _validate_warm_start_trial(
+    number: int,
+    trial: FrozenTrial,
+    config: HybridConfig,
+    digest: str,
+) -> None:
+    """Validate one existing row of the identity-bound warm-start prefix."""
+    expected = parameters_for_config(config)
+    fixed = trial.system_attrs.get("fixed_params")
+    actual = dict(trial.params) if trial.params else fixed
+    if actual != expected:
+        raise ValueError(f"trial {number} parameters differ from warm start")
+    try:
+        rebuilt = suggest_config(FixedTrial(cast(dict[str, object], actual)))
+    except (KeyError, ValueError, ValidationError) as error:
+        raise ValueError(f"trial {number} warm start parameters are invalid") from error
+    if config_sha256(rebuilt) != digest:
+        raise ValueError(f"trial {number} config digest differs from warm start")
+    if trial.user_attrs.get("warm_start_sha256") != digest:
+        raise ValueError(f"trial {number} warm-start identity attribute differs")
 
 
 def run_search(

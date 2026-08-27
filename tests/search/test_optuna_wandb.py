@@ -154,6 +154,8 @@ def terminal_trial(number: int) -> object:
             "games": 704,
             "failures": 0,
             "runtime_seconds": 32.0,
+            "arena_wall_seconds": 6.0,
+            "trial_wall_seconds": 8.0,
             "primary": 0.5,
             "dense_margin": 0.25,
             "objective": 0.50000025,
@@ -170,12 +172,16 @@ def set_task_five_attrs(
     *,
     games: int = 24,
     runtime_seconds: float = 12.0,
+    arena_wall_seconds: float = 2.0,
+    trial_wall_seconds: float = 3.0,
 ) -> None:
     trial.set_user_attr("rung", 1)
     trial.set_user_attr("resource_step", 1)
     trial.set_user_attr("games", games)
     trial.set_user_attr("failures", 0)
     trial.set_user_attr("runtime_seconds", runtime_seconds)
+    trial.set_user_attr("arena_wall_seconds", arena_wall_seconds)
+    trial.set_user_attr("trial_wall_seconds", trial_wall_seconds)
     trial.set_user_attr("primary", 0.5)
     trial.set_user_attr("dense_margin", 0.25)
     trial.set_user_attr("objective", 0.50000025)
@@ -346,6 +352,8 @@ def test_trial_metrics_rejects_nonfinite_values_and_preserves_scalar_telemetry()
         "games",
         "failures",
         "runtime_seconds",
+        "arena_wall_seconds",
+        "trial_wall_seconds",
         "primary",
         "dense_margin",
         "objective",
@@ -396,19 +404,19 @@ def test_callback_derives_throughput_and_eta_from_task_five_trial_facts(
     )
     session.callback(study, study.trials[0])
 
-    assert api.history[0].metrics["throughput_games_per_second"] == 2.0
-    assert api.history[0].metrics["eta_seconds"] == 12.0 * 511.0
+    assert api.history[0].metrics["throughput_games_per_second"] == 8.0
+    assert api.history[0].metrics["eta_seconds"] == 3.0 * 511.0
 
 
 @pytest.mark.parametrize("runtime", (0.0, float("nan")))
-def test_invalid_task_five_runtime_disables_telemetry_without_changing_study(
+def test_invalid_trial_wall_time_disables_telemetry_without_changing_study(
     identity: StudyIdentity,
     runtime: float,
 ) -> None:
     study = optuna.create_study(direction="maximize")
 
     def objective(trial: optuna.Trial) -> float:
-        set_task_five_attrs(trial, runtime_seconds=runtime)
+        set_task_five_attrs(trial, trial_wall_seconds=runtime)
         return 0.5
 
     study.optimize(objective, n_trials=1)

@@ -39,6 +39,7 @@ from kaggriculture.search.optuna_state import (
     StudyIdentity,
     StudyPaths,
     close_and_hash_storage,
+    evaluation_semantics,
     terminal_counts,
     validate_study_evidence,
 )
@@ -414,6 +415,20 @@ def _read_regular_file(path: Path, label: str) -> bytes:
 
 def _validate_semantic_identity(identity: StudyIdentity) -> None:
     """Pin every protocol constant not derived from SQLite evidence itself."""
+    current_semantics = evaluation_semantics()
+    current_digest = hashlib.sha256(
+        json.dumps(
+            current_semantics,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    if (
+        identity.evaluation_semantics != current_semantics
+        or identity.evaluation_semantics_sha256 != current_digest
+    ):
+        raise ValueError("executable evaluation semantics differ from identity")
     if identity.space_sha256 != SPACE_SHA256:
         raise ValueError("parameter-space digest differs from the production space")
     if (

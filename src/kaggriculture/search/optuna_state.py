@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, Self, cast
+from typing import Iterator, Literal, Self, cast
 
 import optuna
 from optuna.pruners import SuccessiveHalvingPruner
 from optuna.samplers import TPESampler
 from optuna.storages import BaseStorage, RDBStorage
 from optuna.trial import FrozenTrial, TrialState
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from kaggriculture.hybrid.config import HybridConfig
 from kaggriculture.search.evolution import PROMOTION_SEEDS, SnapshotLeague
@@ -31,6 +34,7 @@ from kaggriculture.search.optuna_protocol import (
     PanelSet,
     RungEvidence,
     evidence_path,
+    rung_summary_attributes,
 )
 from kaggriculture.search.optuna_space import (
     SPACE_SHA256,
@@ -42,12 +46,26 @@ from kaggriculture.search.promotion import DETERMINISM_SEEDS
 
 _IDENTITY_ATTRIBUTE = "study_identity_sha256"
 _PREFLIGHT_CAPABILITY = object()
-_SUMMARY_ATTRIBUTES = (
-    "config_sha256",
-    "rung",
-    "resource_step",
-    "objective",
-    "evidence_sha256",
+_EVALUATION_SEMANTIC_PATHS = (
+    "src/kaggriculture/action_codec.py",
+    "src/kaggriculture/actions.py",
+    "src/kaggriculture/constants.py",
+    "src/kaggriculture/features.py",
+    "src/kaggriculture/observation.py",
+    "src/kaggriculture/hybrid/config.py",
+    "src/kaggriculture/hybrid/jobs.py",
+    "src/kaggriculture/hybrid/market.py",
+    "src/kaggriculture/hybrid/opening.py",
+    "src/kaggriculture/hybrid/policy.py",
+    "src/kaggriculture/hybrid/runtime.py",
+    "src/kaggriculture/hybrid/schema.py",
+    "src/kaggriculture/search/arena.py",
+    "src/kaggriculture/search/arena_pool.py",
+    "src/kaggriculture/search/fitness.py",
+    "src/kaggriculture/search/optuna_protocol.py",
+    "src/kaggriculture/search/optuna_search.py",
+    "src/kaggriculture/search/optuna_space.py",
+    "src/kaggriculture/search/route.py",
 )
 
 
@@ -59,6 +77,40 @@ class StudyEvidenceError(ValueError):
     """SQLite trial state and canonical evidence disagree."""
 
 
+class StudyOwnershipError(RuntimeError):
+    """Another process already owns the canonical study root."""
+
+
+@contextmanager
+def study_root_lock(root: Path, *, exclusive: bool) -> Iterator[Path]:
+    """Take one nonblocking process lock keyed by the canonical study root."""
+    canonical = _canonical_lexical_path(root)
+    _reject_symlink_components(canonical)
+    parent = canonical.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(parent)
+    lock_path = parent / f".{canonical.name}.lock"
+    if lock_path.is_symlink():
+        raise StudyOwnershipError("study lock path cannot be a symlink")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise StudyOwnershipError("study lock path must be a regular file")
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StudyOwnershipError(
+                f"study root is already owned: {canonical}"
+            ) from error
+        yield lock_path
+    finally:
+        os.close(descriptor)
+
+
 @dataclass(frozen=True)
 class StudyPaths:
     """The only permitted durable locations under one Optuna run root."""
@@ -67,6 +119,7 @@ class StudyPaths:
     sqlite: Path
     identity: Path
     evidence: Path
+    quarantine: Path
     diagnostic: Path
     finalists: Path
 
@@ -78,6 +131,7 @@ class StudyPaths:
             sqlite=root / "study.sqlite3",
             identity=root / "identity.json",
             evidence=root / "evidence",
+            quarantine=root / "quarantine",
             diagnostic=root / "diagnostic.json",
             finalists=root / "finalists.json",
         )
@@ -158,7 +212,7 @@ class StudyIdentity(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     study_name: Literal["hybrid-optuna-v2"] = "hybrid-optuna-v2"
     optuna_version: Literal["4.9.0"] = "4.9.0"
     engine: str
@@ -167,6 +221,8 @@ class StudyIdentity(BaseModel):
     source_sha256: tuple[tuple[str, str], ...]
     league_snapshots: tuple[tuple[str, str, str, str], ...]
     space_sha256: str
+    evaluation_semantics: tuple[tuple[str, str], ...]
+    evaluation_semantics_sha256: str
     sampler: SamplerIdentity
     pruner: PrunerIdentity
     seed_banks: SeedBankIdentity
@@ -176,6 +232,26 @@ class StudyIdentity(BaseModel):
     warm_start_sha256: tuple[str, ...]
     legacy_state_sha256: str
     maximum_trials: Literal[512] = 512
+
+    @model_validator(mode="after")
+    def has_canonical_evaluation_semantics(self) -> Self:
+        """Bind a canonical, content-addressed executable source manifest."""
+        if self.evaluation_semantics != tuple(sorted(self.evaluation_semantics)):
+            raise ValueError("evaluation semantics must be sorted")
+        names = tuple(name for name, _digest in self.evaluation_semantics)
+        if len(names) != len(set(names)) or any(
+            Path(name).is_absolute() or Path(name) == Path() or ".." in Path(name).parts
+            for name in names
+        ):
+            raise ValueError("evaluation semantic paths must be unique relative paths")
+        for _name, digest in self.evaluation_semantics:
+            _required_sha256(digest, "evaluation semantic source")
+        expected = hashlib.sha256(
+            _canonical_json(self.evaluation_semantics)
+        ).hexdigest()
+        if self.evaluation_semantics_sha256 != expected:
+            raise ValueError("evaluation semantics SHA-256 differs from its manifest")
+        return self
 
     @property
     def digest(self) -> str:
@@ -203,6 +279,7 @@ def build_identity(
             for source in snapshot.sources
         )
     )
+    semantic_sources = evaluation_semantics()
     return StudyIdentity(
         engine=frontier.engine,
         manifest_sha256=_required_sha256(frontier.manifest_sha256, "manifest"),
@@ -212,6 +289,10 @@ def build_identity(
         source_sha256=source_sha256,
         league_snapshots=snapshots,
         space_sha256=SPACE_SHA256,
+        evaluation_semantics=semantic_sources,
+        evaluation_semantics_sha256=hashlib.sha256(
+            _canonical_json(semantic_sources)
+        ).hexdigest(),
         sampler=SamplerIdentity(),
         pruner=PrunerIdentity(),
         seed_banks=SeedBankIdentity(
@@ -232,6 +313,21 @@ def build_identity(
         warm_start_sha256=tuple(config_sha256(config) for config in warm_starts),
         legacy_state_sha256=_required_sha256(legacy_state_sha256, "legacy state"),
     )
+
+
+def evaluation_semantics() -> tuple[tuple[str, str], ...]:
+    """Hash the reviewed executable source set that defines trial meaning."""
+    repository = _canonical_lexical_path(Path(__file__)).parents[3]
+    rows: list[tuple[str, str]] = []
+    for relative_name in _EVALUATION_SEMANTIC_PATHS:
+        source = repository / relative_name
+        _reject_symlink_components(source)
+        if not source.is_file() or source.is_symlink():
+            raise StudyIdentityError(
+                f"evaluation semantic source is not a real file: {relative_name}"
+            )
+        rows.append((relative_name, hashlib.sha256(source.read_bytes()).hexdigest()))
+    return tuple(sorted(rows))
 
 
 def validate_study_paths(
@@ -328,19 +424,26 @@ def open_study(
     if exists == (False, False):
         _create_run_root(paths)
         _write_identity(paths.identity, identity)
-        storage = RDBStorage(_sqlite_url(paths.sqlite))
-        study = optuna.create_study(
-            storage=storage,
-            sampler=_sampler_for(identity),
-            pruner=_pruner_for(identity),
-            study_name=identity.study_name,
-            direction="maximize",
-        )
-        study.set_user_attr(_IDENTITY_ATTRIBUTE, identity.digest)
-        return study
-    if exists != (True, True):
+        return _complete_initial_study(paths, identity)
+    if not paths.identity.exists():
         raise StudyIdentityError("study storage and identity file must appear together")
     _validate_stored_identity(paths.identity, identity)
+    if not _is_initialization_only_layout(paths):
+        if not paths.sqlite.exists():
+            raise StudyIdentityError(
+                "study storage and identity file must appear together"
+            )
+        _validate_sqlite_identity_readonly(paths.sqlite, identity)
+        return _load_study(paths, identity)
+    state = _sqlite_initialization_state(paths.sqlite, identity)
+    if state == "complete":
+        _validate_sqlite_identity_readonly(paths.sqlite, identity)
+        return _load_study(paths, identity)
+    return _complete_initial_study(paths, identity)
+
+
+def _load_study(paths: StudyPaths, identity: StudyIdentity) -> optuna.Study:
+    """Open a read-validated identity-bound study with exact sampler semantics."""
     _validate_sqlite_identity_readonly(paths.sqlite, identity)
     study = optuna.load_study(
         storage=RDBStorage(_sqlite_url(paths.sqlite)),
@@ -354,6 +457,122 @@ def open_study(
     return study
 
 
+def _is_initialization_only_layout(paths: StudyPaths) -> bool:
+    """Return whether no durable post-initialization artifact has ever appeared."""
+    if not paths.root.is_dir() or paths.root.is_symlink():
+        return False
+    allowed = {paths.identity.name, paths.sqlite.name}
+    return all(path.name in allowed for path in paths.root.iterdir())
+
+
+def _sqlite_initialization_state(
+    path: Path, identity: StudyIdentity
+) -> Literal["missing", "uninitialized", "missing_study", "missing_attr", "complete"]:
+    """Classify only recoverable empty first-open states through read-only SQLite."""
+    if not path.exists():
+        return "missing"
+    if not path.is_file() or path.is_symlink():
+        raise StudyIdentityError("SQLite storage is not a real file")
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "studies" not in tables:
+            return "uninitialized"
+        return _initialized_sqlite_state(connection, identity)
+    except sqlite3.DatabaseError as error:
+        raise StudyIdentityError("cannot read stored SQLite study identity") from error
+    finally:
+        connection.close()
+
+
+def _initialized_sqlite_state(
+    connection: sqlite3.Connection, identity: StudyIdentity
+) -> Literal["missing_study", "missing_attr", "complete"]:
+    """Classify a schema-complete database without mutating its study rows."""
+    studies = connection.execute(
+        "SELECT study_id, study_name FROM studies ORDER BY study_id"
+    ).fetchall()
+    named = [row for row in studies if row[1] == identity.study_name]
+    if not named:
+        if studies:
+            raise StudyIdentityError("SQLite study name differs from identity")
+        return "missing_study"
+    if len(studies) != 1 or len(named) != 1:
+        raise StudyIdentityError("SQLite contains unexpected study rows")
+    study_id = named[0][0]
+    directions = connection.execute(
+        "SELECT direction FROM study_directions WHERE study_id = ?", (study_id,)
+    ).fetchall()
+    if directions != [("MAXIMIZE",)]:
+        raise StudyIdentityError("SQLite study direction differs from MAXIMIZE")
+    return _sqlite_identity_attribute_state(connection, study_id, identity)
+
+
+def _sqlite_identity_attribute_state(
+    connection: sqlite3.Connection,
+    study_id: int,
+    identity: StudyIdentity,
+) -> Literal["missing_attr", "complete"]:
+    """Accept only an empty crash gap or the exact stored identity digest."""
+    attribute = connection.execute(
+        "SELECT value_json FROM study_user_attributes WHERE study_id = ? AND key = ?",
+        (study_id, _IDENTITY_ATTRIBUTE),
+    ).fetchone()
+    if attribute is None:
+        trial_count = connection.execute(
+            "SELECT COUNT(*) FROM trials WHERE study_id = ?", (study_id,)
+        ).fetchone()
+        other_attributes = connection.execute(
+            "SELECT COUNT(*) FROM study_user_attributes WHERE study_id = ?",
+            (study_id,),
+        ).fetchone()
+        if trial_count != (0,) or other_attributes != (0,):
+            raise StudyIdentityError(
+                "SQLite study identity attribute is missing from nonempty study"
+            )
+        return "missing_attr"
+    try:
+        digest = json.loads(attribute[0])
+    except json.JSONDecodeError as error:
+        raise StudyIdentityError(
+            "SQLite study identity attribute is invalid"
+        ) from error
+    if digest != identity.digest:
+        raise StudyIdentityError("study_identity_sha256 differs from identity.json")
+    return "complete"
+
+
+def _complete_initial_study(paths: StudyPaths, identity: StudyIdentity) -> optuna.Study:
+    """Idempotently finish the identity-first empty-study creation transaction."""
+    if not _is_initialization_only_layout(paths):
+        raise StudyIdentityError(
+            "incomplete first-open study contains post-initialization artifacts"
+        )
+    storage = RDBStorage(_sqlite_url(paths.sqlite))
+    study = optuna.create_study(
+        storage=storage,
+        sampler=_sampler_for(identity),
+        pruner=_pruner_for(identity),
+        study_name=identity.study_name,
+        direction="maximize",
+        load_if_exists=True,
+    )
+    if study.trials:
+        raise StudyIdentityError("incomplete first-open study already contains trials")
+    stored_digest = study.user_attrs.get(_IDENTITY_ATTRIBUTE)
+    if stored_digest is None:
+        study.set_user_attr(_IDENTITY_ATTRIBUTE, identity.digest)
+    elif stored_digest != identity.digest:
+        raise StudyIdentityError("study_identity_sha256 differs from identity.json")
+    _validate_sqlite_identity_readonly(paths.sqlite, identity)
+    return study
+
+
 def terminal_counts(study: optuna.Study) -> dict[str, int]:
     """Count only terminal trial states under stable lowercase keys."""
     trials = study.get_trials(deepcopy=False)
@@ -364,13 +583,120 @@ def terminal_counts(study: optuna.Study) -> dict[str, int]:
     }
 
 
-def reconcile_running_trials(study: optuna.Study) -> tuple[int, ...]:
-    """Mark only stale running rows failed before a restarted coordinator asks again."""
-    running = tuple(study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)))
+def reconcile_running_trials(
+    study: optuna.Study,
+    paths: StudyPaths,
+    identity: StudyIdentity,
+) -> tuple[int, ...]:
+    """Recover proven rung commits, quarantine gaps, then fail stale RUNNING rows."""
+    _validate_layout(paths)
+    _quarantine_abandoned_temporaries(paths)
+    trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+    evidence_by_trial = _load_evidence_records(paths, trials, allow_running=True)
+    running = tuple(
+        trial for trial in trials.values() if trial.state is TrialState.RUNNING
+    )
+    for trial in running:
+        _recover_running_trial(
+            study,
+            trial,
+            evidence_by_trial.get(trial.number, {}),
+            paths,
+            identity,
+        )
     for trial in running:
         _set_interruption_reason(study, trial)
         study.tell(trial.number, state=TrialState.FAIL)
     return tuple(trial.number for trial in running)
+
+
+def _recover_running_trial(
+    study: optuna.Study,
+    trial: FrozenTrial,
+    records: dict[int, tuple[RungEvidence, str]],
+    paths: StudyPaths,
+    identity: StudyIdentity,
+) -> None:
+    """Use only canonical evidence plus exact intermediate rows as commit proof."""
+    committed, uncommitted = _classify_running_evidence(trial, records, identity)
+    _validate_recovery_prefixes(trial, committed, uncommitted)
+    for evidence, _digest in uncommitted:
+        _quarantine_path(
+            evidence_path(paths.root, trial.number, evidence.rung),
+            paths,
+            "uncommitted",
+        )
+    if committed:
+        evidence, digest = committed[-1]
+        path = evidence_path(paths.root, trial.number, evidence.rung)
+        for key, value in rung_summary_attributes(
+            evidence, path, digest, paths.root
+        ).items():
+            _set_trial_user_attr(study, trial, key, value)
+
+
+def _classify_running_evidence(
+    trial: FrozenTrial,
+    records: dict[int, tuple[RungEvidence, str]],
+    identity: StudyIdentity,
+) -> tuple[
+    list[tuple[RungEvidence, str]],
+    list[tuple[RungEvidence, str]],
+]:
+    """Partition canonical running evidence by exact SQLite report proof."""
+    ordered_rungs = tuple(sorted(records))
+    if ordered_rungs and ordered_rungs != tuple(range(1, ordered_rungs[-1] + 1)):
+        raise StudyEvidenceError(
+            f"trial {trial.number} has non-cumulative running evidence"
+        )
+    stored_config_sha256: str | None = None
+    if records:
+        stored_config_sha256 = _config_sha256_from_trial_params(trial)
+    committed: list[tuple[RungEvidence, str]] = []
+    uncommitted: list[tuple[RungEvidence, str]] = []
+    missing = object()
+    for rung in ordered_rungs:
+        evidence, digest = records[rung]
+        _validate_evidence_identity(evidence, identity, trial.number)
+        if evidence.config_sha256 != stored_config_sha256:
+            raise StudyEvidenceError(
+                f"trial {trial.number} rung {rung} config differs from "
+                "stored parameters"
+            )
+        actual = trial.intermediate_values.get(evidence.resource_step, missing)
+        if actual is not missing and actual != evidence.objective:
+            raise StudyEvidenceError(
+                f"trial {trial.number} rung {rung} intermediate differs from evidence"
+            )
+        if evidence.objective is not None and actual == evidence.objective:
+            committed.append((evidence, digest))
+        else:
+            uncommitted.append((evidence, digest))
+    return committed, uncommitted
+
+
+def _validate_recovery_prefixes(
+    trial: FrozenTrial,
+    committed: list[tuple[RungEvidence, str]],
+    uncommitted: list[tuple[RungEvidence, str]],
+) -> None:
+    """Require reported and trailing unreported rungs to form one exact prefix."""
+    committed_steps = {evidence.resource_step for evidence, _digest in committed}
+    if set(trial.intermediate_values) != committed_steps:
+        raise StudyEvidenceError(
+            f"trial {trial.number} intermediate exists without canonical evidence"
+        )
+    committed_rungs = tuple(evidence.rung for evidence, _digest in committed)
+    if committed_rungs != tuple(range(1, len(committed_rungs) + 1)):
+        raise StudyEvidenceError(
+            f"trial {trial.number} committed evidence is not a cumulative prefix"
+        )
+    if uncommitted and any(
+        evidence.rung <= len(committed_rungs) for evidence, _digest in uncommitted
+    ):
+        raise StudyEvidenceError(
+            f"trial {trial.number} uncommitted evidence precedes a committed rung"
+        )
 
 
 def validate_study_evidence(
@@ -387,12 +713,15 @@ def validate_study_evidence(
     evidence_by_trial = _load_evidence_records(paths, trials)
     for number, trial in trials.items():
         _validate_terminal_trial_evidence(
-            number, trial, evidence_by_trial.get(number, {}), identity
+            number, trial, evidence_by_trial.get(number, {}), identity, paths
         )
 
 
 def _load_evidence_records(
-    paths: StudyPaths, trials: dict[int, FrozenTrial]
+    paths: StudyPaths,
+    trials: dict[int, FrozenTrial],
+    *,
+    allow_running: bool = False,
 ) -> dict[int, dict[int, tuple[RungEvidence, str]]]:
     """Load canonical evidence and reject orphan, duplicate, or active-trial rows."""
     loaded: dict[int, dict[int, tuple[RungEvidence, str]]] = {}
@@ -408,7 +737,7 @@ def _load_evidence_records(
                 "orphan completed evidence for trial "
                 f"{evidence.trial_number} rung {evidence.rung}"
             )
-        if trial.state is TrialState.RUNNING:
+        if trial.state is TrialState.RUNNING and not allow_running:
             raise StudyEvidenceError(
                 f"trial {evidence.trial_number} rung {evidence.rung} "
                 "has RUNNING SQLite state"
@@ -423,11 +752,47 @@ def _load_evidence_records(
     return loaded
 
 
+def _quarantine_abandoned_temporaries(paths: StudyPaths) -> None:
+    """Move only atomic-writer temporary names out of canonical evidence."""
+    if not paths.evidence.exists():
+        return
+    if not paths.evidence.is_dir() or paths.evidence.is_symlink():
+        raise StudyEvidenceError("evidence path is not a real directory")
+    pattern = re.compile(r"\.trial-\d+-rung-[123]\.json\..+\.tmp")
+    for path in sorted(paths.evidence.iterdir()):
+        if pattern.fullmatch(path.name):
+            _quarantine_path(path, paths, "temporary")
+
+
+def _quarantine_path(path: Path, paths: StudyPaths, reason: str) -> Path:
+    """Durably move one untrusted interrupted-write artifact without deleting it."""
+    if not path.is_file() or path.is_symlink():
+        raise StudyEvidenceError(f"cannot quarantine non-regular entry {path.name}")
+    if paths.quarantine.exists():
+        if not paths.quarantine.is_dir() or paths.quarantine.is_symlink():
+            raise StudyEvidenceError("quarantine path is not a real directory")
+    else:
+        paths.quarantine.mkdir()
+        _fsync_directory(paths.root)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    base = paths.quarantine / f"{path.name}.{reason}.{digest}"
+    destination = base
+    suffix = 0
+    while destination.exists() or destination.is_symlink():
+        suffix += 1
+        destination = base.with_name(f"{base.name}.{suffix}")
+    os.replace(path, destination)  # noqa: PTH105
+    _fsync_directory(path.parent)
+    _fsync_directory(paths.quarantine)
+    return destination
+
+
 def _validate_terminal_trial_evidence(
     number: int,
     trial: FrozenTrial,
     records: dict[int, tuple[RungEvidence, str]],
     identity: StudyIdentity,
+    paths: StudyPaths,
 ) -> None:
     """Check one terminal trial's cumulative rungs and final SQLite summary."""
     if trial.state is TrialState.RUNNING:
@@ -435,7 +800,7 @@ def _validate_terminal_trial_evidence(
     if not records:
         _validate_empty_terminal_trial(trial, number)
         return
-    _validate_present_terminal_trial(number, trial, records, identity)
+    _validate_present_terminal_trial(number, trial, records, identity, paths)
 
 
 def _validate_empty_terminal_trial(trial: FrozenTrial, number: int) -> None:
@@ -451,6 +816,7 @@ def _validate_present_terminal_trial(
     trial: FrozenTrial,
     records: dict[int, tuple[RungEvidence, str]],
     identity: StudyIdentity,
+    paths: StudyPaths,
 ) -> None:
     """Validate one complete ordered evidence sequence and its final trial state."""
     ordered_rungs = tuple(sorted(records))
@@ -478,7 +844,7 @@ def _validate_present_terminal_trial(
             raise StudyEvidenceError(
                 f"trial {number} rung {rung} config differs from its final evidence"
             )
-    _validate_trial_summary(trial, final, digest)
+    _validate_trial_summary(trial, final, digest, paths)
     if trial.state is TrialState.COMPLETE and ordered_rungs != (1, 2, 3):
         raise StudyEvidenceError(
             f"trial {number} is COMPLETE but is missing rung 3 evidence"
@@ -631,6 +997,18 @@ def _set_interruption_reason(study: optuna.Study, trial: FrozenTrial) -> None:
     storage.set_trial_system_attr(trial_id, "interruption_reason", "process_restarted")
 
 
+def _set_trial_user_attr(
+    study: optuna.Study, trial: FrozenTrial, key: str, value: object
+) -> None:
+    """Restore a canonical trial summary through the version-pinned bridge."""
+    storage = _optuna_49_private_storage(study)
+    trial_id = storage.get_trial_id_from_study_id_trial_number(
+        study._study_id,  # noqa: SLF001
+        trial.number,
+    )
+    storage.set_trial_user_attr(trial_id, key, value)
+
+
 def _validate_identity_inputs(
     frontier: VerifiedFrontier,
     snapshot: SnapshotLeague,
@@ -716,6 +1094,15 @@ def _validate_external_identity(
         != identity.legacy_state_sha256
     ):
         raise StudyIdentityError("legacy state SHA-256 differs from study identity")
+    semantic_sources = evaluation_semantics()
+    semantic_digest = hashlib.sha256(_canonical_json(semantic_sources)).hexdigest()
+    if (
+        semantic_sources != identity.evaluation_semantics
+        or semantic_digest != identity.evaluation_semantics_sha256
+    ):
+        raise StudyIdentityError(
+            "executable evaluation semantics differ from study identity"
+        )
 
 
 def _require_preflight(
@@ -812,6 +1199,7 @@ def _study_output_paths(paths: StudyPaths) -> tuple[Path, ...]:
         paths.sqlite,
         paths.identity,
         paths.evidence,
+        paths.quarantine,
         paths.diagnostic,
         paths.finalists,
     )
@@ -919,18 +1307,16 @@ def _validate_evidence_identity(
 
 
 def _validate_trial_summary(
-    trial: FrozenTrial, evidence: RungEvidence, digest: str
+    trial: FrozenTrial,
+    evidence: RungEvidence,
+    digest: str,
+    paths: StudyPaths,
 ) -> None:
     attributes = trial.user_attrs
-    expected = {
-        "config_sha256": evidence.config_sha256,
-        "rung": evidence.rung,
-        "resource_step": evidence.resource_step,
-        "objective": evidence.objective,
-        "evidence_sha256": digest,
-    }
-    for key in _SUMMARY_ATTRIBUTES:
-        if attributes.get(key, object()) != expected[key]:
+    path = evidence_path(paths.root, evidence.trial_number, evidence.rung)
+    expected = rung_summary_attributes(evidence, path, digest, paths.root)
+    for key, value in expected.items():
+        if attributes.get(key, object()) != value:
             raise StudyEvidenceError(
                 f"trial {trial.number} rung {evidence.rung} {key} "
                 "differs from canonical evidence"

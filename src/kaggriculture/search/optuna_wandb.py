@@ -226,7 +226,7 @@ def _progress_metrics(study: optuna.Study, maximum_trials: int) -> dict[str, flo
     if terminal_count == 0 or terminal_count > maximum_trials:
         raise ValueError("terminal trial count is outside the configured budget")
     games = sum(_positive_attr(item, "games") for item in terminal)
-    runtime = sum(_positive_attr(item, "runtime_seconds") for item in terminal)
+    runtime = sum(_positive_attr(item, "trial_wall_seconds") for item in terminal)
     throughput = games / runtime
     average_runtime = runtime / terminal_count
     eta = average_runtime * (maximum_trials - terminal_count)
