@@ -8,13 +8,13 @@ import json
 import os
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TypeVar, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from kaggriculture.hybrid.config import to_runtime
+from kaggriculture.hybrid.config import HybridConfig, to_runtime
 from kaggriculture.search.arena import HybridOpponent
 from kaggriculture.search.evolution import (
     FinalistArtifact,
@@ -27,6 +27,9 @@ from kaggriculture.search.frontier import (
     VerifiedFrontier,
     verify_frontier,
 )
+from kaggriculture.search.optuna_finalists import OptunaFinalistArtifact
+from kaggriculture.search.optuna_protocol import derive_panels
+from kaggriculture.search.optuna_state import StudyPaths
 from kaggriculture.search.promotion import (
     DETERMINISM_SEEDS,
     PROMOTION_SEEDS,
@@ -44,6 +47,20 @@ _OUTPUT_SCHEMA_VERSION = 2
 _TERMINAL_IDENTITY_SCHEMA_VERSION = 1
 _PROMOTION_PROTOCOL_VERSION = 3
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class PromotionInput:
+    """Schema-neutral, fully certified input to the unchanged claim boundary."""
+
+    configs: tuple[HybridConfig, ...]
+    finalist_rows: tuple[dict[str, object], ...]
+    league: Mapping[str, str]
+    snapshot_root: Path
+    weights: StrengthWeights
+    terminal_digest: str
+    run_identity: dict[str, object]
+    protected_paths: tuple[Path, ...]
 
 
 def parser() -> argparse.ArgumentParser:
@@ -64,57 +81,28 @@ def main() -> None:
     if not 1 <= args.workers <= 16:
         raise SystemExit("--workers must be between 1 and 16 while Toad is running")
     os.nice(10)
+    run(args)
+
+
+def run(args: argparse.Namespace) -> None:
+    """Run preflight and promotion for already parsed fixed-seed arguments."""
     try:
         frontier = verify_frontier(args.manifest, args.artifact_root)
-        report_source = args.frontier_report.read_bytes()
-        report = TypeAdapter(FrontierReport).validate_json(report_source)
-        finalists = FinalistArtifact.load(args.finalists)
-        snapshot, weights = _bind_frontier(finalists, frontier, report)
-        search_identity = finalists.identity
-        league = snapshot.opponents
+        report, report_source = _load_frontier_report(args.frontier_report)
+        promotion = load_promotion_input(
+            args.finalists,
+            frontier,
+            report,
+            report_sha256=hashlib.sha256(report_source).hexdigest(),
+        )
+        league = promotion.league
         incumbent = league["boatlee_v14_current"]
         public_frontier = league[report.frontier_name]
-        finalist_rows = tuple(
-            {
-                "index": index,
-                "genome": list(finalist.genome),
-                "config": finalist.config.model_dump(mode="json"),
-            }
-            for index, finalist in enumerate(finalists.finalists)
-        )
-        run_identity = {
-            "promotion_protocol_version": _PROMOTION_PROTOCOL_VERSION,
-            "claim_schema_version": _CLAIM_SCHEMA_VERSION,
-            "output_schema_version": _OUTPUT_SCHEMA_VERSION,
-            "terminal_identity_schema_version": _TERMINAL_IDENTITY_SCHEMA_VERSION,
-            "engine": frontier.engine,
-            "manifest_sha256": frontier.manifest_sha256,
-            "frontier_report_sha256": hashlib.sha256(report_source).hexdigest(),
-            "terminal_state_integrity_digest": finalists.integrity_digest,
-            "terminal_generation": finalists.generation,
-            "snapshot_lineage": [list(row) for row in search_identity.league_snapshots],
-            "frontier_seeds": list(search_identity.frontier_seeds),
-            "screening_seeds": list(search_identity.screening_seeds),
-            "development_seeds": list(search_identity.development_seeds),
-            "determinism_seeds": list(DETERMINISM_SEEDS),
-            "promotion_seeds": list(PROMOTION_SEEDS),
-            "seats": [0, 1],
-            "incumbent": "boatlee_v14_current",
-            "boatlee": "boatlee_v14_current",
-            "frontier": report.frontier_name,
-            "genome_schema_sha256": search_identity.genome_schema_sha256,
-            "evolution_config": asdict(search_identity.evolution_config),
-            "league_identity": [list(row) for row in search_identity.league_identity],
-            "league_sha256": {
-                artifact.name: artifact.sha256 for artifact in frontier.artifacts
-            },
-            "strength_weights": weights.as_dict(),
-        }
 
         def deterministic(row: Mapping[str, object]) -> bool:
             index = _row_index(row)
             return check_determinism(
-                HybridOpponent(to_runtime(finalists.finalists[index].config)),
+                HybridOpponent(to_runtime(promotion.configs[index])),
                 league,
                 args.workers,
                 seeds=DETERMINISM_SEEDS,
@@ -122,16 +110,15 @@ def main() -> None:
 
         def evaluate(row: Mapping[str, object]) -> Mapping[str, object]:
             index = _row_index(row)
-            finalist = finalists.finalists[index]
             verdict = evaluate_promotion(
-                HybridOpponent(to_runtime(finalist.config)),
+                HybridOpponent(to_runtime(promotion.configs[index])),
                 incumbent,
                 incumbent,
                 public_frontier,
                 league,
                 PROMOTION_SEEDS,
                 args.workers,
-                weights=weights,
+                weights=promotion.weights,
                 deterministic=True,
             )
             return {
@@ -143,15 +130,14 @@ def main() -> None:
 
         _execute_single_use(
             output=args.output,
-            run_identity=run_identity,
-            finalists=finalist_rows,
+            run_identity=promotion.run_identity,
+            finalists=promotion.finalist_rows,
             protected_paths=(
-                args.finalists,
+                *promotion.protected_paths,
                 args.manifest,
                 args.frontier_report,
-                *(Path(path) for path in frontier.opponents.values()),
             ),
-            snapshot_root=Path(snapshot.root),
+            snapshot_root=promotion.snapshot_root,
             deterministic=deterministic,
             evaluate=evaluate,
         )
@@ -164,6 +150,203 @@ def main() -> None:
         ValueError,
     ) as error:
         raise SystemExit(f"invalid holdout provenance: {error}") from error
+
+
+def _load_frontier_report(path: Path) -> tuple[FrontierReport, bytes]:
+    """Read one strict report while retaining the exact legacy claim digest."""
+    source = path.read_bytes()
+    return TypeAdapter(FrontierReport).validate_json(source), source
+
+
+def load_promotion_input(
+    path: Path,
+    frontier: VerifiedFrontier,
+    report: FrontierReport,
+    *,
+    report_sha256: str | None = None,
+) -> PromotionInput:
+    """Normalize one unambiguous legacy or Optuna finalist certification."""
+    payload = _strict_object(path)
+    schema = payload.get("schema")
+    if schema == "optuna-finalists-v1":
+        return _optuna_promotion_input(
+            OptunaFinalistArtifact.load(path), path, frontier, report
+        )
+    if schema is not None:
+        raise ValueError("unsupported finalist schema discriminator")
+    digest = (
+        report_sha256
+        or hashlib.sha256(
+            (json.dumps(asdict(report), indent=2, sort_keys=True) + "\n").encode()
+        ).hexdigest()
+    )
+    return _legacy_promotion_input(
+        FinalistArtifact.load(path), path, frontier, report, digest
+    )
+
+
+def _legacy_promotion_input(
+    finalists: FinalistArtifact,
+    path: Path,
+    frontier: VerifiedFrontier,
+    report: FrontierReport,
+    report_sha256: str,
+) -> PromotionInput:
+    """Preserve the exact legacy Task 9 rows and claim identity."""
+    snapshot, weights = _bind_frontier(finalists, frontier, report)
+    identity = finalists.identity
+    rows = tuple(
+        {
+            "index": index,
+            "genome": list(finalist.genome),
+            "config": finalist.config.model_dump(mode="json"),
+        }
+        for index, finalist in enumerate(finalists.finalists)
+    )
+    run_identity = {
+        "promotion_protocol_version": _PROMOTION_PROTOCOL_VERSION,
+        "claim_schema_version": _CLAIM_SCHEMA_VERSION,
+        "output_schema_version": _OUTPUT_SCHEMA_VERSION,
+        "terminal_identity_schema_version": _TERMINAL_IDENTITY_SCHEMA_VERSION,
+        "engine": frontier.engine,
+        "manifest_sha256": frontier.manifest_sha256,
+        "frontier_report_sha256": report_sha256,
+        "terminal_state_integrity_digest": finalists.integrity_digest,
+        "terminal_generation": finalists.generation,
+        "snapshot_lineage": [list(row) for row in identity.league_snapshots],
+        "frontier_seeds": list(identity.frontier_seeds),
+        "screening_seeds": list(identity.screening_seeds),
+        "development_seeds": list(identity.development_seeds),
+        "determinism_seeds": list(DETERMINISM_SEEDS),
+        "promotion_seeds": list(PROMOTION_SEEDS),
+        "seats": [0, 1],
+        "incumbent": "boatlee_v14_current",
+        "boatlee": "boatlee_v14_current",
+        "frontier": report.frontier_name,
+        "genome_schema_sha256": identity.genome_schema_sha256,
+        "evolution_config": asdict(identity.evolution_config),
+        "league_identity": [list(row) for row in identity.league_identity],
+        "league_sha256": {
+            artifact.name: artifact.sha256 for artifact in frontier.artifacts
+        },
+        "strength_weights": weights.as_dict(),
+    }
+    return PromotionInput(
+        configs=tuple(row.config for row in finalists.finalists),
+        finalist_rows=rows,
+        league=snapshot.opponents,
+        snapshot_root=Path(snapshot.root),
+        weights=weights,
+        terminal_digest=finalists.integrity_digest,
+        run_identity=run_identity,
+        protected_paths=(
+            path,
+            *(Path(source.snapshot_path) for source in snapshot.sources),
+            *(Path(item) for item in frontier.opponents.values()),
+        ),
+    )
+
+
+def _optuna_promotion_input(
+    artifact: OptunaFinalistArtifact,
+    path: Path,
+    frontier: VerifiedFrontier,
+    report: FrontierReport,
+) -> PromotionInput:
+    """Bind a loaded Optuna certification to freshly verified frontier facts."""
+    _validate_frontier_report(report, frontier)
+    identity = artifact.study_identity
+    if (
+        identity.engine != frontier.engine
+        or identity.manifest_sha256 != frontier.manifest_sha256
+    ):
+        raise ValueError("Optuna finalist manifest or engine differs from verification")
+    canonical_report = json.dumps(
+        asdict(report), allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    if hashlib.sha256(canonical_report).hexdigest() != identity.frontier_report_sha256:
+        raise ValueError("Optuna finalist frontier report digest differs")
+    source_sha256 = tuple(
+        sorted((item.name, item.sha256) for item in frontier.artifacts)
+    )
+    if identity.source_sha256 != source_sha256:
+        raise ValueError("Optuna finalist verified source digests differ")
+    panels = derive_panels(report)
+    if (
+        identity.panels.rung_1 != panels.rung_1
+        or identity.panels.rung_2 != panels.rung_2
+        or identity.panels.rung_3 != panels.rung_3
+    ):
+        raise ValueError("Optuna finalist opponent panels differ from report")
+    weights = strength_weights(report)
+    if tuple(weights.as_dict().items()) != identity.strength_weights:
+        raise ValueError("Optuna finalist strength weights differ from report")
+    expected_originals = {
+        name: str(Path(source).absolute())
+        for name, source in frontier.opponents.items()
+    }
+    if any(
+        expected_originals.get(name) != source_path
+        for name, source_path, _snapshot_path, _digest in identity.league_snapshots
+    ):
+        raise ValueError("Optuna finalist source paths differ from verified frontier")
+    sources = tuple(SnapshotSource(*row) for row in identity.league_snapshots)
+    roots = {Path(source.snapshot_path).parent for source in sources}
+    if len(roots) != 1:
+        raise ValueError("Optuna finalist snapshot provenance has multiple roots")
+    snapshot = SnapshotLeague(str(roots.pop()), sources)
+    paths = StudyPaths.from_root(path.parent)
+    evidence_paths = tuple(item for item in paths.evidence.iterdir() if item.is_file())
+    rows = tuple(
+        {
+            "index": index,
+            "trial_number": finalist.trial_number,
+            "parameters": dict(finalist.parameters),
+            "config": finalist.config.model_dump(mode="json"),
+        }
+        for index, finalist in enumerate(artifact.finalists)
+    )
+    run_identity = {
+        "promotion_protocol_version": _PROMOTION_PROTOCOL_VERSION,
+        "claim_schema_version": _CLAIM_SCHEMA_VERSION,
+        "output_schema_version": _OUTPUT_SCHEMA_VERSION,
+        "terminal_identity_schema_version": _TERMINAL_IDENTITY_SCHEMA_VERSION,
+        "engine": frontier.engine,
+        "manifest_sha256": frontier.manifest_sha256,
+        "frontier_report_sha256": identity.frontier_report_sha256,
+        "terminal_state_integrity_digest": artifact.sqlite_sha256,
+        "optuna_finalist_integrity_sha256": artifact.integrity_sha256,
+        "study_identity_sha256": identity.digest,
+        "optuna_study_identity": identity.model_dump(mode="json"),
+        "trial_counts": dict(artifact.trial_counts),
+        "snapshot_lineage": [list(row) for row in identity.league_snapshots],
+        "frontier_seeds": list(report.seeds),
+        "determinism_seeds": list(DETERMINISM_SEEDS),
+        "promotion_seeds": list(PROMOTION_SEEDS),
+        "seats": [0, 1],
+        "incumbent": "boatlee_v14_current",
+        "boatlee": "boatlee_v14_current",
+        "frontier": report.frontier_name,
+        "league_sha256": {item.name: item.sha256 for item in frontier.artifacts},
+        "strength_weights": weights.as_dict(),
+    }
+    return PromotionInput(
+        configs=tuple(row.config for row in artifact.finalists),
+        finalist_rows=rows,
+        league=snapshot.opponents,
+        snapshot_root=Path(snapshot.root),
+        weights=weights,
+        terminal_digest=artifact.sqlite_sha256,
+        run_identity=run_identity,
+        protected_paths=(
+            path,
+            paths.sqlite,
+            paths.identity,
+            *evidence_paths,
+            *(Path(source.snapshot_path) for source in sources),
+            *(Path(item) for item in frontier.opponents.values()),
+        ),
+    )
 
 
 def _bind_frontier(

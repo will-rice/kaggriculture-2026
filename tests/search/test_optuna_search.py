@@ -144,6 +144,10 @@ RUNGS = (
 )
 
 
+def forbidden_finalist_writer(*_args: object) -> None:
+    pytest.fail("nonterminal search attempted to write finalists")
+
+
 def coordinator_fixture(
     root: Path, *, failure_at: GameKey | None = None
 ) -> OptunaCoordinator:
@@ -344,6 +348,7 @@ def test_stop_after_counts_complete_pruned_and_failed_trials_on_resume(
         SearchRunConfig(stop_after=32),
         callbacks=(),
         arena_factory=forbidden_arena,  # type: ignore[arg-type]
+        finalist_writer=forbidden_finalist_writer,
     )
     assert summary.started_trials == 0
     assert summary.terminal_trials == 32
@@ -352,6 +357,45 @@ def test_stop_after_counts_complete_pruned_and_failed_trials_on_resume(
         18,
         4,
     )
+
+
+def test_only_validated_512_terminal_completion_writes_finalists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    study = optuna.create_study()
+    configs = warm_configs()
+    execute_warm_trials(study, configs)
+    for _ in range(504):
+        study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
+    identity = identity_fixture(configs)
+    inputs = SearchInputs(
+        study=study,
+        paths=StudyPaths.from_root(tmp_path),
+        identity=identity,
+        league={},
+        weights=StrengthWeights(dict.fromkeys(NAMES, 1)),
+        rungs=RUNGS,
+        warm_starts=configs,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "kaggriculture.search.optuna_search.economic_stop_gate", lambda *_: False
+    )
+    monkeypatch.setattr(
+        "kaggriculture.search.optuna_search.validate_study_evidence",
+        lambda *_: calls.append("validate"),
+    )
+
+    summary = run_search(
+        inputs,
+        SearchRunConfig(stop_after=512),
+        callbacks=(),
+        arena_factory=lambda _workers: pytest.fail("complete study opened arena"),  # type: ignore[arg-type]
+        finalist_writer=lambda *_: calls.append("write"),
+    )
+
+    assert summary.stopped_reason == "complete"
+    assert calls == ["validate", "write"]
 
 
 def write_rung_one_evidence(
@@ -421,6 +465,7 @@ def test_no_economic_points_at_128_writes_diagnostic_not_finalists(
         SearchRunConfig(stop_after=512),
         callbacks=(),
         arena_factory=lambda _workers: pytest.fail("arena must not open"),  # type: ignore[arg-type]
+        finalist_writer=forbidden_finalist_writer,
     )
     assert summary.stopped_reason == "no_economic_points_at_128"
     diagnostic = json.loads(paths.diagnostic.read_text())
@@ -473,6 +518,7 @@ def test_interrupt_closes_arena_preserves_evidence_and_remains_reconcilable(
         SearchRunConfig(stop_after=32),
         callbacks=(),
         arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+        finalist_writer=forbidden_finalist_writer,
     )
     assert summary.stopped_reason == "interrupted"
     assert arena.closed
@@ -528,6 +574,7 @@ def test_interrupt_after_evidence_write_finishes_optuna_commit_boundary(
         SearchRunConfig(stop_after=32),
         callbacks=(),
         arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+        finalist_writer=forbidden_finalist_writer,
     )
 
     assert summary.stopped_reason == "interrupted"
@@ -576,6 +623,7 @@ def test_interrupt_during_arena_entry_closes_it_and_restores_handlers(
         SearchRunConfig(stop_after=32),
         callbacks=(),
         arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+        finalist_writer=forbidden_finalist_writer,
     )
 
     assert summary.stopped_reason == "interrupted"

@@ -45,6 +45,7 @@ from kaggriculture.search.optuna_state import (
 
 TrialCallback = Callable[[optuna.Study, FrozenTrial], None]
 ArenaFactory = Callable[[int], PersistentArena]
+FinalistWriter = Callable[[optuna.Study, StudyIdentity, StudyPaths], object]
 SignalHandler = Callable[[int, FrameType | None], object] | int | None
 
 
@@ -309,6 +310,7 @@ def run_search(
     config: SearchRunConfig,
     callbacks: Sequence[TrialCallback],
     arena_factory: ArenaFactory = PersistentArena,
+    finalist_writer: FinalistWriter | None = None,
 ) -> SearchSummary:
     """Run one bounded sequential optimization invocation with one arena."""
     enqueue_warm_starts(inputs.study, inputs.warm_starts)
@@ -323,7 +325,9 @@ def run_search(
             if initial_terminal == inputs.identity.maximum_trials
             else "stop_after"
         )
-        return _search_summary(inputs.study, 0, reason)
+        summary = _search_summary(inputs.study, 0, reason)
+        _write_finalists_if_complete(inputs, summary, finalist_writer)
+        return summary
 
     arena = arena_factory(config.workers)
     interruptions = _InterruptionController(inputs.study)
@@ -384,7 +388,32 @@ def run_search(
         )
     terminal = sum(terminal_counts(inputs.study).values())
     reason = "complete" if terminal == inputs.identity.maximum_trials else "stop_after"
-    return _search_summary(inputs.study, started_trials, reason)
+    summary = _search_summary(inputs.study, started_trials, reason)
+    _write_finalists_if_complete(inputs, summary, finalist_writer)
+    return summary
+
+
+def _write_finalists_if_complete(
+    inputs: SearchInputs,
+    summary: SearchSummary,
+    writer: FinalistWriter | None,
+) -> None:
+    """Publish finalists only behind the validated full terminal boundary."""
+    if (
+        summary.stopped_reason != "complete"
+        or summary.terminal_trials != inputs.identity.maximum_trials
+    ):
+        return
+    if inputs.study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
+        raise StudyEvidenceError("complete search still contains RUNNING trials")
+    validate_study_evidence(inputs.study, inputs.paths, inputs.identity)
+    if economic_stop_gate(inputs.study, inputs.paths):
+        raise StudyEvidenceError("complete search failed the 128-trial economic gate")
+    if writer is None:
+        from kaggriculture.search.optuna_finalists import write_optuna_finalists
+
+        writer = write_optuna_finalists
+    writer(inputs.study, inputs.identity, inputs.paths)
 
 
 def pilot_gate(study: optuna.Study, paths: StudyPaths) -> PilotVerdict:

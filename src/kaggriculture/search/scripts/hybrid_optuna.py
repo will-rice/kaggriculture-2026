@@ -30,6 +30,7 @@ from kaggriculture.search.frontier import (
     VerifiedFrontier,
     verify_frontier,
 )
+from kaggriculture.search.optuna_finalists import write_optuna_finalists
 from kaggriculture.search.optuna_protocol import (
     RUNG_3_SEEDS,
     PanelSet,
@@ -179,6 +180,7 @@ def run(args: argparse.Namespace) -> None:
             SearchRunConfig(workers=args.workers, stop_after=args.stop_after),
             callbacks=session.callbacks,
             arena_factory=PersistentArena,
+            finalist_writer=write_optuna_finalists,
         )
     finally:
         session.close()

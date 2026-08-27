@@ -9,10 +9,12 @@ import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from kaggriculture.search import evolution
+from kaggriculture.search.optuna_finalists import OptunaFinalistArtifact
 from kaggriculture.search.scripts import hybrid_holdout
 
 FAKE_SEEDS = (901, 903)
@@ -369,6 +371,81 @@ def test_outputs_and_copied_inputs_cannot_alias_canonical_claim_tree(
 def test_holdout_uses_the_authoritative_task8_finalist_loader() -> None:
     """Task 9 does not maintain an independent finalist parser or validator."""
     assert hybrid_holdout.FinalistArtifact is evolution.FinalistArtifact
+
+
+def test_holdout_dispatches_legacy_and_optuna_through_promotion_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both certified schemas cross one normalized promotion boundary."""
+    legacy_path = tmp_path / "legacy.json"
+    modern_path = tmp_path / "modern.json"
+    legacy_path.write_text("{}")
+    modern_path.write_text('{"schema":"optuna-finalists-v1"}')
+    legacy_input = SimpleNamespace(configs=("legacy",))
+    modern_input = SimpleNamespace(configs=("modern",))
+    monkeypatch.setattr(
+        hybrid_holdout,
+        "_legacy_promotion_input",
+        lambda *_args, **_kwargs: legacy_input,
+    )
+    monkeypatch.setattr(
+        hybrid_holdout,
+        "_optuna_promotion_input",
+        lambda *_args, **_kwargs: modern_input,
+    )
+    monkeypatch.setattr(
+        hybrid_holdout.FinalistArtifact, "load", lambda _path: SimpleNamespace()
+    )
+    monkeypatch.setattr(OptunaFinalistArtifact, "load", lambda _path: SimpleNamespace())
+    frontier = SimpleNamespace()
+    report = SimpleNamespace()
+
+    legacy = hybrid_holdout.load_promotion_input(
+        legacy_path, frontier, report, report_sha256="a" * 64
+    )
+    modern = hybrid_holdout.load_promotion_input(modern_path, frontier, report)
+
+    assert legacy.configs == ("legacy",)
+    assert modern.configs == ("modern",)
+
+
+def test_optuna_preflight_tamper_fails_before_claim_or_holdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Certification failure precedes the durable claim and every holdout game."""
+    finalists = tmp_path / "finalists.json"
+    finalists.write_text('{"schema":"optuna-finalists-v1"}')
+    monkeypatch.setattr(
+        hybrid_holdout,
+        "verify_frontier",
+        lambda *_: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        hybrid_holdout,
+        "_load_frontier_report",
+        lambda _path: (SimpleNamespace(), b"report"),
+    )
+    monkeypatch.setattr(
+        hybrid_holdout,
+        "load_promotion_input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("SQLite digest")),
+    )
+    monkeypatch.setattr(
+        hybrid_holdout,
+        "_execute_single_use",
+        lambda **_kwargs: pytest.fail("claim boundary reached after tamper"),
+    )
+    args = SimpleNamespace(
+        finalists=finalists,
+        manifest=tmp_path / "manifest.json",
+        artifact_root=tmp_path / "artifacts",
+        frontier_report=tmp_path / "frontier.json",
+        workers=1,
+        output=tmp_path / "promotion.json",
+    )
+
+    with pytest.raises(SystemExit, match="invalid holdout provenance"):
+        hybrid_holdout.run(args)
 
 
 def test_crash_claim_forbids_replay_and_spends_no_second_holdout(

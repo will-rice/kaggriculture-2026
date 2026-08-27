@@ -226,6 +226,7 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
     def fake_run_search(*_args: object, **kwargs: object) -> SearchSummary:
         calls.append("search")
         assert kwargs["arena_factory"] is arena_factory
+        assert kwargs["finalist_writer"] is cli.write_optuna_finalists
         return SearchSummary(
             started_trials=0,
             terminal_trials=0,
