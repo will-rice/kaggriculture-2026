@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import optuna
 import pytest
@@ -45,11 +45,11 @@ class FakeRun:
         self,
         api: FakeWandb,
         *,
-        fail_log: bool = False,
+        fail_log_at: Literal["rich", "commit"] | None = None,
         fail_finish: bool = False,
     ) -> None:
         self.api = api
-        self.fail_log = fail_log
+        self.fail_log_at = fail_log_at
         self.fail_finish = fail_finish
 
     def log(
@@ -59,9 +59,13 @@ class FakeRun:
         step: int,
         commit: bool | None = None,
     ) -> None:
-        if self.fail_log:
-            raise RuntimeError("log unavailable")
-        self.api.log_calls.append(LogCall(dict(metrics), step, commit))
+        call = LogCall(dict(metrics), step, commit)
+        self.api.log_attempts.append(call)
+        if self.fail_log_at == "rich" and commit is False:
+            raise RuntimeError("rich log unavailable")
+        if self.fail_log_at == "commit" and commit is True:
+            raise RuntimeError("final commit unavailable")
+        self.api.log_calls.append(call)
         self.api.pending.setdefault(step, {}).update(metrics)
         if commit is True:
             self.api.history.append(LoggedRow(self.api.pending.pop(step), step, True))
@@ -71,6 +75,9 @@ class FakeRun:
         self.api.finish_calls += 1
         if self.fail_finish:
             raise RuntimeError("finish unavailable")
+        for step in sorted(self.api.pending):
+            self.api.history.append(LoggedRow(self.api.pending[step], step, True))
+        self.api.pending.clear()
 
 
 class FakeWandb:
@@ -78,15 +85,16 @@ class FakeWandb:
         self,
         *,
         fail_init: bool = False,
-        fail_log: bool = False,
+        fail_log_at: Literal["rich", "commit"] | None = None,
         fail_finish: bool = False,
     ) -> None:
         self.fail_init = fail_init
-        self.fail_log = fail_log
+        self.fail_log_at = fail_log_at
         self.fail_finish = fail_finish
         self.init_calls: list[dict[str, object]] = []
         self.history: list[LoggedRow] = []
         self.log_calls: list[LogCall] = []
+        self.log_attempts: list[LogCall] = []
         self.pending: dict[int, dict[str, float]] = {}
         self.finish_calls = 0
         self.run: WandbRun | None = None
@@ -95,14 +103,18 @@ class FakeWandb:
         self.init_calls.append(kwargs)
         if self.fail_init:
             raise RuntimeError("init unavailable")
-        self.run = FakeRun(self, fail_log=self.fail_log, fail_finish=self.fail_finish)
+        self.run = FakeRun(
+            self,
+            fail_log_at=self.fail_log_at,
+            fail_finish=self.fail_finish,
+        )
         return self.run
 
 
 def fake_official_factory(
     api: FakeWandb, *, fail: bool = False
 ) -> Callable[..., object]:
-    """Model the official callback committing the existing current run row."""
+    """Model the official callback's uncommitted explicit-step W&B log."""
 
     def factory(
         *, wandb_kwargs: dict[str, object], as_multirun: bool
@@ -224,15 +236,69 @@ def test_session_initializes_once_and_combines_rich_metrics_with_official_callba
     assert api.finish_calls == 1
 
 
-@pytest.mark.parametrize("failure", ("import", "init", "log", "official", "finish"))
+@pytest.mark.parametrize(
+    (
+        "failure",
+        "reason",
+        "attempt_commits",
+        "successful_commits",
+        "pending_before_close",
+        "history_after_close",
+    ),
+    (
+        ("import", "ImportError: wandb missing", (), (), False, ()),
+        ("init", "RuntimeError: init unavailable", (), (), False, ()),
+        ("rich", "RuntimeError: rich log unavailable", (False,), (), False, ()),
+        (
+            "official",
+            "RuntimeError: official callback unavailable",
+            (False,),
+            (False,),
+            True,
+            (0,),
+        ),
+        (
+            "commit",
+            "RuntimeError: final commit unavailable",
+            (False, None, True),
+            (False, None),
+            True,
+            (0,),
+        ),
+        (
+            "finish",
+            "RuntimeError: finish unavailable",
+            (False, None, True),
+            (False, None, True),
+            False,
+            (0,),
+        ),
+    ),
+)
 def test_wandb_failure_never_changes_study_or_raises(
     monkeypatch: pytest.MonkeyPatch,
     identity: StudyIdentity,
     study: optuna.Study,
     failure: str,
+    reason: str,
+    attempt_commits: tuple[bool | None, ...],
+    successful_commits: tuple[bool | None, ...],
+    pending_before_close: bool,
+    history_after_close: tuple[int, ...],
 ) -> None:
-    study.optimize(lambda _trial: 1.0, n_trials=1)
+    def objective(trial: optuna.Trial) -> float:
+        set_task_five_attrs(trial)
+        return 1.0
+
+    study.optimize(objective, n_trials=1)
     before = frozen_trial_payload(study.trials)
+    api = FakeWandb(
+        fail_init=failure == "init",
+        fail_log_at=cast(Literal["rich", "commit"] | None, failure)
+        if failure in {"rich", "commit"}
+        else None,
+        fail_finish=failure == "finish",
+    )
     if failure == "import":
         monkeypatch.setattr(
             "kaggriculture.search.optuna_wandb.load_wandb_dependencies",
@@ -240,11 +306,6 @@ def test_wandb_failure_never_changes_study_or_raises(
         )
         session = WandbSession.open(WandbSettings(), identity, "abc123")
     else:
-        api = FakeWandb(
-            fail_init=failure == "init",
-            fail_log=failure == "log",
-            fail_finish=failure == "finish",
-        )
         session = WandbSession.open(
             WandbSettings(),
             identity,
@@ -254,11 +315,20 @@ def test_wandb_failure_never_changes_study_or_raises(
                 fake_official_factory(api, fail=failure == "official"),
             ),
         )
-    session.callback(study, cast(FrozenTrial, terminal_trial(0)))
+    session.callback(study, study.trials[0])
+    if failure == "finish":
+        assert session.disabled_reason is None
+    else:
+        assert session.disabled_reason == reason
+    assert [call.commit for call in api.log_attempts] == list(attempt_commits)
+    assert [call.commit for call in api.log_calls] == list(successful_commits)
+    assert bool(api.pending) is pending_before_close
     session.close()
 
     assert frozen_trial_payload(study.trials) == before
-    assert session.disabled_reason is not None
+    assert session.disabled_reason == reason
+    assert [row.step for row in api.history] == list(history_after_close)
+    assert api.finish_calls == (0 if failure in {"import", "init"} else 1)
 
 
 def test_trial_metrics_rejects_nonfinite_values_and_preserves_scalar_telemetry() -> (
