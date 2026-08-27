@@ -322,11 +322,12 @@ def run_search(
     if remaining == 0:
         reason: Literal["stop_after", "complete"] = (
             "complete"
-            if initial_terminal == inputs.identity.maximum_trials
+            if config.stop_after == inputs.identity.maximum_trials == 512
+            and initial_terminal == inputs.identity.maximum_trials
             else "stop_after"
         )
         summary = _search_summary(inputs.study, 0, reason)
-        _write_finalists_if_complete(inputs, summary, finalist_writer)
+        _write_finalists_if_complete(inputs, config, summary, finalist_writer)
         return summary
 
     arena = arena_factory(config.workers)
@@ -387,20 +388,28 @@ def run_search(
             inputs.study, started_trials, "no_economic_points_at_128"
         )
     terminal = sum(terminal_counts(inputs.study).values())
-    reason = "complete" if terminal == inputs.identity.maximum_trials else "stop_after"
+    reason = (
+        "complete"
+        if config.stop_after == inputs.identity.maximum_trials == 512
+        and terminal == inputs.identity.maximum_trials
+        else "stop_after"
+    )
     summary = _search_summary(inputs.study, started_trials, reason)
-    _write_finalists_if_complete(inputs, summary, finalist_writer)
+    _write_finalists_if_complete(inputs, config, summary, finalist_writer)
     return summary
 
 
 def _write_finalists_if_complete(
     inputs: SearchInputs,
+    config: SearchRunConfig,
     summary: SearchSummary,
     writer: FinalistWriter | None,
 ) -> None:
     """Publish finalists only behind the validated full terminal boundary."""
     if (
-        summary.stopped_reason != "complete"
+        config.stop_after != inputs.identity.maximum_trials
+        or config.stop_after != 512
+        or summary.stopped_reason != "complete"
         or summary.terminal_trials != inputs.identity.maximum_trials
     ):
         return

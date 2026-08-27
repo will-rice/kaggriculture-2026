@@ -43,6 +43,8 @@ from kaggriculture.search.optuna_state import (
     validate_study_evidence,
 )
 
+_FINALIST_COUNT = 4
+
 
 class OptunaFinalist(BaseModel):
     """One fully recomputed clean rung-three promotion candidate."""
@@ -80,7 +82,9 @@ class OptunaFinalistArtifact(BaseModel):
     sqlite_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     trial_counts: dict[str, int]
     promotion_seeds_used: Literal[False] = False
-    finalists: tuple[OptunaFinalist, ...] = Field(min_length=1)
+    finalists: tuple[OptunaFinalist, ...] = Field(
+        min_length=_FINALIST_COUNT, max_length=_FINALIST_COUNT
+    )
     integrity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @property
@@ -113,8 +117,8 @@ def write_optuna_finalists(
     count: int = 4,
 ) -> OptunaFinalistArtifact:
     """Certify exactly one validated 512-terminal-trial Optuna study."""
-    if type(count) is not int or count < 1:
-        raise ValueError("finalist count must be a positive integer")
+    if type(count) is not int or count != _FINALIST_COUNT:
+        raise ValueError("finalist count must be exactly 4")
     if paths != StudyPaths.from_root(paths.root):
         raise ValueError("study paths must use the canonical fixed layout")
     identity = StudyIdentity.model_validate(identity.model_dump())
@@ -131,7 +135,7 @@ def write_optuna_finalists(
     _validate_identity_files(paths, identity)
     _validate_snapshot_sources(identity)
     _require_economic_gate(study, paths)
-    finalists = _recomputed_finalists(study, identity, paths, count)
+    finalists = _recomputed_finalists(study, identity, paths)
     sqlite_sha256 = close_and_hash_storage(study, paths)
     payload: dict[str, object] = {
         "schema": "optuna-finalists-v1",
@@ -179,12 +183,7 @@ def _validate_loaded_artifact(  # noqa: C901
             validate_study_evidence(study, paths, artifact.study_identity)
             _validate_terminal_shape(study, artifact)
             _require_economic_gate(study, paths)
-            expected = _recomputed_finalists(
-                study,
-                artifact.study_identity,
-                paths,
-                len(artifact.finalists),
-            )
+            expected = _recomputed_finalists(study, artifact.study_identity, paths)
         except (KeyError, OSError, RuntimeError, ValidationError, ValueError) as error:
             raise ValueError(f"certified trial state is invalid: {error}") from error
         finally:
@@ -218,7 +217,6 @@ def _recomputed_finalists(
     study: optuna.Study,
     identity: StudyIdentity,
     paths: StudyPaths,
-    count: int,
 ) -> tuple[OptunaFinalist, ...]:
     weights = _identity_weights(identity)
     ranked: list[tuple[OptunaFinalist, float]] = []
@@ -235,9 +233,9 @@ def _recomputed_finalists(
             item[0].config_sha256,
         )
     )
-    if not ranked:
-        raise ValueError("finalists require at least one clean rung-three trial")
-    return tuple(row for row, _ in ranked[:count])
+    if len(ranked) < _FINALIST_COUNT:
+        raise ValueError("finalists require at least four clean rung-three trials")
+    return tuple(row for row, _ in ranked[:_FINALIST_COUNT])
 
 
 def _finalist_from_trial(

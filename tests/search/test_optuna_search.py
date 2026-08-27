@@ -398,6 +398,41 @@ def test_only_validated_512_terminal_completion_writes_finalists(
     assert calls == ["validate", "write"]
 
 
+@pytest.mark.parametrize("stop_after", (32, 128, 511))
+def test_operational_runs_below_512_never_write_existing_terminal_study(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stop_after: int
+) -> None:
+    """An operational boundary below 512 cannot certify a prefilled study."""
+    study = optuna.create_study()
+    configs = warm_configs()
+    execute_warm_trials(study, configs)
+    for _ in range(504):
+        study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
+    inputs = SearchInputs(
+        study=study,
+        paths=StudyPaths.from_root(tmp_path),
+        identity=identity_fixture(configs),
+        league={},
+        weights=StrengthWeights(dict.fromkeys(NAMES, 1)),
+        rungs=RUNGS,
+        warm_starts=configs,
+    )
+    monkeypatch.setattr(
+        "kaggriculture.search.optuna_search.economic_stop_gate", lambda *_: False
+    )
+
+    summary = run_search(
+        inputs,
+        SearchRunConfig(stop_after=stop_after),
+        callbacks=(),
+        arena_factory=lambda _workers: pytest.fail("complete study opened arena"),  # type: ignore[arg-type]
+        finalist_writer=lambda *_: pytest.fail("sub-512 operation wrote finalists"),
+    )
+
+    assert summary.stopped_reason == "stop_after"
+    assert summary.started_trials == 0
+
+
 def write_rung_one_evidence(
     paths: StudyPaths, trial_number: int, *, wins: bool
 ) -> None:

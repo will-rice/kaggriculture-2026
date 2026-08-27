@@ -9,13 +9,22 @@ import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from kaggriculture.hybrid.config import HybridConfig
 from kaggriculture.search import evolution
-from kaggriculture.search.optuna_finalists import OptunaFinalistArtifact
+from kaggriculture.search.fitness import strength_weights
+from kaggriculture.search.frontier import (
+    FrontierArtifact,
+    FrontierMatchup,
+    FrontierReport,
+    FrontierRow,
+    VerifiedFrontier,
+)
 from kaggriculture.search.scripts import hybrid_holdout
+from kaggriculture.search.scripts.frontier_round_robin import FRONTIER_SEEDS
+from tests.search.test_evolution import _completed_verified_search
 
 FAKE_SEEDS = (901, 903)
 
@@ -373,79 +382,97 @@ def test_holdout_uses_the_authoritative_task8_finalist_loader() -> None:
     assert hybrid_holdout.FinalistArtifact is evolution.FinalistArtifact
 
 
-def test_holdout_dispatches_legacy_and_optuna_through_promotion_input(
+def _legacy_frontier_context(
+    state: evolution.SearchState,
+) -> tuple[VerifiedFrontier, FrontierReport]:
+    identity = state.identity
+    source_paths = {
+        name: source_path
+        for name, source_path, _snapshot_path, _digest in identity.league_snapshots
+    }
+    artifacts = tuple(
+        FrontierArtifact(
+            name=name,
+            provenance="real legacy normalization fixture",
+            relative_path=Path(source_paths[name]).name,
+            sha256=digest,
+        )
+        for name, _kind, digest in identity.league_identity
+    )
+    frontier = VerifiedFrontier(
+        engine=identity.engine,
+        opponents=source_paths,
+        artifacts=artifacts,
+        manifest_sha256=identity.manifest_sha256,
+    )
+    names = tuple(frontier.opponents)
+    assert names == ("frontier", "boatlee_v14_current")
+    games = 2 * len(FRONTIER_SEEDS)
+    rows = (
+        FrontierRow(
+            name=names[0],
+            games=games,
+            field_win_points=1.0,
+            worst_matchup_win_points=1.0,
+            paired_margin=0.25,
+            failures=(),
+            runtime_seconds=0.0,
+            matchups={names[1]: 1.0},
+            matchup_results=(
+                FrontierMatchup(names[1], games, 1.0, games, 0, 0, 0.25, (), 0.0),
+            ),
+        ),
+        FrontierRow(
+            name=names[1],
+            games=games,
+            field_win_points=0.0,
+            worst_matchup_win_points=0.0,
+            paired_margin=-0.25,
+            failures=(),
+            runtime_seconds=0.0,
+            matchups={names[0]: 0.0},
+            matchup_results=(
+                FrontierMatchup(names[0], games, 0.0, 0, 0, games, -0.25, (), 0.0),
+            ),
+        ),
+    )
+    report = FrontierReport(
+        engine=identity.engine,
+        seeds=FRONTIER_SEEDS,
+        frontier_name=names[0],
+        failures=(),
+        runtime_seconds=0.0,
+        rows=rows,
+        manifest_sha256=identity.manifest_sha256,
+        source_sha256={artifact.name: artifact.sha256 for artifact in artifacts},
+    )
+    return frontier, report
+
+
+def test_holdout_normalizes_a_real_legacy_certification(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Both certified schemas cross one normalized promotion boundary."""
-    legacy_path = tmp_path / "legacy.json"
-    modern_path = tmp_path / "modern.json"
-    legacy_path.write_text("{}")
-    modern_path.write_text('{"schema":"optuna-finalists-v1"}')
-    legacy_input = SimpleNamespace(configs=("legacy",))
-    modern_input = SimpleNamespace(configs=("modern",))
-    monkeypatch.setattr(
-        hybrid_holdout,
-        "_legacy_promotion_input",
-        lambda *_args, **_kwargs: legacy_input,
-    )
-    monkeypatch.setattr(
-        hybrid_holdout,
-        "_optuna_promotion_input",
-        lambda *_args, **_kwargs: modern_input,
-    )
-    monkeypatch.setattr(
-        hybrid_holdout.FinalistArtifact, "load", lambda _path: SimpleNamespace()
-    )
-    monkeypatch.setattr(OptunaFinalistArtifact, "load", lambda _path: SimpleNamespace())
-    frontier = SimpleNamespace()
-    report = SimpleNamespace()
+    """The actual legacy loader supplies configs, snapshots, and measured weights."""
+    state, certification, _ = _completed_verified_search(monkeypatch, tmp_path)
+    finalists = tmp_path / "certified-finalists.json"
+    evolution.write_finalists(state, finalists, certification=certification)
+    frontier, report = _legacy_frontier_context(state)
 
-    legacy = hybrid_holdout.load_promotion_input(
-        legacy_path, frontier, report, report_sha256="a" * 64
-    )
-    modern = hybrid_holdout.load_promotion_input(modern_path, frontier, report)
-
-    assert legacy.configs == ("legacy",)
-    assert modern.configs == ("modern",)
-
-
-def test_optuna_preflight_tamper_fails_before_claim_or_holdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Certification failure precedes the durable claim and every holdout game."""
-    finalists = tmp_path / "finalists.json"
-    finalists.write_text('{"schema":"optuna-finalists-v1"}')
-    monkeypatch.setattr(
-        hybrid_holdout,
-        "verify_frontier",
-        lambda *_: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        hybrid_holdout,
-        "_load_frontier_report",
-        lambda _path: (SimpleNamespace(), b"report"),
-    )
-    monkeypatch.setattr(
-        hybrid_holdout,
-        "load_promotion_input",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("SQLite digest")),
-    )
-    monkeypatch.setattr(
-        hybrid_holdout,
-        "_execute_single_use",
-        lambda **_kwargs: pytest.fail("claim boundary reached after tamper"),
-    )
-    args = SimpleNamespace(
-        finalists=finalists,
-        manifest=tmp_path / "manifest.json",
-        artifact_root=tmp_path / "artifacts",
-        frontier_report=tmp_path / "frontier.json",
-        workers=1,
-        output=tmp_path / "promotion.json",
+    promotion = hybrid_holdout.load_promotion_input(
+        finalists,
+        frontier,
+        report,
+        report_sha256="a" * 64,
     )
 
-    with pytest.raises(SystemExit, match="invalid holdout provenance"):
-        hybrid_holdout.run(args)
+    assert promotion.configs == tuple(row.config for row in state.elites)
+    assert all(isinstance(config, HybridConfig) for config in promotion.configs)
+    assert promotion.league == certification.snapshot.opponents
+    assert promotion.weights == strength_weights(report)
+    assert promotion.weights.as_dict() == dict(state.identity.strength_weights)
+    assert tuple(row["config"] for row in promotion.finalist_rows) == tuple(
+        config.model_dump(mode="json") for config in promotion.configs
+    )
 
 
 def test_crash_claim_forbids_replay_and_spends_no_second_holdout(
