@@ -74,6 +74,8 @@ def test_non_done_status_is_a_failure_even_when_the_engine_supplies_rewards(
     route: Route = [{"farmer": ["PASS"], "hands": [], "market": []}]
 
     with pytest.raises(RuntimeError, match="statuses=.*ERROR"):
+        arena._run_banks(route, route, 11)
+    with pytest.raises(RuntimeError, match="statuses=.*ERROR"):
         arena._one((route, route, 11))
 
 

@@ -17,6 +17,7 @@ plain strings, both of which pickle without help.
 """
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -44,6 +45,82 @@ class HybridOpponent:
 
 
 Opponent = Route | str | HybridOpponent
+
+
+@dataclass(frozen=True, order=True)
+class GameKey:
+    """Canonical identity for one candidate-relative arena episode."""
+
+    opponent: str
+    seed: int
+    seat: int
+
+    def __post_init__(self) -> None:
+        """Reject provenance that cannot identify a legal game cell."""
+        if type(self.opponent) is not str or not self.opponent:
+            raise ValueError("game opponent must be a nonempty string")
+        if type(self.seed) is not int:
+            raise ValueError("game seed must be an integer")
+        if type(self.seat) is not int or self.seat not in (0, 1):
+            raise ValueError("game seat must be 0 or 1")
+
+
+@dataclass(frozen=True)
+class GameTask:
+    """Picklable input for one candidate-relative arena episode."""
+
+    key: GameKey
+    candidate: HybridOpponent
+    opponent: Opponent
+
+
+@dataclass(frozen=True)
+class GameResult:
+    """One arena episode with explicit provenance and failure preservation."""
+
+    key: GameKey
+    ours: int | None
+    theirs: int | None
+    runtime_seconds: float
+    failure: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject malformed timing, bank, and failure combinations."""
+        if (
+            type(self.runtime_seconds) not in (int, float)
+            or not math.isfinite(self.runtime_seconds)
+            or self.runtime_seconds < 0
+        ):
+            raise ValueError("game runtime_seconds must be finite and nonnegative")
+        if self.failure is None:
+            if type(self.ours) is not int or type(self.theirs) is not int:
+                raise ValueError("successful game result requires both banks")
+        elif type(self.failure) is not str or not self.failure:
+            raise ValueError("game failure must be a nonempty string")
+        elif self.ours is not None or self.theirs is not None:
+            raise ValueError("failed game result cannot contain banks")
+
+
+def run_game_task(task: GameTask) -> GameResult:
+    """Run one task while retaining provenance when the engine raises."""
+    started = perf_counter()
+    try:
+        seats = (
+            (task.candidate, task.opponent)
+            if task.key.seat == 0
+            else (task.opponent, task.candidate)
+        )
+        left, right = _run_banks(*seats, task.key.seed)
+        ours, theirs = (left, right) if task.key.seat == 0 else (right, left)
+        return GameResult(task.key, ours, theirs, perf_counter() - started)
+    except Exception as error:
+        return GameResult(
+            task.key,
+            None,
+            None,
+            perf_counter() - started,
+            f"{type(error).__name__}: {error}",
+        )
 
 
 class OutcomeScores(list[float]):
@@ -245,8 +322,13 @@ def _side(opponent: Opponent) -> str | _Agent:
 
 
 def _one(work: tuple[Opponent, Opponent, int]) -> tuple[int, int]:
-    """Play a single episode. Runs in a subprocess."""
+    """Play a legacy single episode. Runs in a subprocess."""
     seat_zero, seat_one, seed = work
+    return _run_banks(seat_zero, seat_one, seed)
+
+
+def _run_banks(seat_zero: Opponent, seat_one: Opponent, seed: int) -> tuple[int, int]:
+    """Run the reference engine once and return its seat-zero/seat-one banks."""
     environment = make(
         ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS, "seed": seed}
     )
