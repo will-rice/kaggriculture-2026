@@ -16,7 +16,7 @@ from typing import Literal, Self, cast
 import optuna
 from optuna.pruners import SuccessiveHalvingPruner
 from optuna.samplers import TPESampler
-from optuna.storages import RDBStorage
+from optuna.storages import BaseStorage, RDBStorage
 from optuna.trial import FrozenTrial, TrialState
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -32,10 +32,16 @@ from kaggriculture.search.optuna_protocol import (
     RungEvidence,
     evidence_path,
 )
-from kaggriculture.search.optuna_space import SPACE_SHA256, config_sha256
+from kaggriculture.search.optuna_space import (
+    SPACE_SHA256,
+    config_sha256,
+    parameters_for_config,
+    suggest_config,
+)
 from kaggriculture.search.promotion import DETERMINISM_SEEDS
 
 _IDENTITY_ATTRIBUTE = "study_identity_sha256"
+_PREFLIGHT_CAPABILITY = object()
 _SUMMARY_ATTRIBUTES = (
     "config_sha256",
     "rung",
@@ -75,6 +81,34 @@ class StudyPaths:
             diagnostic=root / "diagnostic.json",
             finalists=root / "finalists.json",
         )
+
+
+@dataclass(frozen=True, init=False)
+class StudyPreflight:
+    """An unforgeable in-process proof that external study facts were verified."""
+
+    paths: StudyPaths
+    identity_digest: str
+    _snapshot: SnapshotLeague
+    _legacy_state: Path
+    _capability: object
+
+    @classmethod
+    def _create(
+        cls,
+        paths: StudyPaths,
+        snapshot: SnapshotLeague,
+        legacy_state: Path,
+        identity: "StudyIdentity",
+    ) -> Self:
+        """Create a capability only after all external bytes and paths validate."""
+        result = object.__new__(cls)
+        object.__setattr__(result, "paths", paths)
+        object.__setattr__(result, "identity_digest", identity.digest)
+        object.__setattr__(result, "_snapshot", snapshot)
+        object.__setattr__(result, "_legacy_state", legacy_state)
+        object.__setattr__(result, "_capability", _PREFLIGHT_CAPABILITY)
+        return result
 
 
 class SamplerIdentity(BaseModel):
@@ -201,13 +235,16 @@ def build_identity(
 
 
 def validate_study_paths(
-    paths: StudyPaths, snapshot: SnapshotLeague, legacy_state: Path
-) -> None:
+    paths: StudyPaths,
+    snapshot: SnapshotLeague,
+    legacy_state: Path,
+    identity: StudyIdentity | None = None,
+) -> StudyPreflight | None:
     """Reject path aliases before a new run root or SQLite file is created."""
     _validate_layout(paths)
-    root = _absolute(paths.root)
-    snapshot_root = _absolute(Path(snapshot.root))
-    legacy = _absolute(legacy_state)
+    root = _canonical_lexical_path(paths.root)
+    snapshot_root = _canonical_lexical_path(Path(snapshot.root))
+    legacy = _canonical_lexical_path(legacy_state)
     _validate_protected_roots(root, snapshot_root, legacy)
     protected = [
         snapshot_root,
@@ -215,6 +252,10 @@ def validate_study_paths(
         *_validate_snapshot_sources(snapshot, snapshot_root),
     ]
     _reject_existing_protected_aliases(paths, protected)
+    if identity is None:
+        return None
+    _validate_external_identity(snapshot, legacy, identity)
+    return StudyPreflight._create(paths, snapshot, legacy, identity)
 
 
 def _validate_protected_roots(root: Path, snapshot_root: Path, legacy: Path) -> None:
@@ -236,10 +277,12 @@ def _validate_snapshot_sources(
     """Verify immutable source bytes before the study root can be made."""
     protected: list[Path] = []
     for source in snapshot.sources:
-        original = _absolute(Path(source.source_path))
-        copied = _absolute(Path(source.snapshot_path))
-        _reject_symlink_components(original)
-        _reject_symlink_components(copied)
+        original_raw = _absolute(Path(source.source_path))
+        copied_raw = _absolute(Path(source.snapshot_path))
+        _reject_symlink_components(original_raw)
+        _reject_symlink_components(copied_raw)
+        original = _canonical_lexical_path(original_raw)
+        copied = _canonical_lexical_path(copied_raw)
         if not original.is_file() or not copied.is_file():
             raise ValueError(f"snapshot source {source.name} is not a regular file")
         if not _is_descendant(copied, snapshot_root):
@@ -260,8 +303,8 @@ def _reject_existing_protected_aliases(
     paths: StudyPaths, protected: Sequence[Path]
 ) -> None:
     """Reject pre-existing fixed children that share protected inodes."""
-    for candidate in (paths.root, paths.sqlite, paths.identity, paths.evidence):
-        absolute = _absolute(candidate)
+    for candidate in _study_output_paths(paths):
+        absolute = _canonical_lexical_path(candidate)
         if absolute.exists():
             for protected_path in protected:
                 if _same_inode(absolute, protected_path):
@@ -270,10 +313,15 @@ def _reject_existing_protected_aliases(
                     )
 
 
-def open_study(paths: StudyPaths, identity: StudyIdentity) -> optuna.Study:
+def open_study(
+    paths: StudyPaths,
+    identity: StudyIdentity,
+    preflight: StudyPreflight | None,
+) -> optuna.Study:
     """Create or reopen exactly one identity-bound SQLite-backed Optuna study."""
     _validate_layout(paths)
-    _reject_symlink_components(_absolute(paths.root))
+    _validate_runtime_optuna_version(identity)
+    _require_preflight(paths, identity, preflight)
     exists = (paths.sqlite.exists(), paths.identity.exists())
     if exists == (False, False):
         _create_run_root(paths)
@@ -281,15 +329,8 @@ def open_study(paths: StudyPaths, identity: StudyIdentity) -> optuna.Study:
         storage = RDBStorage(_sqlite_url(paths.sqlite))
         study = optuna.create_study(
             storage=storage,
-            sampler=TPESampler(
-                seed=20260827,
-                multivariate=True,
-                group=True,
-                n_startup_trials=16,
-            ),
-            pruner=SuccessiveHalvingPruner(
-                min_resource=1, reduction_factor=4, min_early_stopping_rate=0
-            ),
+            sampler=_sampler_for(identity),
+            pruner=_pruner_for(identity),
             study_name=identity.study_name,
             direction="maximize",
         )
@@ -298,8 +339,12 @@ def open_study(paths: StudyPaths, identity: StudyIdentity) -> optuna.Study:
     if exists != (True, True):
         raise StudyIdentityError("study storage and identity file must appear together")
     _validate_stored_identity(paths.identity, identity)
+    _validate_sqlite_identity_readonly(paths.sqlite, identity)
     study = optuna.load_study(
-        storage=RDBStorage(_sqlite_url(paths.sqlite)), study_name=identity.study_name
+        storage=RDBStorage(_sqlite_url(paths.sqlite)),
+        study_name=identity.study_name,
+        sampler=_sampler_for(identity),
+        pruner=_pruner_for(identity),
     )
     stored_digest = study.user_attrs.get(_IDENTITY_ATTRIBUTE)
     if stored_digest != identity.digest:
@@ -321,13 +366,7 @@ def reconcile_running_trials(study: optuna.Study) -> tuple[int, ...]:
     """Mark only stale running rows failed before a restarted coordinator asks again."""
     running = tuple(study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)))
     for trial in running:
-        trial_id = study._storage.get_trial_id_from_study_id_trial_number(  # noqa: SLF001
-            study._study_id,
-            trial.number,  # noqa: SLF001
-        )
-        study._storage.set_trial_system_attr(  # noqa: SLF001
-            trial_id, "interruption_reason", "process_restarted"
-        )
+        _set_interruption_reason(study, trial)
         study.tell(trial.number, state=TrialState.FAIL)
     return tuple(trial.number for trial in running)
 
@@ -391,16 +430,39 @@ def _validate_terminal_trial_evidence(
     """Check one terminal trial's cumulative rungs and final SQLite summary."""
     if trial.state is TrialState.RUNNING:
         return
-    if trial.state in (TrialState.COMPLETE, TrialState.PRUNED) and not records:
-        raise StudyEvidenceError(f"trial {number} is terminal but has missing evidence")
     if not records:
+        _validate_empty_terminal_trial(trial, number)
         return
+    _validate_present_terminal_trial(number, trial, records, identity)
+
+
+def _validate_empty_terminal_trial(trial: FrozenTrial, number: int) -> None:
+    """Require evidence except for a restart or Optuna-recorded non-game failure."""
+    if trial.state in (TrialState.COMPLETE, TrialState.PRUNED):
+        raise StudyEvidenceError(f"trial {number} is terminal but has missing evidence")
+    if trial.state is TrialState.FAIL:
+        _validate_failed_trial_contract(trial, {}, number)
+
+
+def _validate_present_terminal_trial(
+    number: int,
+    trial: FrozenTrial,
+    records: dict[int, tuple[RungEvidence, str]],
+    identity: StudyIdentity,
+) -> None:
+    """Validate one complete ordered evidence sequence and its final trial state."""
     ordered_rungs = tuple(sorted(records))
     if ordered_rungs != tuple(range(1, ordered_rungs[-1] + 1)):
         raise StudyEvidenceError(f"trial {number} has non-cumulative rung evidence")
     final, digest = records[ordered_rungs[-1]]
+    stored_config_sha256 = _config_sha256_from_trial_params(trial)
     for rung, (evidence, _) in records.items():
         _validate_evidence_identity(evidence, identity, number)
+        _validate_trial_rung(trial, evidence)
+        if evidence.config_sha256 != stored_config_sha256:
+            raise StudyEvidenceError(
+                f"trial {number} rung {rung} config differs from stored parameters"
+            )
         if evidence.config_sha256 != final.config_sha256:
             raise StudyEvidenceError(
                 f"trial {number} rung {rung} config differs from its final evidence"
@@ -412,6 +474,94 @@ def _validate_terminal_trial_evidence(
         )
     if trial.state is TrialState.COMPLETE and trial.value != final.objective:
         raise StudyEvidenceError(f"trial {number} objective differs from SQLite value")
+    if trial.state is TrialState.FAIL:
+        _validate_failed_trial_contract(trial, records, number)
+
+
+def _validate_trial_rung(trial: FrozenTrial, evidence: RungEvidence) -> None:
+    """Cross-check each durable rung against its Optuna intermediate value."""
+    actual = trial.intermediate_values.get(evidence.resource_step)
+    if evidence.objective is None:
+        if actual is not None:
+            raise StudyEvidenceError(
+                f"trial {trial.number} rung {evidence.rung} has unexpected intermediate"
+            )
+        return
+    if actual != evidence.objective:
+        raise StudyEvidenceError(
+            f"trial {trial.number} rung {evidence.rung} intermediate "
+            "differs from evidence"
+        )
+
+
+def _validate_failed_trial_contract(
+    trial: FrozenTrial,
+    records: dict[int, tuple[RungEvidence, str]],
+    number: int,
+) -> None:
+    """Reject FAILED rows without canonical execution-failure or restart facts."""
+    interrupted = trial.system_attrs.get("interruption_reason") == "process_restarted"
+    failure = trial.system_attrs.get("fail_reason")
+    if not records:
+        if not interrupted and not isinstance(failure, str):
+            raise StudyEvidenceError(
+                f"trial {number} FAIL lacks interruption/failure contract"
+            )
+        return
+    if records[max(records)][0].failures or interrupted:
+        return
+    raise StudyEvidenceError(f"trial {number} FAIL lacks interruption/failure contract")
+
+
+@dataclass(frozen=True)
+class _StoredParameterTrial:
+    """A strict TrialLike adapter used to rebuild config from stored parameters."""
+
+    params: dict[str, int | float | str]
+
+    def suggest_int(self, name: str, low: int, high: int, *, step: int = 1) -> int:
+        """Return a stored integer only when it remains in the declared domain."""
+        value = self._value(name)
+        if type(value) is not int or not low <= value <= high or (value - low) % step:
+            raise StudyEvidenceError(
+                f"stored trial parameter {name} is not a valid int"
+            )
+        return value
+
+    def suggest_float(self, name: str, low: float, high: float) -> float:
+        """Return a stored float only when it remains in the declared domain."""
+        value = self._value(name)
+        if type(value) not in (int, float) or not low <= float(value) <= high:
+            raise StudyEvidenceError(
+                f"stored trial parameter {name} is not a valid float"
+            )
+        return float(value)
+
+    def suggest_categorical(self, name: str, choices: Sequence[str]) -> str:
+        """Return a stored category only when it remains one declared choice."""
+        value = self._value(name)
+        if type(value) is not str or value not in choices:
+            raise StudyEvidenceError(
+                f"stored trial parameter {name} is not a valid category"
+            )
+        return value
+
+    def _value(self, name: str) -> int | float | str:
+        if name not in self.params:
+            raise StudyEvidenceError(f"stored trial parameter {name} is missing")
+        return self.params[name]
+
+
+def _config_sha256_from_trial_params(trial: FrozenTrial) -> str:
+    """Rebuild a validated HybridConfig and require its exact canonical params."""
+    params = dict(trial.params)
+    config = suggest_config(_StoredParameterTrial(params))
+    if parameters_for_config(config) != params:
+        raise StudyEvidenceError(
+            f"trial {trial.number} stored parameters are not canonical "
+            "config parameters"
+        )
+    return config_sha256(config)
 
 
 def close_and_hash_storage(study: optuna.Study, paths: StudyPaths) -> str:
@@ -428,7 +578,7 @@ def close_and_hash_storage(study: optuna.Study, paths: StudyPaths) -> str:
             raise StudyEvidenceError("SQLite WAL checkpoint could not complete")
     finally:
         connection.close()
-    storage = study._storage  # noqa: SLF001
+    storage = _optuna_49_private_storage(study)
     backend = getattr(storage, "_backend", storage)
     if not isinstance(backend, RDBStorage):
         raise StudyEvidenceError("study is not backed by direct RDBStorage")
@@ -443,6 +593,28 @@ def close_and_hash_storage(study: optuna.Study, paths: StudyPaths) -> str:
                 f"SQLite sidecar remains after checkpoint: {sidecar.name}"
             )
     return hashlib.sha256(paths.sqlite.read_bytes()).hexdigest()
+
+
+def _optuna_49_private_storage(study: optuna.Study) -> BaseStorage:
+    """Return Optuna 4.9's storage bridge for APIs Study does not expose.
+
+    Public ``get_trials`` and ``tell`` handle trial state. Optuna exposes no
+    public API to set a *trial* system attribute or dispose a study engine, so
+    this narrow, version-guarded bridge is limited to those two operations.
+    """
+    if optuna.__version__ != "4.9.0":
+        raise RuntimeError("private storage bridge is pinned to Optuna 4.9.0")
+    return study._storage  # noqa: SLF001
+
+
+def _set_interruption_reason(study: optuna.Study, trial: FrozenTrial) -> None:
+    """Set the unavailable trial system attribute through the versioned bridge."""
+    storage = _optuna_49_private_storage(study)
+    trial_id = storage.get_trial_id_from_study_id_trial_number(
+        study._study_id,  # noqa: SLF001
+        trial.number,
+    )
+    storage.set_trial_system_attr(trial_id, "interruption_reason", "process_restarted")
 
 
 def _validate_identity_inputs(
@@ -513,12 +685,117 @@ def _validate_warm_starts(warm_starts: Sequence[HybridConfig]) -> None:
         raise ValueError("warm-start configurations must be distinct")
 
 
+def _validate_external_identity(
+    snapshot: SnapshotLeague, legacy_state: Path, identity: StudyIdentity
+) -> None:
+    """Bind preflighted mutable paths to every matching immutable identity fact."""
+    snapshots = tuple(
+        sorted(
+            (source.name, source.source_path, source.snapshot_path, source.sha256)
+            for source in snapshot.sources
+        )
+    )
+    if snapshots != identity.league_snapshots:
+        raise StudyIdentityError("snapshot facts differ from study identity")
+    if (
+        hashlib.sha256(legacy_state.read_bytes()).hexdigest()
+        != identity.legacy_state_sha256
+    ):
+        raise StudyIdentityError("legacy state SHA-256 differs from study identity")
+
+
+def _require_preflight(
+    paths: StudyPaths,
+    identity: StudyIdentity,
+    preflight: StudyPreflight | None,
+) -> None:
+    """Require the capability produced by this module's external-byte preflight."""
+    if (
+        not isinstance(preflight, StudyPreflight)
+        or preflight._capability is not _PREFLIGHT_CAPABILITY
+        or preflight.paths != paths
+        or preflight.identity_digest != identity.digest
+    ):
+        raise StudyIdentityError("open_study requires matching validated preflight")
+    validate_study_paths(paths, preflight._snapshot, preflight._legacy_state, identity)
+
+
+def _validate_runtime_optuna_version(identity: StudyIdentity) -> None:
+    """Reject a dependency upgrade before it can alter sampler or storage state."""
+    if optuna.__version__ != identity.optuna_version:
+        raise StudyIdentityError(
+            f"Optuna {optuna.__version__} differs from identity "
+            f"{identity.optuna_version}"
+        )
+
+
+def _sampler_for(identity: StudyIdentity) -> TPESampler:
+    """Reconstruct the exact identity-bound sequential TPE sampler."""
+    return TPESampler(
+        seed=identity.sampler.seed,
+        multivariate=identity.sampler.multivariate,
+        group=identity.sampler.group,
+        n_startup_trials=identity.sampler.n_startup_trials,
+    )
+
+
+def _pruner_for(identity: StudyIdentity) -> SuccessiveHalvingPruner:
+    """Reconstruct the exact identity-bound successive-halving pruner."""
+    return SuccessiveHalvingPruner(
+        min_resource=identity.pruner.min_resource,
+        reduction_factor=identity.pruner.reduction_factor,
+        min_early_stopping_rate=identity.pruner.min_early_stopping_rate,
+    )
+
+
+def _validate_sqlite_identity_readonly(paths: Path, identity: StudyIdentity) -> None:
+    """Read the stored study identity through SQLite without opening RDBStorage."""
+    connection = sqlite3.connect(f"file:{paths}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT study_id FROM studies WHERE study_name = ?", (identity.study_name,)
+        ).fetchone()
+        if row is None:
+            raise StudyIdentityError("SQLite study name differs from identity")
+        attribute = connection.execute(
+            "SELECT value_json FROM study_user_attributes "
+            "WHERE study_id = ? AND key = ?",
+            (row[0], _IDENTITY_ATTRIBUTE),
+        ).fetchone()
+    except sqlite3.DatabaseError as error:
+        raise StudyIdentityError("cannot read stored SQLite study identity") from error
+    finally:
+        connection.close()
+    if attribute is None:
+        raise StudyIdentityError("SQLite study identity attribute is missing")
+    try:
+        digest = json.loads(attribute[0])
+    except json.JSONDecodeError as error:
+        raise StudyIdentityError(
+            "SQLite study identity attribute is invalid"
+        ) from error
+    if digest != identity.digest:
+        raise StudyIdentityError("study_identity_sha256 differs from identity.json")
+
+
 def _validate_layout(paths: StudyPaths) -> None:
     expected = StudyPaths.from_root(paths.root)
     if paths != expected:
         raise ValueError("study paths must use the canonical fixed layout")
-    for path in (paths.root, paths.sqlite, paths.identity, paths.evidence):
+    for path in _study_output_paths(paths):
         _reject_symlink_components(_absolute(path))
+
+
+def _study_output_paths(paths: StudyPaths) -> tuple[Path, ...]:
+    """Return every fixed output that must remain disjoint from protected bytes."""
+    return (
+        paths.root,
+        paths.sqlite,
+        paths.identity,
+        paths.evidence,
+        paths.diagnostic,
+        paths.finalists,
+    )
 
 
 def _create_run_root(paths: StudyPaths) -> None:
@@ -574,7 +851,8 @@ def _read_evidence(path: Path, paths: StudyPaths) -> tuple[RungEvidence, str]:
     if not path.is_file() or path.is_symlink() or path.suffix != ".json":
         raise StudyEvidenceError(f"unexpected evidence entry {path.name}")
     try:
-        evidence = RungEvidence.model_validate_json(path.read_bytes())
+        source = path.read_bytes()
+        evidence = RungEvidence.model_validate_json(source)
     except (ValidationError, ValueError) as error:
         matched = re.fullmatch(r"trial-(\d+)-rung-([123])\.json", path.name)
         if matched is not None:
@@ -585,7 +863,9 @@ def _read_evidence(path: Path, paths: StudyPaths) -> tuple[RungEvidence, str]:
     expected = evidence_path(paths.root, evidence.trial_number, evidence.rung)
     if path != expected:
         raise StudyEvidenceError(f"evidence file {path.name} has a non-canonical path")
-    return evidence, hashlib.sha256(path.read_bytes()).hexdigest()
+    if source != _canonical_json(evidence.model_dump(mode="json")) + b"\n":
+        raise StudyEvidenceError(f"evidence file {path.name} is not canonical JSON")
+    return evidence, hashlib.sha256(source).hexdigest()
 
 
 def _validate_evidence_identity(
@@ -662,6 +942,11 @@ def _required_sha256(value: str | None, label: str) -> str:
 
 def _absolute(path: Path) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
+
+
+def _canonical_lexical_path(path: Path) -> Path:
+    """Normalize ``.``/``..`` without resolving symlinks or requiring existence."""
+    return Path(os.path.normpath(str(_absolute(path))))
 
 
 def _reject_symlink_components(path: Path) -> None:
