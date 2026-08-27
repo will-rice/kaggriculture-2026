@@ -283,6 +283,8 @@ def _validate_snapshot_sources(
         _reject_symlink_components(copied_raw)
         original = _canonical_lexical_path(original_raw)
         copied = _canonical_lexical_path(copied_raw)
+        _reject_symlink_components(original)
+        _reject_symlink_components(copied)
         if not original.is_file() or not copied.is_file():
             raise ValueError(f"snapshot source {source.name} is not a regular file")
         if not _is_descendant(copied, snapshot_root):
@@ -455,6 +457,15 @@ def _validate_present_terminal_trial(
     if ordered_rungs != tuple(range(1, ordered_rungs[-1] + 1)):
         raise StudyEvidenceError(f"trial {number} has non-cumulative rung evidence")
     final, digest = records[ordered_rungs[-1]]
+    expected_steps = {
+        evidence.resource_step
+        for evidence, _ in records.values()
+        if evidence.objective is not None
+    }
+    if set(trial.intermediate_values) != expected_steps:
+        raise StudyEvidenceError(
+            f"trial {number} intermediate step set differs from canonical evidence"
+        )
     stored_config_sha256 = _config_sha256_from_trial_params(trial)
     for rung, (evidence, _) in records.items():
         _validate_evidence_identity(evidence, identity, number)
@@ -472,7 +483,10 @@ def _validate_present_terminal_trial(
         raise StudyEvidenceError(
             f"trial {number} is COMPLETE but is missing rung 3 evidence"
         )
-    if trial.state is TrialState.COMPLETE and trial.value != final.objective:
+    if (
+        trial.state in (TrialState.COMPLETE, TrialState.PRUNED)
+        and trial.value != final.objective
+    ):
         raise StudyEvidenceError(f"trial {number} objective differs from SQLite value")
     if trial.state is TrialState.FAIL:
         _validate_failed_trial_contract(trial, records, number)
@@ -762,12 +776,17 @@ def _validate_sqlite_identity_readonly(paths: Path, identity: StudyIdentity) -> 
             "WHERE study_id = ? AND key = ?",
             (row[0], _IDENTITY_ATTRIBUTE),
         ).fetchone()
+        direction = connection.execute(
+            "SELECT direction FROM study_directions WHERE study_id = ?", (row[0],)
+        ).fetchall()
     except sqlite3.DatabaseError as error:
         raise StudyIdentityError("cannot read stored SQLite study identity") from error
     finally:
         connection.close()
     if attribute is None:
         raise StudyIdentityError("SQLite study identity attribute is missing")
+    if direction != [("MAXIMIZE",)]:
+        raise StudyIdentityError("SQLite study direction differs from MAXIMIZE")
     try:
         digest = json.loads(attribute[0])
     except json.JSONDecodeError as error:

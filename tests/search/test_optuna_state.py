@@ -268,6 +268,33 @@ def test_paths_reject_symlink_and_inode_aliases_before_run_root_mutation(
         validate_study_paths(paths, snapshot, legacy_state)
 
 
+@pytest.mark.parametrize("field", ("source_path", "snapshot_path"))
+def test_paths_reject_normalized_source_or_snapshot_symlink_escape(
+    tmp_path: Path,
+    identity_inputs: tuple[VerifiedFrontier, SnapshotLeague, FrontierReport, Path],
+    field: str,
+) -> None:
+    """Post-normalization source paths cannot hide a symlink behind missing/.. ."""
+    _, snapshot, _, legacy_state = identity_inputs
+    first, *rest = snapshot.sources
+    target = Path(getattr(first, field)).parent
+    link = tmp_path / f"{field}-link"
+    link.symlink_to(target, target_is_directory=True)
+    escaped = tmp_path / "missing" / ".." / link.name / Path(getattr(first, field)).name
+    altered = SnapshotSource(
+        first.name,
+        str(escaped) if field == "source_path" else first.source_path,
+        str(escaped) if field == "snapshot_path" else first.snapshot_path,
+        first.sha256,
+    )
+    forged = SnapshotLeague(snapshot.root, (altered, *rest))
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_study_paths(
+            StudyPaths.from_root(tmp_path / "study"), forged, legacy_state
+        )
+
+
 def test_preflight_rejects_parent_traversal_and_every_fixed_output_alias(
     tmp_path: Path,
     identity: StudyIdentity,
@@ -368,6 +395,26 @@ def test_resume_db_identity_mismatch_does_not_mutate_sqlite(
     original = paths.sqlite.read_bytes()
 
     with pytest.raises(StudyIdentityError, match="study_identity_sha256"):
+        open_study(paths, identity, preflight_factory(paths))
+
+    assert paths.sqlite.read_bytes() == original
+
+
+def test_resume_direction_drift_does_not_mutate_sqlite(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """SQLite must retain the one identity-bound MAXIMIZE study direction on resume."""
+    paths = StudyPaths.from_root(tmp_path / "study")
+    open_study(paths, identity, preflight_factory(paths))
+    connection = sqlite3.connect(paths.sqlite)
+    try:
+        connection.execute("UPDATE study_directions SET direction = 'MINIMIZE'")
+        connection.commit()
+    finally:
+        connection.close()
+    original = paths.sqlite.read_bytes()
+
+    with pytest.raises(StudyIdentityError, match="direction"):
         open_study(paths, identity, preflight_factory(paths))
 
     assert paths.sqlite.read_bytes() == original
@@ -590,6 +637,69 @@ def test_validation_rejects_tampered_intermediate_value(
 
     with pytest.raises(StudyEvidenceError, match="intermediate differs"):
         validate_study_evidence(study, paths, identity)
+
+
+def test_validation_rejects_extra_intermediate_resource_step(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """Only completed evidence rungs may occupy Optuna's intermediate step map."""
+    paths = StudyPaths.from_root(tmp_path / "study")
+    study = open_study(paths, identity, preflight_factory(paths))
+    trial = study.ask()
+    config = suggest_config(trial)
+    final: RungEvidence | None = None
+    for rung, resource_step, opponents, seeds in (
+        (1, 1, PANELS.rung_1, tuple(range(860_000, 860_004))),
+        (2, 4, PANELS.rung_2, tuple(range(860_000, 860_016))),
+        (3, 16, PANELS.rung_3, tuple(range(860_000, 860_032))),
+    ):
+        evidence = build_rung_evidence(
+            trial.number,
+            config,
+            RungSpec(rung, resource_step, opponents, seeds),
+            _rung_rows(RungSpec(rung, resource_step, opponents, seeds)),
+            WEIGHTS,
+        )
+        _, digest = write_rung_evidence_atomic(paths.root, evidence)
+        _set_summary(trial, digest, evidence)
+        assert evidence.objective is not None
+        trial.report(evidence.objective, resource_step)
+        final = evidence
+    assert final is not None and final.objective is not None
+    trial.report(0.5, 2)
+    study.tell(trial, final.objective)
+
+    with pytest.raises(StudyEvidenceError, match="intermediate step set"):
+        validate_study_evidence(study, paths, identity)
+
+
+def test_validation_rejects_tampered_pruned_terminal_value(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """PRUNED values remain bound to their last clean canonical rung objective."""
+    paths = StudyPaths.from_root(tmp_path / "study")
+    study = open_study(paths, identity, preflight_factory(paths))
+    trial = study.ask()
+    config = suggest_config(trial)
+    spec = RungSpec(1, 1, PANELS.rung_1, tuple(range(860_000, 860_004)))
+    evidence = build_rung_evidence(
+        trial.number, config, spec, _rung_rows(spec), WEIGHTS
+    )
+    _, digest = write_rung_evidence_atomic(paths.root, evidence)
+    _set_summary(trial, digest, evidence)
+    assert evidence.objective is not None
+    trial.report(evidence.objective, 1)
+    study.tell(trial, state=TrialState.PRUNED)
+    connection = sqlite3.connect(paths.sqlite)
+    try:
+        connection.execute("UPDATE trial_values SET value = 0.0")
+        connection.commit()
+    finally:
+        connection.close()
+    resumed = open_study(paths, identity, preflight_factory(paths))
+
+    with pytest.raises(StudyEvidenceError, match="objective differs"):
+        validate_study_evidence(resumed, paths, identity)
 
 
 def test_validation_recomputes_config_digest_from_stored_trial_params(
