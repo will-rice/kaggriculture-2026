@@ -27,7 +27,13 @@ class WandbSettings(BaseModel):
 class WandbRun(Protocol):
     """The small W&B run surface used by the telemetry observer."""
 
-    def log(self, metrics: Mapping[str, float], *, step: int, commit: bool) -> None:
+    def log(
+        self,
+        metrics: Mapping[str, float],
+        *,
+        step: int,
+        commit: bool | None = None,
+    ) -> None:
         """Log metrics to the active run."""
         ...
 
@@ -78,12 +84,13 @@ class WandbSession:
 
     run: WandbRun | None
     official: Callable[[optuna.Study, FrozenTrial], None] | None
+    maximum_trials: int | None = None
     disabled_reason: str | None = None
 
     @classmethod
     def disabled(cls, reason: str) -> Self:
         """Create an inert session after an optional telemetry failure."""
-        return cls(run=None, official=None, disabled_reason=reason)
+        return cls(run=None, official=None, maximum_trials=None, disabled_reason=reason)
 
     @classmethod
     def open(
@@ -120,6 +127,7 @@ class WandbSession:
             return cls(
                 run=run,
                 official=cast(Callable[[optuna.Study, FrozenTrial], None], official),
+                maximum_trials=identity.maximum_trials,
             )
         except Exception as error:
             return cls.disabled(_failure_reason(error))
@@ -128,12 +136,21 @@ class WandbSession:
         """Merge rich scalar telemetry into the official trial-number row."""
         if self.disabled_reason is not None:
             return
-        assert self.run is not None and self.official is not None
+        assert (
+            self.run is not None
+            and self.official is not None
+            and self.maximum_trials is not None
+        )
         try:
             metrics = trial_metrics(trial)
             metrics.update(_current_best_metrics(study))
+            metrics.update(_progress_metrics(study, self.maximum_trials))
             self.run.log(metrics, step=trial.number, commit=False)
             self.official(study, trial)
+            # The official 4.9 callback uses an explicit step without commit.
+            # W&B therefore keeps that row pending; finalize the merged row
+            # explicitly so a process crash cannot lose this terminal trial.
+            self.run.log({}, step=trial.number, commit=True)
         except Exception as error:
             self.disabled_reason = _failure_reason(error)
 
@@ -163,6 +180,8 @@ def trial_metrics(trial: FrozenTrial) -> dict[str, float]:
     if trial.value is not None:
         metrics["trial/value"] = _finite_scalar(trial.value, "trial/value")
     for name, value in trial.user_attrs.items():
+        if name in {"throughput_games_per_second", "eta_seconds"}:
+            continue
         if isinstance(value, bool | int | float):
             metrics[name] = _finite_scalar(value, name)
     return metrics
@@ -191,6 +210,46 @@ def _current_best_metrics(study: optuna.Study) -> dict[str, float]:
                 f"best/{name}",
             )
     return metrics
+
+
+def _progress_metrics(study: optuna.Study, maximum_trials: int) -> dict[str, float]:
+    """Derive finite throughput and ETA from authoritative terminal trial facts."""
+    terminal = study.get_trials(
+        deepcopy=False,
+        states=(
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.FAIL,
+        ),
+    )
+    terminal_count = len(terminal)
+    if terminal_count == 0 or terminal_count > maximum_trials:
+        raise ValueError("terminal trial count is outside the configured budget")
+    games = sum(_positive_attr(item, "games") for item in terminal)
+    runtime = sum(_positive_attr(item, "runtime_seconds") for item in terminal)
+    throughput = games / runtime
+    average_runtime = runtime / terminal_count
+    eta = average_runtime * (maximum_trials - terminal_count)
+    return {
+        "terminal_trials": float(terminal_count),
+        "remaining_trials": float(maximum_trials - terminal_count),
+        "throughput_games_per_second": _finite_scalar(
+            throughput,
+            "throughput_games_per_second",
+        ),
+        "eta_seconds": _finite_scalar(eta, "eta_seconds"),
+    }
+
+
+def _positive_attr(trial: FrozenTrial, name: str) -> float:
+    """Read one required positive finite Task 5 scalar from a terminal trial."""
+    value = trial.user_attrs.get(name)
+    if not isinstance(value, bool | int | float):
+        raise ValueError(f"{name} is required for terminal trial telemetry")
+    numeric = _finite_scalar(value, name)
+    if numeric <= 0.0:
+        raise ValueError(f"{name} must be positive for terminal trial telemetry")
+    return numeric
 
 
 def _failure_reason(error: Exception) -> str:
