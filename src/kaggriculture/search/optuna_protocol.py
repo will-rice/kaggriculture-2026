@@ -144,19 +144,60 @@ class RungEvidence(BaseModel):
     seeds: tuple[int, ...]
     games: tuple[GameEvidence, ...]
     matchups: dict[str, MatchupEvidence]
+    strength_weights: tuple[tuple[str, int], ...]
     primary: float | None
     dense_margin: float | None
     objective: float | None
     failures: tuple[str, ...]
 
     @model_validator(mode="after")
-    def scores_match_eligibility(self) -> Self:
-        """Keep failed evidence explicitly unscored rather than ambiguously finite."""
+    def is_derived_from_raw_games(self) -> Self:
+        """Reject summaries and scores that diverge from durable raw game evidence."""
+        spec = RungSpec(
+            self.rung,
+            self.resource_step,
+            self.opponents,
+            self.seeds,
+        )
+        _validate_spec(spec)
+        expected_keys = tuple(
+            (key.opponent, key.seed, key.seat) for key in _expected_keys(spec)
+        )
+        actual_keys = tuple(
+            (game.opponent, game.seed, game.seat) for game in self.games
+        )
+        if actual_keys != expected_keys:
+            raise ValueError("rung evidence game keys differ from the expected cells")
+        expected_failures = _failure_messages(self.games)
+        if self.failures != expected_failures:
+            raise ValueError("rung evidence failures differ from its raw games")
+        expected_matchups = {
+            opponent: _matchup_evidence(
+                opponent,
+                tuple(game for game in self.games if game.opponent == opponent),
+            )
+            for opponent in self.opponents
+        }
+        if self.matchups != expected_matchups:
+            raise ValueError("rung evidence matchups differ from its raw games")
+        weights = _evidence_panel_weights(spec, self.strength_weights)
         values = (self.primary, self.dense_margin, self.objective)
         if self.failures and any(value is not None for value in values):
             raise ValueError("failed rung evidence must not contain scores")
         if not self.failures and any(value is None for value in values):
             raise ValueError("clean rung evidence must contain all scores")
+        if not self.failures:
+            assert self.primary is not None
+            assert self.dense_margin is not None
+            assert self.objective is not None
+            expected_score = _score_matchups(expected_matchups, weights)
+            actual_score = RungScore(
+                primary=self.primary,
+                dense_margin=self.dense_margin,
+                objective=self.objective,
+            )
+            if actual_score != expected_score:
+                raise ValueError("rung evidence scores differ from its raw games")
         return self
 
 
@@ -298,15 +339,11 @@ def build_rung_evidence(
 
     ordered_rows = tuple(completed[key] for key in expected_keys)
     games = tuple(_game_evidence(row) for row in ordered_rows)
-    failures = tuple(
-        f"{row.key.opponent}/{row.key.seed}/seat{row.key.seat}: {row.failure}"
-        for row in ordered_rows
-        if row.failure is not None
-    )
+    failures = _failure_messages(games)
     matchups = {
         opponent: _matchup_evidence(
             opponent,
-            tuple(row for row in ordered_rows if row.key.opponent == opponent),
+            tuple(game for game in games if game.opponent == opponent),
         )
         for opponent in spec.opponents
     }
@@ -327,6 +364,9 @@ def build_rung_evidence(
         seeds=spec.seeds,
         games=games,
         matchups=matchups,
+        strength_weights=tuple(
+            (name, panel_weights.values[name]) for name in spec.opponents
+        ),
         primary=primary,
         dense_margin=dense_margin,
         objective=objective,
@@ -338,6 +378,7 @@ def score_evidence(evidence: RungEvidence, weights: StrengthWeights) -> RungScor
     """Return the lexicographic scalar only when the complete rung is clean."""
     if not isinstance(evidence, RungEvidence):
         raise ValueError("evidence must be a RungEvidence")
+    evidence = _validated_evidence(evidence)
     spec = RungSpec(
         evidence.rung,
         evidence.resource_step,
@@ -346,6 +387,8 @@ def score_evidence(evidence: RungEvidence, weights: StrengthWeights) -> RungScor
     )
     _validate_spec(spec)
     panel_weights = _panel_weights(spec, weights)
+    if panel_weights != _evidence_panel_weights(spec, evidence.strength_weights):
+        raise ValueError("evidence strength weights differ from the supplied weights")
     if evidence.failures:
         raise IneligibleEvidenceError("; ".join(evidence.failures))
     score = _score_matchups(evidence.matchups, panel_weights)
@@ -362,10 +405,15 @@ def minimum_primary_increment(spec: RungSpec, weights: StrengthWeights) -> float
     """Return a conservative positive primary delta for one result half-step."""
     _validate_spec(spec)
     panel_weights = _panel_weights(spec, weights)
+    return _minimum_primary_increment(spec, panel_weights)
+
+
+def _minimum_primary_increment(spec: RungSpec, weights: StrengthWeights) -> float:
+    """Calculate the bound after the caller has selected exact panel weights."""
     return (
         0.70
-        * min(panel_weights.values.values())
-        / sum(panel_weights.values.values())
+        * min(weights.values.values())
+        / sum(weights.values.values())
         * 0.5
         / (2 * len(spec.seeds))
     )
@@ -391,6 +439,7 @@ def write_rung_evidence_atomic(root: Path, evidence: RungEvidence) -> tuple[Path
     """Fsync canonical evidence before atomically replacing its published path."""
     if not isinstance(evidence, RungEvidence):
         raise ValueError("evidence must be a RungEvidence")
+    evidence = _validated_evidence(evidence)
     output = evidence_path(root, evidence.trial_number, evidence.rung)
     output.parent.mkdir(parents=True, exist_ok=True)
     source = (
@@ -441,7 +490,26 @@ def _panel_weights(spec: RungSpec, weights: StrengthWeights) -> StrengthWeights:
         raise ValueError(
             "strength weights are missing rung opponents: " + ", ".join(sorted(missing))
         )
-    return StrengthWeights({name: weights.values[name] for name in spec.opponents})
+    panel_weights = StrengthWeights(
+        {name: weights.values[name] for name in spec.opponents}
+    )
+    if _minimum_primary_increment(spec, panel_weights) <= 1e-6:
+        raise ValueError("strength weights violate lexicographic dominance")
+    return panel_weights
+
+
+def _evidence_panel_weights(
+    spec: RungSpec, pairs: tuple[tuple[str, int], ...]
+) -> StrengthWeights:
+    """Recover and validate the exact per-panel weights persisted with evidence."""
+    if tuple(name for name, _ in pairs) != spec.opponents:
+        raise ValueError("evidence strength weights must follow the opponent panel")
+    return _panel_weights(spec, StrengthWeights(dict(pairs)))
+
+
+def _validated_evidence(evidence: RungEvidence) -> RungEvidence:
+    """Re-run strict model validation after a frozen model's nested data may mutate."""
+    return RungEvidence.model_validate(evidence.model_dump())
 
 
 def _expected_keys(spec: RungSpec) -> tuple[GameKey, ...]:
@@ -467,7 +535,18 @@ def _game_evidence(row: GameResult) -> GameEvidence:
     )
 
 
-def _matchup_evidence(opponent: str, rows: Sequence[GameResult]) -> MatchupEvidence:
+def _failure_messages(games: Sequence[GameEvidence]) -> tuple[str, ...]:
+    """Format failure provenance directly from the canonical ordered game records."""
+    return tuple(
+        f"{game.opponent}/{game.seed}/seat{game.seat}: {game.failure}"
+        for game in games
+        if game.failure is not None
+    )
+
+
+def _matchup_evidence(
+    opponent: str, rows: Sequence[GameEvidence]
+) -> MatchupEvidence:
     """Aggregate one complete opponent block without inventing failed outcomes."""
     successes = tuple(
         (row, _successful_banks(row)) for row in rows if row.failure is None
@@ -491,10 +570,10 @@ def _matchup_evidence(opponent: str, rows: Sequence[GameResult]) -> MatchupEvide
     )
 
 
-def _successful_banks(row: GameResult) -> tuple[int, int]:
-    """Return successful banks while defending the arena's typed row invariant."""
+def _successful_banks(row: GameEvidence) -> tuple[int, int]:
+    """Return successful banks while defending the evidence-row invariant."""
     if row.ours is None or row.theirs is None:
-        raise ValueError("successful game result is missing bank values")
+        raise ValueError("successful game evidence is missing bank values")
     return row.ours, row.theirs
 
 

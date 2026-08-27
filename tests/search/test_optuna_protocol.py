@@ -24,6 +24,7 @@ from kaggriculture.search.optuna_protocol import (
     RUNG_3_SEEDS,
     GameEvidence,
     IneligibleEvidenceError,
+    RungEvidence,
     RungSpec,
     build_rung_evidence,
     derive_panels,
@@ -103,8 +104,14 @@ def test_panels_are_exact_three_six_eleven_from_ranked_report(
     panels = derive_panels(frontier_report)
 
     assert panels.rung_1 == ("economic_policy", "weakest_policy", "tenth_policy")
-    assert len(panels.rung_2) == 6
-    assert {"boatlee_v14_current", frontier_report.frontier_name} <= set(panels.rung_2)
+    assert panels.rung_2 == (
+        "economic_policy",
+        "weakest_policy",
+        "tenth_policy",
+        "boatlee_v14_current",
+        "frontier_policy",
+        "sixth_policy",
+    )
     assert panels.rung_3 == NAMES
 
 
@@ -209,6 +216,72 @@ def test_any_failed_game_makes_rung_ineligible() -> None:
     )
     with pytest.raises(IneligibleEvidenceError, match="boom"):
         score_evidence(evidence, WEIGHTS)
+
+
+def test_rung_evidence_rejects_forged_raw_failure_and_aggregate_fields() -> None:
+    """Raw game cells, failures, matchups, and scores are one inseparable record."""
+    clean = build_rung_evidence(7, HybridConfig.default(), RUNG, _rows(), WEIGHTS)
+    failed = build_rung_evidence(
+        7, HybridConfig.default(), RUNG, _rows(failed=True), WEIGHTS
+    )
+
+    hidden_failure = failed.model_dump()
+    hidden_failure["failures"] = ()
+    missing_game = clean.model_dump()
+    missing_game["games"] = missing_game["games"][:-1]
+    altered_matchup = clean.model_dump()
+    altered_matchup["matchups"] = dict(altered_matchup["matchups"])
+    altered_matchup["matchups"]["economic_policy"] = dict(
+        altered_matchup["matchups"]["economic_policy"]
+    )
+    altered_matchup["matchups"]["economic_policy"]["wins"] = 0
+    fabricated_score = clean.model_dump()
+    fabricated_score["primary"] = 0.5
+    fabricated_score["objective"] = objective_value(
+        fabricated_score["primary"], fabricated_score["dense_margin"]
+    )
+
+    for payload in (
+        hidden_failure,
+        missing_game,
+        altered_matchup,
+        fabricated_score,
+    ):
+        with pytest.raises(ValidationError):
+            RungEvidence.model_validate(payload)
+
+
+def test_score_and_writer_revalidate_mutated_frozen_evidence(tmp_path: Path) -> None:
+    """A model-copy bypass cannot smuggle fabricated score fields across boundaries."""
+    clean = build_rung_evidence(7, HybridConfig.default(), RUNG, _rows(), WEIGHTS)
+    forged = clean.model_copy(
+        update={"primary": 0.5, "objective": objective_value(0.5, 1 / 12)}
+    )
+
+    with pytest.raises(ValueError, match="scores"):
+        score_evidence(forged, WEIGHTS)
+    with pytest.raises(ValueError, match="scores"):
+        write_rung_evidence_atomic(tmp_path, forged)
+
+
+def test_extreme_weight_skew_is_rejected_before_scoring() -> None:
+    """An epsilon-smaller primary step cannot be presented to the objective."""
+    skewed_spec = RungSpec(
+        1,
+        1,
+        ("economic_policy", "strong_policy"),
+        (860_000, 860_001),
+    )
+    skewed_weights = StrengthWeights(
+        {"economic_policy": 1, "strong_policy": 10**20}
+    )
+
+    with pytest.raises(ValueError, match="dominance"):
+        minimum_primary_increment(skewed_spec, skewed_weights)
+    with pytest.raises(ValueError, match="dominance"):
+        build_rung_evidence(
+            7, HybridConfig.default(), skewed_spec, {}, skewed_weights
+        )
 
 
 @pytest.mark.parametrize("rung", (1, 2, 3))
