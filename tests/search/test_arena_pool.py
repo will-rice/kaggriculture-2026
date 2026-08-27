@@ -45,6 +45,20 @@ class RecordingExecutor:
         self.shutdown_calls += 1
 
 
+class ReorderingExecutor(RecordingExecutor):
+    """A broken executor that violates the requested game-key order."""
+
+    def map(
+        self, function: Callable[[GameTask], GameResult], tasks: tuple[GameTask, ...]
+    ) -> tuple[GameResult, ...]:
+        """Return valid rows in reverse provenance order without running games."""
+        del function, tasks
+        return (
+            GameResult(TASK_B.key, 91, 17, 0.0),
+            GameResult(TASK_A.key, 91, 17, 0.0),
+        )
+
+
 def recording_executor(
     created: list[RecordingExecutor],
 ) -> Callable[..., RecordingExecutor]:
@@ -95,6 +109,10 @@ def test_persistent_arena_constructs_one_executor_for_multiple_calls(
         (lambda: GameKey("", 1, 0), "opponent"),
         (lambda: GameKey("econ", True, 0), "seed"),
         (lambda: GameKey("econ", 1, 2), "seat"),
+        (lambda: GameTask("econ", CANDIDATE, ECONOMIC_POLICY), "key"),
+        (lambda: GameTask(GameKey("econ", 1, 0), RUNTIME, ECONOMIC_POLICY), "candidate"),
+        (lambda: GameTask(GameKey("econ", 1, 0), CANDIDATE, object()), "opponent"),
+        (lambda: GameResult("econ", 1, 1, 0.0), "key"),
         (lambda: GameResult(GameKey("econ", 1, 0), None, 1, 0.0), "success"),
         (lambda: GameResult(GameKey("econ", 1, 0), 1, 1, -0.1), "runtime"),
     ),
@@ -176,3 +194,24 @@ def test_persistent_arena_rejects_duplicate_or_reordered_provenance(
     with PersistentArena() as pool:
         with pytest.raises(ValueError, match="duplicate provenance"):
             pool.run((TASK_A, TASK_A))
+
+
+def test_persistent_arena_rejects_reordered_executor_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid but reordered result batch cannot be associated by position."""
+    from kaggriculture.search import arena_pool
+
+    created: list[RecordingExecutor] = []
+
+    def factory(*, max_workers: int) -> ReorderingExecutor:
+        executor = ReorderingExecutor(max_workers)
+        created.append(executor)
+        return executor
+
+    monkeypatch.setattr(arena_pool, "ProcessPoolExecutor", factory)
+    with PersistentArena() as pool:
+        with pytest.raises(RuntimeError, match="results differ"):
+            pool.run((TASK_A, TASK_B))
+
+    assert created[0].shutdown_calls == 1

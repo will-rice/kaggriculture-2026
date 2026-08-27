@@ -73,6 +73,18 @@ class GameTask:
     candidate: HybridOpponent
     opponent: Opponent
 
+    def __post_init__(self) -> None:
+        """Reject objects that cannot safely cross the worker boundary."""
+        if not isinstance(self.key, GameKey):
+            raise ValueError("game task key must be a GameKey")
+        if type(self.candidate) is not HybridOpponent:
+            raise ValueError("game task candidate must be a HybridOpponent")
+        if type(self.opponent) is str:
+            if not self.opponent:
+                raise ValueError("game task opponent path must be nonempty")
+        elif type(self.opponent) not in (list, HybridOpponent):
+            raise ValueError("game task opponent must be a route, path, or HybridOpponent")
+
 
 @dataclass(frozen=True)
 class GameResult:
@@ -86,6 +98,8 @@ class GameResult:
 
     def __post_init__(self) -> None:
         """Reject malformed timing, bank, and failure combinations."""
+        if not isinstance(self.key, GameKey):
+            raise ValueError("game result key must be a GameKey")
         if (
             type(self.runtime_seconds) not in (int, float)
             or not math.isfinite(self.runtime_seconds)
