@@ -16,6 +16,7 @@ import pytest
 
 from kaggriculture.hybrid.config import HybridConfig
 from kaggriculture.search.arena import GameKey, GameResult, GameTask
+from kaggriculture.search.arena_pool import PersistentArena
 from kaggriculture.search.fitness import StrengthWeights
 from kaggriculture.search.optuna_protocol import (
     RUNG_1_SEEDS,
@@ -28,6 +29,7 @@ from kaggriculture.search.optuna_protocol import (
     write_rung_evidence_atomic,
 )
 from kaggriculture.search.optuna_search import (
+    ArenaFactory,
     OptunaCoordinator,
     PilotVerdict,
     SearchInputs,
@@ -151,12 +153,13 @@ def forbidden_finalist_writer(*_args: object) -> None:
 def coordinator_fixture(
     root: Path, *, failure_at: GameKey | None = None
 ) -> OptunaCoordinator:
+    arena = RecordingArena(failure_at)
     return OptunaCoordinator(
         paths=StudyPaths.from_root(root),
         league={name: f"{name}.py" for name in NAMES},
         weights=StrengthWeights(dict.fromkeys(NAMES, 1)),
         rungs=RUNGS,
-        arena=RecordingArena(failure_at),  # type: ignore[arg-type]
+        arena=cast(PersistentArena, arena),
     )
 
 
@@ -171,6 +174,7 @@ def test_objective_writes_each_rung_before_reporting_and_pruning(
 ) -> None:
     trial = RecordingTrial(prune_after_step=4)
     coordinator = coordinator_fixture(tmp_path)
+    arena = cast(RecordingArena, coordinator.arena)
     original = __import__(
         "kaggriculture.search.optuna_search", fromlist=["write_rung_evidence_atomic"]
     ).write_rung_evidence_atomic
@@ -183,9 +187,9 @@ def test_objective_writes_each_rung_before_reporting_and_pruning(
         "kaggriculture.search.optuna_search.write_rung_evidence_atomic",
         recording_write,
     )
-    with coordinator.arena:
+    with arena:
         with pytest.raises(optuna.TrialPruned, match="rung 2"):
-            coordinator.objective(trial)  # type: ignore[arg-type]
+            coordinator.objective(cast(optuna.Trial, trial))
     assert trial.events == [
         "write:rung1",
         "report:1",
@@ -194,7 +198,7 @@ def test_objective_writes_each_rung_before_reporting_and_pruning(
         "report:4",
         "prune:4",
     ]
-    assert len(coordinator.arena.requested_keys) == 24 + 168  # type: ignore[attr-defined]
+    assert len(arena.requested_keys) == 24 + 168
 
 
 def test_game_failure_fails_trial_instead_of_returning_bad_score(
@@ -205,7 +209,7 @@ def test_game_failure_fails_trial_instead_of_returning_bad_score(
     )
     with coordinator.arena:
         with pytest.raises(TrialEvaluationError, match="economic_policy/860000/seat0"):
-            coordinator.objective(RecordingTrial())  # type: ignore[arg-type]
+            coordinator.objective(cast(optuna.Trial, RecordingTrial()))
     assert load_evidence(tmp_path, trial=0, rung=1).failures
 
 
@@ -218,19 +222,21 @@ def test_invalid_semantic_parameters_fail_before_arena_work(tmp_path: Path) -> N
 
     coordinator = coordinator_fixture(tmp_path)
     trial = InvalidTrial()
-    with coordinator.arena:
+    arena = cast(RecordingArena, coordinator.arena)
+    with arena:
         with pytest.raises(TrialEvaluationError, match="liquidation_start_day"):
-            coordinator.objective(trial)  # type: ignore[arg-type]
+            coordinator.objective(cast(optuna.Trial, trial))
     assert trial.system_attrs["fail_reason"]
-    assert coordinator.arena.requested_keys == []  # type: ignore[attr-defined]
+    assert arena.requested_keys == []
 
 
 def test_completed_rung_three_returns_exact_stored_objective(tmp_path: Path) -> None:
     coordinator = coordinator_fixture(tmp_path)
-    with coordinator.arena:
-        value = coordinator.objective(RecordingTrial())  # type: ignore[arg-type]
+    arena = cast(RecordingArena, coordinator.arena)
+    with arena:
+        value = coordinator.objective(cast(optuna.Trial, RecordingTrial()))
     assert value == load_evidence(tmp_path, trial=0, rung=3).objective
-    assert len(coordinator.arena.requested_keys) == 24 + 168 + 512  # type: ignore[attr-defined]
+    assert len(arena.requested_keys) == 24 + 168 + 512
 
 
 def warm_configs() -> tuple[HybridConfig, ...]:
@@ -347,7 +353,7 @@ def test_stop_after_counts_complete_pruned_and_failed_trials_on_resume(
         inputs,
         SearchRunConfig(stop_after=32),
         callbacks=(),
-        arena_factory=forbidden_arena,  # type: ignore[arg-type]
+        arena_factory=cast(ArenaFactory, forbidden_arena),
         finalist_writer=forbidden_finalist_writer,
     )
     assert summary.started_trials == 0
@@ -390,7 +396,10 @@ def test_only_validated_512_terminal_completion_writes_finalists(
         inputs,
         SearchRunConfig(stop_after=512),
         callbacks=(),
-        arena_factory=lambda _workers: pytest.fail("complete study opened arena"),  # type: ignore[arg-type]
+        arena_factory=cast(
+            ArenaFactory,
+            lambda _workers: pytest.fail("complete study opened arena"),
+        ),
         finalist_writer=lambda *_: calls.append("write"),
     )
 
@@ -425,7 +434,10 @@ def test_operational_runs_below_512_never_write_existing_terminal_study(
         inputs,
         SearchRunConfig(stop_after=stop_after),
         callbacks=(),
-        arena_factory=lambda _workers: pytest.fail("complete study opened arena"),  # type: ignore[arg-type]
+        arena_factory=cast(
+            ArenaFactory,
+            lambda _workers: pytest.fail("complete study opened arena"),
+        ),
         finalist_writer=lambda *_: pytest.fail("sub-512 operation wrote finalists"),
     )
 
@@ -499,7 +511,9 @@ def test_no_economic_points_at_128_writes_diagnostic_not_finalists(
         inputs,
         SearchRunConfig(stop_after=512),
         callbacks=(),
-        arena_factory=lambda _workers: pytest.fail("arena must not open"),  # type: ignore[arg-type]
+        arena_factory=cast(
+            ArenaFactory, lambda _workers: pytest.fail("arena must not open")
+        ),
         finalist_writer=forbidden_finalist_writer,
     )
     assert summary.stopped_reason == "no_economic_points_at_128"
@@ -552,7 +566,7 @@ def test_interrupt_closes_arena_preserves_evidence_and_remains_reconcilable(
         inputs,
         SearchRunConfig(stop_after=32),
         callbacks=(),
-        arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+        arena_factory=cast(ArenaFactory, lambda _workers: arena),
         finalist_writer=forbidden_finalist_writer,
     )
     assert summary.stopped_reason == "interrupted"
@@ -608,7 +622,7 @@ def test_interrupt_after_evidence_write_finishes_optuna_commit_boundary(
         inputs,
         SearchRunConfig(stop_after=32),
         callbacks=(),
-        arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+        arena_factory=cast(ArenaFactory, lambda _workers: arena),
         finalist_writer=forbidden_finalist_writer,
     )
 
@@ -657,7 +671,7 @@ def test_interrupt_during_arena_entry_closes_it_and_restores_handlers(
         inputs,
         SearchRunConfig(stop_after=32),
         callbacks=(),
-        arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+        arena_factory=cast(ArenaFactory, lambda _workers: arena),
         finalist_writer=forbidden_finalist_writer,
     )
 

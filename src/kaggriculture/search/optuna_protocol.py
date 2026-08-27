@@ -561,9 +561,7 @@ def _failure_messages(games: Sequence[GameEvidence]) -> tuple[str, ...]:
     )
 
 
-def _matchup_evidence(
-    opponent: str, rows: Sequence[GameEvidence]
-) -> MatchupEvidence:
+def _matchup_evidence(opponent: str, rows: Sequence[GameEvidence]) -> MatchupEvidence:
     """Aggregate one complete opponent block without inventing failed outcomes."""
     successes = tuple(
         (row, _successful_banks(row)) for row in rows if row.failure is None

@@ -83,7 +83,9 @@ class GameTask:
             if not self.opponent:
                 raise ValueError("game task opponent path must be nonempty")
         elif type(self.opponent) not in (list, HybridOpponent):
-            raise ValueError("game task opponent must be a route, path, or HybridOpponent")
+            raise ValueError(
+                "game task opponent must be a route, path, or HybridOpponent"
+            )
 
 
 @dataclass(frozen=True)

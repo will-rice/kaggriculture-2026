@@ -272,16 +272,12 @@ def test_extreme_weight_skew_is_rejected_before_scoring() -> None:
         ("economic_policy", "strong_policy"),
         (860_000, 860_001),
     )
-    skewed_weights = StrengthWeights(
-        {"economic_policy": 1, "strong_policy": 10**20}
-    )
+    skewed_weights = StrengthWeights({"economic_policy": 1, "strong_policy": 10**20})
 
     with pytest.raises(ValueError, match="dominance"):
         minimum_primary_increment(skewed_spec, skewed_weights)
     with pytest.raises(ValueError, match="dominance"):
-        build_rung_evidence(
-            7, HybridConfig.default(), skewed_spec, {}, skewed_weights
-        )
+        build_rung_evidence(7, HybridConfig.default(), skewed_spec, {}, skewed_weights)
 
 
 def test_float_domain_primary_dominance_rejects_near_threshold_counterexample() -> None:
@@ -301,9 +297,7 @@ def test_float_domain_primary_dominance_rejects_near_threshold_counterexample() 
             "weak_policy": counterexample_total - 2 * minimum_weight,
         }
     )
-    baseline = score_fitness(
-        dict.fromkeys(spec.opponents, 0.5), counterexample
-    ).value
+    baseline = score_fitness(dict.fromkeys(spec.opponents, 0.5), counterexample).value
     improved = score_fitness(
         {"economic_policy": 0.5625, "strong_policy": 0.5, "weak_policy": 0.5},
         counterexample,
@@ -312,9 +306,7 @@ def test_float_domain_primary_dominance_rejects_near_threshold_counterexample() 
     mathematical_increment = (
         0.70 * minimum_weight / counterexample_total * 0.5 / (2 * len(spec.seeds))
     )
-    assert mathematical_increment == pytest.approx(
-        1.0000000000000002e-6
-    )
+    assert mathematical_increment == pytest.approx(1.0000000000000002e-6)
     assert improved - baseline == pytest.approx(9.99999999999999e-7)
     assert not objective_value(improved, -1.0) > objective_value(baseline, 1.0)
     with pytest.raises(ValueError, match="dominance"):

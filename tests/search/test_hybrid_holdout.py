@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -232,6 +233,7 @@ def test_concurrent_prerequisite_identities_serialize_before_any_games(
 
 
 def test_same_identity_concurrency_allows_only_one_holdout_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Shared preflight may replay, but the finalist claim stays single-use."""
@@ -243,6 +245,13 @@ def test_same_identity_concurrency_allows_only_one_holdout_evaluation(
     evaluations = 0
     determinism_runs = 0
     lock = threading.Lock()
+    original_fdopen = os.fdopen
+
+    def delayed_fdopen(*args: object, **kwargs: object) -> object:
+        time.sleep(0.05)
+        return cast(Any, original_fdopen)(*args, **kwargs)
+
+    monkeypatch.setattr(hybrid_holdout.os, "fdopen", delayed_fdopen)
 
     def deterministic(row: Mapping[str, object]) -> bool:
         nonlocal determinism_runs
@@ -454,6 +463,7 @@ def test_holdout_normalizes_a_real_legacy_certification(
 ) -> None:
     """The actual legacy loader supplies configs, snapshots, and measured weights."""
     state, certification, _ = _completed_verified_search(monkeypatch, tmp_path)
+    certification = cast(Any, certification)
     finalists = tmp_path / "certified-finalists.json"
     evolution.write_finalists(state, finalists, certification=certification)
     frontier, report = _legacy_frontier_context(state)

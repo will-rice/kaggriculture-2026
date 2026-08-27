@@ -607,21 +607,29 @@ def _exclusive_claim(
             "identity": identity,
         }
     )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raced = _load_claim(path, identity)
-        if raced is not None and raced["status"] == "complete":
-            return _claim_result(raced)
-        raise RuntimeError(
-            "holdout claim already exists; replay is forbidden"
-        ) from None
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(source)
-        stream.flush()
-        os.fsync(stream.fileno())
-    _fsync_directory(path.parent)
-    return None
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(source)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raced = _load_claim(path, identity)
+            if raced is not None and raced["status"] == "complete":
+                return _claim_result(raced)
+            raise RuntimeError(
+                "holdout claim already exists; replay is forbidden"
+            ) from None
+        _fsync_directory(path.parent)
+        return None
+    finally:
+        temporary.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
 
 
 def _complete_claim(

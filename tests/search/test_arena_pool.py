@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any, cast
 
 import pytest
 
@@ -63,6 +64,7 @@ def recording_executor(
     created: list[RecordingExecutor],
 ) -> Callable[..., RecordingExecutor]:
     """Build a deterministic executor factory for ownership tests."""
+
     def factory(*, max_workers: int) -> RecordingExecutor:
         executor = RecordingExecutor(max_workers)
         created.append(executor)
@@ -90,9 +92,7 @@ def test_persistent_arena_constructs_one_executor_for_multiple_calls(
     from kaggriculture.search import arena_pool
 
     created: list[RecordingExecutor] = []
-    monkeypatch.setattr(
-        arena_pool, "ProcessPoolExecutor", recording_executor(created)
-    )
+    monkeypatch.setattr(arena_pool, "ProcessPoolExecutor", recording_executor(created))
     with PersistentArena(workers=3) as pool:
         first = pool.run((TASK_A,))
         second = pool.run((TASK_B,))
@@ -109,10 +109,18 @@ def test_persistent_arena_constructs_one_executor_for_multiple_calls(
         (lambda: GameKey("", 1, 0), "opponent"),
         (lambda: GameKey("econ", True, 0), "seed"),
         (lambda: GameKey("econ", 1, 2), "seat"),
-        (lambda: GameTask("econ", CANDIDATE, ECONOMIC_POLICY), "key"),
-        (lambda: GameTask(GameKey("econ", 1, 0), RUNTIME, ECONOMIC_POLICY), "candidate"),
-        (lambda: GameTask(GameKey("econ", 1, 0), CANDIDATE, object()), "opponent"),
-        (lambda: GameResult("econ", 1, 1, 0.0), "key"),
+        (lambda: GameTask(cast(Any, "econ"), CANDIDATE, ECONOMIC_POLICY), "key"),
+        (
+            lambda: GameTask(
+                GameKey("econ", 1, 0), cast(Any, RUNTIME), ECONOMIC_POLICY
+            ),
+            "candidate",
+        ),
+        (
+            lambda: GameTask(GameKey("econ", 1, 0), CANDIDATE, cast(Any, object())),
+            "opponent",
+        ),
+        (lambda: GameResult(cast(Any, "econ"), 1, 1, 0.0), "key"),
         (lambda: GameResult(GameKey("econ", 1, 0), None, 1, 0.0), "success"),
         (lambda: GameResult(GameKey("econ", 1, 0), 1, 1, -0.1), "runtime"),
     ),
@@ -131,7 +139,7 @@ def test_persistent_arena_rejects_workers_outside_the_operational_range(
 ) -> None:
     """Only the documented one-through-32 CPU-worker range is accepted."""
     with pytest.raises(ValueError, match="1 and 32"):
-        PersistentArena(workers=workers)  # type: ignore[arg-type]
+        PersistentArena(workers=cast(Any, workers))
 
 
 def test_run_game_task_keeps_provenance_when_the_engine_fails(
@@ -174,11 +182,14 @@ def test_persistent_arena_matches_legacy_outcomes_for_two_seeds() -> None:
 
     assert not [row for row in rows if row.failure is not None]
     assert [row.key for row in rows] == [task.key for task in tasks]
-    assert [_win(row.ours, row.theirs) for row in rows] == legacy
-    assert [row.ours - row.theirs for row in rows] == legacy.margins
-    assert [_normalized_margin(row.ours, row.theirs) for row in rows] == pytest.approx(
-        legacy.normalized_margins
-    )
+    banks = tuple((row.ours, row.theirs) for row in rows)
+    assert all(ours is not None and theirs is not None for ours, theirs in banks)
+    exact_banks = cast(tuple[tuple[int, int], ...], banks)
+    assert [_win(ours, theirs) for ours, theirs in exact_banks] == legacy
+    assert [ours - theirs for ours, theirs in exact_banks] == legacy.margins
+    assert [
+        _normalized_margin(ours, theirs) for ours, theirs in exact_banks
+    ] == pytest.approx(legacy.normalized_margins)
 
 
 def test_persistent_arena_rejects_duplicate_or_reordered_provenance(
@@ -188,9 +199,7 @@ def test_persistent_arena_rejects_duplicate_or_reordered_provenance(
     from kaggriculture.search import arena_pool
 
     created: list[RecordingExecutor] = []
-    monkeypatch.setattr(
-        arena_pool, "ProcessPoolExecutor", recording_executor(created)
-    )
+    monkeypatch.setattr(arena_pool, "ProcessPoolExecutor", recording_executor(created))
     with PersistentArena() as pool:
         with pytest.raises(ValueError, match="duplicate provenance"):
             pool.run((TASK_A, TASK_A))

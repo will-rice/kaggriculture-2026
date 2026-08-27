@@ -23,7 +23,7 @@ from kaggriculture.search.evolution import SnapshotLeague
 from kaggriculture.search.fitness import StrengthWeights
 from kaggriculture.search.frontier import VerifiedFrontier
 from kaggriculture.search.optuna_protocol import PanelSet
-from kaggriculture.search.optuna_search import SearchInputs, SearchSummary
+from kaggriculture.search.optuna_search import PilotVerdict, SearchInputs, SearchSummary
 from kaggriculture.search.scripts import hybrid_optuna as cli
 
 from .test_optuna_search import identity_fixture, warm_configs
@@ -194,6 +194,8 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
     identity = identity_fixture(configs)
     study = optuna.create_study()
     snapshot = SimpleNamespace(opponents={})
+    root = tmp_path / "study"
+    root.mkdir()
     legacy = tmp_path / "legacy.json"
     legacy.write_bytes(b"legacy bytes")
     monkeypatch.setattr(os, "nice", lambda *_: pytest.fail("CLI called os.nice"))
@@ -220,6 +222,19 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
     monkeypatch.setattr(cli, "open_study", lambda *_: study)
     monkeypatch.setattr(cli, "reconcile_running_trials", lambda _study: ())
     monkeypatch.setattr(cli, "validate_study_evidence", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "pilot_gate",
+        lambda *_: PilotVerdict(
+            passed=True,
+            reasons=(),
+            terminal_trials=32,
+            best_trial=1,
+            default_trial=0,
+            best_same_rung_delta=0.01,
+            failures=0,
+        ),
+    )
     arena_factory = object()
     monkeypatch.setattr(cli, "PersistentArena", arena_factory)
 
@@ -229,9 +244,9 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
         assert kwargs["finalist_writer"] is cli.write_optuna_finalists
         return SearchSummary(
             started_trials=0,
-            terminal_trials=0,
-            complete_trials=0,
-            pruned_trials=0,
+            terminal_trials=32,
+            complete_trials=2,
+            pruned_trials=30,
             failed_trials=0,
             stopped_reason="stop_after",
             best_trial=None,
@@ -245,11 +260,11 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
             "--legacy-state",
             str(legacy),
             "--root",
-            str(tmp_path / "study"),
+            str(root),
             "--workers",
             "32",
             "--stop-after",
-            "1",
+            "32",
             "--no-wandb",
         ]
     )
@@ -258,6 +273,16 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
     assert calls == ["search"]
     assert '"device": "cpu"' in output
     assert '"workers": 32' in output
+    verdict = json.loads((root / "pilot-verdict.json").read_text())
+    assert verdict == {
+        "best_same_rung_delta": 0.01,
+        "best_trial": 1,
+        "default_trial": 0,
+        "failures": 0,
+        "passed": True,
+        "reasons": [],
+        "terminal_trials": 32,
+    }
 
 
 def test_cli_keeps_search_and_sqlite_authoritative_when_wandb_init_fails(

@@ -38,6 +38,7 @@ from kaggriculture.search.optuna_protocol import (
     rung_specs,
 )
 from kaggriculture.search.optuna_search import (
+    PilotVerdict,
     SearchInputs,
     SearchRunConfig,
     pilot_gate,
@@ -184,6 +185,11 @@ def run(args: argparse.Namespace) -> None:
         )
     finally:
         session.close()
+    if args.stop_after == 32 and summary.terminal_trials == 32:
+        _write_pilot_verdict(
+            paths.root / "pilot-verdict.json",
+            pilot_gate(study, paths),
+        )
     print(
         json.dumps(
             summary.model_dump(mode="json"),
@@ -192,6 +198,40 @@ def run(args: argparse.Namespace) -> None:
             sort_keys=True,
         )
     )
+
+
+def _write_pilot_verdict(path: Path, verdict: PilotVerdict) -> None:
+    """Atomically publish the canonical local verdict for a completed pilot."""
+    payload = (
+        json.dumps(
+            verdict.model_dump(mode="json"),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)  # noqa: PTH105
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _load_frontier_report(path: Path) -> FrontierReport:

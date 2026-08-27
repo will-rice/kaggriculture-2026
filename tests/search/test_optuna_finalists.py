@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import shutil
@@ -9,7 +10,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
 
 import optuna
 import pytest
@@ -34,6 +35,7 @@ from kaggriculture.search.optuna_protocol import (
     RUNG_1_SEEDS,
     RUNG_2_SEEDS,
     RUNG_3_SEEDS,
+    RungEvidence,
     RungSpec,
     build_rung_evidence,
     write_rung_evidence_atomic,
@@ -246,9 +248,8 @@ def _games(spec: RungSpec, score: int, runtime: float) -> dict[GameKey, GameResu
 
 
 def _summary(
-    root: Path, evidence: object, path: Path, digest: str
+    root: Path, row: RungEvidence, path: Path, digest: str
 ) -> dict[str, object]:
-    row = evidence
     return {
         "config_sha256": row.config_sha256,
         "rung": row.rung,
@@ -389,7 +390,7 @@ def test_genuine_optuna_tamper_fails_before_claim_or_holdout(
         "evaluate_promotion",
         lambda *_args, **_kwargs: pytest.fail("holdout game reached after tamper"),
     )
-    args = SimpleNamespace(
+    args = argparse.Namespace(
         finalists=finalists,
         manifest=tmp_path / "manifest.json",
         artifact_root=tmp_path / "artifacts",
@@ -404,9 +405,7 @@ def test_genuine_optuna_tamper_fails_before_claim_or_holdout(
     assert not args.output.exists()
 
 
-def _rewrite_artifact(
-    path: Path, mutate: Callable[[dict[str, object]], object]
-) -> None:
+def _rewrite_artifact(path: Path, mutate: Callable[[dict[str, Any]], object]) -> None:
     payload = json.loads(path.read_text())
     mutate(payload)
     payload["integrity_sha256"] = hashlib.sha256(
