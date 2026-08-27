@@ -8,19 +8,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import optuna
 import pytest
 from optuna.storages import RDBStorage
 
+from kaggriculture.search import optuna_wandb
 from kaggriculture.search.evolution import SnapshotLeague
 from kaggriculture.search.fitness import StrengthWeights
 from kaggriculture.search.frontier import VerifiedFrontier
 from kaggriculture.search.optuna_protocol import PanelSet
-from kaggriculture.search.optuna_search import SearchSummary
+from kaggriculture.search.optuna_search import SearchInputs, SearchSummary
 from kaggriculture.search.scripts import hybrid_optuna as cli
 
 from .test_optuna_search import identity_fixture, warm_configs
@@ -254,6 +257,92 @@ def test_normal_cli_reports_cpu_only_and_passes_one_arena_factory_after_prefligh
     assert calls == ["search"]
     assert '"device": "cpu"' in output
     assert '"workers": 32' in output
+
+
+def test_cli_keeps_search_and_sqlite_authoritative_when_wandb_init_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configs = warm_configs()
+    identity = identity_fixture(configs)
+    legacy = tmp_path / "legacy.json"
+    legacy.write_bytes(b"legacy bytes")
+    paths = cli.StudyPaths.from_root(tmp_path / "study")
+    paths.root.mkdir()
+    study = optuna.create_study(
+        storage=RDBStorage(f"sqlite:///{paths.sqlite.absolute()}"),
+        study_name=identity.study_name,
+        direction="maximize",
+    )
+    telemetry_calls: list[str] = []
+    monkeypatch.setattr(cli, "warm_start_configs", lambda _path: configs)
+    monkeypatch.setattr(cli, "verify_frontier", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(cli, "_load_frontier_report", lambda _path: SimpleNamespace())
+    monkeypatch.setattr(cli, "_validate_frontier_report", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "_protocol_inputs",
+        lambda _report: (
+            PanelSet(
+                identity.panels.rung_1,
+                identity.panels.rung_2,
+                identity.panels.rung_3,
+            ),
+            StrengthWeights(dict(identity.strength_weights)),
+        ),
+    )
+    monkeypatch.setattr(cli, "_preflight_output_ownership", lambda *_: None)
+    monkeypatch.setattr(
+        cli, "snapshot_frontier", lambda *_, **__: SimpleNamespace(opponents={})
+    )
+    monkeypatch.setattr(cli, "build_identity", lambda *_: identity)
+    monkeypatch.setattr(cli, "validate_study_paths", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(cli, "open_study", lambda *_: study)
+    monkeypatch.setattr(cli, "reconcile_running_trials", lambda _study: ())
+    monkeypatch.setattr(cli, "validate_study_evidence", lambda *_: None)
+    monkeypatch.setattr(
+        optuna_wandb,
+        "load_wandb_dependencies",
+        lambda: (
+            telemetry_calls.append("open")
+            or (_ for _ in ()).throw(RuntimeError("offline"))
+        ),
+    )
+
+    def fake_run_search(*args: object, **kwargs: object) -> SearchSummary:
+        inputs = cast(SearchInputs, args[0])
+        callbacks = cast(
+            Sequence[Callable[[optuna.Study, optuna.trial.FrozenTrial], None]],
+            kwargs["callbacks"],
+        )
+        assert callbacks == ()
+        inputs.study.optimize(lambda _trial: 1.0, n_trials=1, callbacks=callbacks)
+        return SearchSummary(
+            started_trials=1,
+            terminal_trials=1,
+            complete_trials=1,
+            pruned_trials=0,
+            failed_trials=0,
+            stopped_reason="stop_after",
+            best_trial=0,
+        )
+
+    monkeypatch.setattr(cli, "run_search", fake_run_search)
+    args = cli.parse_args(
+        [
+            "--frontier-report",
+            str(tmp_path / "report.json"),
+            "--legacy-state",
+            str(legacy),
+            "--root",
+            str(paths.root),
+            "--stop-after",
+            "1",
+        ]
+    )
+    cli.run(args)
+
+    assert telemetry_calls == ["open"]
+    assert [trial.state for trial in study.trials] == [optuna.trial.TrialState.COMPLETE]
 
 
 def test_output_preflight_rejects_symlink_traversal_before_snapshot_creation(

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -52,6 +53,7 @@ from kaggriculture.search.optuna_state import (
     validate_study_evidence,
     validate_study_paths,
 )
+from kaggriculture.search.optuna_wandb import WandbSession, WandbSettings
 from kaggriculture.search.promotion import DETERMINISM_SEEDS
 from kaggriculture.search.scripts.frontier_round_robin import (
     DEFAULT_ARTIFACT_ROOT,
@@ -162,12 +164,24 @@ def run(args: argparse.Namespace) -> None:
         rungs=rung_specs(panels),
         warm_starts=warm_starts,
     )
-    summary = run_search(
-        inputs,
-        SearchRunConfig(workers=args.workers, stop_after=args.stop_after),
-        callbacks=(),
-        arena_factory=PersistentArena,
+    session = WandbSession.open(
+        WandbSettings(
+            enabled=args.wandb,
+            entity=args.wandb_entity,
+            project=args.wandb_project,
+        ),
+        identity,
+        _revision(),
     )
+    try:
+        summary = run_search(
+            inputs,
+            SearchRunConfig(workers=args.workers, stop_after=args.stop_after),
+            callbacks=session.callbacks,
+            arena_factory=PersistentArena,
+        )
+    finally:
+        session.close()
     print(
         json.dumps(
             summary.model_dump(mode="json"),
@@ -294,6 +308,20 @@ def _reject_symlink_components(path: Path) -> None:
 
 def _same_or_below(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
+
+
+def _revision() -> str:
+    """Read the source revision for display-only telemetry without blocking search."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return "unknown"
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
 def main() -> None:
