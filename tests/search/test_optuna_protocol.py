@@ -16,7 +16,7 @@ from kaggriculture.search.evolution import (
     PROMOTION_SEEDS,
     SCREENING_SEEDS,
 )
-from kaggriculture.search.fitness import StrengthWeights
+from kaggriculture.search.fitness import StrengthWeights, score_fitness
 from kaggriculture.search.frontier import FrontierReport, FrontierRow
 from kaggriculture.search.optuna_protocol import (
     RUNG_1_SEEDS,
@@ -282,6 +282,72 @@ def test_extreme_weight_skew_is_rejected_before_scoring() -> None:
         build_rung_evidence(
             7, HybridConfig.default(), skewed_spec, {}, skewed_weights
         )
+
+
+def test_float_domain_primary_dominance_rejects_near_threshold_counterexample() -> None:
+    """A mathematically larger epsilon step must survive actual score rounding."""
+    spec = RungSpec(
+        1,
+        1,
+        ("economic_policy", "strong_policy", "weak_policy"),
+        RUNG_1_SEEDS,
+    )
+    minimum_weight = 10**12
+    counterexample_total = 43_750 * minimum_weight - 11
+    counterexample = StrengthWeights(
+        {
+            "economic_policy": minimum_weight,
+            "strong_policy": minimum_weight,
+            "weak_policy": counterexample_total - 2 * minimum_weight,
+        }
+    )
+    baseline = score_fitness(
+        dict.fromkeys(spec.opponents, 0.5), counterexample
+    ).value
+    improved = score_fitness(
+        {"economic_policy": 0.5625, "strong_policy": 0.5, "weak_policy": 0.5},
+        counterexample,
+    ).value
+
+    mathematical_increment = (
+        0.70 * minimum_weight / counterexample_total * 0.5 / (2 * len(spec.seeds))
+    )
+    assert mathematical_increment == pytest.approx(
+        1.0000000000000002e-6
+    )
+    assert improved - baseline == pytest.approx(9.99999999999999e-7)
+    assert not objective_value(improved, -1.0) > objective_value(baseline, 1.0)
+    with pytest.raises(ValueError, match="dominance"):
+        minimum_primary_increment(spec, counterexample)
+    with pytest.raises(ValueError, match="dominance"):
+        build_rung_evidence(7, HybridConfig.default(), spec, {}, counterexample)
+
+
+def test_float_domain_primary_dominance_accepts_and_rejects_clear_neighbors() -> None:
+    """The rounding guard preserves comfortably safe maps and rejects unsafe ones."""
+    spec = RungSpec(
+        1,
+        1,
+        ("economic_policy", "strong_policy", "weak_policy"),
+        RUNG_1_SEEDS,
+    )
+    minimum_weight = 10**12
+
+    def weights_for(total: int) -> StrengthWeights:
+        return StrengthWeights(
+            {
+                "economic_policy": minimum_weight,
+                "strong_policy": minimum_weight,
+                "weak_policy": total - 2 * minimum_weight,
+            }
+        )
+
+    safe = weights_for(40_000 * minimum_weight)
+    unsafe = weights_for(50_000 * minimum_weight)
+
+    assert minimum_primary_increment(spec, safe) > 1e-6
+    with pytest.raises(ValueError, match="dominance"):
+        minimum_primary_increment(spec, unsafe)
 
 
 @pytest.mark.parametrize("rung", (1, 2, 3))

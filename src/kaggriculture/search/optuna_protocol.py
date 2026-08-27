@@ -493,9 +493,26 @@ def _panel_weights(spec: RungSpec, weights: StrengthWeights) -> StrengthWeights:
     panel_weights = StrengthWeights(
         {name: weights.values[name] for name in spec.opponents}
     )
-    if _minimum_primary_increment(spec, panel_weights) <= 1e-6:
+    if not _float_primary_increment_dominates_dense_range(spec, panel_weights):
         raise ValueError("strength weights violate lexicographic dominance")
     return panel_weights
+
+
+def _float_primary_increment_dominates_dense_range(
+    spec: RungSpec, weights: StrengthWeights
+) -> bool:
+    """Reserve a ULP envelope for two rounded primary/objective evaluations.
+
+    A comparison can evaluate two weighted primary scores and two scalar
+    objectives. For a panel of ``n`` matchups, their independent weighted
+    sums/multiplications account for at most ``4 * n`` unit-roundoff steps;
+    the remaining scalar operations fit in a further 16 steps. Every primary
+    value lies in ``[0, 1]``, so one step is conservatively bounded by
+    ``math.ulp(1.0)``. This rejects an algebraically-safe increment that would
+    collapse to the dense-margin range in binary floating-point arithmetic.
+    """
+    rounding_envelope = math.ulp(1.0) * (4 * len(spec.opponents) + 16)
+    return _minimum_primary_increment(spec, weights) - rounding_envelope > 1e-6
 
 
 def _evidence_panel_weights(
