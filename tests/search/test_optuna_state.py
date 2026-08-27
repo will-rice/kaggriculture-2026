@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -14,6 +15,7 @@ from optuna.storages import RDBStorage
 from optuna.trial import TrialState
 
 from kaggriculture.hybrid.config import HybridConfig
+from kaggriculture.search import optuna_state
 from kaggriculture.search.arena import GameKey, GameResult
 from kaggriculture.search.evolution import SnapshotLeague, SnapshotSource
 from kaggriculture.search.fitness import StrengthWeights
@@ -51,6 +53,7 @@ from kaggriculture.search.optuna_state import (
     reconcile_running_trials,
     study_root_lock,
     terminal_counts,
+    validate_create_root,
     validate_study_evidence,
     validate_study_paths,
 )
@@ -439,6 +442,150 @@ def _write_identity_only(paths: StudyPaths, identity: StudyIdentity) -> None:
             sort_keys=True,
         ).encode()
     )
+
+
+def _hard_crash_during_identity_write(
+    paths: StudyPaths,
+    identity: StudyIdentity,
+    preflight: StudyPreflight,
+    *,
+    after_temporary_fsync: bool,
+) -> int:
+    """Fork so a deterministic failpoint bypasses the writer's cleanup block."""
+    exit_code = 72 if after_temporary_fsync else 71
+    child = os.fork()
+    if child == 0:
+        if after_temporary_fsync:
+            original_replace = Path.replace
+
+            def crash_before_replace(
+                self: Path, target: str | os.PathLike[str]
+            ) -> Path:
+                if self.parent == paths.root and self.name.startswith(".identity."):
+                    os._exit(exit_code)
+                return original_replace(self, target)
+
+            Path.replace = crash_before_replace
+        else:
+
+            def crash_before_temporary(path: Path, identity: StudyIdentity) -> None:
+                del path, identity
+                os._exit(exit_code)
+
+            pytest.MonkeyPatch().setattr(
+                optuna_state, "_write_identity", crash_before_temporary
+            )
+        open_study(paths, identity, preflight)
+        os._exit(99)
+    _, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+def test_first_open_recovers_root_created_before_identity_temporary(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """A hard kill after root fsync leaves an empty create-mode recovery root."""
+    paths = StudyPaths.from_root(tmp_path / "root-only")
+    preflight = preflight_factory(paths)
+
+    assert (
+        _hard_crash_during_identity_write(
+            paths, identity, preflight, after_temporary_fsync=False
+        )
+        == 71
+    )
+    assert paths.root.is_dir()
+    assert list(paths.root.iterdir()) == []
+
+    study = open_study(paths, identity, preflight_factory(paths))
+
+    assert study.user_attrs["study_identity_sha256"] == identity.digest
+    assert study.trials == []
+
+
+def test_first_open_recovers_fsynced_identity_temporary_before_replace(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """A hard kill after temp fsync removes only the exact identity temp on retry."""
+    paths = StudyPaths.from_root(tmp_path / "identity-temporary")
+    preflight = preflight_factory(paths)
+
+    assert (
+        _hard_crash_during_identity_write(
+            paths, identity, preflight, after_temporary_fsync=True
+        )
+        == 72
+    )
+    entries = list(paths.root.iterdir())
+    assert len(entries) == 1
+    assert entries[0].name.startswith(".identity.")
+    assert entries[0].name.endswith(".tmp")
+    assert entries[0].is_file()
+    assert not entries[0].is_symlink()
+
+    study = open_study(paths, identity, preflight_factory(paths))
+
+    assert study.user_attrs["study_identity_sha256"] == identity.digest
+    assert study.trials == []
+    assert {path.name for path in paths.root.iterdir()} == {
+        "identity.json",
+        "study.sqlite3",
+    }
+
+
+def test_first_open_rechecks_identity_temporary_after_create_gate(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """Replacing a validated temp before open cannot bypass the identity recheck."""
+    paths = StudyPaths.from_root(tmp_path / "changed-after-gate")
+    paths.root.mkdir()
+    temporary = paths.root / ".identity.deadbeef.tmp"
+    temporary.write_bytes(
+        json.dumps(
+            identity.model_dump(mode="json"),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    assert validate_create_root(paths) == (temporary,)
+    temporary.unlink()
+    target = tmp_path / "outside"
+    target.write_bytes(b"must remain untouched")
+    temporary.symlink_to(target)
+
+    with pytest.raises(ValueError, match="non-recoverable"):
+        open_study(paths, identity, preflight_factory(paths))
+
+    assert target.read_bytes() == b"must remain untouched"
+    assert temporary.is_symlink()
+    assert not paths.identity.exists()
+    assert not paths.sqlite.exists()
+
+
+def test_first_open_rejects_canonical_temporary_for_another_identity(
+    tmp_path: Path, identity: StudyIdentity, preflight_factory: PreflightFactory
+) -> None:
+    """A well-formed temporary is recoverable only for its exact requested study."""
+    paths = StudyPaths.from_root(tmp_path / "wrong-identity-temporary")
+    paths.root.mkdir()
+    temporary = paths.root / ".identity.deadbeef.tmp"
+    other = identity.model_copy(update={"space_sha256": "f" * 64})
+    source = json.dumps(
+        other.model_dump(mode="json"),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    temporary.write_bytes(source)
+    assert validate_create_root(paths) == (temporary,)
+
+    with pytest.raises(StudyIdentityError, match="temporary differs"):
+        open_study(paths, identity, preflight_factory(paths))
+
+    assert temporary.read_bytes() == source
+    assert not paths.identity.exists()
+    assert not paths.sqlite.exists()
 
 
 def test_first_open_recovers_identity_written_before_sqlite(

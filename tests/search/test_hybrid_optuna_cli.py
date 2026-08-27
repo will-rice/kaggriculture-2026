@@ -79,8 +79,9 @@ def test_create_and_resume_refuse_the_wrong_root_state_before_snapshot(
     legacy.write_text("{}")
     existing = tmp_path / "existing"
     existing.mkdir()
+    (existing / "unexpected.txt").write_text("not a crash residue")
 
-    with pytest.raises(SystemExit, match="create requires an absent"):
+    with pytest.raises(SystemExit, match="create requires"):
         cli.run(
             cli.parse_args(
                 [
@@ -107,6 +108,75 @@ def test_create_and_resume_refuse_the_wrong_root_state_before_snapshot(
             )
         )
     assert calls == []
+
+
+def test_create_mode_accepts_only_empty_or_identity_temporary_recovery_roots(
+    tmp_path: Path,
+) -> None:
+    args = cli.parse_args([*BASE_ARGS, "--create"])
+    absent = cli.StudyPaths.from_root(tmp_path / "absent")
+    cli._require_mode_root(args, absent)  # noqa: SLF001
+
+    empty = cli.StudyPaths.from_root(tmp_path / "empty")
+    empty.root.mkdir()
+    cli._require_mode_root(args, empty)  # noqa: SLF001
+
+    temporary = cli.StudyPaths.from_root(tmp_path / "temporary")
+    temporary.root.mkdir()
+    identity = identity_fixture(warm_configs())
+    (temporary.root / ".identity.deadbeef.tmp").write_bytes(
+        json.dumps(
+            identity.model_dump(mode="json"),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    cli._require_mode_root(args, temporary)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "entry_name,entry_kind",
+    [
+        ("unexpected.txt", "file"),
+        (".identity.bad-name.tmp", "file"),
+        (".identity.deadbeef.tmp", "file"),
+        (".identity.deadbeef.tmp", "directory"),
+        (".identity.deadbeef.tmp", "symlink"),
+        (".identity.deadbeef.tmp", "hardlink"),
+    ],
+)
+def test_create_mode_rejects_every_other_existing_root_entry(
+    tmp_path: Path, entry_name: str, entry_kind: str
+) -> None:
+    args = cli.parse_args([*BASE_ARGS, "--create"])
+    paths = cli.StudyPaths.from_root(tmp_path / entry_kind)
+    paths.root.mkdir()
+    entry = paths.root / entry_name
+    if entry_kind == "directory":
+        entry.mkdir()
+    elif entry_kind == "symlink":
+        entry.symlink_to(tmp_path / "missing")
+    elif entry_kind == "hardlink":
+        source = tmp_path / "aliased-identity"
+        source.write_text("not recoverable")
+        entry.hardlink_to(source)
+    else:
+        entry.write_text("not recoverable")
+
+    with pytest.raises(SystemExit, match="create requires"):
+        cli._require_mode_root(args, paths)  # noqa: SLF001
+
+
+def test_create_mode_rejects_symlink_root(tmp_path: Path) -> None:
+    args = cli.parse_args([*BASE_ARGS, "--create"])
+    target = tmp_path / "target"
+    target.mkdir()
+    root = tmp_path / "root"
+    root.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(SystemExit, match="create requires"):
+        cli._require_mode_root(args, cli.StudyPaths.from_root(root))  # noqa: SLF001
 
 
 def test_real_process_lock_loser_does_not_mutate_or_open_services(

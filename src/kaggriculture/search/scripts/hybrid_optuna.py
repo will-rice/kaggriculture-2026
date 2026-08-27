@@ -55,6 +55,7 @@ from kaggriculture.search.optuna_state import (
     reconcile_running_trials,
     study_root_lock,
     terminal_counts,
+    validate_create_root,
     validate_study_evidence,
     validate_study_paths,
 )
@@ -240,8 +241,12 @@ def _require_mode_root(args: argparse.Namespace, paths: StudyPaths) -> None:
     """Refuse create/resume ambiguity while ownership excludes state changes."""
     snapshot_root = paths.root.with_name(paths.root.name + ".league")
     if args.create:
-        if paths.root.exists() or paths.root.is_symlink():
-            raise SystemExit("create requires an absent study root")
+        try:
+            validate_create_root(paths)
+        except (OSError, ValueError) as error:
+            raise SystemExit(
+                "create requires an absent or recoverable study root"
+            ) from error
         return
     if (
         not paths.root.is_dir()

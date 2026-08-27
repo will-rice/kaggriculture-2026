@@ -45,6 +45,7 @@ from kaggriculture.search.optuna_space import (
 from kaggriculture.search.promotion import DETERMINISM_SEEDS
 
 _IDENTITY_ATTRIBUTE = "study_identity_sha256"
+_IDENTITY_TEMPORARY_NAME = re.compile(r"\.identity\.[a-z0-9_]{8}\.tmp")
 _PREFLIGHT_CAPABILITY = object()
 _EVALUATION_SEMANTIC_PATHS = (
     "src/kaggriculture/action_codec.py",
@@ -422,6 +423,7 @@ def open_study(
     _require_preflight(paths, identity, preflight)
     exists = (paths.sqlite.exists(), paths.identity.exists())
     if exists == (False, False):
+        _remove_recoverable_identity_temporaries(paths, identity)
         _create_run_root(paths)
         _write_identity(paths.identity, identity)
         return _complete_initial_study(paths, identity)
@@ -1192,6 +1194,41 @@ def _validate_layout(paths: StudyPaths) -> None:
         _reject_symlink_components(_absolute(path))
 
 
+def validate_create_root(paths: StudyPaths) -> tuple[Path, ...]:
+    """Accept only an absent, empty, or protocol-temporary-only create root."""
+    _validate_layout(paths)
+    root = _absolute(paths.root)
+    if not root.exists():
+        return ()
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("create root must be a real directory")
+    temporaries: list[Path] = []
+    expected_source: bytes | None = None
+    for entry in sorted(root.iterdir()):
+        status = entry.lstat()
+        if (
+            _IDENTITY_TEMPORARY_NAME.fullmatch(entry.name) is None
+            or entry.is_symlink()
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+        ):
+            raise ValueError("create root contains a non-recoverable entry")
+        source = entry.read_bytes()
+        try:
+            stored = StudyIdentity.model_validate_json(source)
+        except ValidationError as error:
+            raise ValueError(
+                "identity temporary is not a strict StudyIdentity"
+            ) from error
+        if source != _canonical_json(stored.model_dump(mode="json")):
+            raise ValueError("identity temporary is not canonical JSON")
+        if expected_source is not None and source != expected_source:
+            raise ValueError("identity temporaries disagree")
+        expected_source = source
+        temporaries.append(entry)
+    return tuple(temporaries)
+
+
 def _study_output_paths(paths: StudyPaths) -> tuple[Path, ...]:
     """Return every fixed output that must remain disjoint from protected bytes."""
     return (
@@ -1203,6 +1240,23 @@ def _study_output_paths(paths: StudyPaths) -> tuple[Path, ...]:
         paths.diagnostic,
         paths.finalists,
     )
+
+
+def _remove_recoverable_identity_temporaries(
+    paths: StudyPaths, identity: StudyIdentity
+) -> None:
+    """Remove only exact durable identity temporaries from a crashed first open."""
+    temporaries = validate_create_root(paths)
+    expected = _canonical_json(identity.model_dump(mode="json"))
+    for temporary in temporaries:
+        if temporary.read_bytes() != expected:
+            raise StudyIdentityError(
+                "identity temporary differs from requested study identity"
+            )
+    for temporary in temporaries:
+        temporary.unlink()
+    if temporaries:
+        _fsync_directory(_absolute(paths.root))
 
 
 def _create_run_root(paths: StudyPaths) -> None:
