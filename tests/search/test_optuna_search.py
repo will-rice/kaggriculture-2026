@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import signal
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -441,6 +442,13 @@ class InterruptingArena(RecordingArena):
         raise SearchInterrupted("test interruption")
 
 
+class EntryInterruptingArena(InterruptingArena):
+    def __enter__(self) -> "EntryInterruptingArena":
+        super().__enter__()
+        signal.raise_signal(signal.SIGINT)
+        return self
+
+
 def test_interrupt_closes_arena_preserves_evidence_and_remains_reconcilable(
     tmp_path: Path,
 ) -> None:
@@ -473,6 +481,109 @@ def test_interrupt_closes_arena_preserves_evidence_and_remains_reconcilable(
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.RUNNING,
     )
+    reconcile_running_trials(study)
+    validate_study_evidence(study, paths, identity)
+
+
+def test_interrupt_after_evidence_write_finishes_optuna_commit_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configs = warm_configs()
+    identity = identity_fixture(configs)
+    paths = StudyPaths.from_root(tmp_path)
+    write_identity(paths, identity)
+    study = optuna.create_study()
+    study.set_user_attr("study_identity_sha256", identity.digest)
+    arena = RecordingArena()
+    inputs = SearchInputs(
+        study=study,
+        paths=paths,
+        identity=identity,
+        league={name: f"{name}.py" for name in NAMES},
+        weights=StrengthWeights(dict.fromkeys(NAMES, 1)),
+        rungs=RUNGS,
+        warm_starts=configs,
+    )
+    original_write = write_rung_evidence_atomic
+    injected = False
+
+    def interrupt_after_write(root: Path, evidence: RungEvidence) -> tuple[Path, str]:
+        nonlocal injected
+        result = original_write(root, evidence)
+        if not injected:
+            injected = True
+            signal.raise_signal(signal.SIGINT)
+        return result
+
+    monkeypatch.setattr(
+        "kaggriculture.search.optuna_search.write_rung_evidence_atomic",
+        interrupt_after_write,
+    )
+    previous_handlers = {
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    summary = run_search(
+        inputs,
+        SearchRunConfig(stop_after=32),
+        callbacks=(),
+        arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+    )
+
+    assert summary.stopped_reason == "interrupted"
+    assert not arena.open
+    assert not paths.finalists.exists()
+    assert {
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    } == previous_handlers
+    trial = study.trials[0]
+    evidence = load_evidence(tmp_path, trial=0, rung=1)
+    assert trial.intermediate_values == {1: evidence.objective}
+    assert trial.user_attrs["evidence_sha256"]
+    assert trial.state in (
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.RUNNING,
+    )
+    reconcile_running_trials(study)
+    validate_study_evidence(study, paths, identity)
+
+
+def test_interrupt_during_arena_entry_closes_it_and_restores_handlers(
+    tmp_path: Path,
+) -> None:
+    configs = warm_configs()
+    identity = identity_fixture(configs)
+    paths = StudyPaths.from_root(tmp_path)
+    write_identity(paths, identity)
+    study = optuna.create_study()
+    study.set_user_attr("study_identity_sha256", identity.digest)
+    arena = EntryInterruptingArena()
+    inputs = SearchInputs(
+        study=study,
+        paths=paths,
+        identity=identity,
+        league={name: f"{name}.py" for name in NAMES},
+        weights=StrengthWeights(dict.fromkeys(NAMES, 1)),
+        rungs=RUNGS,
+        warm_starts=configs,
+    )
+    previous_handlers = {
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    summary = run_search(
+        inputs,
+        SearchRunConfig(stop_after=32),
+        callbacks=(),
+        arena_factory=lambda _workers: arena,  # type: ignore[arg-type]
+    )
+
+    assert summary.stopped_reason == "interrupted"
+    assert arena.closed
+    assert not paths.finalists.exists()
+    assert {
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    } == previous_handlers
     reconcile_running_trials(study)
     validate_study_evidence(study, paths, identity)
 

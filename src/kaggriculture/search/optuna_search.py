@@ -8,10 +8,11 @@ import signal
 import tempfile
 import warnings
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Literal, cast
+from typing import Iterator, Literal, cast
 
 import optuna
 from optuna.trial import FixedTrial, FrozenTrial, TrialState
@@ -53,6 +54,58 @@ class TrialEvaluationError(RuntimeError):
 
 class SearchInterrupted(RuntimeError):  # noqa: N818 - plan-mandated internal name
     """SIGINT or SIGTERM requested a bounded coordinator shutdown."""
+
+
+@dataclass
+class _InterruptionController:
+    """Defer signal delivery until durable state and owned resources are safe."""
+
+    study: optuna.Study
+    _requested_signal: signal.Signals | None = None
+    _delivery_enabled: bool = False
+    _commit_depth: int = 0
+
+    def request(self, signum: int) -> None:
+        """Record one signal and deliver it only outside a protected boundary."""
+        if self._requested_signal is None:
+            self._requested_signal = signal.Signals(signum)
+        try:
+            self.study.stop()
+        except RuntimeError:
+            pass
+        self._deliver_if_safe()
+
+    def enable_delivery(self) -> None:
+        """Make a pending request visible once arena cleanup is guaranteed."""
+        self._delivery_enabled = True
+        self._deliver_if_safe()
+
+    def disable_delivery(self) -> None:
+        """Keep signals bounded while arena ownership is changing."""
+        self._delivery_enabled = False
+
+    @contextmanager
+    def commit_boundary(self) -> Iterator[None]:
+        """Finish evidence attrs and reporting before delivering a signal."""
+        completed = False
+        self._commit_depth += 1
+        try:
+            yield
+            completed = True
+        finally:
+            self._commit_depth -= 1
+            if completed:
+                self._deliver_if_safe()
+
+    def _deliver_if_safe(self) -> None:
+        if (
+            self._requested_signal is None
+            or not self._delivery_enabled
+            or self._commit_depth
+        ):
+            return
+        name = self._requested_signal.name
+        raise SearchInterrupted(f"received {name}")
 
 
 @dataclass(frozen=True)
@@ -118,6 +171,7 @@ class OptunaCoordinator:
     weights: StrengthWeights
     rungs: tuple[RungSpec, RungSpec, RungSpec]
     arena: PersistentArena
+    interruptions: _InterruptionController | None = None
 
     def objective(self, trial: optuna.Trial) -> float:
         """Evaluate one semantic policy through complete, durable rung boundaries."""
@@ -147,13 +201,20 @@ class OptunaCoordinator:
                 completed,
                 self.weights,
             )
-            path, digest = write_rung_evidence_atomic(self.paths.root, evidence)
-            _set_trial_summary(trial, evidence, path, digest, self.paths.root)
+            boundary = (
+                self.interruptions.commit_boundary()
+                if self.interruptions is not None
+                else nullcontext()
+            )
+            with boundary:
+                path, digest = write_rung_evidence_atomic(self.paths.root, evidence)
+                _set_trial_summary(trial, evidence, path, digest, self.paths.root)
+                if not evidence.failures:
+                    if evidence.objective is None:
+                        raise RuntimeError("clean rung evidence has no objective")
+                    trial.report(evidence.objective, step=spec.resource_step)
             if evidence.failures:
                 raise TrialEvaluationError("; ".join(evidence.failures))
-            if evidence.objective is None:
-                raise RuntimeError("clean rung evidence has no objective")
-            trial.report(evidence.objective, step=spec.resource_step)
             if trial.should_prune():
                 raise optuna.TrialPruned(f"pruned after rung {spec.rung}")
         if evidence is None or evidence.objective is None:
@@ -265,12 +326,14 @@ def run_search(
         return _search_summary(inputs.study, 0, reason)
 
     arena = arena_factory(config.workers)
+    interruptions = _InterruptionController(inputs.study)
     coordinator = OptunaCoordinator(
         paths=inputs.paths,
         league=inputs.league,
         weights=inputs.weights,
         rungs=inputs.rungs,
         arena=arena,
+        interruptions=interruptions,
     )
     started_trials = 0
     economic_stopped = False
@@ -294,18 +357,24 @@ def run_search(
     interrupted = False
     previous_handlers: dict[signal.Signals, SignalHandler] = {}
     try:
-        previous_handlers = _install_signal_handlers(inputs.study)
+        previous_handlers = _install_signal_handlers(interruptions)
         with arena:
-            inputs.study.optimize(
-                objective,
-                n_trials=remaining,
-                n_jobs=1,
-                callbacks=(*callbacks, stop_gate),
-                catch=(TrialEvaluationError,),
-            )
+            try:
+                interruptions.enable_delivery()
+                inputs.study.optimize(
+                    objective,
+                    n_trials=remaining,
+                    n_jobs=1,
+                    callbacks=(*callbacks, stop_gate),
+                    catch=(TrialEvaluationError,),
+                )
+            finally:
+                interruptions.disable_delivery()
+        interruptions.enable_delivery()
     except SearchInterrupted:
         interrupted = True
     finally:
+        interruptions.disable_delivery()
         _restore_signal_handlers(previous_handlers)
     if interrupted:
         return _search_summary(inputs.study, started_trials, "interrupted")
@@ -409,18 +478,13 @@ def _set_trial_system_attr(trial: optuna.Trial, key: str, value: str) -> None:
 
 
 def _install_signal_handlers(
-    study: optuna.Study,
+    interruptions: _InterruptionController,
 ) -> dict[signal.Signals, SignalHandler]:
     """Install bounded handlers only at the coordinator run boundary."""
     previous: dict[signal.Signals, SignalHandler] = {}
 
     def handle(signum: int, _frame: FrameType | None) -> None:
-        try:
-            study.stop()
-        except RuntimeError:
-            pass
-        name = signal.Signals(signum).name
-        raise SearchInterrupted(f"received {name}")
+        interruptions.request(signum)
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous[signum] = signal.getsignal(signum)
