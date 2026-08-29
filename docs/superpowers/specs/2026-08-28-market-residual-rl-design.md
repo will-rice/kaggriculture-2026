@@ -1,7 +1,7 @@
 # Market-Residual RL Design
 
 **Date:** 2026-08-28
-**Status:** Proposed
+**Status:** Approved 2026-08-29
 **Scope:** A market-only learned residual over a frozen Kaito v48 logistics controller
 
 ## 1. Decision and motivation
