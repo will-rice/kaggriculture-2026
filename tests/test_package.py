@@ -105,6 +105,45 @@ print(json.dumps({
     assert tuple(evidence["banks"]) == V54_REFERENCE_BANKS
 
 
+def test_the_market_residual_runtime_imports_no_training_dependencies() -> None:
+    """The learned market boundary has to be packageable before it is served.
+
+    ``market_residual`` is the runtime half of a system whose other half is
+    Torch, and the two live in the same repository and are written in the same
+    week. An accidental import from the runtime side would not fail here or
+    locally -- both are installed -- it would fail in the sandbox, on turn zero,
+    as a zero with no logs, or it would land 200 MB of wheels in an archive with
+    a 4 MB budget. So the audit runs in a subprocess with only ``src`` on the
+    path and checks what actually ended up in ``sys.modules``.
+
+    ``policy`` is the module imported because it is the one the submission would
+    import: it reaches the baseline loader, the event machine, the feature
+    encoder and the merge, so every runtime module in the package is on this
+    path.
+    """
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = "src"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import kaggriculture.market_residual.policy as policy; "
+            "assert policy.build_market_residual_agent is not None; "
+            "heavy = {'torch', 'lightning', 'pytorch_lightning', 'optuna', 'wandb'};"
+            "loaded = heavy & {name.split('.')[0] for name in sys.modules};"
+            "assert not loaded, loaded; "
+            "assert 'kaggriculture.learn' not in sys.modules; "
+            "assert 'kaggriculture.search' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_build_accepts_a_self_contained_alternate_entrypoint(tmp_path: Path) -> None:
     """Candidate packaging can be tested without changing the served default."""
     entrypoint = tmp_path / "main.py"
