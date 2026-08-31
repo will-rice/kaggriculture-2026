@@ -47,8 +47,10 @@ raise. ``tests/market_residual/test_baseline.py`` pins that trap.
 import hashlib
 import importlib.util
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import CodeType
 from typing import Any, Mapping, Protocol
 
 SERVED_MODULE = "kaggriculture.kaito_v54_policy"
@@ -64,8 +66,36 @@ SERVED_SHA256 = "9f21735aaf0354e064e1d9bab1b2e186fad12cf6446e7ecf83f5014915e04a4
 ENTRYPOINT = "agent"
 
 # Serialises the payload ``exec`` below, whose ``sys.modules`` registrations are
-# global. See this module's docstring for why a rule was not enough.
+# global, and guards the two caches beside it. See this module's docstring for
+# why a rule was not enough.
 LOAD_LOCK = threading.Lock()
+
+# Compiled payloads, keyed by the digest that was verified to produce them. The
+# source is still read and hashed on every load, so a controller that changed on
+# disk still raises before anything cached is reached -- the cache is keyed by
+# the digest, so changed bytes address a different entry and can never be served
+# from an old one. Measured on this payload the saving is small (compiling
+# 171 KiB costs ~1.2 ms of a ~890 ms load; the rest is the payload's own
+# module-level work) and it is kept because it is exactly free, not because it
+# is the lever collection needed.
+CODE_CACHE: dict[str, CodeType] = {}
+
+
+@dataclass(frozen=True)
+class LoadReport:
+    """How much of this process's time has gone into loading controllers.
+
+    Counterfactual collection pays two fresh loads per branch arm, and a
+    throughput budget that cannot separate that cost from the simulation it
+    surrounds is a budget nobody can act on. The counter lives here because
+    this is the only place that knows a load happened.
+    """
+
+    count: int
+    seconds: float
+
+
+LOADS = LoadReport(count=0, seconds=0.0)
 
 
 class BaselineIntegrityError(RuntimeError):
@@ -171,6 +201,8 @@ def load_verified_baseline(identity: BaselineIdentity) -> BaselineAgent:
         BaselineIntegrityError: If the source fails its digest check, or the
             verified source binds no callable ``agent``.
     """
+    global LOADS
+    started = time.perf_counter()
     source = identity.verified_source()
     namespace: dict[str, Any] = {
         "__name__": f"verified:{identity.module}",
@@ -178,10 +210,35 @@ def load_verified_baseline(identity: BaselineIdentity) -> BaselineAgent:
         "__package__": "",
     }
     with LOAD_LOCK:
-        exec(compile(source, namespace["__file__"], "exec"), namespace)  # noqa: S102
+        code = CODE_CACHE.get(identity.sha256)
+        if code is None:
+            code = compile(source, namespace["__file__"], "exec")
+            CODE_CACHE[identity.sha256] = code
+        exec(code, namespace)  # noqa: S102
+        LOADS = replace(
+            LOADS,
+            count=LOADS.count + 1,
+            seconds=LOADS.seconds + time.perf_counter() - started,
+        )
     agent = namespace.get(ENTRYPOINT)
     if not callable(agent):
         raise BaselineIntegrityError(
             f"{identity.module} binds no callable {ENTRYPOINT!r}"
         )
     return agent
+
+
+def load_report() -> LoadReport:
+    """Return how many controllers this process has loaded, and at what cost.
+
+    Returns:
+        The running total since the last reset.
+    """
+    return LOADS
+
+
+def reset_load_report() -> None:
+    """Zero the load counter, so one phase's cost can be attributed to it."""
+    global LOADS
+    with LOAD_LOCK:
+        LOADS = LoadReport(count=0, seconds=0.0)

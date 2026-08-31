@@ -54,6 +54,7 @@ from kaggriculture.learn.market_residual.counterfactual import (
     CounterfactualSnapshot,
     RecordedEvent,
     RecordedSeason,
+    RestoredAgent,
     branch_event,
     branch_rows,
     canonical_action,
@@ -188,6 +189,32 @@ def test_a_transcript_replayed_without_its_configuration_is_refused(
 
     with pytest.raises(CounterfactualIntegrityError, match="diverged at call"):
         blind.restore()
+
+
+def test_a_restored_controller_plays_its_forward_turns_under_that_configuration() -> (
+    None
+):
+    """The turns *after* a branch are called the way the recorded season was.
+
+    ``restore`` proving the prefix is not enough. The prefix replay and the
+    forward branch are two different call sites, and a forward branch that drops
+    the configuration reproduces every shared branch fixture here -- they open at
+    turn 700 and only nineteen turns follow. Collection opens events across the
+    whole season, so the site is pinned directly rather than through an outcome
+    that a short tail can hide.
+    """
+    seen: list[object] = []
+
+    def spy(
+        observation: Mapping[str, Any], configuration: object | None = None
+    ) -> dict[str, Any]:
+        seen.append(configuration)
+        return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    configuration = {"episodeSteps": EPISODE_STEPS, "townCenterSellInterval": 24}
+    RestoredAgent(spy, configuration, ()).play({"step": 3})
+
+    assert seen == [configuration]
 
 
 def test_row_zero_is_the_controllers_own_action_object(
