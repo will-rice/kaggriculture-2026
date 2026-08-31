@@ -23,6 +23,13 @@ repos:
         language: system
         entry: uv run ruff format
         files: ^(src|tests|baselines)/.*\.py$|^[^/]*\.py$
+        # The served agent is a public kernel vendored byte for byte, and its
+        # header asserts the SHA-256 the notebook itself publishes over exactly
+        # the bytes in this file. Formatting it would not change how it plays,
+        # and would leave that claim with nothing to be checked against -- the
+        # same reason the Toad tree above is excluded. `ruff check` and `ty`
+        # still run on it; only the formatter is held off.
+        exclude: ^src/kaggriculture/kaito_v54_policy\.py$
         pass_filenames: true
       - id: ruff
         name: ruff

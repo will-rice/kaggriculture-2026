@@ -47,18 +47,26 @@ measured out of the built archive by ``kaggriculture.scripts.budget``. Nothing
 on this path imports torch.
 """
 
-# Serves `boatlee_v14_policy`, restored 2026-08-21 after the ladder falsified
-# the serve decision of 2026-08-20. `searched_route_policy` passed the held-out
-# gate against this agent (0.734 [0.652, 0.803] over 128 games) and that result
-# was real on the ladder too -- doubled overall win rate, +10k median bank --
-# but rating is set at the frontier, and above 1400 the searched route loses to
-# the current meta 4-to-1 (4/19 and 1/9 across its two copies). It converged at
-# ~1370 against this agent's ~1500. The gate examined against what we served,
-# not against the frontier; until the gate's opponent set includes fresh
-# top-band tapes, "PASS" does not mean "worth fielding".
+# Serves `kaito_v54_policy` as of 2026-08-31, replacing `boatlee_v14_policy`,
+# which had been served since 2026-08-21. Held-out seeds 700000-700063, each
+# played in both seat orderings, on kaggle-environments 1.32.7:
 #
-# The searched route remains vendored as `searched_route_policy` -- it is a
-# gate opponent and a record, not a serve.
-from kaggriculture.boatlee_v14_policy import agent
+#     vs boatlee_v14 (the agent it replaces)  64/64 = 1.000  [0.943, 1.000]
+#     pooled public frontier                  226/256 = 0.883  lower 0.838
+#     vs kaito v48 (same author, two days older)  48/64 = 0.750  [0.632, 0.840]
+#
+# The frontier bar is 0.45 and the served bar is 0.5; both clear by a wide
+# margin. The second line is the one that matters. The serve switch of
+# 2026-08-20 was made on a gate that only asked "does the candidate beat what we
+# serve", and the ladder falsified it the next day: rating is set at the
+# frontier, and an agent can beat our own served copy 3-to-1 while losing 4-to-1
+# to the current meta above 1400. So this gate pools fresh top-band tapes from
+# the published archives and refuses a pool more than a week old. See
+# `kaggriculture.search.scripts.holdout`, whose `SERVED` constant tracks this
+# import line and is tested against it.
+#
+# `boatlee_v14_policy` and `searched_route_policy` remain vendored -- they are
+# gate opponents and records, not serves.
+from kaggriculture.kaito_v54_policy import agent
 
 __all__ = ["agent"]

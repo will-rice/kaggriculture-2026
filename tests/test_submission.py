@@ -11,8 +11,8 @@ import pytest
 from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
-from kaggriculture.boatlee_v14_policy import agent as boatlee_v14_agent
 from kaggriculture.hybrid.config import HybridConfig, to_runtime
+from kaggriculture.kaito_v54_policy import agent as kaito_v54_agent
 from kaggriculture.scripts.package import (
     ENTRYPOINT,
     _refuse_a_shadowed_entrypoint,
@@ -39,11 +39,11 @@ def test_entrypoint_exposes_the_agent_last() -> None:
     assert get_last_callable(source, path=str(ENTRYPOINT)) is namespace["agent"]
 
 
-def test_default_entrypoint_is_pinned_to_boatlee_v14() -> None:
+def test_default_entrypoint_is_pinned_to_kaito_v54() -> None:
     """Candidate packaging cannot silently change the served default policy."""
     namespace: dict[str, object] = {}
     exec(compile(ENTRYPOINT.read_text(), str(ENTRYPOINT), "exec"), namespace)
-    assert namespace["agent"] is boatlee_v14_agent
+    assert namespace["agent"] is kaito_v54_agent
 
 
 def test_entrypoint_plays_a_full_episode() -> None:

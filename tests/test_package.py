@@ -1,6 +1,9 @@
 """Tests for the packaging guard that keeps offline tooling out of the archive."""
 
+import json
 import os
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -9,6 +12,7 @@ import pytest
 from kaggriculture.routes import STORE
 from kaggriculture.scripts import package as package_script
 from kaggriculture.scripts.package import build
+from tests.test_vendored_policies import V54_REFERENCE_BANKS
 
 _needs_prototype_store = pytest.mark.skipif(
     not STORE.exists(), reason="prototype store not present on this machine"
@@ -33,6 +37,72 @@ def test_the_archive_does_not_ship_the_search_package(tmp_path: Path) -> None:
     assert not [
         name for name in names if "/search/" in name or name.endswith("/search")
     ]
+
+
+@_needs_prototype_store
+def test_the_archive_ships_the_served_policy_and_plays_its_gate_episode(
+    tmp_path: Path,
+) -> None:
+    """The archive must play the same season the gate scored, not merely build.
+
+    ``EXCLUDED`` drops whole trees by name at every directory level, so a policy
+    module lands in the archive by not matching any of them -- which is a
+    property of the filename, not a decision anyone took. That is fine until the
+    day it is not, and the failure is invisible: the build succeeds, the archive
+    is the right size, and the agent raises on turn zero in a sandbox with no
+    logs.
+
+    So this asserts both halves at once. The served module is in the archive,
+    and the archive's own ``main.py``, run from the extracted directory by the
+    engine, reproduces the exact bank pair
+    ``test_vendored_policies.V54_REFERENCE_BANKS`` pins for the unpackaged
+    module on the same seed against the same opponent. Both seats come out of
+    the extraction, so nothing in this repository is on the path.
+    """
+    archive = build(tmp_path / "submission.tar.gz")
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(archive) as bundle:
+        names = bundle.getnames()
+        bundle.extractall(extracted, filter="data")
+
+    assert "kaggriculture/kaito_v54_policy.py" in names
+    assert "kaggriculture/boatlee_v14_policy.py" in names
+
+    script = """
+import json
+import runpy
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+agent = runpy.run_path(str(root / "main.py"))["agent"]
+from kaggle_environments import make
+from kaggriculture.boatlee_v14_policy import agent as opponent
+
+environment = make(
+    "kaggriculture", configuration={"episodeSteps": 720, "seed": 700_000}
+)
+environment.run([agent, opponent])
+final = environment.steps[-1]
+print(json.dumps({
+    "statuses": [str(state.status) for state in final],
+    "banks": [int(state.reward) for state in final],
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(extracted)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout.splitlines()[-1])
+    assert evidence["statuses"] == ["DONE", "DONE"]
+    assert tuple(evidence["banks"]) == V54_REFERENCE_BANKS
 
 
 def test_build_accepts_a_self_contained_alternate_entrypoint(tmp_path: Path) -> None:

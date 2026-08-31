@@ -16,6 +16,10 @@ post-deadline window. Win condition per episode: most coins banked.
 5. Commit (never `git add -A`; the hook runs the full suite ~9 min; prettier
    bounces md once — re-stage and re-commit).
 
+If the session dies, a fresh one resumes with
+`/ralph-loop:ralph-loop "win this competition"` — this file carries all the
+state, so nothing outside it needs to survive.
+
 ## Standing rules (each has cost us before)
 
 - Measure before acting; read a metric's definition in `docs/metrics.md`
