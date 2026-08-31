@@ -16,6 +16,10 @@ from kaggle_environments import make
 
 from kaggriculture.features import EncodedObservation, encode_observation
 from kaggriculture.kaito_v54_policy import agent as kaito_agent
+from kaggriculture.market_residual.actions import ResidualDecision, ResidualMode
+from kaggriculture.market_residual.baseline import SERVED
+from kaggriculture.market_residual.features import MarketFeatureVector
+from kaggriculture.market_residual.policy import build_market_residual_agent
 
 # Outside every declared bank in `schema.SEED_BANKS`: a fixture is not a
 # measurement, and it may not consume a seed a promotion decision will need.
@@ -102,3 +106,54 @@ def kaito_turns(kaito_episode: list[Any]) -> tuple[Turn, ...]:
             encoded = encode_observation(observation, seat)
             turns.append(Turn(turn, seat, observation, encoded, action))
     return tuple(turns)
+
+
+class RecordingResidual:
+    """A deferring head that keeps every feature row it was shown, in order.
+
+    The recurrent tests need a real event sequence: the rows one seat of one
+    real episode actually produces, at the turns the real event machine opened,
+    under the real schema. Deferring on every one of them keeps the recorded
+    season the frozen controller's own, so the sequence is the one a residual
+    initialised from Kaito would first see.
+    """
+
+    def __init__(self) -> None:
+        """Start with an empty transcript."""
+        self.rows: list[MarketFeatureVector] = []
+
+    def initial_state(self) -> tuple[float, ...]:
+        """Return the empty state; this head remembers nothing itself."""
+        return ()
+
+    def observe(
+        self,
+        features: MarketFeatureVector,
+        state: tuple[float, ...],
+        *,
+        act: bool,
+    ) -> tuple[ResidualDecision | None, tuple[float, ...]]:
+        """Record the row and defer to the frozen controller.
+
+        Args:
+            features: The canonical row for this market event.
+            state: The empty state.
+            act: Whether the decision will be played; either way it defers.
+
+        Returns:
+            A decision that changes nothing, and ``state``.
+        """
+        self.rows.append(features)
+        return ResidualDecision(mode=ResidualMode.USE_KAITO, buckets=()), state
+
+
+@pytest.fixture(scope="session")
+def event_rows() -> tuple[MarketFeatureVector, ...]:
+    """Return seat zero's market feature rows from one real season, in order."""
+    recorder = RecordingResidual()
+    seat = build_market_residual_agent(SERVED, recorder)
+    environment = make(
+        "kaggriculture", configuration={"seed": EPISODE_SEED}, debug=False
+    )
+    environment.run([seat, kaito_agent])
+    return tuple(recorder.rows)

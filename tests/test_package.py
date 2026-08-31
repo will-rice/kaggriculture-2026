@@ -119,7 +119,10 @@ def test_the_market_residual_runtime_imports_no_training_dependencies() -> None:
     ``policy`` is the module imported because it is the one the submission would
     import: it reaches the baseline loader, the event machine, the feature
     encoder and the merge, so every runtime module in the package is on this
-    path.
+    path. ``numpy_policy`` is imported alongside it because it is not on that
+    path -- the wrapper takes any ``ResidualInference`` and never names the
+    exported head -- and it is the module most exposed to the accident, being
+    the NumPy transcription of something whose original is written in Torch.
     """
     environment = os.environ.copy()
     environment["PYTHONPATH"] = "src"
@@ -128,7 +131,9 @@ def test_the_market_residual_runtime_imports_no_training_dependencies() -> None:
             sys.executable,
             "-c",
             "import sys; import kaggriculture.market_residual.policy as policy; "
+            "import kaggriculture.market_residual.numpy_policy as head; "
             "assert policy.build_market_residual_agent is not None; "
+            "assert head.NumpyResidualPolicy is not None; "
             "heavy = {'torch', 'lightning', 'pytorch_lightning', 'optuna', 'wandb'};"
             "loaded = heavy & {name.split('.')[0] for name in sys.modules};"
             "assert not loaded, loaded; "
