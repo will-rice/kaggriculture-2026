@@ -20,6 +20,18 @@ exception -- it would be a slightly wrong reward on a slightly wrong trajectory.
 So every call to ``load_verified_baseline`` ``exec``s the verified bytes into a
 fresh namespace and returns that namespace's own agent.
 
+That ``exec`` is not thread-safe, and the reason is not the namespace -- it is
+``sys.modules``. Executing the payload decodes and registers a bundled ancestor
+under *bare* top-level names (``v48``, ``v50``, ``scripts`` and others), and two
+loads running at once interleave those registrations: the second load can bind a
+half-initialised module the first is still filling in, and the import machinery
+inside the payload then reads attributes that are not there yet. So the load is
+serialised on ``LOAD_LOCK``. It is a lock rather than a documented rule because
+this repository's own convention reaches for ``ThreadPoolExecutor`` by default,
+and collection -- which wants one fresh controller per branch row -- is exactly
+where that reach happens. The lock covers only the load; the returned callables
+share nothing and are played concurrently.
+
 **The agent is resolved by name, not as the last callable defined.** The Kaggle
 runner and ``scripts.package`` both take the last callable in a namespace, and
 for this controller that rule picks the wrong function: its final statements
@@ -34,6 +46,7 @@ raise. ``tests/market_residual/test_baseline.py`` pins that trap.
 
 import hashlib
 import importlib.util
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -49,6 +62,10 @@ SERVED_BODY_START = '"""v51: current-meta capital-flow hybrid.'
 SERVED_SHA256 = "9f21735aaf0354e064e1d9bab1b2e186fad12cf6446e7ecf83f5014915e04a4f"
 
 ENTRYPOINT = "agent"
+
+# Serialises the payload ``exec`` below, whose ``sys.modules`` registrations are
+# global. See this module's docstring for why a rule was not enough.
+LOAD_LOCK = threading.Lock()
 
 
 class BaselineIntegrityError(RuntimeError):
@@ -139,9 +156,10 @@ def load_verified_baseline(identity: BaselineIdentity) -> BaselineAgent:
 
     The returned callable shares no module-level state with any other copy or
     with the imported module, so one per episode is safe to run concurrently.
-    Note that executing this controller registers modules in ``sys.modules``
-    under bare names; that is the same side effect importing it has, and the
-    names are pinned by ``tests/test_vendored_policies.py``.
+    The loading itself is not: executing this controller registers modules in
+    ``sys.modules`` under bare names -- the same side effect importing it has,
+    with the names pinned by ``tests/test_vendored_policies.py`` -- so the
+    ``exec`` is serialised on ``LOAD_LOCK`` and concurrent callers queue.
 
     Args:
         identity: Which controller to load, and the digest it must have.
@@ -159,7 +177,8 @@ def load_verified_baseline(identity: BaselineIdentity) -> BaselineAgent:
         "__file__": str(identity.source_path()),
         "__package__": "",
     }
-    exec(compile(source, namespace["__file__"], "exec"), namespace)  # noqa: S102
+    with LOAD_LOCK:
+        exec(compile(source, namespace["__file__"], "exec"), namespace)  # noqa: S102
     agent = namespace.get(ENTRYPOINT)
     if not callable(agent):
         raise BaselineIntegrityError(

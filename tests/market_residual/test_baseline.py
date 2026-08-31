@@ -18,6 +18,7 @@ counterfactual collection would then train on.
 
 import importlib.util
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import FunctionType
 from typing import cast
@@ -190,3 +191,27 @@ def test_fresh_instances_do_not_share_state(kaito_turns: tuple[Turn, ...]) -> No
     assert len(seat_zero) == TRACE_TURNS
     assert left_trace == right_trace
     assert any(action["market"] for action in left_trace), "trace saw no market orders"
+
+
+def test_concurrent_loads_are_serialised_and_still_independent(
+    kaito_turns: tuple[Turn, ...],
+) -> None:
+    """Loading is the unsafe part, and the lock is what makes it safe.
+
+    The payload registers modules under bare top-level names, so two loads
+    running at once can bind a half-initialised module. The existing
+    fresh-instance test loads serially and so cannot exercise that race at all;
+    this one runs the loads through the pool this repository reaches for by
+    default, and demands both a completed load and a controller that plays the
+    same season as one loaded alone.
+    """
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        loaded = list(pool.map(load_verified_baseline, [SERVED] * 4))
+    seat_zero = [turn for turn in kaito_turns if turn.seat == 0][:TRACE_TURNS]
+    alone = load_verified_baseline(SERVED)
+
+    expected = [alone(turn.observation) for turn in seat_zero]
+    traces = [[agent(turn.observation) for turn in seat_zero] for agent in loaded]
+
+    assert len({id(agent) for agent in loaded}) == len(loaded)
+    assert all(trace == expected for trace in traces)

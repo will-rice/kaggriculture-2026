@@ -109,18 +109,48 @@ class AlternativeConfig:
 
 @dataclass(frozen=True)
 class Alternative:
-    """One thing the seat could have done, and which family proposed it."""
+    """One *replacement* the seat could have played, and who proposed it.
+
+    An ``Alternative`` is by construction something the residual would have to
+    replace the controller's market queue to play, which is why it cannot carry
+    the controller's own family: the controller's plan is played by preserving
+    its action, and asking the replacement merge to prove it legal is a
+    different question with a different answer on nearly a fifth of real turns.
+    """
 
     family: str
     buckets: tuple[int, ...]
 
+    def __post_init__(self) -> None:
+        """Refuse to label a replacement as the controller's own plan.
+
+        Raises:
+            ValueError: If the family is the controller's own.
+        """
+        if self.family == FAMILY_KAITO:
+            raise ValueError(
+                f"{FAMILY_KAITO!r} is the anchor, not a replacement; it is played "
+                "by preserving the controller's action, never by merging"
+            )
+
 
 @dataclass(frozen=True)
 class AlternativeSet:
-    """Every alternative for one market event, with Kaito's own plan first."""
+    """One event's anchor and its replacements, held apart by type.
+
+    ``kaito`` is the controller's own proposal. It is a bare bucket tuple rather
+    than an ``Alternative`` because nothing may iterate it together with the
+    replacements: the merge legitimately refuses the controller's own queue on
+    270 of 1402 real seat-turns -- it is not a *replacement* of anything, and
+    the walk that proves replacements legal has no reason to admit it -- so a
+    loop that merged the anchor would record 19% of the controller's own actions
+    as illegal. Row zero of the recorded set is ``kaito``; rows one and up are
+    ``replacements`` in the order given.
+    """
 
     fingerprint: str
-    rows: tuple[Alternative, ...]
+    kaito: tuple[int, ...]
+    replacements: tuple[Alternative, ...]
 
     @property
     def sha256(self) -> str:
@@ -129,7 +159,10 @@ class AlternativeSet:
             {
                 "version": ALTERNATIVE_VERSION,
                 "event": self.fingerprint,
-                "rows": [[row.family, list(row.buckets)] for row in self.rows],
+                "rows": [
+                    [FAMILY_KAITO, list(self.kaito)],
+                    *([row.family, list(row.buckets)] for row in self.replacements),
+                ],
             },
             separators=(",", ":"),
         )
@@ -144,10 +177,11 @@ def generate_alternatives(
 ) -> AlternativeSet:
     """Return the bounded, legal, deterministic alternatives for one event.
 
-    Row zero is always the frozen controller's own proposal, which is played by
-    preserving its action rather than by replacing it and so is not subject to
-    the replacement merge. Every other row is a replacement the merge has
-    proved legal, deduplicated on its buckets and ordered lexicographically.
+    The controller's own proposal is returned as the set's ``kaito`` anchor,
+    apart from the replacements, because it is played by preserving its action
+    rather than by replacing it and so is not subject to the replacement merge.
+    Every replacement is one the merge has proved legal, deduplicated on its
+    buckets -- including against the anchor -- and ordered lexicographically.
 
     Args:
         event: The event the residual was consulted at.
@@ -157,7 +191,7 @@ def generate_alternatives(
         config: The row budget in force for this run.
 
     Returns:
-        The alternatives, Kaito first and the rest in lexicographic order.
+        The controller's anchor and the replacements in lexicographic order.
 
     Raises:
         ValueError: If the action's commodity orders cannot be read exactly, or
@@ -184,7 +218,6 @@ def generate_alternatives(
         *_ranked_multi(encoded, action, kaito, edges, best, config),
     )
 
-    rows = [Alternative(FAMILY_KAITO, kaito)]
     seen = {kaito}
     tail: list[Alternative] = []
     for family, buckets in candidates:
@@ -192,13 +225,13 @@ def generate_alternatives(
             continue
         seen.add(buckets)
         tail.append(Alternative(family, buckets))
-    rows.extend(sorted(tail, key=lambda row: row.buckets))
-    if len(rows) > config.max_alternatives:
+    replacements = tuple(sorted(tail, key=lambda row: row.buckets))
+    if 1 + len(replacements) > config.max_alternatives:
         raise RuntimeError(
-            f"generated {len(rows)} alternatives, above the cap of "
+            f"generated {1 + len(replacements)} alternatives, above the cap of "
             f"{config.max_alternatives}"
         )
-    return AlternativeSet(fingerprint, tuple(rows))
+    return AlternativeSet(fingerprint, kaito, replacements)
 
 
 def slot_edges(encoded: EncodedObservation) -> tuple[tuple[int, ...], ...]:

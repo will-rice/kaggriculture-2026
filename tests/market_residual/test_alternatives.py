@@ -39,6 +39,8 @@ import pytest
 from kaggriculture.action_codec import MARKET_SLOTS, quantity_of
 from kaggriculture.learn.market_residual.alternatives import (
     ALTERNATIVE_FAMILIES,
+    FAMILY_KAITO,
+    Alternative,
     AlternativeConfig,
     AlternativeSet,
     generate_alternatives,
@@ -85,6 +87,13 @@ def alternatives_for(cell: Cell, config: AlternativeConfig) -> AlternativeSet:
     )
 
 
+def families_of(alternatives: AlternativeSet) -> collections.Counter[str]:
+    """Count the families of one recorded set, anchor included as row zero."""
+    counts = collections.Counter(row.family for row in alternatives.replacements)
+    counts[FAMILY_KAITO] += 1
+    return counts
+
+
 @pytest.fixture(scope="session")
 def market_cells(kaito_turns: tuple[Turn, ...]) -> tuple[Cell, ...]:
     """Return every event the real machine opened on a real season, in order."""
@@ -110,16 +119,15 @@ def busy_cell(market_cells: tuple[Cell, ...]) -> Cell:
     return next(
         cell
         for cell in market_cells
-        if {row.family for row in alternatives_for(cell, CONFIG).rows}
-        == set(ALTERNATIVE_FAMILIES)
+        if set(families_of(alternatives_for(cell, CONFIG))) == set(ALTERNATIVE_FAMILIES)
     )
 
 
 def test_alternatives_include_required_families(busy_cell: Cell) -> None:
     alternatives = alternatives_for(busy_cell, CONFIG)
 
-    assert alternatives.rows[0].family == "kaito"
-    assert {row.family for row in alternatives.rows} >= {
+    assert alternatives.kaito == busy_cell.event.kaito_buckets
+    assert set(families_of(alternatives)) >= {
         "kaito",
         "cancel",
         "scale_down",
@@ -127,24 +135,28 @@ def test_alternatives_include_required_families(busy_cell: Cell) -> None:
         "single",
         "ranked_multi",
     }
-    assert len(alternatives.rows) <= 48
+    assert 1 + len(alternatives.replacements) <= 48
 
 
-def test_row_zero_is_the_controllers_own_plan(market_cells: tuple[Cell, ...]) -> None:
+def test_the_anchor_is_the_controllers_own_plan(market_cells: tuple[Cell, ...]) -> None:
     for cell in market_cells:
-        rows = alternatives_for(cell, CONFIG).rows
-        assert rows[0].family == "kaito"
-        assert rows[0].buckets == cell.event.kaito_buckets
-        assert all(row.family != "kaito" for row in rows[1:])
+        alternatives = alternatives_for(cell, CONFIG)
+        assert alternatives.kaito == cell.event.kaito_buckets
+        assert all(row.family != "kaito" for row in alternatives.replacements)
+
+
+def test_a_replacement_cannot_be_labelled_as_the_controllers_own_plan() -> None:
+    with pytest.raises(ValueError, match="is the anchor, not a replacement"):
+        Alternative(FAMILY_KAITO, (0,) * len(ALLOWED_SLOTS))
 
 
 def test_a_real_season_reaches_every_family(market_cells: tuple[Cell, ...]) -> None:
     families: dict[str, int] = collections.Counter()
     widest = 0
     for cell in market_cells:
-        rows = alternatives_for(cell, CONFIG).rows
-        families.update(row.family for row in rows)
-        widest = max(widest, len(rows))
+        alternatives = alternatives_for(cell, CONFIG)
+        families.update(families_of(alternatives))
+        widest = max(widest, 1 + len(alternatives.replacements))
 
     assert len(market_cells) == 982
     assert dict(families) == {
@@ -167,7 +179,7 @@ def test_every_alternative_fills_completely_in_the_engine(
 ) -> None:
     replayed = 0
     for cell in market_cells[::ENGINE_STRIDE]:
-        for row in alternatives_for(cell, CONFIG).rows[1:]:
+        for row in alternatives_for(cell, CONFIG).replacements:
             result = merge_residual_action(
                 cell.turn.encoded,
                 cell.turn.action,
@@ -186,12 +198,13 @@ def test_rows_are_unique_and_lexicographically_ordered(
     market_cells: tuple[Cell, ...],
 ) -> None:
     for cell in market_cells:
-        rows = alternatives_for(cell, CONFIG).rows
-        tail = [row.buckets for row in rows[1:]]
+        alternatives = alternatives_for(cell, CONFIG)
+        tail = [row.buckets for row in alternatives.replacements]
+        every = [alternatives.kaito, *tail]
         assert tail == sorted(tail)
-        assert len({row.buckets for row in rows}) == len(rows)
-        assert all(len(row.buckets) == len(ALLOWED_SLOTS) for row in rows)
-        assert all(0 <= bucket < BUCKETS for row in rows for bucket in row.buckets)
+        assert len(set(every)) == len(every)
+        assert all(len(buckets) == len(ALLOWED_SLOTS) for buckets in every)
+        assert all(0 <= bucket < BUCKETS for buckets in every for bucket in buckets)
 
 
 def test_scaled_rows_are_the_plan_at_half_and_at_half_again(
@@ -200,7 +213,7 @@ def test_scaled_rows_are_the_plan_at_half_and_at_half_again(
     seen: dict[str, int] = collections.Counter()
     for cell in market_cells:
         plan = cell.event.kaito_buckets
-        for row in alternatives_for(cell, CONFIG).rows:
+        for row in alternatives_for(cell, CONFIG).replacements:
             if row.family not in ("scale_down", "scale_up"):
                 continue
             seen[row.family] += 1
@@ -216,15 +229,12 @@ def test_a_tight_budget_binds_every_family(market_cells: tuple[Cell, ...]) -> No
     families: dict[str, int] = collections.Counter()
     overrun = 0
     for cell in market_cells:
-        rows = alternatives_for(cell, TIGHT).rows
-        counts = collections.Counter(row.family for row in rows)
-        assert len(rows) <= TIGHT.max_alternatives
+        counts = families_of(alternatives_for(cell, TIGHT))
+        assert sum(counts.values()) <= TIGHT.max_alternatives
         assert counts["single"] <= TIGHT.max_single
         assert counts["ranked_multi"] <= TIGHT.max_ranked_multi
         families.update(counts)
-        shipped = collections.Counter(
-            row.family for row in alternatives_for(cell, CONFIG).rows
-        )
+        shipped = families_of(alternatives_for(cell, CONFIG))
         overrun += int(
             shipped["single"] > TIGHT.max_single
             or shipped["ranked_multi"] > TIGHT.max_ranked_multi
@@ -248,12 +258,12 @@ def test_a_budget_that_cannot_fit_the_cap_is_refused() -> None:
 def test_the_kept_rows_are_the_best_quoted_ones(busy_cell: Cell) -> None:
     shipped = [
         row.buckets
-        for row in alternatives_for(busy_cell, CONFIG).rows
+        for row in alternatives_for(busy_cell, CONFIG).replacements
         if row.family == "single"
     ]
     tight = [
         row.buckets
-        for row in alternatives_for(busy_cell, TIGHT).rows
+        for row in alternatives_for(busy_cell, TIGHT).replacements
         if row.family == "single"
     ]
 
@@ -298,7 +308,9 @@ alternatives = generate_alternatives(
     event, encoded, cell["action"], AlternativeConfig()
 )
 print(alternatives.sha256)
-print(json.dumps([[row.family, list(row.buckets)] for row in alternatives.rows]))
+rows = [["kaito", list(alternatives.kaito)]]
+rows += [[row.family, list(row.buckets)] for row in alternatives.replacements]
+print(json.dumps(rows))
 """
 
 
@@ -342,7 +354,9 @@ def test_the_alternative_set_is_byte_equal_under_a_different_hash_seed(
 def test_the_digest_moves_with_the_rows(market_cells: tuple[Cell, ...]) -> None:
     digests = {alternatives_for(cell, CONFIG).sha256 for cell in market_cells}
     shipped = alternatives_for(market_cells[0], CONFIG)
-    reordered = AlternativeSet(shipped.fingerprint, tuple(reversed(shipped.rows)))
+    reordered = AlternativeSet(
+        shipped.fingerprint, shipped.kaito, tuple(reversed(shipped.replacements))
+    )
 
     assert len(digests) > 100, "a constant digest would make the identity untested"
     assert reordered.sha256 != shipped.sha256
@@ -357,7 +371,7 @@ def test_the_learnable_slots_are_the_only_ones_an_alternative_touches(
             for order in cell.turn.action["market"]
             if order[0] not in ("SELL", "BUY_PRODUCT")
         ]
-        for row in alternatives_for(cell, CONFIG).rows[1:]:
+        for row in alternatives_for(cell, CONFIG).replacements:
             result = merge_residual_action(
                 cell.turn.encoded,
                 cell.turn.action,

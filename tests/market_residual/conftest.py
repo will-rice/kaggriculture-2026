@@ -9,15 +9,26 @@ that the residual will trade against.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from kaggle_environments import make
 
 from kaggriculture.features import EncodedObservation, encode_observation
 from kaggriculture.kaito_v54_policy import agent as kaito_agent
+from kaggriculture.learn.market_residual.alternatives import AlternativeConfig
+from kaggriculture.learn.market_residual.counterfactual import (
+    CounterfactualSnapshot,
+    RecordedEvent,
+    RecordedSeason,
+    SeasonIdentity,
+    record_season,
+    season_events,
+    snapshot_event,
+)
 from kaggriculture.market_residual.actions import ResidualDecision, ResidualMode
 from kaggriculture.market_residual.baseline import SERVED
+from kaggriculture.market_residual.events import EventConfig
 from kaggriculture.market_residual.features import MarketFeatureVector
 from kaggriculture.market_residual.policy import build_market_residual_agent
 
@@ -157,3 +168,64 @@ def event_rows() -> tuple[MarketFeatureVector, ...]:
     )
     environment.run([seat, kaito_agent])
     return tuple(recorder.rows)
+
+
+# The counterfactual fixtures below play whole seasons, so they are shared by
+# every test that needs one and are declared here rather than in either file.
+
+# A seed from the declared counterfactual training bank. Branching is the one
+# place these tests must use a real bank seed: the artifact boundary rejects
+# anything else, so a fixture seed would make the boundary untestable.
+BRANCH_SEED = 860_000
+
+BRANCH_SEAT: Literal[0, 1] = 0
+
+# A budget small enough that a branch is a handful of arms rather than twenty.
+# Each arm restores its own pair of controllers, and a restore is a second of
+# work, so the shipped budget would make every branch test a minute long.
+BRANCH_BUDGET = AlternativeConfig(max_single=2, max_ranked_multi=1, max_alternatives=8)
+
+# Late enough that the branch is a short tail of the season and the test stays
+# in seconds, late enough to be past every shop unlock, and not the last turn,
+# so the forward loop actually runs.
+BRANCH_TURN = 700
+
+
+@pytest.fixture(scope="session")
+def branch_identity() -> SeasonIdentity:
+    """Return the run identity every counterfactual fixture is produced under."""
+    return SeasonIdentity.current(
+        learner=SERVED,
+        opponent=SERVED,
+        seed_bank="counterfactual_train",
+        seed=BRANCH_SEED,
+        seat=BRANCH_SEAT,
+        event_config=EventConfig(),
+        alternative_config=BRANCH_BUDGET,
+    )
+
+
+@pytest.fixture(scope="session")
+def recorded_season(branch_identity: SeasonIdentity) -> RecordedSeason:
+    """Play one real reference-engine season and keep both seats' transcripts."""
+    return record_season(branch_identity)
+
+
+@pytest.fixture(scope="session")
+def recorded_events(recorded_season: RecordedSeason) -> tuple[RecordedEvent, ...]:
+    """Return every market event the real machine opened on that season."""
+    return season_events(recorded_season)
+
+
+@pytest.fixture(scope="session")
+def late_event(recorded_events: tuple[RecordedEvent, ...]) -> RecordedEvent:
+    """Return the first event at or after the branch turn."""
+    return next(event for event in recorded_events if event.event.turn >= BRANCH_TURN)
+
+
+@pytest.fixture(scope="session")
+def late_snapshot(
+    recorded_season: RecordedSeason, late_event: RecordedEvent
+) -> CounterfactualSnapshot:
+    """Return the branchable instant that event sits at."""
+    return snapshot_event(recorded_season, late_event)
