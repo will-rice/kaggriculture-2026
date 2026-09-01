@@ -58,11 +58,16 @@ if any(seed in _SEARCH_SEED_POOL for seed in GATE_SEEDS):
     )
 
 # The agent the competition currently fields. This must track what main.py
-# imports -- today `from kaggriculture.kaito_v54_policy import agent` --
-# because the exam this module runs is "does the candidate beat what we would
-# otherwise submit", not some other opponent. `test_holdout.py` parses
-# main.py's own import to check this stays true.
-SERVED = "src/kaggriculture/kaito_v54_policy.py"
+# imports -- today `from kaggriculture.kaito_v56_policy import kaggle_agent_v56
+# as agent` -- because the exam this module runs is "does the candidate beat
+# what we would otherwise submit", not some other opponent. `test_holdout.py`
+# parses main.py's own import to check this stays true.
+#
+# Named as a path, so the engine loads it the way Kaggle would and takes the
+# last callable in it. For this kernel that is `kaggle_agent_v56` and not either
+# of the two functions called `agent` -- the same resolution main.py's import
+# spells out by name. Both routes reach the same object; see that file's header.
+SERVED = "src/kaggriculture/kaito_v56_policy.py"
 
 # Routes harvested from the newest published episode archive by
 # `build_league.harvest`, refreshed by the operator, not by this module. This

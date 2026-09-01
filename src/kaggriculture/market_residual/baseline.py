@@ -3,14 +3,21 @@
 Two things are wrong with importing the frozen controller directly.
 
 The first is that ``import`` is not a check. The controller this residual is
-trained against, gated against and merged over is a specific 171,508-byte
+trained against, gated against and merged over is a specific 199,613-byte
 payload whose SHA-256 the author's notebook publishes; an import gives back
 whatever is on disk under that name. So the baseline is named by
 ``BaselineIdentity`` -- a module path, the first line of the verified region,
 and the digest -- and ``load_verified_baseline`` hashes the bytes before it runs
-them. Swapping controllers is then a change to three strings, not a change to
+them. Swapping controllers is then a change to four strings, not a change to
 code, which is the shape the promotion ledger asked for: the served controller
-has already moved twice this month.
+has already moved three times this month.
+
+The marker is doing less work than it looks like it is. v54 and v56 open their
+verified regions with the *same* line, because both bundle the same v51 ancestor
+and inherit its module docstring; only the digest separates them. A swap that
+changed ``SERVED_MODULE`` and forgot ``SERVED_SHA256`` therefore fails loudly at
+the hash rather than passing on a matching marker, which is the order those two
+checks have to happen in.
 
 The second is that a module is a singleton. The controller keeps per-episode
 state in module-level closures, and counterfactual collection replays the same
@@ -18,7 +25,7 @@ season from different points, in threads, in the same process. A shared instance
 would make those replays talk to each other, and the symptom would not be an
 exception -- it would be a slightly wrong reward on a slightly wrong trajectory.
 So every call to ``load_verified_baseline`` ``exec``s the verified bytes into a
-fresh namespace and returns that namespace's own agent.
+fresh namespace and returns that namespace's own entry point.
 
 That ``exec`` is not thread-safe, and the reason is not the namespace -- it is
 ``sys.modules``. Executing the payload decodes and registers a bundled ancestor
@@ -32,16 +39,29 @@ and collection -- which wants one fresh controller per branch row -- is exactly
 where that reach happens. The lock covers only the load; the returned callables
 share nothing and are played concurrently.
 
-**The agent is resolved by name, not as the last callable defined.** The Kaggle
-runner and ``scripts.package`` both take the last callable in a namespace, and
-for this controller that rule picks the wrong function: its final statements
-bind ``_V54_INNER_AGENT = agent`` and *then* rebind ``agent``, and rebinding an
-existing key leaves it in its original dict position. The last-inserted callable
-is therefore the inner agent -- which is also named ``agent``, so even checking
-``__name__`` would not notice. It differs from the real entry point by the seed
-redaction the header describes, so playing it would be a controller that can see
-the engine seed, parity against the served agent would fail, and nothing would
-raise. ``tests/market_residual/test_baseline.py`` pins that trap.
+**The agent is resolved by the author's own entry-point name, and ``agent`` is
+not it.** This controller defines ``agent`` twice -- once at the end of the
+bundled v51 ancestor, once for v56's shop branch -- and ``ENTRYPOINT`` names
+neither: it names ``kaggle_agent_v56``, the third function the author added
+because rebinding a name does not move it to the end of a namespace, and
+documented as the one that must stay last. That is what the Kaggle runner picks
+out of the file, what ``main.py`` imports, and what the 128-game gate played, so
+loading it here is what makes the counterfactuals this module feeds be about the
+agent we actually serve rather than about one that happens to behave like it.
+
+The reason to pin a name rather than follow the runner's positional rule is the
+shadowed ``agent``, and the reason to pin it rather than test for it is that it
+is almost undetectable. It is the v51 backbone -- no shop branch, no seed
+redaction -- and its route differs from v56's in 690 of 719 entries without that
+changing anything on most boards, because the route is a prior the residual
+controller mostly overrules. On the gate's own reference seed it banks the same
+number v56 banks, to the coin. It only diverges where the shop branch fires, and
+there it diverges on most turns. So a collection run built on the wrong function
+would look right in every summary it produced. The two survivors agree today --
+``kaggle_agent_v56`` delegates straight to the surviving ``agent`` -- which is
+precisely why picking between them cannot be left to a rule that a later kernel
+could quietly move out from under us.
+``tests/market_residual/test_baseline.py`` pins which of the three we load.
 """
 
 import hashlib
@@ -53,17 +73,24 @@ from pathlib import Path
 from types import CodeType
 from typing import Any, Mapping, Protocol
 
-SERVED_MODULE = "kaggriculture.kaito_v54_policy"
+SERVED_MODULE = "kaggriculture.kaito_v56_policy"
 
 # The first line of the author's own file, where our vendoring header stops.
-# Restated from `tests/test_vendored_policies.V54_BODY_START`, which pins the
-# same boundary against the same digest.
+# Restated from `tests/test_vendored_policies.V56_BODY_START`, which pins the
+# same boundary against the same digest. It is the same line v54 opened with --
+# v56 bundles the same v51 ancestor and inherits its module docstring -- so the
+# marker alone does not identify the controller and the digest below is what
+# does.
 SERVED_BODY_START = '"""v51: current-meta capital-flow hybrid.'
 
 # The checksum the source notebook publishes over its own payload.
-SERVED_SHA256 = "9f21735aaf0354e064e1d9bab1b2e186fad12cf6446e7ecf83f5014915e04a4f"
+SERVED_SHA256 = "e7f0502537ea1a79f4ec971235627930fa4ef233156547da942369679141f10c"
 
-ENTRYPOINT = "agent"
+# The author's own final callable, and the name every path that serves this
+# kernel resolves: `main.py` imports it, and `kaggle_environments` picks it out
+# of the file by position when `search.scripts.holdout` plays the file as an
+# agent path. Controller-specific, so it moves with SERVED_MODULE.
+ENTRYPOINT = "kaggle_agent_v56"
 
 # Serialises the payload ``exec`` below, whose ``sys.modules`` registrations are
 # global, and guards the two caches beside it. See this module's docstring for
@@ -195,11 +222,11 @@ def load_verified_baseline(identity: BaselineIdentity) -> BaselineAgent:
         identity: Which controller to load, and the digest it must have.
 
     Returns:
-        That controller's ``agent``, fresh.
+        That controller's ``ENTRYPOINT``, fresh.
 
     Raises:
         BaselineIntegrityError: If the source fails its digest check, or the
-            verified source binds no callable ``agent``.
+            verified source binds no callable under ``ENTRYPOINT``.
     """
     global LOADS
     started = time.perf_counter()

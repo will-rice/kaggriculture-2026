@@ -127,7 +127,7 @@ DEFAULT_MANIFEST = Path("src/kaggriculture/search/frontier_manifest.json")
 DEFAULT_ARTIFACT_ROOT = Path("/data/kaggriculture/search/public-frontier")
 DEFAULT_FRONTIER_GENERATION = Path("run/hybrid/frontier.json")
 
-DEFAULT_BASELINE = "kaito_v54"
+DEFAULT_BASELINE = "kaito_v56"
 
 # Every controller a branch may restore: importable, digest-pinned, and deciding
 # from the board it is handed. The frozen baseline is the whole registry today,

@@ -339,11 +339,19 @@ class AgentTranscript:
     one. Storing what the agent was actually called with is what makes a replay
     a replay.
 
-    ``configuration`` is stored for the same reason and was found the same way.
-    The engine passes it on every call and this controller reads it; replaying
-    with ``None`` instead reproduced 689 of 719 turns of a real season and then
-    quietly reordered a market queue. An observation is not the whole of what an
-    agent was asked.
+    ``configuration`` is stored for the same reason, and it is stored on
+    principle rather than on the strength of a measurement. The engine passes it
+    on every call, so a replay that drops it is replaying a different question.
+    That this is not academic was learned from the v54 controller, which read it
+    on exactly one turn of one recorded season -- replaying with ``None``
+    reproduced 689 of 719 turns and then quietly reordered a market queue. The
+    v56 controller now frozen here appears to read it on none: measured over
+    full seasons on three seeds, its actions are identical whether it is handed
+    the real configuration, an empty one, or nothing. The field stays because
+    the next kernel is not required to be as incurious, and because a failure
+    here does not raise -- it produces labels for a season nobody played.
+    ``tests/market_residual/test_counterfactual.py`` pins the call site rather
+    than an outcome, for the same reason.
     """
 
     source: BaselineIdentity

@@ -12,7 +12,7 @@ import pytest
 from kaggriculture.routes import STORE
 from kaggriculture.scripts import package as package_script
 from kaggriculture.scripts.package import build
-from tests.test_vendored_policies import V54_REFERENCE_BANKS
+from tests.test_vendored_policies import V56_REFERENCE_BANKS, V56_REFERENCE_SEED
 
 _needs_prototype_store = pytest.mark.skipif(
     not STORE.exists(), reason="prototype store not present on this machine"
@@ -55,9 +55,18 @@ def test_the_archive_ships_the_served_policy_and_plays_its_gate_episode(
     So this asserts both halves at once. The served module is in the archive,
     and the archive's own ``main.py``, run from the extracted directory by the
     engine, reproduces the exact bank pair
-    ``test_vendored_policies.V54_REFERENCE_BANKS`` pins for the unpackaged
+    ``test_vendored_policies.V56_REFERENCE_BANKS`` pins for the unpackaged
     module on the same seed against the same opponent. Both seats come out of
     the extraction, so nothing in this repository is on the path.
+
+    The opponent is the agent the served one replaced, which is why v54 has to
+    stay in the archive as well: it is the second seat of the reference episode,
+    and dropping it would leave this test comparing against a game nobody
+    played. That ``main.py`` reaches the right callable at all is a claim in its
+    own right here -- the served kernel defines ``agent`` twice under a name the
+    archive's loader would happily bind -- and the bank pair is what settles it,
+    because the wrong resolution finishes the season and banks a different
+    number.
     """
     archive = build(tmp_path / "submission.tar.gz")
     extracted = tmp_path / "extracted"
@@ -66,6 +75,7 @@ def test_the_archive_ships_the_served_policy_and_plays_its_gate_episode(
         names = bundle.getnames()
         bundle.extractall(extracted, filter="data")
 
+    assert "kaggriculture/kaito_v56_policy.py" in names
     assert "kaggriculture/kaito_v54_policy.py" in names
     assert "kaggriculture/boatlee_v14_policy.py" in names
 
@@ -79,10 +89,11 @@ root = Path(sys.argv[1])
 sys.path.insert(0, str(root))
 agent = runpy.run_path(str(root / "main.py"))["agent"]
 from kaggle_environments import make
-from kaggriculture.boatlee_v14_policy import agent as opponent
+from kaggriculture.kaito_v54_policy import agent as opponent
 
 environment = make(
-    "kaggriculture", configuration={"episodeSteps": 720, "seed": 700_000}
+    "kaggriculture",
+    configuration={"episodeSteps": 720, "seed": int(sys.argv[2])},
 )
 environment.run([agent, opponent])
 final = environment.steps[-1]
@@ -92,7 +103,7 @@ print(json.dumps({
 }))
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(extracted)],
+        [sys.executable, "-I", "-c", script, str(extracted), str(V56_REFERENCE_SEED)],
         check=False,
         capture_output=True,
         text=True,
@@ -102,7 +113,7 @@ print(json.dumps({
     assert result.returncode == 0, result.stderr
     evidence = json.loads(result.stdout.splitlines()[-1])
     assert evidence["statuses"] == ["DONE", "DONE"]
-    assert tuple(evidence["banks"]) == V54_REFERENCE_BANKS
+    assert tuple(evidence["banks"]) == V56_REFERENCE_BANKS
 
 
 def test_the_market_residual_runtime_imports_no_training_dependencies() -> None:

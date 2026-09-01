@@ -176,7 +176,7 @@ def test_controller_quantities_are_read_without_coercion(
     kaito_turns: tuple[Turn, ...],
 ) -> None:
     parsed = [kaito_market_buckets(turn.action) for turn in kaito_turns]
-    assert (parsed.count(None), len(parsed)) == (38, 1440)
+    assert (parsed.count(None), len(parsed)) == (316, 1440)
 
     refused = [
         turn
@@ -215,7 +215,7 @@ def test_replaying_the_controllers_own_proposal_reproduces_its_queue(
         if result.replaced:
             merged = sorted(map(tuple, result.action["market"]))
             assert merged == sorted(map(tuple, turn.action["market"]))
-    assert outcomes == {"replaced": 1124, "mask": 270, "cash": 8}
+    assert outcomes == {"replaced": 860, "mask": 246, "cash": 18}
 
 
 def test_every_accepted_queue_fills_completely_in_the_engine(
@@ -237,12 +237,12 @@ def test_every_accepted_queue_fills_completely_in_the_engine(
             assert engine_fills(turn.observation, turn.seat, queue) == ordered_units(
                 queue
             )
-    assert accepted == 1786
+    assert accepted == 1410
 
 
 @pytest.mark.parametrize(
     ("verb", "merges"),
-    [("HIRE", 196), ("BUY_LAND", 4), ("BUY_SEED", 722), ("BUY_ANIMAL", 12)],
+    [("HIRE", 140), ("BUY_LAND", 4), ("BUY_SEED", 50), ("BUY_ANIMAL", 4)],
 )
 def test_merge_never_changes_frozen_orders(
     verb: str, merges: int, kaito_turns: tuple[Turn, ...]
@@ -427,11 +427,11 @@ def test_quantities_each_slot_allows_are_refused_together(
         reason = "replaced" if result.replaced else result.fallback
         outcomes[str(reason)] = outcomes.get(str(reason), 0) + 1
     assert outcomes == {
-        "replaced": 662,
-        "cash": 420,
-        "shed": 278,
-        "orders": 42,
-        "state": 38,
+        "replaced": 550,
+        "cash": 306,
+        "shed": 230,
+        "orders": 38,
+        "state": 316,
     }
 
 

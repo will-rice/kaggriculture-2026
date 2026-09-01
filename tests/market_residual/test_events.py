@@ -83,7 +83,7 @@ def test_a_proposal_that_cannot_be_read_is_never_an_event(
     refused = [
         turn for turn in kaito_turns if kaito_market_buckets(turn.action) is None
     ]
-    assert len(refused) == 38
+    assert len(refused) == 316
     memory = EventMemory.initial()
     for turn in refused:
         transition = detect_event(turn.encoded, turn.action, memory, CONFIG)
@@ -102,14 +102,14 @@ def test_a_real_season_opens_the_measured_share_of_its_turns(
             if transition.event is not None:
                 triggers.update(transition.event.triggers)
 
-    assert dict(opened) == {True: 982, False: 458}
+    assert dict(opened) == {True: 770, False: 670}
     assert dict(triggers) == {
-        "opponent_supply": 700,
-        "kaito": 458,
-        "price": 206,
-        "slot": 82,
-        "inventory": 76,
-        "shop": 12,
+        "opponent_supply": 514,
+        "kaito": 420,
+        "price": 222,
+        "inventory": 118,
+        "slot": 84,
+        "shop": 14,
         "first": 2,
         "liquidation": 2,
     }

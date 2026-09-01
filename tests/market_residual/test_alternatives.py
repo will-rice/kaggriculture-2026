@@ -158,20 +158,20 @@ def test_a_real_season_reaches_every_family(market_cells: tuple[Cell, ...]) -> N
         families.update(families_of(alternatives))
         widest = max(widest, 1 + len(alternatives.replacements))
 
-    assert len(market_cells) == 982
+    assert len(market_cells) == 770
     assert dict(families) == {
-        "kaito": 982,
-        "single": 4630,
-        "ranked_multi": 2268,
-        "cancel": 444,
-        "scale_down": 188,
-        "scale_up": 142,
+        "kaito": 770,
+        "single": 3532,
+        "ranked_multi": 1706,
+        "cancel": 386,
+        "scale_down": 186,
+        "scale_up": 128,
     }
     assert set(families) == set(ALTERNATIVE_FAMILIES), (
         "a family that never proposes a legal row is a family the learner "
         "will never see, and no cap or legality test would notice"
     )
-    assert widest == 21
+    assert widest == 25
 
 
 def test_every_alternative_fills_completely_in_the_engine(
@@ -191,7 +191,7 @@ def test_every_alternative_fills_completely_in_the_engine(
                 cell.turn.observation, cell.turn.seat, queue
             ) == ordered_units(queue)
             replayed += 1
-    assert replayed == 1935
+    assert replayed == 1438
 
 
 def test_rows_are_unique_and_lexicographically_ordered(
@@ -222,7 +222,7 @@ def test_scaled_rows_are_the_plan_at_half_and_at_half_again(
                 target = quantity_of(planned) * numerator // 2
                 assert quantity_of(asked) <= target
                 assert asked + 1 == BUCKETS or quantity_of(asked + 1) > target
-    assert seen == {"scale_down": 188, "scale_up": 142}
+    assert seen == {"scale_down": 186, "scale_up": 128}
 
 
 def test_a_tight_budget_binds_every_family(market_cells: tuple[Cell, ...]) -> None:
@@ -239,14 +239,14 @@ def test_a_tight_budget_binds_every_family(market_cells: tuple[Cell, ...]) -> No
             shipped["single"] > TIGHT.max_single
             or shipped["ranked_multi"] > TIGHT.max_ranked_multi
         )
-    assert overrun == 710, "the tight budget never actually cut anything"
+    assert overrun == 516, "the tight budget never actually cut anything"
     assert dict(families) == {
-        "kaito": 982,
-        "single": 1460,
-        "ranked_multi": 634,
-        "cancel": 444,
-        "scale_down": 188,
-        "scale_up": 142,
+        "kaito": 770,
+        "single": 1060,
+        "ranked_multi": 490,
+        "cancel": 386,
+        "scale_down": 186,
+        "scale_up": 128,
     }
 
 

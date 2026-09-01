@@ -16,7 +16,7 @@ import pytest
 from kaggle_environments import make
 
 from kaggriculture.features import EncodedObservation, encode_observation
-from kaggriculture.kaito_v54_policy import agent as kaito_agent
+from kaggriculture.kaito_v56_policy import kaggle_agent_v56 as kaito_agent
 from kaggriculture.learn.market_residual.alternatives import AlternativeConfig
 from kaggriculture.learn.market_residual.counterfactual import (
     CounterfactualSnapshot,

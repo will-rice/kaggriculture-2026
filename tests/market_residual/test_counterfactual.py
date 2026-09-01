@@ -41,6 +41,7 @@ from typing import Any, Mapping
 import pytest
 from kaggle_environments import make
 
+import kaggriculture.learn.market_residual.counterfactual as counterfactual
 from kaggriculture.constants import EPISODE_STEPS
 from kaggriculture.features import encode_observation
 from kaggriculture.learn.market_residual.alternatives import (
@@ -77,9 +78,12 @@ from kaggriculture.search import arena
 from tests.market_residual.conftest import BRANCH_SEAT, BRANCH_SEED
 
 # The last stretch of a season, where a branch is cheap. On this seed the merge
-# refuses the controller's own queue at turns 701, 708, 712, 713, 715 and 718,
-# so the anchor test below has real cases to find here.
+# refuses the controller's own queue at turns 694, 708, 712, 713, 715, 717 and
+# 718, so the anchor test below has real cases to find here.
 REFUSED_ANCHOR_TAIL = 690
+
+# The action a stand-in controller answers with, in the engine's own shape.
+PASS: Mapping[str, Any] = {"farmer": ["PASS"], "hands": [], "market": []}
 
 
 @pytest.fixture(scope="session")
@@ -173,7 +177,7 @@ def test_a_transcript_that_did_not_produce_those_actions_is_refused(
         transcript,
         actions=(
             *transcript.actions[:-1],
-            canonical_action({"farmer": ["PASS"], "hands": [], "market": []}),
+            canonical_action(PASS),
         ),
     )
 
@@ -181,14 +185,47 @@ def test_a_transcript_that_did_not_produce_those_actions_is_refused(
         tampered.restore()
 
 
-def test_a_transcript_replayed_without_its_configuration_is_refused(
-    late_snapshot: CounterfactualSnapshot,
+def test_a_restore_replays_every_call_under_the_recorded_configuration(
+    late_snapshot: CounterfactualSnapshot, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The engine passes a configuration every turn, and this controller reads it."""
-    blind = replace(late_snapshot.learner_transcript, configuration={})
+    """Replaying a season is replaying what the agent was asked, not just shown.
 
-    with pytest.raises(CounterfactualIntegrityError, match="diverged at call"):
-        blind.restore()
+    This used to be asserted through an outcome: replay the transcript with an
+    empty configuration and watch the divergence check refuse it. That worked
+    for the v54 controller and it worked by a thread -- across the whole of this
+    season it read the configuration on exactly one turn out of 719, and on the
+    gate's reference seed on none at all. The v56 controller reads it on none of
+    them, on every seed measured here, so the outcome test stopped being able to
+    fail and would have gone on passing as a green line saying something untrue.
+
+    The contract has not changed and must not depend on a controller's current
+    incuriosity: a restore replays under the configuration the season recorded,
+    because a controller may begin reading it in any kernel we vendor next, and
+    the symptom would be counterfactual labels collected against a season nobody
+    played. So it is pinned at the call site instead, the way the forward-turn
+    contract below already is, with a stand-in controller that answers the same
+    action every time and records what it was handed.
+    """
+    transcript = replace(
+        late_snapshot.learner_transcript,
+        actions=(canonical_action(PASS),)
+        * len(late_snapshot.learner_transcript.observations),
+    )
+    seen: list[object] = []
+
+    def spy(
+        observation: Mapping[str, Any], configuration: object | None = None
+    ) -> dict[str, Any]:
+        seen.append(configuration)
+        return dict(PASS)
+
+    monkeypatch.setattr(counterfactual, "load_verified_baseline", lambda source: spy)
+
+    restored = transcript.restore()
+
+    assert len(seen) == len(transcript.observations) > 1
+    assert all(handed is transcript.configuration for handed in seen)
+    assert restored.configuration is transcript.configuration
 
 
 def test_a_restored_controller_plays_its_forward_turns_under_that_configuration() -> (
@@ -249,7 +286,7 @@ def test_the_merge_refuses_the_controllers_own_queue_on_real_events(
         )
         refused += not merged.replaced
 
-    assert (len(recorded_events), refused) == (505, 82), (
+    assert (len(recorded_events), refused) == (511, 93), (
         "the event or merge boundary moved; re-measure before trusting any "
         "counterfactual label produced under the new one"
     )

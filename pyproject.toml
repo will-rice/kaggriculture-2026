@@ -61,13 +61,13 @@ exclude = [".venv"]
 "src/kaggriculture/kaito_v22_policy.py" = ["ANN", "D103", "C901", "B905"]
 "src/kaggriculture/kaito_v23_policy.py" = ["ANN", "D103", "C901", "B905"]
 "src/kaggriculture/boatlee_v14_policy.py" = ["ANN", "D103", "C901", "B905"]
-# v54 is the one vendored kernel kept byte-verbatim, so its ignore list has to
-# cover what a file we may not touch happens to contain, not just what we
-# decline to assert about it: `E402` and `I001` because it imports from the
-# modules its own payload injects into `sys.modules`, which can only happen
-# after those lines have run, and `E501` for two payload lines. Every one of
-# these would be a one-line edit in a file we were allowed to edit, and that is
-# precisely the edit that would invalidate the digest in its header.
+# v54 and v56 are the vendored kernels kept byte-verbatim, so their ignore lists
+# have to cover what a file we may not touch happens to contain, not just what we
+# decline to assert about it: `E402` and `I001` because they import from the
+# modules their own payload injects into `sys.modules`, which can only happen
+# after those lines have run, and `E501` for a handful of payload lines. Every
+# one of these would be a one-line edit in a file we were allowed to edit, and
+# that is precisely the edit that would invalidate the digest in its header.
 "src/kaggriculture/kaito_v54_policy.py" = [
   "ANN",
   "D103",
@@ -76,6 +76,21 @@ exclude = [".venv"]
   "E402", # imports resolve only after the bundled payload is exec'd
   "I001", # so they cannot be sorted into the header block
   "E501", # two payload lines
+]
+# v56 adds `F811` and it is the one entry here that is not a formatting
+# concession: the file really does define `agent` and
+# `_kaggle_submission_entrypoint` twice, and ruff is right to say so. The
+# duplicate is the reason the entry point is a third function,
+# `kaggle_agent_v56`; silencing the diagnostic is only safe because
+# `tests/test_vendored_policies.py` asserts which of the three we resolve to,
+# from the file as committed. Do not add `F811` to any file we wrote.
+"src/kaggriculture/kaito_v56_policy.py" = [
+  "ANN",
+  "D103",
+  "E402", # imports resolve only after the bundled payload is exec'd
+  "I001", # so they cannot be sorted into the header block
+  "E501", # three payload lines
+  "F811", # `agent` is defined twice; `kaggle_agent_v56` is the entry point
 ]
 # These tests reach into the vendored modules' private tables on purpose: the
 # tables are the agent, and a truncated blob is invisible from outside.
@@ -102,14 +117,18 @@ include = [
 [tool.ty.overrides.rules]
 invalid-argument-type = "ignore"
 
-# v54 needs one rule the others do not. It imports `v49.residual_controller` and
-# `v50.hybrid`, which are not on disk anywhere: its payload decodes an ancestor
-# agent and registers it under those names in `sys.modules` before the import
-# lines run. ty resolves imports statically and cannot see that, and it is right
-# not to -- there is no file. The import genuinely works, which
-# `tests/test_vendored_policies.py` demonstrates by playing an episode with it.
+# v54 and v56 need one rule the others do not. They import
+# `v49.residual_controller` and `v50.hybrid`, which are not on disk anywhere:
+# their payload decodes an ancestor agent and registers it under those names in
+# `sys.modules` before the import lines run. ty resolves imports statically and
+# cannot see that, and it is right not to -- there is no file. The import
+# genuinely works, which `tests/test_vendored_policies.py` demonstrates by
+# playing an episode with it.
 [[tool.ty.overrides]]
-include = ["src/kaggriculture/kaito_v54_policy.py"]
+include = [
+  "src/kaggriculture/kaito_v54_policy.py",
+  "src/kaggriculture/kaito_v56_policy.py",
+]
 
 [tool.ty.overrides.rules]
 invalid-argument-type = "ignore"

@@ -396,15 +396,21 @@ def test_served_names_the_module_main_py_actually_imports_agent_from() -> None:
     competition runner), and importing it here would exercise that machinery
     for no reason. If `SERVED` ever points at a retired agent, this gate would
     pass a candidate that only beats a generation we no longer submit.
+
+    Matched on the *bound* name rather than the imported one, because the served
+    kernel's entry point is not called `agent` -- it defines `agent` twice and
+    names its final callable something else, so `main.py` imports that under an
+    alias. What has to be one is the number of imports that produce the `agent`
+    this file serves, which is what an alias-aware match counts.
     """
     tree = ast.parse(MAIN.read_text())
     imports = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom)
-        and any(alias.name == "agent" for alias in node.names)
+        and any((alias.asname or alias.name) == "agent" for alias in node.names)
     ]
-    assert len(imports) == 1, "main.py must import `agent` exactly once"
+    assert len(imports) == 1, "main.py must bind `agent` from exactly one import"
     module = imports[0].module
     assert module is not None
 

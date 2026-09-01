@@ -47,26 +47,36 @@ measured out of the built archive by ``kaggriculture.scripts.budget``. Nothing
 on this path imports torch.
 """
 
-# Serves `kaito_v54_policy` as of 2026-08-31, replacing `boatlee_v14_policy`,
-# which had been served since 2026-08-21. Held-out seeds 700000-700063, each
+# Serves `kaito_v56_policy` as of 2026-09-01, replacing `kaito_v54_policy`,
+# which had been served since 2026-08-31. Held-out seeds 700000-700063, each
 # played in both seat orderings, on kaggle-environments 1.32.7:
 #
-#     vs boatlee_v14 (the agent it replaces)  64/64 = 1.000  [0.943, 1.000]
-#     pooled public frontier                  226/256 = 0.883  lower 0.838
-#     vs kaito v48 (same author, two days older)  48/64 = 0.750  [0.632, 0.840]
+#     vs kaito v54 (the agent it replaces)  116/128 = 0.906  [0.843, 0.946]
 #
-# The frontier bar is 0.45 and the served bar is 0.5; both clear by a wide
-# margin. The second line is the one that matters. The serve switch of
-# 2026-08-20 was made on a gate that only asked "does the candidate beat what we
-# serve", and the ladder falsified it the next day: rating is set at the
-# frontier, and an agent can beat our own served copy 3-to-1 while losing 4-to-1
-# to the current meta above 1400. So this gate pools fresh top-band tapes from
-# the published archives and refuses a pool more than a week old. See
+# The served bar is 0.5 and the interval does not come near it. Only that arm
+# was run live: the frontier pool was scored in its replay form (0.903, lower
+# 0.890, against v54's 0.847) and is a diagnostic, not the pass -- it grades
+# against recorded tapes rather than opponents that re-decide. The serve switch
+# of 2026-08-20 was made on a gate that only asked "does the candidate beat what
+# we serve", and the ladder falsified it the next day, which is why that leg
+# exists at all. Here the ladder is the confirmation rather than the refutation:
+# two v56 copies submitted 2026-09-01 reached 2340.7 and 2302.1 within hours,
+# past the 2270.5 that v54's better copy took seventeen hours to reach, and they
+# track each other to 102 points where the v54 pair differed by 512. See
 # `kaggriculture.search.scripts.holdout`, whose `SERVED` constant tracks this
 # import line and is tested against it.
 #
-# `boatlee_v14_policy` and `searched_route_policy` remain vendored -- they are
-# gate opponents and records, not serves.
-from kaggriculture.kaito_v54_policy import agent
+# **Imported by the author's own entry-point name, not as `agent`.** That file
+# defines `agent` twice and `_kaggle_submission_entrypoint` twice; rebinding a
+# name does not move it to the end of the namespace, so the author added
+# `kaggle_agent_v56` as the last callable and documented that it must stay
+# there. That is what `kaggle_environments` runs when the file is loaded as an
+# agent path -- which is how `search.scripts.holdout` played the 128 games above
+# -- so it is what this line imports, and every path that serves this kernel
+# lands on the same function object.
+#
+# `kaito_v54_policy`, `boatlee_v14_policy` and `searched_route_policy` remain
+# vendored -- they are gate opponents and records, not serves.
+from kaggriculture.kaito_v56_policy import kaggle_agent_v56 as agent
 
 __all__ = ["agent"]

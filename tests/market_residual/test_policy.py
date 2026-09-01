@@ -34,7 +34,8 @@ from kaggle_environments import make
 
 from kaggriculture.boatlee_v14_policy import agent as opponent_agent
 from kaggriculture.constants import ENVIRONMENT
-from kaggriculture.kaito_v54_policy import agent as kaito_agent
+from kaggriculture.kaito_v54_policy import agent as reference_opponent
+from kaggriculture.kaito_v56_policy import kaggle_agent_v56 as kaito_agent
 from kaggriculture.market_residual.actions import (
     FallbackReason,
     ResidualDecision,
@@ -48,7 +49,7 @@ from kaggriculture.market_residual.policy import (
     build_market_residual_agent,
 )
 from kaggriculture.market_residual.schema import ALLOWED_SLOTS, LEARNABLE_VERBS
-from tests.test_vendored_policies import V54_REFERENCE_BANKS, V54_REFERENCE_SEED
+from tests.test_vendored_policies import V56_REFERENCE_BANKS, V56_REFERENCE_SEED
 
 EPISODE_STEPS = 720
 
@@ -293,13 +294,19 @@ def test_forced_use_kaito_reproduces_the_reference_banks_the_gate_measured() -> 
     The seed is a held-out gate seed. That is deliberate and costs nothing: the
     gate it belongs to has already been run and published, and replaying a
     decided episode is not a new measurement.
+
+    The opponent is the controller the served one replaced, not the one the
+    parity fixtures above use, because the reference pair is a property of a
+    specific pair of seats. Getting that wrong would not fail loudly -- the
+    season would still finish and still bank -- so it is named separately here
+    rather than reusing whatever `opponent_agent` happens to be.
     """
     agent = build_market_residual_agent(SERVED, AlwaysUseKaito())
 
-    steps = play([agent, opponent_agent], V54_REFERENCE_SEED)
+    steps = play([agent, reference_opponent], V56_REFERENCE_SEED)
 
     assert statuses(steps) == ("DONE", "DONE")
-    assert banks(steps) == V54_REFERENCE_BANKS
+    assert banks(steps) == V56_REFERENCE_BANKS
 
 
 def test_a_replacing_residual_moves_the_board() -> None:

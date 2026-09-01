@@ -12,7 +12,7 @@ from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.agent import EpisodeAgent
 from kaggriculture.hybrid.config import HybridConfig, to_runtime
-from kaggriculture.kaito_v54_policy import agent as kaito_v54_agent
+from kaggriculture.kaito_v56_policy import kaggle_agent_v56
 from kaggriculture.scripts.package import (
     ENTRYPOINT,
     _refuse_a_shadowed_entrypoint,
@@ -39,11 +39,19 @@ def test_entrypoint_exposes_the_agent_last() -> None:
     assert get_last_callable(source, path=str(ENTRYPOINT)) is namespace["agent"]
 
 
-def test_default_entrypoint_is_pinned_to_kaito_v54() -> None:
-    """Candidate packaging cannot silently change the served default policy."""
+def test_default_entrypoint_is_pinned_to_kaito_v56() -> None:
+    """Candidate packaging cannot silently change the served default policy.
+
+    Identity against ``kaggle_agent_v56`` and not against
+    ``kaito_v56_policy.agent``, which also exists, is also callable, and also
+    plays. The served kernel defines ``agent`` twice; the author's final
+    callable is the one Kaggle runs when the file is loaded as an agent path,
+    which is how the gate scored it, so it is the one ``main.py`` has to bind
+    for the thing we submit to be the thing that was measured.
+    """
     namespace: dict[str, object] = {}
     exec(compile(ENTRYPOINT.read_text(), str(ENTRYPOINT), "exec"), namespace)
-    assert namespace["agent"] is kaito_v54_agent
+    assert namespace["agent"] is kaggle_agent_v56
 
 
 def test_entrypoint_plays_a_full_episode() -> None:
