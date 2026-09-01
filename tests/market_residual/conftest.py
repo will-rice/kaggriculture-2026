@@ -9,6 +9,7 @@ that the residual will trade against.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import pytest
@@ -229,3 +230,39 @@ def late_snapshot(
 ) -> CounterfactualSnapshot:
     """Return the branchable instant that event sits at."""
     return snapshot_event(recorded_season, late_event)
+
+
+@pytest.fixture(scope="session")
+def smoke_sequences() -> tuple[Any, ...]:
+    """Return real event sequences built from the Task 7 smoke collection.
+
+    The smoke root is the profile Task 7 measured: eight ``counterfactual_train``
+    seeds, both seats, eight events per cell at the sixteen-alternative budget.
+    On a machine that has it, reconciling is a second of reading; on one that
+    does not, the collection CLI rebuilds it once — minutes of real branching,
+    which is what the ``slow`` mark on every consumer promises.
+    """
+    from kaggriculture.learn.market_residual.offline import load_sequences
+    from kaggriculture.scripts.market_counterfactuals import main as collect
+
+    root = Path(__file__).parents[2] / "run/market-residual/counterfactual-smoke"
+    mode = "--resume" if (root / "collection-parameters.json").exists() else "--create"
+    collect(
+        [
+            str(root),
+            mode,
+            "--seed-bank",
+            "counterfactual_train",
+            "--seed-start",
+            "860000",
+            "--seed-count",
+            "8",
+            "--workers",
+            "8",
+            "--max-events",
+            "8",
+            "--max-alternatives",
+            "16",
+        ]
+    )
+    return load_sequences(root, workers=8)
