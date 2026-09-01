@@ -804,11 +804,18 @@ CUDA_VISIBLE_DEVICES=0 python -m kaggriculture.scripts.market_pretrain \
   --create --root run/market-residual/offline-v1 \
   --train-manifest run/market-residual/counterfactual-train/manifest.json \
   --selection-manifest run/market-residual/counterfactual-select/manifest.json \
-  --device cuda --epochs 20 --wandb
+  --device cuda --epochs 120 --wandb
 ```
 
 Expected: known-exploit gates pass, unseen paired win-point delta is nonnegative,
 zero nonfinite values, and exported activation lies in `[0.01, 0.50]`.
+
+The budget was 20 epochs and that was too small, measured rather than
+guessed: the 20-epoch run selected epoch 20 -- its own ceiling -- and a
+120-epoch rerun on identical data selected epoch 87 and moved every gate,
+the strict exploit rate from 0.6445 (failing) to 0.8956 (passing) and the
+expected paired win-point delta from +0.178 to +0.280. Treat a
+`best_epoch` equal to the budget as an unfinished run, not a result.
 
 - [ ] **Step 7: Commit**
 
