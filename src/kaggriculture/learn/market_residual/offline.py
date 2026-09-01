@@ -28,7 +28,9 @@ Five loss terms, all reported separately and summed unweighted:
   normalized scales the feature row itself carries.
 
 Rows that flip a lost season into a won one (or the reverse) carry ``4x``
-weight in every term they touch.
+weight in every ranking pair they sit in, and in the event terms when the
+taught arm is itself the flip; an event whose best flip stays below the
+indifference band is taught as an ordinary deferral at weight one.
 
 The quantity mask collated here is all-true on purpose: the served runtime
 applies no legality mask — an illegal argmax costs a fail-closed deferral at
@@ -281,7 +283,7 @@ def collate_event_sequences(
     steps = max(sequence.features.shape[0] for sequence in sequences)
     width = sequences[0].features.shape[1]
     auxiliary_width = sequences[0].auxiliary_targets.shape[1]
-    slots = sequences[0].arm_buckets.shape[1] if sequences else 0
+    slots = sequences[0].arm_buckets.shape[1]
     features = torch.zeros(steps, len(sequences), width)
     valid = torch.zeros(steps, len(sequences), dtype=torch.bool)
     auxiliary_target = torch.zeros(steps, len(sequences), auxiliary_width)
@@ -707,8 +709,12 @@ def selection_gates(
         device: Where the model runs.
 
     Returns:
-        ``exploit_rate``: on events holding a profitable arm (win-point delta
-        above the band), how often some profitable arm outscores the anchor.
+        ``exploit_rate_argmax``: on events holding a profitable arm (win-point
+        delta above the band), how often the single top-scored arm is itself
+        profitable — the brief's reading of "chooses a known profitable
+        alternative over Kaito", and the one ``check_gates`` enforces.
+        ``exploit_rate_any``: on the same events, how often *some* profitable
+        arm outscores the anchor — a weaker reading, reported alongside.
         ``equal_retention``: on events whose best arm changes nothing, how
         often the greedy mode still defers. ``expected_delta``: the mean
         win-point delta of the top-scored arm over every labeled event.
@@ -716,9 +722,16 @@ def selection_gates(
         ``ranking_accuracy``: pairwise order agreement. ``nonfinite``: how
         many head values were not finite. Empty denominators score their gate
         as vacuously passed.
+
+    Raises:
+        ValueError: If there are no cells to measure, which would otherwise
+            claim an activation for a dataset that does not exist.
     """
+    if not sequences:
+        raise ValueError("no held-out cells to measure gates on")
     model.eval()
-    exploit = [0, 0]
+    exploit_argmax = [0, 0]
+    exploit_any = [0, 0]
     retention = [0, 0]
     deltas: list[float] = []
     ordered = [0, 0]
@@ -752,17 +765,25 @@ def selection_gates(
             for group in _event_groups(sequence.arm_event):
                 group_scores = scores[group]
                 wins = sequence.arm_win_delta[group]
-                deltas.append(float(wins[int(group_scores.argmax())]))
+                top = float(wins[int(group_scores.argmax())])
+                deltas.append(top)
                 profitable = wins > INDIFFERENCE_BAND
                 if bool(profitable.any()):
-                    exploit[1] += 1
-                    exploit[0] += int(group_scores[profitable].max() > group_scores[0])
+                    exploit_argmax[1] += 1
+                    exploit_argmax[0] += int(top > INDIFFERENCE_BAND)
+                    exploit_any[1] += 1
+                    exploit_any[0] += int(
+                        group_scores[profitable].max() > group_scores[0]
+                    )
                 if float(wins.max()) == 0.0:
                     retention[1] += 1
                     step = int(sequence.arm_event[group[0]])
                     retention[0] += int(greedy[step, 0]) == USE_KAITO_INDEX
     return {
-        "exploit_rate": exploit[0] / exploit[1] if exploit[1] else 1.0,
+        "exploit_rate_argmax": (
+            exploit_argmax[0] / exploit_argmax[1] if exploit_argmax[1] else 1.0
+        ),
+        "exploit_rate_any": exploit_any[0] / exploit_any[1] if exploit_any[1] else 1.0,
         "equal_retention": retention[0] / retention[1] if retention[1] else 1.0,
         "expected_delta": sum(deltas) / len(deltas) if deltas else 0.0,
         "activation": replaced[0] / replaced[1],
@@ -781,8 +802,10 @@ def check_gates(gates: dict[str, float]) -> None:
         PretrainGateError: Naming every band the run is outside.
     """
     failures = []
-    if gates["exploit_rate"] < EXPLOIT_GATE:
-        failures.append(f"exploit_rate {gates['exploit_rate']:.3f} < {EXPLOIT_GATE}")
+    if gates["exploit_rate_argmax"] < EXPLOIT_GATE:
+        failures.append(
+            f"exploit_rate_argmax {gates['exploit_rate_argmax']:.3f} < {EXPLOIT_GATE}"
+        )
     if gates["equal_retention"] < RETENTION_GATE:
         failures.append(
             f"equal_retention {gates['equal_retention']:.3f} < {RETENTION_GATE}"
@@ -805,17 +828,30 @@ def sequences_digest(sequences: Sequence[EventSequence]) -> str:
     Args:
         sequences: The dataset, in order.
 
+    Every tensor is hashed under its field name, dtype, and shape, and every
+    chunk is length-prefixed, so two datasets whose raw bytes happen to line
+    up — the same values under different shapes, or a boundary shifted from
+    one field into the next — cannot share a digest.
+
     Returns:
-        A SHA-256 hex digest; any changed value, row or order changes it.
+        A SHA-256 hex digest; any changed value, shape, row or order changes
+        it.
     """
     digest = hashlib.sha256()
+
+    def chunk(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
     for sequence in sequences:
-        digest.update(sequence.identity_sha256.encode("utf-8"))
-        digest.update(f"{sequence.seed}:{sequence.seat}".encode("utf-8"))
+        chunk(sequence.identity_sha256.encode("utf-8"))
+        chunk(f"{sequence.seed}:{sequence.seat}".encode("utf-8"))
         for field in fields(sequence):
             value = getattr(sequence, field.name)
             if isinstance(value, torch.Tensor):
-                digest.update(value.numpy(force=True).tobytes())
+                header = f"{field.name}:{value.dtype}:{tuple(value.shape)}"
+                chunk(header.encode("utf-8"))
+                chunk(value.numpy(force=True).tobytes())
     return digest.hexdigest()
 
 
@@ -859,8 +895,16 @@ def write_json_atomic(path: Path, document: dict[str, Any]) -> None:
         document: What to store.
     """
     temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(document, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _capture_rng() -> dict[str, Any]:

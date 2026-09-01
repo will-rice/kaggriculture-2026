@@ -110,7 +110,8 @@ def test_main_trains_reports_and_fails_its_own_gate(roots: dict[str, Path]) -> N
     report = json.loads((roots["root"] / "offline-report.json").read_text())
     assert report["epoch"] == 1
     assert set(report["gates"]) >= {
-        "exploit_rate",
+        "exploit_rate_argmax",
+        "exploit_rate_any",
         "equal_retention",
         "expected_delta",
         "activation",
@@ -188,14 +189,17 @@ def test_pretrain_rejects_config_and_data_drift(tmp_path: Path) -> None:
             PretrainConfig(epochs=1, batch_cells=2, device="cpu", learning_rate=1e-4),
             tmp_path,
         )
+    poisoned = tiny_sequences()
+    poisoned[0].features[0, 0] += 1.0
     with pytest.raises(PretrainDriftError):
-        pretrain(model, tiny_sequences(count=2), sequences, config, tmp_path)
+        pretrain(model, poisoned, sequences, config, tmp_path)
 
 
 def test_the_gate_verdict_is_the_declared_bands() -> None:
     """Every declared band fails the verdict exactly when broken."""
     passing = {
-        "exploit_rate": 0.8,
+        "exploit_rate_argmax": 0.8,
+        "exploit_rate_any": 0.9,
         "equal_retention": 0.9,
         "expected_delta": 0.01,
         "activation": 0.2,
@@ -204,7 +208,7 @@ def test_the_gate_verdict_is_the_declared_bands() -> None:
     }
     check_gates(passing)
     for key, value in (
-        ("exploit_rate", 0.5),
+        ("exploit_rate_argmax", 0.5),
         ("equal_retention", 0.4),
         ("expected_delta", -0.01),
         ("activation", 0.6),
