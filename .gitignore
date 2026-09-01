@@ -257,3 +257,10 @@ run/
 # Kaggle skill caches: regenerable from the competition, and binary churn on
 # every ingest. The findings that matter are written up in docs/, not here.
 data/*.db
+
+# The exported market-residual head. `market_residual_main.py` resolves it from
+# inside the package tree, because that is where a built archive puts it and the
+# loader gives the entrypoint no `__file__` of its own to work from. It is a
+# build product of a run recorded in wandb, content-addressed by the identity
+# block it carries, not source.
+src/kaggriculture/market_residual/generated/
