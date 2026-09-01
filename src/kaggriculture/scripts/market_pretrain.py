@@ -15,8 +15,9 @@ are measured on seeds no update ever saw.
 
 Rebuilding a cell means replaying its recorded season through the reference
 engine, which is minutes of CPU across a few hundred cells; the sequences are
-therefore cached in the root, keyed by the data manifest digest, and rebuilt
-only when the data itself changed — which is a drift refusal anyway.
+therefore cached in the root, keyed by the data manifest digest and named for
+the families ``--exclude-families`` drops, and rebuilt only when the data
+itself changed — which is a drift refusal anyway.
 
 Gates are enforced, not just reported: after training, the best-selection
 checkpoint must hold the known-exploit rate, retain the controller on
@@ -79,7 +80,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     """
     args = parser().parse_args(None if argv is None else list(argv))
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    config = PretrainConfig(epochs=args.epochs, device=args.device)
+    config = PretrainConfig(
+        epochs=args.epochs,
+        device=args.device,
+        excluded_families=args.exclude_families,
+    )
     with root_lock(args.root):
         train_manifest = collection_manifest(args.train_root, TRAIN_BANK)
         select_manifest = collection_manifest(args.select_root, SELECT_BANK)
@@ -90,10 +95,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         seed_everything(config.seed, workers=True)
         train_sequences = cached_sequences(
-            args.root, args.train_root, train_manifest, args.workers
+            args.root, args.train_root, train_manifest, args.workers, config
         )
         select_sequences = cached_sequences(
-            args.root, args.select_root, select_manifest, args.workers
+            args.root, args.select_root, select_manifest, args.workers, config
         )
         model = MarketResidualNet(ModelConfig.current())
         run = wandb_run(args) if args.wandb else None
@@ -134,6 +139,11 @@ def parser() -> argparse.ArgumentParser:
     arguments.add_argument("--epochs", type=int, default=20)
     arguments.add_argument(
         "--workers", type=int, default=8, help="season replay processes"
+    )
+    arguments.add_argument(
+        "--exclude-families",
+        default="",
+        help="comma-separated replacement families to drop from training",
     )
     arguments.add_argument("--wandb", action="store_true", help="log to W&B")
     return arguments
@@ -247,26 +257,38 @@ def reconcile_parameters(
 
 
 def cached_sequences(
-    root: Path, collection_root: Path, manifest: dict[str, Any], workers: int
+    root: Path,
+    collection_root: Path,
+    manifest: dict[str, Any],
+    workers: int,
+    config: PretrainConfig,
 ) -> tuple[EventSequence, ...]:
     """Rebuild one root's sequences, or reuse the cache this root already holds.
+
+    The cache file is named for the bank *and* the excluded families, because
+    those two together decide which arms a rebuild produces: a stale cache from
+    an unfiltered run holds arms this run must never see, and a manifest digest
+    alone cannot tell the two apart.
 
     Args:
         root: The pretraining root the cache lives in.
         collection_root: The collection root to rebuild from.
         manifest: That root's manifest; its digest keys the cache.
         workers: How many replay processes a rebuild may use.
+        config: The run's parameterisation, for the families it excludes.
 
     Returns:
         The sequences.
     """
     key = canonical_digest(manifest)
-    path = root / f"sequences-{manifest['seed_bank']}.pt"
+    excluded = config.excluded_families.replace(",", "-")
+    name = f"sequences-{manifest['seed_bank']}"
+    path = root / (f"{name}-without-{excluded}.pt" if excluded else f"{name}.pt")
     if path.exists():
         cached = load_checkpoint(path)
         if cached["manifest_sha256"] == key:
             return tuple(cached["sequences"])
-    sequences = load_sequences(collection_root, workers)
+    sequences = load_sequences(collection_root, workers, config.excluded())
     offline.save_checkpoint(
         path, {"manifest_sha256": key, "sequences": list(sequences)}
     )

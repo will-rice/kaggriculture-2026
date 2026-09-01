@@ -62,7 +62,7 @@ def roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
     monkeypatch.setattr(
         market_pretrain,
         "load_sequences",
-        lambda root, workers: tiny_sequences(),
+        lambda root, workers, excluded_families: tiny_sequences(),
     )
     return {
         "root": tmp_path / "pretrain",
@@ -121,6 +121,50 @@ def test_main_trains_reports_and_fails_its_own_gate(roots: dict[str, Path]) -> N
     assert (roots["root"] / "last.ckpt").exists()
     assert (roots["root"] / "best.ckpt").exists()
     assert not list(roots["root"].glob("*.tmp*"))
+
+
+def test_the_sequence_cache_is_named_for_the_families_it_excludes(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filtered run forwards its exclusion and cannot eat an unfiltered cache.
+
+    The manifest digest keys the cache but says nothing about which arms were
+    kept, so an unfiltered cache sitting in the root under the same manifest
+    would silently feed a filtered run the very families it excluded.
+    """
+    seen: list[frozenset[str]] = []
+
+    def loader(
+        root: Path, workers: int, excluded_families: frozenset[str]
+    ) -> tuple[EventSequence, ...]:
+        seen.append(excluded_families)
+        return tiny_sequences()
+
+    monkeypatch.setattr(market_pretrain, "load_sequences", loader)
+    roots["root"].mkdir(parents=True)
+    manifest = market_pretrain.collection_manifest(
+        roots["train"], market_pretrain.TRAIN_BANK
+    )
+    stale = roots["root"] / "sequences-counterfactual_train.pt"
+    save_checkpoint(
+        stale,
+        {
+            "manifest_sha256": market_pretrain.canonical_digest(manifest),
+            "sequences": list(tiny_sequences(count=1)),
+        },
+    )
+
+    with pytest.raises(PretrainGateError):
+        market_pretrain.main(
+            arguments(roots, "--create", "--exclude-families", "ranked_multi,cancel")
+        )
+
+    assert seen == [frozenset({"cancel", "ranked_multi"})] * 2
+    filtered = "sequences-counterfactual_train-without-cancel-ranked_multi.pt"
+    assert (roots["root"] / filtered).exists()
+    assert len(load_checkpoint(stale)["sequences"]) == 1
+    report = json.loads((roots["root"] / "offline-report.json").read_text())
+    assert report["config"]["excluded_families"] == "cancel,ranked_multi"
 
 
 def test_create_refuses_a_claimed_root_and_resume_an_unclaimed_one(

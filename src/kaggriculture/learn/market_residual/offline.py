@@ -32,6 +32,14 @@ weight in every ranking pair they sit in, and in the event terms when the
 taught arm is itself the flip; an event whose best flip stays below the
 indifference band is taught as an ordinary deferral at weight one.
 
+``PretrainConfig.excluded_families`` drops whole replacement families before
+any label attaches. It exists because the families are not equally informative:
+measured over the v56 training root, ``ranked_multi`` arms lose 99.1% of the
+time and ``cancel`` 80%, so a head trained on all of them spends most of its
+capacity ranking losses against each other. Excluding a family removes its arms
+from the ranking pairs and from the taught action; the anchor always stays, so
+an event left with no replacement simply teaches deferral.
+
 The quantity mask collated here is all-true on purpose: the served runtime
 applies no legality mask — an illegal argmax costs a fail-closed deferral at
 the merge — and a head trained under a mask the runtime cannot apply would be
@@ -54,7 +62,11 @@ import torch
 from tqdm import tqdm
 
 from kaggriculture.features import PRODUCT_NAMES, encode_observation
-from kaggriculture.learn.market_residual.alternatives import AlternativeConfig
+from kaggriculture.learn.market_residual.alternatives import (
+    ALTERNATIVE_FAMILIES,
+    FAMILY_KAITO,
+    AlternativeConfig,
+)
 from kaggriculture.learn.market_residual.artifacts import (
     CounterfactualRow,
     ShardIdentity,
@@ -144,15 +156,39 @@ class PretrainConfig:
     gradient_clip: float = 1.0
     seed: int = 0
     device: str = "cuda"
+    excluded_families: str = ""
 
     def __post_init__(self) -> None:
-        """Refuse a run that could never produce a checkpoint.
+        """Refuse a run that could never produce a checkpoint, and canonicalize.
+
+        ``excluded_families`` is stored sorted, deduplicated and comma-joined,
+        so two spellings of the same exclusion cannot bind one root to two
+        parameterisations — and as a string rather than a tuple because this
+        config is compared against its own JSON round trip on every resume.
 
         Raises:
-            ValueError: If there is not at least one epoch.
+            ValueError: If there is not at least one epoch, or an excluded
+                family is not a replacement family this collection produces.
         """
         if self.epochs < 1:
             raise ValueError(f"epochs must be at least 1, got {self.epochs}")
+        names = set(self.excluded_families.split(",")) - {""}
+        replacements = set(ALTERNATIVE_FAMILIES) - {FAMILY_KAITO}
+        unknown = sorted(names - replacements)
+        if unknown:
+            raise ValueError(
+                f"{unknown} are not replacement families; "
+                f"the excludable ones are {sorted(replacements)}"
+            )
+        object.__setattr__(self, "excluded_families", ",".join(sorted(names)))
+
+    def excluded(self) -> frozenset[str]:
+        """Return the families no arm may be trained on.
+
+        Returns:
+            The excluded family names; empty when every family trains.
+        """
+        return frozenset(self.excluded_families.split(",")) - frozenset({""})
 
 
 @dataclass(frozen=True)
@@ -985,7 +1021,11 @@ def collection_identities(root: Path) -> tuple[SeasonIdentity, ...]:
     return identities
 
 
-def cell_sequence(root: Path, identity: SeasonIdentity) -> EventSequence:
+def cell_sequence(
+    root: Path,
+    identity: SeasonIdentity,
+    excluded_families: frozenset[str] = frozenset(),
+) -> EventSequence:
     """Rebuild one cell's event sequence and attach its shard's labels.
 
     The season is replayed through the reference engine exactly as collection
@@ -998,6 +1038,13 @@ def cell_sequence(root: Path, identity: SeasonIdentity) -> EventSequence:
     Args:
         root: The collection root holding the shard.
         identity: The cell to rebuild.
+        excluded_families: Replacement families to drop before any label
+            attaches, so a family the collection measured as a loss can be
+            kept out of training without recollecting. The anchor is never
+            excludable — it is the controller's own play, not a deviation, and
+            the ranking objective is defined against it — and an event whose
+            replacements are all excluded stays in the sequence as an anchor
+            alone, which teaches deferral there.
 
     Returns:
         The sequence.
@@ -1031,7 +1078,10 @@ def cell_sequence(root: Path, identity: SeasonIdentity) -> EventSequence:
         auxiliary[index] = torch.tensor(_auxiliary_row(vector))
     auxiliary_valid = torch.arange(len(events)) < len(events) - 1
 
-    labeled = sorted(shard.rows, key=lambda row: (row.event_index, row.alternative_id))
+    labeled = sorted(
+        (row for row in shard.rows if row.family not in excluded_families),
+        key=lambda row: (row.event_index, row.alternative_id),
+    )
     arm_event: list[int] = []
     arm_mode: list[int] = []
     arm_buckets: list[tuple[int, ...]] = []
@@ -1103,12 +1153,16 @@ def _flips_the_season(row: CounterfactualRow) -> bool:
     return low < 0.5 < high
 
 
-def load_sequences(root: Path, workers: int) -> tuple[EventSequence, ...]:
+def load_sequences(
+    root: Path, workers: int, excluded_families: frozenset[str] = frozenset()
+) -> tuple[EventSequence, ...]:
     """Rebuild every cell of one collection root, in parallel.
 
     Args:
         root: The collection root.
         workers: How many replay processes to run.
+        excluded_families: Replacement families to drop, as ``cell_sequence``
+            drops them.
 
     Returns:
         The sequences, in the root's own cell order.
@@ -1122,7 +1176,8 @@ def load_sequences(root: Path, workers: int) -> tuple[EventSequence, ...]:
         max_workers=workers, mp_context=get_context("spawn")
     ) as pool:
         futures = [
-            pool.submit(cell_sequence, root, identity) for identity in identities
+            pool.submit(cell_sequence, root, identity, excluded_families)
+            for identity in identities
         ]
         return tuple(
             future.result()

@@ -19,9 +19,13 @@ import torch
 from kaggriculture.action_codec import bucket_of
 from kaggriculture.features import PRODUCT_NAMES, EncodedObservation
 from kaggriculture.learn.market_residual import offline
+from kaggriculture.learn.market_residual.alternatives import FAMILY_KAITO
 from kaggriculture.learn.market_residual.artifacts import (
     CounterfactualRow,
     OutcomeRecord,
+    ShardIdentity,
+    load_shard_strict,
+    shard_path,
 )
 from kaggriculture.learn.market_residual.model import (
     MarketResidualNet,
@@ -529,6 +533,67 @@ def test_the_auxiliary_row_reads_the_encoded_board(
         assert row[2 * products + index] == bucket_of(
             encoded.opponent_public_supply(product)
         ) / (BUCKETS - 1)
+
+
+def test_excluded_families_must_be_replacements_and_are_stored_canonically() -> None:
+    """A run can drop replacement families, but never the anchor.
+
+    The anchor is the controller's own play and the thing every ranking pair
+    is defined against, so ``kaito`` is not an excludable family; and the
+    stored spelling is sorted and deduplicated, because this string is part of
+    the drift binding and two spellings of one exclusion must not bind a root
+    to two parameterisations.
+    """
+    config = PretrainConfig(excluded_families="ranked_multi,cancel,cancel")
+    assert config.excluded_families == "cancel,ranked_multi"
+    assert config.excluded() == frozenset({"cancel", "ranked_multi"})
+    assert PretrainConfig().excluded() == frozenset()
+    with pytest.raises(ValueError, match="kaito"):
+        PretrainConfig(excluded_families="kaito")
+    with pytest.raises(ValueError, match="no_such_family"):
+        PretrainConfig(excluded_families="no_such_family")
+
+
+@pytest.mark.slow
+def test_excluding_families_drops_their_arms_and_keeps_the_anchor() -> None:
+    """A filtered rebuild loses exactly the excluded rows, anchor untouched.
+
+    Counted against the shard's own families rather than against the
+    unfiltered sequence's arm total, so a filter that dropped the wrong rows —
+    or the right number of the wrong ones — cannot pass by arithmetic.
+
+    Read from the v56 training root rather than the smoke root, because a cell
+    can only be rebuilt against the controller it was collected with and the
+    smoke root predates the v56 rebase.
+    """
+    root = Path(__file__).parents[2] / "run/market-residual/counterfactual-train-v56"
+    identity = offline.collection_identities(root)[0]
+    shard = load_shard_strict(
+        shard_path(root / "shards", ShardIdentity.of(identity)), identity
+    )
+    excluded = frozenset({"cancel", "ranked_multi"})
+    dropped = sum(1 for row in shard.rows if row.family in excluded)
+    assert dropped > 0
+
+    whole = offline.cell_sequence(root, identity)
+    filtered = offline.cell_sequence(root, identity, excluded)
+    assert len(filtered.arm_event) == len(whole.arm_event) - dropped
+    anchors = sum(1 for row in shard.rows if row.family == FAMILY_KAITO)
+    assert int((filtered.arm_mode == USE_KAITO_INDEX).sum()) == anchors
+    assert torch.equal(filtered.features, whole.features)
+    for group in offline._event_groups(filtered.arm_event):
+        assert int(filtered.arm_mode[group[0]]) == USE_KAITO_INDEX
+        assert all(int(filtered.arm_mode[arm]) == REPLACE_INDEX for arm in group[1:])
+    kept = torch.tensor(
+        [
+            row.win_point_delta
+            for row in sorted(
+                (row for row in shard.rows if row.family not in excluded),
+                key=lambda row: (row.event_index, row.alternative_id),
+            )
+        ]
+    )
+    assert torch.equal(filtered.arm_win_delta, kept)
 
 
 @pytest.mark.slow
