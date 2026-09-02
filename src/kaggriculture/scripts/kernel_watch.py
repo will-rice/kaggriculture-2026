@@ -247,18 +247,32 @@ def written_source(cells: list[dict[str, Any]], ref: str) -> str | None:
 def loadable(source: str) -> bool:
     """Return whether the engine's own loader can resolve this source.
 
+    Resolving means executing it, and published notebooks write files when they
+    run -- one of them dropped a `submission_agent.py` into the repository root
+    and an earlier harvest overwrote `main.py` the same way. So the check runs
+    from a temporary directory, and anything the source writes goes there and
+    is discarded with it.
+
     Args:
         source: Candidate agent source.
 
     Returns:
         True if a final callable resolves without raising.
     """
+    import os
+    import tempfile
+
     from kaggle_environments.agent import get_last_callable
 
-    try:
-        get_last_callable(source, path="main.py")
-    except Exception:
-        return False
+    origin = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="kernel-watch-") as sandbox:
+        os.chdir(sandbox)
+        try:
+            get_last_callable(source, path="main.py")
+        except Exception:
+            return False
+        finally:
+            os.chdir(origin)
     return True
 
 
