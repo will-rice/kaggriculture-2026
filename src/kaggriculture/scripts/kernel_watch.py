@@ -328,20 +328,32 @@ def inline_written(source: str, written: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def loadable(source: str) -> bool:
-    """Return whether the engine's own loader can resolve this source.
+def resolve_in_sandbox(source: str) -> object:
+    """Run the engine's loader over untrusted source from a scratch directory.
 
-    Resolving means executing it, and published notebooks write files when they
-    run -- one of them dropped a `submission_agent.py` into the repository root
-    and an earlier harvest overwrote `main.py` the same way. So the check runs
-    from a temporary directory, and anything the source writes goes there and
-    is discarded with it.
+    Resolving means EXECUTING it, so a stranger's code gets two things it must
+    not have.
+
+    It must not have our working directory. Published notebooks write files
+    when they run: one dropped a `submission_agent.py` into the repository
+    root, an earlier harvest overwrote `main.py`, and a scan wrote a
+    `submission.csv` there through the one call site left unwrapped. Every
+    caller resolves through here so the protection cannot be forgotten twice.
+
+    It must not have the power to end the scan. A published kernel that cannot
+    find its dataset prints "Reference-agent dataset not attached" and calls
+    ``sys.exit``, and ``SystemExit`` derives from ``BaseException``, so the
+    scan's ``except Exception`` never saw it -- measured, one such kernel
+    killed a sweep at 80 of 343 with no traceback and no failed run to show
+    for it. A kernel declining to load is an ordinary failure to resolve, so
+    it is reported as one. ``KeyboardInterrupt`` still belongs to the operator
+    and passes through untouched.
 
     Args:
         source: Candidate agent source.
 
     Returns:
-        True if a final callable resolves without raising.
+        The callable the loader selects.
     """
     import os
     import tempfile
@@ -352,11 +364,26 @@ def loadable(source: str) -> bool:
     with tempfile.TemporaryDirectory(prefix="kernel-watch-") as sandbox:
         os.chdir(sandbox)
         try:
-            get_last_callable(source, path="main.py")
-        except Exception:
-            return False
+            return get_last_callable(source, path="main.py")
+        except SystemExit as exit_call:
+            raise RuntimeError(f"source called sys.exit({exit_call.code})") from None
         finally:
             os.chdir(origin)
+
+
+def loadable(source: str) -> bool:
+    """Return whether the engine's own loader can resolve this source.
+
+    Args:
+        source: Candidate agent source.
+
+    Returns:
+        True if a final callable resolves without raising.
+    """
+    try:
+        resolve_in_sandbox(source)
+    except Exception:
+        return False
     return True
 
 
@@ -424,9 +451,7 @@ def resolved_entrypoint(path: Path) -> str:
         The selected callable's name. These artifacts shadow ``agent``, so the
         surviving definition is often not the one that plays.
     """
-    from kaggle_environments.agent import get_last_callable
-
-    selected = get_last_callable(path.read_text(encoding="utf-8"), path="main.py")
+    selected = resolve_in_sandbox(path.read_text(encoding="utf-8"))
     return getattr(selected, "__name__", repr(selected))
 
 

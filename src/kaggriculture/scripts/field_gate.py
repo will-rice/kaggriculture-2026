@@ -146,21 +146,43 @@ def score_field(
     Returns:
         The per-lineage win rates and the total games behind them.
     """
+    import os
+    import tempfile
+
     from kaggriculture.search import arena
     from kaggriculture.search.scripts import holdout
 
+    # Playing an agent executes it, and a candidate here is usually a stranger's
+    # code. Scanned kernels write files when they load: gating a sweep of them
+    # from the repository root OVERWROTE main.py, our own competition
+    # entrypoint, and left four agent files and a tarball behind. Every path
+    # goes absolute first so the games can run from a scratch directory, and
+    # anything a candidate writes is discarded with it.
+    absolute = candidate.resolve()
+    field = {
+        lineage: str(Path(path).resolve())
+        for lineage, (path, _share) in FIELD.items()
+        if lineage not in exclude and Path(path).resolve() != absolute
+    }
     exam = holdout.GATE_SEEDS[:seeds]
     rates: dict[str, float] = {}
     games = 0
-    for lineage, (path, _share) in FIELD.items():
-        if lineage in exclude or Path(path).resolve() == candidate.resolve():
-            continue
-        scores = arena.outcomes(str(candidate), {lineage: path}, exam, workers)
-        rates[lineage] = sum(scores) / len(scores)
-        games += len(scores)
-        LOGGER.info(
-            "   vs %-13s %.4f over %d games", lineage, rates[lineage], len(scores)
-        )
+    origin = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="field-gate-") as sandbox:
+        os.chdir(sandbox)
+        try:
+            for lineage, path in field.items():
+                scores = arena.outcomes(str(absolute), {lineage: path}, exam, workers)
+                rates[lineage] = sum(scores) / len(scores)
+                games += len(scores)
+                LOGGER.info(
+                    "   vs %-13s %.4f over %d games",
+                    lineage,
+                    rates[lineage],
+                    len(scores),
+                )
+        finally:
+            os.chdir(origin)
     return rates, games
 
 
