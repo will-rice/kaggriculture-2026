@@ -214,9 +214,19 @@ def payload_literal(text: str) -> str | None:
         if not isinstance(node, ast.Assign):
             continue
         target = getattr(node.targets[0], "id", "")
-        if target in {"payload", "PAYLOAD", "blob"}:
+        if target not in {"payload", "PAYLOAD", "blob"}:
+            continue
+        try:
             value = ast.literal_eval(node.value)
-            return value if isinstance(value, str) else None
+        except (ValueError, SyntaxError):
+            # Some notebooks build the payload with a call rather than
+            # assigning a literal. There is no safe way to evaluate that
+            # statically, and executing the cell to find out is the one thing
+            # this scanner will not do, so the kernel is reported as
+            # unverifiable and skipped.
+            LOGGER.info("payload for %r is computed, not literal; skipping", target)
+            return None
+        return value if isinstance(value, str) else None
     return None
 
 
