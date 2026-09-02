@@ -42,7 +42,16 @@ def main() -> None:
     """Play one candidate against every lineage and report both means."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("candidate", type=Path, help="agent file to score")
-    parser.add_argument("--seeds", type=int, default=24, help="exam seeds per opponent")
+    # All 64 exam seeds, because 24 is not enough to act on. At 24 seeds (48
+    # games) a per-lineage rate carries a Wilson interval about +/-0.13 wide,
+    # and that cost us: this agent measured 0.562 against indarkarhana on 24
+    # seeds and 0.719 on 64, so a gap twice the real one got chased. The seeds
+    # are exam seeds and measurement is what they are for.
+    #
+    # Reusing the same 64 for every candidate does mean a screened winner is
+    # somewhat seed-lucky. That is tolerable while we are choosing between a
+    # handful of agents and would not be if we were sweeping hundreds.
+    parser.add_argument("--seeds", type=int, default=64, help="exam seeds per opponent")
     parser.add_argument("--workers", type=int, default=20)
     parser.add_argument(
         "--exclude",
