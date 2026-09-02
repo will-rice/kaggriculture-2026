@@ -79,6 +79,67 @@ def test_non_done_status_is_a_failure_even_when_the_engine_supplies_rewards(
         arena._one((route, route, 11))
 
 
+def test_a_seat_the_engine_played_for_is_a_failure_not_a_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed agent finishes DONE with a real bank; only the steps show it.
+
+    This is the shape the engine actually produces, measured against an agent
+    whose ``agent()`` raises: every intermediate step marks the seat ERROR and
+    the engine substitutes a PASS on its behalf, but the final step still reads
+    DONE with the untouched starting bank. Checking the last step alone -- or
+    counting non-empty actions, which the substituted PASS keeps at 718 of 719
+    -- reports a crash as an ordinary 0.0 loss and silently discards the
+    candidate.
+    """
+
+    class Seat:
+        def __init__(self, reward: int, status: str) -> None:
+            self.reward = reward
+            self.status = status
+
+    class Environment:
+        steps = [
+            [Seat(3000, "ERROR"), Seat(9, "ACTIVE")],
+            [Seat(3000, "ERROR"), Seat(9, "ACTIVE")],
+            [Seat(3000, "DONE"), Seat(131522, "DONE")],
+        ]
+
+        def run(self, agents: object) -> None:
+            return None
+
+    monkeypatch.setattr(arena, "make", lambda *args, **kwargs: Environment())
+    route: Route = [{"farmer": ["PASS"], "hands": [], "market": []}]
+
+    with pytest.raises(RuntimeError, match="seat zero held.*ERROR"):
+        arena._run_banks(route, route, 11)
+
+
+def test_a_healthy_episode_is_not_rejected_by_the_seat_status_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACTIVE throughout and DONE at the end is what a real game looks like."""
+
+    class Seat:
+        def __init__(self, reward: int, status: str) -> None:
+            self.reward = reward
+            self.status = status
+
+    class Environment:
+        steps = [
+            [Seat(3000, "ACTIVE"), Seat(3000, "ACTIVE")],
+            [Seat(102194, "DONE"), Seat(122302, "DONE")],
+        ]
+
+        def run(self, agents: object) -> None:
+            return None
+
+    monkeypatch.setattr(arena, "make", lambda *args, **kwargs: Environment())
+    route: Route = [{"farmer": ["PASS"], "hands": [], "market": []}]
+
+    assert arena._run_banks(route, route, 11) == (102194, 122302)
+
+
 def test_a_route_against_itself_scores_exactly_half() -> None:
     """Self-play pins ``evaluate``'s tie handling, but proves nothing about the swap.
 

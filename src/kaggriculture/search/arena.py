@@ -362,6 +362,26 @@ def _run_banks(seat_zero: Opponent, seat_one: Opponent, seed: int) -> tuple[int,
             "a route that no longer matches the episode it plays against, or a "
             "run that timed out, errored, or forfeited, is not an ordinary result."
         )
+    # The final step is the one place a dead agent looks healthy. When an agent
+    # raises, the engine marks its seat ERROR for the rest of the episode,
+    # substitutes {"farmer": ["PASS"], "hands": [], "market": []} on its behalf,
+    # and still reports DONE with a real reward on the last step -- measured, a
+    # crashing agent banks its untouched 3000 and reads as an ordinary 0.0 loss
+    # against an opponent's 131522. Counting non-empty actions does not find it
+    # either: the substituted PASS makes 718 of 719 turns look played. The seat
+    # statuses across the episode are the only place the failure survives.
+    for seat, name in ((0, "seat zero"), (1, "seat one")):
+        broken = {
+            step[seat].status
+            for step in environment.steps
+            if step[seat].status not in ("ACTIVE", "DONE", "INACTIVE")
+        }
+        if broken:
+            raise RuntimeError(
+                f"seed {seed} {name} held {sorted(broken)} during the episode; "
+                "an agent the engine had to play for did not lose, it failed, "
+                "and scoring it as a loss would silently discard a candidate."
+            )
     return (int(final[0].reward), int(final[1].reward))
 
 
