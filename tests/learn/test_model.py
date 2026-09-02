@@ -82,12 +82,15 @@ def test_a_unit_reads_the_trunk_at_its_own_tile() -> None:
 
 
 def test_two_units_on_one_tile_receive_identical_logits() -> None:
-    """One readout is shared by every slot, so a slot's index carries no meaning.
+    """Without ``unit_identity`` a slot's index carries no meaning at all.
 
-    Two hands standing on the same tile see the same game, so they must be
-    scored the same way. A per-slot block of weights -- what a single wide
-    ``Linear`` over a pooled vector amounts to -- would give them different
-    logits for no reason available to the game.
+    This is the default readout, and the assertion is what it costs: the pair
+    is one input to one shared ``Linear``, so no weights can give the two units
+    different ops. 14.5% of the acting slots recorded from our own teacher are
+    such a pair, and the clone scored 0.5035 on them against 0.9999 on every
+    other slot. Passing ``unit_identity=True`` is what buys the pair apart --
+    see the next test -- and this one stays to hold the default honest, not
+    because being unable to answer is a property worth having.
     """
     torch.manual_seed(0)
     model = Policy().eval()
@@ -101,6 +104,49 @@ def test_two_units_on_one_tile_receive_identical_logits() -> None:
 
     assert torch.equal(logits[0, 3], logits[0, 7])
     assert not torch.equal(logits[0, 3], logits[0, 0])
+
+
+def test_unit_identity_separates_two_units_on_one_tile() -> None:
+    """A per-slot vector makes co-located units two inputs rather than one.
+
+    The op the teacher gives a hand is a function of which hand it is -- its
+    index in the farm's hand list -- so a readout that cannot tell slot 3 from
+    slot 7 cannot reproduce it. The slots must still be read by the *same*
+    weights, so the separation has to come from the input; the assertion that
+    the two remain sensitive to the board is what says the identity vector was
+    added to the gathered column rather than replacing it.
+    """
+    torch.manual_seed(0)
+    model = Policy(unit_identity=True).eval()
+    board = torch.randn(1, TILE_PLANES, BOARD, BOARD)
+    scalars = torch.randn(1, SCALARS)
+    positions = _positions(1)
+    positions[0, 3] = positions[0, 7] = BOARD * BOARD // 2
+
+    with torch.no_grad():
+        logits, quantities, _market, _value = model(board, scalars, positions)
+        moved = torch.randn(1, SCALARS)
+        elsewhere, _quantities, _market, _value = model(board, moved, positions)
+
+    assert not torch.equal(logits[0, 3], logits[0, 7])
+    assert not torch.equal(quantities[0, 3], quantities[0, 7])
+    assert not torch.equal(logits[0, 3], elsewhere[0, 3])
+
+
+def test_unit_identity_is_the_only_key_it_adds() -> None:
+    """``play.model`` reads the architecture off the checkpoint by this key.
+
+    It builds ``Policy(unit_identity="slots.weight" in weights)`` so the file
+    and the module cannot disagree about which architecture was trained. That
+    is only sound while the argument adds exactly that one key and changes the
+    shape of none of the others.
+    """
+    plain = Policy(blocks=1, channels=16).state_dict()
+    identified = Policy(blocks=1, channels=16, unit_identity=True).state_dict()
+
+    assert set(identified) - set(plain) == {"slots.weight"}
+    assert not set(plain) - set(identified)
+    assert all(plain[key].shape == identified[key].shape for key in plain)
 
 
 def test_the_model_fits_the_size_every_winner_used() -> None:

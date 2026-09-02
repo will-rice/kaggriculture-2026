@@ -72,8 +72,15 @@ def model() -> Policy:
             ``CHECKPOINT`` currently hits.
     """
     torch.set_num_threads(THREADS)
-    policy = Policy()
-    load_policy_weights(policy, torch.load(CHECKPOINT, map_location="cpu"))
+    weights = torch.load(CHECKPOINT, map_location="cpu")
+    # The architecture is read off the checkpoint rather than restated here.
+    # ``unit_identity`` adds exactly one state-dict key, so its presence is the
+    # fact itself; a constant on this side would be a second statement of the
+    # same thing that could disagree with the file, and disagreeing would fail
+    # as a rejected key on a good day and as a silently different agent on a
+    # bad one.
+    policy = Policy(unit_identity="slots.weight" in weights)
+    load_policy_weights(policy, weights)
     return policy.eval()
 
 

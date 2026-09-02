@@ -78,6 +78,16 @@ LEARNING_RATE = 3e-4
 SEED = 0
 WORKERS = 8
 
+# Give each unit slot its own learned vector, so two units standing on one tile
+# are two inputs rather than one. The first clone did not have this and could
+# not have: it read one gathered trunk column per *tile* through a shared
+# ``Linear``, so a pair of co-located units with different ops was a pair the
+# architecture had no way to answer separately. It scored 0.5035 on those slots
+# and 0.9999 on every other slot, on the rows it was fitted on and on held-out
+# rows alike -- which is not underfitting, it is a ceiling. See
+# ``Policy.forward``.
+UNIT_IDENTITY = True
+
 # 24 of the 64 exam seeds, both seat orderings: 48 games. The gate needs to
 # separate ~0.5 from <0.1, which 48 games does comfortably (a Wilson interval
 # at 0.5 is about +/-0.14 wide), and the remaining 40 seeds stay unspent for
@@ -173,7 +183,7 @@ def train() -> None:
     )
     holdout = DataLoader(held, batch_size=BATCH, num_workers=WORKERS, pin_memory=True)
 
-    model = Policy().to(device)
+    model = Policy(unit_identity=UNIT_IDENTITY).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     history = []
     for epoch in range(EPOCHS):
@@ -201,14 +211,22 @@ def train() -> None:
     torch.save(model.state_dict(), CLONE_CHECKPOINT)
     LOGGER.info("saved %s", CLONE_CHECKPOINT)
 
+    # Accuracy on the training rows, not only the held-out ones. The first
+    # clone's holdout number was meaningless on its own: it equalled the
+    # training number, and reading that as a generalisation result rather than
+    # as a ceiling is what cost this line a week. Whether the model can fit the
+    # teacher at all is answered by the rows it was fitted on.
+    fitted = DataLoader(training, batch_size=BATCH, num_workers=WORKERS)
     report = {
         "teacher": TEACHER,
+        "unit_identity": UNIT_IDENTITY,
         "training_rows": len(training),
         "holdout_rows": len(held),
         "holdout_seasons": len(held_manifest.seasons),
         "teacher_holdout_win_rate": win_rate(held_manifest),
         "epochs": history,
         "final": history[-1],
+        "training": accuracy(model, fitted, device),
         "divergence": divergence(model, held, held_manifest, device),
     }
     (CLONE_DIR / "clone.json").write_text(json.dumps(report, indent=1))
@@ -254,7 +272,12 @@ def accuracy(model: Policy, loader: DataLoader, device: str) -> dict[str, float]
 
     Five numbers, because three of them can each be high while the agent is
     still useless. ``op`` and ``quantity`` count only the slots that carry a
-    label. ``market`` counts every slot, which is flattering -- most slots hold
+    label. ``op`` is also split by whether the slot is *answerable*: a unit
+    sharing its tile with a unit that took a different op is read from the same
+    trunk column through the same shared weights, so the two are one input and
+    only one can be right. ``op_shadowed`` counts those slots and
+    ``op_reachable`` counts the rest, because a single ``op`` number mixes a
+    model's fit with an architecture's ceiling and reports the sum as fit. ``market`` counts every slot, which is flattering -- most slots hold
     "trade nothing" on most turns -- so ``market_traded`` counts only the slots
     where the teacher actually placed an order, and ``market_row`` counts a
     turn's whole 21-slot market as one prediction that is either right or
@@ -271,7 +294,17 @@ def accuracy(model: Policy, loader: DataLoader, device: str) -> dict[str, float]
         Agreement per head, plus the two stricter market readings.
     """
     model.eval()
-    counts = {key: [0.0, 0.0] for key in ("op", "quantity", "market", "market_traded")}
+    counts = {
+        key: [0.0, 0.0]
+        for key in (
+            "op",
+            "op_reachable",
+            "op_shadowed",
+            "quantity",
+            "market",
+            "market_traded",
+        )
+    }
     rows = matched = 0.0
     with torch.no_grad():
         for batch in loader:
@@ -281,8 +314,17 @@ def accuracy(model: Policy, loader: DataLoader, device: str) -> dict[str, float]
             op_logits, quantity_logits, market_logits, _value = model(
                 board, scalars, positions
             )
+            acting = ops != IGNORE
+            together = (
+                (positions[:, :, None] == positions[:, None, :])
+                & acting[:, :, None]
+                & acting[:, None, :]
+            )
+            shadowed = (together & (ops[:, :, None] != ops[:, None, :])).any(2) & acting
             for key, logits, labels, keep in (
-                ("op", op_logits, ops, ops != IGNORE),
+                ("op", op_logits, ops, acting),
+                ("op_reachable", op_logits, ops, acting & ~shadowed),
+                ("op_shadowed", op_logits, ops, shadowed),
                 ("quantity", quantity_logits, quantities, quantities != IGNORE),
                 (
                     "market",

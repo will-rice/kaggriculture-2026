@@ -29,6 +29,7 @@ import torch
 
 from kaggriculture.learn.encoding import (
     MARKET_SLOTS,
+    MAX_UNITS,
     QUANTITIES,
     SCALARS,
     TILE_PLANES,
@@ -100,6 +101,7 @@ class Policy(torch.nn.Module):
         value_bound: float | None = None,
         kernel_size: int = 3,
         activation: str = "relu",
+        unit_identity: bool = False,
     ) -> None:
         """Build the policy.
 
@@ -120,6 +122,15 @@ class Policy(torch.nn.Module):
                 convolutions. The legacy/default topology is 3.
             activation: ``relu`` (legacy/default) or ``leaky_relu`` throughout
                 the scalar projection and residual trunk.
+            unit_identity: Add a learned per-slot vector to the gathered column
+                before the unit heads read it, so slot *k* is a different input
+                from slot *j* even when both units stand on the same tile.
+                Without it the two slots are literally the same input to the
+                same shared ``Linear`` and at most one of them can be right;
+                14.5% of the cloned teacher's acting slots are such a pair, and
+                the clone scored 0.50 on exactly those and 0.9999 on the rest.
+                Defaults to ``False`` so every checkpoint written before this
+                argument keeps its own state-dict keys.
         """
         super().__init__()
         if kernel_size <= 0 or kernel_size % 2 == 0:
@@ -136,6 +147,7 @@ class Policy(torch.nn.Module):
         self.blocks = torch.nn.ModuleList(
             Residual(channels, kernel_size, activation) for _ in range(blocks)
         )
+        self.slots = torch.nn.Embedding(MAX_UNITS, channels) if unit_identity else None
         self.head = torch.nn.Linear(channels, len(UNIT_OPS))
         self.quantity_head = torch.nn.Linear(channels, len(QUANTITIES))
         self.trade_head = torch.nn.Linear(
@@ -160,7 +172,27 @@ class Policy(torch.nn.Module):
         express what the day calls for but never what the unit is standing next
         to; measured, perturbing one board cell moved all ``MAX_UNITS`` slots.
         Gathering per position also makes the readout weights shared across
-        slots, so which unit a slot holds stops mattering.
+        slots. That sharing is the right default -- slot 3 and slot 9 should be
+        read the same way -- but on its own it goes one step too far: two units
+        standing on the same tile gather the *same* column and are therefore
+        the same input to the same ``Linear``, so no weights can give them
+        different ops. That is not a rare corner. 14.5% of the acting slots in
+        the recorded seasons of our own teacher are such a pair, the clone
+        scored 0.5035 on exactly those and 0.9999 on every other slot, and
+        those two numbers reconstruct its whole reported 0.9282 to four
+        decimals. ``unit_identity`` adds a learned per-slot vector to the
+        gathered column, which keeps the weights shared while making the slots
+        distinguishable. Measured, it lifts those slots from 0.5035 to 0.6493
+        and whole-turn agreement from 0.5545 to 0.6949, and it stops there for
+        a reason that is algebra rather than optimisation: ``W(g + e_k) =
+        Wg + We_k`` is a constant per-slot bias on the logits, so a slot can
+        hold a prior -- "slot 3 usually harvests" -- but cannot condition on
+        where in the season it is. Going further needs what the tensors do not
+        carry at all. ``EncodedObservation.unit_carried_items`` holds each
+        unit's own inventory and is dropped before ``board``, ``scalars`` and
+        ``positions`` are built, and the ``unit:CARRIED`` plane sums the units
+        standing on a tile, so *which* unit is which is absent from the input
+        rather than merely hard to read out of it.
 
         The quantity head reads the same gathered column the op head does,
         through its own ``Linear`` rather than a wider op head: how much a
@@ -206,6 +238,8 @@ class Policy(torch.nn.Module):
         columns = features.flatten(2)
         wanted = positions[:, None, :].tile(1, columns.shape[1], 1)
         gathered = columns.gather(2, wanted).transpose(1, 2)
+        if self.slots is not None:
+            gathered = gathered + self.slots.weight
         units = self.head(gathered)
         unit_quantities = self.quantity_head(gathered)
         pooled = features.mean(dim=(2, 3))
