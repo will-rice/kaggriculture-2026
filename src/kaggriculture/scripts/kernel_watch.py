@@ -195,10 +195,9 @@ def extract(ref: str) -> str | None:
     directory = WORK / ref.replace("/", "__")
     directory.mkdir(parents=True, exist_ok=True)
     api.kernels_pull(ref, path=str(directory), metadata=True)
-    books = list(directory.glob("*.ipynb"))
-    if not books:
+    cells = published_cells(directory)
+    if cells is None:
         return None
-    cells = json.loads(books[0].read_text(encoding="utf-8"))["cells"]
     for cell in cells:
         if cell["cell_type"] != "code":
             continue
@@ -218,6 +217,35 @@ def extract(ref: str) -> str | None:
             raise ValueError(f"{ref}: payload digest {digest} != asserted")
         return raw.decode("utf-8")
     return written_source(cells, ref)
+
+
+def published_cells(directory: Path) -> list[dict[str, Any]] | None:
+    """Return a kernel's code cells whether it was published as a book or not.
+
+    Kaggle publishes a kernel as either a notebook or a plain ``.py`` script,
+    and a script is not a lesser artifact: the ones found this way carry the
+    same b85+zlib payload and the same shadowed ``agent`` definitions as any
+    notebook. Globbing only for ``*.ipynb`` silently skipped every one of them,
+    including a whole competitor's v28/v29/v30/v31 series.
+
+    A script becomes a single code cell, which is what it is, and every step
+    downstream -- payload digest, written source, entrypoint -- then works on
+    it unchanged.
+
+    Args:
+        directory: Where the kernel was pulled.
+
+    Returns:
+        The code cells, or None if the pull produced neither form.
+    """
+    books = list(directory.glob("*.ipynb"))
+    if books:
+        cells = json.loads(books[0].read_text(encoding="utf-8"))["cells"]
+        return [cell for cell in cells if cell["cell_type"] == "code"]
+    scripts = list(directory.glob("*.py"))
+    if not scripts:
+        return None
+    return [{"cell_type": "code", "source": scripts[0].read_text(encoding="utf-8")}]
 
 
 def written_source(cells: list[dict[str, Any]], ref: str) -> str | None:
