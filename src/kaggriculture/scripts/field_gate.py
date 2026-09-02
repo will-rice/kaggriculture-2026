@@ -45,6 +45,13 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=24, help="exam seeds per opponent")
     parser.add_argument("--workers", type=int, default=20)
     parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="lineage to leave out; pass the same set for every candidate so "
+        "their means are comparable",
+    )
+    parser.add_argument(
         "--occupancy",
         action="store_true",
         help="also report the 2026-09-01 occupancy-weighted mean, which is a "
@@ -52,10 +59,16 @@ def main() -> None:
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    report(args.candidate, args.seeds, args.workers, args.occupancy)
+    report(args.candidate, args.seeds, args.workers, args.occupancy, set(args.exclude))
 
 
-def report(candidate: Path, seeds: int, workers: int, occupancy: bool) -> None:
+def report(
+    candidate: Path,
+    seeds: int,
+    workers: int,
+    occupancy: bool,
+    exclude: set[str],
+) -> None:
     """Score the candidate and log every per-lineage rate behind the mean.
 
     Args:
@@ -63,6 +76,10 @@ def report(candidate: Path, seeds: int, workers: int, occupancy: bool) -> None:
         seeds: Exam seeds per opponent; each is played in both seat orderings.
         workers: Arena processes.
         occupancy: Whether to also report the occupancy-weighted mean.
+        exclude: Lineages to leave out. A candidate is always excluded from
+            its own field, which makes two candidates' means cover different
+            opponents; pass the union of both candidates' lineages to compare
+            them on the same set.
     """
     from kaggriculture.report import wilson_interval
     from kaggriculture.search import arena
@@ -73,7 +90,7 @@ def report(candidate: Path, seeds: int, workers: int, occupancy: bool) -> None:
     games = 0
     started = time.perf_counter()
     for lineage, (path, _share) in FIELD.items():
-        if Path(path).resolve() == candidate.resolve():
+        if lineage in exclude or Path(path).resolve() == candidate.resolve():
             continue
         scores = arena.outcomes(str(candidate), {lineage: path}, exam, workers)
         rates[lineage] = sum(scores) / len(scores)
