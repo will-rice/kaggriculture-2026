@@ -143,7 +143,7 @@ def report(ref: str, gate_seeds: int, workers: int) -> None:
     for label, path in candidates.items():
         rate, low, high, games = gate(path, gate_seeds, workers)
         LOGGER.info(
-            "%s [%s]: %.4f Wilson [%.4f, %.4f] over %d games",
+            "%s [%s]: FIELD %.4f Wilson [%.4f, %.4f] over %d games",
             ref,
             label,
             rate,
@@ -151,7 +151,14 @@ def report(ref: str, gate_seeds: int, workers: int) -> None:
             high,
             games,
         )
-        if low > 0.75:
+        # The bar is what it takes to be worth standing over the agent we would
+        # otherwise stand: our tuned_v58 gates at 0.700 here and shopforge at
+        # 0.906. Those two are not a like-for-like comparison -- every
+        # candidate is dropped from its own field, so shopforge is scored on
+        # four lineages and ours on five including shopforge. The per-lineage
+        # rates above are the ones to read when ranking two candidates; this
+        # number only has to answer "worth a closer look".
+        if low > 0.80:
             LOGGER.info(
                 "   CANDIDATE. To submit: uv run --with kaggle kaggle competitions "
                 "submit %s -f <archive> -m '%s %s'",
@@ -347,7 +354,15 @@ def resolved_entrypoint(path: Path) -> str:
 
 
 def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float, int]:
-    """Play one candidate against the served agent over the exam seeds.
+    """Play one candidate against the field lineages over the exam seeds.
+
+    This deliberately does not gate against our own served agent. Doing so asks
+    "does this beat us", and the agent worth adopting is the one that beats the
+    FIELD -- which is not the same question, because the field is
+    non-transitive. Measured: shopforge scores 0.6875 against v56 and would
+    have missed the old 0.75 bar, while scoring 0.979 against the field against
+    our own 0.779. The best agent we have found would have been scanned,
+    logged and discarded by its own daily scan.
 
     Args:
         path: The candidate agent file.
@@ -355,18 +370,15 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
         workers: Arena processes.
 
     Returns:
-        The win rate, its Wilson bounds, and the games played.
+        The equal-weighted field rate, its Wilson bounds, and the games played.
     """
     from kaggriculture.report import wilson_interval
-    from kaggriculture.search import arena
-    from kaggriculture.search.scripts import holdout
+    from kaggriculture.scripts.field_gate import score_field
 
-    seeds = holdout.GATE_SEEDS[:gate_seeds]
-    served = {"served": holdout.SERVED}
-    scores = arena.outcomes(str(path), served, seeds, workers)
-    wins, games = sum(scores), len(scores)
-    low, high = wilson_interval(wins, games)
-    return wins / games, low, high, games
+    rates, games = score_field(path, gate_seeds, workers, set())
+    equal = sum(rates.values()) / len(rates)
+    low, high = wilson_interval(equal * games, games)
+    return equal, low, high, games
 
 
 if __name__ == "__main__":

@@ -91,22 +91,9 @@ def report(
             them on the same set.
     """
     from kaggriculture.report import wilson_interval
-    from kaggriculture.search import arena
-    from kaggriculture.search.scripts import holdout
 
-    exam = holdout.GATE_SEEDS[:seeds]
-    rates: dict[str, float] = {}
-    games = 0
     started = time.perf_counter()
-    for lineage, (path, _share) in FIELD.items():
-        if lineage in exclude or Path(path).resolve() == candidate.resolve():
-            continue
-        scores = arena.outcomes(str(candidate), {lineage: path}, exam, workers)
-        rates[lineage] = sum(scores) / len(scores)
-        games += len(scores)
-        LOGGER.info(
-            "   vs %-13s %.4f over %d games", lineage, rates[lineage], len(scores)
-        )
+    rates, games = score_field(candidate, seeds, workers, exclude)
     equal = sum(rates.values()) / len(rates)
     wins = sum(rates.values()) * (games / len(rates))
     low, high = wilson_interval(wins, games)
@@ -133,6 +120,48 @@ def report(
         "per_lineage": {k: round(v, 4) for k, v in rates.items()},
     }
     print(json.dumps(summary, indent=1))
+
+
+def score_field(
+    candidate: Path,
+    seeds: int,
+    workers: int,
+    exclude: set[str],
+) -> tuple[dict[str, float], int]:
+    """Play the candidate against every field lineage and return the rates.
+
+    The daily kernel scan reads this too, so that a scanned kernel is judged on
+    the field rather than on us. Gating a stranger against our own agent is the
+    mirror trap in miniature: measured, shopforge scores 0.6875 against v56 and
+    would miss a 0.75 bar, while scoring 0.979 against the field -- the best
+    agent we hold would have been scanned and discarded.
+
+    Args:
+        candidate: The agent file to score.
+        seeds: Exam seeds per opponent; each is played in both seat orderings.
+        workers: Arena processes.
+        exclude: Lineages to leave out, plus the candidate's own path, which is
+            always dropped.
+
+    Returns:
+        The per-lineage win rates and the total games behind them.
+    """
+    from kaggriculture.search import arena
+    from kaggriculture.search.scripts import holdout
+
+    exam = holdout.GATE_SEEDS[:seeds]
+    rates: dict[str, float] = {}
+    games = 0
+    for lineage, (path, _share) in FIELD.items():
+        if lineage in exclude or Path(path).resolve() == candidate.resolve():
+            continue
+        scores = arena.outcomes(str(candidate), {lineage: path}, exam, workers)
+        rates[lineage] = sum(scores) / len(scores)
+        games += len(scores)
+        LOGGER.info(
+            "   vs %-13s %.4f over %d games", lineage, rates[lineage], len(scores)
+        )
+    return rates, games
 
 
 if __name__ == "__main__":
