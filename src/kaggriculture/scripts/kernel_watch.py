@@ -219,20 +219,47 @@ def written_source(cells: list[dict[str, Any]], ref: str) -> str | None:
     Returns:
         The agent source, or None if no cell defines a loadable agent.
     """
-    best: str | None = None
+    bodies = []
     for cell in cells:
         if cell["cell_type"] != "code":
             continue
         text = "".join(cell["source"])
-        if "%%writefile" in text.split("\n")[0]:
+        if text.lstrip().startswith("%%") and "writefile" in text.split("\n")[0]:
             text = "\n".join(text.split("\n")[1:])
-        if "def agent(" not in text and "def kaggle_agent" not in text:
+        elif text.lstrip().startswith("%%"):
             continue
-        if best is None or len(text) > len(best):
-            best = text
-    if best is not None:
-        LOGGER.info("%s: agent published as source, UNVERIFIED -- opponent only", ref)
-    return best
+        bodies.append(text)
+    defining = [t for t in bodies if "def agent(" in t or "def kaggle_agent" in t]
+    if not defining:
+        return None
+    LOGGER.info("%s: agent published as source, UNVERIFIED -- opponent only", ref)
+    longest = max(defining, key=len)
+    if loadable(longest):
+        return longest
+    # The agent's definitions can span cells, so the longest one alone may
+    # reference names defined elsewhere. Fall back to every code cell up to
+    # and including the last one that defines an agent, in notebook order.
+    last = len(bodies) - 1 - bodies[::-1].index(defining[-1])
+    joined = "\n\n".join(bodies[: last + 1])
+    return joined if loadable(joined) else None
+
+
+def loadable(source: str) -> bool:
+    """Return whether the engine's own loader can resolve this source.
+
+    Args:
+        source: Candidate agent source.
+
+    Returns:
+        True if a final callable resolves without raising.
+    """
+    from kaggle_environments.agent import get_last_callable
+
+    try:
+        get_last_callable(source, path="main.py")
+    except Exception:
+        return False
+    return True
 
 
 def payload_literal(text: str) -> str | None:
