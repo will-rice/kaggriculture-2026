@@ -37,6 +37,7 @@ import logging
 import re
 import zlib
 from pathlib import Path
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
@@ -188,13 +189,50 @@ def extract(ref: str) -> str | None:
         payload = payload_literal(text)
         if payload is None:
             continue
-        raw = zlib.decompress(base64.b85decode(payload))
+        try:
+            raw = zlib.decompress(base64.b85decode(payload))
+        except (ValueError, zlib.error):
+            # The assignment is named like a payload but is not b85+zlib.
+            LOGGER.info("%s: payload is not b85+zlib; trying other cells", ref)
+            continue
         asserted = re.search(r"digest == '([0-9a-f]{64})'", text)
         digest = hashlib.sha256(raw).hexdigest()
         if asserted and digest != asserted.group(1):
             raise ValueError(f"{ref}: payload digest {digest} != asserted")
         return raw.decode("utf-8")
-    return None
+    return written_source(cells, ref)
+
+
+def written_source(cells: list[dict[str, Any]], ref: str) -> str | None:
+    """Return an agent published as plain source rather than a payload.
+
+    Several kernels -- including the one holding the largest share of the
+    ladder -- ship their agent as ordinary code, either written to ``main.py``
+    by a cell magic or simply defined in a long cell. Those carry no digest to
+    check, so the caller must treat them as unverifiable: usable as opponents,
+    never as something we submit.
+
+    Args:
+        cells: The notebook's cells.
+        ref: The kernel ref, for logging.
+
+    Returns:
+        The agent source, or None if no cell defines a loadable agent.
+    """
+    best: str | None = None
+    for cell in cells:
+        if cell["cell_type"] != "code":
+            continue
+        text = "".join(cell["source"])
+        if "%%writefile" in text.split("\n")[0]:
+            text = "\n".join(text.split("\n")[1:])
+        if "def agent(" not in text and "def kaggle_agent" not in text:
+            continue
+        if best is None or len(text) > len(best):
+            best = text
+    if best is not None:
+        LOGGER.info("%s: agent published as source, UNVERIFIED -- opponent only", ref)
+    return best
 
 
 def payload_literal(text: str) -> str | None:
