@@ -21,7 +21,7 @@ What it does, in order:
    0.45 -> 0.225 -- to any kernel that carries a ``ResidualConfig`` literal.
    Measured on v56 that is worth 0.9922 of 128 mirror games, and it applies
    unchanged to v58.
-5. Gates the tuned artifact against the served agent over every exam seed,
+5. Gates the tuned artifact against the FIELD lineages over every exam seed,
    both seat orderings.
 
 It stops there. Submitting is a slot-spending, externally visible action and
@@ -44,6 +44,11 @@ LOGGER = logging.getLogger(__name__)
 COMPETITION = "kaggriculture"
 SEEN = Path("run/kernel-watch/seen.json")
 WORK = Path("run/kernel-watch/kernels")
+
+# What marks a cell as holding the agent: a def the engine can call, or a
+# module-level binding of one, which is how a factory-built policy is
+# published.
+ENTRYPOINT = r"^(?:def (?:agent|kaggle_agent)\(|(?:agent|main|policy)\s*=)"
 
 # The two fields, and the values 128-game gates picked out of a 44-parameter
 # sweep. The horizon curve is unimodal (2 -> 0.500, 5 -> 0.914, 7 -> 0.930,
@@ -158,6 +163,11 @@ def report(ref: str, gate_seeds: int, workers: int) -> None:
         # four lineages and ours on five including shopforge. The per-lineage
         # rates above are the ones to read when ranking two candidates; this
         # number only has to answer "worth a closer look".
+        #
+        # A kernel that republishes a lineage we already hold ties itself at
+        # 0.5 in that row and reads lower than it plays -- scanning shopforge
+        # itself gives 0.85, not 0.906. That row is the tell, and it is worth
+        # more than the mean: an opponent it cannot beat is one it already is.
         if low > 0.80:
             LOGGER.info(
                 "   CANDIDATE. To submit: uv run --with kaggle kaggle competitions "
@@ -227,28 +237,67 @@ def written_source(cells: list[dict[str, Any]], ref: str) -> str | None:
         The agent source, or None if no cell defines a loadable agent.
     """
     bodies = []
+    written: dict[str, str] = {}
     for cell in cells:
         if cell["cell_type"] != "code":
             continue
         text = "".join(cell["source"])
-        if text.lstrip().startswith("%%") and "writefile" in text.split("\n")[0]:
+        first = text.split("\n")[0]
+        if text.lstrip().startswith("%%") and "writefile" in first:
             text = "\n".join(text.split("\n")[1:])
+            name = first.split()[-1]
+            if name.endswith(".py"):
+                written[name[: -len(".py")]] = text
         elif text.lstrip().startswith("%%"):
             continue
         bodies.append(text)
-    defining = [t for t in bodies if "def agent(" in t or "def kaggle_agent" in t]
+    # The engine's loader takes the last callable a file leaves behind, so an
+    # entrypoint need not be a def. The strongest agent we have measured ends
+    # its module with ``agent = make_agent()`` and ``main = agent``, and a
+    # ``def agent(`` test alone does not see it.
+    defining = [t for t in bodies if re.search(ENTRYPOINT, t, re.M)]
     if not defining:
         return None
     LOGGER.info("%s: agent published as source, UNVERIFIED -- opponent only", ref)
-    longest = max(defining, key=len)
+    longest = inline_written(max(defining, key=len), written)
     if loadable(longest):
         return longest
     # The agent's definitions can span cells, so the longest one alone may
     # reference names defined elsewhere. Fall back to every code cell up to
     # and including the last one that defines an agent, in notebook order.
     last = len(bodies) - 1 - bodies[::-1].index(defining[-1])
-    joined = "\n\n".join(bodies[: last + 1])
+    joined = inline_written("\n\n".join(bodies[: last + 1]), written)
     return joined if loadable(joined) else None
+
+
+def inline_written(source: str, written: dict[str, str]) -> str:
+    """Replace imports of the notebook's own written modules with their text.
+
+    A kernel can split its agent across files it writes itself -- the strongest
+    agent we have measured ships a readable controller that does
+    ``from fieldbook_tapes import PLAN_SCRIPTS`` and a second cell that writes
+    ``fieldbook_tapes.py``. Concatenating the cells does not help, because the
+    import still names a module that exists only inside the notebook's own
+    working directory. Its assembly cell substitutes the tape at exactly that
+    import, so doing the same here reproduces what the kernel would run.
+
+    Args:
+        source: Candidate agent source.
+        written: Module name to body, for every ``%%writefile`` cell.
+
+    Returns:
+        The source with those imports replaced by the module bodies.
+    """
+    if not written:
+        return source
+    lines = []
+    for line in source.split("\n"):
+        module = re.match(r"\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
+        if module and module.group(1) in written:
+            lines.append(written[module.group(1)])
+        else:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def loadable(source: str) -> bool:
