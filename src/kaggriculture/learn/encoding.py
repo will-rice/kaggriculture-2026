@@ -380,6 +380,48 @@ def _label(op: list[Any]) -> int:
     return UNIT_OPS.index(name)
 
 
+def encode_unit_quantities(action: Mapping[str, Any], units: int) -> torch.Tensor:
+    """Return one quantity-bucket label per unit, padded to ``MAX_UNITS``.
+
+    The op vocabulary has no slot for a count -- ``_label`` deliberately drops
+    it -- so a clone trained on op labels alone picks up exactly one item per
+    turn whatever the head scores, which is the ``_op`` constant that used to
+    be hard-coded. This is the label that closes that lane: the same
+    ``QUANTITIES`` buckets ``decode_units`` selects from, read off the
+    teacher's own transfer counts.
+
+    Only ``PICKUP`` and ``PLACE`` read a count. Every other op is marked
+    ``IGNORE`` rather than bucket 0, for the same reason a hand that has not
+    been hired is: a ``WATER`` did not *choose* to move nothing, it has no
+    count to choose, and scoring it would train the head on slots whose label
+    means nothing. Padded slots past ``units`` are ``IGNORE`` too.
+
+    A transfer with no count is bucketed as 1, which is what the engine does
+    with it: ``_apply_unit_action`` reads ``int(action[2]) if len(action) >= 3
+    else 1`` for both verbs. Reading it as 0 would label a real one-item
+    transfer as no transfer at all.
+
+    Args:
+        action: One recorded turn's action dict.
+        units: How many units are actually on the board this turn.
+
+    Returns:
+        A ``(1, MAX_UNITS)`` int64 tensor of bucket indices, ``IGNORE`` where
+        no count was chosen.
+
+    Raises:
+        TooManyUnitsError: If ``units`` exceeds ``MAX_UNITS``.
+    """
+    if units > MAX_UNITS:
+        raise TooManyUnitsError(f"{units} acting units exceeds MAX_UNITS={MAX_UNITS}")
+    ops = [action["farmer"], *action["hands"]][:units]
+    labels = torch.full((1, MAX_UNITS), IGNORE, dtype=torch.int64)
+    for index, op in enumerate(ops):
+        if TRANSFER_OPS[_label(op)]:
+            labels[0, index] = bucket_of(int(op[2]) if len(op) >= 3 else 1)
+    return labels
+
+
 def decode_units(
     logits: torch.Tensor,
     quantity_logits: torch.Tensor,

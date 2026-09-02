@@ -35,3 +35,10 @@ from pathlib import Path
 # `/data` would exist only on the workstation, and the submitted agent would
 # load nothing and play untrained with no error to say so.
 CHECKPOINT = Path(__file__).parent / "policy.pt"
+
+# The behaviour-cloned copy of our own strongest agent, written by
+# `scripts/clone_gate.py` and read by `clone_play.py`. It lives under `/data`
+# and not beside this file on purpose: it is a measurement, not a submission,
+# and nothing that ships may load it. `package.py` therefore cannot sweep it
+# into an archive by accident, and the 41 MB never enters the repository.
+CLONE_CHECKPOINT = Path("/data/kaggriculture/clone/policy.pt")
