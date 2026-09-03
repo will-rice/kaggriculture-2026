@@ -24,19 +24,32 @@ _RULES = RuleSet.model_validate_json({rules_json!r})
 
 
 def _load():
+    import inspect
+
     from kaggle_environments.agent import get_last_callable
 
-    return get_last_callable(_BASE_SOURCE, path="base.py")
+    base = get_last_callable(_BASE_SOURCE, path="base.py")
+    accepts_configuration = len(inspect.signature(base).parameters) >= 2
+    return base, accepts_configuration
 
 
-_BASE = _load()
+_BASE, _BASE_ACCEPTS_CONFIGURATION = _load()
 
 
 def agent(observation, configuration=None):
-    """Play the base agent, then apply any rule that fires this turn."""
-    try:
+    """Play the base agent, then apply any rule that fires this turn.
+
+    The base's arity is resolved once, at load time, by ``_load`` -- not
+    re-tried every turn -- because the base agents are stateful across turns
+    (module-level tallies mutated on every call). A per-turn
+    ``try: base(observation, configuration) / except TypeError:
+    base(observation)`` would call a single-argument base twice on its first
+    turn: once raising partway through, once succeeding. That silently
+    perturbs the exact state the wrapper exists to leave untouched.
+    """
+    if _BASE_ACCEPTS_CONFIGURATION:
         action = _BASE(observation, configuration)
-    except TypeError:
+    else:
         action = _BASE(observation)
     if not isinstance(action, dict):
         return action
