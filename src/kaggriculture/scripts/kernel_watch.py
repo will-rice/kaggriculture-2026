@@ -216,6 +216,10 @@ def extract(ref: str) -> str | None:
         if asserted and digest != asserted.group(1):
             raise ValueError(f"{ref}: payload digest {digest} != asserted")
         return raw.decode("utf-8")
+    embedded = embedded_source(cells)
+    if embedded is not None and loadable(embedded):
+        LOGGER.info("%s: agent embedded as a string, UNVERIFIED -- opponent only", ref)
+        return embedded
     return written_source(cells, ref)
 
 
@@ -385,6 +389,43 @@ def loadable(source: str) -> bool:
     except Exception:
         return False
     return True
+
+
+def embedded_source(cells: list[dict[str, Any]]) -> str | None:
+    """Return an agent a cell carries as a plain string it later writes out.
+
+    Some kernels neither compress their agent nor define it inline: they hold
+    it in a raw string, print its size, and write it to disk. Extracting the
+    surrounding cell gets the wrapper, whose last callable is not a policy, so
+    the candidate resolves and then fails on the first turn. The agent itself
+    is a string constant sitting in plain sight.
+
+    Only a constant is read, never a call, and nothing is executed to find it.
+
+    Args:
+        cells: The notebook's code cells.
+
+    Returns:
+        The largest embedded source that defines an agent, or None.
+    """
+    best: str | None = None
+    for cell in cells:
+        try:
+            tree = ast.parse("".join(cell["source"]))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                continue
+            candidate = value.value
+            if not re.search(ENTRYPOINT, candidate, re.M):
+                continue
+            if best is None or len(candidate) > len(best):
+                best = candidate
+    return best
 
 
 def payload_literal(text: str) -> str | None:

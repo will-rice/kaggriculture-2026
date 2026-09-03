@@ -186,3 +186,38 @@ def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
 
     assert played and Path(played[0]).is_absolute()
     assert ours.read_text(encoding="utf-8") == "# our real entrypoint"
+
+
+EMBEDS_AN_AGENT = '''
+AGENT_SOURCE = """
+def agent(observation, configuration=None):
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
+print(f"Embedded agent: {len(AGENT_SOURCE):,} characters")
+open("agent.py", "w").write(AGENT_SOURCE)
+'''
+
+
+def test_an_agent_carried_as_a_plain_string_is_recovered() -> None:
+    """Some kernels neither compress their agent nor define it inline.
+
+    One holds it in a raw string, prints its size and writes it out. Taking the
+    surrounding cell gets the wrapper, whose last callable is not a policy, so
+    the candidate resolved and then failed on turn one -- which the gate
+    reported as a crash rather than as a kernel we had misread.
+    """
+    cells = [{"cell_type": "code", "source": EMBEDS_AN_AGENT}]
+
+    recovered = kernel_watch.embedded_source(cells)
+
+    assert recovered is not None
+    assert "def agent(" in recovered
+    assert "Embedded agent:" not in recovered
+
+
+def test_a_cell_with_no_embedded_agent_yields_nothing() -> None:
+    """A string that merely mentions an agent is not an agent."""
+    cells = [{"cell_type": "code", "source": 'NOTE = "the agent is elsewhere"\n'}]
+
+    assert kernel_watch.embedded_source(cells) is None

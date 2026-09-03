@@ -191,6 +191,28 @@ def _inv_take(
 
 
 def _plant_guard(actions: torch.Tensor, state: SimState) -> torch.Tensor:
+    """Drop every PLANT for a crop whose requests this turn exceed its seeds.
+
+    KNOWN DIVERGENCE, latent for us and a trap for anything that mutates a
+    tape. The reference counts plant demand over ``[farmer, *hands_actions]``
+    -- every entry the agent SUBMITTED, whether or not it owns that hand --
+    while this counts only live slots. An action list naming more hands than
+    the seat owns therefore blocks planting in the reference and not here.
+    Measured on seed 900000 with 15 hand entries appended past the 5 owned:
+    reference [90883, 91472], simulator [104098, 103383] -- 13,215 phantom
+    coins, in OUR favour, which is the direction an optimiser would exploit.
+
+    It stays latent because everything we emit names only owned hands, and 96
+    of 96 recorded seasons replay here exactly. It stops being latent the
+    moment a search mutates a tape freely: fix this before trusting one.
+
+    Args:
+        actions: Per-unit op codes for the batch.
+        state: The simulator state the actions apply to.
+
+    Returns:
+        The actions with blocked PLANTs replaced by PASS.
+    """
     flat = actions.reshape(-1, MAX_UNITS).clone()
     device = flat.device
     op_crop = tensor_constant(_OP_CROP, dtype=torch.int64, device=device)
