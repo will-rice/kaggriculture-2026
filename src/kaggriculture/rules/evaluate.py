@@ -1,8 +1,10 @@
 """Apply a rule set to one turn's action. This is the part that ships.
 
-Kept allocation-light and free of imports beyond the standard library, because
-it runs 719 times per episode inside a one-second-per-step budget and travels
-into the submission archive.
+Kept allocation-light, because it runs 719 times per episode inside a
+one-second-per-step budget and travels into the submission archive. It does
+import ``kaggriculture.rules.spec`` (and, through it, pydantic) for the
+schema types -- there is no dependency free of that, only free of anything
+heavier.
 """
 
 import operator
@@ -64,11 +66,21 @@ def matches(condition: Condition, observation: Mapping[str, Any]) -> bool:
 def apply(
     rules: RuleSet, observation: Mapping[str, Any], action: dict[str, Any]
 ) -> dict[str, Any]:
-    """Return the action with every firing rule's effect applied, in order.
+    """Return a new action with every firing rule's effect applied, in order.
 
-    The action is copied rather than mutated: the base agent may hold a
-    reference to what it returned, and a rule that edited it in place would
-    corrupt the agent's own state between turns.
+    Every mutable field -- ``farmer``, each order in ``hands``, and
+    ``market`` -- is copied into a fresh list before anything runs, on every
+    call, whether or not a rule fires. Nothing in the return value ever
+    aliases the input: the base agent may hold a reference to what it
+    returned, and a rule -- or a future effect kind not yet imagined --
+    mutating a shared list in place would corrupt the agent's own state
+    between turns. A shallower copy (e.g. only copying ``market``, or only
+    copying when a rule fires) would be correct today, since only
+    ``market_insert``/``market_drop`` exist and both already build fresh
+    lists rather than mutate a shared one; it would silently stop being
+    correct the day an effect kind that touches ``farmer`` or ``hands`` is
+    added. Copying unconditionally removes that failure mode rather than
+    documenting and re-checking it.
 
     Args:
         rules: The rule set to apply.
@@ -76,16 +88,17 @@ def apply(
         action: The base agent's action for this turn.
 
     Returns:
-        A new action dict. Identical to the input when no rule fires.
+        A new action dict, equal to the input when no rule fires.
     """
-    firing = [rule for rule in rules.rules if matches(rule.condition, observation)]
-    if not firing:
-        return action
-    updated = dict(action)
-    market = list(updated.get("market", ()))
-    for rule in firing:
-        market = _apply_effect(rule.effect, market)
-    updated["market"] = market[:MAX_MARKET_ORDERS]
+    updated: dict[str, Any] = {
+        "farmer": list(action["farmer"]),
+        "hands": [list(order) for order in action["hands"]],
+        "market": list(action["market"]),
+    }
+    for rule in rules.rules:
+        if matches(rule.condition, observation):
+            updated["market"] = _apply_effect(rule.effect, updated["market"])
+    updated["market"] = updated["market"][:MAX_MARKET_ORDERS]
     return updated
 
 
