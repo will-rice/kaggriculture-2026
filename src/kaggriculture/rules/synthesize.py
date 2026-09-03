@@ -3,6 +3,15 @@
 An LLM proposal that does not validate is dropped rather than repaired: the
 schema is the contract, and silently fixing a malformed proposal would measure
 our repair rather than its idea.
+
+Two shapes are deliberately not repaired. A fence with no JSON inside logs
+what actually arrived and moves on -- worth knowing about, since a codex
+change that stops fencing its output would otherwise read as a silent string
+of empty batches. A single fence containing more than one JSON object is
+*not* split and salvaged: the contract is one candidate per fenced block, and
+guessing where one object ends and the next begins is exactly the kind of
+repair this module exists to avoid. It shows up as one dropped, logged parse
+failure, same as any other malformed block.
 """
 
 import json
@@ -28,8 +37,11 @@ def parse_candidates(text: str) -> list[RuleSet]:
     Returns:
         The candidates that parsed and validated, in order.
     """
+    blocks = _FENCE.findall(text)
+    if not blocks:
+        LOGGER.info("no fenced JSON block in model output: %r", text[:200])
     candidates: list[RuleSet] = []
-    for block in _FENCE.findall(text):
+    for block in blocks:
         try:
             candidates.append(RuleSet.model_validate(json.loads(block)))
         except (json.JSONDecodeError, ValidationError) as error:
@@ -45,16 +57,26 @@ def propose(prompt: str, timeout: float = 600.0) -> list[RuleSet]:
         timeout: Seconds to allow before giving up.
 
     Returns:
-        Validated candidate rule sets, possibly empty.
+        Validated candidate rule sets. Empty only means codex ran and wrote
+        no valid candidate -- a failed or timed-out invocation is never
+        folded into this list, so an empty return always means "codex
+        answered, but with nothing usable".
+
+    Raises:
+        subprocess.CalledProcessError: If ``codex exec`` exits nonzero. A
+            broken invocation is not a legitimate empty result.
+        subprocess.TimeoutExpired: If ``codex exec`` exceeds ``timeout``
+            seconds. A timeout is not an empty result either.
     """
-    result = subprocess.run(
-        ["codex", "exec", "--sandbox", "read-only", prompt],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode != 0:
-        LOGGER.info("codex exec failed: %s", result.stderr.strip()[:200])
-        return []
+    try:
+        result = subprocess.run(
+            ["codex", "exec", "--sandbox", "read-only", prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        LOGGER.warning("codex exec failed: %s", error.stderr.strip()[:200])
+        raise
     return parse_candidates(result.stdout)
