@@ -29,13 +29,29 @@ LOGGER = logging.getLogger(__name__)
 # Lineage -> the agent of ours that reproduces its opening signature, with the
 # share it held on 2026-09-01. The shares are recorded for provenance; they are
 # not used unless --occupancy is passed.
+# The first five are the lineages the census found on the ladder. The last two
+# are here because THE GATE SATURATED: two different candidates both scored
+# 1.0000 against those five, 128 games against each, which is a gate that can
+# no longer rank the things we are choosing between. An instrument every
+# candidate passes has stopped measuring. The router is the strongest agent
+# published in this competition and its successor is what a competitor
+# adopting that kernel gets today, so a candidate that cannot beat them is not
+# a contender whatever it does to the older band.
 FIELD: dict[str, tuple[str, float]] = {
     "router2929": ("/data/kaggriculture/opponents/yhay81_router2929/main.py", 18.4),
     "v54": ("src/kaggriculture/kaito_v54_policy.py", 15.2),
     "v56": ("src/kaggriculture/kaito_v56_policy.py", 14.5),
     "shopforge": ("/data/kaggriculture/opponents/tetsutani_shopforge/main.py", 8.6),
     "indarkarhana": ("/data/kaggriculture/opponents/indarkarhana_top10/main.py", 5.1),
+    "router_v1": ("/data/kaggriculture/agents/yhay81_router_v1/main.py", 0.0),
 }
+# router_v2, that kernel's later revision, is deliberately NOT here. Paired
+# against router_v1 it makes v1 bank exactly 0 in every seat and every seed --
+# a deterministic failure rather than a game, and one the crash guard cannot
+# see because both seats stay ACTIVE throughout. v1 is healthy against
+# shopforge and against our own compiled counter, so this is specific to that
+# pairing and not a general rule about compiled agents. Until it is
+# understood, an opponent that can zero a candidate is a poisoned gate.
 
 
 def main() -> None:
