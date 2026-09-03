@@ -221,3 +221,54 @@ def test_a_cell_with_no_embedded_agent_yields_nothing() -> None:
     cells = [{"cell_type": "code", "source": 'NOTE = "the agent is elsewhere"\n'}]
 
     assert kernel_watch.embedded_source(cells) is None
+
+
+def test_a_notebooks_own_compiler_line_is_read_as_a_literal() -> None:
+    """The top agent in this competition is C++ and must be built to be gated.
+
+    Its notebook assigns the command as a list of string constants and hands it
+    to subprocess. Reading the literal keeps the build the author's own while
+    still never evaluating a cell to discover it.
+    """
+    cell = (
+        "import subprocess\n"
+        'command = ["g++", "-O3", "-shared", "-fPIC", "-o", "agent.so", "p.cpp"]\n'
+        "subprocess.run(command, check=True)\n"
+    )
+
+    assert kernel_watch.compiler_command(cell) == [
+        "g++",
+        "-O3",
+        "-shared",
+        "-fPIC",
+        "-o",
+        "agent.so",
+        "p.cpp",
+    ]
+
+
+def test_a_compiler_line_with_a_computed_argument_is_declined() -> None:
+    """A partially-literal command is the dangerous case, not the obvious one.
+
+    A list holding a name among its constants still parses as a list, and
+    reading it would silently drop that argument and build with a command the
+    author never wrote. Dropping ``-o agent.so``'s target, or an include path,
+    yields a binary that is not the published agent.
+    """
+    cell = 'command = ["g++", flag, "-o", "agent.so", "p.cpp"]\n'
+
+    assert kernel_watch.compiler_command(cell) is None
+
+
+def test_a_command_assembled_by_concatenation_is_declined() -> None:
+    """A cell that builds its arguments cannot be read without running it."""
+    cell = 'flags = ["-O3"]\ncommand = ["g++"] + flags\n'
+
+    assert kernel_watch.compiler_command(cell) is None
+
+
+def test_a_cell_that_runs_no_compiler_yields_nothing() -> None:
+    """Only a compiler invocation counts; ordinary lists must not match."""
+    cell = 'names = ["alpha", "beta"]\n'
+
+    assert kernel_watch.compiler_command(cell) is None

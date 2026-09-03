@@ -129,6 +129,24 @@ def report(ref: str, gate_seeds: int, workers: int) -> None:
         gate_seeds: How many exam seeds to play, both seat orderings.
         workers: Arena processes.
     """
+    # A compiled kernel is tried first, because its main.py extracts perfectly
+    # well as source and is useless on its own: it loads an agent.so that only
+    # exists once the notebook's own build cell has run. Left to the source
+    # path it resolves, then fails on the first turn.
+    built = build_compiled(ref)
+    if built is not None:
+        rate, low, high, games = gate(built, gate_seeds, workers)
+        LOGGER.info(
+            "%s [compiled]: FIELD %.4f Wilson [%.4f, %.4f] over %d games",
+            ref,
+            rate,
+            low,
+            high,
+            games,
+        )
+        if low > 0.80:
+            LOGGER.info("   CANDIDATE. Archive at %s", built.parent)
+        return
     source = extract(ref)
     if source is None:
         LOGGER.info("%s: no verifiable agent payload; skipped", ref)
@@ -176,6 +194,88 @@ def report(ref: str, gate_seeds: int, workers: int) -> None:
                 ref,
                 label,
             )
+
+
+def build_compiled(ref: str) -> Path | None:
+    """Build a kernel that ships a compiled agent, and return its entrypoint.
+
+    The strongest agent in this competition is C++: its notebook writes
+    policy.cpp, several headers and a pinned tape, then compiles them into an
+    agent.so that main.py loads through ctypes. Extraction sees a main.py that
+    imports a shared library which does not exist, so it read as a kernel with
+    no agent, and the gate then reported the ctypes failure. Since the top of
+    the field publishes this way, the scan builds it.
+
+    Everything is taken from the notebook: the ``%%writefile`` targets are its
+    own, and the compiler line is the one its own build cell runs. The build
+    happens in the kernel's work directory because the agent needs its .so
+    beside it, and a compiled artifact cannot be handed around as source.
+
+    Args:
+        ref: The kernel ref, already pulled.
+
+    Returns:
+        The path to a runnable main.py, or None if this kernel is not one.
+    """
+    import subprocess
+
+    directory = WORK / ref.replace("/", "__")
+    cells = published_cells(directory)
+    if cells is None:
+        return None
+    build: list[str] | None = None
+    wrote = False
+    for cell in cells:
+        text = "".join(cell["source"])
+        first = text.split("\n")[0]
+        if text.lstrip().startswith("%%") and "writefile" in first:
+            target = directory / first.split()[-1]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("\n".join(text.split("\n")[1:]), encoding="utf-8")
+            wrote = True
+            continue
+        found = compiler_command(text)
+        if found is not None:
+            build = found
+    if not wrote or build is None:
+        return None
+    LOGGER.info("%s: compiled agent, building with %s", ref, build[0])
+    result = subprocess.run(build, cwd=directory, capture_output=True, text=True)
+    if result.returncode != 0:
+        LOGGER.info("%s: build failed: %s", ref, result.stderr.strip()[:200])
+        return None
+    entry = directory / "main.py"
+    return entry if entry.exists() else None
+
+
+def compiler_command(text: str) -> list[str] | None:
+    """Return the compiler invocation a build cell runs, read as a literal.
+
+    Only a list of string constants is accepted, so the command is read rather
+    than evaluated and a cell that computes its arguments is declined instead
+    of executed.
+
+    Args:
+        text: One notebook code cell's source.
+
+    Returns:
+        The argument list, or None if the cell runs no compiler.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.List):
+            continue
+        parts = [
+            element.value
+            for element in node.value.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        ]
+        if len(parts) == len(node.value.elts) and parts and parts[0] in ("g++", "gcc"):
+            return parts
+    return None
 
 
 def extract(ref: str) -> str | None:
