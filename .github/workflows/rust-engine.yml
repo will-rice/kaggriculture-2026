@@ -1,0 +1,42 @@
+# The Rust engine's only justification is being identical to the reference
+# interpreter, so every change runs both its own tests and the Python
+# differential campaign that drives it and the reference through one tape.
+name: rust-engine
+
+on:
+  push:
+    paths:
+      - "rust/**"
+      - "tests/rust/**"
+      - ".github/workflows/rust-engine.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "tests/rust/**"
+      - ".github/workflows/rust-engine.yml"
+
+jobs:
+  crate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest tests/rust --rust-episodes=4 --rust-turns=719

@@ -37,8 +37,10 @@ relies on, and the places where the engine disagrees with the documentation.
 │       ├── run.py             # Evaluate against the built-in agents
 │       ├── package.py         # Build submission.tar.gz
 │       └── submit.py          # Package and upload to Kaggle
+├── rust/                      # Rust port of the reference engine (see rust/README.md)
 ├── docs/competition.md        # Competition notes
 ├── tests/                     # Test files
+│   └── rust/                  # Drives the Rust engine and the reference through one tape
 ├── pyproject.toml             # Project metadata and dependencies
 ├── .pre-commit-config.yaml    # Pre-commit hooks configuration
 └── .env.example               # Example environment variables
