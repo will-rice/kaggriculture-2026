@@ -7,6 +7,7 @@ image may lack network access to install ours -- either way the script below
 falls back to this repo's vendored copy without ever reaching the network.
 """
 
+import os
 import subprocess
 from importlib.metadata import version
 from pathlib import Path
@@ -71,12 +72,22 @@ def load_test(tarball: Path) -> str:
     script = SCRIPT.format(
         tarball_name=tarball.name, ke_version=KAGGLE_ENVIRONMENTS_VERSION
     )
+    work = tarball.resolve().parent
+    # Docker creates a missing bind-mount target itself, as root, before the
+    # container's --user ever applies -- so the mountpoint has to exist on
+    # the host, owned by us, before the mount happens.
+    (work / "kaggle_environments").mkdir(exist_ok=True)
     command = [
         "docker",
         "run",
         "--rm",
+        "--pull=never",
+        "--network",
+        "none",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
         "-v",
-        f"{tarball.resolve().parent}:/work",
+        f"{work}:/work",
         "-v",
         f"{VENV_KAGGLE_ENVIRONMENTS}:/work/kaggle_environments:ro",
         IMAGE,
