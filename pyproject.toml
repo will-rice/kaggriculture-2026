@@ -42,6 +42,10 @@ root = ["./src"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+  "slow: hundreds of tapes; run with -m slow before trusting the engine",
+]
+addopts = "-m 'not slow'"
 
 [project.scripts]
 package = "kaggriculture.scripts.package:main"
