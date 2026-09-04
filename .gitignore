@@ -264,3 +264,6 @@ data/*.db
 # build product of a run recorded in wandb, content-addressed by the identity
 # block it carries, not source.
 src/kaggriculture/market_residual/generated/
+
+# Compiled engine bridge: rebuildable from bridge.cpp by build.build().
+src/kaggriculture/campaign/engine/*.so
