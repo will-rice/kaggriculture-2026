@@ -1,0 +1,162 @@
+"""What a sandbox may run, and what it may not."""
+
+from pathlib import Path
+
+import pytest
+
+from kaggriculture.campaign import config, harness
+from kaggriculture.constants import EPISODE_STEPS
+
+# An episode records `EPISODE_STEPS` states and so takes one fewer transition;
+# the terminal state is never acted on, so the last counter an agent sees is
+# two below the configured length. Measured on the reference engine, not
+# derived: `make(...).reset()` then stepping PASS to `done` last reports 718.
+LAST_ACTED_STEP = EPISODE_STEPS - 2
+
+PASS_AGENT = """
+def agent(observation, configuration=None):
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
+SLOW_AGENT = """
+import time
+def agent(observation, configuration=None):
+    time.sleep(0.6)
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
+# The Kaggle runner truncates (observation, configuration) to the callable's
+# arity, so an agent declaring one parameter is called with one. Held-out
+# opponent salemali7_2900 is such an agent and raised on its first turn until
+# the harness matched the runner.
+ONE_ARGUMENT_AGENT = """
+def agent(observation):
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
+
+# The port exports `step` on seat zero's observation only; the framework
+# writes it onto every seat at call time, and vendored agents index their
+# opening book by it. An agent that saw a frozen 0 would replay turn one for
+# the whole episode without ever raising.
+STEP_RECORDING_AGENT = """
+from pathlib import Path
+
+DIRECTORY = Path("{directory}")
+
+
+def agent(observation, configuration=None):
+    seat = observation["player"]
+    (DIRECTORY / f"seat{{seat}}.txt").write_text(
+        str(observation["step"]), encoding="utf-8"
+    )
+    return {{"farmer": ["PASS"], "hands": [], "market": []}}
+"""
+
+
+@pytest.fixture
+def one_argument_agent(tmp_path: Path) -> Path:
+    """Write an agent whose signature declares only ``observation``."""
+    path = tmp_path / "main.py"
+    path.write_text(ONE_ARGUMENT_AGENT, encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def pass_agent(tmp_path: Path) -> Path:
+    """Write the agent that does nothing at all, on any observation."""
+    path = tmp_path / "main.py"
+    path.write_text(PASS_AGENT, encoding="utf-8")
+    return path
+
+
+def test_play_refuses_exam_seeds(pass_agent: Path) -> None:
+    """The exam seeds belong to the deep evaluation; the harness will not spend them."""
+    with pytest.raises(ValueError, match="exam"):
+        harness.play(pass_agent, ["v54"], [config.EXAM_SEEDS[0]], workers=1)
+
+
+def test_play_refuses_a_path_where_a_name_belongs(pass_agent: Path) -> None:
+    """A sandbox may name an opponent, never point at one."""
+    with pytest.raises(KeyError):
+        harness.play(
+            pass_agent,
+            ["/data/kaggriculture/opponents/kaito_v54/main.py"],
+            [1],
+            workers=1,
+        )
+
+
+def test_play_reports_both_seats_and_latency(pass_agent: Path) -> None:
+    """Every seed is played from both seats, timing the candidate's own calls."""
+    games = harness.play(pass_agent, ["v54"], [1, 2], workers=2)
+    assert [(g.seed, g.seat) for g in games] == [(1, 0), (1, 1), (2, 0), (2, 1)]
+    assert all(g.ours == 3000.0 for g in games)
+    assert all(g.worst_step_seconds < 0.5 for g in games)
+
+
+def test_play_passes_each_side_the_arguments_its_signature_declares(
+    one_argument_agent: Path,
+) -> None:
+    """Both the candidate and the opponent here take one argument."""
+    games = harness.play(one_argument_agent, ["salemali7_2900"], [11], workers=2)
+    assert all(game.ours == 3000.0 and game.theirs > 3000.0 for game in games)
+
+
+def test_play_gives_both_seats_the_step_counter(tmp_path: Path) -> None:
+    """Seat one gets the counter the framework, not the interpreter, writes."""
+    agent = tmp_path / "main.py"
+    agent.write_text(STEP_RECORDING_AGENT.format(directory=tmp_path), encoding="utf-8")
+    harness.play(agent, ["v54"], [11], workers=2)
+    seen = {
+        seat: int((tmp_path / f"seat{seat}.txt").read_text(encoding="utf-8"))
+        for seat in (0, 1)
+    }
+    assert seen == {0: LAST_ACTED_STEP, 1: LAST_ACTED_STEP}
+
+
+def test_play_caps_workers_at_the_core_budget(pass_agent: Path) -> None:
+    """The box's other tenants keep the cores the budget reserves for them."""
+    with pytest.raises(ValueError, match="CORE_BUDGET"):
+        harness.play(pass_agent, ["v54"], [1], workers=config.CORE_BUDGET + 1)
+
+
+def test_check_loads_as_kaggle_does_and_times_steps(pass_agent: Path) -> None:
+    """A well-formed agent loads, keeps its opening bank and reports its latency."""
+    report = harness.check(pass_agent)
+    assert report.loaded and report.error is None and report.bank == 3000.0
+    assert report.worst_step_seconds < 0.5
+
+
+def test_check_calls_a_one_argument_agent_the_way_kaggle_does(
+    one_argument_agent: Path,
+) -> None:
+    """An agent declaring one parameter is called with one."""
+    report = harness.check(one_argument_agent, steps=5)
+    assert report.loaded and report.error is None
+
+
+def test_check_flags_a_slow_agent(tmp_path: Path) -> None:
+    """A per-call cost over the budget is reported rather than averaged away."""
+    slow = tmp_path / "main.py"
+    slow.write_text(SLOW_AGENT, encoding="utf-8")
+    report = harness.check(slow, steps=5)
+    assert report.worst_step_seconds >= 0.5
+
+
+def test_package_places_main_and_the_engine_library_at_the_root(
+    pass_agent: Path, tmp_path: Path
+) -> None:
+    """What Kaggle unpacks: entrypoint, library, plumbing, no campaign."""
+    import tarfile
+
+    archive = harness.package(pass_agent, tmp_path / "submission.tar.gz")
+    with tarfile.open(archive) as tar:
+        listed = tar.getnames()
+    names = set(listed)
+    assert "main.py" in names and "kaggriculture_engine.so" in names
+    assert "kaggriculture/constants.py" in names
+    assert not any(name.startswith("kaggriculture/campaign") for name in names)
+    # A duplicated member is invisible to a set of names and to `tar -x`, which
+    # simply overwrites; it doubles the upload and reads as a corrupt archive.
+    assert sorted(listed) == sorted(names)
