@@ -28,17 +28,17 @@ dimension. Read §1 as a finding about tape corpora, not about the policy.
 Measured on the **identical 3,937,244 turn-slots** that produced the 355,281
 baseline, which reproduces exactly, confirming both measure the same thing.
 
-| stream | vocab | hapax | % of vocab | % of slots | slots |
-|---|---|---|---|---|---|
-| whole-turn (baseline) | 355,281 | 278,484 | 78.38% | 7.073% | 3,937,244 |
-| `unit_op` | 41 | 0 | 0.00% | 0.00000% | 42,386,711 |
-| `unit_quantity` | 20 | 0 | 0.00% | 0.00000% | 42,386,711 |
-| `market_slot` | 23 | 0 | 0.00% | 0.00000% | 8,559,072 |
-| `market_quantity` | 133 | 19 | 14.29% | 0.00022% | 8,559,072 |
-| **combined** | **217** | 19 | | | |
+| stream                | vocab   | hapax   | % of vocab | % of slots | slots      |
+| --------------------- | ------- | ------- | ---------- | ---------- | ---------- |
+| whole-turn (baseline) | 355,281 | 278,484 | 78.38%     | 7.073%     | 3,937,244  |
+| `unit_op`             | 41      | 0       | 0.00%      | 0.00000%   | 42,386,711 |
+| `unit_quantity`       | 20      | 0       | 0.00%      | 0.00000%   | 42,386,711 |
+| `market_slot`         | 23      | 0       | 0.00%      | 0.00000%   | 8,559,072  |
+| `market_quantity`     | 133     | 19      | 14.29%     | 0.00022%   | 8,559,072  |
+| **combined**          | **217** | 19      |            |            |            |
 
 **Losslessness verified against the engine, not against its own inverse.**
-Byte-exact round-trip is 99.154%. Pushing *both* the original and the
+Byte-exact round-trip is 99.154%. Pushing _both_ the original and the
 round-tripped action through the repo's `sim.rollout.encode_turn`, on 4,744
 differing turns sampled 1-in-7, **4,744 of 4,744 encode to identical simulator
 codes**. Every divergence is an item the engine never reads, or a
@@ -52,8 +52,8 @@ preserved, no affordability mask; quantity as a plain integer; `UNKNOWN` and
 **Alias fix, done structurally.** `FEED WHEAT` (32,872 slots) and
 `FERTILIZE FERTILIZER` (8,469) are 0.097% of unit slots. Verified in the
 reference engine: `op = action[0]`, and `action[1]` is read only inside the
-PLANT / PICKUP / PLACE branches. The tokenizer now reads an item *only for the
-three verbs that take one*, so the entire alias class is unrepresentable rather
+PLANT / PICKUP / PLACE branches. The tokenizer now reads an item _only for the
+three verbs that take one_, so the entire alias class is unrepresentable rather
 than two strings deleted. Shards keep old indices; `dataset.unit_remap()`
 builds the remap **by name**, and `simdecode` raises a named error rather than
 a device-side assert if an un-remapped label arrives.
@@ -64,10 +64,10 @@ a device-side assert if an un-remapped label arrives.
 **13 minutes**. 850 teams; held out **85 teams / 4,155 tapes**, by team and
 never by tape. Median bank 92,912; win rate 0.4904.
 
-| key | distinct | largest | top-5 | singletons |
-|---|---|---|---|---|
-| step-1 market queue | 241 | 20.4% | **51.1%** | 15 |
-| opening-24 | 575 | 18.0% | **40.5%** | 138 (24.0%) |
+| key                 | distinct | largest | top-5     | singletons  |
+| ------------------- | -------- | ------- | --------- | ----------- |
+| step-1 market queue | 241      | 20.4%   | **51.1%** | 15          |
+| opening-24          | 575      | 18.0%   | **40.5%** | 138 (24.0%) |
 
 - largest cluster: 8,937 tapes, 142 teams, median bank **85,898**, win 0.485
 - strong cluster (5th): 2,601 tapes, 94 teams, median bank **131,152**, win 0.512
@@ -103,16 +103,16 @@ median |simulated − published| = 0 coins.**
 
 ## 5. Central strategic finding
 
-| condition | win rate | cost | games |
-|---|---|---|---|
-| own opponent, own seed | 0.562 | — | 105 |
-| own opponent, **exam seeds** | 0.508 | seed −0.054 | 1,680 |
-| **top-1% opponent** (bank 160,177 vs 88,422), exam seeds, **still frozen** | 0.434 | strength −0.074 | 4,480 |
-| **live lineages**, exam seeds | 0.004–0.017 | **live opponent −0.42** | 768 each |
+| condition                                                                  | win rate    | cost                    | games    |
+| -------------------------------------------------------------------------- | ----------- | ----------------------- | -------- |
+| own opponent, own seed                                                     | 0.562       | —                       | 105      |
+| own opponent, **exam seeds**                                               | 0.508       | seed −0.054             | 1,680    |
+| **top-1% opponent** (bank 160,177 vs 88,422), exam seeds, **still frozen** | 0.434       | strength −0.074         | 4,480    |
+| **live lineages**, exam seeds                                              | 0.004–0.017 | **live opponent −0.42** | 768 each |
 
 **It is neither the seed nor opponent strength. What kills a frozen tape is an
 opponent that can re-plan.** The control is strong by construction: the frozen
-top-1% opponents were *produced by* the same lineages the gate plays live, so
+top-1% opponents were _produced by_ the same lineages the gate plays live, so
 strength is matched and only "thinking versus not" remains. Per-tape spread
 against the frozen top-1%: [0.12, 0.33, 0.44, 0.61, 0.66], best 0.83.
 
@@ -125,7 +125,7 @@ all six lineages 0.0.
 a seed, and the seed is most of it." **Wrong.** Across 105 tapes × 16 exam
 seeds median retention is **0.961**, quartiles [0.646, 0.783, 0.961, 1.153,
 1.53]. The tape generalised from retained 0.22 — below the 10th percentile —
-and was chosen *because* it was extreme. What survives:
+and was chosen _because_ it was extreme. What survives:
 **Spearman(recorded bank, other-seed bank) = 0.232**, and the **top decile
 transfers to 76,210 against a corpus-wide 80,916 — worse than average.**
 Do not rank harvested seats by episode bank.
@@ -135,10 +135,10 @@ Do not rank harvested seats by episode bank.
 64 plans, closed-loop inside the exact simulator, legality-masked, against
 top-5% opponents. The real seat that faced those opponents won 0.219.
 
-| temp | bank | win | distinct openings | reproduces top opening |
-|---|---|---|---|---|
-| 0.7 | **269** | 0.016 | 64/64 | 0.000 |
-| 1.0 | **98** | 0.000 | 64/64 | 0.000 |
+| temp | bank    | win   | distinct openings | reproduces top opening |
+| ---- | ------- | ----- | ----------------- | ---------------------- |
+| 0.7  | **269** | 0.016 | 64/64             | 0.000                  |
+| 1.0  | **98**  | 0.000 | 64/64             | 0.000                  |
 
 Zero samples reproduce the monoculture — **and that means nothing.** Novelty
 measured on garbage is not creativity.
@@ -154,7 +154,7 @@ around for 719 turns.
 **The absorbing-state mechanism, which is a fact about the game rather than
 about this model:** movement is legal almost everywhere and the productive
 verbs are legal only in specific states, so once a policy drifts somewhere
-nothing productive is legal, the only actions *left* are movement and PASS,
+nothing productive is legal, the only actions _left_ are movement and PASS,
 which drifts it further. It has no representation of a destination because the
 16 slots are drawn independently. **A self-play policy with per-unit
 conditionally-independent heads inherits this risk.** The mask is not starving
@@ -162,21 +162,21 @@ it — the actions are legal and varied, just useless.
 
 ## 7. No second life as a proposal distribution
 
-| | top-1 | top-2 | top-3 | top-5 |
-|---|---|---|---|---|
-| unit slots | 0.7553 | 0.8307 | 0.8781 | 0.9275 |
+|                       | top-1      | top-2  | top-3  | top-5      |
+| --------------------- | ---------- | ------ | ------ | ---------- |
+| unit slots            | 0.7553     | 0.8307 | 0.8781 | 0.9275     |
 | **active unit slots** | **0.4974** | 0.6522 | 0.7496 | **0.8511** |
-| order slots | 0.9434 | 0.9644 | 0.9728 | 0.9827 |
+| order slots           | 0.9434     | 0.9644 | 0.9728 | 0.9827     |
 
 Read the middle row; the other two flatter it. On slots where a unit acts,
-top-1 is a coin flip, and top-5 *out of 44 ops* misses one slot in seven.
+top-1 is a coin flip, and top-5 _out of 44 ops_ misses one slot in seven.
 Keeping 5 candidates across 16 slots retains ~`0.851**16` ≈ **7% of the true
 turn** while blowing branching to `5**16`. That is a worse search, not a
 narrower one.
 
 **Legal-random control**, same rollout with the model switched off: prior mean
 bank **21.4** (median 0, max 992, win 0.0) against legal-random **0.0** (median
-0, max 0, win 0.0). The prior learned *something* — it does not instantly
+0, max 0, win 0.0). The prior learned _something_ — it does not instantly
 bankrupt itself — but that is a difference between two kinds of failure against
 a corpus median of 92,912.
 
@@ -205,7 +205,7 @@ shipped, 1.0000 best) nothing here is progress.
 ## 10. Operational notes, all learned the hard way
 
 - **`CUDA_DEVICE_ORDER` defaults to `FASTEST_FIRST`**, so torch's `cuda:0` was
-  the *reserved* card. Pin by UUID.
+  the _reserved_ card. Pin by UUID.
 - **The simulator `step` is launch-bound:** 310 ms at batch 4, 144 ms at 64,
   148 ms at 256. Always batch every (plan × opponent × seed) pair into one call.
 - **`pgrep -f` matches your own monitor shells** — two jobs launched twice and

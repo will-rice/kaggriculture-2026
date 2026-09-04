@@ -11,7 +11,7 @@ candidate at 640 games. Results feed back and the LLM proposes the next batch.
 
 The distinction that makes it work: **you cannot precompute the answer, but you
 can precompute the function.** Which plan to switch to depends on the shop
-draw, the seed, and the opponent's play — none known until runtime. The *rule*
+draw, the seed, and the opponent's play — none known until runtime. The _rule_
 mapping those observations to a choice is fixed, and that is what gets written
 in advance.
 
@@ -112,7 +112,7 @@ Non-negotiable, each item earned by a failure on this project.
   a different failure — the ctypes collision. Never run two compiled agents in
   one episode.
 - **Never rank candidates by recorded bank.** Spearman between recorded bank
-  and bank on other seeds is 0.232, and the top decile transfers *worse* than
+  and bank on other seeds is 0.232, and the top decile transfers _worse_ than
   average.
 - The bar: our shipped `squeeze_v58` gates 0.9115, `counter_43_38` 1.0000.
   A rule set below 0.9115 is not progress.

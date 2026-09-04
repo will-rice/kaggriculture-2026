@@ -10,18 +10,13 @@ requires-python = ">=3.11"
 dependencies = [
   "kaggle-environments>=1.32.7",
   "kaggle>=1.7.4",
-  "lightning>=2.6.5",
-  "optuna==4.9.0",
-  "optuna-integration[wandb]==4.9.0",
   "pre-commit>=4.1.0",
   "pydantic>=2.12.2",
   "pytest>=8.3.4",
   "python-dotenv>=1.1.1",
   "ruff>=0.9.7",
-  "torch>=2.13.0",
   "tqdm>=4.70.0",
   "ty>=0.0.18",
-  "wandb>=0.28.1",
 ]
 
 [build-system]
@@ -39,151 +34,16 @@ select = ["C", "E", "F", "I", "W", "D", "N", "B", "PTH", "ANN"]
 ignore = ["D107"]
 exclude = [".venv"]
 
-# The vendored policies are decoded copies of published kernels' agents: three
-# generations of one author's agent (v21.1, v22, v23) and one descendant of
-# them by another author. They are formatted and import-sorted like everything
-# else -- provenance is checked by diffing against the cached kernel under
-# /data/kaggriculture/kernels, not by leaving our copy untouched, and
-# `tests/test_kaito_policy.py` and `tests/test_vendored_policies.py` pin their
-# behaviour.
-#
-# What is ignored is only the rules that would have us assert things about them
-# we have not established. Annotating nineteen functions nobody here has read
-# means writing down types we have not checked, and documenting them means
-# claiming to know what they do. Named rules rather than a blanket exclude, so
-# an undefined name, an unused import or a mutable default still fails.
-[tool.ruff.lint.per-file-ignores]
-"src/kaggriculture/kaito_policy.py" = [
-  "ANN",  # types we have not verified
-  "D103", # docstrings would claim understanding we do not have
-  "C901", # the retrieval function is complex; it is not ours to simplify
-]
-"src/kaggriculture/kaito_v22_policy.py" = ["ANN", "D103", "C901", "B905"]
-"src/kaggriculture/kaito_v23_policy.py" = ["ANN", "D103", "C901", "B905"]
-"src/kaggriculture/boatlee_v14_policy.py" = ["ANN", "D103", "C901", "B905"]
-# v54 and v56 are the vendored kernels kept byte-verbatim, so their ignore lists
-# have to cover what a file we may not touch happens to contain, not just what we
-# decline to assert about it: `E402` and `I001` because they import from the
-# modules their own payload injects into `sys.modules`, which can only happen
-# after those lines have run, and `E501` for a handful of payload lines. Every
-# one of these would be a one-line edit in a file we were allowed to edit, and
-# that is precisely the edit that would invalidate the digest in its header.
-"src/kaggriculture/kaito_v54_policy.py" = [
-  "ANN",
-  "D103",
-  "C901",
-  "B905",
-  "E402", # imports resolve only after the bundled payload is exec'd
-  "I001", # so they cannot be sorted into the header block
-  "E501", # two payload lines
-]
-# v56 adds `F811` and it is the one entry here that is not a formatting
-# concession: the file really does define `agent` and
-# `_kaggle_submission_entrypoint` twice, and ruff is right to say so. The
-# duplicate is the reason the entry point is a third function,
-# `kaggle_agent_v56`; silencing the diagnostic is only safe because
-# `tests/test_vendored_policies.py` asserts which of the three we resolve to,
-# from the file as committed. Do not add `F811` to any file we wrote.
-"src/kaggriculture/kaito_v56_policy.py" = [
-  "ANN",
-  "D103",
-  "E402", # imports resolve only after the bundled payload is exec'd
-  "I001", # so they cannot be sorted into the header block
-  "E501", # three payload lines
-  "F811", # `agent` is defined twice; `kaggle_agent_v56` is the entry point
-]
-# These tests reach into the vendored modules' private tables on purpose: the
-# tables are the agent, and a truncated blob is invisible from outside.
-"tests/test_vendored_policies.py" = ["ANN001", "SLF001"]
-
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
-# The same bargain the ruff per-file-ignores above strike, for the type checker.
-# The vendored agents read an untyped observation dict and feed it to `int()`,
-# which ty cannot prove is safe and neither can we -- the author can, and the
-# published kernel runs. Narrowing it would mean editing code we do not own to
-# satisfy a checker, which is exactly the rewrite this project refuses. One
-# rule, named, on the vendored files only: everything else about them is still
-# checked, and every file we did write is checked in full.
-[[tool.ty.overrides]]
-include = [
-  "src/kaggriculture/kaito_policy.py",
-  "src/kaggriculture/kaito_v22_policy.py",
-  "src/kaggriculture/kaito_v23_policy.py",
-  "src/kaggriculture/boatlee_v14_policy.py",
-]
-
-[tool.ty.overrides.rules]
-invalid-argument-type = "ignore"
-
-# v54 and v56 need one rule the others do not. They import
-# `v49.residual_controller` and `v50.hybrid`, which are not on disk anywhere:
-# their payload decodes an ancestor agent and registers it under those names in
-# `sys.modules` before the import lines run. ty resolves imports statically and
-# cannot see that, and it is right not to -- there is no file. The import
-# genuinely works, which `tests/test_vendored_policies.py` demonstrates by
-# playing an episode with it.
-[[tool.ty.overrides]]
-include = [
-  "src/kaggriculture/kaito_v54_policy.py",
-  "src/kaggriculture/kaito_v56_policy.py",
-]
-
-[tool.ty.overrides.rules]
-invalid-argument-type = "ignore"
-unresolved-import = "ignore"
-
-# The same bargain again, for Toad Brigade's learner. `.pre-commit-config.yaml`
-# already excludes this tree from every formatting hook, and for the identical
-# reason: it is vendored verbatim from the artifact we are reproducing, and a
-# copy we have edited can no longer tell a bad result in their recipe from a bad
-# transcription of it.
-#
-# The diagnostics here are not fixable in principle, only in appearance. The
-# tree imports `lux_gym`, `omegaconf` and other modules from the parts of their
-# repository we deliberately did NOT vendor -- we took the learner, not the Lux
-# game -- so those imports cannot resolve and would not resolve if we tried. The
-# rest follow from their functions being unannotated, which is a property of
-# their source.
-#
-# This is scoped to the vendored directory alone. Everything we wrote around it
-# -- `toad_loss.py`, `toad_reward.py`, `scripts/toad.py` and their tests
-# -- is still checked in full.
-[[tool.ty.overrides]]
-include = [
-  "src/kaggriculture/learn/toad/core/**",
-  "src/kaggriculture/learn/toad/nns/**",
-  "src/kaggriculture/learn/toad/monobeast.py",
-  "src/kaggriculture/learn/toad/reward_spaces_lux.py",
-]
-
-[tool.ty.overrides.rules]
-unresolved-import = "ignore"
-unresolved-attribute = "ignore"
-invalid-argument-type = "ignore"
-invalid-assignment = "ignore"
-invalid-return-type = "ignore"
-unsupported-operator = "ignore"
-not-subscriptable = "ignore"
-invalid-type-form = "ignore"
-call-non-callable = "ignore"
-no-matching-overload = "ignore"
-# Their `torch.cuda.amp.autocast` call. Modernising it would be an edit to the
-# artifact, which is the one thing this vendoring may not do.
-deprecated = "ignore"
+[tool.ty.environment]
+root = ["./src"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
-markers = [
-  "cuda: requires a CUDA device supporting BF16",
-  "compile: requires torch.compile support",
-  "economic_acceptance: production Trainer and real economic-opponent gate",
-  "slow: reads the replay corpus; minutes, not seconds",
-]
-addopts = "-m 'not slow'"
 
 [project.scripts]
-run = "kaggriculture.scripts.run:main"
 package = "kaggriculture.scripts.package:main"
 submit = "kaggriculture.scripts.submit:main"
+campaign = "kaggriculture.campaign.harness:main"

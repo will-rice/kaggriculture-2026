@@ -72,8 +72,8 @@
 Add these exact dependencies:
 
 ```toml
-  "optuna==4.9.0",
-  "optuna-integration[wandb]==4.9.0",
+"optuna==4.9.0",
+"optuna-integration[wandb]==4.9.0",
 ```
 
 Run:

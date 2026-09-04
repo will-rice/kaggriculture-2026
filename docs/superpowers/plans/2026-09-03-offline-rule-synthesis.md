@@ -22,28 +22,30 @@
 
 ## File Structure
 
-| file | responsibility |
-|---|---|
-| `src/kaggriculture/rules/spec.py` | `RuleSpec`, `Condition`, `Effect` Pydantic models — the schema |
-| `src/kaggriculture/rules/evaluate.py` | `RuleEvaluator` — applies rules to an observation |
-| `src/kaggriculture/rules/agent.py` | `build_rule_agent` — wraps a base agent file into a runnable agent |
-| `src/kaggriculture/rules/synthesize.py` | `propose` — runs `codex exec`, parses and validates candidates |
-| `src/kaggriculture/scripts/rule_search.py` | the screen/gate loop CLI |
-| `tests/rules/test_spec.py` | schema validation and rejection |
-| `tests/rules/test_evaluate.py` | condition matching and effect application |
-| `tests/rules/test_agent.py` | the wrapped agent plays and is byte-identical when no rule fires |
-| `tests/rules/test_synthesize.py` | parsing and rejecting LLM output, without calling the LLM |
+| file                                       | responsibility                                                     |
+| ------------------------------------------ | ------------------------------------------------------------------ |
+| `src/kaggriculture/rules/spec.py`          | `RuleSpec`, `Condition`, `Effect` Pydantic models — the schema     |
+| `src/kaggriculture/rules/evaluate.py`      | `RuleEvaluator` — applies rules to an observation                  |
+| `src/kaggriculture/rules/agent.py`         | `build_rule_agent` — wraps a base agent file into a runnable agent |
+| `src/kaggriculture/rules/synthesize.py`    | `propose` — runs `codex exec`, parses and validates candidates     |
+| `src/kaggriculture/scripts/rule_search.py` | the screen/gate loop CLI                                           |
+| `tests/rules/test_spec.py`                 | schema validation and rejection                                    |
+| `tests/rules/test_evaluate.py`             | condition matching and effect application                          |
+| `tests/rules/test_agent.py`                | the wrapped agent plays and is byte-identical when no rule fires   |
+| `tests/rules/test_synthesize.py`           | parsing and rejecting LLM output, without calling the LLM          |
 
 ---
 
 ### Task 1: The rule schema
 
 **Files:**
+
 - Create: `src/kaggriculture/rules/__init__.py`
 - Create: `src/kaggriculture/rules/spec.py`
 - Test: `tests/rules/__init__.py`, `tests/rules/test_spec.py`
 
 **Interfaces:**
+
 - Consumes: nothing.
 - Produces: `Condition`, `Effect`, `RuleSpec`, `RuleSet` — all `pydantic.BaseModel`. `RuleSet.rules: tuple[RuleSpec, ...]`. `RuleSet.digest() -> str` returns a 64-hex sha256 of the canonical JSON.
 
@@ -216,10 +218,12 @@ git commit -m "feat: a rule schema an LLM can write and an evaluator can run"
 ### Task 2: The evaluator
 
 **Files:**
+
 - Create: `src/kaggriculture/rules/evaluate.py`
 - Test: `tests/rules/test_evaluate.py`
 
 **Interfaces:**
+
 - Consumes: `Condition`, `Effect`, `RuleSpec`, `RuleSet` from Task 1.
 - Produces: `read_field(observation: dict, field: str) -> float`, `matches(condition: Condition, observation: dict) -> bool`, `apply(rules: RuleSet, observation: dict, action: dict) -> dict`.
 
@@ -438,10 +442,12 @@ git commit -m "feat: evaluate rules against one turn's action"
 ### Task 3: The wrapped agent
 
 **Files:**
+
 - Create: `src/kaggriculture/rules/agent.py`
 - Test: `tests/rules/test_agent.py`
 
 **Interfaces:**
+
 - Consumes: `RuleSet` from Task 1, `apply` from Task 2.
 - Produces: `write_rule_agent(base: Path, rules: RuleSet, target: Path) -> Path` — writes a self-contained agent file that the engine's loader can run.
 
@@ -590,6 +596,7 @@ Expected: PASS, 2 tests. The first is slow (two full seasons); that is expected.
 - [ ] **Step 5: Verify the generated agent resolves the way the engine will**
 
 Run:
+
 ```bash
 uv run python -c "
 from pathlib import Path
@@ -600,6 +607,7 @@ target = write_rule_agent(Path('/data/kaggriculture/agents/tuned_v58_h7_ratio225
 print('entrypoint:', resolved_entrypoint(target))
 "
 ```
+
 Expected: `entrypoint: agent`. The engine's loader takes the last callable a file
 leaves behind, so anything defined after `agent` would be played instead.
 
@@ -615,16 +623,18 @@ git commit -m "feat: write a self-contained agent from a rule set and a base"
 ### Task 4: The synthesizer
 
 **Files:**
+
 - Create: `src/kaggriculture/rules/synthesize.py`
 - Test: `tests/rules/test_synthesize.py`
 
 **Interfaces:**
+
 - Consumes: `RuleSet` from Task 1.
 - Produces: `parse_candidates(text: str) -> list[RuleSet]` and `propose(prompt: str, timeout: float) -> list[RuleSet]`.
 
 - [ ] **Step 1: Write the failing tests**
 
-```python
+````python
 """Parsing is tested without calling the LLM; the LLM is tested by hand once."""
 
 from kaggriculture.rules.synthesize import parse_candidates
@@ -638,7 +648,7 @@ def test_a_fenced_json_block_is_parsed() -> None:
 {"rules": [{"name": "prebuy",
   "condition": {"field": "step", "op": "eq", "value": 0},
   "effect": {"kind": "market_insert", "order": ["BUY_PRODUCT", "WHEAT", 51], "at": 0}}]}
-```
+````
 
 That should squeeze their opening."""
 
@@ -647,26 +657,39 @@ That should squeeze their opening."""
     assert len(candidates) == 1
     assert candidates[0].rules[0].name == "prebuy"
 
-
 def test_an_invalid_candidate_is_dropped_not_raised() -> None:
-    """One bad proposal in a batch must not lose the good ones."""
-    text = """
+"""One bad proposal in a batch must not lose the good ones."""
+text = """
+
 ```json
-{"rules": [{"name": "bad", "condition": {"field": "opponent.private.seeds",
-  "op": "ge", "value": 1}, "effect": {"kind": "market_insert", "order": [], "at": 0}}]}
+{
+  "rules": [
+    {
+      "name": "bad",
+      "condition": {
+        "field": "opponent.private.seeds",
+        "op": "ge",
+        "value": 1
+      },
+      "effect": { "kind": "market_insert", "order": [], "at": 0 }
+    }
+  ]
+}
 ```
+
 ```json
-{"rules": []}
+{ "rules": [] }
 ```
+
 """
 
     assert len(parse_candidates(text)) == 1
 
-
 def test_output_with_no_json_yields_nothing() -> None:
-    """A refusal or an error message is not a candidate."""
-    assert parse_candidates("I could not determine a good rule.") == []
-```
+"""A refusal or an error message is not a candidate."""
+assert parse_candidates("I could not determine a good rule.") == []
+
+````
 
 - [ ] **Step 2: Run the tests and capture RED**
 
@@ -736,7 +759,7 @@ def propose(prompt: str, timeout: float = 600.0) -> list[RuleSet]:
         LOGGER.info("codex exec failed: %s", result.stderr.strip()[:200])
         return []
     return parse_candidates(result.stdout)
-```
+````
 
 - [ ] **Step 4: Run the tests and capture GREEN**
 
@@ -746,6 +769,7 @@ Expected: PASS, 3 tests.
 - [ ] **Step 5: Smoke-test `codex exec` once, by hand**
 
 Run:
+
 ```bash
 uv run python -c "
 import logging; logging.basicConfig(level=logging.INFO)
@@ -757,6 +781,7 @@ print('candidates:', len(out))
 print(out[0].model_dump_json(indent=1) if out else 'none')
 "
 ```
+
 Expected: at least one candidate. If zero, read the raw stdout before changing
 the parser — the failure is more likely in the prompt than in the regex.
 
@@ -772,10 +797,12 @@ git commit -m "feat: ask codex for rule sets and keep the ones that validate"
 ### Task 5: The screen and gate loop
 
 **Files:**
+
 - Create: `src/kaggriculture/scripts/rule_search.py`
 - Test: `tests/rules/test_rule_search.py`
 
 **Interfaces:**
+
 - Consumes: `RuleSet` (Task 1), `write_rule_agent` (Task 3), `propose` (Task 4).
 - Produces: `screen(candidates, base, seeds, workers) -> list[tuple[RuleSet, float]]` and `main()`.
 
@@ -962,8 +989,8 @@ Task 4. The screen/gate loop and result feedback → Task 5. The exam-seed rule,
 the 640-game bar, win-rate ranking and the crash signatures are in Global
 Constraints and enforced by tests in Tasks 2 and 5.
 
-**Gap accepted deliberately.** The spec's requirement that rules *condition on
-the opponent* is only partly met: `READABLE_FIELDS` exposes the opponent's
+**Gap accepted deliberately.** The spec's requirement that rules _condition on
+the opponent_ is only partly met: `READABLE_FIELDS` exposes the opponent's
 money, hands and hires, not their board tiles. Reading tiles needs a richer
 condition language, and building it before we know whether the loop produces
 anything is speculative. It is the first extension, and the spec's open

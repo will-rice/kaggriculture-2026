@@ -10,52 +10,16 @@ import logging
 import shutil
 import tarfile
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
-
-from kaggriculture.routes import STORE
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_ROOT = REPO_ROOT / "src" / "kaggriculture"
 ENTRYPOINT = REPO_ROOT / "main.py"
 SUBMISSION = REPO_ROOT / "submission.tar.gz"
 
-# ``copytree`` applies these at every directory level, so one "scripts" entry
-# drops both ``kaggriculture/scripts`` and ``kaggriculture/learn/scripts``.
-#
-# ``learn`` itself is no longer excluded: the trained policy is the agent now,
-# and ``learn/play.py`` imports ``learn/model.py``, ``learn/encoding.py`` and
-# the checkpoint beside them. ``corpus.py`` and ``dataset.py`` are named here
-# instead, one file at a time, because they are training-only and pull in tqdm
-# and a ``/data`` path the sandbox does not have.
-#
-# ``learn`` goes entirely: ``main.py`` serves the route agent, which imports
-# none of it, and shipping it carried a 39 MB checkpoint the archive never
-# loaded -- measured, an archive built with it was 41.7 MB and `torch` was
-# absent from ``sys.modules`` after a full episode. Excluding the package also
-# removes any path by which a later edit could import torch into the agent and
-# spend 10.7 s of the 60 s overage pool.
-#
-# ``*.pt`` and the prototype store are excluded so that ``build`` is the single
-# thing that decides they ship. Left to ``copytree``, each would be included
-# exactly when a harvest run happened to have left it in the source tree, and
-# absent without complaint when it had not.
-#
-# ``search`` is offline hill-climbing tooling: it plays hundreds of games
-# against a league to find a better route, work that has no place in a 4 MB
-# agent archive regardless of what it imports today. It happens to import no
-# torch right now, but that is not the reason it is excluded -- a later edit
-# could add one, and this entry means that edit cannot also reintroduce it
-# into the submission.
-EXCLUDED = shutil.ignore_patterns(
-    "__pycache__", "scripts", "learn", "search", "*.pt", STORE.name
-)
-
-# The two build artifacts the archive cannot be assembled without, each mapped
-# to the module that produces it. Both are gitignored, so a fresh checkout has
-# neither, and both are loaded from beside the package at play time -- an
-# archive missing one is not a degraded agent but a broken one.
-REQUIRED = {STORE: "kaggriculture.routes.scripts.harvest"}
+# ``scripts`` and ``campaign`` are offline tooling -- packaging, submission and
+# the codex-driven search -- that has no place in a 4 MB agent archive.
+EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "campaign")
 
 
 def main() -> None:
@@ -71,57 +35,25 @@ def main() -> None:
     )
 
 
-def build(
-    output: Path = SUBMISSION,
-    *,
-    entrypoint: Path = ENTRYPOINT,
-    required: Mapping[Path, str] = REQUIRED,
-) -> Path:
+def build(output: Path = SUBMISSION, *, entrypoint: Path = ENTRYPOINT) -> Path:
     """Write the submission archive and return its path.
 
-    The packaging scripts themselves are left out: they import ``argparse`` and
-    the Kaggle client, neither of which the agent needs at play time.
-
-    ``REQUIRED`` is copied in explicitly rather than left to ``copytree``,
-    which would pick each file up only when it happened to be sitting in the
-    source tree. Both are gitignored build artifacts, so a fresh checkout has
-    neither, and the failure is silent in the direction that matters: without
-    the checkpoint the archive ships a policy of random weights that plays a
-    full episode and loses without ever raising, and without the store the
-    route agent raises ``FileNotFoundError`` on turn zero, in the sandbox,
-    where nobody sees it until the leaderboard reads zero.
+    The packaging and campaign packages are left out: they import ``argparse``,
+    the Kaggle client and codex tooling, none of which the served agent needs
+    at play time.
 
     Args:
         output: Where to write the archive.
-        entrypoint: Self-contained root ``main.py`` to stage. The default remains
-            the repository's served Boatlee entrypoint.
-        required: Package-local generated artifacts and their producer modules.
-            Tests may pass an empty mapping for a self-contained alternate agent.
+        entrypoint: Self-contained root ``main.py`` to stage. The default is
+            the repository's served entrypoint.
 
     Returns:
         ``output``, unchanged.
-
-    Raises:
-        FileNotFoundError: If a required build artifact has not been produced.
     """
-    validated_required = _validate_required(required)
     with tempfile.TemporaryDirectory() as staging:
         root = Path(staging)
         package = root / PACKAGE_ROOT.name
         shutil.copytree(PACKAGE_ROOT, package, ignore=EXCLUDED)
-        staged_root = package.resolve(strict=True)
-        for artifact, relative in validated_required:
-            destination = package / relative
-            canonical_destination = destination.resolve(strict=False)
-            if staged_root not in canonical_destination.parents:
-                raise ValueError(
-                    f"required artifact escapes staged package: {artifact}"
-                )
-            if destination.exists() and (
-                destination.is_symlink() or destination.stat().st_nlink != 1
-            ):
-                raise ValueError(f"unsafe staged package destination: {destination}")
-            shutil.copy(artifact, destination)
         staged_entrypoint = root / "main.py"
         shutil.copy(entrypoint, staged_entrypoint)
         _refuse_a_shadowed_entrypoint(staged_entrypoint)
@@ -129,42 +61,6 @@ def build(
             for path in sorted(root.iterdir()):
                 archive.add(path, arcname=path.name)
     return output
-
-
-def _validate_required(required: Mapping[Path, str]) -> list[tuple[Path, Path]]:
-    """Resolve package-local inputs before any staging directory is created."""
-    validated: list[tuple[Path, Path]] = []
-    package_root = PACKAGE_ROOT.resolve(strict=True)
-    for artifact, producer in required.items():
-        worktree_default = required is REQUIRED and artifact == STORE
-        if not artifact.is_file():
-            raise FileNotFoundError(
-                f"no {artifact.name} at {artifact} — run "
-                f"`uv run python -m {producer}` first"
-            )
-        if artifact.is_symlink() and not worktree_default:
-            raise ValueError(
-                f"required package artifact may not be a symlink: {artifact}"
-            )
-        try:
-            relative = artifact.relative_to(PACKAGE_ROOT)
-        except ValueError as error:
-            raise ValueError(
-                f"required artifact must be inside package root: {artifact}"
-            ) from error
-        if ".." in relative.parts:
-            raise ValueError(
-                f"required artifact contains package traversal: {artifact}"
-            )
-        canonical = artifact.resolve(strict=True)
-        if package_root not in canonical.parents and not worktree_default:
-            raise ValueError(f"required artifact escapes package root: {artifact}")
-        if artifact.stat().st_nlink != 1 and not worktree_default:
-            raise ValueError(
-                f"required package artifact may not be a hardlink: {artifact}"
-            )
-        validated.append((artifact, relative))
-    return validated
 
 
 def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
