@@ -7,8 +7,16 @@ and runs before the imports and shadowed-entrypoint checks so a wholesale
 copy of an opponent (see roster "v56", whose real submission imports its
 own modules and names its real entrypoint something other than `agent` on
 purpose) reports as a copy, not as an unrelated contract or import
-complaint about code that was never ours to bound -- and only then does a
-candidate earn ~20s of reference-engine time in `harness.check`.
+complaint about code that was never ours to bound. The imports check
+itself has two layers: `ast.Import`/`ast.ImportFrom` nodes, and calls --
+`__import__`, `eval`, `exec`, `compile`, `open`, `input`, and anything
+rooted at `importlib` -- that reach a module or a resource without ever
+naming it in an import statement. The shadowed-entrypoint check has two
+layers too: a syntactic pass over top-level definitions, and a dynamic one
+that loads the module the way Kaggle's runner does, because a decorator or
+a conditional definition can rebind the last name in ways no AST walk
+sees. Only once every one of those clears does a candidate earn ~20s of
+reference-engine time in `harness.check`.
 """
 
 import ast
@@ -62,6 +70,11 @@ class Verdict(BaseModel):
     worst_step_seconds: float = 0.0
 
 
+_DENIED_CALLS: frozenset[str] = frozenset(
+    {"__import__", "eval", "exec", "compile", "open", "input"}
+)
+
+
 def _has_top_level_agent(tree: ast.Module) -> bool:
     """Whether a top-level function literally named ``agent`` exists."""
     return any(
@@ -69,15 +82,44 @@ def _has_top_level_agent(tree: ast.Module) -> bool:
     )
 
 
+def _top_level_callable_name(node: ast.stmt) -> str | None:
+    """The name a top-level statement binds, if the value it binds is callable.
+
+    A `def` or `class` always binds a callable; an assignment binds one only
+    when its value is a `lambda` -- an ordinary value (a dict, a number)
+    does not shadow anything Kaggle's loader would call instead.
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    if isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda):
+        names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        return names[-1] if names else None
+    if (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.value, ast.Lambda)
+        and isinstance(node.target, ast.Name)
+    ):
+        return node.target.id
+    return None
+
+
 def _last_top_level_callable_name(tree: ast.Module) -> str | None:
-    """The name of the last top-level function Kaggle's runner would call.
+    """The name of the last top-level callable Kaggle's runner would call.
 
     ``get_last_callable`` takes the last callable defined in the file, not
-    the one named ``agent`` -- a helper defined after ``agent`` would run
-    instead of it, silently.
+    the one named ``agent`` -- a helper defined after ``agent`` (a function,
+    a class, or a lambda bound to a name) would run instead of it, silently.
+    This is the syntactic half of that rule; `validate` also checks it
+    dynamically, against the actual module namespace, right before
+    `harness.check` -- a decorator or a conditional definition can rebind
+    the last name without looking like it from the syntax alone.
     """
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-    return functions[-1].name if functions else None
+    names = [
+        name
+        for node in tree.body
+        if (name := _top_level_callable_name(node)) is not None
+    ]
+    return names[-1] if names else None
 
 
 def _forbidden_import(tree: ast.Module) -> str | None:
@@ -93,6 +135,62 @@ def _forbidden_import(tree: ast.Module) -> str | None:
             top = name.split(".", 1)[0]
             if top not in ALLOWED_IMPORTS:
                 return name
+    return None
+
+
+def _forbidden_call(tree: ast.Module) -> str | None:
+    """The first call that reaches a module without ever naming it in an import.
+
+    `ast.Import`/`ast.ImportFrom` are not the only door to a module:
+    `__import__` (and `eval`/`exec`/`compile`, which can build and run an
+    `__import__` call from a string) reach any module by name at runtime,
+    bypassing `ALLOWED_IMPORTS` entirely. `open` and `input` are blocked the
+    same way, as the same kind of ambient access a sandboxed agent must not
+    have. `importlib` is already unimportable, but a call chain rooted at
+    that name is rejected explicitly too, for a reason that names it rather
+    than relying on the import check having caught it first.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _DENIED_CALLS:
+            return func.id
+        if isinstance(func, ast.Attribute):
+            root = func.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id == "importlib":
+                return f"importlib.{func.attr}"
+    return None
+
+
+def _shadowed_entrypoint(tree: ast.Module, agent: Path) -> Verdict | None:
+    """Whether something other than `agent` is the callable Kaggle would run.
+
+    Checked twice: syntactically, over top-level definitions; then
+    dynamically, against the loaded module's actual namespace -- a
+    decorator or a conditional definition can rebind the last name in ways
+    no AST walk sees. A load failure at the dynamic layer is exactly what
+    `harness.check` would report as `crashed` a moment later, so it is
+    reported the same way here.
+    """
+    last_name = _last_top_level_callable_name(tree)
+    if last_name != "agent":
+        return Verdict(
+            status="contract",
+            reason=f"agent is shadowed by {last_name!r}, the last top-level definition",
+        )
+    try:
+        last_callable = harness.load_agent(agent)
+    except Exception as error:  # noqa: BLE001 - a candidate's own failure
+        return Verdict(status="crashed", reason=f"{type(error).__name__}: {error}")
+    loaded_name = getattr(last_callable, "__name__", "<anonymous>")
+    if loaded_name != "agent":
+        return Verdict(
+            status="contract",
+            reason=f"agent is shadowed by {loaded_name!r}, the last callable",
+        )
     return None
 
 
@@ -126,22 +224,25 @@ def validate(agent: Path, steps: int = 720) -> Verdict:
         name = offender.split(":", 1)[0]
         return Verdict(status="copy", reason=f"{score:.3f} similar to {name}")
 
-    forbidden = _forbidden_import(tree)
-    if forbidden is not None:
+    forbidden_import = _forbidden_import(tree)
+    if forbidden_import is not None:
         return Verdict(
-            status="imports", reason=f"import of {forbidden!r} is not allowed"
+            status="imports", reason=f"import of {forbidden_import!r} is not allowed"
         )
 
-    # A cheap AST check, but it must run after the copy check: a copied
-    # opponent's own wrapper-name games -- see roster "v56", whose last
-    # top-level function is not named ``agent`` on purpose -- would
-    # otherwise report the wrong reason for the same rejected file.
-    last_name = _last_top_level_callable_name(tree)
-    if last_name != "agent":
+    forbidden_call = _forbidden_call(tree)
+    if forbidden_call is not None:
         return Verdict(
-            status="contract",
-            reason=f"agent is shadowed by {last_name!r}, the last top-level function",
+            status="imports", reason=f"call to {forbidden_call!r} is not allowed"
         )
+
+    # Checked after the copy check: a copied opponent's own wrapper-name
+    # games -- see roster "v56", whose last callable is not named ``agent``
+    # on purpose -- would otherwise report the wrong reason for the same
+    # rejected file.
+    shadowed = _shadowed_entrypoint(tree, agent)
+    if shadowed is not None:
+        return shadowed
 
     report = harness.check(agent, steps=steps)
     if not report.loaded or report.error is not None:

@@ -56,6 +56,41 @@ def test_forbidden_import(tmp_path: Path) -> None:
     assert verdict.status == "imports" and "socket" in verdict.reason
 
 
+def test_dunder_import_bypasses_the_import_statement_check(tmp_path: Path) -> None:
+    """`__import__` reaches a module without ever naming it in an import."""
+    source = GOOD + '\nsock = __import__("socket")\n'
+    verdict = validate.validate(write(tmp_path, source))
+    assert verdict.status == "imports" and "__import__" in verdict.reason
+
+
+def test_eval_is_a_forbidden_call(tmp_path: Path) -> None:
+    """`eval` can build and run an `__import__` call from a string."""
+    source = GOOD + "\nresult = eval('1')\n"
+    verdict = validate.validate(write(tmp_path, source))
+    assert verdict.status == "imports" and "eval" in verdict.reason
+
+
+def test_trailing_class_shadows_the_entrypoint(tmp_path: Path) -> None:
+    """A trailing top-level `class` is also a callable that would run instead."""
+    source = GOOD + "\n\nclass Zzz:\n    pass\n"
+    verdict = validate.validate(write(tmp_path, source))
+    assert verdict.status == "contract" and "last" in verdict.reason
+
+
+def test_trailing_lambda_shadows_the_entrypoint(tmp_path: Path) -> None:
+    """A trailing name bound to a `lambda` shadows `agent` the same way a def would."""
+    source = GOOD + "\nhelper = lambda o, c=None: {'farmer': ['PASS']}\n"
+    verdict = validate.validate(write(tmp_path, source))
+    assert verdict.status == "contract" and "last" in verdict.reason
+
+
+def test_trailing_async_def_shadows_the_entrypoint(tmp_path: Path) -> None:
+    """A trailing top-level `async def` is invisible to a `FunctionDef`-only check."""
+    source = GOOD + "\nasync def zzz():\n    pass\n"
+    verdict = validate.validate(write(tmp_path, source))
+    assert verdict.status == "contract" and "last" in verdict.reason
+
+
 def test_copied_opponent(tmp_path: Path) -> None:
     """A wholesale copy of an opponent is caught, and named, before the harness.
 
@@ -66,6 +101,14 @@ def test_copied_opponent(tmp_path: Path) -> None:
         write(tmp_path, roster.path("v56").read_text(encoding="utf-8"))
     )
     assert verdict.status == "copy" and "v56" in verdict.reason
+
+
+def test_copied_opponent_reason_never_names_a_path(tmp_path: Path) -> None:
+    """The copy verdict names the roster key, never the file it lives at."""
+    verdict = validate.validate(
+        write(tmp_path, roster.path("v56").read_text(encoding="utf-8"))
+    )
+    assert "/data" not in verdict.reason
 
 
 def test_crash(tmp_path: Path) -> None:
