@@ -4,6 +4,13 @@ An archived episode carries its seed in ``info.seed`` and the reference
 engine's own observation at every step, so replaying its actions through the
 port and comparing is a differential test against the oracle with no
 reference-engine time at all.
+
+Tests parametrize over plain integers, not over ``tapes.Episode`` instances:
+pytest evaluates a parametrize decorator's arguments at collection time, and
+loading episodes there would mean every ``pytest`` invocation in this repo —
+including the pre-commit hook, on every commit — pays for parsing however
+many tapes the slow test needs, before ``-m 'not slow'`` gets a chance to
+deselect it. ``tapes.qualifying`` defers that work into the test body.
 """
 
 import pytest
@@ -17,11 +24,10 @@ def strip(observation: dict) -> dict:
     return {k: v for k, v in observation.items() if k != "remainingOverageTime"}
 
 
-@pytest.mark.parametrize("episode", tapes.sample(8), ids=lambda e: str(e.seed))
-def test_replaying_an_archived_episode_reproduces_every_observation(
-    episode: tapes.Episode,
-) -> None:
+@pytest.mark.parametrize("i", range(8), ids=lambda i: f"tape{i}")
+def test_replaying_an_archived_episode_reproduces_every_observation(i: int) -> None:
     """Replaying an archived episode's actions must reproduce every observation."""
+    episode = tapes.qualifying(i)
     engine = Engine(seed=episode.seed)
     for index in range(1, len(episode.steps)):
         recorded = episode.steps[index]
@@ -39,7 +45,7 @@ def test_replaying_an_archived_episode_reproduces_every_observation(
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("episode", tapes.sample(200), ids=lambda e: str(e.seed))
-def test_two_hundred_episodes(episode: tapes.Episode) -> None:
+@pytest.mark.parametrize("i", range(200), ids=lambda i: f"tape{i}")
+def test_two_hundred_episodes(i: int) -> None:
     """The full acceptance sweep: 200 archived episodes, zero disagreement."""
-    test_replaying_an_archived_episode_reproduces_every_observation(episode)
+    test_replaying_an_archived_episode_reproduces_every_observation(i)
