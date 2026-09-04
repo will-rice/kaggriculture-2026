@@ -20,6 +20,7 @@ class OutcomeScores(list[float]):
     def __init__(self) -> None:
         super().__init__()
         self.margins: list[int] = []
+        self.members: list[str] = []
         self.failures: list[str] = []
         self.runtime_seconds = 0.0
 
@@ -86,9 +87,13 @@ def outcomes(
 ) -> OutcomeScores:
     """Score the candidate against every league member, both seats, ties as half.
 
-    Order is fixed: league member, then seed, then seat (candidate in seat
-    zero, then seat one), ``2 * len(seeds)`` entries per member. A game that
-    raises is recorded in ``failures`` and contributes no score.
+    Games are played in a fixed order -- league member, then seed, then seat
+    (candidate in seat zero, then seat one) -- but a game that raises is
+    recorded in ``failures`` and contributes no entry to ``scores`` or
+    ``scores.members``, so a failure shortens its member's own run rather than
+    shifting every later member's games into the wrong slot. ``members[i]``
+    names whose game ``scores[i]`` (and ``margins[i]``) belongs to; that
+    parallel list, not position, is what ``summarize`` attributes by.
     """
     started = perf_counter()
     work: list[_Work] = [
@@ -100,7 +105,7 @@ def outcomes(
     with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
         results = list(pool.map(_one_outcome, work))
     scores = OutcomeScores()
-    for _name, _seed, seat, banks, failure in results:
+    for name, _seed, seat, banks, failure in results:
         if failure is not None:
             scores.failures.append(failure)
             continue
@@ -108,19 +113,28 @@ def outcomes(
         ours, theirs = banks if seat == 0 else banks[::-1]
         scores.append(_win(ours, theirs))
         scores.margins.append(ours - theirs)
+        scores.members.append(name)
     scores.runtime_seconds = perf_counter() - started
     return scores
 
 
-def summarize(
-    scores: Sequence[float], league: Mapping[str, str], seeds: Sequence[int]
-) -> dict[str, float]:
-    """One win rate per league member, over ``2 * len(seeds)`` games each."""
-    games = 2 * len(seeds)
-    return {
-        name: sum(scores[i * games : (i + 1) * games]) / games
-        for i, name in enumerate(league)
-    }
+def summarize(scores: OutcomeScores, league: Mapping[str, str]) -> dict[str, float]:
+    """One win rate per league member, over the games actually scored for it.
+
+    Attribution is by ``scores.members``, not by position, so a member that
+    lost games to failures is averaged over the games it actually has rather
+    than a fixed-width slice that would drift into a neighbour's scores. A
+    member with zero scored games (every one of its games failed) gets 0.0.
+    """
+    summary = {}
+    for name in league:
+        games = [
+            score
+            for score, member in zip(scores, scores.members, strict=True)
+            if member == name
+        ]
+        summary[name] = sum(games) / len(games) if games else 0.0
+    return summary
 
 
 def _win(ours: int, theirs: int) -> float:
