@@ -2,20 +2,34 @@
 
 Independent programs that solve the same game share vocabulary (the op
 names, the item names) but not eight consecutive tokens; a lifted block
-does. Measured on the roster corpus (39 files, ~42k shingles): a realistic
-~60-line independent agent, written fresh against the shared op/item
-vocabulary, scores 0.0 against every corpus file — no 8-token window it
-produces happens to recur anywhere. A 200-line block lifted verbatim from
-the middle of `shopforge`'s 3,778 lines and pasted into the PASS skeleton
-scores 0.048 against `shopforge:main.py` (the Jaccard denominator carries
-the other ~3,700 unshared lines of that file, so even an exact lift reads
-well under 1.0). THRESHOLD is set at 0.02: below the measured lift with
-room to spare, above the independent agent's exact-zero floor. A verbatim
-opponent file scores 1.0, as expected.
+does — and stays sharing them under non-semantic reformatting, because the
+tokenizer sees words, numbers, and lone punctuation characters, never
+whitespace or quote style. Measured on the roster corpus (39 files, ~42k
+shingles):
+
+- a verbatim opponent file (`v54:main.py` fed back in) scores 1.0.
+- the PASS skeleton (~10 lines) scores 0.0062 against its best match.
+- a realistic 70-line independent agent (53 non-blank lines: watering,
+  harvesting, planting, hiring, and selling branches — the size an evolved
+  candidate will actually be) scores 0.0066 against its best match.
+- a 200-line block lifted verbatim from the middle of `shopforge`'s
+  3,778 lines, pasted into the skeleton, scores 0.152 against
+  `shopforge:main.py`.
+- a 110-line block lifted verbatim from `indarkarhana`'s
+  `e749a_niklita_consensus_network.py` (lines 91-200) scores 0.231.
+- that same 110-line block after collapsing whitespace around `:`, `,`,
+  `=`, `->` and swapping `"` for `'` — what an LLM asked to "rewrite this"
+  would produce — still scores 0.231: byte-identical tokens either way.
+
+THRESHOLD is the log-midpoint between the independent score (0.0066) and
+the smaller of the two lifted-block scores (0.152), rounded down for
+margin: sqrt(0.0066 * 0.152) ~= 0.032, so THRESHOLD = 0.03 sits about
+4.5x above the independent floor and 5x below the weakest lift.
 """
 
 import functools
 import logging
+import re
 from pathlib import Path
 
 from kaggriculture.campaign import roster
@@ -23,26 +37,32 @@ from kaggriculture.campaign import roster
 logger = logging.getLogger(__name__)
 
 K = 8
-THRESHOLD = 0.02
+THRESHOLD = 0.03
 CORPUS_SUFFIXES = (".py", ".cpp", ".inc", ".hpp")
 ENGINE_DIR = Path(__file__).parent / "engine"
 
+# Identifiers/keywords, numbers, or a single punctuation character. Quote
+# characters are excluded from the punctuation class so `"x"` and `'x'`
+# tokenize identically; whitespace never matches, so it never produces a
+# token and reformatting (spacing, line breaks) cannot change the stream.
+_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|\d+(?:\.\d+)?|[^\w\s'\"`]")
+
 
 def tokens(source: str) -> list[str]:
-    """Whitespace-delimited tokens.
+    """Formatting-invariant tokens: words, numbers, and lone punctuation.
 
-    Python's `tokenize` was tried first, but it drops comments and string
-    literals as a single opaque unit each — and several opponents store
-    their strategy as a literal data table (a big string constant). A
-    fragment lifted from the middle of such a table tokenizes as ordinary
-    code once it loses its enclosing quotes, while the source file that
-    still has the quotes tokenizes it as one dropped STRING token: the two
-    sides never share a single token, let alone a shingle. Splitting on
-    whitespace has no such asymmetry — it is the same one scheme for every
-    file, Python or C++, syntactically valid or not — so a lifted block
-    always shingle-matches the file it was lifted from.
+    Whitespace-splitting (tried first) is defeated by non-semantic
+    reformatting: collapsing the spaces around `:`, `,`, `=`, `->` glues
+    tokens together, and swapping `"` for `'` changes every string token —
+    exactly what an LLM asked to "rewrite this" will do to a lifted block.
+    A regex tokenizer that treats punctuation characters individually and
+    drops quote marks is invariant to both: `x: int = 1` and `x:int=1`
+    yield the same token stream, and `"WATER"` and `'WATER'` yield the
+    same token. It also treats every file — Python, C++, and any embedded
+    data table — the same way, since it never depends on the text being
+    syntactically valid in any particular language.
     """
-    return source.split()
+    return _TOKEN_RE.findall(source)
 
 
 def shingles(source: str, k: int = K) -> set[tuple[str, ...]]:

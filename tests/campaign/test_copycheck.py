@@ -1,5 +1,6 @@
 """Copied code cannot pass the gate."""
 
+import re
 from pathlib import Path
 
 from kaggriculture.campaign import copycheck, roster
@@ -11,12 +12,15 @@ SKELETON = Path("src/kaggriculture/served/main.py").read_text(encoding="utf-8")
 # candidate will actually be, so its score is the one the threshold must
 # clear.
 INDEPENDENT_AGENT = '''
-"""A small farming agent: water thirsty crops, harvest ready ones, buy seed."""
+"""A small farming agent: water thirsty crops, harvest ready ones, buy seed,
+hire a hand when cash is flush, and sell whatever is piling up in storage."""
 
 from collections.abc import Mapping
 from typing import Any
 
 ITEMS = ["wheat", "corn", "tomato", "chicken", "cow", "sheep"]
+HIRE_COST_CEILING = 5_000
+STORAGE_SELL_FLOOR = 20
 
 
 def _thirsty(tile: Mapping[str, Any]) -> bool:
@@ -36,10 +40,32 @@ def _farmer_action(observation: Mapping[str, Any], farmer: Mapping[str, Any]) ->
         return "WATER"
     if tile.get("crop") is None and farmer.get("holding") == "seed":
         return "PLANT"
+    if farmer.get("holding") in ITEMS:
+        return "DROP"
     return "NORTH"
 
 
+def _should_hire(observation: Mapping[str, Any]) -> bool:
+    cash = observation.get("cash", 0)
+    hire_price = observation.get("hire_price", HIRE_COST_CEILING + 1)
+    farmers = observation.get("farmers", [])
+    return cash > hire_price * 3 and len(farmers) < 4
+
+
+def _oversupplied_item(observation: Mapping[str, Any]) -> str | None:
+    storage = observation.get("storage", {})
+    for item in ITEMS:
+        if storage.get(item, 0) >= STORAGE_SELL_FLOOR:
+            return item
+    return None
+
+
 def _market_action(observation: Mapping[str, Any]) -> list[Any]:
+    if _should_hire(observation):
+        return ["HIRE"]
+    surplus = _oversupplied_item(observation)
+    if surplus is not None:
+        return ["SELL", surplus]
     cash = observation.get("cash", 0)
     prices = observation.get("prices", {})
     for item in ITEMS:
@@ -51,7 +77,7 @@ def _market_action(observation: Mapping[str, Any]) -> list[Any]:
 def agent(
     observation: Mapping[str, Any], configuration: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Water what is thirsty, harvest what is ready, buy seed when flush."""
+    """Water, harvest, plant, hire when flush, and sell what piles up."""
     farmers = observation.get("farmers", [])
     hands = [_farmer_action(observation, farmer) for farmer in farmers]
     return {"farmer": hands, "hands": [], "market": _market_action(observation)}
@@ -83,6 +109,24 @@ def test_a_lifted_block_is_caught() -> None:
     lines = source.splitlines()
     lifted = "\n".join(lines[len(lines) // 2 : len(lines) // 2 + 200])
     candidate = SKELETON + "\n" + lifted
+    _, score = copycheck.against_opponents(candidate)
+    assert score >= copycheck.THRESHOLD
+
+
+def test_a_reformatted_lift_is_still_caught() -> None:
+    """Collapsing whitespace and swapping quote style cannot launder a lift.
+
+    This is what an LLM asked to "rewrite this" will do to a copied block:
+    the tokens are unchanged, so the score must be too.
+    """
+    path = Path(
+        "/data/kaggriculture/opponents/indarkarhana_top10/agents/"
+        "e749a_niklita_consensus_network.py"
+    )
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lifted = "\n".join(lines[90:200])  # lines 91-200, 1-indexed
+    reformatted = re.sub(r"\s*(->|[:,=])\s*", r"\1", lifted).replace('"', "'")
+    candidate = SKELETON + "\n" + reformatted
     _, score = copycheck.against_opponents(candidate)
     assert score >= copycheck.THRESHOLD
 
