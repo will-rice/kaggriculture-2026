@@ -615,10 +615,30 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     Returns:
         The equal-weighted field rate, its Wilson bounds, and the games played.
     """
+    import os
+    import tempfile
+
+    from kaggriculture.campaign import config, roster
     from kaggriculture.campaign.field_gate import score_field
     from kaggriculture.report import wilson_interval
 
-    rates, games = score_field(path, gate_seeds, workers, set())
+    # A gated candidate is usually a stranger's kernel, and playing it executes
+    # it: one wrote its own `main.py` over ours and left four agent files and a
+    # tarball behind. `score_field` plays on the caller's own working
+    # directory, so this is the one place a stranger's writes must be diverted.
+    # The path is resolved to absolute before the sandbox is entered, because
+    # every relative path a caller might pass -- the daily scan's own kernel
+    # directories included -- stops resolving the moment the sandbox does.
+    absolute = path.resolve()
+    seeds = config.EXAM_SEEDS[:gate_seeds]
+    origin = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="kernel-watch-gate-") as sandbox:
+        os.chdir(sandbox)
+        try:
+            rates = score_field(absolute, seeds, workers, list(roster.TRAINING))
+        finally:
+            os.chdir(origin)
+    games = len(rates) * len(seeds) * 2
     equal = sum(rates.values()) / len(rates)
     low, high = wilson_interval(equal * games, games)
     return equal, low, high, games

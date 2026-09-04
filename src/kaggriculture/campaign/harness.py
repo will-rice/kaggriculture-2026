@@ -235,7 +235,41 @@ def play(
         RuntimeError: A side raised during a game, or the reference-engine
             sample disagreed with the port.
     """
-    if any(seed in config.EXAM_SEEDS for seed in seeds):
+    return _play(agent, opponents, seeds, workers, sealed=True)
+
+
+def play_unsealed(
+    agent: Path, opponents: Sequence[str], seeds: Sequence[int], workers: int
+) -> list[Game]:
+    """``play`` for the gate: the exam seeds are allowed. Never exposed on the CLI.
+
+    Args:
+        agent: The candidate's ``main.py``.
+        opponents: Roster names; a path here is a KeyError.
+        seeds: Episode seeds, exam seeds included.
+        workers: Processes to fan the games over, at most ``config.CORE_BUDGET``.
+
+    Returns:
+        One ``Game`` per opponent, seed and seat, in that order.
+
+    Raises:
+        ValueError: More workers than the core budget.
+        KeyError: An opponent name not in the roster.
+        RuntimeError: A side raised during a game, or the reference-engine
+            sample disagreed with the port.
+    """
+    return _play(agent, opponents, seeds, workers, sealed=False)
+
+
+def _play(
+    agent: Path,
+    opponents: Sequence[str],
+    seeds: Sequence[int],
+    workers: int,
+    sealed: bool,
+) -> list[Game]:
+    """Shared body of ``play`` and ``play_unsealed``; only the exam check differs."""
+    if sealed and any(seed in config.EXAM_SEEDS for seed in seeds):
         raise ValueError("exam seeds are sealed; the harness will not play them")
     if workers > config.CORE_BUDGET:
         raise ValueError(f"workers exceeds CORE_BUDGET ({config.CORE_BUDGET})")

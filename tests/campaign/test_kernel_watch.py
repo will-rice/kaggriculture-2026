@@ -151,11 +151,11 @@ def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
 
     This is not hypothetical: a sweep gated from the repository root overwrote
     `main.py`, our own competition entrypoint, and left four agent files and a
-    tarball behind. The scan sandboxes resolution, but gating runs the engine,
-    and the engine had our working directory.
+    tarball behind. The scan sandboxes resolution, and `gate` sandboxes the
+    play too, because that is where the engine runs with our working
+    directory.
     """
-    from kaggriculture.campaign import field_gate
-    from kaggriculture.campaign.arena import OutcomeScores
+    from kaggriculture.campaign import harness, roster
 
     monkeypatch.chdir(tmp_path)
     ours = tmp_path / "main.py"
@@ -164,27 +164,32 @@ def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
     candidate.write_text(WRITES_ON_LOAD, encoding="utf-8")
     opponent = tmp_path / "opponent.py"
     opponent.write_text(WRITES_ON_LOAD, encoding="utf-8")
-    played: list[str] = []
+    monkeypatch.setattr(roster, "TRAINING", {"only": opponent})
+    played: list[Path] = []
 
     def record(
-        path: str, league: dict[str, str], seeds: object, workers: int
-    ) -> OutcomeScores:
-        """Stand in for the arena, executing the agents the way it would."""
-        played.append(path)
-        for source in (path, *league.values()):
-            exec(compile(Path(source).read_text(), source, "exec"), {})
-        scores = OutcomeScores()
-        scores.append(0.5)
-        scores.margins.append(0)
-        scores.members.append("only")
-        return scores
+        agent: Path, opponents: list[str], seeds: object, workers: int
+    ) -> list[harness.Game]:
+        """Stand in for the harness, executing the agents the way it would."""
+        played.append(agent)
+        for source in (agent, *(roster.TRAINING[name] for name in opponents)):
+            exec(compile(Path(source).read_text(), str(source), "exec"), {})
+        return [
+            harness.Game(
+                opponent="only",
+                seed=1,
+                seat=0,
+                ours=1.0,
+                theirs=1.0,
+                worst_step_seconds=0.0,
+            )
+        ]
 
-    monkeypatch.setattr(field_gate, "FIELD", {"only": (str(opponent), 1.0)})
-    monkeypatch.setattr("kaggriculture.campaign.arena.outcomes", record)
+    monkeypatch.setattr(harness, "play_unsealed", record)
 
-    field_gate.score_field(candidate, 1, 1, set())
+    kernel_watch.gate(candidate, gate_seeds=1, workers=1)
 
-    assert played and Path(played[0]).is_absolute()
+    assert played and played[0].is_absolute()
     assert ours.read_text(encoding="utf-8") == "# our real entrypoint"
 
 
