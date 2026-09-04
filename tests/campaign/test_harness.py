@@ -1,10 +1,11 @@
 """What a sandbox may run, and what it may not."""
 
+import traceback
 from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, harness
+from kaggriculture.campaign import config, harness, roster
 from kaggriculture.constants import EPISODE_STEPS
 
 # An episode records `EPISODE_STEPS` states and so takes one fewer transition;
@@ -52,6 +53,22 @@ def agent(observation, configuration=None):
     )
     return {{"farmer": ["PASS"], "hands": [], "market": []}}
 """
+
+
+# An opponent is loaded with its real path as `__code__.co_filename`, so its
+# traceback names a file the sandbox is never allowed to learn.
+CRASHING_AGENT = """
+def agent(observation, configuration=None):
+    raise ZeroDivisionError("the message itself must not travel either")
+"""
+
+
+@pytest.fixture
+def step_recording_agent(tmp_path: Path) -> Path:
+    """Write an agent that records ``observation["step"]`` per seat it plays."""
+    path = tmp_path / "main.py"
+    path.write_text(STEP_RECORDING_AGENT.format(directory=tmp_path), encoding="utf-8")
+    return path
 
 
 @pytest.fixture
@@ -103,16 +120,79 @@ def test_play_passes_each_side_the_arguments_its_signature_declares(
     assert all(game.ours == 3000.0 and game.theirs > 3000.0 for game in games)
 
 
-def test_play_gives_both_seats_the_step_counter(tmp_path: Path) -> None:
+def test_play_gives_both_seats_the_step_counter(
+    step_recording_agent: Path, tmp_path: Path
+) -> None:
     """Seat one gets the counter the framework, not the interpreter, writes."""
-    agent = tmp_path / "main.py"
-    agent.write_text(STEP_RECORDING_AGENT.format(directory=tmp_path), encoding="utf-8")
-    harness.play(agent, ["v54"], [11], workers=2)
+    harness.play(step_recording_agent, ["v54"], [11], workers=2)
     seen = {
         seat: int((tmp_path / f"seat{seat}.txt").read_text(encoding="utf-8"))
         for seat in (0, 1)
     }
     assert seen == {0: LAST_ACTED_STEP, 1: LAST_ACTED_STEP}
+
+
+def test_a_crashing_opponent_is_a_failure_that_never_names_its_file(
+    pass_agent: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The crash is reported by roster name and exception type, and by nothing else."""
+    hidden = tmp_path / "secret_dir"
+    hidden.mkdir()
+    (hidden / "main.py").write_text(CRASHING_AGENT, encoding="utf-8")
+    monkeypatch.setitem(roster.TRAINING, "crasher", hidden / "main.py")
+
+    with pytest.raises(RuntimeError) as caught:
+        harness.play(pass_agent, ["crasher"], [11], workers=2)
+
+    message = str(caught.value)
+    assert "crasher" in message and "ZeroDivisionError" in message
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "secret_dir" not in message
+    assert "secret_dir" not in rendered
+    assert "the message itself must not travel either" not in rendered
+
+
+def test_the_reference_sample_is_drawn_from_the_system_entropy_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seeded draw would be reproducible from the run shape the sandbox chose."""
+    games = [
+        harness.Game(
+            opponent="v54",
+            seed=seed,
+            seat=0,
+            ours=1.0,
+            theirs=2.0,
+            worst_step_seconds=0.0,
+        )
+        for seed in (1, 2, 3, 4)
+    ]
+    built: list[object] = []
+    # Below REFERENCE_SAMPLE selects the game; at or above it skips.
+    draws = iter([0.9, 0.0, 0.9, 0.0])
+
+    class Recording:
+        """Stand in for ``random.SystemRandom`` and count its construction."""
+
+        def __init__(self) -> None:
+            built.append(self)
+
+        def random(self) -> float:
+            """Return the next scripted draw."""
+            return next(draws)
+
+    audited: list[int] = []
+
+    def spy(seat_zero: str, seat_one: str, seed: int) -> tuple[int, int]:
+        audited.append(seed)
+        return 1, 2
+
+    monkeypatch.setattr(harness.random, "SystemRandom", Recording)
+    monkeypatch.setattr(harness.arena, "run_banks", spy)
+    harness._verify_sample(tmp_path / "main.py", {"v54": tmp_path / "v54.py"}, games)
+
+    assert len(built) == 1
+    assert audited == [2, 4]
 
 
 def test_play_caps_workers_at_the_core_budget(pass_agent: Path) -> None:
@@ -134,6 +214,19 @@ def test_check_calls_a_one_argument_agent_the_way_kaggle_does(
     """An agent declaring one parameter is called with one."""
     report = harness.check(one_argument_agent, steps=5)
     assert report.loaded and report.error is None
+
+
+def test_check_gives_both_seats_the_step_counter(
+    step_recording_agent: Path, tmp_path: Path
+) -> None:
+    """`check` drives the state directly, so it owes seat one the shared copy."""
+    report = harness.check(step_recording_agent, steps=5)
+    assert report.loaded and report.error is None
+    seen = {
+        seat: int((tmp_path / f"seat{seat}.txt").read_text(encoding="utf-8"))
+        for seat in (0, 1)
+    }
+    assert seen == {0: 4, 1: 4}
 
 
 def test_check_flags_a_slow_agent(tmp_path: Path) -> None:

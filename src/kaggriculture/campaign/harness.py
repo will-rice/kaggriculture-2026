@@ -19,6 +19,7 @@ from typing import Any
 
 from kaggle_environments import make
 from kaggle_environments.agent import get_last_callable
+from kaggle_environments.core import Environment
 from kaggle_environments.utils import Struct, structify
 from pydantic import BaseModel
 
@@ -45,6 +46,9 @@ class Game(BaseModel):
         ours: The candidate's final bank.
         theirs: The opponent's final bank.
         worst_step_seconds: The slowest single call to the candidate.
+        error: Which side raised and what it raised, or None if the game
+            finished. Names the side by roster name and the failure by type,
+            because the traceback behind it names the opponent's real file.
     """
 
     opponent: str
@@ -53,6 +57,7 @@ class Game(BaseModel):
     ours: float
     theirs: float
     worst_step_seconds: float
+    error: str | None = None
 
 
 class CheckReport(BaseModel):
@@ -126,12 +131,56 @@ def argument_count(agent: Callable[..., Any]) -> int:
     return min(2, getattr(code, "co_argcount", 2))
 
 
+def shared_step(environment: Environment) -> int:
+    """Return the step counter every seat is handed, as the runner hands it.
+
+    ``Environment.__get_shared_state`` copies each property the schema marks
+    ``shared`` from seat zero onto every other seat at call time, and ``step``
+    is the one this environment shares. Driving ``environment.state`` directly
+    skips that copy, so seat one's observation has no ``step`` at all --
+    ``remainingOverageTime`` is per-seat and already present on both, so it is
+    left exactly as the framework maintains it. Without this an agent that
+    reads ``observation["step"]`` raises as seat one under ``check`` while
+    running fine under ``play`` and on Kaggle.
+    """
+    return int(environment.state[0].observation.step)
+
+
+def _failed(
+    work: tuple[str, str, str, int, int], player: int, error: Exception, worst: float
+) -> Game:
+    """Record a crash as a name and an exception type, and nothing else.
+
+    Opponents are loaded with their real path as ``__code__.co_filename``, so
+    letting the exception itself cross back out of the pool would hand a
+    sandbox the path in a remote traceback -- and a ``SyntaxError`` carries the
+    filename in its own message besides. Only the type name travels.
+    """
+    _, opponent_name, _, seed, seat = work
+    who = "candidate" if player == seat else opponent_name
+    return Game(
+        opponent=opponent_name,
+        seed=seed,
+        seat=seat,
+        ours=0.0,
+        theirs=0.0,
+        worst_step_seconds=worst,
+        error=f"seat {player} ({who}) raised {type(error).__name__}",
+    )
+
+
 def _one(work: tuple[str, str, str, int, int]) -> Game:
     """Play one game on the engine port. Runs in a fresh process per game."""
     agent_path, opponent_name, opponent_path, seed, seat = work
-    agents = [load_agent(Path(agent_path)), load_agent(Path(opponent_path))]
+    sources = [agent_path, opponent_path]
     if seat == 1:
-        agents.reverse()
+        sources.reverse()
+    agents = []
+    for player, source in enumerate(sources):
+        try:
+            agents.append(load_agent(Path(source)))
+        except Exception as error:  # noqa: BLE001 - a failure, never a path
+            return _failed(work, player, error, 0.0)
     arities = [argument_count(agent) for agent in agents]
     engine = Engine(seed=seed)
     conf = configuration()
@@ -147,7 +196,10 @@ def _one(work: tuple[str, str, str, int, int]) -> Game:
                 }
             )
             started = perf_counter()
-            actions.append(agent(*(observation, conf)[: arities[player]]))
+            try:
+                actions.append(agent(*(observation, conf)[: arities[player]]))
+            except Exception as error:  # noqa: BLE001 - a failure, never a path
+                return _failed(work, player, error, worst)
             elapsed = perf_counter() - started
             if player == seat:
                 worst = max(worst, elapsed)
@@ -180,7 +232,8 @@ def play(
     Raises:
         ValueError: An exam seed, or more workers than the core budget.
         KeyError: An opponent name not in the roster.
-        RuntimeError: The reference-engine sample disagreed with the port.
+        RuntimeError: A side raised during a game, or the reference-engine
+            sample disagreed with the port.
     """
     if any(seed in config.EXAM_SEEDS for seed in seeds):
         raise ValueError("exam seeds are sealed; the harness will not play them")
@@ -195,13 +248,29 @@ def play(
     ]
     with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
         games = list(pool.map(_one, work))
+    # A crash is a failure, never a score: an agent that raised banked its
+    # untouched opening money and would otherwise read as an ordinary loss,
+    # which is the same rule `arena.run_banks` enforces on the reference
+    # engine. `from None` because the only chained context available here is
+    # the one that names the opponent's file.
+    failures = [f"seed {game.seed}: {game.error}" for game in games if game.error]
+    if failures:
+        raise RuntimeError(
+            "agents raised during play -- " + "; ".join(failures)
+        ) from None
     _verify_sample(agent, paths, games)
     return games
 
 
 def _verify_sample(agent: Path, paths: dict[str, Path], games: list[Game]) -> None:
-    """Replay a fixed 2% of the games on the reference engine and compare banks."""
-    rng = random.Random(len(games))
+    """Replay roughly 2% of the games on the reference engine and compare banks.
+
+    The draw comes from the system entropy source, not a seeded generator: the
+    thing being sampled is an evolved agent's own source, and a seed derived
+    from the run's shape -- the opponents and seeds named on the command line
+    -- would make the audited games predictable to whatever is being audited.
+    """
+    rng = random.SystemRandom()
     for game in games:
         if rng.random() >= REFERENCE_SAMPLE:
             continue
@@ -245,7 +314,10 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
                 break
             actions = []
             for state in environment.state:
-                arguments = (state.observation, environment.configuration)[:arity]
+                observation = structify(
+                    {**dict(state.observation), "step": shared_step(environment)}
+                )
+                arguments = (observation, environment.configuration)[:arity]
                 started = perf_counter()
                 actions.append(policy(*arguments))
                 worst = max(worst, perf_counter() - started)
