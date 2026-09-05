@@ -11,6 +11,13 @@ test failure, and let ruff-format rewrite the codex-written ``main.py``,
 changing the bytes the gate just measured. The gate itself is the
 verification here -- the commit is only the record -- and the file gets
 linted on the next human commit that touches it.
+
+The on-disk state -- the floor, ``served/main.py``, the pool file, the
+epoch line -- is written before the commit and is the source of truth for
+promotion. A failed git record (nothing to commit, a lock file, a full
+disk) is logged and swallowed rather than raised: a promotion that already
+happened on disk must never be undone by a commit that failed to explain
+it.
 """
 
 import json
@@ -109,17 +116,29 @@ def promote(
     epoch_line(iteration=-1, results=[result], promoted=name, rho=None)
 
     if commit:
-        subprocess.run(["git", "add", str(SERVED)], check=True, cwd=config.ROOT)
         message = (
             f"feat: promote {program.id} to the floor as {name}\n\n"
             f"deep {result.score:.4f} [{result.low:.4f}, {result.high:.4f}], "
             f"field {result.field:.4f}"
         )
-        subprocess.run(
-            ["git", "commit", "--no-verify", "-q", "-m", message],
-            check=True,
-            cwd=config.ROOT,
-        )
+        try:
+            subprocess.run(
+                ["git", "add", str(SERVED)],
+                check=True,
+                cwd=config.ROOT,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--no-verify", "-q", "-m", message],
+                check=True,
+                cwd=config.ROOT,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            stderr = (error.stderr or "")[-300:]
+            LOGGER.warning("promotion commit failed for %s: %s", name, stderr)
 
     LOGGER.info("promoted %s to %s", program.id, name)
     return name
