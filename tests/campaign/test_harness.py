@@ -115,6 +115,7 @@ def test_play_refuses_a_path_where_a_name_belongs(pass_agent: Path) -> None:
         )
 
 
+@pytest.mark.local_data
 def test_play_reports_both_seats_and_latency(pass_agent: Path) -> None:
     """Every seed is played from both seats, timing the candidate's own calls."""
     games = harness.play(pass_agent, ["v54"], [1, 2], workers=2)
@@ -123,6 +124,7 @@ def test_play_reports_both_seats_and_latency(pass_agent: Path) -> None:
     assert all(g.worst_step_seconds < 0.5 for g in games)
 
 
+@pytest.mark.local_data
 def test_play_passes_each_side_the_arguments_its_signature_declares(
     one_argument_agent: Path,
 ) -> None:
@@ -131,6 +133,7 @@ def test_play_passes_each_side_the_arguments_its_signature_declares(
     assert all(game.ours == 3000.0 and game.theirs > 3000.0 for game in games)
 
 
+@pytest.mark.local_data
 def test_play_gives_both_seats_the_step_counter(
     step_recording_agent: Path, tmp_path: Path
 ) -> None:
@@ -184,6 +187,7 @@ def test_a_crash_confined_to_opponent_seats_is_its_own_exception(
     assert "secret_dir" not in str(caught.value)
 
 
+@pytest.mark.local_data
 def test_a_crashing_candidate_is_the_candidates_own_failure(
     tmp_path: Path,
 ) -> None:
@@ -198,6 +202,7 @@ def test_a_crashing_candidate_is_the_candidates_own_failure(
     assert "candidate" in str(caught.value)
 
 
+@pytest.mark.local_data
 def test_a_candidate_writing_files_leaves_nothing_in_the_callers_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -221,6 +226,7 @@ def test_a_candidate_writing_files_leaves_nothing_in_the_callers_directory(
     assert Path.cwd() == workspace
 
 
+@pytest.mark.local_data
 def test_play_accepts_a_relative_candidate_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

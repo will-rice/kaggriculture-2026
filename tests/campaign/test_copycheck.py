@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import copycheck, roster
 
 SKELETON = Path("src/kaggriculture/served/main.py").read_text(encoding="utf-8")
@@ -84,6 +86,7 @@ def agent(
 '''
 
 
+@pytest.mark.local_data
 def test_a_verbatim_opponent_scores_one() -> None:
     """An opponent's own file matches itself, near-exactly."""
     source = roster.path("v54").read_text(encoding="utf-8")
@@ -103,6 +106,7 @@ def test_a_realistic_independent_agent_scores_below_threshold() -> None:
     assert score < copycheck.THRESHOLD
 
 
+@pytest.mark.local_data
 def test_a_lifted_block_is_caught() -> None:
     """A 200-line block lifted from an opponent trips the gate."""
     source = roster.path("shopforge").read_text(encoding="utf-8")
@@ -113,6 +117,7 @@ def test_a_lifted_block_is_caught() -> None:
     assert score >= copycheck.THRESHOLD
 
 
+@pytest.mark.local_data
 def test_a_reformatted_lift_is_still_caught() -> None:
     """Collapsing whitespace and swapping quote style cannot launder a lift.
 

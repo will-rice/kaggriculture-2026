@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import field_gate
 
 PASS_AGENT = (
@@ -10,6 +12,7 @@ PASS_AGENT = (
 )
 
 
+@pytest.mark.local_data
 def test_score_field_returns_one_rate_per_opponent_on_the_given_seeds(
     tmp_path: Path,
 ) -> None:

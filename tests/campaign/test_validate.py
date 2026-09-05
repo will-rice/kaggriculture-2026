@@ -129,6 +129,7 @@ def test_trailing_async_def_shadows_the_entrypoint(tmp_path: Path) -> None:
     assert verdict.status == "contract" and "last" in verdict.reason
 
 
+@pytest.mark.local_data
 def test_copied_opponent(tmp_path: Path) -> None:
     """A wholesale copy of an opponent is caught, and named, before the harness.
 
@@ -141,6 +142,7 @@ def test_copied_opponent(tmp_path: Path) -> None:
     assert verdict.status == "copy" and "v56" in verdict.reason
 
 
+@pytest.mark.local_data
 def test_copied_opponent_reason_never_names_a_path(tmp_path: Path) -> None:
     """The copy verdict names the roster key, never the file it lives at."""
     verdict = validate.validate(

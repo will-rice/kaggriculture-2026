@@ -18,6 +18,9 @@ import pytest
 from kaggriculture.campaign import tapes
 from kaggriculture.campaign.engine.wrapper import Engine
 
+# every tape lives in the local episode archive.
+pytestmark = pytest.mark.local_data
+
 
 def strip(observation: dict) -> dict:
     """The framework adds remainingOverageTime; the engine does not know it."""

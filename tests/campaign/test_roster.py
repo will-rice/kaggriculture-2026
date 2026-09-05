@@ -7,6 +7,7 @@ import pytest
 from kaggriculture.campaign import config, pool, roster
 
 
+@pytest.mark.local_data
 def test_every_roster_entry_exists_on_disk() -> None:
     """A name the harness accepts must resolve to a file that is there."""
     for name in roster.names():

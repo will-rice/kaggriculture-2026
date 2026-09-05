@@ -45,6 +45,7 @@ root = ["./src"]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
   "slow: hundreds of tapes; run with -m slow before trusting the engine",
+  "local_data: needs /data/kaggriculture or the local Kaggle image; skipped where absent",
 ]
 addopts = "-m 'not slow'"
 # Codex writes test files of its own inside run/campaign/sandboxes while the

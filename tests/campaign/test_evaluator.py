@@ -25,6 +25,7 @@ CRASHER = (
 )
 
 
+@pytest.mark.local_data
 def test_fast_draws_fresh_non_exam_seeds_and_weights_by_the_pool(
     tmp_path: Path,
 ) -> None:
@@ -42,6 +43,7 @@ def test_fast_draws_fresh_non_exam_seeds_and_weights_by_the_pool(
     assert result.rates == {"v54": 0.0} and result.fitness == 0.0
 
 
+@pytest.mark.local_data
 def test_two_fast_calls_draw_different_seeds(tmp_path: Path) -> None:
     """Ranking must not reuse one seed block, or drift becomes overfitting."""
     agent = tmp_path / "main.py"
@@ -57,6 +59,7 @@ def test_two_fast_calls_draw_different_seeds(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.local_data
 def test_deep_scores_the_exam_block_with_intervals_and_held_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -111,6 +114,7 @@ def test_deep_bounds_are_the_pool_weighted_sum_of_the_per_opponent_bounds(
     assert result.low < result.score < result.high
 
 
+@pytest.mark.local_data
 def test_deep_diverts_what_a_candidate_writes_away_from_the_caller(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -171,6 +175,7 @@ def test_deep_names_an_empty_field_instead_of_dividing_by_zero(
         evaluator.deep(agent, "prog", p, workers=1)
 
 
+@pytest.mark.local_data
 def test_fast_diverts_what_a_candidate_writes_away_from_the_caller(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

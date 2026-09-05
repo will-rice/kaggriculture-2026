@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import harness, validate
 
 SERVED = Path("src/kaggriculture/served/main.py")
@@ -12,6 +14,7 @@ def test_the_skeleton_validates() -> None:
     assert validate.validate(SERVED).status == "ok"
 
 
+@pytest.mark.local_data
 def test_the_skeleton_plants_something() -> None:
     """It plays a full port game and a short reference run without error."""
     games = harness.play(SERVED, ["v54"], [1], workers=2)

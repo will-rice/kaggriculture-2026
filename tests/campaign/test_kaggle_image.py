@@ -8,7 +8,7 @@ import pytest
 
 from kaggriculture.campaign import harness, kaggle_image
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.local_data, pytest.mark.slow]
 
 PASS_AGENT = (
     "def agent(observation, configuration=None):\n"
