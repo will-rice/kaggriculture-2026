@@ -11,7 +11,8 @@ relies on, and the places where the engine disagrees with the documentation.
 
 The agent is no longer hand-written: a codex-driven search plays candidate
 agents against a held-out field, keeps the ones that validate, and promotes
-what wins to `src/kaggriculture/served/main.py`, which `main.py` serves. See
+what wins to the campaign floor, `run/campaign/floor/agent/main.py`, which is
+what `uv run package` ships. See
 [docs/superpowers/specs/2026-09-04-codex-campaign-design.md](docs/superpowers/specs/2026-09-04-codex-campaign-design.md)
 for the design and
 [docs/superpowers/plans/2026-09-04-campaign-foundation.md](docs/superpowers/plans/2026-09-04-campaign-foundation.md)
@@ -31,10 +32,9 @@ for how it was built.
 | `src/kaggriculture/campaign/harness.py`                               | `play`, `check`, `package`; the `campaign` CLI                                                                                                                  |
 | `src/kaggriculture/campaign/copycheck.py`                             | token-shingle similarity against opponent sources                                                                                                               |
 | `src/kaggriculture/campaign/validate.py`                              | `validate(agent) -> Verdict`: syntax, contract, imports, copy, load, latency                                                                                    |
-| `src/kaggriculture/campaign/kaggle_image.py`                          | load test of a tarball inside `gcr.io/kaggle-gpu-images/python:latest`                                                                                          |
 | `src/kaggriculture/campaign/field_gate.py`, `kernel_watch.py`         | moved from `scripts/`, imports fixed; Plan 2 folds `field_gate` into the evaluator                                                                              |
 | `src/kaggriculture/scripts/package.py`, `submit.py`                   | shipping, without the routes store                                                                                                                              |
-| `src/kaggriculture/served/main.py`                                    | the floor: starts as the skeleton                                                                                                                               |
+| `src/kaggriculture/served/main.py`                                    | the cold-start seed the loop begins from; not what ships                                                                                                        |
 | `src/kaggriculture/campaign/task_prompt.md`                           | phase 1's product; a first draft is written by hand in Task 12                                                                                                  |
 | `tests/campaign/*.py`                                                 | one test module per source module                                                                                                                               |
 
@@ -103,8 +103,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-The project pins Python 3.11 because agents run on Kaggle's image; developing
-below the runner's version keeps anything that works locally working there too.
+The project pins Python 3.12 because that is what Kaggle's image runs
+(3.12.13). Developing on the runner's own version closes the gap in which a
+candidate could use something the local interpreter accepts and the runner
+does not.
 
 ### 3. Set up environment variables
 
@@ -128,7 +130,7 @@ uv sync                        # install dependencies
 uv run campaign --help         # the campaign CLI (play / check / package / loop)
 uv run pytest                  # run the test suite
 uv run pre-commit run -a       # format, lint, type-check, test
-uv run package                 # writes submission.tar.gz for the served floor
+uv run package                 # writes submission.tar.gz for the campaign floor
 uv run submit "melon loop v1"  # packages, confirms, then uploads
 ```
 

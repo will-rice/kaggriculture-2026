@@ -1,11 +1,12 @@
 """Build the sandbox one codex session works in.
 
 ``AGENTS.md`` is codex's standing context: the task prompt phase 1 wrote,
-how to use the harness, and the doctrine. ``child.py`` is the champion,
-copied in; it is the file the session edits in place until it clears the
-bar. ``PROMPT.md`` carries the instruction drawn for this session and the
-budget. ``feedback.md`` states the bar and what the evaluator measured
-about the champion. Nothing in the sandbox names where an opponent lives.
+how to use the harness, what the program may import, and the doctrine.
+``child.py`` is the champion, copied in; it is the file the session edits in
+place until it clears the bar. ``PROMPT.md`` carries the instruction drawn for
+this session and the budget. ``feedback.md`` states the bar and what the
+evaluator measured about the champion. Nothing in the sandbox names where an
+opponent lives.
 
 The task prompt phase 1 wrote already contains a harness section, but its
 commands are hard-coded to the worktree that wrote them. ``_strip_stale_harness``
@@ -20,7 +21,7 @@ from pathlib import Path
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as engine_module
 
-from kaggriculture.campaign import config, harness
+from kaggriculture.campaign import config, harness, validate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +63,21 @@ uv run --project {project} campaign play child.py --vs NAME... --seeds A-B --wor
 The evaluator measures for real after you finish; use these only to make
 sure the file runs and does what you intended.
 """.format(project=config.ROOT, workers=harness.SANDBOX_WORKER_CAP)
+
+# Rendered from the gate's own whitelist, so the sandbox is never told a
+# different set from the one that rejects it. One file ships, so this list is
+# the program's whole dependency surface.
+IMPORTS_SECTION = """
+## What your program may import
+
+Your program is one file, and that file ships alone: nothing is packaged
+beside it. It may import only these modules, and an import of anything else is
+rejected before the program is scored.
+
+{names}
+
+`engine/kaggriculture.py` is there to read as ground truth, never to import.
+""".format(names=", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS)))
 
 DOCTRINE = """
 ## Doctrine
@@ -260,7 +276,7 @@ def build_sandbox(
 
     task_prompt = _strip_stale_harness(TASK_PROMPT.read_text(encoding="utf-8"))
     (box / "AGENTS.md").write_text(
-        task_prompt + HARNESS_SECTION + DOCTRINE, encoding="utf-8"
+        task_prompt + HARNESS_SECTION + IMPORTS_SECTION + DOCTRINE, encoding="utf-8"
     )
 
     child = box / "child.py"

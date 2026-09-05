@@ -129,7 +129,7 @@ def test_promote_leaves_a_tarball_the_champion_record_names(
     assert tarball.exists() and tarball.parent == config.CHAMPIONS
     with tarfile.open(tarball) as tar:
         names = tar.getnames()
-    assert "main.py" in names and "kaggriculture_engine.so" in names
+    assert sorted(names) == ["LICENSE", "main.py"]
 
 
 def test_gate_runs_no_version_control() -> None:

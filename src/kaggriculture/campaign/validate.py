@@ -40,6 +40,11 @@ from pydantic import BaseModel
 
 from kaggriculture.campaign import config, copycheck, harness
 
+# One file ships, so this is the whole surface a program may name. The
+# `kaggriculture` package and `ctypes` were once here, for the engine library
+# the archive used to carry; the archive is now `main.py` and the licence, so
+# a candidate importing either would validate here and die on the ladder --
+# the one failure this system cannot afford.
 ALLOWED_IMPORTS: frozenset[str] = frozenset(
     {
         "math",
@@ -56,10 +61,8 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
         "enum",
         "copy",
         "json",
-        "ctypes",
         "pathlib",
         "time",
-        "kaggriculture",
         "kaggle_environments",
     }
 )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, prompt
+from kaggriculture.campaign import config, prompt, validate
 
 IMPROVE = prompt.INSTRUCTIONS[0][1]
 
@@ -159,6 +159,35 @@ def test_agents_md_is_the_task_prompt_plus_harness_and_doctrine(tmp_path: Path) 
     text = (box / "AGENTS.md").read_text()
     assert "campaign play" in text and "never read their source" in text.lower()
     assert "700000" not in text
+
+
+def test_agents_md_states_the_imports_the_gate_actually_allows(
+    tmp_path: Path,
+) -> None:
+    """A session told it may import our package would write a program that dies.
+
+    One file ships, so the whitelist is the program's whole dependency
+    surface. The section is rendered from `validate.ALLOWED_IMPORTS` rather
+    than restated, because a sandbox told a different set from the one that
+    rejects it is worse than one told nothing.
+    """
+    monkeypatched_sandbox(tmp_path)
+    champion = tmp_path / "p.py"
+    champion.write_text("# champion\n")
+    box = prompt.build_sandbox(
+        "imports",
+        champion,
+        IMPROVE,
+        rates={},
+        failures=[],
+        started_from="champion_1",
+    )
+
+    text = (box / "AGENTS.md").read_text()
+    for name in validate.ALLOWED_IMPORTS:
+        assert f"`{name}`" in text, name
+    assert "`ctypes`" not in text
+    assert "`kaggriculture`" not in text
 
 
 def test_agents_md_strips_the_stale_harness_block_and_rewrites_the_project_path(

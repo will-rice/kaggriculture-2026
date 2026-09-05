@@ -9,7 +9,6 @@ from kaggriculture.campaign import config, roster, validate
 
 GOOD = """
 import math
-from kaggriculture.constants import CROPS
 
 def agent(observation, configuration=None):
     return {"farmer": ["PASS"], "hands": [], "market": []}
@@ -92,6 +91,24 @@ def test_forbidden_import(tmp_path: Path) -> None:
     """An import outside `ALLOWED_IMPORTS` is rejected by name."""
     verdict = validate.validate(write(tmp_path, "import socket\n" + GOOD))
     assert verdict.status == "imports" and "socket" in verdict.reason
+
+
+def test_the_kaggriculture_package_is_not_importable(tmp_path: Path) -> None:
+    """Only `main.py` ships, so a program importing our package dies on Kaggle.
+
+    It used to be allowed, back when the archive carried four plumbing
+    modules. A candidate that still imports one would pass every check here
+    and fail on the ladder, which is worse than failing in the campaign.
+    """
+    source = "from kaggriculture.actions import PASS\n" + GOOD
+    verdict = validate.validate(write(tmp_path, source))
+    assert verdict.status == "imports" and "kaggriculture.actions" in verdict.reason
+
+
+def test_ctypes_is_not_importable(tmp_path: Path) -> None:
+    """`ctypes` was for the engine library, and the archive no longer has one."""
+    verdict = validate.validate(write(tmp_path, "import ctypes\n" + GOOD))
+    assert verdict.status == "imports" and "ctypes" in verdict.reason
 
 
 def test_dunder_import_bypasses_the_import_statement_check(tmp_path: Path) -> None:

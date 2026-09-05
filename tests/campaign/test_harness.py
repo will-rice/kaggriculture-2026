@@ -364,19 +364,17 @@ def test_check_flags_a_slow_agent(tmp_path: Path) -> None:
     assert report.worst_step_seconds >= 0.5
 
 
-def test_package_places_main_and_the_engine_library_at_the_root(
+def test_package_places_main_and_the_licence_at_the_root(
     pass_agent: Path, tmp_path: Path
 ) -> None:
-    """What Kaggle unpacks: entrypoint, library, plumbing, no campaign."""
+    """What Kaggle unpacks: one file, the licence, and nothing importable."""
     import tarfile
 
     archive = harness.package(pass_agent, tmp_path / "submission.tar.gz")
     with tarfile.open(archive) as tar:
         listed = tar.getnames()
     names = set(listed)
-    assert "main.py" in names and "kaggriculture_engine.so" in names
-    assert "kaggriculture/constants.py" in names
-    assert not any(name.startswith("kaggriculture/campaign") for name in names)
+    assert names == {"main.py", "LICENSE"}
     # A duplicated member is invisible to a set of names and to `tar -x`, which
     # simply overwrites; it doubles the upload and reads as a corrupt archive.
     assert sorted(listed) == sorted(names)

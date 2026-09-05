@@ -2,13 +2,13 @@
 
 There is one packager, and it is ``harness.package``: Kaggle unpacks the
 archive into ``/kaggle_simulations/agent`` and imports ``main.py`` from its
-root, so the archive holds the served agent as ``main.py`` beside the engine
-library, the four plumbing modules, and the attribution the library carries.
+root, so the archive holds one self-contained file as ``main.py``, beside the
+repository licence and nothing else.
 
-This module is the command-line face of that one function. Two packagers is
-how the shipping path came to have no engine in it: the artefact
-``kaggle_image.load_test`` proves and the artefact ``uv run submit`` uploads
-have to be the same bytes, built by the same code.
+This module is the command-line face of that one function; a second packager
+is how a shipping path comes to disagree with the one the campaign measured.
+What ships is the campaign floor -- the file the gate writes on every
+promotion -- not the cold-start seed committed under ``src/``.
 """
 
 import argparse
@@ -18,7 +18,7 @@ from pathlib import Path
 from kaggriculture.campaign import config, harness, validate
 
 REPO_ROOT = config.ROOT
-ENTRYPOINT = config.SERVED
+ENTRYPOINT = config.FLOOR / "main.py"
 SUBMISSION = REPO_ROOT / "submission.tar.gz"
 
 
@@ -41,8 +41,8 @@ def build(output: Path = SUBMISSION, *, entrypoint: Path = ENTRYPOINT) -> Path:
     Args:
         output: Where to write the archive.
         entrypoint: Self-contained ``main.py`` to ship at the archive root.
-            The default is the served agent, which is what the gate writes on
-            every promotion.
+            The default is the campaign floor, which is what the gate writes
+            on every promotion.
 
     Returns:
         ``output``, unchanged.
@@ -60,11 +60,11 @@ def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
     has spent a submission slot and displaced an agent from the scored pair.
 
     Checked here rather than only in a test because this file is written by
-    automation: the gate overwrites it on every promotion, and a subagent
-    decoding a public kernel already clobbered it once by executing a
-    notebook cell. The check is `validate.validate`, the same gate every
-    candidate passes, and it executes the file only inside that gate's child
-    process and scratch directory -- never in the caller's.
+    automation: the gate overwrites the floor on every promotion, and a
+    subagent decoding a public kernel already clobbered an entrypoint once by
+    executing a notebook cell. The check is `validate.validate`, the same gate
+    every candidate passes, and it executes the file only inside that gate's
+    child process and scratch directory -- never in the caller's.
 
     Args:
         entrypoint: The ``main.py`` that will ship, checked as it sits.

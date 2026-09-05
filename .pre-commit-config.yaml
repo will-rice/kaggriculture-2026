@@ -13,10 +13,14 @@ repos:
       - id: prettier-format
   - repo: local
     hooks:
-      # `src/kaggriculture/served/` is written by the campaign gate, not by
-      # hand: it is evolved code, verified by the deep evaluation rather than
-      # by lint. Formatting it would rewrite the bytes the gate measured, and
-      # a type error in it would block every later human commit.
+      # `src/kaggriculture/served/` holds the cold-start seed, and the seed is
+      # a promoted champion: evolved code, verified by the deep evaluation
+      # rather than by lint. Formatting it rewrites the bytes the evaluation
+      # measured and the pool still plays, and what lint asks for beyond
+      # formatting cannot be given without editing the program -- four
+      # `C901` complex-structure findings ask for its control flow to be
+      # restructured. Nothing writes here any more; the exclusion is about
+      # what the file is, not who wrote it.
       - id: ruff-format
         name: ruff-format
         language: system

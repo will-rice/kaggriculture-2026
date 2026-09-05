@@ -3,19 +3,27 @@
 import tarfile
 from pathlib import Path
 
-from kaggriculture.campaign import harness
+import pytest
+
 from kaggriculture.scripts.package import build
 
-# `main.py`, the engine library, the attribution that has to travel with it,
-# and the four plumbing modules the served agent imports. Nothing else.
-EXPECTED = {
-    "main.py",
-    "NOTICE",
-    "LICENSE",
-    "kaggriculture_engine.so",
-    "kaggriculture",
-    *(f"kaggriculture/{module}" for module in harness.PACKAGE_MODULES),
-}
+# One file ships, and the repository licence rides with it. Nothing else: no
+# engine library, no `kaggriculture` package, no attribution for a binary the
+# archive no longer carries.
+EXPECTED = {"main.py", "LICENSE"}
+
+PASS_AGENT = (
+    "def agent(observation, configuration=None):\n"
+    "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+)
+
+
+@pytest.fixture
+def entrypoint(tmp_path: Path) -> Path:
+    """A self-contained agent to package, standing in for the campaign floor."""
+    path = tmp_path / "main.py"
+    path.write_text(PASS_AGENT, encoding="utf-8")
+    return path
 
 
 def names(archive: Path) -> list[str]:
@@ -24,8 +32,8 @@ def names(archive: Path) -> list[str]:
         return bundle.getnames()
 
 
-def test_the_archive_is_exactly_the_agent_the_engine_and_the_plumbing(
-    tmp_path: Path,
+def test_the_archive_is_exactly_the_agent_and_the_licence(
+    entrypoint: Path, tmp_path: Path
 ) -> None:
     """Every member is expected, and each appears exactly once.
 
@@ -33,47 +41,36 @@ def test_the_archive_is_exactly_the_agent_the_engine_and_the_plumbing(
     which simply overwrites; it doubles the upload and reads as a corrupt
     archive.
     """
-    listed = names(build(tmp_path / "submission.tar.gz"))
+    listed = names(build(tmp_path / "submission.tar.gz", entrypoint=entrypoint))
 
     assert sorted(listed) == sorted(set(listed))
     assert set(listed) == EXPECTED
 
 
-def test_the_archive_ships_the_engine_and_its_attribution(tmp_path: Path) -> None:
-    """The library is a port of Apache-2.0 kernel source; its NOTICE rides along."""
-    archive = build(tmp_path / "submission.tar.gz")
+def test_the_archive_ships_no_engine_and_no_package(
+    entrypoint: Path, tmp_path: Path
+) -> None:
+    """A program is one file, so nothing it could import travels with it.
 
-    with tarfile.open(archive) as bundle:
-        notice = bundle.extractfile("NOTICE")
-        assert notice is not None
-        text = notice.read().decode()
-    assert "Apache License 2.0" in text
-    assert "kaggriculture_engine.so" in names(archive)
-
-
-def test_the_archive_does_not_ship_offline_tooling(tmp_path: Path) -> None:
-    """The scripts and campaign packages have no place in a 4 MB agent archive.
-
-    ``campaign`` plays hundreds of games against a league to search for a
-    better agent, work the submitted agent never does at play time, and the
-    guard also closes the path by which a later edit could reintroduce a heavy
-    import behind it.
+    The engine library and the four plumbing modules used to ship, for a
+    lookahead option no evolved agent ever took. Shipping them made the
+    search and the ladder disagree: a session could import a helper it was
+    not allowed to edit, and a weakness in that helper was invisible to the
+    search that was supposed to find it.
     """
-    listed = names(build(tmp_path / "submission.tar.gz"))
+    listed = names(build(tmp_path / "submission.tar.gz", entrypoint=entrypoint))
 
-    assert not any(name.startswith("kaggriculture/scripts") for name in listed)
-    assert not any(name.startswith("kaggriculture/campaign") for name in listed)
+    assert not any(name.endswith(".so") for name in listed)
+    assert not any(name == "kaggriculture" for name in listed)
+    assert not any(name.startswith("kaggriculture/") for name in listed)
+    assert "NOTICE" not in listed
     assert not any("__pycache__" in name for name in listed)
 
 
-def test_build_accepts_a_self_contained_alternate_entrypoint(tmp_path: Path) -> None:
-    """Candidate packaging can be tested without changing the served default."""
-    entrypoint = tmp_path / "main.py"
-    entrypoint.write_text(
-        "def agent(observation, configuration=None):\n"
-        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
-    )
-
+def test_build_accepts_a_self_contained_alternate_entrypoint(
+    entrypoint: Path, tmp_path: Path
+) -> None:
+    """The bytes handed to the packager are the bytes that land at the root."""
     archive = build(tmp_path / "alternate.tar.gz", entrypoint=entrypoint)
 
     with tarfile.open(archive) as bundle:

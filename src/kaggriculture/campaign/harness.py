@@ -32,7 +32,6 @@ from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 LOGGER = logging.getLogger(__name__)
 REFERENCE_SAMPLE = 0.02
 LATENCY_BUDGET = 0.5  # half of actTimeout
-PACKAGE_MODULES = ("__init__.py", "constants.py", "observation.py", "actions.py")
 # What `campaign play` promises a sandbox in AGENTS.md, enforced on the CLI
 # only: the library function is what the evaluator calls, and it plays the
 # whole exam block.
@@ -504,13 +503,14 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
 
 
 def package(agent: Path, output: Path) -> Path:
-    """Write ``main.py`` + the engine library + the plumbing package into a tarball.
+    """Write ``main.py`` and the repository ``LICENSE`` into a tarball.
 
-    The only packager: ``uv run package`` and ``uv run submit`` call this too,
-    so the artefact ``kaggle_image.load_test`` proves is the artefact that
-    ships. The engine's ``NOTICE`` and the repository ``LICENSE`` ride along
-    at the root because the library in the archive is a port of Apache-2.0
-    kernel source and the attribution has to travel with the binary.
+    The only packager: ``uv run package`` and ``uv run submit`` call this too.
+    A program is one file whose last top-level callable is ``agent``, so that
+    file and the licence are the whole archive -- no engine library, no
+    ``kaggriculture`` package. Shipping either would let a candidate depend on
+    something the search can edit but the ladder cannot see, and what evolves
+    would stop being what ships.
 
     Args:
         agent: The self-contained ``main.py`` to ship.
@@ -519,21 +519,10 @@ def package(agent: Path, output: Path) -> Path:
     Returns:
         ``output``, unchanged.
     """
-    from kaggriculture.campaign.engine import build
-
-    library = build.build()
-    package_root = Path(config.ROOT / "src" / "kaggriculture")
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
         shutil.copy(agent, root / "main.py")
-        shutil.copy(library, root / library.name)
-        shutil.copy(library.parent / "NOTICE", root / "NOTICE")
-        license_file = config.ROOT / "LICENSE"
-        if license_file.exists():
-            shutil.copy(license_file, root / "LICENSE")
-        (root / "kaggriculture").mkdir()
-        for module in PACKAGE_MODULES:
-            shutil.copy(package_root / module, root / "kaggriculture" / module)
+        shutil.copy(config.ROOT / "LICENSE", root / "LICENSE")
         output.parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(output, "w:gz") as tar:
             for item in sorted(root.rglob("*")):
