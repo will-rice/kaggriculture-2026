@@ -157,7 +157,7 @@ child.py --vs NAME --seeds` (non-exam only, at most 16 games), so codex can
 Then runs
 
 ```
-codex exec -C <sandbox> -s workspace-write -c approval_policy=never -m gpt-5.6-sol --json - < PROMPT.md
+codex exec -C <sandbox> -s workspace-write -c approval_policy=never -m gpt-6-astra --json - < PROMPT.md
 ```
 
 with a 25-minute liveness cap: a session that had already written `child.py`

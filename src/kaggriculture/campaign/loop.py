@@ -18,6 +18,7 @@ import datetime
 import logging
 import random
 import shutil
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -63,6 +64,7 @@ HYPERPARAMETERS = (
     "RETIRE_THRESHOLD",
     "WEAKNESS_CAP",
     "CODEX_CONCURRENCY",
+    "CODEX_MODEL",
     "DAILY_CALL_BUDGET",
 )
 
@@ -119,10 +121,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     # A dry run proves the pipeline; its numbers would only pollute the
     # campaign's run.
+    revision = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=config.ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
     log = wandb.init(
         entity=config.WANDB_ENTITY,
         project=config.WANDB_PROJECT,
         id=config.WANDB_RUN_ID,
+        name=f"{config.CODEX_MODEL}-{revision}",
         resume="allow",
         mode="disabled" if args.dry_run else "online",
         config={name: getattr(config, name) for name in HYPERPARAMETERS},

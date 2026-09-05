@@ -100,7 +100,7 @@ class CodexMutator:
 
     def __init__(
         self,
-        model: str = "gpt-5.6-sol",
+        model: str = config.CODEX_MODEL,
         timeout: float = config.MUTATION_TIMEOUT_SECONDS,
     ) -> None:
         """Initializes the mutator.

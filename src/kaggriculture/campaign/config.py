@@ -87,6 +87,9 @@ POOL_CAP = 10
 RETIRE_THRESHOLD = 0.95
 WEAKNESS_CAP = 0.5
 CODEX_CONCURRENCY = 8
+# Probed 2026-09-05 on codex 0.153: the ChatGPT login accepts `gpt-6-astra`
+# ("our most capable model for complex, demanding work") but not `gpt-5.6-astra`.
+CODEX_MODEL = "gpt-6-astra"
 # Measured on the first live iteration (2026-09-05): a session writes its
 # first complete child at 8-10 minutes and then spends as long again testing
 # it through the harness. Whatever `child.py` holds when the cap fires is

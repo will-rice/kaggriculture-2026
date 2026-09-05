@@ -51,7 +51,8 @@ visible edit, so it exercises validation, evaluation, insertion and the
 promotion gate without spending a call. Both commands resume from
 `run/campaign/state.json` and the archive log, so a killed loop restarts
 where it stopped, and it resumes the same wandb run (`config.WANDB_RUN_ID`),
-so the curves continue; a dry run logs nothing. Each promotion also uploads
+so the curves continue, named `<codex model>-<git revision>` as of the launch;
+a dry run logs nothing. Each promotion also uploads
 the champion's file as a wandb artifact named after it. Keep `--workers * --concurrency` inside the core budget:
 each mutation in flight runs an evaluation that forks that many processes.
 
