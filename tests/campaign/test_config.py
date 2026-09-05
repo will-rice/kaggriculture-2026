@@ -79,3 +79,45 @@ def test_core_budget_leaves_headroom() -> None:
     import os
 
     assert 1 <= config.CORE_BUDGET <= max(1, (os.cpu_count() or 1) - 8)
+
+
+def test_fast_seed_range_never_touches_the_exam_block() -> None:
+    """The fast seed range never overlaps with the exam seed block."""
+    assert not set(config.FAST_SEED_RANGE) & set(config.EXAM_SEEDS)
+
+
+def test_hyperparameters_match_the_spec_table() -> None:
+    """Evolution hyperparameters match Spec §3."""
+    assert (config.ISLANDS, config.ISLAND_SIZE) == (4, 12)
+    assert (config.MIGRATION_INTERVAL, config.MIGRANTS, config.RESET_INTERVAL) == (
+        10,
+        2,
+        40,
+    )
+    assert config.UCB_C == 0.5 and config.CROSS_PROBABILITY == 0.3
+    assert (config.FAST_SEEDS, config.EPOCH_INTERVAL, config.DEEP_TOP_K) == (4, 25, 3)
+    assert (
+        config.CHAMPION_WEIGHT,
+        config.POOL_CAP,
+        config.RETIRE_THRESHOLD,
+        config.WEAKNESS_CAP,
+    ) == (0.20, 10, 0.95, 0.5)
+    assert (
+        config.CODEX_CONCURRENCY,
+        config.MUTATION_TIMEOUT_SECONDS,
+        config.DAILY_CALL_BUDGET,
+    ) == (8, 600, 200)
+
+
+def test_runtime_paths_live_under_run_campaign() -> None:
+    """All runtime paths live under the run campaign directory."""
+    for path in (
+        config.ARCHIVE,
+        config.PROGRAMS,
+        config.SANDBOXES,
+        config.POOL,
+        config.EPOCHS,
+        config.FLOOR,
+        config.CALLS,
+    ):
+        assert config.RUN in path.parents
