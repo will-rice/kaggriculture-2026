@@ -18,13 +18,13 @@ import datetime
 import logging
 import random
 import shutil
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
 import wandb
+from git import Repo
 from pydantic import BaseModel
 
 from kaggriculture.campaign import archive as archive_module
@@ -121,13 +121,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     # A dry run proves the pipeline; its numbers would only pollute the
     # campaign's run.
-    revision = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=config.ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    revision = Repo(config.ROOT).head.commit.hexsha[:7]
     log = wandb.init(
         entity=config.WANDB_ENTITY,
         project=config.WANDB_PROJECT,

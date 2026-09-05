@@ -8,6 +8,7 @@ authors = [{ name = "Will Rice", email = "wrice20@gmail.com" }]
 # runs locally also runs on the competition image.
 requires-python = ">=3.11"
 dependencies = [
+  "gitpython>=3.1.61",
   "kaggle-environments>=1.32.7",
   "kaggle>=1.7.4",
   "pre-commit>=4.1.0",
