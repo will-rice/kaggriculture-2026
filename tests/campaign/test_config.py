@@ -100,6 +100,7 @@ def test_constants_match_the_spec_table() -> None:
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-6-astra"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
+    assert config.CROSS_PROBABILITY == 0.3
 
 
 def test_the_deleted_constants_are_gone() -> None:

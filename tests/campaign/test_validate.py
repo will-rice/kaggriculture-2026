@@ -174,11 +174,11 @@ def test_a_candidate_that_never_finishes_loading_is_too_slow_not_a_hang(
     the thread validating it -- and through that thread, the island it was
     mutating -- for as long as the campaign runs.
     """
-    monkeypatch.setattr(config, "CHECK_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(config, "GAME_LIMIT_SECONDS", 5)
 
     verdict = validate.validate(write(tmp_path, WEDGING_AGENT))
 
-    assert verdict.status == "too_slow" and "exceeded" in verdict.reason
+    assert verdict.status == "too_slow" and "stuck" in verdict.reason
 
 
 def test_what_a_candidate_writes_while_loading_lands_in_a_scratch_directory(
@@ -198,7 +198,7 @@ def test_a_candidate_that_exits_while_loading_is_a_crash_not_slow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A dead child is reported at once and as what it was."""
-    monkeypatch.setattr(config, "CHECK_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(config, "GAME_LIMIT_SECONDS", 30)
     started = time.monotonic()
 
     verdict = validate.validate(write(tmp_path, EXITING_AGENT))

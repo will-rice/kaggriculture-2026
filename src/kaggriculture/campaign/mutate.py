@@ -100,7 +100,7 @@ class CodexMutator:
     (``start_new_session=True``) so a timeout -- or the cancellation that
     shutting the loop down delivers -- can kill the whole process group with
     ``os.killpg``, not just codex itself. Without the cancellation arm, a
-    killed loop would leave ``CODEX_CONCURRENCY`` sessions running.
+    killed loop would leave ``SESSIONS`` sessions running.
     """
 
     COMMAND = [

@@ -38,7 +38,7 @@ PACKAGE_MODULES = ("__init__.py", "constants.py", "observation.py", "actions.py"
 # whole exam block.
 SANDBOX_GAME_CAP = 16
 # Sessions run the harness on their own, outside the loop's core budget, so
-# `CODEX_CONCURRENCY` of them can take this many cores each at once.
+# `SESSIONS` of them can take this many cores each at once.
 SANDBOX_WORKER_CAP = 4
 # The framework, not the interpreter, writes these onto every seat's
 # observation at call time. The port exports neither, so `_one` injects both.

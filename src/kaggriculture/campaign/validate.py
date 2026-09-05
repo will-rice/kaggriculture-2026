@@ -253,7 +253,9 @@ def _dynamic_child(agent: str, steps: int, results: "Queue[dict]") -> None:
 
 
 def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
-    """`_dynamic` in a child process, capped at ``config.CHECK_TIMEOUT_SECONDS``.
+    """`_dynamic` in a child process, killed if still running after the cap.
+
+    ``config.GAME_LIMIT_SECONDS`` is a liveness guard, not a speed target.
 
     Args:
         agent: The candidate's `main.py`.
@@ -269,7 +271,7 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
         target=_dynamic_child, args=(str(agent.resolve()), steps, results)
     )
     process.start()
-    deadline = time.monotonic() + config.CHECK_TIMEOUT_SECONDS
+    deadline = time.monotonic() + config.GAME_LIMIT_SECONDS
     while True:
         # Poll in short slices so a child that dies without reporting -- a
         # module-level ``SystemExit``, a native crash, a failed spawn -- is
@@ -291,9 +293,10 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
             if time.monotonic() >= deadline:
                 process.kill()
                 process.join()
+                cap = config.GAME_LIMIT_SECONDS
                 return Verdict(
                     status="too_slow",
-                    reason=f"check exceeded {config.CHECK_TIMEOUT_SECONDS}s",
+                    reason=f"game stuck, still running after {cap}s",
                 )
     process.join()
     return Verdict.model_validate(payload)
