@@ -47,8 +47,8 @@ root = ["./src"]
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
-  "slow: hundreds of tapes; run with -m slow before trusting the engine",
-  "local_data: needs /data/kaggriculture or the local Kaggle image; skipped where absent",
+  "slow: hundreds of tapes and every local_data test; run with -m slow before pushing",
+  "local_data: needs /data/kaggriculture or the local Kaggle image; implies slow, and is skipped where absent",
 ]
 addopts = "-m 'not slow'"
 # Codex writes test files of its own inside run/campaign/sandboxes while the

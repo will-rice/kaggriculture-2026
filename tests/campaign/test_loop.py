@@ -11,9 +11,11 @@ wrote, the archive it filled, and the metrics it logged.
 """
 
 import asyncio
+import contextlib
 import random
 import subprocess
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -75,6 +77,17 @@ def agent(observation, configuration=None):
 # in flight, so their product must fit the budget on the smallest box too.
 WORKERS = max(1, min(4, config.CORE_BUDGET // 2))
 CONCURRENCY = max(1, min(2, config.CORE_BUDGET // WORKERS))
+# The share one evaluation takes in the tests that watch the core counter
+# hold evaluations back. Small, so a box with few cores can still fit two.
+PERMIT_WORKERS = 2
+# Read once, at import, so `tiny_run` can be applied twice in one test: the
+# second call would otherwise be resolving paths and slicing seeds that the
+# first call had already replaced.
+RUNTIME_PATHS = {
+    name: getattr(config, name).relative_to(config.RUN)
+    for name in ("ARCHIVE", "PROGRAMS", "SANDBOXES", "FLOOR", "CHAMPIONS", "CHAMPION")
+}
+EXAM_SEEDS = config.EXAM_SEEDS
 
 
 @pytest.fixture
@@ -124,19 +137,10 @@ def tiny_run(
         vendored: The pool opponent that stands in for the vendored field.
     """
     run = tmp_path / "run"
-    for name in (
-        "ARCHIVE",
-        "PROGRAMS",
-        "SANDBOXES",
-        "FLOOR",
-        "CHAMPIONS",
-        "CHAMPION",
-    ):
-        monkeypatch.setattr(
-            config, name, run / getattr(config, name).relative_to(config.RUN)
-        )
+    for name, relative in RUNTIME_PATHS.items():
+        monkeypatch.setattr(config, name, run / relative)
     monkeypatch.setattr(config, "POOL", run / "pool.json")
-    monkeypatch.setattr(config, "EXAM_SEEDS", config.EXAM_SEEDS[:2])
+    monkeypatch.setattr(config, "EXAM_SEEDS", EXAM_SEEDS[:2])
     monkeypatch.setattr(config, "EPOCH_INTERVAL", 1)
     monkeypatch.setattr(config, "MIGRATION_INTERVAL", 10**6)
     monkeypatch.setattr(config, "RESET_INTERVAL", 10**6)
@@ -576,6 +580,157 @@ def test_the_core_counter_refuses_a_share_larger_than_the_whole_budget() -> None
 
     with pytest.raises(ValueError, match="budget is 4"):
         asyncio.run(body())
+
+
+def test_a_budget_of_one_share_serialises_the_loops_fast_evaluations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A fast evaluation holds the cores it fans its games over, and waits for them.
+
+    Two calls run at once and their children are scored at once, so a budget
+    with room for one share makes the second child wait for the first out and
+    a budget with room for both does not. What is recorded is the counter's
+    own boundary -- everything inside it is the real evaluation, playing real
+    games -- rather than wall clock, which on a busy box says how many cores
+    were going spare and not what the loop did with them.
+    """
+    narrow = _permits_of_two_calls(
+        tmp_path / "narrow", monkeypatch, log, PERMIT_WORKERS
+    )
+    assert narrow == ["in", "out", "in", "out"]
+
+    wide = _permits_of_two_calls(
+        tmp_path / "wide", monkeypatch, log, 2 * PERMIT_WORKERS
+    )
+    assert wide[:2] == ["in", "in"]
+
+
+class Watched(loop.Cores):
+    """The loop's core counter, recording when a taker holds permits and lets go.
+
+    A subclass, not a stand-in: the counting, the waiting and everything the
+    body does inside it are the real thing, and all this adds is a note of
+    when the boundary was crossed.
+    """
+
+    def __init__(self, budget: int) -> None:
+        """Initializes the counter.
+
+        Args:
+            budget: Permits available in total.
+        """
+        super().__init__(budget)
+        self.trace: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def take(self, n: int) -> AsyncIterator[None]:
+        """Hold ``n`` permits, noting the moment they are held and given back.
+
+        Args:
+            n: Permits to hold.
+
+        Yields:
+            None, once the permits are held.
+        """
+        async with super().take(n):
+            self.trace.append("in")
+            try:
+                yield
+            finally:
+                self.trace.append("out")
+
+
+def test_both_of_the_loops_evaluations_take_their_share_from_the_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A budget with no room for one share stops both, from the counter itself.
+
+    Timing shows a fast evaluation waiting for cores; it cannot show an
+    epoch's deep evaluations waiting without measuring two multi-second
+    measurements against each other, which says more about how loaded the box
+    is than about the loop. This says it exactly: the counter refuses a share
+    larger than the whole budget, so an evaluation that goes through it
+    raises before it plays anything and one that does not, does not. The
+    message is the counter's own -- the harness has a budget check of its
+    own, and it would report a different one.
+    """
+    job = _campaign(tmp_path / "job", monkeypatch, log, PERMIT_WORKERS - 1, 1)
+    with pytest.raises(ValueError, match=f"{PERMIT_WORKERS} cores requested"):
+        asyncio.run(job.work(1))
+
+    # Its own campaign: an asyncio primitive belongs to the first loop that
+    # waits on it, and the one above is closed.
+    epoch = _campaign(tmp_path / "epoch", monkeypatch, log, PERMIT_WORKERS - 1, 1)
+    assert len(epoch.archive.top(config.DEEP_TOP_K)) == 2
+    with pytest.raises(ValueError, match=f"{PERMIT_WORKERS} cores requested"):
+        asyncio.run(epoch.epoch())
+
+
+def _permits_of_two_calls(
+    root: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run, budget: int
+) -> list[str]:
+    """Run two calls on a loop with ``budget`` cores; return the permit trace.
+
+    `Campaign` is driven directly rather than through `run`, because `run`
+    refuses a mutation share that cannot fit the budget and one share for two
+    sessions is exactly that -- which is the configuration under test.
+
+    Args:
+        root: This run's own directory.
+        monkeypatch: The test's patcher.
+        log: The wandb run metrics go to.
+        budget: Cores the loop's own evaluations may use between them.
+
+    Returns:
+        "in" and "out" per evaluation, in the order the counter saw them.
+    """
+    campaign = _campaign(root, monkeypatch, log, budget, concurrency=2)
+    cores = Watched(budget)
+    campaign.cores = cores
+    asyncio.run(campaign.work(2))
+    return cores.trace
+
+
+def _campaign(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    budget: int,
+    concurrency: int,
+) -> loop.Campaign:
+    """A seeded campaign whose evaluations share ``budget`` cores.
+
+    Args:
+        root: This run's own directory; every runtime path lands under it.
+        monkeypatch: The test's patcher.
+        log: The wandb run metrics go to.
+        budget: Cores the loop's own evaluations may use between them.
+        concurrency: Codex sessions in flight at once.
+
+    Returns:
+        The campaign, seeded and ready to be driven.
+    """
+    root.mkdir()
+    tiny_run(root, monkeypatch)
+    monkeypatch.setattr(config, "EPOCH_INTERVAL", 10**6)
+    # Enough games that one evaluation is longer than the fixed cost of
+    # starting one, or the two budgets would not be distinguishable.
+    monkeypatch.setattr(config, "FAST_SEEDS", 3)
+    monkeypatch.setattr(config, "CORE_BUDGET", budget)
+    opponents = pass_pool(root)
+    archive = archive_module.Archive(config.ARCHIVE, config.PROGRAMS)
+    archive.seed(_write(root / "seed.py", PASS), fitness=0.5)
+    return loop.Campaign(
+        loop.State(),
+        archive,
+        opponents,
+        mutate.FakeMutator(edit=lambda _: SELLER),
+        PERMIT_WORKERS,
+        concurrency,
+        random.Random(0),
+        log,
+        commit=False,
+    )
 
 
 @pytest.mark.local_data

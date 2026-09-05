@@ -8,6 +8,10 @@ Both mutators are awaitable, because the loop runs many sessions at once on
 one event loop: codex is an ``asyncio`` child process, and the fake's file
 work goes to a thread so an ``edit`` that sleeps cannot stall the loop.
 
+A session's transcript runs to hundreds of kilobytes, so reading and parsing
+it goes to a thread like everything else that blocks: the loop thread is
+dispatching seven other sessions while this one is being totted up.
+
 Codex 0.147's ``--json`` output is one JSON object per line. Token usage
 lives on the ``turn.completed`` event, under ``usage.input_tokens`` and
 ``usage.output_tokens`` (verified against a real session log); other events
@@ -159,7 +163,7 @@ class CodexMutator:
                     pgid,
                     "keeping the child it had written" if child else "no child",
                 )
-                tokens_in, tokens_out = _tokens(log)
+                tokens_in, tokens_out = await asyncio.to_thread(_tokens, log)
                 return Mutation(
                     program_id=program_id,
                     child=child,
@@ -193,10 +197,13 @@ class CodexMutator:
                 input_tokens=0,
                 output_tokens=0,
             )
-        tokens_in, tokens_out = _tokens(log)
+        tokens_in, tokens_out = await asyncio.to_thread(_tokens, log)
         child = _written(sandbox)
         if child is None:
-            reason = _last_message(log) or "child.py missing or empty"
+            reason = (
+                await asyncio.to_thread(_last_message, log)
+                or "child.py missing or empty"
+            )
             return Mutation(
                 program_id=program_id,
                 child=None,

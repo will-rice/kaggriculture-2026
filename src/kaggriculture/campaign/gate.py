@@ -43,9 +43,9 @@ class Champion(BaseModel):
     """The promoted floor, as ``config.CHAMPION`` records it.
 
     Written before ``promote`` returns and preferred over ``state.json`` on
-    restart: ``state.json`` is written only once an iteration finishes, so a
-    kill in between would otherwise lose the champion and let the gate
-    promote a second time against no baseline.
+    restart: ``state.json`` is written after every completed call, so a kill
+    between the promotion and that write would otherwise lose the champion
+    and let the gate promote a second time against no baseline.
 
     Attributes:
         name: The champion's pool name, e.g. "champion_3".

@@ -256,7 +256,7 @@ class Campaign:
             async with self.group as group:
                 group.create_task(self.dispatch(calls), name="dispatch")
         except BaseExceptionGroup as failures:
-            raise _first(failures) from None
+            raise _first(failures) from failures
 
     async def dispatch(self, calls: int) -> None:
         """Keep sessions in flight until ``calls`` of them have been planned.
@@ -304,6 +304,14 @@ class Campaign:
         carries the reason. The sandbox is removed only on a successful
         insert: on failure its codex log is the evidence.
 
+        The two counters the dispatcher reads are given up in ``finally``
+        blocks that cover everything after it handed them over: the session
+        permit as soon as codex is gone, and the island's in-flight count
+        when the job is. Anything this raises -- an ``OpponentCrash`` on its
+        way to stopping the run, a sandbox that could not be built -- would
+        otherwise leak a permit the dispatcher never gets back or an island
+        that looks busy for the rest of the run.
+
         Args:
             island: The island this call belongs to.
             plan: What to mutate, from ``_plan``.
@@ -311,32 +319,37 @@ class Campaign:
         """
         kind, parent, inspiration = plan
         program_id = f"i{island}-{int(rng.random() * 1e9):09d}"
-        failures = [f.reason for f in self.archive.failures() if parent.id in f.parents]
-        box = prompt.build_sandbox(
-            program_id,
-            kind,
-            Path(parent.source_path),
-            Path(inspiration.source_path) if inspiration else None,
-            feedback=parent.rates,
-            weakest=self.pool.weakest(parent.rates) if parent.rates else "",
-            weights=self.pool.weights,
-            failures=failures[-3:],
-        )
         try:
-            mutation = await self.mutator(box, program_id)
+            try:
+                failures = [
+                    f.reason for f in self.archive.failures() if parent.id in f.parents
+                ]
+                box = prompt.build_sandbox(
+                    program_id,
+                    kind,
+                    Path(parent.source_path),
+                    Path(inspiration.source_path) if inspiration else None,
+                    feedback=parent.rates,
+                    weakest=self.pool.weakest(parent.rates) if parent.rates else "",
+                    weights=self.pool.weights,
+                    failures=failures[-3:],
+                )
+                mutation = await self.mutator(box, program_id)
+            finally:
+                self.sessions.release()
+            parents = [parent.id] + ([inspiration.id] if inspiration else [])
+            if mutation.child is None:
+                self.archive.record_failure(
+                    island, parents, kind, f"{mutation.status}: {mutation.reason}"
+                )
+                fitness = None
+            else:
+                fitness = await self.score(
+                    island, parents, kind, program_id, mutation.child, box, rng
+                )
+            self.finish(mutation, fitness)
         finally:
-            self.sessions.release()
-        parents = [parent.id] + ([inspiration.id] if inspiration else [])
-        if mutation.child is None:
-            self.archive.record_failure(
-                island, parents, kind, f"{mutation.status}: {mutation.reason}"
-            )
-            fitness = None
-        else:
-            fitness = await self.score(
-                island, parents, kind, program_id, mutation.child, box, rng
-            )
-        self.finish(island, mutation, fitness)
+            self.in_flight[island] -= 1
 
     async def score(
         self,
@@ -405,19 +418,17 @@ class Campaign:
             result.fitness,
             "dropped" if replaced is program else "inserted",
         )
-        shutil.rmtree(box, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, box, ignore_errors=True)
         return result.fitness
 
-    def finish(self, island: int, mutation: Mutation, fitness: float | None) -> None:
+    def finish(self, mutation: Mutation, fitness: float | None) -> None:
         """Count the call, persist the state, log it, and run the schedule.
 
         Args:
-            island: The island the call belonged to.
             mutation: What the session cost and whether it wrote a child.
             fitness: The child's fast fitness, or None where it never got
                 that far.
         """
-        self.in_flight[island] -= 1
         self.state.calls += 1
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(
@@ -459,7 +470,9 @@ class Campaign:
             "calls/output_tokens": mutation.output_tokens,
             "calls/seconds": mutation.seconds,
             "calls/today": self.state.calls_today,
-            "calls/in_flight": sum(self.in_flight),
+            # This call is still counted against its island until its job
+            # returns, so it is the one subtracted here.
+            "calls/in_flight": sum(self.in_flight) - 1,
             "archive/programs": sum(
                 len(self.archive.island(i)) for i in range(config.ISLANDS)
             ),
@@ -780,7 +793,9 @@ def _first(failures: BaseExceptionGroup) -> BaseException:
     A task group reports what its children raised as a tree. The loop's own
     failure mode is a single ``OpponentCrash`` out of one job, and callers --
     the tests and the operator reading a traceback -- want that exception,
-    not a wrapper around it.
+    not a wrapper around it. The caller raises it *from* the group, so the
+    siblings that failed with it stay reachable as the cause rather than
+    being thrown away.
 
     Args:
         failures: What the task group raised.

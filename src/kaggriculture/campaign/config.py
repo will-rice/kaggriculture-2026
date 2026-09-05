@@ -98,7 +98,12 @@ CODEX_MODEL = "gpt-6-astra"
 # it through the harness. Whatever `child.py` holds when the cap fires is
 # kept, so the cap bounds an iteration's wall clock, not whether it yields.
 MUTATION_TIMEOUT_SECONDS = 1500
-DAILY_CALL_BUDGET = 200
+# A liveness guard, not a target: what keeps a spent provider quota from
+# becoming hours of `exec_error` lineage failures. Raised to 800 for this
+# week's ramp, because the async loop expects roughly 750 calls a day and a
+# cap below that would park the dispatcher until midnight with quota to
+# spare -- the failure this whole redesign exists to end.
+DAILY_CALL_BUDGET = 800
 # Wall clock a candidate gets for the dynamic load plus `harness.check`, which
 # run together in a child process. Module-level code runs on load, so a
 # candidate with an unbounded loop outside any function would otherwise wedge

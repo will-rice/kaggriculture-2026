@@ -41,10 +41,23 @@ for how it was built.
 ### Running the campaign
 
 ```bash
-uv run campaign dry-run --iterations 2         # fake mutator, proves the pipeline
+uv run campaign dry-run --calls 2         # fake mutator, proves the pipeline
 nohup uv run campaign loop > run/campaign/loop.log 2>&1 &
 tail -f run/campaign/loop.log            # metrics: wandb.ai/will-rice/kaggriculture-2026
 ```
+
+The loop is one `asyncio` event loop and nothing in it waits on anything it
+does not need. A dispatcher keeps `--concurrency` codex sessions running at
+once, and a session's slot is refilled the moment codex exits rather than
+when its child finishes being scored; every child is validated,
+fast-evaluated and inserted as soon as it exists. The schedule is counted in
+completed calls, not rounds -- migration every `MIGRATION_INTERVAL` calls,
+a deep-evaluation epoch every `EPOCH_INTERVAL`, an island reset every
+`RESET_INTERVAL` -- and an epoch is a task like any other: it competes for
+cores with the evaluations running beside it instead of stopping dispatch,
+and a crossing that finds the previous epoch still running is skipped.
+`--calls` is how many mutation calls to run; whatever is in flight when the
+last one is planned is drained.
 
 `dry-run` swaps the codex mutator for one that copies the parent with a
 visible edit, so it exercises validation, evaluation, insertion and the
@@ -54,7 +67,11 @@ where it stopped, and it resumes the same wandb run (`config.WANDB_RUN_ID`),
 so the curves continue, named `<codex model>-<git revision>` as of the launch;
 a dry run logs nothing. Each promotion also uploads
 the champion's file as a wandb artifact named after it. Keep `--workers * --concurrency` inside the core budget:
-each mutation in flight runs an evaluation that forks that many processes.
+every session in flight can be evaluating at once, so the peak is their product.
+
+The commit hook runs the fast suite; run `uv run pytest -m slow` before
+pushing, which is where the tests that play real games against the vendored
+corpus live.
 
 ## Quick Start
 
