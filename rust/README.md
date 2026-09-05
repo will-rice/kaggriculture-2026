@@ -20,6 +20,10 @@ with one action tape and compares every observable field of both seats at
 every step of full 719-step episodes, under the default configuration and a
 variant that overrides most of `kaggriculture.json`.
 
+`uv run replay-corpus` does the same against recorded Kaggle episodes: it
+replays each archive's recorded actions from the recorded seed and compares
+every recorded observation of every step (see **Corpus verification**).
+
 ## Layout
 
 | file              | reference counterpart                                             |
@@ -34,6 +38,53 @@ variant that overrides most of `kaggriculture.json`.
 | `src/agents.rs`   | `pass_agent`, `random_agent`, `starter_agent`                     |
 | `src/render.rs`   | `renderer`                                                        |
 | `src/main.rs`     | CLI: `run` a tape, `bench`, `render`                              |
+| `python/`         | PyO3 bindings: the `kaggriculture_engine` Python module           |
+
+## Python
+
+```sh
+uv sync --group rust
+uv run maturin develop --release --uv -m rust/python/Cargo.toml
+```
+
+```python
+import kaggriculture_engine as ke
+
+engine = ke.Engine({"seed": 42})          # any kaggriculture.json key
+while not engine.done:
+    obs = engine.observation(0)           # the dict a Kaggle agent receives
+    engine.step([my_agent(obs), None])    # reference action dicts; None passes
+print(engine.rewards)
+
+snapshot = engine.state()                 # both sheds included
+later = ke.Engine.from_state(snapshot, seed=engine.seed)
+branch = engine.copy()                    # cheap, for search
+```
+
+`Engine` also exposes `observations()`, `money`, `day`, `hour`, `step_count`,
+`render()` and `reset()`; the module carries `market_price`, the three
+reference agents, a CPython-exact `Random`, and the name tables. Stubs ship
+with the wheel. `tests/rust/test_bindings.py` checks the bindings against the
+reference the same way the CLI is checked.
+
+## Corpus verification
+
+Kaggle's daily replay archives record the seed, both seats' actions and the
+world after every turn, so a replay through this engine must reproduce every
+recorded field. With archives under `/data/kaggriculture/episodes` (see
+`scripts/fetch_episodes.py`):
+
+```sh
+uv run replay-corpus --episodes 50 -v          # fixed-seed sample across archives
+uv run replay-corpus --archive path/to/one.zip # every episode in one archive
+uv run replay-corpus --version 1.32.7 --stop   # only this engine version; stop at first divergence
+uv run pytest tests/rust -m slow --rust-episodes=50   # the same as a test
+```
+
+The tool exits non-zero on any divergence and names the first turn, seat and
+field. `tests/rust/test_corpus.py` checks the tool itself on locally recorded
+episodes in the same archive layout, including that a corrupted record is
+caught at the right step.
 
 ## Use
 

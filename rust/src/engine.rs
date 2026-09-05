@@ -70,6 +70,23 @@ impl Engine {
         self.state = state;
     }
 
+    /// Load a state produced by `GameState::to_json`, keeping this engine's
+    /// configuration and seed. The number of players follows the state.
+    pub fn load_state_json(&mut self, value: &serde_json::Value) -> Result<(), String> {
+        let (params, params_json) = self.config.resolve_market_params();
+        let template = Market::new(params, params_json);
+        let state = GameState::from_json(value, &template)?;
+        self.players = state.players();
+        self.state = state;
+        Ok(())
+    }
+
+    /// Replace the seed that drives weeds and shop unlocks, e.g. when
+    /// resuming a recorded episode whose seed is known.
+    pub fn set_seed(&mut self, seed: i64) {
+        self.seed = seed;
+    }
+
     pub fn done(&self) -> bool {
         self.state.done
     }

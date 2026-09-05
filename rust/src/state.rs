@@ -757,11 +757,107 @@ impl GameState {
         map.insert("step".into(), self.step.into());
         Value::Object(map)
     }
+
+    /// The whole state, both privates included: enough to resume an episode.
+    pub fn to_json(&self) -> Value {
+        let mut map = Map::new();
+        map.insert(
+            "farms".into(),
+            Value::Array(self.farms.iter().map(Farm::to_json).collect()),
+        );
+        map.insert(
+            "privates".into(),
+            Value::Array(self.privates.iter().map(Private::to_json).collect()),
+        );
+        map.insert("market".into(), self.market.to_json());
+        map.insert("town".into(), self.town.to_json());
+        map.insert("step".into(), self.step.into());
+        map.insert("day".into(), self.day.into());
+        map.insert("hour".into(), self.hour.into());
+        map.insert("done".into(), self.done.into());
+        map.insert(
+            "rewards".into(),
+            Value::Array(self.rewards.iter().map(|r| (*r).into()).collect()),
+        );
+        Value::Object(map)
+    }
+
+    /// Inverse of `to_json`. `template` supplies the market curve, which the
+    /// state JSON only echoes when overrides were configured.
+    pub fn from_json(value: &Value, template: &Market) -> Result<GameState, String> {
+        let map = value.as_object().ok_or("state must be an object")?;
+        let farms = map
+            .get("farms")
+            .and_then(Value::as_array)
+            .ok_or("state.farms missing")?
+            .iter()
+            .map(Farm::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        let privates = map
+            .get("privates")
+            .and_then(Value::as_array)
+            .ok_or("state.privates missing")?
+            .iter()
+            .map(Private::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        if farms.len() != privates.len() {
+            return Err("state.farms and state.privates differ in length".into());
+        }
+        let market = Market::from_json(map.get("market").ok_or("state.market missing")?, template)?;
+        let town = Town::from_json(map.get("town").ok_or("state.town missing")?)?;
+        let step = int(map, "step")?;
+        let rewards = map
+            .get("rewards")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
+            .unwrap_or_default();
+        Ok(GameState {
+            farms,
+            privates,
+            market,
+            town,
+            step,
+            day: map.get("day").and_then(Value::as_i64).unwrap_or(0),
+            hour: map.get("hour").and_then(Value::as_i64).unwrap_or(0),
+            done: map.get("done").and_then(Value::as_bool).unwrap_or(false),
+            rewards,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_state_round_trips_through_json() {
+        let mut state = GameState {
+            farms: vec![Farm::new(10, 3000), Farm::new(10, 3000)],
+            privates: vec![Private::new(), Private::new()],
+            market: Market::new(crate::tables::MARKET_PARAMS, None),
+            town: Town {
+                unlocked_shops: vec![Shop::PetCafe, Shop::PetCafe],
+            },
+            step: 77,
+            day: 3,
+            hour: 5,
+            done: false,
+            rewards: Vec::new(),
+        };
+        *state.farms[0].tile_mut(1, 2) = Tile::Plant(Plant::new(Crop::Melon, 2, 24));
+        *state.farms[1].tile_mut(0, 0) = Tile::Animal(Livestock::new(Animal::Cow, 1));
+        state.farms[1].hands.push((5, 4));
+        state.privates[1].inventories.push(Inventory::new());
+        state.privates[1].inventories[1].add(Item::Egg, 2);
+        state.privates[1].inventories[1].add(Item::Wheat, 1);
+        state.privates[0].shed[Item::Melon as usize] = 9;
+        state.privates[0].seeds[Crop::Wheat as usize] = 4;
+        state.market.inventory[0] = 9_950;
+        state.market.refresh_prices();
+        let template = Market::new(crate::tables::MARKET_PARAMS, None);
+        let restored = GameState::from_json(&state.to_json(), &template).unwrap();
+        assert_eq!(restored, state);
+    }
 
     #[test]
     fn new_farm_unlocks_only_nw() {

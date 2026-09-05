@@ -183,7 +183,11 @@ markers = [
 ]
 addopts = "-m 'not slow'"
 
+[dependency-groups]
+rust = ["maturin>=1.8,<2"]
+
 [project.scripts]
 run = "kaggriculture.scripts.run:main"
 package = "kaggriculture.scripts.package:main"
 submit = "kaggriculture.scripts.submit:main"
+replay-corpus = "kaggriculture.scripts.replay_corpus:main"

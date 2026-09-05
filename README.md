@@ -36,8 +36,9 @@ relies on, and the places where the engine disagrees with the documentation.
 │   └── scripts/
 │       ├── run.py             # Evaluate against the built-in agents
 │       ├── package.py         # Build submission.tar.gz
-│       └── submit.py          # Package and upload to Kaggle
-├── rust/                      # Rust port of the reference engine (see rust/README.md)
+│       ├── submit.py          # Package and upload to Kaggle
+│       └── replay_corpus.py   # Replay Kaggle episode archives through the Rust engine
+├── rust/                      # Rust port of the reference engine + Python bindings (see rust/README.md)
 ├── docs/competition.md        # Competition notes
 ├── tests/                     # Test files
 │   └── rust/                  # Drives the Rust engine and the reference through one tape

@@ -38,5 +38,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - run: uv sync --locked
+      - run: uv sync --locked --group rust
+      - run: uv run maturin develop --release --uv -m rust/python/Cargo.toml
       - run: uv run pytest tests/rust --rust-episodes=4 --rust-turns=719
