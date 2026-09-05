@@ -1,34 +1,29 @@
 """The one place a candidate becomes the floor.
 
-The promotion rule is the spec's §5.5: the candidate's lower Wilson bound
+The promotion rule is the spec's §5.2: the candidate's lower Wilson bound
 above the champion's point estimate, the vendored field not down more than
 two points, no opponent regressed beyond the wider of the two intervals.
 
-The promotion commit runs ``git commit --no-verify``. This repo's
-pre-commit hook runs the full pytest suite and ruff-format on every commit;
-inside the loop that would cost minutes per champion, fail on any unrelated
-test failure, and let ruff-format rewrite the codex-written ``main.py``,
-changing the bytes the gate just measured. Evolved code is gated, not
-linted: the deep evaluation is the whole of its verification, and
-``served/`` is excluded from the format, lint and type hooks so a champion
-whose annotations do not typecheck cannot block the next human commit.
+A promotion also produces the artefact a cut uploads. The program is
+packaged and played in the Kaggle docker image *before* anything durable is
+written, so the floor only ever holds a program Kaggle's own image has run,
+and a cut is one command: upload `champion.tarball`. Nothing is built at
+cut time.
 
-The on-disk state -- ``champions/<name>.py``, the floor, ``served/main.py``,
-``champion.json``, the pool file -- is written before the commit and is the
-source of truth for promotion. A failed git record (nothing to commit, a
-lock file, a full disk) is logged and swallowed rather than raised: a
-promotion that already happened on disk must never be undone by a commit
-that failed to explain it.
+Nothing here touches version control. Provenance is `champion.json`, the
+champions directory and the archive; every write is under `run/campaign`
+except `served/main.py`, which is the copy the packaging entry points read.
 """
 
 import logging
 import os
-import subprocess
+import shutil
+import tempfile
 from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, harness, kaggle_image
 from kaggriculture.campaign.archive import Program
 from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.pool import Pool
@@ -37,6 +32,14 @@ LOGGER = logging.getLogger(__name__)
 
 SERVED = config.SERVED
 FIELD_TOLERANCE = 0.02
+
+
+class NotShippable(RuntimeError):  # noqa: N818 - a property of the tarball
+    """A candidate's tarball would not run in the Kaggle image.
+
+    Raised by `promote` before any durable write, so a candidate that fails
+    the image test leaves the previous champion exactly as it was.
+    """
 
 
 class Champion(BaseModel):
@@ -50,11 +53,14 @@ class Champion(BaseModel):
     Attributes:
         name: The champion's pool name, e.g. "champion_3".
         path: The immutable copy under ``config.CHAMPIONS`` the pool plays.
+        tarball: The archive a cut uploads, played in the Kaggle image
+            before this record existed.
         result: The deep evaluation the promotion was decided on.
     """
 
     name: str
     path: str
+    tarball: str
     result: DeepResult
 
 
@@ -99,7 +105,7 @@ def promotion(candidate: DeepResult, champion: DeepResult | None) -> tuple[bool,
 
 
 def promote(program: Program, result: DeepResult, pool: Pool) -> Champion:
-    """Keep the champion's own copy, write the floor and update the pool.
+    """Ship the tarball, then write the floor, the pool and the champion record.
 
     Each champion is written once to ``CHAMPIONS/<name>.py`` and it is that
     path the pool registers, so a pool holding N champions holds N different
@@ -115,82 +121,70 @@ def promote(program: Program, result: DeepResult, pool: Pool) -> Champion:
 
     Returns:
         The champion record, exactly as ``config.CHAMPION`` now holds it.
-        Recording it in the repository is ``commit_floor``'s job: that runs
-        subprocesses, so the loop hands it to a thread rather than blocking
-        the event loop here.
+
+    Raises:
+        FileExistsError: The champions directory already holds this name.
+        NotShippable: The tarball does not run in the Kaggle image. Nothing
+            has been written.
     """
     number = 1 + sum(1 for n in pool.names() if n.startswith("champion_"))
     name = f"champion_{number}"
-    source = Path(program.source_path).read_text(encoding="utf-8")
-
-    config.CHAMPIONS.mkdir(parents=True, exist_ok=True)
-    champion = config.CHAMPIONS / f"{name}.py"
-    if champion.exists():
+    kept = config.CHAMPIONS / f"{name}.py"
+    if kept.exists():
         raise FileExistsError(
-            f"{champion} already exists: the pool and the champions directory "
+            f"{kept} already exists: the pool and the champions directory "
             "disagree about how many champions there have been"
         )
-    champion.write_text(source, encoding="utf-8")
-    champion.chmod(0o444)
+    source = Path(program.source_path)
+
+    with tempfile.TemporaryDirectory() as scratch:
+        # Every byte written before the image has played the tarball is
+        # written in here, and the directory is removed on every path out of
+        # this block. So a candidate that fails `load_test` leaves nothing to
+        # clean up and nothing to undo: at the point it raises, no file under
+        # `run/campaign` has been touched, and the only way past this block is
+        # the image having played the tarball to a reward.
+        built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
+        try:
+            output = kaggle_image.load_test(built)
+        except Exception as error:
+            raise NotShippable(
+                f"{name} does not run in the Kaggle image: {error}"
+            ) from error
+        # The script's last print is `EPISODE_OK <reward> <reward>`; ahead of
+        # it are pages of the image's own import chatter, which is only worth
+        # reading when the container failed and `NotShippable` carries it.
+        LOGGER.info("%s in the kaggle image: %s", name, " ".join(output.split()[-3:]))
+        config.CHAMPIONS.mkdir(parents=True, exist_ok=True)
+        tarball = config.CHAMPIONS / f"{name}.tar.gz"
+        shutil.move(str(built), str(tarball))
+
+    code = source.read_text(encoding="utf-8")
+    kept.write_text(code, encoding="utf-8")
+    kept.chmod(0o444)
 
     config.FLOOR.mkdir(parents=True, exist_ok=True)
     floor = config.FLOOR / "main.py"
     if floor.exists():
         floor.chmod(0o644)
-    floor.write_text(source, encoding="utf-8")
+    floor.write_text(code, encoding="utf-8")
     floor.chmod(0o444)
 
     SERVED.parent.mkdir(parents=True, exist_ok=True)
-    SERVED.write_text(source, encoding="utf-8")
+    SERVED.write_text(code, encoding="utf-8")
 
     # add_champion and weakness pressure change the pool in memory; save
     # immediately after so nothing between here and the save can resolve the
-    # champion's name through a stale pool (Task 8 inherits this order).
-    pool.add_champion(name, str(champion), result.rates)
+    # champion's name through a stale pool.
+    pool.add_champion(name, str(kept), result.rates)
     pool.apply_weakness_pressure(pool.weakest(result.rates))
     pool.save(config.POOL)
 
-    record = Champion(name=name, path=str(champion), result=result)
+    record = Champion(name=name, path=str(kept), tarball=str(tarball), result=result)
     _write_champion(record)
 
     LOGGER.info("promoted %s to %s", program.id, name)
     return record
-
-
-def commit_floor(champion: Champion, program_id: str) -> None:
-    """Record a promotion that already happened on disk in the repository.
-
-    Blocking: two version-control subprocesses. The loop awaits this through
-    a thread so the event loop keeps dispatching while it runs.
-
-    Args:
-        champion: The record ``promote`` just wrote.
-        program_id: The archive id of the program that was promoted.
-    """
-    result = champion.result
-    message = (
-        f"feat: promote {program_id} to the floor as {champion.name}\n\n"
-        f"deep {result.score:.4f} [{result.low:.4f}, {result.high:.4f}], "
-        f"field {result.field:.4f}"
-    )
-    try:
-        subprocess.run(
-            ["git", "add", str(SERVED)],
-            check=True,
-            cwd=config.ROOT,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["git", "commit", "--no-verify", "-q", "-m", message],
-            check=True,
-            cwd=config.ROOT,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as error:
-        stderr = (error.stderr or "")[-300:]
-        LOGGER.warning("promotion commit failed for %s: %s", champion.name, stderr)
 
 
 def _write_champion(champion: Champion) -> None:
