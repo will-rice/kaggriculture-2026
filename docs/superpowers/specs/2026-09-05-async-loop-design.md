@@ -123,25 +123,49 @@ at a finer grain, accepted.
 `DEEP_TOP_K = 3` keeps its meaning as the trigger's rank; `DEEP_CONCURRENCY
 = 2` is new. `State.iteration` becomes `State.calls`.
 
-## 5. Shutdown and resume
+## 5. Sessions, shutdown and resume
 
-- `SIGTERM`/`SIGINT` cancel every task. A cancelled codex call kills its
-  process group, so a restart never orphans sessions (today it does, and a
-  `pkill` of the loop leaves eight sessions running).
-- `state.json` is written after every completed call; `champion.json` by the
-  gate as today. A restart resumes `calls` and the champion and loses only
-  the sessions in flight. A `state.json` from the old loop has `iteration`
-  and no `calls`: it loads as `calls = 0`, which only shifts the cadence.
-- `run(calls, ...)` runs until `state.calls` reaches the target, then drains
+**A codex session is independent of the loop process.** The loop launches
+it in its own process group and from then on merely tracks it. Every
+session has a record under `run/campaign/sessions/<program_id>.json`:
+island, parents, kind, model, start time, sandbox path, pid and process
+group, written before the session starts and deleted when its call
+completes.
+
+- **Shutdown** (`SIGTERM`/`SIGINT`, or `OpponentCrash`) stops dispatching,
+  abandons the in-flight evaluations and exits. It kills no session. The
+  records and the sandboxes stay.
+- **Start** scans the records. A session whose process is still alive is
+  re-attached: a task waits for the process to exit (polling, since it is
+  not the new loop's child), with the cap measured from the recorded start,
+  then runs the normal chain — validate, fast, insert — and completes the
+  call. A session whose process has already exited is harvested the same
+  way from what it left in the sandbox. Re-attached sessions hold session
+  permits, so the dispatcher only tops up to `CODEX_CONCURRENCY`.
+- The timeout kill stays: a session past its cap is stuck, not
+  independent. A restart therefore loses nothing but the seconds it takes,
+  and loop code can be deployed at will.
+- `state.json` is written after every completed call; `champion.json` by
+  the gate. A `state.json` from the old loop has `iteration` and no
+  `calls`: it loads as `calls = 0`, which only shifts the cadence.
+- `run(calls, ...)` plans exactly `calls` new sessions, then drains
   in-flight tasks (they complete and count). `campaign loop --calls N`.
+
+**One wandb run per code version.** The run id is `<model>-<short
+revision>`, the same string as the name, with `resume="allow"`: a restart
+on unchanged code resumes its run; a restart on changed code opens a new
+one on the same `calls` axis, so versions are separate lines that line up.
+The loop reads the revision from a clean tree and refuses to start from a
+dirty one (uncommitted changes under `src/`), because a run named by a hash
+must be that hash.
 
 ## 6. Failure handling
 
 Unchanged in kind. A candidate's failure at any step is its lineage's failure
 and is recorded with the reason. `OpponentCrash` (a pool opponent failing in
 its own seat) is not a candidate's failure: it propagates out of the job or
-a deep task, the dispatcher stops, in-flight sessions are killed, and
-`run` raises. A session that ends without a verdict — the provider refused
+a deep task, the dispatcher stops, in-flight sessions are left running
+for the next start to harvest, and `run` raises. A session that ends without a verdict — the provider refused
 (`gpt-6-astra` answers "at capacity" some of the time) or codex died — is
 retried once on `CODEX_FALLBACK_MODEL` (`gpt-5.6-sol`) in the same sandbox,
 and the call records which model produced its child (`calls/fallback`). A
@@ -185,15 +209,25 @@ evaluation of its child landing.
    (the ordering construction already in `test_loop.py`).
 5. A spent cap parks dispatch without advancing `calls` or the cadence; the
    day rolling over resumes it.
-6. Cancellation kills the codex process group (the existing `bash -c "sleep
-30 & sleep 30"` pattern); no member of the pgid survives.
-7. `OpponentCrash` from a job stops the loop, and in-flight sessions are gone.
-8. Resume carries over in terms of `calls`. A program is deep-scored once:
+6. A session survives the loop: a loop killed with SIGTERM while a session
+   (`bash -c` writing `child.py` after a sleep) is running leaves it
+   running, and a fresh loop started against the same run directory
+   re-attaches, harvests its child and inserts it, completing the call. A
+   session that already exited before the restart is harvested the same
+   way. The timeout still kills a session past its cap, process group and
+   all.
+7. `OpponentCrash` from a job stops the loop; its sessions are left running
+   and their records remain.
+8. A loop launched from a tree with uncommitted changes under `src/`
+   refuses to start; one launched from a clean tree names its run
+   `<model>-<revision>` and a second launch resumes that run.
+9. Resume carries over in terms of `calls`. A program is deep-scored once:
    re-inserting it into the top K never creates a second task, and a
    restart reads its stored result from the archive log. After a
    promotion the champion is re-scored on the post-promotion pool and the
    next comparison uses that score.
-9. Mutator tests await; timeout-keeps-child and kill-the-group still pass.
+10. Mutator tests await; timeout-keeps-child and timeout-kills-the-group still
+    pass.
 
 ## 10. Out of scope
 
