@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, evaluator, pool
+from kaggriculture.campaign import config, evaluator, field_gate, pool
+from kaggriculture.report import wilson_interval
 
 PASS = (
     "def agent(observation, configuration=None):\n"
@@ -72,6 +73,42 @@ def test_deep_scores_the_exam_block_with_intervals_and_held_out(
     assert result.intervals["v54"][0] == 0.0 and result.intervals["v54"][1] < 1.0
     assert set(result.held_out) == set(evaluator.HELD_OUT)
     assert set(result.rates) == set(p.names())  # held-out never enters the score
+
+
+def test_deep_bounds_are_the_pool_weighted_sum_of_the_per_opponent_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-uniform pool is not one binomial, so the bounds combine per opponent.
+
+    Treating the weighted score as a single binomial over every game would
+    report an interval narrower than the truth, and the gate promotes on the
+    lower bound. The rates are fixed here so the arithmetic, not the engine,
+    is what is under test.
+    """
+    agent = tmp_path / "main.py"
+    agent.write_text(PASS, encoding="utf-8")
+    monkeypatch.setattr(config, "EXAM_SEEDS", config.EXAM_SEEDS[:8])
+    fixed = {"v54": 0.9, "v56": 0.1} | dict.fromkeys(evaluator.HELD_OUT, 0.5)
+    monkeypatch.setattr(
+        field_gate,
+        "score_field",
+        lambda candidate, seeds, workers, opponents: {n: fixed[n] for n in opponents},
+    )
+    p = pool.Pool(
+        opponents={
+            "v54": str(config.OPPONENTS / "kaito_v54" / "main.py"),
+            "v56": str(config.OPPONENTS / "kaito_v56" / "main.py"),
+        },
+        weights={"v54": 0.8, "v56": 0.2},
+    )
+    result = evaluator.deep(agent, "prog", p, workers=4)
+    games = 2 * 8
+    strong = wilson_interval(0.9 * games, games)
+    weak = wilson_interval(0.1 * games, games)
+    assert result.games == games
+    assert result.low == pytest.approx(0.8 * strong[0] + 0.2 * weak[0])
+    assert result.high == pytest.approx(0.8 * strong[1] + 0.2 * weak[1])
+    assert result.low < result.score < result.high
 
 
 def test_deep_diverts_what_a_candidate_writes_away_from_the_caller(

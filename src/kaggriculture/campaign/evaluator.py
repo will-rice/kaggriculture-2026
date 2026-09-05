@@ -40,8 +40,15 @@ class DeepResult(BaseModel):
     Attributes:
         program_id: The program this measures.
         score: Pool-weighted win rate over the pool opponents only.
-        low: Wilson lower bound on ``score``.
-        high: Wilson upper bound on ``score``.
+        low: Conservative lower bound on ``score``: the pool-weighted sum of
+            the per-opponent Wilson lower bounds. ``score`` is not a single
+            binomial over every game -- the weights are not uniform, so its
+            variance is ``sum(w_i**2 * p_i * (1 - p_i)) / games`` -- and each
+            per-opponent interval holds at 95%, so their weighted combination
+            is at least as wide as the exact interval. The gate promotes on
+            this bound, so it errs wide rather than narrow.
+        high: Conservative upper bound on ``score``, by the same weighted sum
+            of the per-opponent Wilson upper bounds.
         rates: Win rate per pool opponent.
         intervals: Wilson interval per pool opponent.
         field: Equal-weighted rate over the vendored opponents still in the pool.
@@ -119,6 +126,8 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
     Raises:
         RuntimeError: A side raised during a game. A crashed candidate is a
             failed evaluation, never a zero score, so this propagates.
+        ZeroDivisionError: The pool holds no vendored opponent, so there is no
+            field to average over.
     """
     names = pool.names()
     opponents = names + [name for name in HELD_OUT if name not in names]
@@ -133,17 +142,15 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
         finally:
             os.chdir(origin)
     games = 2 * len(config.EXAM_SEEDS)
-    weighted = pool.weighted(rates)
-    total = games * len(names)
-    low, high = wilson_interval(weighted * total, total)
+    intervals = {name: wilson_interval(rates[name] * games, games) for name in names}
     vendored = [name for name in VENDORED if name in names]
     return DeepResult(
         program_id=program_id,
-        score=weighted,
-        low=low,
-        high=high,
+        score=pool.weighted(rates),
+        low=pool.weighted({name: bounds[0] for name, bounds in intervals.items()}),
+        high=pool.weighted({name: bounds[1] for name, bounds in intervals.items()}),
         rates={name: rates[name] for name in names},
-        intervals={name: wilson_interval(rates[name] * games, games) for name in names},
+        intervals=intervals,
         field=sum(rates[name] for name in vendored) / len(vendored),
         held_out={name: rates[name] for name in HELD_OUT},
         games=games,
