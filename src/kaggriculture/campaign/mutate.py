@@ -1,0 +1,274 @@
+"""One mutation: a codex session in a sandbox, or a fake that edits a constant.
+
+The codex command is a class attribute so a test can replace it with ``true``
+or ``sleep``; the rest of the module never changes between the fake and the
+real thing.
+
+Codex 0.147's ``--json`` output is one JSON object per line. Token usage
+lives on the ``turn.completed`` event, under ``usage.input_tokens`` and
+``usage.output_tokens`` (verified against a real session log); other events
+carry no usage and are ignored. Codex sometimes ends a turn with a question
+instead of writing ``child.py``; ``_last_message`` recovers the last
+``agent_message`` text so the caller knows why.
+"""
+
+import json
+import logging
+import subprocess
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Literal, Protocol
+
+from pydantic import BaseModel
+
+from kaggriculture.campaign import config
+
+LOGGER = logging.getLogger(__name__)
+
+
+class Mutation(BaseModel):
+    """The outcome of one mutation call.
+
+    Attributes:
+        program_id: The child program id the sandbox was built for.
+        child: Path to the written child program, or None on failure.
+        status: "ok", "no_output" (ran but wrote nothing usable), "timeout",
+            or "exec_error".
+        reason: Free-form explanation; empty on "ok".
+        seconds: Wall-clock time the call took.
+        input_tokens: Total input tokens billed, summed across the call.
+        output_tokens: Total output tokens billed, summed across the call.
+    """
+
+    program_id: str
+    child: Path | None
+    status: Literal["ok", "no_output", "timeout", "exec_error"]
+    reason: str
+    seconds: float
+    input_tokens: int
+    output_tokens: int
+
+
+class Mutator(Protocol):
+    """Something that turns a sandbox into a child program, or a failure."""
+
+    def __call__(self, sandbox: Path, program_id: str) -> Mutation:
+        """Mutates the parent in ``sandbox`` into a child program.
+
+        Args:
+            sandbox: A directory built by ``prompt.build_sandbox``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` describing the outcome.
+        """
+        ...
+
+
+class CodexMutator:
+    """Runs ``codex exec`` in a prebuilt sandbox and reports the result.
+
+    ``COMMAND`` is overridden by tests (e.g. to ``["true"]`` or
+    ``["sleep", "N"]``) to exercise the no-output and timeout paths without
+    spending a real codex call; the ``-m``/``-C`` flags are only appended
+    when the command actually is codex.
+    """
+
+    COMMAND = [
+        "codex",
+        "exec",
+        "-s",
+        "workspace-write",
+        "-c",
+        "approval_policy=never",
+        "--json",
+        "-",
+    ]
+
+    def __init__(
+        self,
+        model: str = "gpt-5.6-sol",
+        timeout: float = config.MUTATION_TIMEOUT_SECONDS,
+    ) -> None:
+        """Initializes the mutator.
+
+        Args:
+            model: The codex model to request.
+            timeout: Seconds to allow the codex call before killing it.
+        """
+        self.model = model
+        self.timeout = timeout
+
+    def __call__(self, sandbox: Path, program_id: str) -> Mutation:
+        """Runs one codex session in ``sandbox`` and returns its outcome.
+
+        Args:
+            sandbox: A directory built by ``prompt.build_sandbox``, holding
+                ``AGENTS.md``, ``parent.py``, and ``PROMPT.md``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` describing what happened.
+        """
+        started = time.perf_counter()
+        prompt = (sandbox / "PROMPT.md").read_text(encoding="utf-8")
+        command = [*self.COMMAND]
+        if command[0] == "codex":
+            command += ["-m", self.model, "-C", str(sandbox)]
+        log = sandbox / "codex.jsonl"
+        try:
+            with log.open("w", encoding="utf-8") as handle:
+                subprocess.run(
+                    command,
+                    input=prompt,
+                    stdout=handle,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=sandbox,
+                    timeout=self.timeout,
+                    check=True,
+                )
+        except subprocess.TimeoutExpired:
+            LOGGER.warning(
+                "codex call for %s timed out after %ss", program_id, self.timeout
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="timeout",
+                reason=f"{self.timeout}s",
+                seconds=time.perf_counter() - started,
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except subprocess.CalledProcessError as error:
+            LOGGER.warning("codex call for %s exited %s", program_id, error.returncode)
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=(error.stderr or "")[-500:],
+                seconds=time.perf_counter() - started,
+                input_tokens=0,
+                output_tokens=0,
+            )
+        tokens_in, tokens_out = _tokens(log)
+        child = sandbox / "child.py"
+        if not child.exists() or not child.read_text(encoding="utf-8").strip():
+            reason = _last_message(log) or "child.py missing or empty"
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="no_output",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=tokens_in,
+                output_tokens=tokens_out,
+            )
+        return Mutation(
+            program_id=program_id,
+            child=child,
+            status="ok",
+            reason="",
+            seconds=time.perf_counter() - started,
+            input_tokens=tokens_in,
+            output_tokens=tokens_out,
+        )
+
+
+def _tokens(log: Path) -> tuple[int, int]:
+    """Sums token counts from codex's ``--json`` log.
+
+    Args:
+        log: Path to the ``codex.jsonl`` transcript.
+
+    Returns:
+        The total (input_tokens, output_tokens) across every
+        ``turn.completed`` event; (0, 0) if the log has none.
+    """
+    tokens_in = tokens_out = 0
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "turn.completed":
+            continue
+        usage = event.get("usage") or {}
+        tokens_in += int(usage.get("input_tokens", 0))
+        tokens_out += int(usage.get("output_tokens", 0))
+    return tokens_in, tokens_out
+
+
+def _last_message(log: Path) -> str:
+    """Returns the last ``agent_message`` text in a codex ``--json`` log.
+
+    Args:
+        log: Path to the ``codex.jsonl`` transcript.
+
+    Returns:
+        The first 200 characters of the last agent message, or "" if the
+        log has none.
+    """
+    last = ""
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") or {}
+        if (
+            event.get("type") == "item.completed"
+            and item.get("type") == "agent_message"
+        ):
+            last = item.get("text", "")
+    return last[:200]
+
+
+class FakeMutator:
+    """Copies ``parent.py`` to ``child.py`` through ``edit``. For dry runs and tests."""
+
+    def __init__(self, edit: Callable[[str], str]) -> None:
+        """Initializes the mutator.
+
+        Args:
+            edit: Transforms the parent's source text into the child's.
+        """
+        self.edit = edit
+
+    def __call__(self, sandbox: Path, program_id: str) -> Mutation:
+        """Writes ``sandbox / "child.py"`` as ``edit`` of the parent's source.
+
+        Args:
+            sandbox: A directory holding ``parent.py``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` with status "ok".
+        """
+        child = sandbox / "child.py"
+        child.write_text(
+            self.edit((sandbox / "parent.py").read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+        return Mutation(
+            program_id=program_id,
+            child=child,
+            status="ok",
+            reason="",
+            seconds=0.0,
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+
+def record(mutation: Mutation) -> None:
+    """Appends ``mutation`` as one JSON line to ``config.CALLS``.
+
+    Args:
+        mutation: The mutation outcome to record.
+    """
+    config.CALLS.parent.mkdir(parents=True, exist_ok=True)
+    with config.CALLS.open("a", encoding="utf-8") as handle:
+        handle.write(mutation.model_dump_json() + "\n")
