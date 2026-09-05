@@ -1,0 +1,25 @@
+# Everything the campaign loop depends on that can be proved without the
+# local data box: the engine port builds and loads, the archive, pool, gate
+# and loop logic, validation, packaging. Tests that need the vendored
+# opponent corpus, the episode archive or the Kaggle image are marked
+# `local_data` and skip here (tests/conftest.py); pre-commit runs them on
+# the box that has the data.
+name: campaign
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff format --check src tests
+      - run: uv run ruff check src tests
+      - run: uv run ty check --exclude src/kaggriculture/served src tests main.py
+      - run: uv run pytest -q

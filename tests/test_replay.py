@@ -12,7 +12,7 @@ from kaggriculture.replay import Season, load, summarise
 def test_summarise_reads_a_real_episode(tmp_path: Path) -> None:
     """The module has to read what the harness actually writes."""
     env = make(ENVIRONMENT, configuration={"episodeSteps": 96, "seed": 5})
-    env.run(["baselines/heuristic_v1.py", "pass"])
+    env.run(["starter", "pass"])
     path = tmp_path / "episode.json"
     path.write_text(json.dumps(env.toJSON()))
 
@@ -133,7 +133,7 @@ def test_summarise_reads_the_right_seat_s_private_state(tmp_path: Path) -> None:
     everybody, and nothing would raise.
     """
     env = make(ENVIRONMENT, configuration={"episodeSteps": 240, "seed": 9})
-    env.run(["baselines/heuristic_v1.py", "baselines/heuristic_v2.py"])
+    env.run(["starter", "random"])
     path = tmp_path / "episode.json"
     path.write_text(json.dumps(env.toJSON()))
     steps = load(path)

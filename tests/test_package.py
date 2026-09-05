@@ -1,212 +1,83 @@
-"""Tests for the packaging guard that keeps offline tooling out of the archive."""
+"""The one packager: what `uv run package` and `uv run submit` actually write."""
 
-import json
-import os
-import subprocess
-import sys
 import tarfile
 from pathlib import Path
 
-import pytest
-
-from kaggriculture.routes import STORE
-from kaggriculture.scripts import package as package_script
+from kaggriculture.campaign import harness
 from kaggriculture.scripts.package import build
-from tests.test_vendored_policies import V56_REFERENCE_BANKS, V56_REFERENCE_SEED
 
-_needs_prototype_store = pytest.mark.skipif(
-    not STORE.exists(), reason="prototype store not present on this machine"
-)
+# `main.py`, the engine library, the attribution that has to travel with it,
+# and the four plumbing modules the served agent imports. Nothing else.
+EXPECTED = {
+    "main.py",
+    "NOTICE",
+    "LICENSE",
+    "kaggriculture_engine.so",
+    "kaggriculture",
+    *(f"kaggriculture/{module}" for module in harness.PACKAGE_MODULES),
+}
 
 
-@_needs_prototype_store
-def test_the_archive_does_not_ship_the_search_package(tmp_path: Path) -> None:
-    """The search package has no place in a 4 MB agent archive.
-
-    It happens to import no torch today -- the simulator encoder that did was
-    deleted -- so that is not the reason it stays excluded. It is offline
-    hill-climbing tooling that plays hundreds of games to find a better route,
-    work the submitted agent never does at play time, and the guard also closes
-    the path by which a later edit could reintroduce a heavy import behind it.
-    """
-    archive = build(tmp_path / "submission.tar.gz")
-
+def names(archive: Path) -> list[str]:
+    """Return the member names of ``archive``, duplicates included."""
     with tarfile.open(archive) as bundle:
-        names = bundle.getnames()
-
-    assert not [
-        name for name in names if "/search/" in name or name.endswith("/search")
-    ]
+        return bundle.getnames()
 
 
-@_needs_prototype_store
-def test_the_archive_ships_the_served_policy_and_plays_its_gate_episode(
+def test_the_archive_is_exactly_the_agent_the_engine_and_the_plumbing(
     tmp_path: Path,
 ) -> None:
-    """The archive must play the same season the gate scored, not merely build.
+    """Every member is expected, and each appears exactly once.
 
-    ``EXCLUDED`` drops whole trees by name at every directory level, so a policy
-    module lands in the archive by not matching any of them -- which is a
-    property of the filename, not a decision anyone took. That is fine until the
-    day it is not, and the failure is invisible: the build succeeds, the archive
-    is the right size, and the agent raises on turn zero in a sandbox with no
-    logs.
-
-    So this asserts both halves at once. The served module is in the archive,
-    and the archive's own ``main.py``, run from the extracted directory by the
-    engine, reproduces the exact bank pair
-    ``test_vendored_policies.V56_REFERENCE_BANKS`` pins for the unpackaged
-    module on the same seed against the same opponent. Both seats come out of
-    the extraction, so nothing in this repository is on the path.
-
-    The opponent is the agent the served one replaced, which is why v54 has to
-    stay in the archive as well: it is the second seat of the reference episode,
-    and dropping it would leave this test comparing against a game nobody
-    played. That ``main.py`` reaches the right callable at all is a claim in its
-    own right here -- the served kernel defines ``agent`` twice under a name the
-    archive's loader would happily bind -- and the bank pair is what settles it,
-    because the wrong resolution finishes the season and banks a different
-    number.
+    A duplicated member is invisible to a set of names and to ``tar -x``,
+    which simply overwrites; it doubles the upload and reads as a corrupt
+    archive.
     """
+    listed = names(build(tmp_path / "submission.tar.gz"))
+
+    assert sorted(listed) == sorted(set(listed))
+    assert set(listed) == EXPECTED
+
+
+def test_the_archive_ships_the_engine_and_its_attribution(tmp_path: Path) -> None:
+    """The library is a port of Apache-2.0 kernel source; its NOTICE rides along."""
     archive = build(tmp_path / "submission.tar.gz")
-    extracted = tmp_path / "extracted"
-    extracted.mkdir()
+
     with tarfile.open(archive) as bundle:
-        names = bundle.getnames()
-        bundle.extractall(extracted, filter="data")
-
-    assert "kaggriculture/kaito_v56_policy.py" in names
-    assert "kaggriculture/kaito_v54_policy.py" in names
-    assert "kaggriculture/boatlee_v14_policy.py" in names
-
-    script = """
-import json
-import runpy
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-sys.path.insert(0, str(root))
-agent = runpy.run_path(str(root / "main.py"))["agent"]
-from kaggle_environments import make
-from kaggriculture.kaito_v54_policy import agent as opponent
-
-environment = make(
-    "kaggriculture",
-    configuration={"episodeSteps": 720, "seed": int(sys.argv[2])},
-)
-environment.run([agent, opponent])
-final = environment.steps[-1]
-print(json.dumps({
-    "statuses": [str(state.status) for state in final],
-    "banks": [int(state.reward) for state in final],
-}))
-"""
-    result = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(extracted), str(V56_REFERENCE_SEED)],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    assert result.returncode == 0, result.stderr
-    evidence = json.loads(result.stdout.splitlines()[-1])
-    assert evidence["statuses"] == ["DONE", "DONE"]
-    assert tuple(evidence["banks"]) == V56_REFERENCE_BANKS
+        notice = bundle.extractfile("NOTICE")
+        assert notice is not None
+        text = notice.read().decode()
+    assert "Apache License 2.0" in text
+    assert "kaggriculture_engine.so" in names(archive)
 
 
-def test_the_market_residual_runtime_imports_no_training_dependencies() -> None:
-    """The learned market boundary has to be packageable before it is served.
+def test_the_archive_does_not_ship_offline_tooling(tmp_path: Path) -> None:
+    """The scripts and campaign packages have no place in a 4 MB agent archive.
 
-    ``market_residual`` is the runtime half of a system whose other half is
-    Torch, and the two live in the same repository and are written in the same
-    week. An accidental import from the runtime side would not fail here or
-    locally -- both are installed -- it would fail in the sandbox, on turn zero,
-    as a zero with no logs, or it would land 200 MB of wheels in an archive with
-    a 4 MB budget. So the audit runs in a subprocess with only ``src`` on the
-    path and checks what actually ended up in ``sys.modules``.
-
-    ``policy`` is the module imported because it is the one the submission would
-    import: it reaches the baseline loader, the event machine, the feature
-    encoder and the merge, so every runtime module in the package is on this
-    path. ``numpy_policy`` is imported alongside it because it is not on that
-    path -- the wrapper takes any ``ResidualInference`` and never names the
-    exported head -- and it is the module most exposed to the accident, being
-    the NumPy transcription of something whose original is written in Torch.
+    ``campaign`` plays hundreds of games against a league to search for a
+    better agent, work the submitted agent never does at play time, and the
+    guard also closes the path by which a later edit could reintroduce a heavy
+    import behind it.
     """
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = "src"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; import kaggriculture.market_residual.policy as policy; "
-            "import kaggriculture.market_residual.numpy_policy as head; "
-            "assert policy.build_market_residual_agent is not None; "
-            "assert head.NumpyResidualPolicy is not None; "
-            "heavy = {'torch', 'lightning', 'pytorch_lightning', 'optuna', 'wandb'};"
-            "loaded = heavy & {name.split('.')[0] for name in sys.modules};"
-            "assert not loaded, loaded; "
-            "assert 'kaggriculture.learn' not in sys.modules; "
-            "assert 'kaggriculture.search' not in sys.modules",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
+    listed = names(build(tmp_path / "submission.tar.gz"))
 
-    assert result.returncode == 0, result.stderr
+    assert not any(name.startswith("kaggriculture/scripts") for name in listed)
+    assert not any(name.startswith("kaggriculture/campaign") for name in listed)
+    assert not any("__pycache__" in name for name in listed)
 
 
 def test_build_accepts_a_self_contained_alternate_entrypoint(tmp_path: Path) -> None:
     """Candidate packaging can be tested without changing the served default."""
     entrypoint = tmp_path / "main.py"
     entrypoint.write_text(
-        "from kaggriculture.hybrid.policy import agent\n\n__all__ = ['agent']\n"
+        "def agent(observation, configuration=None):\n"
+        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
     )
 
-    archive = build(tmp_path / "hybrid.tar.gz", entrypoint=entrypoint, required={})
+    archive = build(tmp_path / "alternate.tar.gz", entrypoint=entrypoint)
 
     with tarfile.open(archive) as bundle:
-        names = bundle.getnames()
         packaged_main = bundle.extractfile("main.py")
         assert packaged_main is not None
         source = packaged_main.read().decode()
     assert source == entrypoint.read_text()
-    assert not any("/search/" in name for name in names)
-
-
-@pytest.mark.parametrize("escape", ["absolute", "dotdot", "symlink", "hardlink"])
-def test_required_artifacts_cannot_escape_the_package_boundary(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, escape: str
-) -> None:
-    """Required inputs and staged destinations stay package-local by path and inode."""
-    package_root = tmp_path / "source" / "kaggriculture"
-    package_root.mkdir(parents=True)
-    (package_root / "__init__.py").write_text("")
-    outside = tmp_path / "outside.bin"
-    outside.write_bytes(b"outside")
-    if escape == "absolute":
-        artifact = outside
-    elif escape == "dotdot":
-        artifact = package_root / ".." / ".." / "outside.bin"
-    else:
-        artifact = package_root / f"{escape}.bin"
-        if escape == "symlink":
-            artifact.symlink_to(outside)
-        else:
-            os.link(outside, artifact)
-    entrypoint = tmp_path / "main.py"
-    entrypoint.write_text(
-        "def agent(observation, configuration=None):\n    return {}\n"
-    )
-    monkeypatch.setattr(package_script, "PACKAGE_ROOT", package_root)
-
-    with pytest.raises(ValueError, match="package|symlink|hardlink"):
-        package_script.build(
-            tmp_path / "submission.tar.gz",
-            entrypoint=entrypoint,
-            required={artifact: "producer"},
-        )

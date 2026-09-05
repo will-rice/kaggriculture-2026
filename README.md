@@ -7,44 +7,86 @@ the most coins banked wins.
 See [docs/competition.md](docs/competition.md) for the format, the rules the code
 relies on, and the places where the engine disagrees with the documentation.
 
-## Features
+## The campaign
 
-- **Turn Policy**: Job-list planner that gives each farmer and hired hand the nearest useful action every turn
-- **Pydantic Configuration**: Type-safe configuration management
-- **Protocol-based Design**: Clean `Agent` and `Task` protocols for easy extensibility
-- **Result Tracking**: Structured result collection with `pydantic` models
-- **Parallel Evaluation**: Seeded head-to-head matches against the built-in agents, fanned out across processes
-- **Submission Tooling**: One command to build the archive, one to upload it
-- **Modern Tooling**: Built with `uv` for fast dependency management
-- **Code Quality**: Pre-configured with `ruff`, `ty`, `pytest`, and `pre-commit` hooks
+The agent is no longer hand-written: a codex-driven search plays candidate
+agents against a held-out field, keeps the ones that validate, and promotes
+what wins to `src/kaggriculture/served/main.py`, which `main.py` serves. See
+[docs/superpowers/specs/2026-09-04-codex-campaign-design.md](docs/superpowers/specs/2026-09-04-codex-campaign-design.md)
+for the design and
+[docs/superpowers/plans/2026-09-04-campaign-foundation.md](docs/superpowers/plans/2026-09-04-campaign-foundation.md)
+for how it was built.
 
-## Project Structure
+| path                                                                  | responsibility                                                                                                                                                  |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/kaggriculture/campaign/__init__.py`                              | package marker                                                                                                                                                  |
+| `src/kaggriculture/campaign/config.py`                                | every path and constant: `EXAM_SEEDS`, `ROOT`, `RUN`, `OPPONENTS`, `EPISODES`, `ENGINE_LIBRARY`, `CORE_BUDGET`, `ITEMS`, `SHOP_NAMES`, `UNIT_OPS`, `MARKET_OPS` |
+| `src/kaggriculture/campaign/arena.py`                                 | reference-engine games between two agent files, both seats, over a process pool (from `search/arena.py`, stripped to file-path opponents)                       |
+| `src/kaggriculture/campaign/engine/sim.hpp`, `pyrandom.hpp`, `NOTICE` | the adopted port, verbatim, with license                                                                                                                        |
+| `src/kaggriculture/campaign/engine/bridge.cpp`                        | `extern "C"` surface: create, step, export packed state, free                                                                                                   |
+| `src/kaggriculture/campaign/engine/build.py`                          | compiles `kaggriculture_engine.so` beside itself                                                                                                                |
+| `src/kaggriculture/campaign/engine/wrapper.py`                        | `Engine` class: `reset`, `step`, `observation(player)`, `bank(player)`; `pack_action`, `render`                                                                 |
+| `src/kaggriculture/campaign/tapes.py`                                 | iterate archived episodes: seed, actions per step, observations per step                                                                                        |
+| `src/kaggriculture/campaign/roster.py`                                | opponent names → paths (never exposed), training pool and held-out set                                                                                          |
+| `src/kaggriculture/campaign/harness.py`                               | `play`, `check`, `package`; the `campaign` CLI                                                                                                                  |
+| `src/kaggriculture/campaign/copycheck.py`                             | token-shingle similarity against opponent sources                                                                                                               |
+| `src/kaggriculture/campaign/validate.py`                              | `validate(agent) -> Verdict`: syntax, contract, imports, copy, load, latency                                                                                    |
+| `src/kaggriculture/campaign/kaggle_image.py`                          | load test of a tarball inside `gcr.io/kaggle-gpu-images/python:latest`                                                                                          |
+| `src/kaggriculture/campaign/field_gate.py`, `kernel_watch.py`         | moved from `scripts/`, imports fixed; Plan 2 folds `field_gate` into the evaluator                                                                              |
+| `src/kaggriculture/scripts/package.py`, `submit.py`                   | shipping, without the routes store                                                                                                                              |
+| `src/kaggriculture/served/main.py`                                    | the floor: starts as the skeleton                                                                                                                               |
+| `src/kaggriculture/campaign/task_prompt.md`                           | phase 1's product; a first draft is written by hand in Task 12                                                                                                  |
+| `tests/campaign/*.py`                                                 | one test module per source module                                                                                                                               |
 
+### Running the campaign
+
+```bash
+uv run campaign dry-run --calls 2         # fake mutator, proves the pipeline
+nohup uv run campaign loop > run/campaign/loop.log 2>&1 &
+tail -f run/campaign/loop.log            # metrics: wandb.ai/will-rice/kaggriculture-2026
 ```
-.
-├── main.py                    # Competition entrypoint; Kaggle imports `agent` from here
-├── src/kaggriculture/
-│   ├── policy.py              # The agent: one turn of farm and market decisions
-│   ├── observation.py         # Typed view over the raw observation dict
-│   ├── actions.py             # Turn/action construction and movement
-│   ├── constants.py           # Rules tables, imported from kaggle-environments
-│   ├── agent.py               # Agent protocol and the episode-playing agent
-│   ├── config.py              # Pydantic configuration
-│   ├── harness.py             # Main Harness class
-│   ├── result.py              # Result data models
-│   ├── task.py                # Task protocol and seeded match task
-│   └── scripts/
-│       ├── run.py             # Evaluate against the built-in agents
-│       ├── package.py         # Build submission.tar.gz
-│       ├── submit.py          # Package and upload to Kaggle
-│       └── replay_corpus.py   # Replay Kaggle episode archives through the Rust engine
-├── rust/                      # Rust port of the reference engine + Python bindings (see rust/README.md)
-├── docs/competition.md        # Competition notes
-├── tests/                     # Test files
-│   └── rust/                  # Drives the Rust engine and the reference through one tape
-├── pyproject.toml             # Project metadata and dependencies
-├── .pre-commit-config.yaml    # Pre-commit hooks configuration
-└── .env.example               # Example environment variables
+
+The loop is one `asyncio` event loop and nothing in it waits on anything it
+does not need. A dispatcher keeps `--concurrency` codex sessions running at
+once, and a session's slot is refilled the moment codex exits rather than
+when its child finishes being scored; every child is validated,
+fast-evaluated and inserted as soon as it exists. The schedule is counted in
+completed calls, not rounds -- migration every `MIGRATION_INTERVAL` calls,
+a deep-evaluation epoch every `EPOCH_INTERVAL`, an island reset every
+`RESET_INTERVAL` -- and an epoch is a task like any other: it competes for
+cores with the evaluations running beside it instead of stopping dispatch,
+and a crossing that finds the previous epoch still running is skipped.
+`--calls` is how many mutation calls to run; whatever is in flight when the
+last one is planned is drained.
+
+`dry-run` swaps the codex mutator for one that copies the parent with a
+visible edit, so it exercises validation, evaluation, insertion and the
+promotion gate without spending a call. Both commands resume from
+`run/campaign/state.json` and the archive log, so a killed loop restarts
+where it stopped, and it resumes the same wandb run (`config.WANDB_RUN_ID`),
+so the curves continue, named `<codex model>-<git revision>` as of the launch;
+a dry run logs nothing. Each promotion also uploads
+the champion's file as a wandb artifact named after it. Keep `--workers * --concurrency` inside the core budget:
+every session in flight can be evaluating at once, so the peak is their product.
+
+The commit hook runs the fast suite; run `uv run pytest -m slow` before
+pushing, which is where the tests that play real games against the vendored
+corpus live.
+
+## The Rust engine
+
+`rust/` is a Rust port of the reference interpreter, bit-for-bit: the same
+rules in the same order, CPython's random stream for weeds and shop unlocks,
+and observations laid out like the reference's. It steps about 2,000 times
+faster than `env.step`. `rust/python/` wraps it as the `kaggriculture_engine`
+Python module, and `uv run replay-corpus` replays recorded Kaggle episodes
+through it and compares every recorded field. `tests/rust/` proves both
+against the installed reference. See [rust/README.md](rust/README.md).
+
+```bash
+uv sync --group rust
+uv run maturin develop --release --uv -m rust/python/Cargo.toml
+uv run replay-corpus --episodes 50 -v     # needs the archives under /data/kaggriculture/episodes
 ```
 
 ## Quick Start
@@ -79,106 +121,19 @@ cp .env.example .env
 uv run pre-commit install
 ```
 
-## Usage
-
-### Evaluating the Agent
-
-Play the submission entrypoint against the environment's built-in agents:
+## Commands
 
 ```bash
-uv run run --games 8
-```
-
-```
-vs starter    win_rate 1.00  (8W 0L 0T)  bank    48221 vs     3506
-vs random     win_rate 1.00  (8W 0L 0T)  bank    48221 vs       27
-vs pass       win_rate 1.00  (8W 0L 0T)  bank    48221 vs     3000
-```
-
-Play a specific matchup, or save replays for the visualizer:
-
-```bash
-uv run run --agent main.py --opponents starter --games 4 --replays replays/
-```
-
-### Submitting
-
-Joining the competition on the website is required before the first submission.
-
-```bash
-uv run package                       # writes submission.tar.gz
-uv run submit "melon loop v1"        # packages, confirms, then uploads
-kaggle competitions submissions kaggriculture
+uv sync                        # install dependencies
+uv run campaign --help         # the campaign CLI (play / check / package / loop)
+uv run pytest                  # run the test suite
+uv run pre-commit run -a       # format, lint, type-check, test
+uv run package                 # writes submission.tar.gz for the served floor
+uv run submit "melon loop v1"  # packages, confirms, then uploads
 ```
 
 Submitting spends one of the day's five slots, so `submit` asks before
 uploading; pass `--yes` to skip the prompt.
-
-### Changing the Strategy
-
-`Strategy` in `src/kaggriculture/policy.py` holds the tunable knobs — crop
-choice, crew size, how much land one unit can service, sell throttling. The
-defaults come from sweeping each knob over seeded matches against `starter`.
-
-```python
-from kaggriculture import policy
-from kaggriculture.policy import Strategy
-
-policy.STRATEGY = Strategy(crop="WHEAT", max_hands=10)
-```
-
-### Implementing Your Agent
-
-Create a class that conforms to the `Agent` protocol:
-
-```python
-from kaggriculture.agent import Agent
-
-
-class MyAgent:
-    """A custom agent implementation."""
-
-    def run(self, task):
-        """Run the agent on a task and return the output."""
-        # Your agent logic here
-        return [0.0, 0.0]
-```
-
-### Implementing Your Task
-
-Create a class that conforms to the `Task` protocol:
-
-```python
-from kaggriculture.task import Task
-
-
-class MyTask:
-    """A custom task implementation."""
-
-    @property
-    def id(self) -> str:
-        """Return the task identifier."""
-        return "my_task_001"
-
-    def evaluate(self, output) -> float:
-        """Evaluate agent output and return a score between 0 and 1."""
-        return 1.0 if output[0] > output[1] else 0.0
-```
-
-### Running an Evaluation
-
-```python
-from kaggriculture.agent import EpisodeAgent
-from kaggriculture.config import HarnessConfig
-from kaggriculture.harness import Harness
-
-config = HarnessConfig(games=4, opponents=("starter",))
-harness = Harness(config=config)
-
-results = harness.run(EpisodeAgent(spec="main.py"), harness.matches())
-for result in results:
-    print(f"Task {result.task_id}: score={result.score} banks={result.scores}")
-```
 
 ## Development
 
@@ -209,31 +164,15 @@ Pre-commit hooks will automatically run on every commit to ensure code quality. 
 uv run pre-commit run --all-files
 ```
 
-## Configuration
-
-Edit `src/kaggriculture/config.py` to customize harness settings:
-
-```python
-from pydantic import BaseModel
-
-
-class HarnessConfig(BaseModel):
-    max_workers: int | None = None
-    seed: int = 42
-    games: int = 8
-    opponents: tuple[str, ...] = ("starter", "random", "pass")
-    episode_steps: int = 720
-    debug: bool = False
-```
-
 ## Dependencies
 
 Core dependencies:
 
 - **kaggle-environments**: The Kaggriculture simulator and its rules tables
 - **kaggle**: Competition CLI used for submission
-- **Pydantic**: Data validation and configuration
+- **Pydantic**: Data validation, used by `replay.py`
 - **python-dotenv**: Environment variable management
+- **tqdm**: Progress bars over iterables
 
 Development tools:
 

@@ -1,0 +1,11 @@
+sim.hpp and pyrandom.hpp are a C++ port of kaggriculture.py from
+kaggle-environments 1.32.7 (official source SHA256
+bc8a54879ef02c7ea64b8b333d6a976f0ea65c4949149d01f463f23bccee653e),
+published under the Apache License 2.0 in the Kaggle kernel
+yhay81/three-day-shop-router. They are used here as a simulator. No
+policy, tape, or guard from that kernel is included.
+
+The two files carry one modification and no other: a two-line comment at
+the top of each naming the kernel they came from and this notice, so a
+reader who opens the source before the directory sees the attribution.
+bridge.cpp is ours.

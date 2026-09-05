@@ -153,8 +153,7 @@ impl Engine {
 fn random_seed() -> i64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let mut x = (nanos as u64) ^ 0x9E37_79B9_7F4A_7C15;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
