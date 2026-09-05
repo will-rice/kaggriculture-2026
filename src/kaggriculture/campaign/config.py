@@ -1,12 +1,12 @@
 """Every path and constant the campaign shares.
 
-Opponent paths and the exam seeds are written here and nowhere else, which
-keeps them out of the sandbox's way but does not hide them: ``codex exec -s
-workspace-write`` restricts writes, not reads, and a sandbox that walked up
-to the repository could read this module like any other file. What actually
-keeps a candidate from copying an opponent is the doctrine in the prompt and
-the copy-check gate that rejects a candidate resembling one; what this module
-buys is that the harness never has to *print* a path to do its job.
+Opponent paths and the exam seeds are written here and nowhere else. That
+does not hide them -- ``codex exec -s workspace-write`` restricts writes, not
+reads, and a round's directory sits in the system temporary tree with the
+repository a walk away. What keeps a candidate from copying an opponent is
+the doctrine in the prompt and the copy-check gate that rejects a candidate
+resembling one; what this module buys is that nothing the loop composes has
+to *print* a path to do its job.
 """
 
 import os
@@ -73,6 +73,11 @@ MARKET_OPS: list[str] = [
 # One codex session per worker; eight fit the machine beside their
 # evaluations. Spec section 8.
 SESSIONS = 8
+# Codex calls in one session, each continuing from the program the last one
+# produced. A session ends at whichever of this count and
+# `SESSION_LIMIT_SECONDS` comes first: five rounds of codex plus a minute of
+# scoring each fits inside 1500 seconds.
+ROUNDS_PER_SESSION = 5
 FAST_SEEDS = 4  # x both seats x every pool opponent
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
 DEEP_TOP_K = 3
@@ -90,20 +95,21 @@ STAGNATION_SESSIONS = 40
 CODEX_MODEL = "gpt-6-astra"
 # Astra answers "Selected model is at capacity" some of the time (two calls
 # in the first live hour). A call that fails on the first model is retried
-# once on this one, in the same sandbox, so the island still gets a child.
+# once on this one, in the same directory, so the round still gets a child.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-# Measured on the first live iteration (2026-09-05): a session writes its
-# first complete child at 8-10 minutes and then spends as long again testing
-# it through the harness. Whatever `child.py` holds when the cap fires is
-# kept, so the cap bounds an iteration's wall clock, not whether it yields.
+# The session's own budget, checked between rounds; the round that overruns
+# it is the last one. Measured on the first live iteration (2026-09-05).
 SESSION_LIMIT_SECONDS = 1500
+# One round's share of that budget, and the cap on a single codex call.
+# Whatever `child.py` holds when it fires is what the loop scores, so the cap
+# bounds a round's wall clock, not whether it yields a program.
+ROUND_LIMIT_SECONDS = SESSION_LIMIT_SECONDS // ROUNDS_PER_SESSION
 # Liveness only, never speed: a 720-turn game of rule-based policies takes
 # well under a second, so one still running after two minutes is stuck.
 GAME_LIMIT_SECONDS = 120
 
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
-SANDBOXES = RUN / "sandboxes"
 # The current floor, the copy that ships, and every champion ever promoted.
 # `FLOOR/main.py` is overwritten each promotion; `CHAMPIONS/<name>.py` is
 # written once and is what the pool points at, so a pool of N champions holds
@@ -120,5 +126,5 @@ CHAMPION = RUN / "champion.json"
 WANDB_ENTITY = "will-rice"
 WANDB_PROJECT = "kaggriculture-2026"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
-# is not a sibling of the sandboxes a codex session works in.
+# is not a sibling of anything a codex call is given.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"

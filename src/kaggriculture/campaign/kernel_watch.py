@@ -635,7 +635,7 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     with tempfile.TemporaryDirectory(prefix="kernel-watch-gate-") as sandbox:
         os.chdir(sandbox)
         try:
-            rates = score_field(absolute, seeds, workers, list(roster.TRAINING))
+            rates, _ = score_field(absolute, seeds, workers, list(roster.TRAINING))
         finally:
             os.chdir(origin)
     games = len(rates) * len(seeds) * 2

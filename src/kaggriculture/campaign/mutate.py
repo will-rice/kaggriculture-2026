@@ -1,16 +1,20 @@
-"""One mutation: a codex session in a sandbox, or a fake that edits a constant.
+"""One mutation: one codex call on one file, or a fake that edits a constant.
+
+A call is given a directory holding ``child.py`` and nothing else, and the
+whole message on standard input. It edits that file and stops; the loop reads
+it back, scores it, and composes the next round's message from the result.
 
 The codex command is a class attribute so a test can replace it with ``true``
 or ``sleep``; the rest of the module never changes between the fake and the
 real thing.
 
-Both mutators are awaitable, because the loop runs many sessions at once on
+Both mutators are awaitable, because the loop runs many rounds at once on
 one event loop: codex is an ``asyncio`` child process, and the fake's file
 work goes to a thread so an ``edit`` that sleeps cannot stall the loop.
 
-A session's transcript runs to hundreds of kilobytes, so reading and parsing
+A call's transcript runs to hundreds of kilobytes, so reading and parsing
 it goes to a thread like everything else that blocks: the loop thread is
-dispatching seven other sessions while this one is being totted up.
+dispatching seven other rounds while this one is being totted up.
 
 Codex 0.147's ``--json`` output is one JSON object per line. Token usage
 lives on the ``turn.completed`` event, under ``usage.input_tokens`` and
@@ -41,11 +45,11 @@ class Mutation(BaseModel):
     """The outcome of one mutation call.
 
     Attributes:
-        program_id: The child program id the sandbox was built for.
+        program_id: The child program id this call was made for.
         child: Path to the written child program, or None if there is
-            nothing to evaluate. A timed-out session that had already
+            nothing to evaluate. A timed-out call that had already
             written ``child.py`` still yields it: the file is what gets
-            evaluated, however the session ended.
+            evaluated, however the call ended.
         status: "ok", "no_output" (ran but wrote nothing usable), "timeout",
             or "exec_error".
         reason: Free-form explanation; empty on "ok". An "exec_error" carries
@@ -55,7 +59,7 @@ class Mutation(BaseModel):
         output_tokens: Total output tokens billed, summed across the call.
         model: The model that produced this outcome.
         fallback: Whether that model was the fallback, after the first
-            model's session failed.
+            model's call failed.
     """
 
     program_id: str
@@ -70,13 +74,16 @@ class Mutation(BaseModel):
 
 
 class Mutator(Protocol):
-    """Something that turns a sandbox into a child program, or a failure."""
+    """Something that turns one file and one message into a child program."""
 
-    async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
-        """Mutates the parent in ``sandbox`` into a child program.
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Mutates ``workspace / "child.py"`` in place.
 
         Args:
-            sandbox: A directory built by ``prompt.build_sandbox``.
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, composed by ``prompt.compose``.
             program_id: The child program id.
 
         Returns:
@@ -86,7 +93,7 @@ class Mutator(Protocol):
 
 
 class CodexMutator:
-    """Runs ``codex exec`` in a prebuilt sandbox and reports the result.
+    """Runs one ``codex exec`` over one file and reports the result.
 
     ``COMMAND`` is overridden by tests (e.g. to ``["true"]`` or
     ``["sleep", "N"]``) to exercise the no-output and timeout paths without
@@ -100,7 +107,7 @@ class CodexMutator:
     (``start_new_session=True``) so a timeout -- or the cancellation that
     shutting the loop down delivers -- can kill the whole process group with
     ``os.killpg``, not just codex itself. Without the cancellation arm, a
-    killed loop would leave ``SESSIONS`` sessions running.
+    killed loop would leave ``SESSIONS`` codex calls running.
     """
 
     COMMAND = [
@@ -118,39 +125,43 @@ class CodexMutator:
         self,
         model: str = config.CODEX_MODEL,
         fallback: str = config.CODEX_FALLBACK_MODEL,
-        timeout: float = config.SESSION_LIMIT_SECONDS,
+        timeout: float = config.ROUND_LIMIT_SECONDS,
     ) -> None:
         """Initializes the mutator.
 
         Args:
             model: The codex model to request.
-            fallback: The model to retry on, once, when a session on
-                ``model`` fails without a verdict (the provider refused or
-                codex crashed); "" to never retry.
-            timeout: Seconds to allow the codex call before killing it.
+            fallback: The model to retry on, once, when a call on ``model``
+                fails without a verdict (the provider refused or codex
+                crashed); "" to never retry.
+            timeout: Seconds to allow the codex call before killing it. One
+                round's share of the session budget, so five of them and
+                their scoring fit inside it.
         """
         self.model = model
         self.fallback = fallback
         self.timeout = timeout
 
-    async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
-        """Runs one codex session in ``sandbox``, retrying once on the fallback.
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Runs one codex call in ``workspace``, retrying once on the fallback.
 
-        A session that ends in ``exec_error`` -- the provider failed the turn
+        A call that ends in ``exec_error`` -- the provider failed the turn
         (a model at capacity, a rate limit) or codex itself died -- is run
-        again on the fallback model in the same sandbox. The failed
-        transcript is kept beside the new one as ``codex.<model>.failed.jsonl``.
+        again on the fallback model over the same file. The failed transcript
+        is kept beside the new one as ``codex.<model>.failed.jsonl``.
 
         Args:
-            sandbox: A directory built by ``prompt.build_sandbox``, holding
-                ``AGENTS.md``, ``child.py``, and ``PROMPT.md``.
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, composed by ``prompt.compose``.
             program_id: The child program id.
 
         Returns:
             A `Mutation` describing what happened, on whichever model
             produced it.
         """
-        mutation = await self.session(sandbox, program_id, self.model)
+        mutation = await self.call(workspace, message, program_id, self.model)
         if mutation.status != "exec_error" or not self.fallback:
             return mutation
         LOGGER.warning(
@@ -160,21 +171,24 @@ class CodexMutator:
             mutation.reason[:120],
             self.fallback,
         )
-        log = sandbox / "codex.jsonl"
+        log = workspace / "codex.jsonl"
         log.replace(log.with_name(f"codex.{self.model}.failed.jsonl"))
-        retried = await self.session(sandbox, program_id, self.fallback)
+        retried = await self.call(workspace, message, program_id, self.fallback)
         return retried.model_copy(
             update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
         )
 
-    async def session(self, sandbox: Path, program_id: str, model: str) -> Mutation:
-        """Runs one codex session in ``sandbox`` on ``model``.
+    async def call(
+        self, workspace: Path, message: str, program_id: str, model: str
+    ) -> Mutation:
+        """Runs one codex call in ``workspace`` on ``model``.
 
         The model is also exported to the child as ``CAMPAIGN_CODEX_MODEL``,
         which codex ignores and a stand-in command in a test can read.
 
         Args:
-            sandbox: A directory built by ``prompt.build_sandbox``.
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, written to codex's standard input.
             program_id: The child program id.
             model: The codex model to request.
 
@@ -182,29 +196,31 @@ class CodexMutator:
             A `Mutation` describing what happened.
         """
         started = time.perf_counter()
-        prompt = (sandbox / "PROMPT.md").read_text(encoding="utf-8")
+        # What the round was handed. A call that ends with the file exactly
+        # as it found it has written nothing, however cleanly it exited.
+        given = (workspace / "child.py").read_text(encoding="utf-8")
         command = [*self.COMMAND]
         if command[0] == "codex":
-            command += ["-m", model, "-C", str(sandbox)]
-        log = sandbox / "codex.jsonl"
+            command += ["-m", model, "-C", str(workspace)]
+        log = workspace / "codex.jsonl"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=handle,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=sandbox,
+                cwd=workspace,
                 start_new_session=True,
                 env={**os.environ, "CAMPAIGN_CODEX_MODEL": model},
             )
             try:
                 _, stderr = await asyncio.wait_for(
-                    process.communicate(prompt.encode()), self.timeout
+                    process.communicate(message.encode()), self.timeout
                 )
             except TimeoutError:
                 pgid = kill_group(process)
                 await process.wait()
-                child = _written(sandbox)
+                child = _written(workspace, given)
                 LOGGER.warning(
                     "codex call for %s timed out after %ss, killed pgid %s; %s",
                     program_id,
@@ -224,9 +240,9 @@ class CodexMutator:
                     model=model,
                 )
             except asyncio.CancelledError:
-                # The loop is shutting down. The session goes with it, whole
+                # The loop is shutting down. The call goes with it, whole
                 # process group and all, or a restart would find eight codex
-                # sessions still running against sandboxes nothing owns.
+                # calls still running against directories nothing owns.
                 LOGGER.warning(
                     "codex call for %s cancelled, killed pgid %s",
                     program_id,
@@ -257,11 +273,11 @@ class CodexMutator:
                 model=model,
             )
         tokens_in, tokens_out = await asyncio.to_thread(_tokens, log)
-        child = _written(sandbox)
+        child = _written(workspace, given)
         if child is None:
             reason = (
                 await asyncio.to_thread(_last_message, log)
-                or "child.py missing or empty"
+                or "child.py missing, empty or unchanged"
             )
             return Mutation(
                 program_id=program_id,
@@ -289,7 +305,7 @@ def kill_group(process: asyncio.subprocess.Process) -> int | None:
     """SIGKILL a session's whole process group and return the group it killed.
 
     Args:
-        process: The codex child, started with ``start_new_session=True``.
+        process: The codex process, started with ``start_new_session=True``.
 
     Returns:
         The process group killed, or None if the process had already been
@@ -304,12 +320,28 @@ def kill_group(process: asyncio.subprocess.Process) -> int | None:
     return pgid
 
 
-def _written(sandbox: Path) -> Path | None:
-    """``sandbox/child.py`` if the session wrote something there, else None."""
-    child = sandbox / "child.py"
-    if child.exists() and child.read_text(encoding="utf-8").strip():
-        return child
-    return None
+def _written(workspace: Path, given: str) -> Path | None:
+    """``workspace/child.py`` if the call left something new there, else None.
+
+    A call that ended without touching the file leaves the very program it
+    was asked to improve. Scoring that again would insert a duplicate, spend
+    an evaluation on it, and tell the telemetry a child was produced when
+    none was.
+
+    Args:
+        workspace: The directory the call worked in.
+        given: What ``child.py`` held before the call.
+
+    Returns:
+        The child, or None if it is missing, empty, or unchanged.
+    """
+    child = workspace / "child.py"
+    if not child.exists():
+        return None
+    source = child.read_text(encoding="utf-8")
+    if not source.strip() or source == given:
+        return None
+    return child
 
 
 def _tokens(log: Path) -> tuple[int, int]:
@@ -405,23 +437,27 @@ class FakeMutator:
         """
         self.edit = edit
 
-    async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
-        """Rewrites ``sandbox / "child.py"`` as ``edit`` of what it holds.
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Rewrites ``workspace / "child.py"`` as ``edit`` of what it holds.
 
-        The edit runs in a thread, as the codex session it stands in for runs
-        in a child process: a dry run with a slow ``edit`` must exercise the
+        The edit runs in a thread, as the codex call it stands in for runs in
+        a child process: a dry run with a slow ``edit`` must exercise the
         loop's concurrency rather than stall its single thread.
 
         Args:
-            sandbox: A directory holding ``child.py``, the champion copied in.
+            workspace: A directory holding ``child.py``, the program to edit.
+            message: The whole prompt. A fake reads nothing of it; it is here
+                because the loop hands every mutator the same three things.
             program_id: The child program id.
 
         Returns:
             A `Mutation` with status "ok".
         """
         started = time.perf_counter()
-        child = sandbox / "child.py"
-        await asyncio.to_thread(self.write, sandbox, child)
+        child = workspace / "child.py"
+        await asyncio.to_thread(self.write, child)
         return Mutation(
             program_id=program_id,
             child=child,
@@ -433,11 +469,10 @@ class FakeMutator:
             model="fake",
         )
 
-    def write(self, sandbox: Path, child: Path) -> None:
+    def write(self, child: Path) -> None:
         """Read ``child.py``, apply ``edit``, write it back. Runs in a thread.
 
         Args:
-            sandbox: A directory holding ``child.py``, the champion copied in.
-            child: The file to rewrite, which is that same ``child.py``.
+            child: The file to rewrite.
         """
         child.write_text(self.edit(child.read_text(encoding="utf-8")), encoding="utf-8")

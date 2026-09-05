@@ -3,19 +3,20 @@
 Everything here is the campaign's own code: real validation, real games
 through the real harness and its process pools, a real database, pool and
 gate, real ``state.json`` and ``champion.json`` under ``tmp_path``. The one
-substitution is the codex session itself -- a ``FakeMutator``, or a
-``CodexMutator`` whose ``COMMAND`` is an ordinary shell command -- because a
-real session costs quota. Concurrency, the champion and the gate are
+substitution is the codex call itself -- a ``FakeMutator``, a ``Recorder``,
+or a ``CodexMutator`` whose ``COMMAND`` is an ordinary shell command --
+because a real call costs quota. Concurrency, the champion and the gate are
 therefore observed the way an operator would: through the files the run
 wrote, the database it filled, and the metrics it logged.
 
-Two of these are seam tests and play real games all the way through: the
-end-to-end one, and the one that a promotion changes what the next session
-starts from. The rest are about scheduling -- which program the gate fires
-on, what a session is handed, what a restart resumes -- and take their
-numbers from ``stub_evaluator``, because playing 720 turns to produce a
-fitness those assertions never read is cost without coverage. Everything
-else in them is the real thing, validation included.
+Three of these are seam tests and play real games all the way through: the
+end-to-end one, the one that a promotion changes what the next session
+starts from, and the one that the first round is sent the loop's own verdict
+on the program it starts from. The rest are about scheduling -- which
+program the gate fires on, what a round is handed, what a restart resumes --
+and take their numbers from ``stub_evaluator``, because playing 720 turns to
+produce a fitness those assertions never read is cost without coverage.
+Everything else in them is the real thing, validation included.
 
 Where a test needs the floor to stay where it is, it sets one no candidate
 can beat (``strong_champion``) rather than arranging for the gate to fail:
@@ -28,6 +29,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -94,7 +96,7 @@ WORKERS = max(1, min(2, config.CORE_BUDGET // config.SESSIONS))
 # second call would otherwise resolve paths the first call had replaced.
 RUNTIME_PATHS = {
     name: getattr(config, name).relative_to(config.RUN)
-    for name in ("ARCHIVE", "PROGRAMS", "SANDBOXES", "FLOOR", "CHAMPIONS", "CHAMPION")
+    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION")
 }
 EXAM_SEEDS = config.EXAM_SEEDS
 
@@ -119,7 +121,12 @@ def log(
 
 def sessions_of(records: list[tuple[float, dict]]) -> list[dict]:
     """The per-session records, in the order the loop logged them."""
-    return [record for _, record in records if "sessions/ok" in record]
+    return [record for _, record in records if "sessions/rounds" in record]
+
+
+def calls_of(records: list[tuple[float, dict]]) -> list[dict]:
+    """The per-round records, in the order the loop logged them."""
+    return [record for _, record in records if "calls/ok" in record]
 
 
 def deeps_of(records: list[tuple[float, dict]]) -> list[dict]:
@@ -127,17 +134,21 @@ def deeps_of(records: list[tuple[float, dict]]) -> list[dict]:
     return [record for _, record in records if "deep/promoted" in record]
 
 
-def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rounds: int = 1) -> None:
     """Point every runtime path at ``tmp_path`` and shrink the loop to one seed.
 
     The one-opponent test pool stands in for the vendored field and the real
     held-out set is dropped: these tests measure the pipeline, not a field,
     and playing the held-out opponents would cost games nothing asserts on.
 
-    Nothing here touches a constant that decides behaviour rather than cost.
+    ``rounds`` is one by default, because a test that is not about rounds
+    should cost one call and one evaluation; the tests that are about rounds
+    ask for more. It is the only constant here that decides behaviour rather
+    than cost, which is why it is a parameter and not a line in the body.
     ``DEEP_TOP_K`` used to be set to one, which configured away the only
     values at which the gate has more than one program to choose between.
     """
+    monkeypatch.setattr(config, "ROUNDS_PER_SESSION", rounds)
     run = tmp_path / "run"
     for name, relative in RUNTIME_PATHS.items():
         monkeypatch.setattr(config, name, run / relative)
@@ -217,11 +228,22 @@ def stub_evaluator(
         rng: random.Random,
         workers: int,
     ) -> evaluator.FastResult:
-        """The fast evaluation's shape, without its games."""
+        """The fast evaluation's shape, without its games.
+
+        No day table: a scheduling test asserts on what the loop did with a
+        number, never on the states behind it, and the only game that could
+        produce one is the game this stands in for.
+        """
         measured = evaluator.opponents(opponents, program_id, agent)
         rate = score(agent)
+        names = measured.names()
         return evaluator.FastResult(
-            fitness=rate, rates=dict.fromkeys(measured.names(), rate), seeds=[1]
+            fitness=rate,
+            rates=dict.fromkeys(names, rate),
+            margins=dict.fromkeys(names, harness.Margin(mean=0.0, worst=0.0, best=0.0)),
+            seeds=[1],
+            hardest=names[0],
+            states=[],
         )
 
     def deep(
@@ -240,50 +262,63 @@ def stub_evaluator(
 
 
 class Handed(NamedTuple):
-    """What one session was given: the file it edits, and what it was told."""
+    """What one round was given: the program, the message, and the directory.
+
+    Attributes:
+        child: The source found in ``child.py``.
+        message: The whole prompt, on standard input.
+        held: Everything in the directory, by name.
+        where: The directory itself, so a test can watch it go away.
+    """
 
     child: str
-    prompt: str
-    feedback: str
+    message: str
+    held: list[str]
+    where: Path
 
 
 class Recorder:
-    """A stand-in session that notes what it was handed, then writes ``child``.
+    """A stand-in call that notes what it was handed, then edits ``child.py``.
 
-    The loop removes a sandbox once its child is in the database, so what a
-    session was given has to be read while it is running. This is the same
-    contract ``FakeMutator`` meets, and nothing but the codex process is
+    The loop removes a round's directory once its program is in the database,
+    so what a call was given has to be read while it is running. This is the
+    same contract ``FakeMutator`` meets, and nothing but the codex process is
     stood in for.
     """
 
-    def __init__(self, child: str) -> None:
+    def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the recorder.
 
         Args:
-            child: The source every session writes into ``child.py``.
+            edit: Turns what ``child.py`` holds into what the round writes.
         """
-        self.child = child
+        self.edit = edit
         self.seen: list[Handed] = []
 
-    async def __call__(self, sandbox: Path, program_id: str) -> mutate.Mutation:
-        """Note what the sandbox holds, then write the child.
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> mutate.Mutation:
+        """Note what the round was handed, then write the child.
 
         Args:
-            sandbox: The sandbox built for this session.
+            workspace: The directory built for this round.
+            message: The composed prompt.
             program_id: The child program id.
 
         Returns:
             A `Mutation` with status "ok".
         """
-        child = sandbox / "child.py"
+        child = workspace / "child.py"
+        source = child.read_text(encoding="utf-8")
         self.seen.append(
             Handed(
-                child.read_text(encoding="utf-8"),
-                (sandbox / "PROMPT.md").read_text(encoding="utf-8"),
-                (sandbox / "feedback.md").read_text(encoding="utf-8"),
+                source,
+                message,
+                sorted(item.name for item in workspace.iterdir()),
+                workspace,
             )
         )
-        child.write_text(self.child, encoding="utf-8")
+        child.write_text(self.edit(source), encoding="utf-8")
         return mutate.Mutation(
             program_id=program_id,
             child=child,
@@ -487,7 +522,7 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path)
     seed = _write(tmp_path / "seed.py", PASS)
-    mutator = Recorder(SELLER)
+    mutator = Recorder(edit=lambda _: SELLER)
 
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
 
@@ -497,7 +532,7 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
 
     assert mutator.seen[1].child == SELLER
-    assert "champion_1" in mutator.seen[1].feedback
+    assert "champion_1" in mutator.seen[1].message
 
 
 def test_a_program_is_deep_scored_once(
@@ -656,8 +691,9 @@ def test_a_provider_failure_is_not_the_lineages_failure(
 
     assert state.sessions == 1
     assert '"event": "failure"' not in config.ARCHIVE.read_text()
-    assert [record["sessions/ok"] for record in sessions_of(records)] == [0]
-    assert [record["sessions/fallback"] for record in sessions_of(records)] == [1]
+    assert [record["calls/ok"] for record in calls_of(records)] == [0]
+    assert [record["calls/fallback"] for record in calls_of(records)] == [1]
+    assert [record["sessions/rounds"] for record in sessions_of(records)] == [1]
 
 
 def test_a_broken_pool_opponent_stops_the_run(
@@ -758,15 +794,15 @@ def test_stagnation_switches_the_starting_program(
     stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
     marked = f"{SELLER}\n# a child of the champion\n"
-    mutator = Recorder(marked)
+    mutator = Recorder(edit=lambda _: marked)
 
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
 
     first, second = mutator.seen
-    assert first.child == SELLER and "no promotion" not in first.prompt
+    assert first.child == SELLER and "no promotion" not in first.message
     assert second.child in {PASS, marked} and second.child != SELLER
-    assert "no promotion" in second.prompt and "top ten" in second.prompt
+    assert "no promotion" in second.message and "top ten" in second.message
 
 
 def test_a_dirty_src_refuses_to_start(
@@ -837,27 +873,29 @@ def test_a_restart_resumes_state_json_and_champion_json(
     assert state.champion == champion
 
 
-def test_a_session_is_told_a_name_and_never_a_path(
+def test_a_round_is_told_a_name_and_never_a_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """What a session starts from is interpolated raw, so it is a name, not a path.
+    """What a round starts from is interpolated raw, so it is a name, not a path.
 
-    The champion reaches the prompt as its pool name, which is also how the
-    feedback tells the session to beat it head to head. A path there would
-    both break that sentence and point at the file it must not read.
+    The champion reaches the message as its pool name, which is also how the
+    verdict tells the round to beat it head to head. A path there would both
+    break that sentence and point at the file it must not read. Everything a
+    model is given is this one string, so this is the whole exposure.
     """
     tiny_run(tmp_path, monkeypatch)
     champion = strong_champion(tmp_path)
     stub_evaluator(monkeypatch)
-    mutator = Recorder(SELLER)
+    mutator = Recorder(edit=lambda _: SELLER)
     seed = _write(tmp_path / "seed.py", PASS)
 
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
 
     handed = mutator.seen[0]
-    assert f"`{champion.name}`" in handed.feedback
-    assert str(tmp_path) not in handed.feedback + handed.prompt
-    assert prompt.PREAMBLE in handed.prompt
+    assert f"`{champion.name}`" in handed.message
+    assert str(tmp_path) not in handed.message
+    assert "/data/kaggriculture" not in handed.message
+    assert prompt.DOCTRINE in handed.message
 
 
 def _repository(root: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
@@ -903,3 +941,148 @@ def _deep_result(
         held_out={},
         games=4,
     )
+
+
+def test_a_session_is_rounds_and_each_continues_from_the_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """Rounds go deeper on one line, and every one of them is kept.
+
+    A round continues from its own previous program -- that is the whole
+    difference between a round and a session, which starts again from the
+    champion -- and every round's program is scored and inserted, so three
+    rounds leave three programs in the database beside the seed.
+    """
+    tiny_run(tmp_path, monkeypatch, rounds=3)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda source: source + "# a round\n")
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    handed = [given.child for given in mutator.seen]
+    assert handed == [PASS, PASS + "# a round\n", PASS + "# a round\n" * 2]
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    written = [p for p in database.programs if p.id != loop.SEED_ID]
+    assert len(written) == 3
+    assert all(program.rates for program in written)
+    assert len(calls_of(records)) == 3
+    assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
+
+
+def test_a_round_that_clears_the_bar_ends_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """There is nothing left to ask for once a program beats every opponent.
+
+    The condition is `gate.promotion` on the round's own rates -- the same
+    function, on the same reading of a win, that the message told the model
+    it had to clear.
+    """
+    tiny_run(tmp_path, monkeypatch, rounds=3)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    # Long enough that the stand-in fitness puts it above half against every
+    # opponent, which is what beating them all means.
+    mutator = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    assert len(mutator.seen) == 1
+
+
+def test_a_round_that_writes_nothing_ends_the_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """A round with no program leaves nothing for the next one to continue from."""
+    tiny_run(tmp_path, monkeypatch, rounds=3)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    monkeypatch.setattr(mutate.CodexMutator, "COMMAND", ["true"])
+
+    loop.run(
+        sessions=1,
+        mutator=mutate.CodexMutator(model="a", fallback="", timeout=30),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    assert [record["sessions/rounds"] for record in sessions_of(records)] == [1]
+    assert '"no_output' in config.ARCHIVE.read_text()
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert [program.id for program in database.programs] == [loop.SEED_ID]
+
+
+def test_the_session_budget_ends_it_before_the_rounds_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A session is bounded by whichever of the two comes first."""
+    tiny_run(tmp_path, monkeypatch, rounds=3)
+    monkeypatch.setattr(config, "SESSION_LIMIT_SECONDS", 0)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda source: source + "# a round\n")
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    assert len(mutator.seen) == 1
+
+
+def test_a_round_is_given_one_file_and_the_directory_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """One file, `child.py`, and nothing else a path could leak through.
+
+    The engine copy, the standing rules and the feedback file were all things
+    a session read off disk; nothing reads them now, so nothing is written.
+    The directory goes once its program is in the database.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    handed = mutator.seen[0]
+    assert handed.held == ["child.py"]
+    assert not handed.where.exists()
+
+
+def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The opening round is composed from a measurement the loop made itself.
+
+    A seam test: the verdict and the thirty rows below it come out of real
+    games the loop played against the pool before the first round, which is
+    what makes the first round no different from the fourth. Nothing in the
+    message could have come from anywhere else -- the model has played
+    nothing at this point.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    message = mutator.seen[0].message
+    assert f"The verdict on `{loop.SEED_ID}`" in message
+    # PASS against PASS is a dead heat, and a dead heat is not a win.
+    assert "It did not beat pass at 0.500." in message
+    assert "One game against `pass`, day by day" in message
+    assert message.count("\n| 2") + message.count("\n| 1") > 0
+    assert "| 29 |" in message

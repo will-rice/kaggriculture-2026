@@ -7,19 +7,11 @@ than the opponent at the final recorded state. The engine exposes raw final bank
 as reward, but evaluation cares about win/loss/tie, not winning margin. A season
 has `720` recorded states but only `719` policy calls per seat. [Verified season probe.](experiments/season_visibility.py)
 
-Treat `engine/kaggriculture.py` as ground truth for
-`kaggle-environments==1.32.7`; older notes lose every disagreement. [Engine identity check.](experiments/_common.py)
+Everything below is ground truth for `kaggle-environments==1.32.7`, which is
+the engine the campaign plays on; older notes lose every disagreement.
 
-Opponent doctrine is strict: measure behavior only through the harness; never
-read opponent source.
-
-```bash
-uv run --project /home/will/projects/kaggriculture-2026/.claude/worktrees/campaign campaign play AGENT --vs NAME... --seeds A-B --workers N
-uv run --project /home/will/projects/kaggriculture-2026/.claude/worktrees/campaign campaign check AGENT
-```
-
-Valid measured opponents are `router_v1`, `router2929`, `v54`, `v56`,
-`shopforge`, and `indarkarhana`.
+Opponent doctrine is strict: the campaign measures opponents and tells you
+what it measured; never read opponent source.
 
 ## Key insights
 

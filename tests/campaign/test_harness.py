@@ -59,6 +59,14 @@ def agent(observation, configuration=None):
 """
 
 
+# Buys one sack of wheat into its shed on the first step and does nothing
+# else, so the shed only the buyer can see holds exactly one known thing.
+BUYING_AGENT = """
+def agent(observation, configuration=None):
+    market = [["BUY_PRODUCT", "WHEAT", 1]] if observation["step"] == 0 else []
+    return {"farmer": ["PASS"], "hands": [], "market": market}
+"""
+
 # An opponent is loaded with its real path as `__code__.co_filename`, so its
 # traceback names a file the sandbox is never allowed to learn.
 CRASHING_AGENT = """
@@ -117,6 +125,84 @@ def test_play_refuses_a_path_where_a_name_belongs(pass_agent: Path) -> None:
             [1],
             workers=1,
         )
+
+
+def test_a_game_records_a_row_for_every_day_when_asked(
+    pass_agent: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thirty days, thirty rows, both sides -- the opponent's shed included.
+
+    A seat cannot see the other's shed while it plays. The day table is not
+    played by anyone: it is what the loop shows the author of a program after
+    the game, so the buyer's single sack of wheat has to be in it.
+    """
+    hidden = tmp_path / "opponent"
+    hidden.mkdir()
+    (hidden / "main.py").write_text(BUYING_AGENT, encoding="utf-8")
+    monkeypatch.setitem(roster.TRAINING, "buyer", hidden / "main.py")
+
+    games = harness.play(pass_agent, ["buyer"], [11], workers=1, days=True)
+
+    for game in games:
+        assert [row.day for row in game.days] == list(range(30))
+        assert game.days[-1].ours_bank == game.ours
+        assert game.days[-1].theirs_bank == game.theirs
+        assert all(row.theirs_shed == {"WHEAT": 1} for row in game.days)
+        assert all(row.ours_shed == {} for row in game.days)
+        assert all(row.prices["WHEAT"] > 0 for row in game.days)
+
+
+def test_a_game_records_no_days_unless_asked(
+    pass_agent: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the one game a model is shown is worth a render a day."""
+    hidden = tmp_path / "opponent"
+    hidden.mkdir()
+    (hidden / "main.py").write_text(BUYING_AGENT, encoding="utf-8")
+    monkeypatch.setitem(roster.TRAINING, "buyer", hidden / "main.py")
+
+    games = harness.play(pass_agent, ["buyer"], [11], workers=1)
+
+    assert all(game.days == [] for game in games)
+
+
+def test_margins_are_the_bank_gap_over_the_games_against_each_opponent() -> None:
+    """A rate says how often; a margin says by how much, which is what is missing.
+
+    Two opponents beaten at the same rate are not the same problem when one
+    is three hundred coins away and the other thirty thousand.
+    """
+    games = [
+        harness.Game(
+            opponent="near",
+            seed=1,
+            seat=0,
+            ours=100.0,
+            theirs=90.0,
+            worst_step_seconds=0.0,
+        ),
+        harness.Game(
+            opponent="near",
+            seed=1,
+            seat=1,
+            ours=80.0,
+            theirs=90.0,
+            worst_step_seconds=0.0,
+        ),
+        harness.Game(
+            opponent="far",
+            seed=1,
+            seat=0,
+            ours=10.0,
+            theirs=900.0,
+            worst_step_seconds=0.0,
+        ),
+    ]
+
+    margins = harness.margins(games, ["near", "far"])
+
+    assert margins["near"] == harness.Margin(mean=0.0, worst=-10.0, best=10.0)
+    assert margins["far"] == harness.Margin(mean=-890.0, worst=-890.0, best=-890.0)
 
 
 @pytest.mark.local_data

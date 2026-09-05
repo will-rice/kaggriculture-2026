@@ -67,26 +67,32 @@ class Champion(BaseModel):
     result: DeepResult
 
 
-def promotion(candidate: DeepResult) -> tuple[bool, str]:
-    """Whether ``candidate`` becomes the floor: it beats every pool opponent.
+def promotion(rates: dict[str, float]) -> tuple[bool, str]:
+    """Whether a program clears the bar: it beats every pool opponent.
 
-    One clause, absolute. A rate is over the sealed exam block in both seats,
-    and "beats" means strictly more than half of those games: a dead heat at
-    0.5 is not a win and does not pass. Held-out opponents are measured and
-    logged but never part of this -- they are the generalisation number, not
-    the bar.
+    One clause, absolute. "Beats" means strictly more than half the games
+    against that opponent over both seats: a dead heat at 0.5 is not a win
+    and does not pass. Held-out opponents are measured and logged but are
+    never in this dict -- they are the generalisation number, not the bar.
 
-    The reason names every opponent the candidate failed to beat and its rate
+    This is the campaign's only reading of "did it win", and it is applied
+    twice: to a candidate's sealed-block rates, where it decides a promotion,
+    and to a round's fast rates, where it is the verdict the loop sends the
+    model and the condition that ends a session. Two implementations would
+    let a model believe it had cleared a bar the gate then refused.
+
+    The reason names every opponent the program failed to beat and its rate
     against each, because when nothing is promoting for a week that list is
     what says why.
 
     Args:
-        candidate: The deep result of the program under consideration.
+        rates: Win rate per pool opponent.
 
     Returns:
-        Whether to promote, and a reason (why not, or "beat every opponent").
+        Whether it clears the bar, and a reason (why not, or "beat every
+        opponent").
     """
-    lost = sorted((name, rate) for name, rate in candidate.rates.items() if rate <= 0.5)
+    lost = sorted((name, rate) for name, rate in rates.items() if rate <= 0.5)
     if lost:
         return False, "did not beat " + ", ".join(
             f"{name} at {rate:.3f}" for name, rate in lost

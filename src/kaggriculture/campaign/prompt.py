@@ -1,70 +1,27 @@
-"""Build the sandbox one codex session works in.
+"""Compose the one message a codex call is given.
 
-``AGENTS.md`` is codex's standing context: the task prompt phase 1 wrote,
-how to use the harness, what the program may import, and the doctrine.
-``child.py`` is the champion, copied in; it is the file the session edits in
-place until it clears the bar. ``PROMPT.md`` carries the instruction drawn for
-this session and the budget. ``feedback.md`` states the bar and what the
-evaluator measured about the champion. Nothing in the sandbox names where an
-opponent lives.
+The model is a mutation operator: it is handed a directory holding one file,
+``child.py``, and everything else arrives on standard input as this message.
+It edits that file and stops. The loop plays every game, so there is nothing
+here about running a harness, no engine to read and no workspace to manage --
+and no file we assemble that an opponent's path could leak through.
 
-The task prompt phase 1 wrote already contains a harness section, but its
-commands are hard-coded to the worktree that wrote them. ``_strip_stale_harness``
-removes that block so ``AGENTS.md`` can carry a version built fresh from
-``config.ROOT`` at build time, correct wherever the repository is checked out.
+The message is spec section 4's five parts, in order: the game, the program,
+the verdict on it, the states behind that verdict, and the instruction. One
+function composes it and every round is composed by it, the first included,
+so the model never sees a round that is shaped differently from the others.
 """
 
 import logging
-import re
-import shutil
 from pathlib import Path
 
-from kaggle_environments.envs.kaggriculture import kaggriculture as engine_module
-
-from kaggriculture.campaign import config, harness, validate
+from kaggriculture.campaign import config, evaluator, gate, harness, validate
 
 LOGGER = logging.getLogger(__name__)
 
 TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
 
-# A program id becomes a directory name under config.SANDBOXES; it must be a
-# single path segment so a crafted id (e.g. "..") can never resolve outside
-# the sandboxes directory before it is rmtree'd.
-_PROGRAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-
-# Matches the fenced ```bash block containing `uv run --project` and the
-# "Valid measured opponents" sentence that follows it, however it is spaced.
-_STALE_HARNESS_RE = re.compile(
-    r"```bash\n.*?uv run --project.*?\n```\n\n"
-    r"Valid measured opponents[^\n]*\n(?:[^\n]*\n)*?\n",
-    re.DOTALL,
-)
-
-# {project} is filled with ``config.ROOT`` at module load, so the commands are
-# right wherever this repository is checked out; {workers} is the harness's own
-# cap, so the sandbox is never promised more cores than the command allows.
-HARNESS_SECTION = """
-## Testing what you write
-
-```bash
-uv run --project {project} campaign check child.py
-uv run --project {project} campaign play child.py --vs NAME... --seeds A-B --workers N
-```
-
-- `campaign check child.py` — loads the file as Kaggle does and plays one
-  episode against itself; reports the worst per-step latency (budget 0.5 s).
-- `campaign play child.py --vs NAME... --seeds A-B --workers N` — plays the
-  named opponents on the engine, both seats. Opponents x seeds x 2 seats may
-  not exceed 16 games and `--workers` may not exceed {workers}; the command refuses
-  anything larger, because the rest of the box is running the loop. Opponent
-  names are those in feedback.md. Seeds are your choice; the evaluator uses
-  others.
-
-The evaluator measures for real after you finish; use these only to make
-sure the file runs and does what you intended.
-""".format(project=config.ROOT, workers=harness.SANDBOX_WORKER_CAP)
-
-# Rendered from the gate's own whitelist, so the sandbox is never told a
+# Rendered from the gate's own whitelist, so the model is never told a
 # different set from the one that rejects it. One file ships, so this list is
 # the program's whole dependency surface.
 IMPORTS_SECTION = """
@@ -75,22 +32,45 @@ beside it. It may import only these modules, and an import of anything else is
 rejected before the program is scored.
 
 {names}
-
-`engine/kaggriculture.py` is there to read as ground truth, never to import.
 """.format(names=", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS)))
 
 DOCTRINE = """
 ## Doctrine
 
-Measure opponents through the harness. Never read their source, never ask
-for it, never reconstruct it: the gate rejects code that resembles any
-opponent's. Your agent is ours.
+Never read an opponent's source, never ask for it, never reconstruct it: the
+gate rejects code that resembles any opponent's. You are given their names and
+what your program scored against them, and that is the whole of what you may
+know about them. Your agent is ours.
 """
 
-# FAMOU appendix C.2's five rewrite instructions. One is drawn per session,
-# so eight sessions starting from the same champion are pushed eight
-# different ways. The caller draws the pair, records the name on the program
-# it produces, and hands ``build_sandbox`` the text.
+# What the model is asked to do with the file, stated the same way every
+# round: one edit, then stop. The campaign measures; it does not.
+PROGRAM_SECTION = """
+## The program
+
+`child.py` in your working directory is `{name}`, and it is the only file
+there. It is the program to improve.
+
+Edit it in place and stop. Do not run anything and do not report anything back
+in your reply: whatever `child.py` holds when you finish is what the campaign
+plays, against every opponent below, and the result comes back to you as
+another message like this one asking you to improve it again.
+
+`child.py` must stay one self-contained file whose last top-level callable is
+`agent(observation, configuration)` -- that is what Kaggle loads. Say in a
+docstring at its top what you changed and why. Your budget is {minutes}
+minutes; the call is stopped then and the file is scored as it stands, so keep
+it complete and runnable throughout.
+
+The rules above cite probes by filename. Those files are not in your
+directory: take their numbers as verified and do not go looking.
+"""
+
+# FAMOU appendix C.2's five rewrite instructions. One is drawn per round, so
+# eight workers starting from the same champion are pushed eight different
+# ways and a lineage is pushed a different way each round. The caller draws
+# the pair, records the name on the program it produces, and hands ``compose``
+# the text.
 INSTRUCTIONS: tuple[tuple[str, str], ...] = (
     ("improve", "Improve child.py's performance against the pool."),
     (
@@ -104,7 +84,7 @@ INSTRUCTIONS: tuple[tuple[str, str], ...] = (
     ),
     (
         "restructure",
-        "Redesign child.py's core components, keeping what the feedback says wins.",
+        "Redesign child.py's core components, keeping what the verdict says wins.",
     ),
     (
         "tune",
@@ -112,185 +92,112 @@ INSTRUCTIONS: tuple[tuple[str, str], ...] = (
     ),
 )
 
-# Every instruction is wrapped in these at build time, so the bar, the
-# doctrine and the budget are stated once and cannot drift between variants.
-PREAMBLE = """Read AGENTS.md and feedback.md, then child.py.
 
-child.py is the champion, and it is the file you edit. Keep editing it in
-place until it clears the bar feedback.md states -- beating every opponent
-in the pool -- testing it with the harness as you go. Stop as soon as it
-does.
+def _verdict_lines(name: str, result: evaluator.FastResult) -> list[str]:
+    """Render what the loop measured about ``name``, and the bar it is short of.
 
-Your instruction for this session:
-
-"""
-
-POSTAMBLE = """
-
-Keep what the feedback says is winning; change what is losing, and say in a
-docstring at the top of child.py what you changed and why. The opponents
-feedback.md says the champion does not beat are the ones to fix.
-
-Do not read, request, or reconstruct any opponent's source; the gate rejects
-code resembling any opponent's.
-
-Run `campaign check child.py` before you finish.
-
-Your budget is {minutes} minutes; the session is stopped then, and whatever
-child.py holds at that moment is what is evaluated. Keep it complete and
-runnable throughout; do not leave it half-edited while you run experiments.
-""".format(minutes=config.SESSION_LIMIT_SECONDS // 60)
-
-
-def _strip_stale_harness(text: str) -> str:
-    """Remove phase 1's hard-coded harness block from the task prompt text.
+    The bar and the sentence naming what it did not beat both come from
+    ``gate.promotion``, the one function that decides whether a program has
+    won, so a model cannot be told it has cleared something the gate refuses.
 
     Args:
-        text: The raw contents of ``task_prompt.md``.
+        name: The program's name -- a pool name or a database id, never a path.
+        result: The loop's own fast evaluation of it.
 
     Returns:
-        ``text`` with the stale ```bash harness block and the "Valid measured
-        opponents" sentence that follows it removed.
+        Lines of a markdown section naming opponents only.
     """
-    stripped, count = _STALE_HARNESS_RE.subn("", text)
-    if count != 1:
-        raise ValueError(
-            f"expected exactly one stale harness block in task_prompt.md, found {count}"
-        )
-    return stripped
-
-
-def _feedback_lines(
-    rates: dict[str, float], failures: list[str], started_from: str
-) -> list[str]:
-    """Render the bar, the champion against each opponent, and past failures.
-
-    The bar is one thing now, and it is absolute: win more than half the
-    games against every opponent in the pool. The champion is one of those
-    opponents, so beating it is part of the same sentence rather than a
-    second clause -- and the opponents the champion itself does not beat are
-    named, because those are the ones standing between this lineage and a
-    promotion.
-
-    Args:
-        rates: The champion's win rate per pool opponent name.
-        failures: Recent failure descriptions from this lineage.
-        started_from: The champion's name, which is also its pool opponent
-            name once it has been promoted.
-
-    Returns:
-        Lines of a markdown document naming opponents only, never paths.
-    """
-    losing = [name for name, rate in rates.items() if rate <= 0.5]
+    cleared, why = gate.promotion(result.rates)
     lines = [
-        "# Feedback on child.py",
+        f"## The verdict on `{name}`",
         "",
-        "## The bar",
+        f"Played over {len(result.seeds)} seeds, both seats, against every "
+        "opponent in the pool. The margin is your bank minus theirs at the "
+        "final state.",
         "",
-        f"child.py is `{started_from}`. Keep editing it until it beats every "
-        "opponent below -- more than half the games against each, over both "
-        "seats -- and stop as soon as it does. Nothing else is measured: an "
-        "average over the pool promotes nothing.",
-        "",
-        f"`{started_from}` is itself one of those opponents, so a child has to "
-        "beat what it was edited from as well.",
-        "",
-        "## The champion against the pool",
-        "",
-        "| opponent | champion win rate |",
-        "| --- | --- |",
+        "| opponent | win rate | mean margin | worst | best |",
+        "| --- | --- | --- | --- | --- |",
     ]
-    lines += [f"| {name} | {rate:.3f} |" for name, rate in rates.items()]
+    for opponent, rate in result.rates.items():
+        margin = result.margins[opponent]
+        lines.append(
+            f"| {opponent} | {rate:.3f} | {margin.mean:+.0f} | "
+            f"{margin.worst:+.0f} | {margin.best:+.0f} |"
+        )
     lines += [
         "",
-        (
-            "The champion does not beat: "
-            + ", ".join(f"**{name}**" for name in losing)
-            + ". Those are what a promotion turns on."
-            if losing
-            else "The champion beats every opponent above; the bar is holding "
-            "all of that while beating the champion too."
+        f"It {why}.",
+        "",
+        "The bar is beating every opponent above: more than half the games "
+        "against each, over both seats. Nothing else is measured, and an "
+        "average over the pool promotes nothing. "
+        + (
+            "Clear it again on the sealed block and it becomes the champion."
+            if cleared
+            else "The opponents it does not beat are what a promotion turns on."
         ),
     ]
-    if failures:
-        lines += ["", "Recent failures in this lineage (do not repeat):"]
-        lines += [f"- {failure}" for failure in failures]
     return lines
 
 
-def _sandbox_path(program_id: str) -> Path:
-    """Resolve ``program_id`` to a directory directly under ``config.SANDBOXES``.
+def _states_lines(opponent: str, states: list[harness.Day]) -> list[str]:
+    """Render one game against ``opponent`` day by day.
 
     Args:
-        program_id: The child program id.
+        opponent: The opponent that game was against, by name.
+        states: The day table the loop recorded while playing it.
 
     Returns:
-        ``config.SANDBOXES / program_id``.
-
-    Raises:
-        ValueError: If ``program_id`` is not a single safe path segment, or
-            resolves outside ``config.SANDBOXES`` (e.g. ``".."``).
+        Lines of a markdown section: one row per day, both sides.
     """
-    if not _PROGRAM_ID_RE.fullmatch(program_id):
-        raise ValueError(f"unsafe program_id: {program_id!r}")
-    box = config.SANDBOXES / program_id
-    if box.resolve().parent != config.SANDBOXES.resolve():
-        raise ValueError(f"unsafe program_id: {program_id!r}")
-    return box
+    lines = [
+        f"## One game against `{opponent}`, day by day",
+        "",
+        "The game it lost by the most, of those it played against the opponent "
+        "it does worst against. Each row is how that day closed. You are shown "
+        "both sides because you are the program's author; the program itself "
+        "cannot see the opponent's shed while it plays.",
+        "",
+        "| day | our bank | their bank | our shed | their shed | our hands | "
+        "their hands | prices |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for day in states:
+        lines.append(
+            f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
+            f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
+            f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
+        )
+    return lines
 
 
-def build_sandbox(
-    program_id: str,
-    champion: Path,
-    instruction: str,
-    rates: dict[str, float],
-    failures: list[str],
-    started_from: str,
-) -> Path:
-    """Build the sandbox directory one codex session works in.
+def _items(counts: dict[str, int]) -> str:
+    """Render a shed or a price list as ``WHEAT 12, EGG 3``; "-" when empty."""
+    return ", ".join(f"{item} {n}" for item, n in counts.items()) or "-"
 
-    The champion is copied in as ``child.py``: the session edits that file in
-    place until it clears the bar, and whatever it holds when the budget runs
-    out is what is evaluated.
+
+def compose(name: str, result: evaluator.FastResult, instruction: str) -> str:
+    """Compose the message for one round.
 
     Args:
-        program_id: The child program id; also the sandbox's directory name.
-        champion: Path to the champion's program file, copied in as child.py.
-        instruction: The drawn instruction's text — one of ``INSTRUCTIONS``'
-            second elements. It is recorded in PROMPT.md.
-        rates: The champion's win rate per pool opponent name.
-        failures: Recent failure descriptions from this lineage.
-        started_from: The champion's id, which is also its pool opponent name.
+        name: What the program in ``child.py`` is called -- a pool name or a
+            database id. It is interpolated raw, so it must never be a path.
+        result: The loop's fast evaluation of that program: the verdict, and
+            the day table of one game behind it.
+        instruction: The drawn instruction's text, one of ``INSTRUCTIONS``'
+            second elements, with any stagnation note the caller prepended.
 
     Returns:
-        The path to the built sandbox directory, rebuilt clean each call.
-
-    Raises:
-        ValueError: If ``program_id`` is not a safe single path segment
-            directly under ``config.SANDBOXES``.
+        The whole message, for codex's standard input.
     """
-    box = _sandbox_path(program_id)
-    if box.exists():
-        shutil.rmtree(box)
-    (box / "engine").mkdir(parents=True)
-
-    task_prompt = _strip_stale_harness(TASK_PROMPT.read_text(encoding="utf-8"))
-    (box / "AGENTS.md").write_text(
-        task_prompt + HARNESS_SECTION + IMPORTS_SECTION + DOCTRINE, encoding="utf-8"
-    )
-
-    child = box / "child.py"
-    shutil.copy(champion, child)
-    # The gate writes a champion read-only so nothing can edit the file the
-    # pool plays, and `shutil.copy` carries that mode across. This copy is
-    # the one file the session must be able to write.
-    child.chmod(0o644)
-    shutil.copy(engine_module.__file__, box / "engine" / "kaggriculture.py")
-
-    lines = _feedback_lines(rates, failures, started_from)
-    (box / "feedback.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    (box / "PROMPT.md").write_text(PREAMBLE + instruction + POSTAMBLE, encoding="utf-8")
-
-    LOGGER.info("built sandbox %s from %s", box, started_from)
-    return box
+    parts = [
+        TASK_PROMPT.read_text(encoding="utf-8"),
+        PROGRAM_SECTION.format(name=name, minutes=config.ROUND_LIMIT_SECONDS // 60),
+        IMPORTS_SECTION,
+        DOCTRINE,
+        "\n".join(_verdict_lines(name, result)),
+        "\n".join(_states_lines(result.hardest, result.states)),
+        f"## Your instruction\n\n{instruction}\n",
+    ]
+    LOGGER.info("composed a round on %s (hardest: %s)", name, result.hardest)
+    return "\n".join(parts)

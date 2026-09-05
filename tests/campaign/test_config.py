@@ -89,7 +89,9 @@ def test_fast_seed_range_never_touches_the_exam_block() -> None:
 def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
+    assert config.ROUNDS_PER_SESSION == 5
     assert config.SESSION_LIMIT_SECONDS == 1500
+    assert config.ROUND_LIMIT_SECONDS == 300
     assert config.GAME_LIMIT_SECONDS == 120
     assert config.FAST_SEEDS == 4
     assert len(config.EXAM_SEEDS) == 64
@@ -101,8 +103,14 @@ def test_constants_match_the_spec_table() -> None:
 
 
 def test_the_deleted_constants_are_gone() -> None:
-    """Islands, epochs, the call cap, crossover and weights are not this system."""
+    """Islands, epochs, the call cap, crossover, weights and the sandboxes.
+
+    `SANDBOXES` went with the workspace a model used to be given: it gets a
+    temporary directory holding one file now, and nothing under `run/` is a
+    model's to write.
+    """
     for name in (
+        "SANDBOXES",
         "ISLANDS",
         "ISLAND_SIZE",
         "MIGRANTS",
@@ -127,7 +135,6 @@ def test_runtime_paths_live_under_run_campaign() -> None:
     for path in (
         config.ARCHIVE,
         config.PROGRAMS,
-        config.SANDBOXES,
         config.FLOOR,
         config.CHAMPIONS,
         config.CHAMPION,
@@ -135,10 +142,9 @@ def test_runtime_paths_live_under_run_campaign() -> None:
         assert config.RUN in path.parents
 
 
-def test_the_pool_file_is_not_a_sibling_of_the_sandboxes() -> None:
-    """The one file listing opponent paths lives away from the codex sandboxes."""
+def test_the_pool_file_is_not_a_sibling_of_the_run_directory() -> None:
+    """The one file listing opponent paths lives away from everything else."""
     assert config.RUN not in config.POOL.parents
-    assert config.SANDBOXES not in config.POOL.parents
     assert config.POOL == config.OPPONENTS.parent / "campaign" / "pool.json"
 
 

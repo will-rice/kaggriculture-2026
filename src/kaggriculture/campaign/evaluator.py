@@ -31,15 +31,26 @@ HELD_OUT = list(roster.HELD_OUT)
 class FastResult(BaseModel):
     """A ranking measurement on seeds nothing else has seen.
 
+    It is also the whole of what a model is told about the program it is
+    asked to improve: the rates and margins are the verdict, and ``states``
+    is the game behind it.
+
     Attributes:
         fitness: Mean win rate over the pool.
         rates: Win rate per pool opponent, ties as half.
+        margins: Bank margin per pool opponent.
         seeds: The seeds drawn for this call.
+        hardest: The opponent with the lowest win rate.
+        states: One game against ``hardest``, day by day -- the one it lost
+            by the most, which is a lost game whenever it lost any.
     """
 
     fitness: float
     rates: dict[str, float]
+    margins: dict[str, harness.Margin]
     seeds: list[int]
+    hardest: str
+    states: list[harness.Day]
 
 
 class DeepResult(BaseModel):
@@ -54,6 +65,8 @@ class DeepResult(BaseModel):
         high: Conservative upper bound on ``score``, by the same mean of the
             per-opponent Wilson upper bounds.
         rates: Win rate per pool opponent.
+        margins: Bank margin per pool opponent. Defaulted, so a result
+            written before margins existed still loads out of the log.
         intervals: Wilson interval per pool opponent.
         field: Mean rate over the vendored opponents still in the pool.
         held_out: Win rate per held-out opponent; never part of ``score``.
@@ -65,6 +78,7 @@ class DeepResult(BaseModel):
     low: float
     high: float
     rates: dict[str, float]
+    margins: dict[str, harness.Margin] = {}
     intervals: dict[str, tuple[float, float]]
     field: float
     held_out: dict[str, float]
@@ -128,6 +142,13 @@ def fast(
     exam block, so ranking pressure never touches the seeds the gate decides
     on and no two candidates are ranked on a block that could be memorised.
 
+    Every game is played with its day table recorded, because one of them
+    is what the loop shows a model of how its program played: the game
+    against the opponent it does worst against that it lost by the most.
+    Taking the minimum margin is what makes that a lost game whenever one
+    exists -- every loss is below every tie and every win -- and the
+    narrowest win when the program lost nothing at all.
+
     Args:
         agent: The candidate's ``main.py``.
         program_id: The program being scored, so it is not among them.
@@ -136,17 +157,31 @@ def fast(
         workers: Processes to fan the games over.
 
     Returns:
-        The mean fitness, the per-opponent rates, and the seeds drawn.
+        The mean fitness, the per-opponent rates and margins, the seeds
+        drawn, and one game against the hardest opponent day by day.
 
     Raises:
         RuntimeError: A side raised during a game. A crashed candidate is a
             failed evaluation, never a zero score, so this propagates.
     """
     measured = opponents(pool, program_id, agent)
+    names = measured.names()
     seeds = rng.sample(config.FAST_SEED_RANGE, config.FAST_SEEDS)
-    games = harness.play(agent, measured.names(), seeds, workers)
-    rates = _rates(games, measured.names())
-    return FastResult(fitness=_mean(rates), rates=rates, seeds=seeds)
+    games = harness.play(agent, names, seeds, workers, days=True)
+    rates = _rates(games, names)
+    hardest = min(rates, key=lambda name: rates[name])
+    shown = min(
+        (game for game in games if game.opponent == hardest),
+        key=lambda game: game.ours - game.theirs,
+    )
+    return FastResult(
+        fitness=_mean(rates),
+        rates=rates,
+        margins=harness.margins(games, names),
+        seeds=seeds,
+        hardest=hardest,
+        states=shown.days,
+    )
 
 
 def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
@@ -167,7 +202,7 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
         workers: Processes to fan the games over.
 
     Returns:
-        The mean score with its interval, the per-opponent rates and
+        The mean score with its interval, the per-opponent rates, margins and
         intervals, the vendored-field rate, and the held-out rates.
 
     Raises:
@@ -179,7 +214,7 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
     measured = opponents(pool, program_id, agent)
     names = measured.names()
     played = names + [name for name in HELD_OUT if name not in names]
-    rates = field_gate.score_field(
+    rates, margins = field_gate.score_field(
         agent, seeds=config.EXAM_SEEDS, workers=workers, opponents=played
     )
     games = 2 * len(config.EXAM_SEEDS)
@@ -193,6 +228,7 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
         low=_mean({n: bounds[0] for n, bounds in intervals.items()}),
         high=_mean({n: bounds[1] for n, bounds in intervals.items()}),
         rates={name: rates[name] for name in names},
+        margins={name: margins[name] for name in names},
         intervals=intervals,
         field=sum(rates[name] for name in vendored) / len(vendored),
         held_out={name: rates[name] for name in HELD_OUT},

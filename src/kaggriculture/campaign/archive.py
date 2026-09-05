@@ -2,9 +2,9 @@
 
 An append-only JSON-lines log, replayed on start and shared by every worker.
 Nothing is evicted and there is no population structure: every program a
-session produced stays, ranked only by the fitness it was added with, and the
-failures are kept beside them so a prompt can show a lineage what has already
-been tried and did not work.
+round produced stays, ranked only by the fitness it was added with, and the
+failures are kept beside them: a round that produced no program is not in the
+database, so the ledger is the only place it is written down.
 """
 
 import json
@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from kaggriculture.campaign.evaluator import DeepResult
+from kaggriculture.campaign.harness import Margin
 
 
 class Program(BaseModel):
@@ -22,9 +23,14 @@ class Program(BaseModel):
         id: Unique identifier, also the stored file's stem.
         source_path: Where the source is stored.
         started_from: The id this program was edited from; "" for the seed.
-        instruction: The mutation instruction the session was given.
-        fitness: Weighted pool win rate from the fast evaluation.
+        instruction: The mutation instruction the round was given.
+        model: The model that wrote it, so a block of quota can be judged
+            after the fact. Defaulted, and empty for the seed, which no model
+            wrote.
+        fitness: Mean pool win rate from the fast evaluation.
         rates: Fast-evaluation win rate per pool opponent.
+        margins: Fast-evaluation bank margin per pool opponent. Defaulted,
+            so a program written before margins existed still loads.
         created: Unix timestamp.
         deep: The sealed-block result, once it has one.
     """
@@ -33,8 +39,10 @@ class Program(BaseModel):
     source_path: str
     started_from: str
     instruction: str
+    model: str = ""
     fitness: float
     rates: dict[str, float] = {}
+    margins: dict[str, Margin] = {}
     created: float
     deep: DeepResult | None = None
 
@@ -43,7 +51,7 @@ class Failure(BaseModel):
     """One attempt that never became a program.
 
     Attributes:
-        started_from: The id the session was editing.
+        started_from: The id or name the round was editing.
         instruction: The mutation instruction it was given.
         reason: Why the attempt was rejected.
         created: Unix timestamp.

@@ -3,6 +3,9 @@
 Every codex stand-in here is a real subprocess -- ``true``, ``sleep``, a
 ``bash`` line -- because what these tests are about is what the mutator does
 to a live process group, which no fake process could show.
+
+A call is given a directory holding ``child.py`` and the whole prompt on
+standard input, so these build the first and pass the second.
 """
 
 import asyncio
@@ -27,48 +30,85 @@ TRANSCRIPT = (
 )
 
 
-def sandbox(tmp_path: Path) -> Path:
-    """A minimal sandbox: a prompt and standing agent rules, and no child yet.
+MESSAGE = (
+    "Write child.py implementing def agent(observation, configuration=None).\n"
+    "Keep it a complete, self-contained agent file.\n"
+)
 
-    A real sandbox also holds the champion as ``child.py``; the tests that
-    care whether a session wrote anything need it absent, and the one that
-    edits it writes it itself.
+
+# The program a round is handed: a call has written something when what it
+# leaves behind is not this.
+PARENT = "def agent(o, c=None):\n    return {'farmer': ['PASS']}\n"
+
+
+def workspace(tmp_path: Path) -> Path:
+    """The directory a call works in: ``child.py``, the program to improve.
+
+    That is the whole contract -- one file and the prompt on standard input --
+    so a call that leaves this file as it found it has written nothing.
     """
-    (tmp_path / "PROMPT.md").write_text(
-        "Write child.py implementing def agent(observation, configuration=None).\n"
-    )
-    (tmp_path / "AGENTS.md").write_text(
-        "Write child.py implementing def agent(observation, configuration=None).\n"
-        "Keep it a complete, self-contained agent file.\n"
-    )
+    (tmp_path / "child.py").write_text(PARENT, encoding="utf-8")
     return tmp_path
 
 
 def test_fake_mutator_writes_a_child_with_the_edit_applied(tmp_path: Path) -> None:
     """FakeMutator rewrites child.py through the caller's edit."""
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     (box / "child.py").write_text(
         "LIMIT = 1\n"
         "def agent(o, c=None):\n"
         "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
     )
     mutator = mutate.FakeMutator(edit=lambda s: s.replace("LIMIT = 1", "LIMIT = 2"))
-    result = asyncio.run(mutator(box, "p1"))
+    result = asyncio.run(mutator(box, MESSAGE, "p1"))
     assert result.status == "ok" and result.child == box / "child.py"
     assert result.child is not None
     assert "LIMIT = 2" in result.child.read_text()
 
 
-def test_codex_mutator_reports_no_output_when_nothing_is_written(
+def test_the_whole_prompt_reaches_the_call_on_standard_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A codex that exits clean but writes no child.py is "no_output", not "ok"."""
-    box = sandbox(tmp_path)
+    """The message is the prompt, and there is no file to read it from.
+
+    Everything the model is told -- the rules, the verdict, the day table,
+    the instruction -- travels this way, so the directory can hold one file
+    and nothing a path could leak through.
+    """
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        [
+            "bash",
+            "-c",
+            "cat > stdin.txt; printf 'def agent(o, c=None):\\n    return {}\\n' "
+            "> child.py",
+        ],
+    )
+
+    result = asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p12"))
+
+    assert result.status == "ok"
+    assert (box / "stdin.txt").read_text() == MESSAGE
+
+
+def test_codex_mutator_reports_no_output_when_the_file_is_left_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A codex that exits clean having touched nothing is "no_output", not "ok".
+
+    The file it was handed is a complete program, so it would validate and
+    score; taking it would insert a copy of the round's own parent and count
+    a child the model never wrote.
+    """
+    box = workspace(tmp_path)
     monkeypatch.setattr(
         mutate.CodexMutator, "COMMAND", ["true"]
     )  # a codex that says nothing
-    result = asyncio.run(mutate.CodexMutator()(box, "p2"))
-    assert result.status == "no_output"
+    result = asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p2"))
+    assert result.status == "no_output" and result.child is None
+    assert (box / "child.py").read_text() == PARENT
     assert (box / "codex.jsonl").exists()
 
 
@@ -76,9 +116,9 @@ def test_codex_mutator_reports_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A codex call that outlives its timeout is reported as "timeout"."""
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     monkeypatch.setattr(mutate.CodexMutator, "COMMAND", ["sleep", "5"])
-    result = asyncio.run(mutate.CodexMutator(timeout=1)(box, "p3"))
+    result = asyncio.run(mutate.CodexMutator(timeout=1)(box, MESSAGE, "p3"))
     assert result.status == "timeout"
     assert (box / "codex.jsonl").exists()
 
@@ -86,12 +126,13 @@ def test_codex_mutator_reports_timeout(
 def test_a_timed_out_session_still_yields_the_child_it_wrote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cap bounds the session's wall clock, not whether its work counts.
+    """The cap bounds a round's wall clock, not whether its work counts.
 
-    Live sessions write a complete child within minutes and then spend as
-    long again testing it; killing the session must not throw that away.
+    Whatever ``child.py`` holds when the cap fires is what the loop scores,
+    so a call killed after it had written a complete program must not have
+    that thrown away.
     """
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     monkeypatch.setattr(
         mutate.CodexMutator,
         "COMMAND",
@@ -101,7 +142,7 @@ def test_a_timed_out_session_still_yields_the_child_it_wrote(
             "printf 'def agent(o, c=None):\\n    return {}\\n' > child.py; sleep 30",
         ],
     )
-    result = asyncio.run(mutate.CodexMutator(timeout=2)(box, "p8"))
+    result = asyncio.run(mutate.CodexMutator(timeout=2)(box, MESSAGE, "p8"))
     assert result.status == "timeout"
     assert result.child == box / "child.py"
     assert "def agent" in (box / "child.py").read_text()
@@ -141,13 +182,13 @@ printf '%s\\n' '{{"type":"turn.completed","usage":{{"input_tokens":7}}}}'
 def test_a_session_that_fails_on_the_first_model_is_retried_on_the_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One retry on the fallback, in the same sandbox; the first transcript kept."""
-    box = sandbox(tmp_path)
+    """One retry on the fallback, over the same file; the first transcript kept."""
+    box = workspace(tmp_path)
     monkeypatch.setattr(
         mutate.CodexMutator, "COMMAND", ["bash", "-c", CAPACITY_OR_CHILD, "_", "first"]
     )
     result = asyncio.run(
-        mutate.CodexMutator(model="first", fallback="second")(box, "p10")
+        mutate.CodexMutator(model="first", fallback="second")(box, MESSAGE, "p10")
     )
     assert result.status == "ok" and result.model == "second" and result.fallback
     assert result.input_tokens == 7
@@ -160,25 +201,27 @@ def test_a_failure_on_both_models_is_an_exec_error_naming_the_provider_cause(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The reason is the provider's message, not the empty stderr."""
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     monkeypatch.setattr(
         mutate.CodexMutator, "COMMAND", ["bash", "-c", CAPACITY_OR_CHILD, "_", "same"]
     )
-    result = asyncio.run(mutate.CodexMutator(model="same", fallback="same")(box, "p11"))
+    result = asyncio.run(
+        mutate.CodexMutator(model="same", fallback="same")(box, MESSAGE, "p11")
+    )
     assert result.status == "exec_error" and result.fallback
     assert "at capacity" in result.reason
-    assert not (box / "child.py").exists()
+    assert (box / "child.py").read_text() == PARENT
 
 
 def test_codex_mutator_reports_exec_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A codex process that exits non-zero is reported as "exec_error"."""
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     monkeypatch.setattr(
         mutate.CodexMutator, "COMMAND", ["sh", "-c", "echo boom 1>&2; exit 1"]
     )
-    result = asyncio.run(mutate.CodexMutator()(box, "p6"))
+    result = asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p6"))
     assert result.status == "exec_error"
     assert "boom" in result.reason
     assert (box / "codex.jsonl").exists()
@@ -188,11 +231,11 @@ def test_codex_mutator_no_output_reason_carries_the_last_agent_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A no_output reason names the last thing codex said, and tokens still parse."""
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     # `printf %s` writes its argument verbatim, so the transcript reaches
     # `codex.jsonl` exactly as a real session would have written it.
     monkeypatch.setattr(mutate.CodexMutator, "COMMAND", ["printf", "%s", TRANSCRIPT])
-    result = asyncio.run(mutate.CodexMutator()(box, "p5"))
+    result = asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p5"))
     assert result.status == "no_output"
     assert "question about the interface" in result.reason
     assert result.input_tokens == 10 and result.output_tokens == 5
@@ -202,11 +245,11 @@ def test_codex_mutator_kills_the_whole_process_group_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A timeout kills the process group, not just codex, so no orphan survives."""
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     monkeypatch.setattr(
         mutate.CodexMutator, "COMMAND", ["bash", "-c", "sleep 30 & sleep 30"]
     )
-    result = asyncio.run(mutate.CodexMutator(timeout=1)(box, "p7"))
+    result = asyncio.run(mutate.CodexMutator(timeout=1)(box, MESSAGE, "p7"))
     assert result.status == "timeout"
     pgid = int(result.reason.split("pgid ")[1].rstrip(")"))
     for _ in range(20):
@@ -228,10 +271,10 @@ def test_cancelling_a_call_kills_the_whole_process_group(
     """Shutting the loop down takes the session with it, grandchildren included.
 
     A cancelled call that only closed its pipes would leave codex running
-    against a sandbox nothing owns, holding cores the budget counts as free;
-    a restart would then race eight orphans.
+    against a directory nothing owns, holding cores the budget counts as
+    free; a restart would then race eight orphans.
     """
-    box = sandbox(tmp_path)
+    box = workspace(tmp_path)
     pgid_file = tmp_path / "pgid"
     monkeypatch.setattr(
         mutate.CodexMutator,
@@ -245,7 +288,9 @@ def test_cancelling_a_call_kills_the_whole_process_group(
 
     async def cancel_mid_session() -> None:
         """Start the call, wait for the group to exist, then cancel it."""
-        call = asyncio.ensure_future(mutate.CodexMutator(timeout=30)(box, "p9"))
+        call = asyncio.ensure_future(
+            mutate.CodexMutator(timeout=30)(box, MESSAGE, "p9")
+        )
         while not pgid_file.exists():
             await asyncio.sleep(0.05)
         call.cancel()
@@ -274,12 +319,12 @@ def test_cancelling_a_call_kills_the_whole_process_group(
 )
 def test_real_codex_writes_a_child(tmp_path: Path) -> None:
     """One real codex call turns a trivial parent into a working child.py."""
-    box = sandbox(tmp_path)
-    # codex refuses to run outside a trusted directory; production sandboxes
-    # already live inside this repo's own trusted worktree, so make this
-    # tmp_path one too rather than relaxing the mutator's real command.
+    box = workspace(tmp_path)
+    # codex refuses to run outside a trusted directory, and a round's
+    # directory is a fresh one under the system temporary tree, so make this
+    # tmp_path trusted rather than relaxing the mutator's real command.
     subprocess.run(["git", "init", "-q"], cwd=box, check=True)
-    result = asyncio.run(mutate.CodexMutator()(box, "p4"))
+    result = asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p4"))
     assert result.status == "ok"
     assert result.child is not None
     assert "def agent" in (box / "child.py").read_text()

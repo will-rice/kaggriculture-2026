@@ -13,7 +13,7 @@ The agent is no longer hand-written: a codex-driven search plays candidate
 agents against a held-out field, keeps the ones that validate, and promotes
 what wins to the campaign floor, `run/campaign/floor/agent/main.py`, which is
 what `uv run package` ships. See
-[docs/superpowers/specs/2026-09-04-codex-campaign-design.md](docs/superpowers/specs/2026-09-04-codex-campaign-design.md)
+[docs/superpowers/specs/2026-09-05-campaign-script-design.md](docs/superpowers/specs/2026-09-05-campaign-script-design.md)
 for the design and
 [docs/superpowers/plans/2026-09-04-campaign-foundation.md](docs/superpowers/plans/2026-09-04-campaign-foundation.md)
 for how it was built.
@@ -41,33 +41,38 @@ for how it was built.
 ### Running the campaign
 
 ```bash
-uv run campaign dry-run --calls 2         # fake mutator, proves the pipeline
+uv run campaign dry-run --sessions 2      # fake mutator, proves the pipeline
 nohup uv run campaign loop > run/campaign/loop.log 2>&1 &
 tail -f run/campaign/loop.log            # metrics: wandb.ai/will-rice/kaggriculture-2026
 ```
 
-The loop is one `asyncio` event loop and nothing in it waits on anything it
-does not need. A dispatcher keeps `--concurrency` codex sessions running at
-once, and a session's slot is refilled the moment codex exits rather than
-when its child finishes being scored; every child is validated,
-fast-evaluated and inserted as soon as it exists. The schedule is counted in
-completed calls, not rounds -- migration every `MIGRATION_INTERVAL` calls,
-a deep-evaluation epoch every `EPOCH_INTERVAL`, an island reset every
-`RESET_INTERVAL` -- and an epoch is a task like any other: it competes for
-cores with the evaluations running beside it instead of stopping dispatch,
-and a crossing that finds the previous epoch still running is skipped.
-`--calls` is how many mutation calls to run; whatever is in flight when the
-last one is planned is drained.
+The loop is one `asyncio` event loop running `SESSIONS` workers against one
+database, one pool and one champion. A worker takes the champion and runs a
+session on it: each round composes a message, hands codex a directory holding
+one file, `child.py`, and the message on standard input, then validates what
+codex wrote, plays it against every pool opponent, inserts it, and sends the
+result back for another round. A round continues from its own previous
+program; a new session starts again from the champion. A session ends when a
+round beats every opponent, or at whichever of `ROUNDS_PER_SESSION` and
+`SESSION_LIMIT_SECONDS` comes first.
 
-`dry-run` swaps the codex mutator for one that copies the parent with a
-visible edit, so it exercises validation, evaluation, insertion and the
-promotion gate without spending a call. Both commands resume from
-`run/campaign/state.json` and the archive log, so a killed loop restarts
-where it stopped, and it resumes the same wandb run (`config.WANDB_RUN_ID`),
-so the curves continue, named `<codex model>-<git revision>` as of the launch;
-a dry run logs nothing. Each promotion also uploads
-the champion's file as a wandb artifact named after it. Keep `--workers * --concurrency` inside the core budget:
-every session in flight can be evaluating at once, so the peak is their product.
+The model is a mutation operator: it plays nothing and measures nothing, so
+every game goes through the one pool that knows how many cores there are, and
+the verdict it is sent is the same rule the promotion gate applies. A program
+entering the top `DEEP_TOP_K` is confirmed on the sealed exam block, and one
+that beats every opponent there becomes the champion and joins the pool.
+`--sessions` is how many sessions to run; whatever is in flight when the last
+one is taken is drained.
+
+`dry-run` swaps the codex call for one that copies the parent with a visible
+edit, so it exercises validation, evaluation, insertion and the promotion gate
+without spending quota. Both commands resume from `run/campaign/state.json`,
+`run/campaign/champion.json` and the archive log, so a killed loop restarts
+where it stopped, and it resumes the same wandb run, named
+`<codex model>-<git revision>`; a dry run logs nothing. Each promotion uploads
+the champion's tarball as a wandb artifact named after it. `--workers` is what
+one evaluation may fan over, and every session in flight can be evaluating at
+once, so keep `--workers * SESSIONS` inside `CORE_BUDGET`.
 
 The commit hook runs the fast suite; run `uv run pytest -m slow` before
 pushing, which is where the tests that play real games against the vendored

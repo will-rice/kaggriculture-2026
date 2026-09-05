@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, evaluator, field_gate, pool
+from kaggriculture.campaign import config, evaluator, field_gate, harness, pool
 from kaggriculture.report import wilson_interval
 
 # Fits the smallest box the suite runs on: CORE_BUDGET clamps to 1 on a
@@ -136,7 +136,10 @@ def test_deep_bounds_are_the_mean_of_the_per_opponent_bounds(
     monkeypatch.setattr(
         field_gate,
         "score_field",
-        lambda candidate, seeds, workers, opponents: {n: fixed[n] for n in opponents},
+        lambda candidate, seeds, workers, opponents: (
+            {n: fixed[n] for n in opponents},
+            {n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in opponents},
+        ),
     )
     p = pool.Pool(
         opponents={
@@ -199,7 +202,10 @@ def test_deep_names_an_empty_field_instead_of_dividing_by_zero(
     monkeypatch.setattr(
         field_gate,
         "score_field",
-        lambda candidate, seeds, workers, opponents: dict.fromkeys(opponents, 0.5),
+        lambda candidate, seeds, workers, opponents: (
+            dict.fromkeys(opponents, 0.5),
+            {n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in opponents},
+        ),
     )
     p = pool.Pool(opponents={"champion_1": str(tmp_path / "champ.py")})
 

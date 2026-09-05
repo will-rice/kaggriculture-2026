@@ -59,8 +59,8 @@ markers = [
   "local_data: needs /data/kaggriculture or the local Kaggle image; implies slow, and is skipped where absent",
 ]
 addopts = "-m 'not slow'"
-# Codex writes test files of its own inside run/campaign/sandboxes while the
-# loop runs; the suite is what lives under tests/.
+# The suite is what lives under tests/, never what a campaign leaves lying
+# about under run/.
 testpaths = ["tests"]
 
 [dependency-groups]

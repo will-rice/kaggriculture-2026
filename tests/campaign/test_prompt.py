@@ -1,87 +1,144 @@
-"""What a sandbox contains, and what it must never contain."""
+"""What the composed message says, and what it must never say."""
 
 import re
-from collections.abc import Iterator
-from pathlib import Path
 
-import pytest
-
-from kaggriculture.campaign import config, prompt, validate
+from kaggriculture.campaign import (
+    config,
+    evaluator,
+    gate,
+    harness,
+    prompt,
+    validate,
+)
 
 IMPROVE = prompt.INSTRUCTIONS[0][1]
 
 
-@pytest.fixture(autouse=True)
-def restore_sandboxes() -> Iterator[None]:
-    """Put ``config.SANDBOXES`` back after a test has pointed it at a tmp_path."""
-    original = config.SANDBOXES
-    yield
-    config.SANDBOXES = original
-
-
-def monkeypatched_sandbox(tmp_path: Path) -> Path:
-    """Point ``config.SANDBOXES`` at a directory under ``tmp_path``.
-
-    Args:
-        tmp_path: The test's temporary directory.
-
-    Returns:
-        The sandboxes directory the campaign will build under.
-    """
-    config.SANDBOXES = tmp_path / "sandboxes"
-    config.SANDBOXES.mkdir(exist_ok=True)
-    return config.SANDBOXES
-
-
-def test_the_sandbox_holds_the_champion_as_child_py(tmp_path: Path) -> None:
-    """A session edits the champion in place; there is no parent.py."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "champion.py"
-    champion.write_text("def agent(o, c=None):\n    return {'x': 1}\n")
-
-    box = prompt.build_sandbox(
-        "p1",
-        champion,
-        IMPROVE,
-        rates={"v54": 0.3},
-        failures=[],
-        started_from="champion_1",
+def day(number: int, ours: float, theirs: float) -> harness.Day:
+    """One row of a day table, with something in every field."""
+    return harness.Day(
+        day=number,
+        ours_bank=ours,
+        theirs_bank=theirs,
+        ours_shed={"WHEAT": 12},
+        theirs_shed={"EGG": 3},
+        ours_hands=2,
+        theirs_hands=1,
+        prices={"WHEAT": 25},
     )
 
-    assert (box / "child.py").read_text() == champion.read_text()
-    assert not (box / "parent.py").exists()
 
-
-def test_the_feedback_states_the_bar_and_names_what_the_champion_loses_to(
-    tmp_path: Path,
-) -> None:
-    """The bar is absolute, and what stands in its way is named.
-
-    There is no number to clear any more: a candidate is promoted when it
-    beats every opponent in the pool, so the useful thing to tell a session
-    is which of them the program it starts from does not beat.
-    """
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "champion.py"
-    champion.write_text("def agent(o, c=None):\n    return {}\n")
-
-    box = prompt.build_sandbox(
-        "p2",
-        champion,
-        IMPROVE,
-        rates={"v54": 0.3},
-        failures=[],
-        started_from="champion_1",
+def result(rates: dict[str, float], days: int = 2) -> evaluator.FastResult:
+    """A fast evaluation standing in for one the loop played."""
+    hardest = min(rates, key=lambda name: rates[name])
+    return evaluator.FastResult(
+        fitness=sum(rates.values()) / len(rates),
+        rates=rates,
+        margins={
+            name: harness.Margin(mean=-100.0, worst=-300.0, best=50.0) for name in rates
+        },
+        seeds=[1, 2, 3, 4],
+        hardest=hardest,
+        states=[day(n, 3000.0 - n, 3000.0 + n) for n in range(days)],
     )
 
-    feedback = (box / "feedback.md").read_text()
-    assert "The champion does not beat: **v54**" in feedback
-    assert "| v54 | 0.300 |" in feedback
-    assert "`champion_1`" in feedback
+
+def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
+    """The model edits child.py and stops; the campaign plays it."""
+    text = prompt.compose("champion_1", result({"v54": 0.3}), IMPROVE)
+
+    assert "`child.py` in your working directory is `champion_1`" in text
+    assert "Edit it in place and stop" in text
+    assert "the campaign plays" in text
+    assert f"{config.ROUND_LIMIT_SECONDS // 60}\nminutes" in text.replace(" ", "\n")
+
+
+def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:
+    """One implementation of "did it win", so a model cannot believe otherwise.
+
+    The sentence naming what the program does not beat is the gate's own,
+    word for word, which is what stops a model concluding it has cleared a
+    bar the gate then refuses it on.
+    """
+    rates = {"v54": 0.3, "v56": 0.9}
+
+    text = prompt.compose("champion_1", result(rates), IMPROVE)
+
+    assert f"It {gate.promotion(rates)[1]}." in text
+    assert "It did not beat v54 at 0.300." in text
+    assert "| v54 | 0.300 | -100 | -300 | +50 |" in text
+    assert "| v56 | 0.900 |" in text
+
+
+def test_a_program_that_beats_everything_is_told_so() -> None:
+    """The bar is stated the same way whether or not it has been cleared."""
+    rates = {"v54": 0.9, "v56": 0.8}
+
+    text = prompt.compose("champion_1", result(rates), IMPROVE)
+
+    assert f"It {gate.promotion(rates)[1]}." in text
+    assert "It beat every opponent." in text
+    assert "sealed block" in text
+
+
+def test_the_states_are_one_game_day_by_day() -> None:
+    """One lost game against the hardest opponent, both sides, day by day."""
+    text = prompt.compose(
+        "champion_1", result({"v54": 0.0, "v56": 0.9}, days=30), IMPROVE
+    )
+
+    assert "One game against `v54`, day by day" in text
+    assert text.count("| WHEAT 12 | EGG 3 |") == 30
+    assert "| 29 | 2971 | 3029 |" in text
+    # The shed is hidden from a player at runtime; the author is not a player.
+    assert "cannot see the opponent's shed" in text
+
+
+def test_the_message_names_opponents_and_never_a_path() -> None:
+    """The doctrine: nothing the loop composes carries an opponent's path.
+
+    Everything a model is given is this string, so this is the whole of the
+    campaign's exposure. Opponent names travel; nothing that could be opened
+    does.
+    """
+    text = prompt.compose("champion_1", result({"v54": 0.1, "router_v1": 0.0}), IMPROVE)
+
+    assert "/data/kaggriculture" not in text
+    assert not re.search(r"/(?:home|data|Users|tmp)/\S*", text)
+    assert str(config.ROOT) not in text
+    assert "router_v1" in text and "v54" in text
+
+
+def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
+    """A model told it may import our package would write a program that dies.
+
+    One file ships, so the whitelist is the program's whole dependency
+    surface. The section is rendered from `validate.ALLOWED_IMPORTS` rather
+    than restated, because a model told a different set from the one that
+    rejects it is worse than one told nothing.
+    """
+    text = prompt.compose("champion_1", result({"v54": 0.5}), IMPROVE)
+
+    for name in validate.ALLOWED_IMPORTS:
+        assert f"`{name}`" in text, name
+    assert "`ctypes`" not in text
+    assert "`kaggriculture`" not in text
+
+
+def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
+    """The game's rules travel; the harness section does not, having nothing to run."""
+    text = prompt.compose("champion_1", result({"v54": 0.5}), IMPROVE)
+
+    assert "Kaggriculture policy task" in text
+    assert "never read opponent source" in text
+    assert "campaign play AGENT" not in text and "campaign check" not in text
+    assert "uv run" not in text and "--vs" not in text
+    assert "engine/kaggriculture.py" not in text
+    assert "700000" not in text
 
 
 def test_there_are_five_full_instructions_and_they_differ() -> None:
-    """FAMOU C.2's variants, so eight sessions on one champion diverge."""
+    """FAMOU C.2's variants, so eight workers on one champion diverge."""
     names = [name for name, _ in prompt.INSTRUCTIONS]
     texts = [text for _, text in prompt.INSTRUCTIONS]
     assert len(prompt.INSTRUCTIONS) == 5
@@ -89,192 +146,10 @@ def test_there_are_five_full_instructions_and_they_differ() -> None:
     assert all("child.py" in text for text in texts)
 
 
-def test_sandbox_has_every_required_file_and_no_opponent_path(tmp_path: Path) -> None:
-    """Every required file exists, and no opponent path leaks anywhere in it."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text(
-        "def agent(o, c=None):\n"
-        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
-    )
-    box = prompt.build_sandbox(
-        "abc",
-        champion,
-        IMPROVE,
-        rates={"v54": 0.1, "router_v1": 0.0},
-        failures=["syntax: bad"],
-        started_from="champion_1",
-    )
-    for name in (
-        "AGENTS.md",
-        "child.py",
-        "feedback.md",
-        "engine/kaggriculture.py",
-        "PROMPT.md",
-    ):
-        assert (box / name).exists(), name
-    everything = "".join(
-        p.read_text(encoding="utf-8", errors="replace")
-        for p in box.rglob("*")
-        if p.is_file()
-    )
-    assert "/data/kaggriculture" not in everything
-    feedback = (box / "feedback.md").read_text()
-    assert "router_v1" in feedback and "does not beat" in feedback
-    assert "syntax: bad" in feedback
-
-
-def test_prompt_states_the_instruction_the_bar_and_the_budget(tmp_path: Path) -> None:
-    """PROMPT.md records the drawn instruction and the session's budget."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    box = prompt.build_sandbox(
-        "drawn",
-        champion,
-        prompt.INSTRUCTIONS[4][1],
-        rates={},
-        failures=[],
-        started_from="champion_1",
-    )
-    text = (box / "PROMPT.md").read_text()
-    assert prompt.INSTRUCTIONS[4][1] in text
-    assert prompt.INSTRUCTIONS[0][1] not in text
-    assert f"{config.SESSION_LIMIT_SECONDS // 60} minutes" in text
-
-
-def test_agents_md_is_the_task_prompt_plus_harness_and_doctrine(tmp_path: Path) -> None:
-    """AGENTS.md carries the harness commands and the never-read-source doctrine."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    box = prompt.build_sandbox(
-        "q",
-        champion,
-        IMPROVE,
-        rates={},
-        failures=[],
-        started_from="champion_1",
-    )
-    text = (box / "AGENTS.md").read_text()
-    assert "campaign play" in text and "never read their source" in text.lower()
-    assert "700000" not in text
-
-
-def test_agents_md_states_the_imports_the_gate_actually_allows(
-    tmp_path: Path,
-) -> None:
-    """A session told it may import our package would write a program that dies.
-
-    One file ships, so the whitelist is the program's whole dependency
-    surface. The section is rendered from `validate.ALLOWED_IMPORTS` rather
-    than restated, because a sandbox told a different set from the one that
-    rejects it is worse than one told nothing.
-    """
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    box = prompt.build_sandbox(
-        "imports",
-        champion,
-        IMPROVE,
-        rates={},
-        failures=[],
-        started_from="champion_1",
-    )
-
-    text = (box / "AGENTS.md").read_text()
-    for name in validate.ALLOWED_IMPORTS:
-        assert f"`{name}`" in text, name
-    assert "`ctypes`" not in text
-    assert "`kaggriculture`" not in text
-
-
-def test_agents_md_strips_the_stale_harness_block_and_rewrites_the_project_path(
-    tmp_path: Path,
-) -> None:
-    """Phase 1's harness block is hard-coded to this worktree; it must not leak."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    box = prompt.build_sandbox(
-        "r",
-        champion,
-        IMPROVE,
-        rates={},
-        failures=[],
-        started_from="champion_1",
-    )
-    text = (box / "AGENTS.md").read_text()
-    root = str(config.ROOT)
-    assert text.count(f"uv run --project {root} campaign check") == 1
-    assert text.count(f"uv run --project {root} campaign play") == 1
-    # No other absolute path appears anywhere in AGENTS.md.
-    sanitized = text.replace(root, "<ROOT>")
-    assert not re.search(r"/(?:home|data|Users|tmp)/\S*", sanitized)
-    assert "Valid measured opponents" not in text
-    assert "700000" not in text
-
-
-def test_every_instruction_forbids_reading_opponent_source(tmp_path: Path) -> None:
-    """The doctrine is wrapped around every one of the five instructions."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    forbidden = "do not read, request, or reconstruct any opponent's source"
-
+def test_every_instruction_reaches_the_message_whole() -> None:
+    """The drawn instruction is the last thing said, and only that one."""
     for index, (name, text) in enumerate(prompt.INSTRUCTIONS):
-        box = prompt.build_sandbox(
-            f"full-{index}",
-            champion,
-            text,
-            rates={},
-            failures=[],
-            started_from="champion_1",
-        )
-        assert forbidden in (box / "PROMPT.md").read_text().lower(), name
-
-
-def test_program_id_path_traversal_is_rejected(tmp_path: Path) -> None:
-    """A crafted program_id can never resolve outside the sandboxes directory."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    sentinel = tmp_path / "sentinel-must-survive.txt"
-    sentinel.write_text("still here\n")
-    for bad_id in ("..", "../x", "a/b", ""):
-        with pytest.raises(ValueError):
-            prompt.build_sandbox(
-                bad_id,
-                champion,
-                IMPROVE,
-                rates={},
-                failures=[],
-                started_from="champion_1",
-            )
-    assert sentinel.read_text() == "still here\n"
-
-
-def test_the_child_is_writable_even_when_the_champion_is_not(tmp_path: Path) -> None:
-    """The gate writes a champion read-only; the file a session edits cannot be.
-
-    `gate.promote` chmods `CHAMPIONS/<name>.py` to 0o444 so nothing can edit
-    what the pool plays, and `shutil.copy` carries the mode across. A session
-    handed a read-only `child.py` cannot do the one thing it is asked to do.
-    """
-    champion = tmp_path / "champion_1.py"
-    champion.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
-    champion.chmod(0o444)
-
-    box = prompt.build_sandbox(
-        "p-readonly",
-        champion,
-        prompt.INSTRUCTIONS[0][1],
-        rates={"pass": 0.5},
-        failures=[],
-        started_from="champion_1",
-    )
-
-    child = box / "child.py"
-    child.write_text("edited\n", encoding="utf-8")
-    assert child.read_text() == "edited\n"
+        message = prompt.compose("champion_1", result({"v54": 0.5}), text)
+        assert message.rstrip().endswith(text), name
+        others = [t for i, (_, t) in enumerate(prompt.INSTRUCTIONS) if i != index]
+        assert not [other for other in others if other in message], name

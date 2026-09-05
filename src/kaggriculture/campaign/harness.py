@@ -1,4 +1,4 @@
-"""What a mutation sandbox may run: play by name, check as Kaggle loads, package.
+"""Play a program by opponent name, check it as Kaggle loads it, package it.
 
 Games run on the engine port; a 2% sample is replayed on the reference engine
 and any bank disagreement fails the call, so drift between the two engines is
@@ -26,22 +26,27 @@ from kaggle_environments.utils import Struct, structify
 from pydantic import BaseModel
 
 from kaggriculture.campaign import arena, config, roster
-from kaggriculture.campaign.engine.wrapper import Engine
+from kaggriculture.campaign.engine.wrapper import Engine, render_private
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
 LOGGER = logging.getLogger(__name__)
 REFERENCE_SAMPLE = 0.02
 LATENCY_BUDGET = 0.5  # half of actTimeout
-# What `campaign play` promises a sandbox in AGENTS.md, enforced on the CLI
+# What `campaign play` allows a person at a terminal, enforced on the CLI
 # only: the library function is what the evaluator calls, and it plays the
-# whole exam block.
+# whole exam block. Nothing in the campaign calls the command -- the loop
+# plays every game anything is scored on -- so these bound a hand-run check
+# beside a live campaign, and nothing else.
 SANDBOX_GAME_CAP = 16
-# Sessions run the harness on their own, outside the loop's core budget, so
-# `SESSIONS` of them can take this many cores each at once.
 SANDBOX_WORKER_CAP = 4
 # The framework, not the interpreter, writes these onto every seat's
 # observation at call time. The port exports neither, so `_one` injects both.
 OVERAGE_SECONDS = 60
+# One game for a worker process: the candidate, the opponent's roster name and
+# file, the seed, the candidate's seat, and whether to record a day table.
+Work = tuple[str, str, str, int, int, bool]
+# The last hour label of a day; the step taken on it runs the day-end refresh.
+LAST_HOUR = 23
 
 
 class OpponentCrash(RuntimeError):  # noqa: N818 - a crash, not our error
@@ -52,6 +57,58 @@ class OpponentCrash(RuntimeError):  # noqa: N818 - a crash, not our error
     A broken opponent is a broken pool, so the loop lets this one out (spec
     section 8): it halts loudly rather than scoring around the hole.
     """
+
+
+class Day(BaseModel):
+    """One day of a game as it closed, from the candidate's point of view.
+
+    The row for day ``d`` is that day at hour 23: what both programs were
+    looking at when they made their last decision in it, and for the final
+    day the terminal state the match is decided on. Hour 23 rather than the
+    next day's hour zero because the day-end refresh in between clears the
+    hands: a table read after it says every day was worked alone. A season is
+    thirty days, so a game is thirty rows.
+
+    Both sides appear, the shed a player cannot see at runtime included. That
+    is deliberate: this is what the author of a program is shown after the
+    game, never what the program may read while playing one.
+
+    Attributes:
+        day: The day this row closed.
+        ours_bank: The candidate's money.
+        theirs_bank: The opponent's money.
+        ours_shed: The candidate's shed, zero counts dropped.
+        theirs_shed: The opponent's shed, zero counts dropped.
+        ours_hands: Hands the candidate holds, the farmer aside.
+        theirs_hands: Hands the opponent holds, the farmer aside.
+        prices: The shared market's price per product.
+    """
+
+    day: int
+    ours_bank: float
+    theirs_bank: float
+    ours_shed: dict[str, int]
+    theirs_shed: dict[str, int]
+    ours_hands: int
+    theirs_hands: int
+    prices: dict[str, int]
+
+
+class Margin(BaseModel):
+    """How far apart the banks finished, over the games against one opponent.
+
+    A win rate says how often; this says by how much, which is what separates
+    an opponent a candidate nearly beats from one it is nowhere near.
+
+    Attributes:
+        mean: Mean of ``ours - theirs`` over those games.
+        worst: The lowest such difference.
+        best: The highest.
+    """
+
+    mean: float
+    worst: float
+    best: float
 
 
 class Game(BaseModel):
@@ -71,6 +128,9 @@ class Game(BaseModel):
             set, else None. Carried as its own field rather than parsed back
             out of ``error``, because who raised decides whether the loop
             records a lineage failure or halts.
+        days: One row per day when the game was played with ``days``, and
+            empty otherwise: recording costs a render per day, and only the
+            one game the loop shows a model is ever read.
     """
 
     opponent: str
@@ -81,6 +141,7 @@ class Game(BaseModel):
     worst_step_seconds: float
     error: str | None = None
     culprit: str | None = None
+    days: list[Day] = []
 
 
 class CheckReport(BaseModel):
@@ -200,9 +261,24 @@ def shared_step(environment: Environment) -> int:
     return int(environment.state[0].observation.step)
 
 
-def _failed(
-    work: tuple[str, str, str, int, int], player: int, error: Exception, worst: float
-) -> Game:
+def margins(games: list[Game], names: list[str]) -> dict[str, Margin]:
+    """Mean, worst and best bank margin per opponent, over the games against it.
+
+    Args:
+        games: The games played, in any order.
+        names: The opponents to report on; each must have been played.
+
+    Returns:
+        One ``Margin`` per name, over ``ours - theirs``.
+    """
+    out = {}
+    for name in names:
+        gaps = [game.ours - game.theirs for game in games if game.opponent == name]
+        out[name] = Margin(mean=sum(gaps) / len(gaps), worst=min(gaps), best=max(gaps))
+    return out
+
+
+def _failed(work: Work, player: int, error: Exception, worst: float) -> Game:
     """Record a crash as a name and an exception type, and nothing else.
 
     Opponents are loaded with their real path as ``__code__.co_filename``, so
@@ -210,7 +286,7 @@ def _failed(
     sandbox the path in a remote traceback -- and a ``SyntaxError`` carries the
     filename in its own message besides. Only the type name travels.
     """
-    _, opponent_name, _, seed, seat = work
+    _, opponent_name, _, seed, seat, _ = work
     who = "candidate" if player == seat else opponent_name
     return Game(
         opponent=opponent_name,
@@ -224,7 +300,32 @@ def _failed(
     )
 
 
-def _one(work: tuple[str, str, str, int, int]) -> Game:
+def _day(engine: Engine, seat: int, day: int) -> Day:
+    """The row for ``day``, read off the engine as that day closed.
+
+    Args:
+        engine: The episode, standing at the state that closed ``day``.
+        seat: The seat the candidate holds.
+        day: The day this row is for.
+
+    Returns:
+        One ``Day``: both banks, both sheds, both hand counts, the prices.
+    """
+    ours = engine.observation(seat)
+    theirs = render_private(engine.state.farms[1 - seat])["shed"]
+    return Day(
+        day=day,
+        ours_bank=engine.bank(seat),
+        theirs_bank=engine.bank(1 - seat),
+        ours_shed={item: n for item, n in ours["private"]["shed"].items() if n},
+        theirs_shed={item: n for item, n in theirs.items() if n},
+        ours_hands=len(ours["farms"][seat]["hands"]),
+        theirs_hands=len(ours["farms"][1 - seat]["hands"]),
+        prices=ours["market"]["prices"],
+    )
+
+
+def _one(work: Work) -> Game:
     """Play one game on the engine port. Runs in a fresh process per game.
 
     Playing a candidate executes it, and a candidate is evolved source that
@@ -237,13 +338,14 @@ def _one(work: tuple[str, str, str, int, int]) -> Game:
     scratch tree is removed so nothing is left standing in a deleted
     directory.
     """
-    agent_path, opponent_name, opponent_path, seed, seat = work
+    agent_path, opponent_name, opponent_path, seed, seat, days = work
     resolved = (
         str(Path(agent_path).resolve()),
         opponent_name,
         str(Path(opponent_path).resolve()),
         seed,
         seat,
+        days,
     )
     origin = Path.cwd()
     with tempfile.TemporaryDirectory(prefix="campaign-game-") as scratch:
@@ -254,9 +356,9 @@ def _one(work: tuple[str, str, str, int, int]) -> Game:
             os.chdir(origin)
 
 
-def _play_one(work: tuple[str, str, str, int, int]) -> Game:
+def _play_one(work: Work) -> Game:
     """Play one game; the caller has moved to a scratch cwd and resolved the paths."""
-    agent_path, opponent_name, opponent_path, seed, seat = work
+    agent_path, opponent_name, opponent_path, seed, seat, days = work
     sources = [agent_path, opponent_path]
     if seat == 1:
         sources.reverse()
@@ -270,6 +372,7 @@ def _play_one(work: tuple[str, str, str, int, int]) -> Game:
     engine = Engine(seed=seed)
     conf = configuration()
     worst = 0.0
+    rows: list[Day] = []
     while not engine.done:
         actions = []
         for player, agent in enumerate(agents):
@@ -288,7 +391,14 @@ def _play_one(work: tuple[str, str, str, int, int]) -> Game:
             elapsed = perf_counter() - started
             if player == seat:
                 worst = max(worst, elapsed)
+        # The last hour of the day, before the step that ends it takes the
+        # hands away with it. The final day never reaches this branch: its
+        # hour 23 is the terminal state, which is the row below.
+        if days and engine.state.hour == LAST_HOUR:
+            rows.append(_day(engine, seat, engine.state.day))
         engine.step(actions[0], actions[1])
+    if days:
+        rows.append(_day(engine, seat, engine.state.day))
     ours, theirs = engine.bank(seat), engine.bank(1 - seat)
     return Game(
         opponent=opponent_name,
@@ -297,11 +407,16 @@ def _play_one(work: tuple[str, str, str, int, int]) -> Game:
         ours=ours,
         theirs=theirs,
         worst_step_seconds=worst,
+        days=rows,
     )
 
 
 def play(
-    agent: Path, opponents: Sequence[str], seeds: Sequence[int], workers: int
+    agent: Path,
+    opponents: Sequence[str],
+    seeds: Sequence[int],
+    workers: int,
+    days: bool = False,
 ) -> list[Game]:
     """Play every (opponent, seed, seat) on the port, sampling the reference engine.
 
@@ -310,6 +425,9 @@ def play(
         opponents: Roster names; a path here is a KeyError.
         seeds: Episode seeds; an exam seed here is a ValueError.
         workers: Processes to fan the games over, at most ``config.CORE_BUDGET``.
+        days: Record each game's day table. The ranking evaluation asks for
+            them because one of these games is what a model is shown of how
+            its program played.
 
     Returns:
         One ``Game`` per opponent, seed and seat, in that order.
@@ -321,7 +439,7 @@ def play(
         RuntimeError: The candidate raised during a game, or the
             reference-engine sample disagreed with the port.
     """
-    return _play(agent, opponents, seeds, workers, sealed=True)
+    return _play(agent, opponents, seeds, workers, sealed=True, days=days)
 
 
 def play_unsealed(
@@ -345,7 +463,7 @@ def play_unsealed(
         RuntimeError: The candidate raised during a game, or the
             reference-engine sample disagreed with the port.
     """
-    return _play(agent, opponents, seeds, workers, sealed=False)
+    return _play(agent, opponents, seeds, workers, sealed=False, days=False)
 
 
 def _play(
@@ -354,6 +472,7 @@ def _play(
     seeds: Sequence[int],
     workers: int,
     sealed: bool,
+    days: bool,
 ) -> list[Game]:
     """Shared body of ``play`` and ``play_unsealed``; only the exam check differs."""
     if sealed and any(seed in config.EXAM_SEEDS for seed in seeds):
@@ -362,7 +481,7 @@ def _play(
         raise ValueError(f"workers exceeds CORE_BUDGET ({config.CORE_BUDGET})")
     paths = {name: roster.path(name) for name in opponents}
     work = [
-        (str(agent), name, str(paths[name]), seed, seat)
+        (str(agent), name, str(paths[name]), seed, seat, days)
         for name in opponents
         for seed in seeds
         for seat in (0, 1)
