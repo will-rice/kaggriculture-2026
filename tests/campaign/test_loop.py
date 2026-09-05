@@ -133,8 +133,10 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     The one-opponent test pool stands in for the vendored field and the real
     held-out set is dropped: these tests measure the pipeline, not a field,
     and playing the held-out opponents would cost games nothing asserts on.
-    ``DEEP_TOP_K`` is one so the gate fires on a known program rather than on
-    everything a run has ever kept; the tests that care set their own.
+
+    Nothing here touches a constant that decides behaviour rather than cost.
+    ``DEEP_TOP_K`` used to be set to one, which configured away the only
+    values at which the gate has more than one program to choose between.
     """
     run = tmp_path / "run"
     for name, relative in RUNTIME_PATHS.items():
@@ -142,9 +144,6 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "POOL", run / "pool.json")
     monkeypatch.setattr(config, "EXAM_SEEDS", EXAM_SEEDS[:2])
     monkeypatch.setattr(config, "FAST_SEEDS", 1)
-    monkeypatch.setattr(config, "DEEP_TOP_K", 1)
-    monkeypatch.setattr(config, "CROSS_PROBABILITY", 0.0)
-    monkeypatch.setattr(gate, "SERVED", tmp_path / "served.py")
     monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
     monkeypatch.setattr(evaluator, "HELD_OUT", [])
 
@@ -188,7 +187,9 @@ def strong_champion(tmp_path: Path) -> gate.Champion:
     return champion
 
 
-def stub_evaluator(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def stub_evaluator(
+    monkeypatch: pytest.MonkeyPatch, deep_crashes: bool = False
+) -> list[str]:
     """Answer both evaluations from the source itself, without playing a game.
 
     A scheduling test needs a fitness to rank on, not a game to produce one.
@@ -201,6 +202,8 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     Args:
         monkeypatch: The test's patcher.
+        deep_crashes: Whether every deep evaluation raises, as one does when
+            the candidate fails in its own seat on the exam block.
 
     Returns:
         The program ids handed to the deep evaluation, in order.
@@ -225,6 +228,8 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     ) -> evaluator.DeepResult:
         """The deep evaluation's shape, without its games."""
         scored.append(program_id)
+        if deep_crashes:
+            raise RuntimeError("the candidate raised in its own seat")
         return _deep_result(program_id, dict.fromkeys(opponents.names(), score(agent)))
 
     monkeypatch.setattr(evaluator, "fast", fast)
@@ -313,17 +318,117 @@ def test_a_better_child_is_deep_scored_and_promoted(
     )
 
     assert state.sessions == 2
-    assert state.champion is not None and state.champion.score > 0.5
-    assert Path(str(state.champion_path)).read_text() == SELLER
+    champion = state.champion
+    assert champion is not None and champion.result.score > 0.5
+    assert Path(champion.path).read_text() == SELLER
     assert (config.FLOOR / "main.py").read_text() == SELLER
-    assert (config.CHAMPIONS / "champion_1.tar.gz").exists()
-    assert "champion_1" in pool.Pool.load(config.POOL).names()
-    assert gate.load_champion() == gate.Champion.model_validate_json(
-        config.CHAMPION.read_text(encoding="utf-8")
-    )
-    deep = deeps_of(records)
-    assert len(deep) == 1 and deep[0]["deep/promoted"] == 1
+    assert Path(champion.tarball).exists()
+    assert champion.name in pool.Pool.load(config.POOL).names()
+    assert gate.load_champion() == champion
+    promotions = [record for record in deeps_of(records) if record["deep/promoted"]]
+    assert len(promotions) == 1 and promotions[0]["deep/score"] > 0.5
     assert [record["sessions"] for record in sessions_of(records)] == [1, 2]
+
+
+def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A campaign that promotes must still be a campaign that can restart.
+
+    Every write a promotion makes is under ``run/campaign``. One that landed
+    in ``src/`` -- ``served/main.py`` was such a write -- would dirty a
+    tracked file, and ``_open_run`` refuses to start a run whose ``src/`` has
+    uncommitted changes: the first promotion would be the last thing that
+    campaign ever did.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    repo = _repository(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "SERVED", tmp_path / "src" / "served" / "main.py")
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+
+    state = loop.run(
+        sessions=1,
+        mutator=mutate.FakeMutator(edit=lambda _: SELLER),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    # `config.ROOT` is the real checkout until here, because packaging a
+    # champion reads the plumbing modules out of it. From here it is the
+    # repository the promotion could have dirtied.
+    assert state.champion is not None
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    assert repo.git.status("--porcelain", "--", "src") == ""
+    loop._open_run(dry_run=True).finish()
+
+
+def test_the_seed_is_never_deep_scored_or_promoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The gate confirms programs sessions wrote, not the one the campaign began on.
+
+    At the production ``DEEP_TOP_K`` the seed shares the top three with the
+    first children, and a child that ranks below it leaves the seed the best
+    program in the database. Confirming it would promote it -- there is no
+    champion to beat on a cold start -- and `champion_1` would join the pool
+    at a fifth of the weight as an opponent that loses to everything, a
+    constant added to every candidate's score that separates none of them.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    scored = stub_evaluator(monkeypatch)
+
+    state = loop.run(
+        sessions=1,
+        # A child that ranks *below* the seed, so the seed is the top program.
+        mutator=mutate.FakeMutator(edit=lambda _: PASS),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", SELLER),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    assert config.DEEP_TOP_K == 3
+    # The child, then the champion it became being re-scored: never the seed,
+    # which was the best program in the database the whole time.
+    assert loop.SEED_ID not in scored
+    assert state.champion is not None
+    assert Path(state.champion.path).read_text() == PASS
+
+
+def test_a_deep_evaluation_that_crashes_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The exam block is spent on a program once, whatever it costs the program.
+
+    A candidate that raises in its own seat is the lineage's failure, and it
+    is recorded as one. What must not happen is the program keeping its place
+    in the top three with no result to show for it: every later insert would
+    send it back through the gate, and each retry is ten minutes of the exam
+    block holding one of the two deep slots. Three restarts, so the ledger --
+    not just the in-flight set -- is what has to remember.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    strong_champion(tmp_path)
+    scored = stub_evaluator(monkeypatch, deep_crashes=True)
+    seed = _write(tmp_path / "seed.py", PASS)
+    for session in range(3):
+        mutator = mutate.FakeMutator(edit=lambda s, n=session: f"{s}\n# child {n}\n")
+        loop.run(1, mutator, WORKERS, seed, random.Random(session), log)
+
+    assert len(scored) == 3
+    assert sorted(scored) == sorted(set(scored))
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    crashed = [
+        failure
+        for program in database.programs
+        for failure in database.failures(program.id)
+    ]
+    assert len(crashed) == 3
+    assert all(failure.reason.startswith("deep: ") for failure in crashed)
 
 
 def test_eight_workers_run_at_once(
@@ -397,7 +502,6 @@ def test_a_program_is_deep_scored_once(
     exam block on them over and over.
     """
     tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "DEEP_TOP_K", 3)
     strong_champion(tmp_path)
     scored = stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
@@ -433,7 +537,47 @@ def test_the_champion_is_rescored_after_a_promotion(
     )
 
     assert state.champion is not None
-    assert set(state.champion.rates) == {"pass", "champion_1"}
+    assert set(state.champion.result.rates) == {"pass", "champion_1"}
+
+
+def test_the_pool_is_changed_on_the_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A promotion's file work goes to a thread; the pool it joins does not.
+
+    ``gate.promote`` blocks for as long as packaging takes, so it runs in a
+    thread. The pool is a different matter: it is the one object every other
+    session is reading -- `session` for its weights, `evaluate` for the copy
+    an evaluation keeps -- and adding a champion to it rebuilds those dicts.
+    Off the loop that is a dictionary changing size while a coroutine walks
+    it, which is a run that dies or a score against a pool that never was.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    threads: list[str] = []
+    add_champion = pool.Pool.add_champion
+
+    def watched(
+        self: pool.Pool, name: str, path: str, rates: dict[str, float]
+    ) -> str | None:
+        """The real pool change, with a note of the thread that made it."""
+        threads.append(threading.current_thread().name)
+        return add_champion(self, name, path, rates)
+
+    monkeypatch.setattr(pool.Pool, "add_champion", watched)
+
+    state = loop.run(
+        sessions=1,
+        mutator=mutate.FakeMutator(edit=lambda _: SELLER),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    assert state.champion is not None
+    assert threads == [threading.main_thread().name]
 
 
 def test_a_promotion_logs_the_tarball_a_cut_uploads(
@@ -680,8 +824,7 @@ def test_a_restart_resumes_state_json_and_champion_json(
     )
 
     assert state.sessions == 7 and state.sessions_since_promotion == 3
-    assert state.champion == champion.result
-    assert state.champion_path == champion.path
+    assert state.champion == champion
 
 
 def test_a_session_is_told_a_name_and_never_a_path(
