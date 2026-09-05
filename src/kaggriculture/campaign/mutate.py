@@ -14,6 +14,8 @@ instead of writing ``child.py``; ``_last_message`` recovers the last
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import time
 from collections.abc import Callable
@@ -73,6 +75,13 @@ class CodexMutator:
     ``["sleep", "N"]``) to exercise the no-output and timeout paths without
     spending a real codex call; the ``-m``/``-C`` flags are only appended
     when the command actually is codex.
+
+    Codex spawns shell commands as tool calls in ``workspace-write`` mode; on
+    a timeout, killing only the direct child would orphan any grandchild
+    still running, leaking a core the harness's ``config.CORE_BUDGET``
+    assumes is free. The process runs in its own session
+    (``start_new_session=True``) so a timeout can kill the whole process
+    group with ``os.killpg``, not just codex itself.
     """
 
     COMMAND = [
@@ -117,38 +126,46 @@ class CodexMutator:
         if command[0] == "codex":
             command += ["-m", self.model, "-C", str(sandbox)]
         log = sandbox / "codex.jsonl"
-        try:
-            with log.open("w", encoding="utf-8") as handle:
-                subprocess.run(
-                    command,
-                    input=prompt,
-                    stdout=handle,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    cwd=sandbox,
-                    timeout=self.timeout,
-                    check=True,
+        with log.open("w", encoding="utf-8") as handle:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=handle,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=sandbox,
+                start_new_session=True,
+            )
+            try:
+                _, stderr = process.communicate(input=prompt, timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+                process.wait()
+                LOGGER.warning(
+                    "codex call for %s timed out after %ss, killed pgid %s",
+                    program_id,
+                    self.timeout,
+                    pgid,
                 )
-        except subprocess.TimeoutExpired:
+                return Mutation(
+                    program_id=program_id,
+                    child=None,
+                    status="timeout",
+                    reason=f"{self.timeout}s (pgid {pgid})",
+                    seconds=time.perf_counter() - started,
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+        if process.returncode != 0:
             LOGGER.warning(
-                "codex call for %s timed out after %ss", program_id, self.timeout
+                "codex call for %s exited %s", program_id, process.returncode
             )
-            return Mutation(
-                program_id=program_id,
-                child=None,
-                status="timeout",
-                reason=f"{self.timeout}s",
-                seconds=time.perf_counter() - started,
-                input_tokens=0,
-                output_tokens=0,
-            )
-        except subprocess.CalledProcessError as error:
-            LOGGER.warning("codex call for %s exited %s", program_id, error.returncode)
             return Mutation(
                 program_id=program_id,
                 child=None,
                 status="exec_error",
-                reason=(error.stderr or "")[-500:],
+                reason=(stderr or "")[-500:],
                 seconds=time.perf_counter() - started,
                 input_tokens=0,
                 output_tokens=0,

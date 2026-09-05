@@ -2,7 +2,9 @@
 
 import os
 import subprocess
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import IO
 
 import pytest
@@ -100,16 +102,15 @@ def test_codex_mutator_no_output_reason_carries_the_last_agent_message(
     """A no_output reason names the last thing codex said, and tokens still parse."""
     box = sandbox(tmp_path)
 
-    def fake_run(
+    def fake_popen(
         command: list[str],
-        input: str,
+        stdin: int,
         stdout: IO[str],
         stderr: int,
         text: bool,
         cwd: Path,
-        timeout: float,
-        check: bool,
-    ) -> subprocess.CompletedProcess:
+        start_new_session: bool,
+    ) -> SimpleNamespace:
         stdout.write(
             '{"type":"thread.started","thread_id":"t"}\n'
             '{"type":"item.completed","item":{"id":"i1","type":"agent_message",'
@@ -117,13 +118,39 @@ def test_codex_mutator_no_output_reason_carries_the_last_agent_message(
             '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,'
             '"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}\n'
         )
-        return subprocess.CompletedProcess(command, 0)
+        return SimpleNamespace(
+            pid=99999, returncode=0, communicate=lambda input, timeout: (None, "")
+        )
 
-    monkeypatch.setattr(mutate.subprocess, "run", fake_run)
+    monkeypatch.setattr(mutate.subprocess, "Popen", fake_popen)
     result = mutate.CodexMutator()(box, "p5")
     assert result.status == "no_output"
     assert "question about the interface" in result.reason
     assert result.input_tokens == 10 and result.output_tokens == 5
+
+
+def test_codex_mutator_kills_the_whole_process_group_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout kills the process group, not just codex, so no orphan survives."""
+    box = sandbox(tmp_path)
+    monkeypatch.setattr(
+        mutate.CodexMutator, "COMMAND", ["bash", "-c", "sleep 30 & sleep 30"]
+    )
+    result = mutate.CodexMutator(timeout=1)(box, "p7")
+    assert result.status == "timeout"
+    pgid = int(result.reason.split("pgid ")[1].rstrip(")"))
+    for _ in range(20):
+        survivors = subprocess.run(
+            ["pgrep", "-g", str(pgid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if survivors.returncode != 0:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(f"process group {pgid} still has a member after the timeout kill")
 
 
 @pytest.mark.skipif(
