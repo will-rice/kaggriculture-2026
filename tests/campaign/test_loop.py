@@ -341,6 +341,49 @@ def test_a_spent_daily_budget_parks_dispatch_until_the_day_rolls_over(
     assert not epochs_of(records)
 
 
+def test_a_provider_failure_is_not_the_lineages_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """A call that never ran to a verdict leaves no failure line on the island.
+
+    A failure line becomes the lineage's feedback in the next prompt; a model
+    at capacity is not something the next child can fix.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_agent = _write(tmp_path / "pass.py", PASS)
+    p = pool.Pool(opponents={"pass": str(pass_agent)}, weights={"pass": 1.0})
+    p.save(config.POOL)
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        [
+            "bash",
+            "-c",
+            'printf \'%s\\n\' \'{"type":"turn.failed","error":'
+            '{"message":"Selected model is at capacity."}}\'; exit 1',
+        ],
+    )
+
+    state = loop.run(
+        calls=1,
+        mutator=mutate.CodexMutator(model="a", fallback="b", timeout=30),
+        workers=WORKERS,
+        concurrency=1,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+        commit=False,
+    )
+
+    assert state.calls == 1
+    assert '"event": "failure"' not in config.ARCHIVE.read_text()
+    assert [r["calls/ok"] for _, r in calls_of(records)] == [0]
+    assert [r["calls/fallback"] for _, r in calls_of(records)] == [1]
+
+
 def test_a_broken_pool_opponent_stops_the_run_and_takes_the_sessions_with_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:

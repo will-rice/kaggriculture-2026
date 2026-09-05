@@ -93,6 +93,10 @@ CODEX_CONCURRENCY = 8
 # Probed 2026-09-05 on codex 0.153: the ChatGPT login accepts `gpt-6-astra`
 # ("our most capable model for complex, demanding work") but not `gpt-5.6-astra`.
 CODEX_MODEL = "gpt-6-astra"
+# Astra answers "Selected model is at capacity" some of the time (two calls
+# in the first live hour). A call that fails on the first model is retried
+# once on this one, in the same sandbox, so the island still gets a child.
+CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 # Measured on the first live iteration (2026-09-05): a session writes its
 # first complete child at 8-10 minutes and then spends as long again testing
 # it through the harness. Whatever `child.py` holds when the cap fires is

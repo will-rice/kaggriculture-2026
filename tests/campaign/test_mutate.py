@@ -6,6 +6,7 @@ to a live process group, which no fake process could show.
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -99,6 +100,69 @@ def test_a_timed_out_session_still_yields_the_child_it_wrote(
     assert result.status == "timeout"
     assert result.child == box / "child.py"
     assert "def agent" in (box / "child.py").read_text()
+
+
+# The provider's capacity refusal, as codex records it: the provider's error
+# is a JSON string inside the event's own message.
+CAPACITY = json.dumps(
+    {
+        "type": "turn.failed",
+        "error": {
+            "message": json.dumps(
+                {
+                    "type": "error",
+                    "status": 503,
+                    "error": {
+                        "message": "Selected model is at capacity. "
+                        "Please try a different model."
+                    },
+                }
+            )
+        },
+    }
+)
+# A stand-in codex that fails the turn as the provider does when a model is
+# at capacity, or writes a child, depending on the model it was asked for.
+CAPACITY_OR_CHILD = f"""
+if [ "$CAMPAIGN_CODEX_MODEL" = "$1" ]; then
+  printf '%s\\n' '{CAPACITY}'
+  exit 1
+fi
+printf 'def agent(o, c=None):\\n    return {{}}\\n' > child.py
+printf '%s\\n' '{{"type":"turn.completed","usage":{{"input_tokens":7}}}}'
+"""
+
+
+def test_a_session_that_fails_on_the_first_model_is_retried_on_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One retry on the fallback, in the same sandbox; the first transcript kept."""
+    box = sandbox(tmp_path)
+    monkeypatch.setattr(
+        mutate.CodexMutator, "COMMAND", ["bash", "-c", CAPACITY_OR_CHILD, "_", "first"]
+    )
+    result = asyncio.run(
+        mutate.CodexMutator(model="first", fallback="second")(box, "p10")
+    )
+    assert result.status == "ok" and result.model == "second" and result.fallback
+    assert result.input_tokens == 7
+    assert (box / "child.py").exists()
+    assert "turn.failed" in (box / "codex.first.failed.jsonl").read_text()
+    assert "turn.completed" in (box / "codex.jsonl").read_text()
+
+
+def test_a_failure_on_both_models_is_an_exec_error_naming_the_provider_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason is the provider's message, not the empty stderr."""
+    box = sandbox(tmp_path)
+    monkeypatch.setattr(
+        mutate.CodexMutator, "COMMAND", ["bash", "-c", CAPACITY_OR_CHILD, "_", "same"]
+    )
+    result = asyncio.run(mutate.CodexMutator(model="same", fallback="same")(box, "p11"))
+    assert result.status == "exec_error" and result.fallback
+    assert "at capacity" in result.reason
+    assert not (box / "child.py").exists()
 
 
 def test_codex_mutator_reports_exec_error(

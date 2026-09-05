@@ -76,6 +76,7 @@ HYPERPARAMETERS = (
     "WEAKNESS_CAP",
     "CODEX_CONCURRENCY",
     "CODEX_MODEL",
+    "CODEX_FALLBACK_MODEL",
     "DAILY_CALL_BUDGET",
 )
 
@@ -338,7 +339,17 @@ class Campaign:
             finally:
                 self.sessions.release()
             parents = [parent.id] + ([inspiration.id] if inspiration else [])
-            if mutation.child is None:
+            if mutation.status == "exec_error":
+                # The provider refused or codex died, on both models: nothing
+                # about the lineage caused it, so it gets no failure line and
+                # the island is simply dispatched again.
+                LOGGER.warning(
+                    "%s: no session ran to a verdict (%s)",
+                    program_id,
+                    mutation.reason[:200],
+                )
+                fitness = None
+            elif mutation.child is None:
                 self.archive.record_failure(
                     island, parents, kind, f"{mutation.status}: {mutation.reason}"
                 )
@@ -466,6 +477,7 @@ class Campaign:
             "calls": self.state.calls,
             "calls/ok": int(mutation.child is not None),
             "calls/timed_out": int(mutation.status == "timeout"),
+            "calls/fallback": int(mutation.fallback),
             "calls/input_tokens": mutation.input_tokens,
             "calls/output_tokens": mutation.output_tokens,
             "calls/seconds": mutation.seconds,

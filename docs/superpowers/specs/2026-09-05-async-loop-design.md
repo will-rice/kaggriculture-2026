@@ -122,9 +122,14 @@ Unchanged in kind. A candidate's failure at any step is its lineage's failure
 and is recorded with the reason. `OpponentCrash` (a pool opponent failing in
 its own seat) is not a candidate's failure: it propagates out of the job or
 the epoch, the dispatcher stops, in-flight sessions are killed, and `run`
-raises. A spent provider quota surfaces per call as `exec_error` lineage
-failures; `DAILY_CALL_BUDGET` is the guard that keeps a spent quota from
-becoming hours of them, and is 800 for this week's ramp.
+raises. A session that ends without a verdict — the provider refused
+(`gpt-6-astra` answers "at capacity" some of the time) or codex died — is
+retried once on `CODEX_FALLBACK_MODEL` (`gpt-5.6-sol`) in the same sandbox,
+and the call records which model produced its child (`calls/fallback`). A
+failure on both models is logged with the provider's message and the island
+is dispatched again; it is never the lineage's failure and writes no
+failure line. `DAILY_CALL_BUDGET` is the guard that keeps a spent quota from
+becoming hours of such calls, and is 800 for this week's ramp.
 
 ## 7. Telemetry
 
