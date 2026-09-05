@@ -86,30 +86,39 @@ def test_fast_seed_range_never_touches_the_exam_block() -> None:
     assert not set(config.FAST_SEED_RANGE) & set(config.EXAM_SEEDS)
 
 
-def test_hyperparameters_match_the_spec_table() -> None:
-    """Evolution hyperparameters match Spec §3, with the async schedule."""
-    assert (config.ISLANDS, config.ISLAND_SIZE) == (4, 12)
-    # Counted in completed calls, not iterations: the old 10/25/40 iterations
-    # times the four islands one iteration used to mutate at once, so the
-    # wall-clock cadence the numbers were tuned for is unchanged.
-    assert (config.MIGRATION_INTERVAL, config.MIGRANTS, config.RESET_INTERVAL) == (
-        40,
-        2,
-        160,
-    )
-    assert config.UCB_C == 0.5 and config.CROSS_PROBABILITY == 0.3
-    assert (config.FAST_SEEDS, config.EPOCH_INTERVAL, config.DEEP_TOP_K) == (4, 100, 3)
-    assert (
-        config.CHAMPION_WEIGHT,
-        config.POOL_CAP,
-        config.RETIRE_THRESHOLD,
-        config.WEAKNESS_CAP,
-    ) == (0.20, 10, 0.95, 0.5)
-    assert (
-        config.CODEX_CONCURRENCY,
-        config.MUTATION_TIMEOUT_SECONDS,
-        config.DAILY_CALL_BUDGET,
-    ) == (8, 1500, 800)
+def test_constants_match_the_spec_table() -> None:
+    """Spec section 8: the campaign's constants, and only these."""
+    assert config.SESSIONS == 8
+    assert config.SESSION_LIMIT_SECONDS == 1500
+    assert config.GAME_LIMIT_SECONDS == 120
+    assert config.FAST_SEEDS == 4
+    assert len(config.EXAM_SEEDS) == 64
+    assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
+    assert config.CHAMPION_WEIGHT == 0.20
+    assert (config.POOL_CAP, config.RETIRE_THRESHOLD) == (10, 0.95)
+    assert config.WEAKNESS_CAP == 0.5
+    assert config.STAGNATION_SESSIONS == 40
+    assert config.CODEX_MODEL == "gpt-6-astra"
+    assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
+
+
+def test_the_deleted_constants_are_gone() -> None:
+    """Islands, epochs and the call cap are not part of this system."""
+    for name in (
+        "ISLANDS",
+        "ISLAND_SIZE",
+        "MIGRANTS",
+        "MIGRATION_INTERVAL",
+        "RESET_INTERVAL",
+        "UCB_C",
+        "EPOCH_INTERVAL",
+        "DAILY_CALL_BUDGET",
+        "CODEX_CONCURRENCY",
+        "MUTATION_TIMEOUT_SECONDS",
+        "CHECK_TIMEOUT_SECONDS",
+        "WANDB_RUN_ID",
+    ):
+        assert not hasattr(config, name), name
 
 
 def test_runtime_paths_live_under_run_campaign() -> None:

@@ -118,7 +118,7 @@ class CodexMutator:
         self,
         model: str = config.CODEX_MODEL,
         fallback: str = config.CODEX_FALLBACK_MODEL,
-        timeout: float = config.MUTATION_TIMEOUT_SECONDS,
+        timeout: float = config.SESSION_LIMIT_SECONDS,
     ) -> None:
         """Initializes the mutator.
 

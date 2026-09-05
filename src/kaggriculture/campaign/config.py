@@ -70,26 +70,22 @@ MARKET_OPS: list[str] = [
     "SELL",
 ]
 
-# Spec §3, with the schedule amended by the async-loop design: the loop has
-# no iterations, so migration, the epoch and the island reset are counted in
-# completed calls. 40/100/160 are the old 10/25/40 iterations x 4 islands, so
-# the wall-clock cadence is unchanged.
-ISLANDS = 4
-ISLAND_SIZE = 12
-MIGRATION_INTERVAL = 40
-MIGRANTS = 2
-RESET_INTERVAL = 160
-UCB_C = 0.5
+# One codex session per worker; eight fit the machine beside their
+# evaluations. Spec section 8.
+SESSIONS = 8
 CROSS_PROBABILITY = 0.3
 FAST_SEEDS = 4  # x both seats x every pool opponent
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
-EPOCH_INTERVAL = 100
 DEEP_TOP_K = 3
+# Deep evaluations in flight at once. Each is about ten minutes of games.
+DEEP_CONCURRENCY = 2
 CHAMPION_WEIGHT = 0.20
 POOL_CAP = 10
 RETIRE_THRESHOLD = 0.95
 WEAKNESS_CAP = 0.5
-CODEX_CONCURRENCY = 8
+# Sessions without a promotion before a session starts from a program
+# drawn from the database's top ten instead of the champion.
+STAGNATION_SESSIONS = 40
 # Probed 2026-09-05 on codex 0.153: the ChatGPT login accepts `gpt-6-astra`
 # ("our most capable model for complex, demanding work") but not `gpt-5.6-astra`.
 CODEX_MODEL = "gpt-6-astra"
@@ -101,18 +97,10 @@ CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 # first complete child at 8-10 minutes and then spends as long again testing
 # it through the harness. Whatever `child.py` holds when the cap fires is
 # kept, so the cap bounds an iteration's wall clock, not whether it yields.
-MUTATION_TIMEOUT_SECONDS = 1500
-# A liveness guard, not a target: what keeps a spent provider quota from
-# becoming hours of `exec_error` lineage failures. Raised to 800 for this
-# week's ramp, because the async loop expects roughly 750 calls a day and a
-# cap below that would park the dispatcher until midnight with quota to
-# spare -- the failure this whole redesign exists to end.
-DAILY_CALL_BUDGET = 800
-# Wall clock a candidate gets for the dynamic load plus `harness.check`, which
-# run together in a child process. Module-level code runs on load, so a
-# candidate with an unbounded loop outside any function would otherwise wedge
-# the validating thread for the life of the run.
-CHECK_TIMEOUT_SECONDS = 180
+SESSION_LIMIT_SECONDS = 1500
+# Liveness only, never speed: a 720-turn game of rule-based policies takes
+# well under a second, so one still running after two minutes is stuck.
+GAME_LIMIT_SECONDS = 120
 
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
@@ -132,7 +120,6 @@ CHAMPION = RUN / "champion.json"
 # here, or its curves land on top of the old run's.
 WANDB_ENTITY = "will-rice"
 WANDB_PROJECT = "kaggriculture-2026"
-WANDB_RUN_ID = "campaign"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of the sandboxes a codex session works in.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"
