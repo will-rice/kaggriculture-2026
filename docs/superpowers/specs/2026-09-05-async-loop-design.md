@@ -91,8 +91,11 @@ sessions cannot take 64 cores between them.
 2. `gather` the deep evaluations — champion re-measure plus each candidate —
    each as its own coroutine that takes `workers` permits and awaits
    `to_thread(deep)`. They overlap with each other and with jobs.
-3. On the loop: Spearman, promotion rule, `gate.promote`, wandb epoch record
-   and artifact. A promotion changes the pool while fast evaluations against
+3. On the loop: Spearman, the promotion rule, the file writes and pool save
+   of `gate.promote`, the wandb epoch record and artifact — all milliseconds.
+   The promotion's git commit is the one call that is not: `promote` takes a
+   `commit` callable and the epoch awaits it through `to_thread`, so the loop
+   never blocks on a subprocess. A promotion changes the pool while fast evaluations against
    the previous pool may be in flight; their fitness is inserted as measured.
    The archive's mean fitness already spans pool changes across epochs, so
    this is the same inconsistency at a finer grain, accepted.
