@@ -23,9 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
-import wandb
 from pydantic import BaseModel
 
+import wandb
 from kaggriculture.campaign import archive as archive_module
 from kaggriculture.campaign import (
     config,
@@ -298,7 +298,8 @@ def _iteration_record(
         iteration: The iteration just completed.
         state: The state as of that iteration.
         outcomes: Each island's mutation and its child's fast fitness, or
-            None where no child reached evaluation.
+            None where no child reached evaluation. A call is ``ok`` when it
+            yielded a child, whether or not the session finished.
         archive: The population after the iteration's inserts.
 
     Returns:
@@ -306,11 +307,12 @@ def _iteration_record(
     """
     mutations = [mutation for mutation, _ in outcomes]
     fitnesses = [fitness for _, fitness in outcomes if fitness is not None]
-    ok = sum(mutation.status == "ok" for mutation in mutations)
+    ok = sum(mutation.child is not None for mutation in mutations)
     record: dict[str, float | int] = {
         "iteration": iteration,
         "calls/ok": ok,
         "calls/failed": len(mutations) - ok,
+        "calls/timed_out": sum(m.status == "timeout" for m in mutations),
         "calls/input_tokens": sum(m.input_tokens for m in mutations),
         "calls/output_tokens": sum(m.output_tokens for m in mutations),
         "calls/seconds": sum(m.seconds for m in mutations) / len(mutations),
@@ -390,7 +392,7 @@ def _mutate(
     )
     mutation = mutator(box, program_id)
     parents = [parent.id] + ([inspiration.id] if inspiration else [])
-    if mutation.status != "ok" or mutation.child is None:
+    if mutation.child is None:
         archive.record_failure(
             island, parents, kind, f"{mutation.status}: {mutation.reason}"
         )

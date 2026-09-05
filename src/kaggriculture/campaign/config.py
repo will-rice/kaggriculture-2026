@@ -87,7 +87,11 @@ POOL_CAP = 10
 RETIRE_THRESHOLD = 0.95
 WEAKNESS_CAP = 0.5
 CODEX_CONCURRENCY = 8
-MUTATION_TIMEOUT_SECONDS = 600
+# Measured on the first live iteration (2026-09-05): a session writes its
+# first complete child at 8-10 minutes and then spends as long again testing
+# it through the harness. Whatever `child.py` holds when the cap fires is
+# kept, so the cap bounds an iteration's wall clock, not whether it yields.
+MUTATION_TIMEOUT_SECONDS = 1500
 DAILY_CALL_BUDGET = 200
 # Wall clock a candidate gets for the dynamic load plus `harness.check`, which
 # run together in a child process. Module-level code runs on load, so a

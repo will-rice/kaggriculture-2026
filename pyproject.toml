@@ -47,6 +47,9 @@ markers = [
   "slow: hundreds of tapes; run with -m slow before trusting the engine",
 ]
 addopts = "-m 'not slow'"
+# Codex writes test files of its own inside run/campaign/sandboxes while the
+# loop runs; the suite is what lives under tests/.
+testpaths = ["tests"]
 
 [project.scripts]
 package = "kaggriculture.scripts.package:main"

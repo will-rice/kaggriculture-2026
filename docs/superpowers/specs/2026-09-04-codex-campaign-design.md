@@ -160,7 +160,10 @@ Then runs
 codex exec -C <sandbox> -s workspace-write -c approval_policy=never -m gpt-5.6-sol --json - < PROMPT.md
 ```
 
-with a 10-minute cap. `PROMPT.md` is FAMOU's mutation instruction: produce a
+with a 25-minute liveness cap: a session that had already written `child.py`
+when the cap fires still yields it (live sessions write a first complete child
+at 8-10 minutes and then test it for as long again), so the cap bounds an
+iteration's wall clock, not whether it yields. `PROMPT.md` is FAMOU's mutation instruction: produce a
 complete `child.py` implementing the interface; keep what works; change what
 the feedback says is losing; for `cross`, combine the two programs' ideas.
 Output is `child.py` or a recorded failure (`no_output`, `timeout`,

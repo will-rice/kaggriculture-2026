@@ -80,7 +80,11 @@ Do not read, request, or reconstruct any opponent's source; the gate rejects
 code resembling any opponent's.
 
 Run `campaign check child.py` before you finish. Do not modify parent.py.
-"""
+
+This session is stopped after {minutes} minutes. Whatever child.py holds at
+that moment is what gets evaluated, so write a complete child first and
+refine it in place; do not leave it half-edited while you run experiments.
+""".format(minutes=config.MUTATION_TIMEOUT_SECONDS // 60)
 
 CROSS = """Read AGENTS.md, then parent.py, inspiration.py and feedback.md.
 
@@ -94,7 +98,11 @@ code resembling any opponent's.
 
 Run `campaign check child.py` before you finish. Do not modify parent.py or
 inspiration.py.
-"""
+
+This session is stopped after {minutes} minutes. Whatever child.py holds at
+that moment is what gets evaluated, so write a complete child first and
+refine it in place; do not leave it half-edited while you run experiments.
+""".format(minutes=config.MUTATION_TIMEOUT_SECONDS // 60)
 
 
 def _strip_stale_harness(text: str) -> str:

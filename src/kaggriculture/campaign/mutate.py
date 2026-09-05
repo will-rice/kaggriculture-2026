@@ -34,7 +34,10 @@ class Mutation(BaseModel):
 
     Attributes:
         program_id: The child program id the sandbox was built for.
-        child: Path to the written child program, or None on failure.
+        child: Path to the written child program, or None if there is
+            nothing to evaluate. A timed-out session that had already
+            written ``child.py`` still yields it: the file is what gets
+            evaluated, however the session ended.
         status: "ok", "no_output" (ran but wrote nothing usable), "timeout",
             or "exec_error".
         reason: Free-form explanation; empty on "ok".
@@ -150,20 +153,23 @@ class CodexMutator:
                 if pgid is not None:
                     os.killpg(pgid, signal.SIGKILL)
                 process.wait()
+                child = _written(sandbox)
                 LOGGER.warning(
-                    "codex call for %s timed out after %ss, killed pgid %s",
+                    "codex call for %s timed out after %ss, killed pgid %s; %s",
                     program_id,
                     self.timeout,
                     pgid,
+                    "keeping the child it had written" if child else "no child",
                 )
+                tokens_in, tokens_out = _tokens(log)
                 return Mutation(
                     program_id=program_id,
-                    child=None,
+                    child=child,
                     status="timeout",
                     reason=f"{self.timeout}s (pgid {pgid})",
                     seconds=time.perf_counter() - started,
-                    input_tokens=0,
-                    output_tokens=0,
+                    input_tokens=tokens_in,
+                    output_tokens=tokens_out,
                 )
         if process.returncode != 0:
             LOGGER.warning(
@@ -179,8 +185,8 @@ class CodexMutator:
                 output_tokens=0,
             )
         tokens_in, tokens_out = _tokens(log)
-        child = sandbox / "child.py"
-        if not child.exists() or not child.read_text(encoding="utf-8").strip():
+        child = _written(sandbox)
+        if child is None:
             reason = _last_message(log) or "child.py missing or empty"
             return Mutation(
                 program_id=program_id,
@@ -200,6 +206,14 @@ class CodexMutator:
             input_tokens=tokens_in,
             output_tokens=tokens_out,
         )
+
+
+def _written(sandbox: Path) -> Path | None:
+    """``sandbox/child.py`` if the session wrote something there, else None."""
+    child = sandbox / "child.py"
+    if child.exists() and child.read_text(encoding="utf-8").strip():
+        return child
+    return None
 
 
 def _tokens(log: Path) -> tuple[int, int]:

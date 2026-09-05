@@ -106,7 +106,7 @@ def test_hyperparameters_match_the_spec_table() -> None:
         config.CODEX_CONCURRENCY,
         config.MUTATION_TIMEOUT_SECONDS,
         config.DAILY_CALL_BUDGET,
-    ) == (8, 600, 200)
+    ) == (8, 1500, 200)
 
 
 def test_runtime_paths_live_under_run_campaign() -> None:

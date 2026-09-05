@@ -63,6 +63,30 @@ def test_codex_mutator_reports_timeout(
     assert (box / "codex.jsonl").exists()
 
 
+def test_a_timed_out_session_still_yields_the_child_it_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cap bounds the session's wall clock, not whether its work counts.
+
+    Live sessions write a complete child within minutes and then spend as
+    long again testing it; killing the session must not throw that away.
+    """
+    box = sandbox(tmp_path)
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        [
+            "bash",
+            "-c",
+            "printf 'def agent(o, c=None):\\n    return {}\\n' > child.py; sleep 30",
+        ],
+    )
+    result = mutate.CodexMutator(timeout=2)(box, "p8")
+    assert result.status == "timeout"
+    assert result.child == box / "child.py"
+    assert "def agent" in (box / "child.py").read_text()
+
+
 def test_codex_mutator_reports_exec_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -148,5 +172,5 @@ def test_real_codex_writes_a_child(tmp_path: Path) -> None:
     result = mutate.CodexMutator()(box, "p4")
     assert result.status == "ok"
     assert result.child is not None
-    assert "def agent" in result.child.read_text()
+    assert "def agent" in (box / "child.py").read_text()
     assert result.input_tokens > 0 and result.output_tokens > 0
