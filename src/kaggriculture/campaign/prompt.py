@@ -1,9 +1,11 @@
-"""Build the sandbox one codex call works in.
+"""Build the sandbox one codex session works in.
 
 ``AGENTS.md`` is codex's standing context: the task prompt phase 1 wrote,
-how to use the harness, and the doctrine. ``PROMPT.md`` is FAMOU's mutation
-instruction. ``feedback.md`` is what the evaluator said about the parent.
-Nothing in the sandbox names where an opponent lives.
+how to use the harness, and the doctrine. ``child.py`` is the champion,
+copied in; it is the file the session edits in place until it clears the
+bar. ``PROMPT.md`` carries the instruction drawn for this session and the
+budget. ``feedback.md`` states the bar and what the evaluator measured
+about the champion. Nothing in the sandbox names where an opponent lives.
 
 The task prompt phase 1 wrote already contains a harness section, but its
 commands are hard-coded to the worktree that wrote them. ``_strip_stale_harness``
@@ -15,7 +17,6 @@ import logging
 import re
 import shutil
 from pathlib import Path
-from typing import Literal
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as engine_module
 
@@ -70,40 +71,65 @@ for it, never reconstruct it: the gate rejects code that resembles any
 opponent's. Your agent is ours.
 """
 
-FULL = """Read AGENTS.md, then parent.py and feedback.md.
+# FAMOU appendix C.2's five rewrite instructions. One is drawn per session,
+# so eight sessions starting from the same champion are pushed eight
+# different ways. The caller draws the pair, records the name on the program
+# it produces, and hands ``build_sandbox`` the text; a crossover session is
+# handed CROSS the same way.
+INSTRUCTIONS: tuple[tuple[str, str], ...] = (
+    ("improve", "Improve child.py's performance against the pool."),
+    (
+        "different",
+        "Replace child.py with a completely different algorithm for the same game.",
+    ),
+    (
+        "inspired",
+        "Create a novel approach inspired by child.py that works fundamentally "
+        "differently.",
+    ),
+    (
+        "restructure",
+        "Redesign child.py's core components, keeping what the feedback says wins.",
+    ),
+    (
+        "tune",
+        "Tune child.py's constants and thresholds only; keep its structure.",
+    ),
+)
 
-Write child.py: a complete agent file implementing the interface in
-AGENTS.md. Start from parent.py. Keep what the feedback says is winning;
-change what is losing, and say in a docstring at the top what you changed
-and why. The weakest opponent is where the score moves most.
+CROSS = (
+    "Fold the strongest ideas of inspiration.py into child.py. Say in the "
+    "docstring which idea came from which and why the combination should beat "
+    "both. Do not modify inspiration.py."
+)
+
+# Every instruction is wrapped in these at build time, so the bar, the
+# doctrine and the budget are stated once and cannot drift between variants.
+PREAMBLE = """Read AGENTS.md and feedback.md, then child.py.
+
+child.py is the champion, and it is the file you edit. Keep editing it in
+place until it clears the bar feedback.md states, testing it with the
+harness as you go. Stop as soon as it clears both parts of the bar.
+
+Your instruction for this session:
+
+"""
+
+POSTAMBLE = """
+
+Keep what the feedback says is winning; change what is losing, and say in a
+docstring at the top of child.py what you changed and why. The weakest
+opponent named in feedback.md is where the score moves most.
 
 Do not read, request, or reconstruct any opponent's source; the gate rejects
 code resembling any opponent's.
 
-Run `campaign check child.py` before you finish. Do not modify parent.py.
+Run `campaign check child.py` before you finish.
 
-This session is stopped after {minutes} minutes. Whatever child.py holds at
-that moment is what gets evaluated, so write a complete child first and
-refine it in place; do not leave it half-edited while you run experiments.
-""".format(minutes=config.MUTATION_TIMEOUT_SECONDS // 60)
-
-CROSS = """Read AGENTS.md, then parent.py, inspiration.py and feedback.md.
-
-Write child.py: a complete agent file implementing the interface in
-AGENTS.md, combining the strongest ideas of parent.py and inspiration.py.
-Say in a docstring at the top which idea came from which and why the
-combination should beat both.
-
-Do not read, request, or reconstruct any opponent's source; the gate rejects
-code resembling any opponent's.
-
-Run `campaign check child.py` before you finish. Do not modify parent.py or
-inspiration.py.
-
-This session is stopped after {minutes} minutes. Whatever child.py holds at
-that moment is what gets evaluated, so write a complete child first and
-refine it in place; do not leave it half-edited while you run experiments.
-""".format(minutes=config.MUTATION_TIMEOUT_SECONDS // 60)
+Your budget is {minutes} minutes; the session is stopped then, and whatever
+child.py holds at that moment is what is evaluated. Keep it complete and
+runnable throughout; do not leave it half-edited while you run experiments.
+""".format(minutes=config.SESSION_LIMIT_SECONDS // 60)
 
 
 def _strip_stale_harness(text: str) -> str:
@@ -125,30 +151,51 @@ def _strip_stale_harness(text: str) -> str:
 
 
 def _feedback_lines(
-    feedback: dict[str, float],
-    weakest: str,
+    bar: dict[str, float],
+    rates: dict[str, float],
     weights: dict[str, float],
+    weakest: str,
     failures: list[str],
+    started_from: str,
 ) -> list[str]:
-    """Render the parent's per-opponent rates, pool weights, and lineage failures.
+    """Render the bar, the champion's rates, the pool weights, and past failures.
 
     Args:
-        feedback: The parent's fast-eval win rate per opponent name.
-        weakest: The name of the pool's weakest opponent, or "" if unknown.
+        bar: What the edit has to beat; ``bar["fitness"]`` is the champion's
+            weighted pool fitness.
+        rates: The champion's fast-eval win rate per opponent name.
         weights: The pool weight per opponent name.
+        weakest: The name of the pool's weakest opponent, or "" if unknown.
         failures: Recent failure descriptions from this lineage.
+        started_from: The champion's id, which is also its pool opponent name.
 
     Returns:
         Lines of a markdown document naming opponents only, never paths.
     """
     lines = [
-        "# Feedback on parent.py",
+        "# Feedback on child.py",
         "",
-        "| opponent | parent win rate | weight |",
+        "## The bar",
+        "",
+        f"child.py is the champion `{started_from}`. Keep editing it until it "
+        "clears both of these, and stop as soon as it does:",
+        "",
+        f"1. A weighted pool fitness above **{bar['fitness']:.4f}**, the "
+        "champion's, measured over every opponent in the table below.",
+        "2. A winning head-to-head record against the champion itself, which "
+        f"is the pool opponent named `{started_from}`.",
+        "",
+        "Both, because the game is non-transitive: an edit told only to beat "
+        "the champion breeds a champion-counter. An edit that clears the first "
+        "alone is still worth writing.",
+        "",
+        "## The champion against the pool",
+        "",
+        "| opponent | champion win rate | weight |",
         "| --- | --- | --- |",
     ]
     lines += [
-        f"| {name} | {feedback.get(name, float('nan')):.3f} "
+        f"| {name} | {rates.get(name, float('nan')):.3f} "
         f"| {weights.get(name, 0.0):.2f} |"
         for name in weights
     ]
@@ -183,27 +230,35 @@ def _sandbox_path(program_id: str) -> Path:
 
 def build_sandbox(
     program_id: str,
-    kind: Literal["full", "cross"],
-    parent: Path,
+    champion: Path,
+    instruction: str,
     inspiration: Path | None,
-    feedback: dict[str, float],
-    weakest: str,
+    bar: dict[str, float],
+    rates: dict[str, float],
     weights: dict[str, float],
+    weakest: str,
     failures: list[str],
+    started_from: str,
 ) -> Path:
-    """Build the sandbox directory one codex mutation call works in.
+    """Build the sandbox directory one codex session works in.
+
+    The champion is copied in as ``child.py``: the session edits that file in
+    place until it clears the bar, and whatever it holds when the budget runs
+    out is what is evaluated.
 
     Args:
         program_id: The child program id; also the sandbox's directory name.
-        kind: "full" for a from-parent mutation, "cross" to combine parent
-            and inspiration.
-        parent: Path to the parent agent's program file.
-        inspiration: Path to the crossover partner's program file, required
-            when ``kind`` is "cross".
-        feedback: The parent's fast-eval win rate per pool opponent name.
-        weakest: The pool's weakest opponent name, or "" if unknown.
+        champion: Path to the champion's program file, copied in as child.py.
+        instruction: The drawn instruction's text — one of ``INSTRUCTIONS``'
+            second elements, or ``CROSS``. It is recorded in PROMPT.md.
+        inspiration: Path to the crossover partner's program file, or None.
+        bar: What the edit has to beat; ``bar["fitness"]`` is the champion's
+            weighted pool fitness.
+        rates: The champion's fast-eval win rate per pool opponent name.
         weights: The pool weight per opponent name.
+        weakest: The pool's weakest opponent name, or "" if unknown.
         failures: Recent failure descriptions from this lineage.
+        started_from: The champion's id, which is also its pool opponent name.
 
     Returns:
         The path to the built sandbox directory, rebuilt clean each call.
@@ -222,15 +277,15 @@ def build_sandbox(
         task_prompt + HARNESS_SECTION + DOCTRINE, encoding="utf-8"
     )
 
-    shutil.copy(parent, box / "parent.py")
+    shutil.copy(champion, box / "child.py")
     if inspiration is not None:
         shutil.copy(inspiration, box / "inspiration.py")
     shutil.copy(engine_module.__file__, box / "engine" / "kaggriculture.py")
 
-    lines = _feedback_lines(feedback, weakest, weights, failures)
+    lines = _feedback_lines(bar, rates, weights, weakest, failures, started_from)
     (box / "feedback.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    (box / "PROMPT.md").write_text(CROSS if kind == "cross" else FULL, encoding="utf-8")
+    (box / "PROMPT.md").write_text(PREAMBLE + instruction + POSTAMBLE, encoding="utf-8")
 
-    LOGGER.info("built sandbox %s (%s)", box, kind)
+    LOGGER.info("built sandbox %s from %s", box, started_from)
     return box
