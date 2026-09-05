@@ -76,17 +76,19 @@ def test_opponent_regression_of_exactly_the_width_still_passes() -> None:
 
 
 def _program_and_pool(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = "PASS"
 ) -> archive.Program:
     """Patch config/gate paths into tmp_path and build a program to promote."""
     monkeypatch.setattr(config, "FLOOR", tmp_path / "floor" / "agent")
+    monkeypatch.setattr(config, "CHAMPIONS", tmp_path / "champions")
+    monkeypatch.setattr(config, "CHAMPION", tmp_path / "champion.json")
     monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
     monkeypatch.setattr(config, "EPOCHS", tmp_path / "epochs.jsonl")
     monkeypatch.setattr(gate, "SERVED", tmp_path / "served" / "main.py")
-    source = tmp_path / "prog.py"
+    source = tmp_path / f"prog-{body}.py"
     source.write_text(
-        "def agent(o, c=None):\n"
-        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+        f"def agent(o, c=None):\n"
+        f"    return {{'farmer': ['{body}'], 'hands': [], 'market': []}}\n"
     )
     return archive.Program(
         id="p9",
@@ -111,19 +113,87 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
-    name = gate.promote(
+    champion = gate.promote(
         program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False
     )
-    assert name == "champion_1"
+    assert champion.name == "champion_1"
     floor = config.FLOOR / "main.py"
     assert (
         floor.read_text() == source.read_text()
         and (floor.stat().st_mode & 0o777) == 0o444
     )
+    kept = config.CHAMPIONS / "champion_1.py"
+    assert (
+        kept.read_text() == source.read_text()
+        and (kept.stat().st_mode & 0o777) == 0o444
+    )
     assert gate.SERVED.read_text() == source.read_text()
     saved = pool.Pool.load(config.POOL)
     assert "champion_1" in saved.names() and saved.weights["b"] > saved.weights["a"]
-    assert "champion_1" in (tmp_path / "epochs.jsonl").read_text()
+
+
+def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two promotions leave two different programs in the pool, not two aliases.
+
+    The floor is one path that every promotion overwrites. Registering it
+    would make `champion_1` and `champion_2` both resolve to whatever was
+    promoted last, so the pool would hold N copies of the newest agent and
+    every earlier champion would be gone.
+    """
+    first = _program_and_pool(tmp_path, monkeypatch, body="PASS")
+    p = pool.Pool(
+        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
+    )
+    gate.promote(first, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False)
+
+    second = _program_and_pool(tmp_path, monkeypatch, body="WATER")
+    reloaded = pool.Pool.load(config.POOL)
+    gate.promote(
+        second, result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}), reloaded, commit=False
+    )
+
+    saved = pool.Pool.load(config.POOL)
+    one, two = saved.opponents["champion_1"], saved.opponents["champion_2"]
+    assert one != two
+    assert Path(one).read_text() == Path(first.source_path).read_text()
+    assert Path(two).read_text() == Path(second.source_path).read_text()
+    floor = config.FLOOR / "main.py"
+    assert floor.read_text() == Path(second.source_path).read_text()
+
+
+def test_promote_writes_the_champion_record_before_it_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`champion.json` exists the moment promote returns; a restart trusts it."""
+    program = _program_and_pool(tmp_path, monkeypatch)
+    p = pool.Pool(
+        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
+    )
+    deep = result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5})
+
+    champion = gate.promote(program, deep, p, commit=False)
+
+    assert gate.load_champion() == champion
+    assert champion.result == deep
+    assert Path(champion.path).read_text() == Path(program.source_path).read_text()
+
+
+def test_promote_writes_no_epoch_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loop writes the epoch line; a second one from here would double-count."""
+    program = _program_and_pool(tmp_path, monkeypatch)
+    p = pool.Pool(
+        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
+    )
+
+    gate.promote(
+        program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False
+    )
+
+    assert not config.EPOCHS.exists()
 
 
 def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
@@ -138,13 +208,13 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
         program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False
     )
     reloaded = pool.Pool.load(config.POOL)
-    name = gate.promote(
+    champion = gate.promote(
         program,
         result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}),
         reloaded,
         commit=False,
     )
-    assert name == "champion_2"
+    assert champion.name == "champion_2"
 
 
 def test_a_failed_commit_is_logged_and_never_undoes_the_promotion(
@@ -161,10 +231,10 @@ def test_a_failed_commit_is_logged_and_never_undoes_the_promotion(
 
     monkeypatch.setattr(gate.subprocess, "run", failing_run)
     with caplog.at_level(logging.WARNING):
-        name = gate.promote(
+        champion = gate.promote(
             program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=True
         )
-    assert name == "champion_1"
+    assert champion.name == "champion_1"
     floor = config.FLOOR / "main.py"
     assert (floor.stat().st_mode & 0o777) == 0o444
     saved = pool.Pool.load(config.POOL)

@@ -17,15 +17,27 @@ that loads the module the way Kaggle's runner does, because a decorator or
 a conditional definition can rebind the last name in ways no AST walk
 sees. Only once every one of those clears does a candidate earn ~20s of
 reference-engine time in `harness.check`.
+
+That dynamic half -- the load and the reference-engine run -- happens in a
+child process with a wall-clock cap. Loading a module runs its top-level
+code, so a candidate with an unbounded loop outside any function would
+otherwise wedge the validating thread, and through it the island it was
+mutating, for the life of the run. The child also works from a scratch
+directory, because loading a candidate is running it.
 """
 
 import ast
+import multiprocessing
+import os
+import queue
+import tempfile
+from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import copycheck, harness
+from kaggriculture.campaign import config, copycheck, harness
 
 ALLOWED_IMPORTS: frozenset[str] = frozenset(
     {
@@ -165,15 +177,13 @@ def _forbidden_call(tree: ast.Module) -> str | None:
     return None
 
 
-def _shadowed_entrypoint(tree: ast.Module, agent: Path) -> Verdict | None:
-    """Whether something other than `agent` is the callable Kaggle would run.
+def _shadowed_entrypoint(tree: ast.Module) -> Verdict | None:
+    """Whether something other than `agent` is the last top-level definition.
 
-    Checked twice: syntactically, over top-level definitions; then
-    dynamically, against the loaded module's actual namespace -- a
-    decorator or a conditional definition can rebind the last name in ways
-    no AST walk sees. A load failure at the dynamic layer is exactly what
-    `harness.check` would report as `crashed` a moment later, so it is
-    reported the same way here.
+    The syntactic half of the rule. The dynamic half -- against the loaded
+    module's actual namespace, where a decorator or a conditional definition
+    can rebind the last name in ways no AST walk sees -- is `_dynamic`, which
+    runs in the child process because it has to load the file to look.
     """
     last_name = _last_top_level_callable_name(tree)
     if last_name != "agent":
@@ -181,6 +191,24 @@ def _shadowed_entrypoint(tree: ast.Module, agent: Path) -> Verdict | None:
             status="contract",
             reason=f"agent is shadowed by {last_name!r}, the last top-level definition",
         )
+    return None
+
+
+def _dynamic(agent: Path, steps: int) -> Verdict:
+    """Load the candidate as Kaggle does, then play it on the reference engine.
+
+    Everything here executes the candidate's own code, which is why the caller
+    runs it in a child process under a timeout. A load failure is exactly what
+    `harness.check` would report as `crashed` a moment later, so it is
+    reported the same way.
+
+    Args:
+        agent: The candidate's `main.py`, already absolute.
+        steps: How many turns `harness.check` plays before stopping.
+
+    Returns:
+        The failing `Verdict`, or `status="ok"`.
+    """
     try:
         last_callable = harness.load_agent(agent)
     except Exception as error:  # noqa: BLE001 - a candidate's own failure
@@ -191,7 +219,65 @@ def _shadowed_entrypoint(tree: ast.Module, agent: Path) -> Verdict | None:
             status="contract",
             reason=f"agent is shadowed by {loaded_name!r}, the last callable",
         )
-    return None
+    report = harness.check(agent, steps=steps)
+    if not report.loaded or report.error is not None:
+        return Verdict(
+            status="crashed",
+            reason=report.error or "did not load",
+            worst_step_seconds=report.worst_step_seconds,
+        )
+    if report.worst_step_seconds > harness.LATENCY_BUDGET:
+        return Verdict(
+            status="too_slow",
+            reason=f"worst step {report.worst_step_seconds:.3f}s",
+            worst_step_seconds=report.worst_step_seconds,
+        )
+    return Verdict(status="ok", reason="", worst_step_seconds=report.worst_step_seconds)
+
+
+def _dynamic_child(agent: str, steps: int, results: "Queue[dict]") -> None:
+    """Run `_dynamic` in a scratch directory and put its verdict on ``results``.
+
+    Module-level so ``spawn`` can import it. The scratch directory is never
+    left, because the process ends with this call.
+
+    Args:
+        agent: The candidate's `main.py` as an absolute path string.
+        steps: How many turns `harness.check` plays before stopping.
+        results: Where the verdict goes, as a plain dict.
+    """
+    with tempfile.TemporaryDirectory(prefix="campaign-check-") as scratch:
+        os.chdir(scratch)
+        results.put(_dynamic(Path(agent), steps).model_dump())
+
+
+def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
+    """`_dynamic` in a child process, capped at ``config.CHECK_TIMEOUT_SECONDS``.
+
+    Args:
+        agent: The candidate's `main.py`.
+        steps: How many turns `harness.check` plays before stopping.
+
+    Returns:
+        The child's verdict, or `too_slow` if it did not finish in time.
+    """
+    context = multiprocessing.get_context("spawn")
+    results: "Queue[dict]" = context.Queue()
+    process = context.Process(
+        target=_dynamic_child, args=(str(agent.resolve()), steps, results)
+    )
+    process.start()
+    try:
+        payload = results.get(timeout=config.CHECK_TIMEOUT_SECONDS)
+    except queue.Empty:
+        process.kill()
+        process.join()
+        return Verdict(
+            status="too_slow",
+            reason=f"check exceeded {config.CHECK_TIMEOUT_SECONDS}s",
+        )
+    process.join()
+    return Verdict.model_validate(payload)
 
 
 def validate(agent: Path, steps: int = 720) -> Verdict:
@@ -240,21 +326,8 @@ def validate(agent: Path, steps: int = 720) -> Verdict:
     # games -- see roster "v56", whose last callable is not named ``agent``
     # on purpose -- would otherwise report the wrong reason for the same
     # rejected file.
-    shadowed = _shadowed_entrypoint(tree, agent)
+    shadowed = _shadowed_entrypoint(tree)
     if shadowed is not None:
         return shadowed
 
-    report = harness.check(agent, steps=steps)
-    if not report.loaded or report.error is not None:
-        return Verdict(
-            status="crashed",
-            reason=report.error or "did not load",
-            worst_step_seconds=report.worst_step_seconds,
-        )
-    if report.worst_step_seconds > harness.LATENCY_BUDGET:
-        return Verdict(
-            status="too_slow",
-            reason=f"worst step {report.worst_step_seconds:.3f}s",
-            worst_step_seconds=report.worst_step_seconds,
-        )
-    return Verdict(status="ok", reason="", worst_step_seconds=report.worst_step_seconds)
+    return _dynamic_verdict(agent, steps)

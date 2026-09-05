@@ -51,7 +51,9 @@ uv run --project {project} campaign play child.py --vs NAME... --seeds A-B --wor
 - `campaign check child.py` — loads the file as Kaggle does and plays one
   episode against itself; reports the worst per-step latency (budget 0.5 s).
 - `campaign play child.py --vs NAME... --seeds A-B --workers N` — plays the
-  named opponents on the engine, both seats, at most 16 games. Opponent
+  named opponents on the engine, both seats. Opponents x seeds x 2 seats may
+  not exceed 16 games and `--workers` may not exceed 8; the command refuses
+  anything larger, because the rest of the box is running the loop. Opponent
   names are those in feedback.md. Seeds are your choice; the evaluator uses
   others.
 

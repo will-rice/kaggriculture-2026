@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from kaggle_environments.agent import get_last_callable
 
+from kaggriculture.campaign import harness
 from kaggriculture.scripts.package import (
     ENTRYPOINT,
     _refuse_a_shadowed_entrypoint,
@@ -19,14 +20,18 @@ def test_entrypoint_exposes_the_agent_last() -> None:
     The invariant is about position, not identity -- appending a helper below
     the import silently ships that helper as the agent, and the episode fails
     on turn zero with no clue why. So this compares the last callable against
-    whatever ``main`` binds to ``agent``, and stays true whichever agent we
-    serve.
+    whatever the served file binds to ``agent``, and stays true whichever
+    agent we serve, including one the gate wrote. Identity is checked by the
+    build guard, which execs the file once and compares objects; here the
+    same file is put through Kaggle's own loader, which execs it again, so
+    only the name survives to be compared.
     """
     source = ENTRYPOINT.read_text()
-    namespace: dict[str, object] = {}
-    exec(compile(source, str(ENTRYPOINT), "exec"), namespace)
 
-    assert get_last_callable(source, path=str(ENTRYPOINT)) is namespace["agent"]
+    last = get_last_callable(source, path=str(ENTRYPOINT))
+
+    assert getattr(last, "__name__", None) == "agent"
+    _refuse_a_shadowed_entrypoint(ENTRYPOINT)
 
 
 def archive_names(tmp_path: Path) -> list[str]:
@@ -35,16 +40,21 @@ def archive_names(tmp_path: Path) -> list[str]:
         return tar.getnames()
 
 
-def test_archive_holds_the_entrypoint_beside_the_package(tmp_path: Path) -> None:
+def test_archive_holds_the_entrypoint_the_engine_and_the_package(
+    tmp_path: Path,
+) -> None:
     """Kaggle imports main.py from the archive root with the package alongside."""
     names = archive_names(tmp_path)
 
     assert len(names) == len(set(names))
     assert "main.py" in names
-    assert "kaggriculture/served/main.py" in names
-    assert "kaggriculture/constants.py" in names
+    assert "kaggriculture_engine.so" in names
+    assert "NOTICE" in names
+    for module in harness.PACKAGE_MODULES:
+        assert names.count(f"kaggriculture/{module}") == 1
     assert not any(name.startswith("kaggriculture/scripts") for name in names)
     assert not any(name.startswith("kaggriculture/campaign") for name in names)
+    assert not any(name.startswith("kaggriculture/served") for name in names)
     assert not any("__pycache__" in name for name in names)
 
 
@@ -52,10 +62,11 @@ def test_the_build_refuses_a_shadowed_entrypoint(tmp_path: Path) -> None:
     """A broken entrypoint must not be able to become an archive.
 
     The positional invariant above is also enforced at build time, because
-    `main.py` is edited by automation -- a subagent decoding a public kernel
-    clobbered it once by executing a notebook cell. A test reports the damage
-    after the fact; a build that refuses means the broken archive never exists
-    to be uploaded, which is the difference between noticing and being safe.
+    `main.py` is written by automation -- the gate overwrites it on every
+    promotion, and a subagent decoding a public kernel clobbered it once by
+    executing a notebook cell. A test reports the damage after the fact; a
+    build that refuses means the broken archive never exists to be uploaded,
+    which is the difference between noticing and being safe.
     """
     entrypoint = tmp_path / "main.py"
     entrypoint.write_text(

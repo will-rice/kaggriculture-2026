@@ -45,8 +45,23 @@ class Pool(BaseModel):
         return list(self.opponents)
 
     def weighted(self, rates: dict[str, float]) -> float:
-        """Pool-weighted win rate over the opponents present in ``rates``."""
-        return sum(self.weights[n] * rates[n] for n in self.opponents if n in rates)
+        """Pool-weighted win rate over every pool opponent.
+
+        Args:
+            rates: Win rate per opponent name.
+
+        Returns:
+            The weight-dot-rate sum over the whole pool.
+
+        Raises:
+            KeyError: ``rates`` omits a pool member. Skipping it would return
+                a partial sum that reads as a low score rather than as the
+                missing measurement it is.
+        """
+        missing = [n for n in self.opponents if n not in rates]
+        if missing:
+            raise KeyError(f"no rate for pool opponent(s): {', '.join(missing)}")
+        return sum(self.weights[n] * rates[n] for n in self.opponents)
 
     def weakest(self, rates: dict[str, float]) -> str:
         """The pool opponent with the lowest rate in ``rates``."""
@@ -89,7 +104,17 @@ class Pool(BaseModel):
         return retired
 
     def apply_weakness_pressure(self, name: str) -> None:
-        """Double ``name``'s weight up to ``WEAKNESS_CAP``, scaling the rest down."""
+        """Double ``name``'s weight up to ``WEAKNESS_CAP``, scaling the rest down.
+
+        Args:
+            name: The opponent to weight up.
+
+        Raises:
+            ValueError: The pool holds one opponent, whose weight is already
+                the whole of it; there is nothing to scale down.
+        """
+        if len(self.weights) < 2:
+            raise ValueError("weakness pressure needs a pool of at least two")
         old = self.weights[name]
         new = min(old * 2, config.WEAKNESS_CAP)
         scale = (1.0 - new) / (1.0 - old)

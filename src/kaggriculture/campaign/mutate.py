@@ -139,8 +139,16 @@ class CodexMutator:
             try:
                 _, stderr = process.communicate(input=prompt, timeout=self.timeout)
             except subprocess.TimeoutExpired:
-                pgid = os.getpgid(process.pid)
-                os.killpg(pgid, signal.SIGKILL)
+                # The process can exit between the timeout firing and this
+                # lookup, and a reaped pid has no process group: that is a
+                # call that finished too late to count, not a kill that
+                # failed, so it is recorded as the timeout it is.
+                try:
+                    pgid: int | None = os.getpgid(process.pid)
+                except ProcessLookupError:
+                    pgid = None
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
                 process.wait()
                 LOGGER.warning(
                     "codex call for %s timed out after %ss, killed pgid %s",

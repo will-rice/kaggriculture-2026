@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-from kaggriculture.campaign import roster, validate
+import pytest
+
+from kaggriculture.campaign import config, roster, validate
 
 GOOD = """
 import math
@@ -16,6 +18,30 @@ SLOW_AGENT = """
 import time
 def agent(o, c=None):
     time.sleep(0.6)
+    return {'farmer': ['PASS'], 'hands': [], 'market': []}
+"""
+
+# Loading a module runs its top-level code. Nothing about this file is
+# syntactically wrong and `agent` is still the last callable defined, so every
+# static check passes and the wedge only shows up when the file is loaded.
+WEDGING_AGENT = """
+def agent(o, c=None):
+    return {'farmer': ['PASS'], 'hands': [], 'market': []}
+
+
+while True:
+    pass
+"""
+
+# The candidate writes at import time, where a scratch cwd is the only thing
+# between it and the caller's working directory.
+WRITING_AGENT = """
+from pathlib import Path
+
+Path('scribble.txt').write_text('x', encoding='utf-8')
+
+
+def agent(o, c=None):
     return {'farmer': ['PASS'], 'hands': [], 'market': []}
 """
 
@@ -123,3 +149,32 @@ def test_too_slow(tmp_path: Path) -> None:
     """An agent slower than the latency budget is `too_slow`, not `ok`."""
     verdict = validate.validate(write(tmp_path, SLOW_AGENT), steps=3)
     assert verdict.status == "too_slow"
+
+
+def test_a_candidate_that_never_finishes_loading_is_too_slow_not_a_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unbounded loop at module level must cost the cap, not the run.
+
+    The load happens in a child process precisely so this file cannot wedge
+    the thread validating it -- and through that thread, the island it was
+    mutating -- for as long as the campaign runs.
+    """
+    monkeypatch.setattr(config, "CHECK_TIMEOUT_SECONDS", 5)
+
+    verdict = validate.validate(write(tmp_path, WEDGING_AGENT))
+
+    assert verdict.status == "too_slow" and "exceeded" in verdict.reason
+
+
+def test_what_a_candidate_writes_while_loading_lands_in_a_scratch_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loading a candidate runs it, so validation is an execution path too."""
+    agent = write(tmp_path, WRITING_AGENT)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+
+    assert validate.validate(agent, steps=3).status == "ok"
+    assert list(workspace.iterdir()) == []

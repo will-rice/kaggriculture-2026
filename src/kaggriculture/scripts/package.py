@@ -1,25 +1,25 @@
 """Build the submission tarball.
 
-Kaggle unpacks the archive into ``/kaggle_simulations/agent`` and imports
-``main.py`` from its root, so the archive holds ``main.py`` beside a flat copy of
-the ``kaggriculture`` package.
+There is one packager, and it is ``harness.package``: Kaggle unpacks the
+archive into ``/kaggle_simulations/agent`` and imports ``main.py`` from its
+root, so the archive holds the served agent as ``main.py`` beside the engine
+library, the four plumbing modules, and the attribution the library carries.
+
+This module is the command-line face of that one function. Two packagers is
+how the shipping path came to have no engine in it: the artefact
+``kaggle_image.load_test`` proves and the artefact ``uv run submit`` uploads
+have to be the same bytes, built by the same code.
 """
 
 import argparse
 import logging
-import shutil
-import tarfile
-import tempfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-PACKAGE_ROOT = REPO_ROOT / "src" / "kaggriculture"
-ENTRYPOINT = REPO_ROOT / "main.py"
-SUBMISSION = REPO_ROOT / "submission.tar.gz"
+from kaggriculture.campaign import config, harness
 
-# ``scripts`` and ``campaign`` are offline tooling -- packaging, submission and
-# the codex-driven search -- that has no place in a 4 MB agent archive.
-EXCLUDED = shutil.ignore_patterns("__pycache__", "scripts", "campaign")
+REPO_ROOT = config.ROOT
+ENTRYPOINT = config.SERVED
+SUBMISSION = REPO_ROOT / "submission.tar.gz"
 
 
 def main() -> None:
@@ -38,47 +38,35 @@ def main() -> None:
 def build(output: Path = SUBMISSION, *, entrypoint: Path = ENTRYPOINT) -> Path:
     """Write the submission archive and return its path.
 
-    The packaging and campaign packages are left out: they import ``argparse``,
-    the Kaggle client and codex tooling, none of which the served agent needs
-    at play time.
-
     Args:
         output: Where to write the archive.
-        entrypoint: Self-contained root ``main.py`` to stage. The default is
-            the repository's served entrypoint.
+        entrypoint: Self-contained ``main.py`` to ship at the archive root.
+            The default is the served agent, which is what the gate writes on
+            every promotion.
 
     Returns:
         ``output``, unchanged.
     """
-    with tempfile.TemporaryDirectory() as staging:
-        root = Path(staging)
-        package = root / PACKAGE_ROOT.name
-        shutil.copytree(PACKAGE_ROOT, package, ignore=EXCLUDED)
-        staged_entrypoint = root / "main.py"
-        shutil.copy(entrypoint, staged_entrypoint)
-        _refuse_a_shadowed_entrypoint(staged_entrypoint)
-        with tarfile.open(output, "w:gz") as archive:
-            for path in sorted(root.iterdir()):
-                archive.add(path, arcname=path.name)
-    return output
+    _refuse_a_shadowed_entrypoint(entrypoint)
+    return harness.package(entrypoint, output)
 
 
 def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
-    """Raise unless the last callable in the staged entrypoint is its agent.
+    """Raise unless the last callable in the entrypoint is its agent.
 
-    ``kaggle_environments`` plays whatever callable is defined last, so anything
-    appended below the agent import is served instead of the agent, and the
-    episode dies on turn zero with no useful diagnostic -- after the upload has
-    spent a submission slot and displaced an agent from the scored pair.
+    ``kaggle_environments`` plays whatever callable is defined last, so
+    anything appended below the agent is served instead of the agent, and the
+    episode dies on turn zero with no useful diagnostic -- after the upload
+    has spent a submission slot and displaced an agent from the scored pair.
 
-    Checked here rather than only in a test because this file is edited by
-    automation: a subagent decoding a public kernel already clobbered it once by
-    executing a notebook cell. A test reports the damage; a build that refuses
-    means a broken archive cannot exist to be uploaded.
+    Checked here rather than only in a test because this file is written by
+    automation: the gate overwrites it on every promotion, and a subagent
+    decoding a public kernel already clobbered it once by executing a
+    notebook cell. A test reports the damage; a build that refuses means a
+    broken archive cannot exist to be uploaded.
 
     Args:
-        entrypoint: The staged copy of ``main.py``, checked as it will ship
-            rather than as it sits in the repository.
+        entrypoint: The ``main.py`` that will ship, checked as it sits.
 
     Raises:
         RuntimeError: If the entrypoint binds no ``agent``, or if some other

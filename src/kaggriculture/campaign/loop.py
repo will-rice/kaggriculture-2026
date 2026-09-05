@@ -25,7 +25,15 @@ from typing import Literal
 from pydantic import BaseModel
 
 from kaggriculture.campaign import archive as archive_module
-from kaggriculture.campaign import config, evaluator, gate, mutate, prompt, validate
+from kaggriculture.campaign import (
+    config,
+    evaluator,
+    gate,
+    harness,
+    mutate,
+    prompt,
+    validate,
+)
 from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.mutate import Mutator
 from kaggriculture.campaign.pool import Pool
@@ -42,13 +50,18 @@ class State(BaseModel):
 
     Attributes:
         iteration: Iterations completed so far.
-        champion: The deep result of the program currently on the floor.
+        champion: The deep result of the program currently on the floor,
+            re-measured against the pool as it stands at the start of every
+            epoch rather than kept as it was at promotion.
+        champion_path: The champion's own immutable copy under
+            ``config.CHAMPIONS``, so an epoch can re-measure it.
         calls_today: Mutation calls spent on ``day``.
         day: The calendar day ``calls_today`` counts, ISO format.
     """
 
     iteration: int = 0
     champion: DeepResult | None = None
+    champion_path: str | None = None
     calls_today: int = 0
     day: str = ""
 
@@ -99,6 +112,7 @@ def run(
     concurrency: int,
     seed_agent: Path,
     rng: random.Random,
+    commit: bool = True,
 ) -> State:
     """Seed the archive if it is empty, then run ``iterations`` iterations.
 
@@ -109,6 +123,8 @@ def run(
         concurrency: Mutations in flight at once.
         seed_agent: The program every island starts from, on a cold start.
         rng: The loop's generator; every thread gets a child of it.
+        commit: Whether a promotion records itself in the repository. Tests
+            pass False so a promotion never runs a version-control command.
 
     Returns:
         The state as of the last completed iteration.
@@ -130,6 +146,16 @@ def run(
         if state_file.exists()
         else State()
     )
+    # `state.json` is written only once an iteration finishes; `champion.json`
+    # is written before `gate.promote` returns. A kill in between leaves the
+    # first stale and the second current, so the second wins -- otherwise the
+    # gate would restart with no baseline and promote a second time.
+    champion = gate.load_champion()
+    if champion is not None:
+        state = state.model_copy(
+            update={"champion": champion.result, "champion_path": champion.path}
+        )
+        LOGGER.info("resuming on champion %s from champion.json", champion.name)
     pool = Pool.load(config.POOL) if config.POOL.exists() else Pool.initial()
     # A champion's name resolves through the pool file, so the pool on disk
     # must be current before anything plays a game (`gate.promote` keeps it
@@ -143,7 +169,9 @@ def run(
             "seeded every island from %s at fast fitness %.3f", seed_agent, fitness
         )
     for _ in range(iterations):
-        state = iterate(state, archive, pool, mutator, workers, concurrency, rng)
+        state = iterate(
+            state, archive, pool, mutator, workers, concurrency, rng, commit
+        )
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(state.model_dump_json(indent=2), encoding="utf-8")
     return state
@@ -157,6 +185,7 @@ def iterate(
     workers: int,
     concurrency: int,
     rng: random.Random,
+    commit: bool = True,
 ) -> State:
     """One iteration: a mutation per island, then whatever the schedule owes.
 
@@ -168,36 +197,46 @@ def iterate(
         workers: Processes each evaluation fans its games over.
         concurrency: Mutations in flight at once.
         rng: The loop's generator; every thread gets a child of it.
+        commit: Whether a promotion records itself in the repository.
 
     Returns:
-        The advanced state.
+        The advanced state, or the state unchanged when the day's mutation
+        quota is spent: an iteration that ran no mutation left the archive
+        exactly as it found it, so advancing the counter would walk the
+        migrate/epoch/reset cadence over a population nothing touched.
     """
     today = datetime.date.today().isoformat()
     if state.day != today:
         state = state.model_copy(update={"day": today, "calls_today": 0})
     if state.calls_today >= config.DAILY_CALL_BUDGET:
-        LOGGER.warning("daily call budget spent; evaluating only")
+        LOGGER.warning("daily call budget spent; idling until it resets")
         time.sleep(QUOTA_SLEEP_SECONDS)
-    else:
-        # `random.Random` is not thread-safe, so each mutation carries its
-        # own generator, drawn from the loop's before any thread starts.
-        jobs = [
-            (island, _plan(archive, island, rng), random.Random(rng.random()))
-            for island in range(config.ISLANDS)
-        ]
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            spent = list(
-                executor.map(
-                    lambda job: _mutate(job, archive, pool, mutator, workers), jobs
-                )
+        return state
+    # `random.Random` is not thread-safe, so each mutation carries its own
+    # generator, drawn from the loop's before any thread starts. The threads
+    # share one `Archive`, which is safe only because there is exactly one job
+    # per island per iteration: every `insert` and every `record_failure` from
+    # a given thread lands in that thread's own island, so no two threads ever
+    # read or replace the same island's worst program.
+    jobs = [
+        (island, _plan(archive, island, rng), random.Random(rng.random()))
+        for island in range(config.ISLANDS)
+    ]
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        spent = list(
+            executor.map(
+                lambda job: _mutate(job, archive, pool, mutator, workers), jobs
             )
-        state = state.model_copy(update={"calls_today": state.calls_today + len(spent)})
+        )
+    state = state.model_copy(update={"calls_today": state.calls_today + len(spent)})
     iteration = state.iteration + 1
     state = state.model_copy(update={"iteration": iteration})
     if iteration % config.MIGRATION_INTERVAL == 0:
         archive.migrate()
     if iteration % config.EPOCH_INTERVAL == 0:
-        state = epoch(state, archive, pool, workers)
+        # The mutation executor has joined and nothing else is running, so the
+        # epoch gets the whole budget rather than one mutation's share of it.
+        state = epoch(state, archive, pool, config.CORE_BUDGET, commit)
     if iteration % config.RESET_INTERVAL == 0 and archive.top(1):
         archive.reset_worst_island(archive.top(1)[0])
     return state
@@ -278,6 +317,10 @@ def _mutate(
     stored = archive.store(mutation.child.read_text(encoding="utf-8"), program_id)
     try:
         result = evaluator.fast(stored, pool, rng, workers)
+    except harness.OpponentCrash:
+        # A broken opponent is not this lineage's failure and must not become
+        # its feedback; the pool is broken, so the loop halts (spec section 8).
+        raise
     except RuntimeError as error:
         archive.record_failure(island, parents, kind, f"fast: {error}")
         return
@@ -306,9 +349,20 @@ def _mutate(
 
 
 def epoch(
-    state: State, archive: archive_module.Archive, pool: Pool, workers: int
+    state: State,
+    archive: archive_module.Archive,
+    pool: Pool,
+    workers: int,
+    commit: bool = True,
 ) -> State:
     """Deep-evaluate the top K on the exam block; promote if the rule says so.
+
+    The champion is re-measured first, on the pool as it stands now. Its
+    stored result was computed against the pool as it was at its own
+    promotion -- before it joined that pool, before the weights renormalised
+    and before weakness pressure moved them -- so comparing a candidate's
+    fresh score against it would be two numbers from two different exams. One
+    extra deep evaluation per epoch buys a comparison that means something.
 
     Args:
         state: The state this epoch closes.
@@ -316,10 +370,15 @@ def epoch(
         pool: The opponents that count towards the score; a promotion
             changes it and saves it.
         workers: Processes each deep evaluation fans its games over.
+        commit: Whether a promotion records itself in the repository.
 
     Returns:
-        The state, carrying the new champion if one was promoted.
+        The state, carrying the champion's fresh score and the new champion
+        if one was promoted.
     """
+    if state.champion_path is not None:
+        baseline = evaluator.deep(Path(state.champion_path), "champion", pool, workers)
+        state = state.model_copy(update={"champion": baseline})
     measured: list[archive_module.Program] = []
     results: list[DeepResult] = []
     for program in archive.top(config.DEEP_TOP_K):
@@ -327,6 +386,10 @@ def epoch(
             results.append(
                 evaluator.deep(Path(program.source_path), program.id, pool, workers)
             )
+        except harness.OpponentCrash:
+            # Not the candidate's failure, so not its archive line: the gate
+            # halts rather than record a verdict it did not compute.
+            raise
         except RuntimeError as error:
             archive.record_failure(
                 program.island, [program.id], program.kind, f"deep: {error}"
@@ -352,8 +415,11 @@ def epoch(
         )
         if ok:
             program = next(p for p in measured if p.id == best.program_id)
-            promoted = gate.promote(program, best, pool)
-            state = state.model_copy(update={"champion": best})
+            champion = gate.promote(program, best, pool, commit=commit)
+            promoted = champion.name
+            state = state.model_copy(
+                update={"champion": champion.result, "champion_path": champion.path}
+            )
     gate.epoch_line(state.iteration, results, promoted, rho)
     return state
 

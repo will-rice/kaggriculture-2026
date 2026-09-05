@@ -126,8 +126,8 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
     Raises:
         RuntimeError: A side raised during a game. A crashed candidate is a
             failed evaluation, never a zero score, so this propagates.
-        ZeroDivisionError: The pool holds no vendored opponent, so there is no
-            field to average over.
+        ValueError: The pool holds no vendored opponent, so there is no field
+            to average over.
     """
     names = pool.names()
     opponents = names + [name for name in HELD_OUT if name not in names]
@@ -144,6 +144,8 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
     games = 2 * len(config.EXAM_SEEDS)
     intervals = {name: wilson_interval(rates[name] * games, games) for name in names}
     vendored = [name for name in VENDORED if name in names]
+    if not vendored:
+        raise ValueError("pool holds no vendored opponent; field is undefined")
     return DeepResult(
         program_id=program_id,
         score=pool.weighted(rates),

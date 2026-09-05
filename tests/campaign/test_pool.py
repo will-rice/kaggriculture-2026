@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import config, pool, roster
 
 
@@ -62,6 +64,20 @@ def test_weakest_and_weighted() -> None:
     rates = {"a": 0.9, "b": 0.2, "c": 0.5, "d": 0.7, "e": 0.6}
     assert p.weakest(rates) == "b"
     assert abs(p.weighted(rates) - 0.58) < 1e-12
+
+
+def test_weighted_refuses_to_score_a_pool_member_it_has_no_rate_for() -> None:
+    """A partial sum reads as a low score; a missing measurement is not one."""
+    p = five()
+    with pytest.raises(KeyError, match="c"):
+        p.weighted({"a": 0.9, "b": 0.2, "d": 0.7, "e": 0.6})
+
+
+def test_weakness_pressure_refuses_a_pool_of_one() -> None:
+    """One opponent already carries the whole weight; there is nothing to scale."""
+    p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
+    with pytest.raises(ValueError, match="at least two"):
+        p.apply_weakness_pressure("a")
 
 
 def test_round_trips_through_json(tmp_path: Path) -> None:

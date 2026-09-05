@@ -7,6 +7,7 @@ a harness error rather than a quietly wrong fitness.
 
 import argparse
 import logging
+import os
 import random
 import shutil
 import sys
@@ -32,9 +33,24 @@ LOGGER = logging.getLogger(__name__)
 REFERENCE_SAMPLE = 0.02
 LATENCY_BUDGET = 0.5  # half of actTimeout
 PACKAGE_MODULES = ("__init__.py", "constants.py", "observation.py", "actions.py")
+# What `campaign play` promises a sandbox in AGENTS.md, enforced on the CLI
+# only: the library function is what the evaluator calls, and it plays the
+# whole exam block.
+SANDBOX_GAME_CAP = 16
+SANDBOX_WORKER_CAP = 8
 # The framework, not the interpreter, writes these onto every seat's
 # observation at call time. The port exports neither, so `_one` injects both.
 OVERAGE_SECONDS = 60
+
+
+class OpponentCrash(RuntimeError):  # noqa: N818 - a crash, not our error
+    """An opponent, not the candidate, raised during a game.
+
+    Attributing this to the candidate would write a failure into its lineage's
+    feedback for something it did not do, and the next prompt would chase it.
+    A broken opponent is a broken pool, so the loop lets this one out (spec
+    section 8): it halts loudly rather than scoring around the hole.
+    """
 
 
 class Game(BaseModel):
@@ -50,6 +66,10 @@ class Game(BaseModel):
         error: Which side raised and what it raised, or None if the game
             finished. Names the side by roster name and the failure by type,
             because the traceback behind it names the opponent's real file.
+        culprit: "candidate" or the opponent's roster name when ``error`` is
+            set, else None. Carried as its own field rather than parsed back
+            out of ``error``, because who raised decides whether the loop
+            records a lineage failure or halts.
     """
 
     opponent: str
@@ -59,6 +79,7 @@ class Game(BaseModel):
     theirs: float
     worst_step_seconds: float
     error: str | None = None
+    culprit: str | None = None
 
 
 class CheckReport(BaseModel):
@@ -115,7 +136,20 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if args.command == "play":
         first, last = (int(part) for part in args.seeds.split("-"))
-        for game in play(args.agent, args.vs, range(first, last + 1), args.workers):
+        seeds = range(first, last + 1)
+        games = len(args.vs) * len(seeds) * 2
+        if games > SANDBOX_GAME_CAP:
+            raise SystemExit(
+                f"{games} games requested; campaign play allows at most "
+                f"{SANDBOX_GAME_CAP} (opponents x seeds x 2 seats). "
+                "The evaluator measures for real after you finish."
+            )
+        if args.workers > SANDBOX_WORKER_CAP:
+            raise SystemExit(
+                f"--workers {args.workers} exceeds the {SANDBOX_WORKER_CAP} "
+                "a sandbox may take; the rest of the box is running the loop."
+            )
+        for game in play(args.agent, args.vs, seeds, args.workers):
             LOGGER.info("%s", game.model_dump_json())
     elif args.command == "check":
         LOGGER.info("%s", check(args.agent).model_dump_json())
@@ -185,11 +219,42 @@ def _failed(
         theirs=0.0,
         worst_step_seconds=worst,
         error=f"seat {player} ({who}) raised {type(error).__name__}",
+        culprit=who,
     )
 
 
 def _one(work: tuple[str, str, str, int, int]) -> Game:
-    """Play one game on the engine port. Runs in a fresh process per game."""
+    """Play one game on the engine port. Runs in a fresh process per game.
+
+    Playing a candidate executes it, and a candidate is evolved source that
+    may write files, so the game runs with the working directory moved into a
+    scratch tree that is removed afterwards. This is the one place every
+    execution path -- fast, deep, and a sandbox's own ``campaign play`` --
+    passes through, so isolating here isolates all of them. Both sources are
+    resolved to absolute paths before the move, because a relative one stops
+    resolving the moment it happens, and the cwd is restored before the
+    scratch tree is removed so nothing is left standing in a deleted
+    directory.
+    """
+    agent_path, opponent_name, opponent_path, seed, seat = work
+    resolved = (
+        str(Path(agent_path).resolve()),
+        opponent_name,
+        str(Path(opponent_path).resolve()),
+        seed,
+        seat,
+    )
+    origin = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="campaign-game-") as scratch:
+        os.chdir(scratch)
+        try:
+            return _play_one(resolved)
+        finally:
+            os.chdir(origin)
+
+
+def _play_one(work: tuple[str, str, str, int, int]) -> Game:
+    """Play one game; the caller has moved to a scratch cwd and resolved the paths."""
     agent_path, opponent_name, opponent_path, seed, seat = work
     sources = [agent_path, opponent_path]
     if seat == 1:
@@ -251,8 +316,9 @@ def play(
     Raises:
         ValueError: An exam seed, or more workers than the core budget.
         KeyError: An opponent name not in the roster.
-        RuntimeError: A side raised during a game, or the reference-engine
-            sample disagreed with the port.
+        OpponentCrash: Only opponent seats raised; the pool is broken.
+        RuntimeError: The candidate raised during a game, or the
+            reference-engine sample disagreed with the port.
     """
     return _play(agent, opponents, seeds, workers, sealed=True)
 
@@ -274,8 +340,9 @@ def play_unsealed(
     Raises:
         ValueError: More workers than the core budget.
         KeyError: An opponent name not in the roster.
-        RuntimeError: A side raised during a game, or the reference-engine
-            sample disagreed with the port.
+        OpponentCrash: Only opponent seats raised; the pool is broken.
+        RuntimeError: The candidate raised during a game, or the
+            reference-engine sample disagreed with the port.
     """
     return _play(agent, opponents, seeds, workers, sealed=False)
 
@@ -305,11 +372,21 @@ def _play(
     # untouched opening money and would otherwise read as an ordinary loss,
     # which is the same rule `arena.run_banks` enforces on the reference
     # engine. `from None` because the only chained context available here is
-    # the one that names the opponent's file.
-    failures = [f"seed {game.seed}: {game.error}" for game in games if game.error]
-    if failures:
+    # the one that names the opponent's file. Which side raised decides the
+    # exception type: a candidate's crash is the candidate's failure, while a
+    # crash confined to opponent seats is a broken pool the loop must not
+    # charge to the lineage under test.
+    broken = [game for game in games if game.error]
+    failures = [f"seed {game.seed}: {game.error}" for game in broken]
+    if any(game.culprit == "candidate" for game in broken):
         raise RuntimeError(
             "agents raised during play -- " + "; ".join(failures)
+        ) from None
+    if broken:
+        culprits = sorted({game.culprit for game in broken if game.culprit})
+        raise OpponentCrash(
+            f"opponent(s) {', '.join(culprits)} raised during play -- "
+            + "; ".join(failures)
         ) from None
     _verify_sample(agent, paths, games)
     return games
@@ -391,7 +468,21 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
 
 
 def package(agent: Path, output: Path) -> Path:
-    """Write ``main.py`` + the engine library + the plumbing package into a tarball."""
+    """Write ``main.py`` + the engine library + the plumbing package into a tarball.
+
+    The only packager: ``uv run package`` and ``uv run submit`` call this too,
+    so the artefact ``kaggle_image.load_test`` proves is the artefact that
+    ships. The engine's ``NOTICE`` and the repository ``LICENSE`` ride along
+    at the root because the library in the archive is a port of Apache-2.0
+    kernel source and the attribution has to travel with the binary.
+
+    Args:
+        agent: The self-contained ``main.py`` to ship.
+        output: Where to write the tarball.
+
+    Returns:
+        ``output``, unchanged.
+    """
     from kaggriculture.campaign.engine import build
 
     library = build.build()
@@ -400,6 +491,10 @@ def package(agent: Path, output: Path) -> Path:
         root = Path(scratch)
         shutil.copy(agent, root / "main.py")
         shutil.copy(library, root / library.name)
+        shutil.copy(library.parent / "NOTICE", root / "NOTICE")
+        license_file = config.ROOT / "LICENSE"
+        if license_file.exists():
+            shutil.copy(license_file, root / "LICENSE")
         (root / "kaggriculture").mkdir()
         for module in PACKAGE_MODULES:
             shutil.copy(package_root / module, root / "kaggriculture" / module)

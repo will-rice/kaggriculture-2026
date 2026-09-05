@@ -62,6 +62,17 @@ def agent(observation, configuration=None):
     raise ZeroDivisionError("the message itself must not travel either")
 """
 
+# A candidate is evolved source, so it may write files. It must not write them
+# where the caller lives.
+WRITING_AGENT = """
+from pathlib import Path
+
+
+def agent(observation, configuration=None):
+    Path("scribble.txt").write_text("x", encoding="utf-8")
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
 
 @pytest.fixture
 def step_recording_agent(tmp_path: Path) -> Path:
@@ -152,6 +163,69 @@ def test_a_crashing_opponent_is_a_failure_that_never_names_its_file(
     assert "the message itself must not travel either" not in rendered
 
 
+def test_a_crash_confined_to_opponent_seats_is_its_own_exception(
+    pass_agent: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken opponent is a broken pool, not the candidate's failure.
+
+    The loop writes a candidate's failure into its lineage's feedback and the
+    next prompt chases it, so an opponent's crash must arrive as a different
+    exception -- one the loop does not catch.
+    """
+    hidden = tmp_path / "secret_dir"
+    hidden.mkdir()
+    (hidden / "main.py").write_text(CRASHING_AGENT, encoding="utf-8")
+    monkeypatch.setitem(roster.TRAINING, "crasher", hidden / "main.py")
+
+    with pytest.raises(harness.OpponentCrash) as caught:
+        harness.play(pass_agent, ["crasher"], [11], workers=2)
+
+    assert "crasher" in str(caught.value)
+    assert "secret_dir" not in str(caught.value)
+
+
+def test_a_crashing_candidate_is_the_candidates_own_failure(
+    tmp_path: Path,
+) -> None:
+    """The candidate raised, so the loop must be free to record it and go on."""
+    candidate = tmp_path / "main.py"
+    candidate.write_text(CRASHING_AGENT, encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as caught:
+        harness.play(candidate, ["v54"], [11], workers=2)
+
+    assert not isinstance(caught.value, harness.OpponentCrash)
+    assert "candidate" in str(caught.value)
+
+
+def test_a_candidate_writing_files_leaves_nothing_in_the_callers_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Playing a candidate runs it; every path that runs one is a scratch directory."""
+    candidate = tmp_path / "main.py"
+    candidate.write_text(WRITING_AGENT, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+
+    harness.play(candidate, ["v54"], [11], workers=2)
+
+    assert list(workspace.iterdir()) == []
+    assert Path.cwd() == workspace
+
+
+def test_play_accepts_a_relative_candidate_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scratch move happens after the paths resolve, or nothing would load."""
+    (tmp_path / "main.py").write_text(PASS_AGENT, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    games = harness.play(Path("main.py"), ["v54"], [11], workers=2)
+
+    assert all(game.error is None for game in games)
+
+
 def test_the_reference_sample_is_drawn_from_the_system_entropy_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -199,6 +273,42 @@ def test_play_caps_workers_at_the_core_budget(pass_agent: Path) -> None:
     """The box's other tenants keep the cores the budget reserves for them."""
     with pytest.raises(ValueError, match="CORE_BUDGET"):
         harness.play(pass_agent, ["v54"], [1], workers=config.CORE_BUDGET + 1)
+
+
+def test_the_cli_refuses_more_than_sixteen_games(
+    pass_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AGENTS.md promises a sandbox at most 16 games; the command keeps the promise."""
+    monkeypatch.setattr(
+        harness.sys,
+        "argv",
+        ["campaign", "play", str(pass_agent), "--vs", "v54", "--seeds", "1-9"],
+    )
+    with pytest.raises(SystemExit, match="16"):
+        harness.main()
+
+
+def test_the_cli_refuses_more_workers_than_a_sandbox_may_take(
+    pass_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rest of the box is running the loop."""
+    monkeypatch.setattr(
+        harness.sys,
+        "argv",
+        [
+            "campaign",
+            "play",
+            str(pass_agent),
+            "--vs",
+            "v54",
+            "--seeds",
+            "1-1",
+            "--workers",
+            "9",
+        ],
+    )
+    with pytest.raises(SystemExit, match="workers"):
+        harness.main()
 
 
 def test_check_loads_as_kaggle_does_and_times_steps(pass_agent: Path) -> None:

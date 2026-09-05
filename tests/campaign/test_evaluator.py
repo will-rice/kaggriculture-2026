@@ -147,3 +147,48 @@ def test_deep_lets_a_crash_propagate_and_still_restores_the_cwd(
     with pytest.raises(RuntimeError):
         evaluator.deep(agent, "prog", p, workers=4)
     assert Path.cwd() == workspace
+
+
+def test_deep_names_an_empty_field_instead_of_dividing_by_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pool of nothing but champions has no vendored field to average."""
+    agent = tmp_path / "main.py"
+    agent.write_text(PASS, encoding="utf-8")
+    monkeypatch.setattr(config, "EXAM_SEEDS", config.EXAM_SEEDS[:1])
+    monkeypatch.setattr(evaluator, "HELD_OUT", [])
+    monkeypatch.setattr(
+        field_gate,
+        "score_field",
+        lambda candidate, seeds, workers, opponents: dict.fromkeys(opponents, 0.5),
+    )
+    p = pool.Pool(
+        opponents={"champion_1": str(tmp_path / "champ.py")},
+        weights={"champion_1": 1.0},
+    )
+
+    with pytest.raises(ValueError, match="no vendored opponent"):
+        evaluator.deep(agent, "prog", p, workers=1)
+
+
+def test_fast_diverts_what_a_candidate_writes_away_from_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ranking evaluation executes candidates too, so it is isolated too."""
+    import random as random_module
+
+    agent = tmp_path / "main.py"
+    agent.write_text(WRITER, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(config, "FAST_SEEDS", 1)
+    p = pool.Pool(
+        opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")},
+        weights={"v54": 1.0},
+    )
+
+    evaluator.fast(agent, p, random_module.Random(3), workers=2)
+
+    assert list(workspace.iterdir()) == []
+    assert Path.cwd() == workspace

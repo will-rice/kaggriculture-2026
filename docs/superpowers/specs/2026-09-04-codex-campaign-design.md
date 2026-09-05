@@ -214,6 +214,20 @@ history. Initial pool: `router_v1`, `router2929`, `v54`, `v56`, `shopforge`,
 `kernel_watch` adds a new ladder kernel to the held-out set first; it enters
 the pool only by a decision recorded in `epochs.jsonl`.
 
+**Measured overlap (2026-09-04), and how to read the numbers it discounts.**
+The held-out set and the field are only as informative as they are
+independent of the pool, so both were measured:
+
+| pair                               | overlap | what it means                                                                                                                                                                        |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `indarkarhana` vs `lynnsakurai_v5` | 0.165   | the held-out opponent is close to independent of the pool opponent nearest it, so the held-out score is close to the honest generalisation number it is meant to be                  |
+| `v54` vs `v56`                     | 0.737   | the two Kaito lineages are nearly one opponent, so `field` — an equal-weighted average over the vendored lineages — counts that lineage roughly twice and is optimistic by that much |
+
+No roster change follows from this now: a replacement held-out opponent needs
+a fresh `kernel_watch` find, which is a follow-up rather than a blocker. The
+numbers are recorded here and in `roster.py`'s docstring so nobody reads
+`field` as six independent opponents.
+
 ### 5.7 Shipping
 
 Manual. Two scored slots, two lineages (ours and the vendored hedge, per the

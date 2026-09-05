@@ -115,9 +115,23 @@ def test_runtime_paths_live_under_run_campaign() -> None:
         config.ARCHIVE,
         config.PROGRAMS,
         config.SANDBOXES,
-        config.POOL,
         config.EPOCHS,
         config.FLOOR,
+        config.CHAMPIONS,
+        config.CHAMPION,
         config.CALLS,
     ):
         assert config.RUN in path.parents
+
+
+def test_the_pool_file_is_not_a_sibling_of_the_sandboxes() -> None:
+    """The one file listing opponent paths lives away from the codex sandboxes."""
+    assert config.RUN not in config.POOL.parents
+    assert config.SANDBOXES not in config.POOL.parents
+    assert config.POOL == config.OPPONENTS.parent / "campaign" / "pool.json"
+
+
+def test_each_champion_keeps_its_own_file_apart_from_the_floor() -> None:
+    """A pool of N champions must be able to hold N different programs."""
+    assert config.CHAMPIONS != config.FLOOR
+    assert config.FLOOR not in config.CHAMPIONS.parents

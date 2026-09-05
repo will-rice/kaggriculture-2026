@@ -1,7 +1,12 @@
 """Every path and constant the campaign shares.
 
-Opponent paths and the exam seeds live here and nowhere else, so the one
-place a sandbox could learn either is a module it never imports.
+Opponent paths and the exam seeds are written here and nowhere else, which
+keeps them out of the sandbox's way but does not hide them: ``codex exec -s
+workspace-write`` restricts writes, not reads, and a sandbox that walked up
+to the repository could read this module like any other file. What actually
+keeps a candidate from copying an opponent is the doctrine in the prompt and
+the copy-check gate that rejects a candidate resembling one; what this module
+buys is that the harness never has to *print* a path to do its job.
 """
 
 import os
@@ -16,6 +21,10 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
 ROOT = Path(__file__).resolve().parents[3]
 RUN = ROOT / "run" / "campaign"
 OPPONENTS = Path("/data/kaggriculture/opponents")
+# Where an opponent whose source predates the vendored drop still lives; the
+# roster names one. Both roots are stated here so no other module spells out
+# a path under /data.
+AGENTS = Path("/data/kaggriculture/agents")
 EPISODES = Path("/data/kaggriculture/episodes")
 ENGINE_LIBRARY = Path(__file__).parent / "engine" / "kaggriculture_engine.so"
 
@@ -80,11 +89,27 @@ WEAKNESS_CAP = 0.5
 CODEX_CONCURRENCY = 8
 MUTATION_TIMEOUT_SECONDS = 600
 DAILY_CALL_BUDGET = 200
+# Wall clock a candidate gets for the dynamic load plus `harness.check`, which
+# run together in a child process. Module-level code runs on load, so a
+# candidate with an unbounded loop outside any function would otherwise wedge
+# the validating thread for the life of the run.
+CHECK_TIMEOUT_SECONDS = 180
 
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
 SANDBOXES = RUN / "sandboxes"
-POOL = RUN / "pool.json"
 EPOCHS = RUN / "epochs.jsonl"
+# The current floor, the copy that ships, and every champion ever promoted.
+# `FLOOR/main.py` is overwritten each promotion; `CHAMPIONS/<name>.py` is
+# written once and is what the pool points at, so a pool of N champions holds
+# N different programs rather than N references to the newest one.
 FLOOR = RUN / "floor" / "agent"
+CHAMPIONS = RUN / "champions"
+SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
+# The promoted champion, written atomically by the gate before it returns, so
+# a kill between the promotion and the next `state.json` write cannot lose it.
+CHAMPION = RUN / "champion.json"
 CALLS = RUN / "calls.jsonl"
+# The only file that lists opponent paths, kept out of `run/campaign/` so it
+# is not a sibling of the sandboxes a codex session works in.
+POOL = OPPONENTS.parent / "campaign" / "pool.json"

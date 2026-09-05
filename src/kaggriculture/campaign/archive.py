@@ -29,8 +29,11 @@ class Program(BaseModel):
         source_path: Path to the stored source file.
         parents: Ids of the program(s) this one was derived from.
         kind: How this program was produced.
-        fitness_sum: Sum of fitness across all deep evaluations so far.
-        n_evals: Number of deep evaluations contributing to `fitness_sum`.
+        fitness_sum: Sum of the fast-evaluation fitnesses recorded for this
+            program. A program is inserted with one, and nothing re-evaluates
+            it, so in practice this is that single number.
+        n_evals: How many fitnesses contribute to `fitness_sum`; also the
+            visit count UCB reads.
         status: Free-form status ("ok", "failed", ...).
         reason: Free-form explanation, e.g. a failure reason.
         created: Unix timestamp of creation.
@@ -52,7 +55,7 @@ class Program(BaseModel):
 
     @property
     def mean(self) -> float:
-        """Mean fitness across deep evaluations, or 0.0 with none yet."""
+        """Mean fast fitness across the evaluations recorded, or 0.0 with none."""
         return self.fitness_sum / self.n_evals if self.n_evals else 0.0
 
 
@@ -98,20 +101,10 @@ class Archive:
             self._islands[program.island][program.id] = program
         elif kind == "remove":
             self._islands[event["island"]].pop(event["id"], None)
-        elif kind == "eval":
-            program = self._find(event["id"])
-            program.fitness_sum += event["fitness"]
-            program.n_evals += 1
         elif kind == "failure":
             self._failures.append(Program.model_validate(event["program"]))
         else:
             raise ValueError(f"unknown archive event: {kind!r}")
-
-    def _find(self, program_id: str) -> Program:
-        for island in self._islands:
-            if program_id in island:
-                return island[program_id]
-        raise KeyError(program_id)
 
     def island(self, i: int) -> list[Program]:
         """Return every program on island `i`."""
@@ -122,9 +115,11 @@ class Archive:
         return list(self._failures)
 
     def top(self, k: int) -> list[Program]:
-        """Return the `k` best programs across all islands by mean fitness.
+        """Return the `k` best programs across all islands by mean fast fitness.
 
-        Programs with `n_evals == 0` (never deep-evaluated) are excluded.
+        This is what the epoch deep-evaluates, so the ranking it reads is the
+        cheap one. Programs with `n_evals == 0` -- failures, which never
+        joined an island with a fitness -- are excluded.
         """
         everyone = [p for island in self._islands for p in island.values() if p.n_evals]
         return sorted(everyone, key=lambda p: p.mean, reverse=True)[:k]
@@ -179,10 +174,6 @@ class Archive:
             return worst
         self._apply({"event": "insert", "program": program.model_dump()})
         return None
-
-    def append_eval(self, program_id: str, fitness: float) -> None:
-        """Log one more deep-evaluation fitness for `program_id`."""
-        self._apply({"event": "eval", "id": program_id, "fitness": fitness})
 
     def record_failure(
         self, island: int, parents: list[str], kind: Kind, reason: str

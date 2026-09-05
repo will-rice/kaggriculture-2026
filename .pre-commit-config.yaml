@@ -13,23 +13,30 @@ repos:
       - id: prettier-format
   - repo: local
     hooks:
+      # `src/kaggriculture/served/` is written by the campaign gate, not by
+      # hand: it is evolved code, verified by the deep evaluation rather than
+      # by lint. Formatting it would rewrite the bytes the gate measured, and
+      # a type error in it would block every later human commit.
       - id: ruff-format
         name: ruff-format
         language: system
         entry: uv run ruff format
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
+        exclude: ^src/kaggriculture/served/
         pass_filenames: true
       - id: ruff
         name: ruff
         language: system
         entry: uv run ruff check --fix
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
+        exclude: ^src/kaggriculture/served/
         pass_filenames: true
       - id: ty
         name: ty
         language: system
-        entry: uv run ty check src tests main.py
+        entry: uv run ty check --exclude src/kaggriculture/served src tests main.py
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
+        exclude: ^src/kaggriculture/served/
         pass_filenames: false
       - id: pytest
         name: pytest

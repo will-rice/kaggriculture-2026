@@ -1,3 +1,5 @@
+// Adopted unmodified from the Kaggle kernel yhay81/three-day-shop-router,
+// Apache-2.0; see NOTICE.
 // CPython-compatible Mersenne Twister.
 //
 // The environment seeds `random.Random((seed * 1_000_003) ^ day)` and calls

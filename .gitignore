@@ -233,21 +233,6 @@ replays/
 wandb/
 .worktrees/
 
-# Trained weights. `train.py` writes src/kaggriculture/learn/policy.pt and
-# `package.py` copies it into the archive, so the file lives inside the package
-# tree — but it is a 40 MB build artifact of a run recorded in wandb, not
-# source, and committing it would put a binary blob in every diff.
-*.pt
-# This small, deterministic CPU control freezes the Toad optimizer boundary.
-!tests/learn/fixtures/
-!tests/learn/fixtures/toad_control_batch.pt
-
-# The prototype store, for the same reason. `routes.scripts.harvest` writes
-# src/kaggriculture/routes/prototypes.json.gz out of the 107 GB replay corpus
-# and `package.py` copies it into the archive; it is a 3.6 MiB build artifact,
-# rebuildable from the corpus, and gzip diffs are worthless anyway.
-prototypes.json.gz
-
 # Node — only the prettier plugin the pre-commit format hook resolves from here
 node_modules/
 
@@ -258,12 +243,7 @@ run/
 # every ingest. The findings that matter are written up in docs/, not here.
 data/*.db
 
-# The exported market-residual head. `market_residual_main.py` resolves it from
-# inside the package tree, because that is where a built archive puts it and the
-# loader gives the entrypoint no `__file__` of its own to work from. It is a
-# build product of a run recorded in wandb, content-addressed by the identity
-# block it carries, not source.
-src/kaggriculture/market_residual/generated/
-
-# Compiled engine bridge: rebuildable from bridge.cpp by build.build().
+# Compiled engine bridge and the scratch file build.build() lands from:
+# rebuildable from bridge.cpp, never source.
 src/kaggriculture/campaign/engine/*.so
+src/kaggriculture/campaign/engine/*.tmp

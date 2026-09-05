@@ -216,7 +216,6 @@ def test_the_log_replays_to_the_same_state(tmp_path: Path) -> None:
             created=0.0,
         )
     )
-    a.append_eval("p", 0.7)
     a.record_failure(0, ["p"], "full", "syntax")
     b = archive.Archive(
         path=tmp_path / "archive.jsonl", programs_dir=tmp_path / "programs"
@@ -224,4 +223,4 @@ def test_the_log_replays_to_the_same_state(tmp_path: Path) -> None:
     assert [p.model_dump() for p in b.island(0)] == [
         p.model_dump() for p in a.island(0)
     ]
-    assert a.island(0)[0].mean == 0.5 and b.failures()[0].reason == "syntax"
+    assert a.island(0)[0].mean == 0.3 and b.failures()[0].reason == "syntax"

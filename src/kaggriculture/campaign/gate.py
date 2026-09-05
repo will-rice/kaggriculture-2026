@@ -8,23 +8,27 @@ The promotion commit runs ``git commit --no-verify``. This repo's
 pre-commit hook runs the full pytest suite and ruff-format on every commit;
 inside the loop that would cost minutes per champion, fail on any unrelated
 test failure, and let ruff-format rewrite the codex-written ``main.py``,
-changing the bytes the gate just measured. The gate itself is the
-verification here -- the commit is only the record -- and the file gets
-linted on the next human commit that touches it.
+changing the bytes the gate just measured. Evolved code is gated, not
+linted: the deep evaluation is the whole of its verification, and
+``served/`` is excluded from the format, lint and type hooks so a champion
+whose annotations do not typecheck cannot block the next human commit.
 
-The on-disk state -- the floor, ``served/main.py``, the pool file, the
-epoch line -- is written before the commit and is the source of truth for
-promotion. A failed git record (nothing to commit, a lock file, a full
-disk) is logged and swallowed rather than raised: a promotion that already
-happened on disk must never be undone by a commit that failed to explain
-it.
+The on-disk state -- ``champions/<name>.py``, the floor, ``served/main.py``,
+``champion.json``, the pool file -- is written before the commit and is the
+source of truth for promotion. A failed git record (nothing to commit, a
+lock file, a full disk) is logged and swallowed rather than raised: a
+promotion that already happened on disk must never be undone by a commit
+that failed to explain it.
 """
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
+
+from pydantic import BaseModel
 
 from kaggriculture.campaign import config
 from kaggriculture.campaign.archive import Program
@@ -33,8 +37,27 @@ from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
 
-SERVED = config.ROOT / "src" / "kaggriculture" / "served" / "main.py"
+SERVED = config.SERVED
 FIELD_TOLERANCE = 0.02
+
+
+class Champion(BaseModel):
+    """The promoted floor, as ``config.CHAMPION`` records it.
+
+    Written before ``promote`` returns and preferred over ``state.json`` on
+    restart: ``state.json`` is written only once an iteration finishes, so a
+    kill in between would otherwise lose the champion and let the gate
+    promote a second time against no baseline.
+
+    Attributes:
+        name: The champion's pool name, e.g. "champion_3".
+        path: The immutable copy under ``config.CHAMPIONS`` the pool plays.
+        result: The deep evaluation the promotion was decided on.
+    """
+
+    name: str
+    path: str
+    result: DeepResult
 
 
 def promotion(candidate: DeepResult, champion: DeepResult | None) -> tuple[bool, str]:
@@ -79,8 +102,15 @@ def promotion(candidate: DeepResult, champion: DeepResult | None) -> tuple[bool,
 
 def promote(
     program: Program, result: DeepResult, pool: Pool, commit: bool = True
-) -> str:
-    """Write the floor, register the champion in the pool, record the epoch, commit.
+) -> Champion:
+    """Keep the champion's own copy, write the floor, update the pool, commit.
+
+    Each champion is written once to ``CHAMPIONS/<name>.py`` and it is that
+    path the pool registers, so a pool holding N champions holds N different
+    programs. ``FLOOR/main.py`` is the current floor and is overwritten every
+    promotion; registering it instead would make every pool entry an alias
+    for the newest agent and silently erase the history the pool exists to
+    keep.
 
     Args:
         program: The archive entry being promoted.
@@ -90,11 +120,16 @@ def promote(
             to skip git entirely.
 
     Returns:
-        The new champion's pool name.
+        The champion record, exactly as ``config.CHAMPION`` now holds it.
     """
     number = 1 + sum(1 for n in pool.names() if n.startswith("champion_"))
     name = f"champion_{number}"
     source = Path(program.source_path).read_text(encoding="utf-8")
+
+    config.CHAMPIONS.mkdir(parents=True, exist_ok=True)
+    champion = config.CHAMPIONS / f"{name}.py"
+    champion.write_text(source, encoding="utf-8")
+    champion.chmod(0o444)
 
     config.FLOOR.mkdir(parents=True, exist_ok=True)
     floor = config.FLOOR / "main.py"
@@ -109,11 +144,12 @@ def promote(
     # add_champion and weakness pressure change the pool in memory; save
     # immediately after so nothing between here and the save can resolve the
     # champion's name through a stale pool (Task 8 inherits this order).
-    pool.add_champion(name, str(floor), result.rates)
+    pool.add_champion(name, str(champion), result.rates)
     pool.apply_weakness_pressure(pool.weakest(result.rates))
     pool.save(config.POOL)
 
-    epoch_line(iteration=-1, results=[result], promoted=name, rho=None)
+    record = Champion(name=name, path=str(champion), result=result)
+    _write_champion(record)
 
     if commit:
         message = (
@@ -141,7 +177,29 @@ def promote(
             LOGGER.warning("promotion commit failed for %s: %s", name, stderr)
 
     LOGGER.info("promoted %s to %s", program.id, name)
-    return name
+    return record
+
+
+def _write_champion(champion: Champion) -> None:
+    """Write ``config.CHAMPION`` atomically: a temporary file, then a rename.
+
+    A reader never sees a half-written record, and the file exists in full or
+    not at all -- which is what lets ``loop.run`` trust it over ``state.json``.
+
+    Args:
+        champion: The record to write.
+    """
+    config.CHAMPION.parent.mkdir(parents=True, exist_ok=True)
+    scratch = config.CHAMPION.with_name(f"{config.CHAMPION.name}.{os.getpid()}.tmp")
+    scratch.write_text(champion.model_dump_json(indent=2), encoding="utf-8")
+    scratch.replace(config.CHAMPION)
+
+
+def load_champion() -> Champion | None:
+    """The promoted champion on disk, or None if nothing has been promoted."""
+    if not config.CHAMPION.exists():
+        return None
+    return Champion.model_validate_json(config.CHAMPION.read_text(encoding="utf-8"))
 
 
 def epoch_line(
@@ -150,8 +208,7 @@ def epoch_line(
     """Append one epoch record to ``config.EPOCHS``.
 
     Args:
-        iteration: The loop iteration this epoch closes, or -1 for a
-            promotion recorded outside the epoch cadence.
+        iteration: The loop iteration this epoch closes.
         results: The deep results measured this epoch.
         promoted: The name of the champion promoted this epoch, or None.
         rho: Correlation between fast and deep scores this epoch, or None.
