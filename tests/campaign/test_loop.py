@@ -251,53 +251,37 @@ def test_four_sessions_run_at_once_rather_than_one_after_another(
 
 
 def test_an_epoch_never_stops_the_dispatcher(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    log: wandb.Run,
-    records: list[tuple[float, dict]],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """Sessions keep starting and calls keep completing while an epoch runs.
+    """A call completes while the epoch a previous call started is still running.
 
-    The epoch is created inside the completion step of the call that crossed
-    the interval, so that call's record is the moment it began, and its own
-    record is the moment it ended. What an epoch could not do under the old
-    barrier -- where it ran to completion on the one thread that dispatches
-    -- is let a new codex session start while it works. Sessions started
-    after that first record are exactly that, and they are why the crossings
-    that follow find the epoch still running and are skipped.
+    Under the old barrier the epoch ran to completion on the one thread that
+    dispatches, so no call could finish while one was in flight. Here the
+    budget holds one evaluation, so the two calls' children are scored one
+    after the other and the epoch the first call starts has to queue behind
+    the second -- which means the second call is still finishing, and logging
+    its record, with that epoch in flight. Nothing is timed: the ordering is
+    the core counter's, and it is the same on any box.
     """
-    tiny_run(tmp_path, monkeypatch)
-    pass_pool(tmp_path)
-    starts = tmp_path / "starts"
-    monkeypatch.setattr(
-        mutate.CodexMutator,
-        "COMMAND",
-        ["bash", "-c", f"date +%s.%N >> {starts}; sleep 1; cp parent.py child.py"],
-    )
+    campaign = _campaign(tmp_path / "loop", monkeypatch, log, PERMIT_WORKERS, 2)
+    monkeypatch.setattr(config, "EPOCH_INTERVAL", 1)
+    running: list[bool] = []
 
-    state = loop.run(
-        calls=6,
-        mutator=mutate.CodexMutator(timeout=30),
-        workers=WORKERS,
-        concurrency=1,
-        seed_agent=_write(tmp_path / "seed.py", PASS),
-        rng=random.Random(0),
-        log=log,
-        commit=False,
-    )
+    def note(record: dict) -> None:
+        """Note whether an epoch was in flight as this call's record was logged."""
+        if "calls/ok" not in record:
+            return
+        task = campaign.epoch_task
+        running.append(task is not None and not task.done())
 
-    assert state.calls == 6
-    calls = calls_of(records)
-    epochs = epochs_of(records)
-    assert [record["calls"] for _, record in calls] == [1, 2, 3, 4, 5, 6]
-    # A session's `date` and the record's stamp are both wall clock.
-    began = [float(line) for line in starts.read_text().split()]
-    launched, finished = calls[0][0], epochs[0][0]
-    assert len(began) == 6
-    assert any(launched < start < finished for start in began)
-    # Six crossings, and the epoch the first one started was still running
-    # for at least one of them.
-    assert 1 <= len(epochs) < 6
+    monkeypatch.setattr(log, "log", note)
+
+    asyncio.run(campaign.work(2))
+
+    # The first call is what starts the epoch, and its record is written
+    # before the schedule runs; the second finishes with that epoch alive.
+    assert running == [False, True]
+    assert campaign.state.calls == 2
 
 
 def test_a_spent_daily_budget_parks_dispatch_until_the_day_rolls_over(
@@ -384,6 +368,10 @@ def test_a_provider_failure_is_not_the_lineages_failure(
     assert [r["calls/fallback"] for _, r in calls_of(records)] == [1]
 
 
+@pytest.mark.skipif(
+    config.CORE_BUDGET < 2 * WORKERS,
+    reason="two sessions in flight need two evaluations' worth of cores",
+)
 def test_a_broken_pool_opponent_stops_the_run_and_takes_the_sessions_with_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -777,6 +765,10 @@ def _campaign(
 
 
 @pytest.mark.local_data
+@pytest.mark.skipif(
+    config.CORE_BUDGET < 2 * WORKERS,
+    reason="two sessions in flight need two evaluations' worth of cores",
+)
 def test_four_calls_against_a_vendored_opponent_fill_the_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
