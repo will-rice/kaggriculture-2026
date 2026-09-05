@@ -21,9 +21,14 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as engine_modul
 
 from kaggriculture.campaign import config
 
-logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
 
 TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
+
+# A program id becomes a directory name under config.SANDBOXES; it must be a
+# single path segment so a crafted id (e.g. "..") can never resolve outside
+# the sandboxes directory before it is rmtree'd.
+_PROGRAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # Matches the fenced ```bash block containing `uv run --project` and the
 # "Valid measured opponents" sentence that follows it, however it is spaced.
@@ -144,6 +149,27 @@ def _feedback_lines(
     return lines
 
 
+def _sandbox_path(program_id: str) -> Path:
+    """Resolve ``program_id`` to a directory directly under ``config.SANDBOXES``.
+
+    Args:
+        program_id: The child program id.
+
+    Returns:
+        ``config.SANDBOXES / program_id``.
+
+    Raises:
+        ValueError: If ``program_id`` is not a single safe path segment, or
+            resolves outside ``config.SANDBOXES`` (e.g. ``".."``).
+    """
+    if not _PROGRAM_ID_RE.fullmatch(program_id):
+        raise ValueError(f"unsafe program_id: {program_id!r}")
+    box = config.SANDBOXES / program_id
+    if box.resolve().parent != config.SANDBOXES.resolve():
+        raise ValueError(f"unsafe program_id: {program_id!r}")
+    return box
+
+
 def build_sandbox(
     program_id: str,
     kind: Literal["full", "cross"],
@@ -170,8 +196,12 @@ def build_sandbox(
 
     Returns:
         The path to the built sandbox directory, rebuilt clean each call.
+
+    Raises:
+        ValueError: If ``program_id`` is not a safe single path segment
+            directly under ``config.SANDBOXES``.
     """
-    box = config.SANDBOXES / program_id
+    box = _sandbox_path(program_id)
     if box.exists():
         shutil.rmtree(box)
     (box / "engine").mkdir(parents=True)
@@ -191,5 +221,5 @@ def build_sandbox(
 
     (box / "PROMPT.md").write_text(CROSS if kind == "cross" else FULL, encoding="utf-8")
 
-    logging.info("built sandbox %s (%s)", box, kind)
+    LOGGER.info("built sandbox %s (%s)", box, kind)
     return box

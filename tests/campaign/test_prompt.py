@@ -91,3 +91,39 @@ def test_agents_md_strips_the_stale_harness_block_and_rewrites_the_project_path(
     assert not re.search(r"/(?:home|data|Users|tmp)/\S*", sanitized)
     assert "Valid measured opponents" not in text
     assert "700000" not in text
+
+
+def test_full_and_cross_prompts_forbid_reading_opponent_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both mutation prompts carry the doctrine against opponent source."""
+    monkeypatch.setattr(config, "SANDBOXES", tmp_path)
+    parent = tmp_path / "p.py"
+    parent.write_text("# parent\n")
+    other = tmp_path / "q.py"
+    other.write_text("# inspiration\n")
+    forbidden = "do not read, request, or reconstruct any opponent's source"
+
+    full_box = prompt.build_sandbox("full-id", "full", parent, None, {}, "", {}, [])
+    assert forbidden in (full_box / "PROMPT.md").read_text().lower()
+
+    cross_box = prompt.build_sandbox("cross-id", "cross", parent, other, {}, "", {}, [])
+    assert forbidden in (cross_box / "PROMPT.md").read_text().lower()
+
+
+def test_program_id_path_traversal_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crafted program_id can never resolve outside the sandboxes directory."""
+    monkeypatch.setattr(config, "SANDBOXES", tmp_path)
+    parent = tmp_path / "p.py"
+    parent.write_text("# parent\n")
+    sentinel = tmp_path.parent / "sentinel-must-survive.txt"
+    sentinel.write_text("still here\n")
+    try:
+        for bad_id in ("..", "../x", "a/b", ""):
+            with pytest.raises(ValueError):
+                prompt.build_sandbox(bad_id, "full", parent, None, {}, "", {}, [])
+        assert sentinel.read_text() == "still here\n"
+    finally:
+        sentinel.unlink(missing_ok=True)
