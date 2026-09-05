@@ -17,6 +17,7 @@ dependencies = [
   "ruff>=0.9.7",
   "tqdm>=4.70.0",
   "ty>=0.0.18",
+  "wandb>=0.29.0",
 ]
 
 [build-system]

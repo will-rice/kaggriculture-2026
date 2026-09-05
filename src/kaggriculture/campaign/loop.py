@@ -2,9 +2,10 @@
 
 One iteration is one mutation per island, run in parallel; migration, the
 deep-evaluation epoch and the island reset happen on their own intervals.
-Everything a run remembers is on disk -- the archive log, the pool, the
-epoch lines, ``state.json`` beside the archive -- so a killed run resumes
-where it stopped.
+Everything a run remembers is on disk -- the archive log, the pool,
+``champion.json`` and ``state.json`` beside the archive -- so a killed run
+resumes where it stopped. Metrics go to wandb, one run per campaign, keyed
+by ``iteration`` so a resumed loop continues the same curves.
 
 Every evaluation forks a process pool (spawn, because the harness caps
 tasks per child), so every caller of ``run`` must sit behind an
@@ -22,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
+import wandb
 from pydantic import BaseModel
 
 from kaggriculture.campaign import archive as archive_module
@@ -35,7 +37,7 @@ from kaggriculture.campaign import (
     validate,
 )
 from kaggriculture.campaign.evaluator import DeepResult
-from kaggriculture.campaign.mutate import Mutator
+from kaggriculture.campaign.mutate import Mutation, Mutator
 from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +45,26 @@ LOGGER = logging.getLogger(__name__)
 # Seconds to idle for once the day's codex quota is spent. Without it the
 # loop would spin through iterations at no cost but full CPU until midnight.
 QUOTA_SLEEP_SECONDS = 60
+
+# What the wandb run records as its configuration.
+HYPERPARAMETERS = (
+    "ISLANDS",
+    "ISLAND_SIZE",
+    "MIGRATION_INTERVAL",
+    "MIGRANTS",
+    "RESET_INTERVAL",
+    "UCB_C",
+    "CROSS_PROBABILITY",
+    "FAST_SEEDS",
+    "EPOCH_INTERVAL",
+    "DEEP_TOP_K",
+    "CHAMPION_WEIGHT",
+    "POOL_CAP",
+    "RETIRE_THRESHOLD",
+    "WEAKNESS_CAP",
+    "CODEX_CONCURRENCY",
+    "DAILY_CALL_BUDGET",
+)
 
 
 class State(BaseModel):
@@ -95,14 +117,30 @@ def main(argv: list[str] | None = None) -> None:
         if args.dry_run
         else mutate.CodexMutator()
     )
-    run(
-        args.iterations,
-        mutator,
-        args.workers,
-        args.concurrency,
-        args.seed_agent,
-        random.Random(),
+    # A dry run proves the pipeline; its numbers would only pollute the
+    # campaign's run.
+    log = wandb.init(
+        entity=config.WANDB_ENTITY,
+        project=config.WANDB_PROJECT,
+        id=config.WANDB_RUN_ID,
+        resume="allow",
+        mode="disabled" if args.dry_run else "online",
+        config={name: getattr(config, name) for name in HYPERPARAMETERS},
     )
+    log.define_metric("iteration")
+    log.define_metric("*", step_metric="iteration")
+    try:
+        run(
+            args.iterations,
+            mutator,
+            args.workers,
+            args.concurrency,
+            args.seed_agent,
+            random.Random(),
+            log,
+        )
+    finally:
+        log.finish()
 
 
 def run(
@@ -112,6 +150,7 @@ def run(
     concurrency: int,
     seed_agent: Path,
     rng: random.Random,
+    log: wandb.Run,
     commit: bool = True,
 ) -> State:
     """Seed the archive if it is empty, then run ``iterations`` iterations.
@@ -123,6 +162,8 @@ def run(
         concurrency: Mutations in flight at once.
         seed_agent: The program every island starts from, on a cold start.
         rng: The loop's generator; every thread gets a child of it.
+        log: The wandb run metrics go to; ``wandb.init(mode="disabled")``
+            where nothing should be recorded.
         commit: Whether a promotion records itself in the repository. Tests
             pass False so a promotion never runs a version-control command.
 
@@ -170,7 +211,7 @@ def run(
         )
     for _ in range(iterations):
         state = iterate(
-            state, archive, pool, mutator, workers, concurrency, rng, commit
+            state, archive, pool, mutator, workers, concurrency, rng, log, commit
         )
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(state.model_dump_json(indent=2), encoding="utf-8")
@@ -185,6 +226,7 @@ def iterate(
     workers: int,
     concurrency: int,
     rng: random.Random,
+    log: wandb.Run,
     commit: bool = True,
 ) -> State:
     """One iteration: a mutation per island, then whatever the schedule owes.
@@ -197,6 +239,7 @@ def iterate(
         workers: Processes each evaluation fans its games over.
         concurrency: Mutations in flight at once.
         rng: The loop's generator; every thread gets a child of it.
+        log: The wandb run metrics go to.
         commit: Whether a promotion records itself in the repository.
 
     Returns:
@@ -223,23 +266,64 @@ def iterate(
         for island in range(config.ISLANDS)
     ]
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        spent = list(
+        outcomes = list(
             executor.map(
                 lambda job: _mutate(job, archive, pool, mutator, workers), jobs
             )
         )
-    state = state.model_copy(update={"calls_today": state.calls_today + len(spent)})
+    state = state.model_copy(update={"calls_today": state.calls_today + len(outcomes)})
     iteration = state.iteration + 1
     state = state.model_copy(update={"iteration": iteration})
+    log.log(_iteration_record(iteration, state, outcomes, archive))
     if iteration % config.MIGRATION_INTERVAL == 0:
         archive.migrate()
     if iteration % config.EPOCH_INTERVAL == 0:
         # The mutation executor has joined and nothing else is running, so the
         # epoch gets the whole budget rather than one mutation's share of it.
-        state = epoch(state, archive, pool, config.CORE_BUDGET, commit)
+        state = epoch(state, archive, pool, config.CORE_BUDGET, log, commit)
     if iteration % config.RESET_INTERVAL == 0 and archive.top(1):
         archive.reset_worst_island(archive.top(1)[0])
     return state
+
+
+def _iteration_record(
+    iteration: int,
+    state: State,
+    outcomes: list[tuple[Mutation, float | None]],
+    archive: archive_module.Archive,
+) -> dict[str, float | int]:
+    """What one iteration cost and what it put in the archive.
+
+    Args:
+        iteration: The iteration just completed.
+        state: The state as of that iteration.
+        outcomes: Each island's mutation and its child's fast fitness, or
+            None where no child reached evaluation.
+        archive: The population after the iteration's inserts.
+
+    Returns:
+        The metrics for ``wandb.Run.log``, keyed by ``iteration``.
+    """
+    mutations = [mutation for mutation, _ in outcomes]
+    fitnesses = [fitness for _, fitness in outcomes if fitness is not None]
+    ok = sum(mutation.status == "ok" for mutation in mutations)
+    record: dict[str, float | int] = {
+        "iteration": iteration,
+        "calls/ok": ok,
+        "calls/failed": len(mutations) - ok,
+        "calls/input_tokens": sum(m.input_tokens for m in mutations),
+        "calls/output_tokens": sum(m.output_tokens for m in mutations),
+        "calls/seconds": sum(m.seconds for m in mutations) / len(mutations),
+        "calls/today": state.calls_today,
+        "fast/evaluated": len(fitnesses),
+        "archive/programs": sum(len(archive.island(i)) for i in range(config.ISLANDS)),
+    }
+    if fitnesses:
+        record["fast/best_child"] = max(fitnesses)
+    top = archive.top(1)
+    if top:
+        record["archive/top"] = top[0].mean
+    return record
 
 
 def _plan(
@@ -270,7 +354,7 @@ def _mutate(
     pool: Pool,
     mutator: Mutator,
     workers: int,
-) -> None:
+) -> tuple[Mutation, float | None]:
     """Mutate, validate, fast-evaluate and insert one child. Runs in a thread.
 
     Every way this can end short of an insert is recorded on the archive as
@@ -286,6 +370,10 @@ def _mutate(
         pool: The opponents the child is measured against.
         mutator: What turns the sandbox into a child program.
         workers: Processes the fast evaluation fans its games over.
+
+    Returns:
+        The mutation and the child's fast fitness, or None where the child
+        never reached evaluation.
     """
     island, (kind, parent, inspiration), rng = job
     program_id = f"i{island}-{int(rng.random() * 1e9):09d}"
@@ -301,19 +389,18 @@ def _mutate(
         failures=failures,
     )
     mutation = mutator(box, program_id)
-    mutate.record(mutation)
     parents = [parent.id] + ([inspiration.id] if inspiration else [])
     if mutation.status != "ok" or mutation.child is None:
         archive.record_failure(
             island, parents, kind, f"{mutation.status}: {mutation.reason}"
         )
-        return
+        return mutation, None
     verdict = validate.validate(mutation.child)
     if verdict.status != "ok":
         archive.record_failure(
             island, parents, kind, f"{verdict.status}: {verdict.reason}"
         )
-        return
+        return mutation, None
     stored = archive.store(mutation.child.read_text(encoding="utf-8"), program_id)
     try:
         result = evaluator.fast(stored, pool, rng, workers)
@@ -323,7 +410,7 @@ def _mutate(
         raise
     except RuntimeError as error:
         archive.record_failure(island, parents, kind, f"fast: {error}")
-        return
+        return mutation, None
     program = archive_module.Program(
         id=program_id,
         island=island,
@@ -346,6 +433,7 @@ def _mutate(
         "dropped" if replaced is program else "inserted",
     )
     shutil.rmtree(box, ignore_errors=True)
+    return mutation, result.fitness
 
 
 def epoch(
@@ -353,6 +441,7 @@ def epoch(
     archive: archive_module.Archive,
     pool: Pool,
     workers: int,
+    log: wandb.Run,
     commit: bool = True,
 ) -> State:
     """Deep-evaluate the top K on the exam block; promote if the rule says so.
@@ -370,6 +459,8 @@ def epoch(
         pool: The opponents that count towards the score; a promotion
             changes it and saves it.
         workers: Processes each deep evaluation fans its games over.
+        log: The wandb run the epoch's scores go to; a promotion also logs
+            the champion's file as an artifact named after it.
         commit: Whether a promotion records itself in the repository.
 
     Returns:
@@ -402,8 +493,23 @@ def epoch(
         else None
     )
     best = max(results, key=lambda r: r.score, default=None)
+    record: dict[str, float | int] = {"iteration": state.iteration}
+    if state.champion is not None:
+        record["deep/champion"] = state.champion.score
+    if rho is not None:
+        record["deep/rho_fast_deep"] = rho
     promoted = None
     if best is not None:
+        record.update(
+            {
+                "deep/best": best.score,
+                "deep/best_low": best.low,
+                "deep/best_high": best.high,
+                "deep/best_field": best.field,
+                **{f"deep/rate/{name}": rate for name, rate in best.rates.items()},
+                **{f"deep/held_out/{n}": rate for n, rate in best.held_out.items()},
+            }
+        )
         ok, why = gate.promotion(best, state.champion)
         LOGGER.info(
             "epoch %d: best deep %.4f [%.4f, %.4f] -- %s",
@@ -420,7 +526,13 @@ def epoch(
             state = state.model_copy(
                 update={"champion": champion.result, "champion_path": champion.path}
             )
-    gate.epoch_line(state.iteration, results, promoted, rho)
+            artifact = wandb.Artifact(
+                champion.name, type="champion", metadata=best.model_dump()
+            )
+            artifact.add_file(champion.path)
+            log.log_artifact(artifact)
+    record["deep/promoted"] = int(promoted is not None)
+    log.log(record)
     return state
 
 

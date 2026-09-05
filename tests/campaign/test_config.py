@@ -115,11 +115,9 @@ def test_runtime_paths_live_under_run_campaign() -> None:
         config.ARCHIVE,
         config.PROGRAMS,
         config.SANDBOXES,
-        config.EPOCHS,
         config.FLOOR,
         config.CHAMPIONS,
         config.CHAMPION,
-        config.CALLS,
     ):
         assert config.RUN in path.parents
 

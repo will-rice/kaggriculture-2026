@@ -83,7 +83,6 @@ def _program_and_pool(
     monkeypatch.setattr(config, "CHAMPIONS", tmp_path / "champions")
     monkeypatch.setattr(config, "CHAMPION", tmp_path / "champion.json")
     monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
-    monkeypatch.setattr(config, "EPOCHS", tmp_path / "epochs.jsonl")
     monkeypatch.setattr(gate, "SERVED", tmp_path / "served" / "main.py")
     source = tmp_path / f"prog-{body}.py"
     source.write_text(
@@ -195,22 +194,6 @@ def test_promote_writes_the_champion_record_before_it_returns(
     assert gate.load_champion() == champion
     assert champion.result == deep
     assert Path(champion.path).read_text() == Path(program.source_path).read_text()
-
-
-def test_promote_writes_no_epoch_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The loop writes the epoch line; a second one from here would double-count."""
-    program = _program_and_pool(tmp_path, monkeypatch)
-    p = pool.Pool(
-        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
-    )
-
-    gate.promote(
-        program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False
-    )
-
-    assert not config.EPOCHS.exists()
 
 
 def test_a_second_promotion_on_the_saved_pool_yields_champion_2(

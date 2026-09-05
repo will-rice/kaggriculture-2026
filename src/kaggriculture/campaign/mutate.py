@@ -286,14 +286,3 @@ class FakeMutator:
             input_tokens=0,
             output_tokens=0,
         )
-
-
-def record(mutation: Mutation) -> None:
-    """Appends ``mutation`` as one JSON line to ``config.CALLS``.
-
-    Args:
-        mutation: The mutation outcome to record.
-    """
-    config.CALLS.parent.mkdir(parents=True, exist_ok=True)
-    with config.CALLS.open("a", encoding="utf-8") as handle:
-        handle.write(mutation.model_dump_json() + "\n")

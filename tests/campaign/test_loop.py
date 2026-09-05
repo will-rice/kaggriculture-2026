@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+import wandb
 
 from kaggriculture.campaign import archive as archive_module
 from kaggriculture.campaign import config, evaluator, gate, loop, mutate, pool
@@ -50,6 +51,32 @@ WORKERS = max(1, min(4, config.CORE_BUDGET // 2))
 CONCURRENCY = max(1, min(2, config.CORE_BUDGET // WORKERS))
 
 
+@pytest.fixture
+def records() -> list[dict]:
+    """Every metrics dict the loop hands to ``log.log``, in order."""
+    return []
+
+
+@pytest.fixture
+def log(records: list[dict], monkeypatch: pytest.MonkeyPatch) -> wandb.Run:
+    """A wandb run that records nothing, with its `log` calls kept in ``records``."""
+    run = wandb.init(mode="disabled")
+    monkeypatch.setattr(run, "log", records.append)
+    return run
+
+
+# What a mutation that never ran looks like to the iteration's record.
+_NO_CALL = mutate.Mutation(
+    program_id="none",
+    child=None,
+    status="no_output",
+    reason="stubbed",
+    seconds=0.0,
+    input_tokens=0,
+    output_tokens=0,
+)
+
+
 def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Point every runtime path at ``tmp_path`` and shrink the loop to one seed.
 
@@ -62,11 +89,9 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "ARCHIVE",
         "PROGRAMS",
         "SANDBOXES",
-        "EPOCHS",
         "FLOOR",
         "CHAMPIONS",
         "CHAMPION",
-        "CALLS",
     ):
         monkeypatch.setattr(
             config, name, run / getattr(config, name).relative_to(config.RUN)
@@ -83,7 +108,10 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_dry_run_promotes_a_better_child_over_a_pass_floor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[dict],
 ) -> None:
     """One iteration end to end: mutate, insert, deep-evaluate, promote."""
     tiny_run(tmp_path, monkeypatch)
@@ -101,6 +129,7 @@ def test_dry_run_promotes_a_better_child_over_a_pass_floor(
         concurrency=CONCURRENCY,
         seed_agent=seed,
         rng=random.Random(0),
+        log=log,
         commit=False,
     )
 
@@ -109,11 +138,15 @@ def test_dry_run_promotes_a_better_child_over_a_pass_floor(
     assert state.champion_path is not None
     assert Path(state.champion_path).read_text() == SELLER
     assert "champion_1" in pool.Pool.load(config.POOL).names()
-    assert config.EPOCHS.read_text().count("\n") == 1
+    assert [r["calls/ok"] for r in records if "calls/ok" in r] == [config.ISLANDS]
+    epochs = [r for r in records if "deep/promoted" in r]
+    assert len(epochs) == 1 and epochs[0]["deep/promoted"] == 1
+    assert epochs[0]["deep/best"] == state.champion.score
+    assert epochs[0]["iteration"] == 1
 
 
 def test_the_epoch_scores_the_champion_on_the_pool_the_candidate_faced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """The comparison baseline is re-measured, not the one frozen at promotion.
 
@@ -131,7 +164,7 @@ def test_the_epoch_scores_the_champion_on_the_pool_the_candidate_faced(
     archive = archive_module.Archive(config.ARCHIVE, config.PROGRAMS)
     archive.seed(_write(tmp_path / "seller.py", SELLER), fitness=0.9)
 
-    state = loop.epoch(loop.State(), archive, p, workers=WORKERS, commit=False)
+    state = loop.epoch(loop.State(), archive, p, workers=WORKERS, log=log, commit=False)
     assert state.champion_path is not None
     promoted_rates = set(state.champion.rates) if state.champion else set()
 
@@ -157,7 +190,7 @@ def test_the_epoch_scores_the_champion_on_the_pool_the_candidate_faced(
     monkeypatch.setattr(evaluator, "deep", spy_deep)
     monkeypatch.setattr(gate, "promotion", spy_promotion)
 
-    loop.epoch(state, archive, p, workers=WORKERS, commit=False)
+    loop.epoch(state, archive, p, workers=WORKERS, log=log, commit=False)
 
     assert order.index(f"deep:{state.champion_path}") < order.index("promotion")
     # The pool gained champion_1 at the first promotion, so a baseline measured
@@ -168,7 +201,7 @@ def test_the_epoch_scores_the_champion_on_the_pool_the_candidate_faced(
 
 
 def test_a_champion_json_outranks_a_state_json_that_never_saw_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """A kill between the promotion and the state write must not lose the champion.
 
@@ -203,6 +236,7 @@ def test_a_champion_json_outranks_a_state_json_that_never_saw_it(
         concurrency=CONCURRENCY,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),
+        log=log,
         commit=False,
     )
 
@@ -212,7 +246,7 @@ def test_a_champion_json_outranks_a_state_json_that_never_saw_it(
 
 
 def test_a_weaker_candidate_is_not_promoted_over_a_resumed_champion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """The resumed champion is the baseline, so a PASS child stays where it is."""
     tiny_run(tmp_path, monkeypatch)
@@ -239,6 +273,7 @@ def test_a_weaker_candidate_is_not_promoted_over_a_resumed_champion(
         concurrency=CONCURRENCY,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),
+        log=log,
         commit=False,
     )
 
@@ -247,7 +282,7 @@ def test_a_weaker_candidate_is_not_promoted_over_a_resumed_champion(
 
 
 def test_a_spent_quota_idles_without_advancing_the_schedule(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """An iteration that ran no mutation left the archive as it found it.
 
@@ -274,13 +309,14 @@ def test_a_spent_quota_idles_without_advancing_the_schedule(
         workers=WORKERS,
         concurrency=CONCURRENCY,
         rng=random.Random(0),
+        log=log,
     )
 
     assert after == spent
 
 
 def test_the_epoch_gets_the_whole_core_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """The mutation executor has joined by then, so nothing shares the box."""
     tiny_run(tmp_path, monkeypatch)
@@ -294,6 +330,7 @@ def test_the_epoch_gets_the_whole_core_budget(
         archive: archive_module.Archive,
         pool_: pool.Pool,
         workers: int,
+        log: wandb.Run,
         commit: bool = True,
     ) -> loop.State:
         """Record the worker count the epoch was handed."""
@@ -301,7 +338,7 @@ def test_the_epoch_gets_the_whole_core_budget(
         return state
 
     monkeypatch.setattr(loop, "epoch", spy_epoch)
-    monkeypatch.setattr(loop, "_mutate", lambda *args: None)
+    monkeypatch.setattr(loop, "_mutate", lambda *args: (_NO_CALL, None))
     # Distinct from the mutation share on every box, so a pass-through of
     # ``workers`` cannot satisfy the assertion by coincidence.
     monkeypatch.setattr(config, "CORE_BUDGET", 7)
@@ -314,6 +351,7 @@ def test_the_epoch_gets_the_whole_core_budget(
         workers=1,
         concurrency=1,
         rng=random.Random(0),
+        log=log,
     )
 
     assert seen == [7]

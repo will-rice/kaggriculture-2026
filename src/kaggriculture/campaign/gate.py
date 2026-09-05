@@ -21,11 +21,9 @@ promotion that already happened on disk must never be undone by a commit
 that failed to explain it.
 """
 
-import json
 import logging
 import os
 import subprocess
-import time
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -205,30 +203,3 @@ def load_champion() -> Champion | None:
     if not config.CHAMPION.exists():
         return None
     return Champion.model_validate_json(config.CHAMPION.read_text(encoding="utf-8"))
-
-
-def epoch_line(
-    iteration: int, results: list[DeepResult], promoted: str | None, rho: float | None
-) -> None:
-    """Append one epoch record to ``config.EPOCHS``.
-
-    Args:
-        iteration: The loop iteration this epoch closes.
-        results: The deep results measured this epoch.
-        promoted: The name of the champion promoted this epoch, or None.
-        rho: Correlation between fast and deep scores this epoch, or None.
-    """
-    config.EPOCHS.parent.mkdir(parents=True, exist_ok=True)
-    with config.EPOCHS.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "ts": time.time(),
-                    "iteration": iteration,
-                    "promoted": promoted,
-                    "rho_fast_deep": rho,
-                    "results": [r.model_dump() for r in results],
-                }
-            )
-            + "\n"
-        )

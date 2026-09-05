@@ -98,7 +98,6 @@ CHECK_TIMEOUT_SECONDS = 180
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
 SANDBOXES = RUN / "sandboxes"
-EPOCHS = RUN / "epochs.jsonl"
 # The current floor, the copy that ships, and every champion ever promoted.
 # `FLOOR/main.py` is overwritten each promotion; `CHAMPIONS/<name>.py` is
 # written once and is what the pool points at, so a pool of N champions holds
@@ -109,7 +108,12 @@ SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The promoted champion, written atomically by the gate before it returns, so
 # a kill between the promotion and the next `state.json` write cannot lose it.
 CHAMPION = RUN / "champion.json"
-CALLS = RUN / "calls.jsonl"
+# Metrics go to one wandb run per campaign, resumed across restarts by its
+# fixed id. Starting a fresh campaign (a new `run/campaign`) means a new id
+# here, or its curves land on top of the old run's.
+WANDB_ENTITY = "will-rice"
+WANDB_PROJECT = "kaggriculture-2026"
+WANDB_RUN_ID = "campaign"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of the sandboxes a codex session works in.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"

@@ -43,14 +43,16 @@ for how it was built.
 ```bash
 uv run campaign dry-run --iterations 2         # fake mutator, proves the pipeline
 nohup uv run campaign loop > run/campaign/loop.log 2>&1 &
-tail -f run/campaign/loop.log; tail -1 run/campaign/epochs.jsonl | python -m json.tool
+tail -f run/campaign/loop.log            # metrics: wandb.ai/will-rice/kaggriculture-2026
 ```
 
 `dry-run` swaps the codex mutator for one that copies the parent with a
 visible edit, so it exercises validation, evaluation, insertion and the
 promotion gate without spending a call. Both commands resume from
 `run/campaign/state.json` and the archive log, so a killed loop restarts
-where it stopped. Keep `--workers * --concurrency` inside the core budget:
+where it stopped, and it resumes the same wandb run (`config.WANDB_RUN_ID`),
+so the curves continue; a dry run logs nothing. Each promotion also uploads
+the champion's file as a wandb artifact named after it. Keep `--workers * --concurrency` inside the core budget:
 each mutation in flight runs an evaluation that forks that many processes.
 
 ## Quick Start

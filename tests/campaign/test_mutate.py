@@ -9,7 +9,7 @@ from typing import IO
 
 import pytest
 
-from kaggriculture.campaign import config, mutate
+from kaggriculture.campaign import mutate
 
 
 def sandbox(tmp_path: Path) -> Path:
@@ -37,25 +37,6 @@ def test_fake_mutator_writes_a_child_with_the_edit_applied(tmp_path: Path) -> No
     assert result.status == "ok" and result.child == box / "child.py"
     assert result.child is not None
     assert "LIMIT = 2" in result.child.read_text()
-
-
-def test_record_appends_one_json_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """record() appends one JSON line to config.CALLS per call."""
-    monkeypatch.setattr(config, "CALLS", tmp_path / "calls.jsonl")
-    m = mutate.Mutation(
-        program_id="p",
-        child=None,
-        status="timeout",
-        reason="",
-        seconds=1.0,
-        input_tokens=0,
-        output_tokens=0,
-    )
-    mutate.record(m)
-    mutate.record(m)
-    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 2
 
 
 def test_codex_mutator_reports_no_output_when_nothing_is_written(

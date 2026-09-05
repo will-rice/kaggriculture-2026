@@ -116,7 +116,6 @@ src/kaggriculture/
 run/campaign/                     runtime state, gitignored
   archive.jsonl                   every program ever evaluated: source path, fitness, n, parents, kind
   pool.json                       as FAMOU's, paths hidden from sandboxes
-  epochs.jsonl                    one line per epoch: deep scores, held-out scores, rho(fast, deep), pool change
   programs/<id>.py                sources
   sandboxes/<id>/                 one per mutation: AGENTS.md, parent.py, [inspiration.py], feedback.md, engine/, child.py, codex JSONL
   floor/agent/                    champion, 444
@@ -212,7 +211,7 @@ when the pool is full at 10), `apply_weakness_pressure` (×2, cap 0.5),
 history. Initial pool: `router_v1`, `router2929`, `v54`, `v56`, `shopforge`,
 `indarkarhana`, equal weights. Held-out: `salemali7_2900`, `lynnsakurai_v5`.
 `kernel_watch` adds a new ladder kernel to the held-out set first; it enters
-the pool only by a decision recorded in `epochs.jsonl`.
+the pool only by a promotion, which the wandb run records.
 
 **Measured overlap (2026-09-04), and how to read the numbers it discounts.**
 The held-out set and the field are only as informative as they are
@@ -290,7 +289,9 @@ tests for the kept modules.
 `scripts/autonomous|budget|market_*|meta|tracking|rule_search|run`;
 `features.py`, `action_codec.py`, `harness.py`, `task.py`, `result.py`,
 `config.py`, `agent.py`, `policy.py`; every vendored policy in `src/`; torch,
-lightning, wandb, optuna and dependants from `pyproject`; their tests.
+lightning, optuna and dependants from `pyproject`; their tests. (`wandb`
+returned later as the loop's metrics sink: one run per campaign, keyed by
+iteration, replacing the `epochs.jsonl` and `calls.jsonl` files.)
 `README.md` rewritten to describe what remains.
 
 ## 10. Open questions, settled by measurement
