@@ -46,6 +46,9 @@ convention = "google"
 # (tests/rust shares its policies between modules) and the research scripts
 # under docs/ can import their sibling `_common`.
 root = ["./src", "."]
+# The Rust bindings' stub file is their type surface, so ty can check code
+# that imports `kaggriculture_engine` without the extension being built.
+extra-paths = ["./rust/python"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
