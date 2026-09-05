@@ -79,7 +79,11 @@ CONCURRENCY = max(1, min(2, config.CORE_BUDGET // WORKERS))
 
 @pytest.fixture
 def records() -> list[tuple[float, dict]]:
-    """Every metrics dict the loop hands to ``log.log``, with when it did."""
+    """Every metrics dict the loop hands to ``log.log``, with when it did.
+
+    The stamp is wall clock rather than a monotonic count, so it can be
+    compared with what a session's own ``date`` wrote.
+    """
     return []
 
 
@@ -90,7 +94,7 @@ def log(
     """A wandb run that records nothing, with its `log` calls kept in ``records``."""
     run = wandb.init(mode="disabled")
     monkeypatch.setattr(
-        run, "log", lambda record: records.append((time.monotonic(), record))
+        run, "log", lambda record: records.append((time.time(), record))
     )
     return run
 
@@ -242,44 +246,54 @@ def test_four_sessions_run_at_once_rather_than_one_after_another(
     assert max(began) < min(ended)
 
 
-@pytest.mark.skipif(
-    config.CORE_BUDGET < 3, reason="three evaluations at once need three cores"
-)
 def test_an_epoch_never_stops_the_dispatcher(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     log: wandb.Run,
     records: list[tuple[float, dict]],
 ) -> None:
-    """Calls keep completing while a deep-evaluation epoch runs.
+    """Sessions keep starting and calls keep completing while an epoch runs.
 
     The epoch is created inside the completion step of the call that crossed
-    the interval, and it logs its own record when it is done. Every later
-    call landing between those two moments is dispatch that an epoch would
-    have stopped under the old barrier -- and it is why the two crossings
+    the interval, so that call's record is the moment it began, and its own
+    record is the moment it ended. What an epoch could not do under the old
+    barrier -- where it ran to completion on the one thread that dispatches
+    -- is let a new codex session start while it works. Sessions started
+    after that first record are exactly that, and they are why the crossings
     that follow find the epoch still running and are skipped.
     """
     tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path)
+    starts = tmp_path / "starts"
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        ["bash", "-c", f"date +%s.%N >> {starts}; sleep 1; cp parent.py child.py"],
+    )
 
     state = loop.run(
-        calls=3,
-        mutator=mutate.FakeMutator(edit=lambda _: SELLER),
-        workers=1,
-        concurrency=3,
+        calls=6,
+        mutator=mutate.CodexMutator(timeout=30),
+        workers=WORKERS,
+        concurrency=1,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),
         log=log,
         commit=False,
     )
 
-    assert state.calls == 3
+    assert state.calls == 6
     calls = calls_of(records)
     epochs = epochs_of(records)
-    assert [record["calls"] for _, record in calls] == [1, 2, 3]
+    assert [record["calls"] for _, record in calls] == [1, 2, 3, 4, 5, 6]
+    # A session's `date` and the record's stamp are both wall clock.
+    began = [float(line) for line in starts.read_text().split()]
     launched, finished = calls[0][0], epochs[0][0]
-    assert all(launched < when < finished for when, _ in calls[1:])
-    assert len(epochs) == 1
+    assert len(began) == 6
+    assert any(launched < start < finished for start in began)
+    # Six crossings, and the epoch the first one started was still running
+    # for at least one of them.
+    assert 1 <= len(epochs) < 6
 
 
 def test_a_spent_daily_budget_parks_dispatch_until_the_day_rolls_over(

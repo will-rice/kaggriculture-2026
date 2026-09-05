@@ -377,7 +377,7 @@ class Campaign:
         try:
             async with self.cores.take(self.workers):
                 result = await asyncio.to_thread(
-                    evaluator.fast, stored, self.pool, rng, self.workers
+                    evaluator.fast, stored, self.snapshot(), rng, self.workers
                 )
         except harness.OpponentCrash:
             raise
@@ -597,8 +597,25 @@ class Campaign:
         """
         async with self.cores.take(self.workers):
             return await asyncio.to_thread(
-                evaluator.deep, agent, program_id, self.pool, self.workers
+                evaluator.deep, agent, program_id, self.snapshot(), self.workers
             )
+
+    def snapshot(self) -> Pool:
+        """The pool as it stands, copied for one evaluation to keep.
+
+        A promotion adds a champion and renormalises the weights, and it
+        happens on the loop thread while evaluations are running in others.
+        An evaluation reads the pool more than once -- who to play, then how
+        to weight what it measured -- so sharing the live object would let a
+        promotion land between those reads and leave it weighting a game it
+        never played. The copy is taken here, on the loop, so it cannot
+        straddle a promotion: the measurement is against the pool it started
+        with, and its fitness is inserted as measured.
+
+        Returns:
+            A pool of its own for one evaluation.
+        """
+        return self.pool.model_copy(deep=True)
 
     async def promote(self, program: archive_module.Program, best: DeepResult) -> str:
         """Put ``program`` on the floor and record it everywhere it belongs.
