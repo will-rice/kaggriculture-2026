@@ -277,7 +277,12 @@ def build_sandbox(
         task_prompt + HARNESS_SECTION + DOCTRINE, encoding="utf-8"
     )
 
-    shutil.copy(champion, box / "child.py")
+    child = box / "child.py"
+    shutil.copy(champion, child)
+    # The gate writes a champion read-only so nothing can edit the file the
+    # pool plays, and `shutil.copy` carries that mode across. This copy is
+    # the one file the session must be able to write.
+    child.chmod(0o644)
     if inspiration is not None:
         shutil.copy(inspiration, box / "inspiration.py")
     shutil.copy(engine_module.__file__, box / "engine" / "kaggriculture.py")

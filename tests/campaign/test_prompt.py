@@ -286,3 +286,32 @@ def test_program_id_path_traversal_is_rejected(tmp_path: Path) -> None:
                 started_from="champion_1",
             )
     assert sentinel.read_text() == "still here\n"
+
+
+def test_the_child_is_writable_even_when_the_champion_is_not(tmp_path: Path) -> None:
+    """The gate writes a champion read-only; the file a session edits cannot be.
+
+    `gate.promote` chmods `CHAMPIONS/<name>.py` to 0o444 so nothing can edit
+    what the pool plays, and `shutil.copy` carries the mode across. A session
+    handed a read-only `child.py` cannot do the one thing it is asked to do.
+    """
+    champion = tmp_path / "champion_1.py"
+    champion.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
+    champion.chmod(0o444)
+
+    box = prompt.build_sandbox(
+        "p-readonly",
+        champion,
+        prompt.INSTRUCTIONS[0][1],
+        None,
+        bar={"fitness": 0.5},
+        rates={"pass": 0.5},
+        weights={"pass": 1.0},
+        weakest="pass",
+        failures=[],
+        started_from="champion_1",
+    )
+
+    child = box / "child.py"
+    child.write_text("edited\n", encoding="utf-8")
+    assert child.read_text() == "edited\n"

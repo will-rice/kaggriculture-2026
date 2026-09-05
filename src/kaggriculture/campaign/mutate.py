@@ -143,7 +143,7 @@ class CodexMutator:
 
         Args:
             sandbox: A directory built by ``prompt.build_sandbox``, holding
-                ``AGENTS.md``, ``parent.py``, and ``PROMPT.md``.
+                ``AGENTS.md``, ``child.py``, and ``PROMPT.md``.
             program_id: The child program id.
 
         Returns:
@@ -395,7 +395,7 @@ def _last_message(log: Path) -> str:
 
 
 class FakeMutator:
-    """Copies ``parent.py`` to ``child.py`` through ``edit``. For dry runs and tests."""
+    """Edits ``child.py`` in place through ``edit``. For dry runs and tests."""
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the mutator.
@@ -406,14 +406,14 @@ class FakeMutator:
         self.edit = edit
 
     async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
-        """Writes ``sandbox / "child.py"`` as ``edit`` of the parent's source.
+        """Rewrites ``sandbox / "child.py"`` as ``edit`` of what it holds.
 
         The edit runs in a thread, as the codex session it stands in for runs
         in a child process: a dry run with a slow ``edit`` must exercise the
         loop's concurrency rather than stall its single thread.
 
         Args:
-            sandbox: A directory holding ``parent.py``.
+            sandbox: A directory holding ``child.py``, the champion copied in.
             program_id: The child program id.
 
         Returns:
@@ -434,13 +434,10 @@ class FakeMutator:
         )
 
     def write(self, sandbox: Path, child: Path) -> None:
-        """Read the parent, apply ``edit``, write the child. Runs in a thread.
+        """Read ``child.py``, apply ``edit``, write it back. Runs in a thread.
 
         Args:
-            sandbox: A directory holding ``parent.py``.
-            child: Where to write the edited source.
+            sandbox: A directory holding ``child.py``, the champion copied in.
+            child: The file to rewrite, which is that same ``child.py``.
         """
-        child.write_text(
-            self.edit((sandbox / "parent.py").read_text(encoding="utf-8")),
-            encoding="utf-8",
-        )
+        child.write_text(self.edit(child.read_text(encoding="utf-8")), encoding="utf-8")

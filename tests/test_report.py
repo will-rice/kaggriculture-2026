@@ -1,6 +1,6 @@
 """Tests for win-rate reporting and its confidence intervals."""
 
-from kaggriculture.report import wilson_interval
+from kaggriculture.report import spearman, wilson_interval
 
 
 def test_wilson_interval_is_not_degenerate_at_zero_wins() -> None:
@@ -24,3 +24,14 @@ def test_a_hundred_even_games_meet_the_phase_one_gate() -> None:
     low, high = wilson_interval(wins=50, games=100)
 
     assert (high - low) / 2 < 0.1
+
+
+def test_spearman_reads_an_agreeing_and_a_reversed_ranking() -> None:
+    """The fast/deep correlation the campaign logs, at both of its extremes."""
+    assert spearman([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]) == 1.0
+    assert spearman([1.0, 2.0, 3.0], [0.3, 0.2, 0.1]) == -1.0
+
+
+def test_spearman_ranks_rather_than_values() -> None:
+    """A monotone but wildly nonlinear relation is still a perfect ranking."""
+    assert spearman([1.0, 2.0, 3.0, 4.0], [0.01, 0.02, 0.03, 900.0]) == 1.0

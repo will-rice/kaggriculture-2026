@@ -28,12 +28,12 @@ TRANSCRIPT = (
 
 
 def sandbox(tmp_path: Path) -> Path:
-    """A minimal sandbox: a parent, a prompt, and standing agent rules."""
-    (tmp_path / "parent.py").write_text(
-        "LIMIT = 1\n"
-        "def agent(o, c=None):\n"
-        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
-    )
+    """A minimal sandbox: a prompt and standing agent rules, and no child yet.
+
+    A real sandbox also holds the champion as ``child.py``; the tests that
+    care whether a session wrote anything need it absent, and the one that
+    edits it writes it itself.
+    """
     (tmp_path / "PROMPT.md").write_text(
         "Write child.py implementing def agent(observation, configuration=None).\n"
     )
@@ -45,8 +45,13 @@ def sandbox(tmp_path: Path) -> Path:
 
 
 def test_fake_mutator_writes_a_child_with_the_edit_applied(tmp_path: Path) -> None:
-    """FakeMutator copies parent.py to child.py through the caller's edit."""
+    """FakeMutator rewrites child.py through the caller's edit."""
     box = sandbox(tmp_path)
+    (box / "child.py").write_text(
+        "LIMIT = 1\n"
+        "def agent(o, c=None):\n"
+        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+    )
     mutator = mutate.FakeMutator(edit=lambda s: s.replace("LIMIT = 1", "LIMIT = 2"))
     result = asyncio.run(mutator(box, "p1"))
     assert result.status == "ok" and result.child == box / "child.py"

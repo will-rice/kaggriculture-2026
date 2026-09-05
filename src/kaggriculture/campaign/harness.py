@@ -116,9 +116,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "campaign loop [--calls N] [--workers N] [--concurrency N] "
-            "[--seed-agent PATH] runs the evolution loop; campaign dry-run "
-            "takes the same flags and runs it on a fake mutator."
+            "campaign loop [--sessions N] [--workers N] [--seed-agent PATH] "
+            "runs the campaign; campaign dry-run takes the same flags and "
+            "runs it on a fake session."
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)

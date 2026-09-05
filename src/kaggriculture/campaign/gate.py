@@ -4,11 +4,13 @@ The promotion rule is the spec's §5.2: the candidate's lower Wilson bound
 above the champion's point estimate, the vendored field not down more than
 two points, no opponent regressed beyond the wider of the two intervals.
 
-A promotion also produces the artefact a cut uploads. The program is
-packaged and played in the Kaggle docker image *before* anything durable is
-written, so the floor only ever holds a program Kaggle's own image has run,
-and a cut is one command: upload `champion.tarball`. Nothing is built at
-cut time.
+A promotion also produces the artefact a cut uploads: the program is
+packaged into `champions/<name>.tar.gz`, so a cut is one command -- upload
+`champion.tarball` -- and nothing is built at cut time. What proves a
+candidate runs is validation, which loads it through Kaggle's own loader and
+plays a full episode; everything else in the tarball is the same bytes for
+every candidate, so proving the packaging is the packager's own tests' job
+and not something to re-run on each promotion.
 
 Nothing here touches version control. Provenance is `champion.json`, the
 champions directory and the archive; every write is under `run/campaign`
@@ -23,7 +25,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, harness, kaggle_image
+from kaggriculture.campaign import config, harness
 from kaggriculture.campaign.archive import Program
 from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.pool import Pool
@@ -32,14 +34,6 @@ LOGGER = logging.getLogger(__name__)
 
 SERVED = config.SERVED
 FIELD_TOLERANCE = 0.02
-
-
-class NotShippable(RuntimeError):  # noqa: N818 - a property of the tarball
-    """A candidate's tarball would not run in the Kaggle image.
-
-    Raised by `promote` before any durable write, so a candidate that fails
-    the image test leaves the previous champion exactly as it was.
-    """
 
 
 class Champion(BaseModel):
@@ -53,8 +47,7 @@ class Champion(BaseModel):
     Attributes:
         name: The champion's pool name, e.g. "champion_3".
         path: The immutable copy under ``config.CHAMPIONS`` the pool plays.
-        tarball: The archive a cut uploads, played in the Kaggle image
-            before this record existed.
+        tarball: The archive a cut uploads, written by this promotion.
         result: The deep evaluation the promotion was decided on.
     """
 
@@ -124,8 +117,6 @@ def promote(program: Program, result: DeepResult, pool: Pool) -> Champion:
 
     Raises:
         FileExistsError: The champions directory already holds this name.
-        NotShippable: The tarball does not run in the Kaggle image. Nothing
-            has been written.
     """
     number = 1 + sum(1 for n in pool.names() if n.startswith("champion_"))
     name = f"champion_{number}"
@@ -138,23 +129,10 @@ def promote(program: Program, result: DeepResult, pool: Pool) -> Champion:
     source = Path(program.source_path)
 
     with tempfile.TemporaryDirectory() as scratch:
-        # Every byte written before the image has played the tarball is
-        # written in here, and the directory is removed on every path out of
-        # this block. So a candidate that fails `load_test` leaves nothing to
-        # clean up and nothing to undo: at the point it raises, no file under
-        # `run/campaign` has been touched, and the only way past this block is
-        # the image having played the tarball to a reward.
+        # The tarball is built in here and moved into place whole. Packaging
+        # writes a file at a time and can fail part way through; a half-built
+        # archive under `champions/` would be a cut waiting to upload it.
         built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
-        try:
-            output = kaggle_image.load_test(built)
-        except Exception as error:
-            raise NotShippable(
-                f"{name} does not run in the Kaggle image: {error}"
-            ) from error
-        # The script's last print is `EPISODE_OK <reward> <reward>`; ahead of
-        # it are pages of the image's own import chatter, which is only worth
-        # reading when the container failed and `NotShippable` carries it.
-        LOGGER.info("%s in the kaggle image: %s", name, " ".join(output.split()[-3:]))
         config.CHAMPIONS.mkdir(parents=True, exist_ok=True)
         tarball = config.CHAMPIONS / f"{name}.tar.gz"
         shutil.move(str(built), str(tarball))

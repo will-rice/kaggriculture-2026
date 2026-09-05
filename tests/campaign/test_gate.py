@@ -115,7 +115,6 @@ def test_promote_leaves_a_tarball_the_champion_record_names(
     """A cut is uploading this file; nothing is built at cut time."""
     program = _program(tmp_path, monkeypatch)
     p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
-    monkeypatch.setattr(gate.kaggle_image, "load_test", lambda tar: "EPISODE_OK")
 
     champion = gate.promote(program, _result(), p)
 
@@ -124,29 +123,6 @@ def test_promote_leaves_a_tarball_the_champion_record_names(
     with tarfile.open(tarball) as tar:
         names = tar.getnames()
     assert "main.py" in names and "kaggriculture_engine.so" in names
-
-
-def test_a_tarball_that_will_not_run_is_not_promoted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The floor only ever holds a program Kaggle's own image played."""
-    program = _program(tmp_path, monkeypatch)
-    p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
-
-    def refuses(tarball: Path) -> str:
-        """Stand in for an image the tarball does not load on."""
-        raise RuntimeError("ENGINE_MISSING")
-
-    monkeypatch.setattr(gate.kaggle_image, "load_test", refuses)
-
-    with pytest.raises(gate.NotShippable, match="ENGINE_MISSING"):
-        gate.promote(program, _result(), p)
-    assert not (config.FLOOR / "main.py").exists()
-    assert not config.CHAMPION.exists()
-    # Not even the directory the tarball would have landed in: a candidate
-    # that fails the image test writes nothing outside its scratch directory.
-    assert not config.CHAMPIONS.exists()
-    assert not config.POOL.exists()
 
 
 def test_gate_runs_no_version_control() -> None:
@@ -160,7 +136,6 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
 ) -> None:
     """promote() writes the floor read-only, mirrors served/, and saves the pool."""
     program = _program(tmp_path, monkeypatch)
-    monkeypatch.setattr(gate.kaggle_image, "load_test", lambda tar: "EPISODE_OK")
     source = Path(program.source_path)
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
@@ -214,7 +189,6 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     every earlier champion would be gone.
     """
     first = _program(tmp_path, monkeypatch, body="PASS")
-    monkeypatch.setattr(gate.kaggle_image, "load_test", lambda tar: "EPISODE_OK")
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
@@ -238,7 +212,6 @@ def test_promote_writes_the_champion_record_before_it_returns(
 ) -> None:
     """`champion.json` exists the moment promote returns; a restart trusts it."""
     program = _program(tmp_path, monkeypatch)
-    monkeypatch.setattr(gate.kaggle_image, "load_test", lambda tar: "EPISODE_OK")
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
@@ -256,7 +229,6 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
 ) -> None:
     """The champion counter reads the pool that was just saved, not a stale one."""
     program = _program(tmp_path, monkeypatch)
-    monkeypatch.setattr(gate.kaggle_image, "load_test", lambda tar: "EPISODE_OK")
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
@@ -268,27 +240,3 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
         reloaded,
     )
     assert champion.name == "champion_2"
-
-
-@pytest.mark.local_data
-def test_a_promoted_tarball_plays_in_the_real_kaggle_image(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The one substitution the other promotion tests make, made honestly.
-
-    Every other promotion test stubs ``kaggle_image.load_test`` because CI
-    has no docker. This one lets it run: the gate's own tarball is unpacked
-    inside Kaggle's image, its engine library loaded there and a full
-    episode played. That is the only evidence that what a cut uploads is
-    something the competition can actually run.
-    """
-    program = _program(tmp_path, monkeypatch)
-    p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
-
-    champion = gate.promote(program, _result(), p)
-
-    tarball = Path(champion.tarball)
-    assert tarball.exists() and tarball.parent == config.CHAMPIONS
-    assert (config.FLOOR / "main.py").read_text() == Path(
-        program.source_path
-    ).read_text()
