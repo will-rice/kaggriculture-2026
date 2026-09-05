@@ -406,13 +406,47 @@ def _verify_sample(agent: Path, paths: dict[str, Path], games: list[Game]) -> No
             continue
         opponent = str(paths[game.opponent])
         seating = (str(agent), opponent) if game.seat == 0 else (opponent, str(agent))
-        banks = arena.run_banks(*seating, game.seed)
+        banks = _replay(*seating, game.seed)
         ours, theirs = banks if game.seat == 0 else banks[::-1]
         if (float(ours), float(theirs)) != (game.ours, game.theirs):
             raise RuntimeError(
                 f"engine drift: seed {game.seed} seat {game.seat} vs {game.opponent}: "
                 f"port {game.ours}/{game.theirs}, reference {ours}/{theirs}"
             )
+
+
+def _replay(seat_zero: str, seat_one: str, seed: int) -> tuple[int, int]:
+    """Play one audited game on the reference engine, away from the caller.
+
+    ``arena.run_banks`` hands both files to ``kaggle_environments``, which
+    execs them in the calling process -- so an audited candidate would run
+    wherever its caller stands, which is the one thing ``_one`` exists to
+    prevent. The audit therefore gets a process of its own, and the same
+    scratch directory every other game gets.
+
+    Args:
+        seat_zero: The file playing seat zero.
+        seat_one: The file playing seat one.
+        seed: The episode seed.
+
+    Returns:
+        Both seats' final banks, seat zero first.
+    """
+    with ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as pool:
+        return pool.submit(_reference, (seat_zero, seat_one, seed)).result()
+
+
+def _reference(work: tuple[str, str, int]) -> tuple[int, int]:
+    """Run one reference-engine game in a scratch directory. Runs in a child."""
+    seat_zero, seat_one, seed = work
+    sources = (str(Path(seat_zero).resolve()), str(Path(seat_one).resolve()))
+    origin = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="campaign-reference-") as scratch:
+        os.chdir(scratch)
+        try:
+            return arena.run_banks(*sources, seed)
+        finally:
+            os.chdir(origin)
 
 
 def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:

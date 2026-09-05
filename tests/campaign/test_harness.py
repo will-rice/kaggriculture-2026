@@ -201,7 +201,14 @@ def test_a_crashing_candidate_is_the_candidates_own_failure(
 def test_a_candidate_writing_files_leaves_nothing_in_the_callers_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Playing a candidate runs it; every path that runs one is a scratch directory."""
+    """Playing a candidate runs it; every path that runs one is a scratch directory.
+
+    ``REFERENCE_SAMPLE`` is forced to 1 so the reference-engine audit runs on
+    every game: it hands the candidate's file to ``kaggle_environments``,
+    which execs it, and at 2% a hole there shows up as a test that fails one
+    run in twelve.
+    """
+    monkeypatch.setattr(harness, "REFERENCE_SAMPLE", 1.0)
     candidate = tmp_path / "main.py"
     candidate.write_text(WRITING_AGENT, encoding="utf-8")
     workspace = tmp_path / "workspace"
@@ -262,7 +269,7 @@ def test_the_reference_sample_is_drawn_from_the_system_entropy_source(
         return 1, 2
 
     monkeypatch.setattr(harness.random, "SystemRandom", Recording)
-    monkeypatch.setattr(harness.arena, "run_banks", spy)
+    monkeypatch.setattr(harness, "_replay", spy)
     harness._verify_sample(tmp_path / "main.py", {"v54": tmp_path / "v54.py"}, games)
 
     assert len(built) == 1
