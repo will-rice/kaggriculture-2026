@@ -1,7 +1,7 @@
 //! Episode configuration, mirroring `kaggriculture.json`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::tables::{MarketParams, Shape, MARKET_PARAMS, PRODUCTS, PRODUCT_COUNT};
 
@@ -43,7 +43,7 @@ impl Default for Config {
             town_center_sell_interval: 24,
             seed: None,
             farm_hand_cost_mult: 1,
-            market_params: Value::Object(Default::default()),
+            market_params: Value::Object(Map::default()),
         }
     }
 }
@@ -117,12 +117,14 @@ fn number(value: f64) -> Value {
 }
 
 fn params_from_json(map: &serde_json::Map<String, Value>, fallback: &MarketParams) -> MarketParams {
-    let float = |key: &str, default: f64| map.get(key).and_then(Value::as_f64).unwrap_or(default);
+    let float = |key: &str, default: f64| {
+        map.get(key)
+            .map_or(default, |v| v.as_f64().unwrap_or(default))
+    };
     let shape = |key: &str, default: Shape| {
         map.get(key)
             .and_then(Value::as_str)
-            .map(Shape::from_name)
-            .unwrap_or(default)
+            .map_or(default, Shape::from_name)
     };
     MarketParams {
         base: float("base", fallback.base),

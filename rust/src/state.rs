@@ -31,7 +31,7 @@ impl Plant {
             planted_day: day,
             watered_today: false,
             consecutive_unwatered: 1, // planting day counts as unwatered
-            yield_units: if data.ongoing { 0 } else { 1 },
+            yield_units: i64::from(!data.ongoing),
             max_lifespan_step: if data.ongoing {
                 -1
             } else {

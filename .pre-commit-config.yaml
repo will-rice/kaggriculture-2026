@@ -46,6 +46,21 @@ repos:
         entry: uv run ty check
         files: ^(src|tests|baselines)/.*\.py$|^[^/]*\.py$
         pass_filenames: false
+      # The Rust engine is linted like the Python: formatting, then clippy
+      # with the workspace's deny-level lint set, across every crate in
+      # rust/ (the bindings crate included). Both need cargo on PATH.
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --all --manifest-path rust/Cargo.toml -- --check
+        files: ^rust/.*\.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy --workspace --all-targets --manifest-path rust/Cargo.toml -- -D warnings
+        files: ^rust/.*\.(rs|toml)$
+        pass_filenames: false
       - id: pytest
         name: pytest
         language: system

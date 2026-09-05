@@ -32,3 +32,30 @@ serde_json = { version = "1.0", features = [
 [profile.release]
 lto = true
 codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# The engine mirrors Python arithmetic: money is a float that integer prices
+# are added to, day and step counters are i64, and board coordinates index
+# Vecs. Every such cast is deliberate and bounded by the rules tables, so
+# the precision and truncation lints only add noise here.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Money is compared exactly on purpose: the reference compares floats with
+# `<`, and a tolerance would change which orders fill.
+float_cmp = "allow"
+# Getters on state types are used for their values; a must_use on each adds
+# nothing a caller could act on.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[lints]
+workspace = true

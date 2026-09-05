@@ -6,10 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::action::{Action, Order, UnitAction};
 use crate::config::Config;
 use crate::pyrandom::PyRandom;
-use crate::state::Market;
 use crate::state::{
     default_spawn, is_shed_adjacent, Farm, GameState, Livestock, Plant, Private, Tile, Town,
 };
+use crate::state::{Inventory, Market};
 use crate::tables::{
     Animal, Crop, Item, Quadrant, Structure, CROP_COUNT, LAND_ORDER, LAND_PRICES,
     MAX_SHOP_INSTANCES, SHOPS_SORTED, TOWN_CENTER_PRODUCTS,
@@ -225,6 +225,9 @@ fn apply_player_actions(
 }
 
 /// `_apply_unit_action`. Illegal actions are silent no-ops.
+///
+/// One function, like the reference: the op dispatch reads as the rules table.
+#[allow(clippy::too_many_lines)]
 pub fn apply_unit_action(
     farm: &mut Farm,
     private: &mut Private,
@@ -479,6 +482,7 @@ enum Quote {
 
 /// `_process_market`: per-unit lockstep. At each unit, both players' prices
 /// are quoted against the same inventory, then both commit in player order.
+#[allow(clippy::too_many_lines)]
 fn process_market(state: &mut GameState, actions: &[Action], config: &Config) {
     let players = state.players();
     let max_orders = config.max_market_orders_per_turn.max(1) as usize;
@@ -653,7 +657,7 @@ fn do_hire(farm: &mut Farm, private: &mut Private, _board_size: i64, mult: i64) 
     farm.hires_today += 1;
     let spawn = farm.spawn_hand_position();
     farm.hands.push(spawn);
-    private.inventories.push(Default::default());
+    private.inventories.push(Inventory::default());
 }
 
 /// `_do_buy_land`.
@@ -825,7 +829,7 @@ fn drop_inventories_to_shed(private: &mut Private, capacity: i64) {
 
 /// The day's RNG: `random.Random((seed * 1_000_003) ^ day)`.
 pub fn day_rng(seed: i64, day: i64) -> PyRandom {
-    PyRandom::new((seed as i128 * 1_000_003) ^ day as i128)
+    PyRandom::new((i128::from(seed) * 1_000_003) ^ i128::from(day))
 }
 
 /// `_end_of_day`.
@@ -965,7 +969,7 @@ mod tests {
         let farm = &engine.state().farms[0];
         assert_eq!(farm.hires_today, 4);
         assert_eq!(farm.hands, vec![(5, 4), (4, 5), (5, 5), (4, 4)]);
-        assert_eq!(farm.money, 3000.0 - (1 + 1 + 2 + 3) as f64);
+        assert_eq!(farm.money, 3000.0 - f64::from(1 + 1 + 2 + 3));
         assert_eq!(engine.state().privates[0].inventories.len(), 5);
         while engine.state().hour != 0 {
             engine.step(&[Action::pass(), Action::pass()]);

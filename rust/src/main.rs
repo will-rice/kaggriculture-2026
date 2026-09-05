@@ -116,7 +116,7 @@ fn bench(args: &[String]) {
     let mut checksum = 0.0f64;
     for episode in 0..episodes {
         let mut engine = Engine::new(Config::with_seed(seed + episode as i64));
-        let mut rng = PyRandom::new((seed + episode as i64) as i128);
+        let mut rng = PyRandom::new(i128::from(seed + episode as i64));
         while !engine.done() {
             let actions = [
                 starter_agent(engine.state(), 0),
@@ -145,7 +145,7 @@ fn render(args: &[String]) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
     let mut engine = Engine::new(Config::with_seed(seed));
-    let mut rng = PyRandom::new(seed as i128);
+    let mut rng = PyRandom::new(i128::from(seed));
     for _ in 0..steps {
         if engine.done() {
             break;

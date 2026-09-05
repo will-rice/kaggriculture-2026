@@ -2,7 +2,7 @@
 //! (`kaggle_environments/envs/kaggriculture/kaggriculture.py`).
 //!
 //! The port is meant to be bit-for-bit faithful: the same rules, the same
-//! order of resolution, the same CPython random stream for weeds and shop
+//! order of resolution, the same `CPython` random stream for weeds and shop
 //! unlocks, and observation JSON laid out exactly like the reference's. The
 //! Python test in `tests/rust/` drives both engines with one action tape and
 //! compares every observable field each step.

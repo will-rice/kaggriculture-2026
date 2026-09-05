@@ -93,7 +93,7 @@ pub fn starter_agent(state: &GameState, player: usize) -> Action {
     let mut farmer = UnitAction::Noop;
     match tile {
         Tile::Empty if private.seeds_get(Crop::Carrot) > 0 => {
-            farmer = UnitAction::Plant(Crop::Carrot)
+            farmer = UnitAction::Plant(Crop::Carrot);
         }
         Tile::Plant(plant) if plant.crop == Crop::Carrot => {
             let age = day - plant.planted_day;

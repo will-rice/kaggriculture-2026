@@ -91,7 +91,7 @@ impl UnitAction {
             "SOUTH" => UnitAction::Move(Direction::South),
             "EAST" => UnitAction::Move(Direction::East),
             "WEST" => UnitAction::Move(Direction::West),
-            "PASS" => UnitAction::Noop,
+            // `PASS` and every unknown op share the fallthrough arm.
             "DROP" => UnitAction::Drop,
             "PICKUP" => {
                 if items.len() < 2 {
@@ -335,7 +335,7 @@ impl Action {
 /// anything else is `None` (a `TypeError`/`ValueError` in the reference).
 pub fn py_int(value: &Value) -> Option<i64> {
     match value {
-        Value::Bool(b) => Some(*b as i64),
+        Value::Bool(b) => Some(i64::from(*b)),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Some(i)

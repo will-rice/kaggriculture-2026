@@ -1,4 +1,4 @@
-//! Checks against values recorded from CPython and the reference module.
+//! Checks against values recorded from `CPython` and the reference module.
 //!
 //! `tests/data/cpython_golden.json` is written by `tools/make_golden.py`
 //! against the installed `kaggle-environments`; regenerate it there rather
@@ -28,7 +28,7 @@ fn mt19937_words_match_cpython_for_every_recorded_seed() {
             .map(|w| w.as_u64().unwrap())
             .collect();
         for (index, want) in words.iter().enumerate() {
-            assert_eq!(rng.next_u32() as u64, *want, "seed {seed} word {index}");
+            assert_eq!(u64::from(rng.next_u32()), *want, "seed {seed} word {index}");
         }
     }
 }

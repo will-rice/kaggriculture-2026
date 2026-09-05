@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use engine::agents;
 use engine::engine::day_rng;
 use engine::tables::{ANIMALS, CROPS, ITEMS, PRODUCTS, SHOPS_SORTED};
-use engine::{Action, Config, Engine, Item, PyRandom};
+use engine::{Action, Animal, Config, Crop, Engine, Item, PyRandom, Shop};
 
 /// Convert a JSON value into the equivalent Python object.
 fn to_py<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
@@ -434,11 +434,11 @@ fn kaggriculture_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(starter_agent, m)?)?;
     m.add_function(wrap_pyfunction!(random_agent, m)?)?;
     let names = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    m.add("PRODUCTS", names(&PRODUCTS.map(|item| item.name())))?;
-    m.add("ITEMS", names(&ITEMS.map(|item| item.name())))?;
-    m.add("CROPS", names(&CROPS.map(|crop| crop.name())))?;
-    m.add("ANIMALS", names(&ANIMALS.map(|animal| animal.name())))?;
-    m.add("SHOPS", names(&SHOPS_SORTED.map(|shop| shop.name())))?;
+    m.add("PRODUCTS", names(&PRODUCTS.map(Item::name)))?;
+    m.add("ITEMS", names(&ITEMS.map(Item::name)))?;
+    m.add("CROPS", names(&CROPS.map(Crop::name)))?;
+    m.add("ANIMALS", names(&ANIMALS.map(Animal::name)))?;
+    m.add("SHOPS", names(&SHOPS_SORTED.map(Shop::name)))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

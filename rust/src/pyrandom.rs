@@ -1,4 +1,4 @@
-//! A bit-exact port of CPython's `random.Random` for the calls the reference
+//! A bit-exact port of `CPython`'s `random.Random` for the calls the reference
 //! engine makes: `random()`, `choice()` and `getrandbits()`.
 //!
 //! The engine seeds one generator per day with
@@ -22,7 +22,7 @@ impl std::fmt::Debug for PyRandom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PyRandom")
             .field("index", &self.index)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -118,8 +118,8 @@ impl PyRandom {
 
     /// `random.random()`: a 53-bit float in `[0, 1)`.
     pub fn random(&mut self) -> f64 {
-        let a = (self.next_u32() >> 5) as f64;
-        let b = (self.next_u32() >> 6) as f64;
+        let a = f64::from(self.next_u32() >> 5);
+        let b = f64::from(self.next_u32() >> 6);
         (a * 67_108_864.0 + b) / 9_007_199_254_740_992.0
     }
 
@@ -129,11 +129,11 @@ impl PyRandom {
             return 0;
         }
         if k <= 32 {
-            return (self.next_u32() >> (32 - k)) as u64;
+            return u64::from(self.next_u32() >> (32 - k));
         }
         // CPython fills 32-bit words little-endian, least significant first.
-        let low = self.next_u32() as u64;
-        let high = (self.next_u32() >> (64 - k)) as u64;
+        let low = u64::from(self.next_u32());
+        let high = u64::from(self.next_u32() >> (64 - k));
         low | (high << 32)
     }
 

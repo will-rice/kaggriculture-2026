@@ -316,8 +316,8 @@ pub enum Shape {
 
 impl Shape {
     pub fn from_name(name: &str) -> Shape {
+        // `linear` and every unknown name share the fallthrough arm.
         match name {
-            "linear" => Shape::Linear,
             "sq" => Shape::Sq,
             "sqrt" => Shape::Sqrt,
             "log" => Shape::Log,
