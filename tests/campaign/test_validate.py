@@ -1,5 +1,6 @@
 """Everything that rejects a candidate before a game is scored."""
 
+import time
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,17 @@ Path('scribble.txt').write_text('x', encoding='utf-8')
 
 def agent(o, c=None):
     return {'farmer': ['PASS'], 'hands': [], 'market': []}
+"""
+
+# Exits while loading: a Python-level failure with no verdict to report, which
+# must read as a crash the moment the child is gone, not as slowness after the
+# whole cap has elapsed.
+EXITING_AGENT = """
+def agent(o, c=None):
+    return {'farmer': ['PASS'], 'hands': [], 'market': []}
+
+
+raise SystemExit(3)
 """
 
 
@@ -178,3 +190,16 @@ def test_what_a_candidate_writes_while_loading_lands_in_a_scratch_directory(
 
     assert validate.validate(agent, steps=3).status == "ok"
     assert list(workspace.iterdir()) == []
+
+
+def test_a_candidate_that_exits_while_loading_is_a_crash_not_slow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead child is reported at once and as what it was."""
+    monkeypatch.setattr(config, "CHECK_TIMEOUT_SECONDS", 30)
+    started = time.monotonic()
+
+    verdict = validate.validate(write(tmp_path, EXITING_AGENT))
+
+    assert verdict.status == "crashed" and "exited with code 3" in verdict.reason
+    assert time.monotonic() - started < 15

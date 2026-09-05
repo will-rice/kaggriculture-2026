@@ -302,6 +302,9 @@ def test_the_epoch_gets_the_whole_core_budget(
 
     monkeypatch.setattr(loop, "epoch", spy_epoch)
     monkeypatch.setattr(loop, "_mutate", lambda *args: None)
+    # Distinct from the mutation share on every box, so a pass-through of
+    # ``workers`` cannot satisfy the assertion by coincidence.
+    monkeypatch.setattr(config, "CORE_BUDGET", 7)
 
     loop.iterate(
         loop.State(),
@@ -313,7 +316,7 @@ def test_the_epoch_gets_the_whole_core_budget(
         rng=random.Random(0),
     )
 
-    assert seen == [config.CORE_BUDGET]
+    assert seen == [7]
 
 
 def _write(path: Path, source: str) -> Path:

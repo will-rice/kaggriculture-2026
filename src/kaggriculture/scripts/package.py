@@ -15,7 +15,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from kaggriculture.campaign import config, harness
+from kaggriculture.campaign import config, harness, validate
 
 REPO_ROOT = config.ROOT
 ENTRYPOINT = config.SERVED
@@ -52,7 +52,7 @@ def build(output: Path = SUBMISSION, *, entrypoint: Path = ENTRYPOINT) -> Path:
 
 
 def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
-    """Raise unless the last callable in the entrypoint is its agent.
+    """Raise unless the entrypoint passes the candidate gate.
 
     ``kaggle_environments`` plays whatever callable is defined last, so
     anything appended below the agent is served instead of the agent, and the
@@ -62,33 +62,19 @@ def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
     Checked here rather than only in a test because this file is written by
     automation: the gate overwrites it on every promotion, and a subagent
     decoding a public kernel already clobbered it once by executing a
-    notebook cell. A test reports the damage; a build that refuses means a
-    broken archive cannot exist to be uploaded.
+    notebook cell. The check is `validate.validate`, the same gate every
+    candidate passes, and it executes the file only inside that gate's child
+    process and scratch directory -- never in the caller's.
 
     Args:
         entrypoint: The ``main.py`` that will ship, checked as it sits.
 
     Raises:
-        RuntimeError: If the entrypoint binds no ``agent``, or if some other
-            callable is defined after it.
+        RuntimeError: If the entrypoint fails any check, the shadowed-agent
+            check included.
     """
-    source = entrypoint.read_text()
-    namespace: dict[str, object] = {}
-    exec(compile(source, str(entrypoint), "exec"), namespace)  # noqa: S102
-    agent = namespace.get("agent")
-    if agent is None:
-        raise RuntimeError(f"{entrypoint} binds no `agent`; nothing would play")
-    served = next(
-        (value for value in reversed(tuple(namespace.values())) if callable(value)),
-        None,
-    )
-    if served is not agent:
+    verdict = validate.validate(entrypoint)
+    if verdict.status != "ok":
         raise RuntimeError(
-            f"{entrypoint} defines {getattr(served, '__name__', served)!r} after "
-            "its agent, so the runner would play that instead. Move it above the "
-            "agent import or into the package."
+            f"{entrypoint} must not ship: {verdict.status}: {verdict.reason}"
         )
-
-
-if __name__ == "__main__":
-    main()

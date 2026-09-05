@@ -1,5 +1,5 @@
-// Adopted unmodified from the Kaggle kernel yhay81/three-day-shop-router,
-// Apache-2.0; see NOTICE.
+// Adopted from the Kaggle kernel yhay81/three-day-shop-router, Apache-2.0,
+// unchanged apart from this comment; see NOTICE.
 // Kaggriculture simulator — a C++ port of kaggriculture.py from
 // kaggle-environments 1.32.7.
 // Official source SHA256:

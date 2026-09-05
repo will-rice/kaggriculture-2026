@@ -132,6 +132,23 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
     assert "champion_1" in saved.names() and saved.weights["b"] > saved.weights["a"]
 
 
+def test_promote_refuses_a_champion_name_the_directory_already_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuilt pool must not overwrite -- or trip over -- an older champion file."""
+    program = _program_and_pool(tmp_path, monkeypatch)
+    p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
+    config.CHAMPIONS.mkdir(parents=True)
+    stale = config.CHAMPIONS / "champion_1.py"
+    stale.write_text("# an older champion\n", encoding="utf-8")
+    stale.chmod(0o444)
+
+    with pytest.raises(FileExistsError, match="champion_1.py already exists"):
+        gate.promote(program, result("p9", 0.7, 0.65, {"a": 0.9}), p, commit=False)
+    assert stale.read_text() == "# an older champion\n"
+    assert not (config.FLOOR / "main.py").exists()
+
+
 def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

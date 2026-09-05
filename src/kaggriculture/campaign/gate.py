@@ -128,6 +128,11 @@ def promote(
 
     config.CHAMPIONS.mkdir(parents=True, exist_ok=True)
     champion = config.CHAMPIONS / f"{name}.py"
+    if champion.exists():
+        raise FileExistsError(
+            f"{champion} already exists: the pool and the champions directory "
+            "disagree about how many champions there have been"
+        )
     champion.write_text(source, encoding="utf-8")
     champion.chmod(0o444)
 

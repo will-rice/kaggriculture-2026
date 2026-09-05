@@ -51,6 +51,9 @@ def build() -> Path:
     ]
     LOGGER.info("building %s", target.name)
     target.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(command, check=True)
-    scratch.replace(target)
+    try:
+        subprocess.run(command, check=True)
+        scratch.replace(target)
+    finally:
+        scratch.unlink(missing_ok=True)
     return target

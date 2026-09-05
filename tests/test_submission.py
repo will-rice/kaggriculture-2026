@@ -4,7 +4,6 @@ import tarfile
 from pathlib import Path
 
 import pytest
-from kaggle_environments.agent import get_last_callable
 
 from kaggriculture.campaign import harness
 from kaggriculture.scripts.package import (
@@ -19,18 +18,10 @@ def test_entrypoint_exposes_the_agent_last() -> None:
 
     The invariant is about position, not identity -- appending a helper below
     the import silently ships that helper as the agent, and the episode fails
-    on turn zero with no clue why. So this compares the last callable against
-    whatever the served file binds to ``agent``, and stays true whichever
-    agent we serve, including one the gate wrote. Identity is checked by the
-    build guard, which execs the file once and compares objects; here the
-    same file is put through Kaggle's own loader, which execs it again, so
-    only the name survives to be compared.
+    on turn zero with no clue why. The served file is evolved code, so it is
+    never executed here: the build guard puts it through the candidate gate,
+    whose dynamic half runs in a child process in a scratch directory.
     """
-    source = ENTRYPOINT.read_text()
-
-    last = get_last_callable(source, path=str(ENTRYPOINT))
-
-    assert getattr(last, "__name__", None) == "agent"
     _refuse_a_shadowed_entrypoint(ENTRYPOINT)
 
 
@@ -78,7 +69,7 @@ def test_the_build_refuses_a_shadowed_entrypoint(tmp_path: Path) -> None:
         "    return None\n"
     )
 
-    with pytest.raises(RuntimeError, match="after its agent"):
+    with pytest.raises(RuntimeError, match="shadowed by"):
         _refuse_a_shadowed_entrypoint(entrypoint)
 
 
@@ -87,7 +78,7 @@ def test_the_build_refuses_an_entrypoint_with_no_agent(tmp_path: Path) -> None:
     entrypoint = tmp_path / "main.py"
     entrypoint.write_text("def helper():\n    return None\n")
 
-    with pytest.raises(RuntimeError, match="binds no"):
+    with pytest.raises(RuntimeError, match="no top-level function named agent"):
         _refuse_a_shadowed_entrypoint(entrypoint)
 
 
@@ -106,5 +97,5 @@ def test_build_refuses_a_same_named_but_different_final_callable(
         "agent = real_agent\n"
     )
 
-    with pytest.raises(RuntimeError, match="after its agent"):
+    with pytest.raises(RuntimeError, match="shadowed by"):
         _refuse_a_shadowed_entrypoint(entrypoint)

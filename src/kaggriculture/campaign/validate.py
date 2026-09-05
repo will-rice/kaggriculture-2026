@@ -31,6 +31,7 @@ import multiprocessing
 import os
 import queue
 import tempfile
+import time
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Literal
@@ -259,7 +260,8 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
         steps: How many turns `harness.check` plays before stopping.
 
     Returns:
-        The child's verdict, or `too_slow` if it did not finish in time.
+        The child's verdict; `too_slow` if it did not finish in time;
+        `crashed` if the child exited without reporting one.
     """
     context = multiprocessing.get_context("spawn")
     results: "Queue[dict]" = context.Queue()
@@ -267,15 +269,32 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
         target=_dynamic_child, args=(str(agent.resolve()), steps, results)
     )
     process.start()
-    try:
-        payload = results.get(timeout=config.CHECK_TIMEOUT_SECONDS)
-    except queue.Empty:
-        process.kill()
-        process.join()
-        return Verdict(
-            status="too_slow",
-            reason=f"check exceeded {config.CHECK_TIMEOUT_SECONDS}s",
-        )
+    deadline = time.monotonic() + config.CHECK_TIMEOUT_SECONDS
+    while True:
+        # Poll in short slices so a child that dies without reporting -- a
+        # module-level ``SystemExit``, a native crash, a failed spawn -- is
+        # seen at once instead of being read as slow after the whole cap.
+        try:
+            payload = results.get(
+                timeout=min(1.0, max(0.0, deadline - time.monotonic()))
+            )
+            break
+        except queue.Empty:
+            if process.exitcode is not None:
+                return Verdict(
+                    status="crashed",
+                    reason=(
+                        f"check process exited with code {process.exitcode} "
+                        "before reporting"
+                    ),
+                )
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.join()
+                return Verdict(
+                    status="too_slow",
+                    reason=f"check exceeded {config.CHECK_TIMEOUT_SECONDS}s",
+                )
     process.join()
     return Verdict.model_validate(payload)
 

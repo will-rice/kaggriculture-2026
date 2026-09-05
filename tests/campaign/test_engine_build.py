@@ -54,6 +54,25 @@ def test_a_compile_is_never_visible_at_the_target_until_it_is_whole(
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_a_failed_compile_leaves_no_scratch_library_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The private output path is cleaned up when the compiler fails."""
+    target = tmp_path / "engine.so"
+    monkeypatch.setattr(config, "ENGINE_LIBRARY", target)
+
+    def failing_compile(command: list[str], check: bool) -> subprocess.CompletedProcess:
+        """Write a partial output, then fail as g++ would."""
+        Path(command[command.index("-o") + 1]).write_bytes(b"partial")
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(build.subprocess, "run", failing_compile)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        build.build()
+    assert list(tmp_path.iterdir()) == []
+
+
 def _build_into(target: Path) -> None:
     """Point this process's config at ``target`` and build. Runs after a fork."""
     config.ENGINE_LIBRARY = target
