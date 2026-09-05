@@ -73,16 +73,15 @@ MARKET_OPS: list[str] = [
 # One codex session per worker; eight fit the machine beside their
 # evaluations. Spec section 8.
 SESSIONS = 8
-CROSS_PROBABILITY = 0.3
 FAST_SEEDS = 4  # x both seats x every pool opponent
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
 DEEP_TOP_K = 3
 # Deep evaluations in flight at once. Each is about ten minutes of games.
 DEEP_CONCURRENCY = 2
-CHAMPION_WEIGHT = 0.20
 POOL_CAP = 10
+# A joining champion retires the opponent it beats at least this
+# decisively, if the pool is full.
 RETIRE_THRESHOLD = 0.95
-WEAKNESS_CAP = 0.5
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40

@@ -1,8 +1,11 @@
 """The one place a candidate becomes the floor.
 
-The promotion rule is the spec's §5.2: the candidate's lower Wilson bound
-above the champion's point estimate, the vendored field not down more than
-two points, no opponent regressed beyond the wider of the two intervals.
+The promotion rule is one question: does this candidate beat every opponent
+in the pool? A champion is two things at once -- the program we would submit
+and a gatekeeper every later candidate has to get past -- and a program that
+loses to four of the six vendored kernels is no good as either. Nothing is
+compared with the champion, because the champion is in the pool: beating it
+is part of beating them all.
 
 A promotion also produces the artefact a cut uploads: the program is
 packaged into `champions/<name>.tar.gz`, so a cut is one command -- upload
@@ -41,8 +44,6 @@ from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
 
-FIELD_TOLERANCE = 0.02
-
 
 class Champion(BaseModel):
     """The promoted floor, as ``config.CHAMPION`` records it.
@@ -50,15 +51,14 @@ class Champion(BaseModel):
     ``record`` writes it the moment the champion is in the pool, and it is
     preferred over ``state.json`` on restart: ``state.json`` is written after
     every completed session, so a kill in between would otherwise lose the
-    champion and let the gate promote a second time against no baseline.
+    champion the pool file already names.
 
     Attributes:
         name: The champion's pool name, e.g. "champion_3".
         path: The immutable copy under ``config.CHAMPIONS`` the pool plays.
         tarball: The archive a cut uploads, written by this promotion.
-        result: The deep evaluation this champion carries -- the one the
-            promotion was decided on, and then the re-score on the pool that
-            promotion changed, which is the bar the next candidate must beat.
+        result: The deep evaluation it was promoted on, which is also what a
+            session is shown of the program it starts from.
     """
 
     name: str
@@ -67,73 +67,31 @@ class Champion(BaseModel):
     result: DeepResult
 
 
-def promotion(candidate: DeepResult, champion: DeepResult | None) -> tuple[bool, str]:
-    """Whether ``candidate`` replaces ``champion``, and why not if not.
+def promotion(candidate: DeepResult) -> tuple[bool, str]:
+    """Whether ``candidate`` becomes the floor: it beats every pool opponent.
 
-    Four clauses, cheapest and most explanatory first: the lower bound, the
-    field, the worst matchup, and the per-opponent regression.
+    One clause, absolute. A rate is over the sealed exam block in both seats,
+    and "beats" means strictly more than half of those games: a dead heat at
+    0.5 is not a win and does not pass. Held-out opponents are measured and
+    logged but never part of this -- they are the generalisation number, not
+    the bar.
 
-    The worst-matchup clause is a maximin ratchet, and it is here because
-    fitness is a weighted mean and this game is not transitive. A mean lets a
-    candidate buy a promotion by crushing whatever carries weight while
-    losing badly to something else, and the finale is a wide field where one
-    hard counter is exactly the risk that matters. Requiring the candidate's
-    worst per-opponent rate to be at least the champion's means the floor
-    only ever rises: a good matchup can never be traded for a bad one,
-    however high the average. It costs nothing early, because the first
-    champion needs no comparison and its own worst rate starts near zero.
-
-    Both that clause and the per-opponent one compare rates rather than
-    interval bounds -- deliberately, so they are comparable with each other
-    and with the champion's own result, which was measured the same way --
-    and both compare only over the opponents the two results have in common,
-    because the pool changes between measurements.
+    The reason names every opponent the candidate failed to beat and its rate
+    against each, because when nothing is promoting for a week that list is
+    what says why.
 
     Args:
         candidate: The deep result of the program under consideration.
-        champion: The deep result of the current floor, or None if there is
-            no champion yet.
 
     Returns:
-        Whether to promote, and a reason (why not, or "promoted").
+        Whether to promote, and a reason (why not, or "beat every opponent").
     """
-    if champion is None:
-        return True, "no champion yet"
-    if candidate.low <= champion.score:
-        return (
-            False,
-            f"lower bound {candidate.low:.3f} <= champion {champion.score:.3f}",
+    lost = sorted((name, rate) for name, rate in candidate.rates.items() if rate <= 0.5)
+    if lost:
+        return False, "did not beat " + ", ".join(
+            f"{name} at {rate:.3f}" for name, rate in lost
         )
-    if candidate.field < champion.field - FIELD_TOLERANCE:
-        return (
-            False,
-            f"field {candidate.field:.3f} < "
-            f"champion {champion.field:.3f} - {FIELD_TOLERANCE}",
-        )
-    both = [name for name in champion.rates if name in candidate.rates]
-    if both:
-        worst = min(both, key=lambda name: candidate.rates[name])
-        floor = min(both, key=lambda name: champion.rates[name])
-        if candidate.rates[worst] < champion.rates[floor]:
-            return (
-                False,
-                f"worst matchup {worst} at {candidate.rates[worst]:.3f}, under "
-                f"the champion's floor of {champion.rates[floor]:.3f} vs {floor}",
-            )
-    for name, rate in champion.rates.items():
-        if name not in candidate.rates:
-            continue
-        width = max(
-            champion.intervals[name][1] - champion.intervals[name][0],
-            candidate.intervals[name][1] - candidate.intervals[name][0],
-        )
-        if candidate.rates[name] < rate - width:
-            return (
-                False,
-                f"regressed against {name}: {candidate.rates[name]:.3f} < "
-                f"{rate:.3f} - {width:.3f}",
-            )
-    return True, "promoted"
+    return True, "beat every opponent"
 
 
 def promote(program: Program, result: DeepResult) -> Champion:
@@ -198,7 +156,7 @@ def promote(program: Program, result: DeepResult) -> Champion:
 
 
 def enroll(champion: Champion, pool: Pool) -> None:
-    """Put ``champion`` in the pool and press on its weakest opponent.
+    """Put ``champion`` in the pool, as a gatekeeper every later candidate faces.
 
     Mutates ``pool`` in place, so it belongs on whichever thread owns it --
     for the campaign, the event loop. The save follows immediately, so
@@ -209,9 +167,13 @@ def enroll(champion: Champion, pool: Pool) -> None:
         champion: The record ``promote`` returned.
         pool: The opponent pool, updated and saved in place.
     """
-    pool.add_champion(champion.name, champion.path, champion.result.rates)
-    pool.apply_weakness_pressure(pool.weakest(champion.result.rates))
+    retired = pool.add_champion(champion.name, champion.path, champion.result.rates)
     pool.save(config.POOL)
+    LOGGER.info(
+        "%s joined the pool%s",
+        champion.name,
+        f", retiring {retired}" if retired else "",
+    )
 
 
 def record(champion: Champion) -> Champion:

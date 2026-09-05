@@ -74,8 +74,7 @@ opponent's. Your agent is ours.
 # FAMOU appendix C.2's five rewrite instructions. One is drawn per session,
 # so eight sessions starting from the same champion are pushed eight
 # different ways. The caller draws the pair, records the name on the program
-# it produces, and hands ``build_sandbox`` the text; a crossover session is
-# handed CROSS the same way.
+# it produces, and hands ``build_sandbox`` the text.
 INSTRUCTIONS: tuple[tuple[str, str], ...] = (
     ("improve", "Improve child.py's performance against the pool."),
     (
@@ -97,19 +96,14 @@ INSTRUCTIONS: tuple[tuple[str, str], ...] = (
     ),
 )
 
-CROSS = (
-    "Fold the strongest ideas of inspiration.py into child.py. Say in the "
-    "docstring which idea came from which and why the combination should beat "
-    "both. Do not modify inspiration.py."
-)
-
 # Every instruction is wrapped in these at build time, so the bar, the
 # doctrine and the budget are stated once and cannot drift between variants.
 PREAMBLE = """Read AGENTS.md and feedback.md, then child.py.
 
 child.py is the champion, and it is the file you edit. Keep editing it in
-place until it clears the bar feedback.md states, testing it with the
-harness as you go. Stop as soon as it clears both parts of the bar.
+place until it clears the bar feedback.md states -- beating every opponent
+in the pool -- testing it with the harness as you go. Stop as soon as it
+does.
 
 Your instruction for this session:
 
@@ -118,8 +112,8 @@ Your instruction for this session:
 POSTAMBLE = """
 
 Keep what the feedback says is winning; change what is losing, and say in a
-docstring at the top of child.py what you changed and why. The weakest
-opponent named in feedback.md is where the score moves most.
+docstring at the top of child.py what you changed and why. The opponents
+feedback.md says the champion does not beat are the ones to fix.
 
 Do not read, request, or reconstruct any opponent's source; the gate rejects
 code resembling any opponent's.
@@ -151,56 +145,57 @@ def _strip_stale_harness(text: str) -> str:
 
 
 def _feedback_lines(
-    bar: dict[str, float],
-    rates: dict[str, float],
-    weights: dict[str, float],
-    weakest: str,
-    failures: list[str],
-    started_from: str,
+    rates: dict[str, float], failures: list[str], started_from: str
 ) -> list[str]:
-    """Render the bar, the champion's rates, the pool weights, and past failures.
+    """Render the bar, the champion against each opponent, and past failures.
+
+    The bar is one thing now, and it is absolute: win more than half the
+    games against every opponent in the pool. The champion is one of those
+    opponents, so beating it is part of the same sentence rather than a
+    second clause -- and the opponents the champion itself does not beat are
+    named, because those are the ones standing between this lineage and a
+    promotion.
 
     Args:
-        bar: What the edit has to beat; ``bar["fitness"]`` is the champion's
-            weighted pool fitness.
-        rates: The champion's fast-eval win rate per opponent name.
-        weights: The pool weight per opponent name.
-        weakest: The name of the pool's weakest opponent, or "" if unknown.
+        rates: The champion's win rate per pool opponent name.
         failures: Recent failure descriptions from this lineage.
-        started_from: The champion's id, which is also its pool opponent name.
+        started_from: The champion's name, which is also its pool opponent
+            name once it has been promoted.
 
     Returns:
         Lines of a markdown document naming opponents only, never paths.
     """
+    losing = [name for name, rate in rates.items() if rate <= 0.5]
     lines = [
         "# Feedback on child.py",
         "",
         "## The bar",
         "",
-        f"child.py is the champion `{started_from}`. Keep editing it until it "
-        "clears both of these, and stop as soon as it does:",
+        f"child.py is `{started_from}`. Keep editing it until it beats every "
+        "opponent below -- more than half the games against each, over both "
+        "seats -- and stop as soon as it does. Nothing else is measured: an "
+        "average over the pool promotes nothing.",
         "",
-        f"1. A weighted pool fitness above **{bar['fitness']:.4f}**, the "
-        "champion's, measured over every opponent in the table below.",
-        "2. A winning head-to-head record against the champion itself, which "
-        f"is the pool opponent named `{started_from}`.",
-        "",
-        "Both, because the game is non-transitive: an edit told only to beat "
-        "the champion breeds a champion-counter. An edit that clears the first "
-        "alone is still worth writing.",
+        f"`{started_from}` is itself one of those opponents, so a child has to "
+        "beat what it was edited from as well.",
         "",
         "## The champion against the pool",
         "",
-        "| opponent | champion win rate | weight |",
-        "| --- | --- | --- |",
+        "| opponent | champion win rate |",
+        "| --- | --- |",
     ]
+    lines += [f"| {name} | {rate:.3f} |" for name, rate in rates.items()]
     lines += [
-        f"| {name} | {rates.get(name, float('nan')):.3f} "
-        f"| {weights.get(name, 0.0):.2f} |"
-        for name in weights
+        "",
+        (
+            "The champion does not beat: "
+            + ", ".join(f"**{name}**" for name in losing)
+            + ". Those are what a promotion turns on."
+            if losing
+            else "The champion beats every opponent above; the bar is holding "
+            "all of that while beating the champion too."
+        ),
     ]
-    if weakest:
-        lines += ["", f"Weakest opponent: **{weakest}**."]
     if failures:
         lines += ["", "Recent failures in this lineage (do not repeat):"]
         lines += [f"- {failure}" for failure in failures]
@@ -232,11 +227,7 @@ def build_sandbox(
     program_id: str,
     champion: Path,
     instruction: str,
-    inspiration: Path | None,
-    bar: dict[str, float],
     rates: dict[str, float],
-    weights: dict[str, float],
-    weakest: str,
     failures: list[str],
     started_from: str,
 ) -> Path:
@@ -250,13 +241,8 @@ def build_sandbox(
         program_id: The child program id; also the sandbox's directory name.
         champion: Path to the champion's program file, copied in as child.py.
         instruction: The drawn instruction's text — one of ``INSTRUCTIONS``'
-            second elements, or ``CROSS``. It is recorded in PROMPT.md.
-        inspiration: Path to the crossover partner's program file, or None.
-        bar: What the edit has to beat; ``bar["fitness"]`` is the champion's
-            weighted pool fitness.
-        rates: The champion's fast-eval win rate per pool opponent name.
-        weights: The pool weight per opponent name.
-        weakest: The pool's weakest opponent name, or "" if unknown.
+            second elements. It is recorded in PROMPT.md.
+        rates: The champion's win rate per pool opponent name.
         failures: Recent failure descriptions from this lineage.
         started_from: The champion's id, which is also its pool opponent name.
 
@@ -283,11 +269,9 @@ def build_sandbox(
     # pool plays, and `shutil.copy` carries that mode across. This copy is
     # the one file the session must be able to write.
     child.chmod(0o644)
-    if inspiration is not None:
-        shutil.copy(inspiration, box / "inspiration.py")
     shutil.copy(engine_module.__file__, box / "engine" / "kaggriculture.py")
 
-    lines = _feedback_lines(bar, rates, weights, weakest, failures, started_from)
+    lines = _feedback_lines(rates, failures, started_from)
     (box / "feedback.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     (box / "PROMPT.md").write_text(PREAMBLE + instruction + POSTAMBLE, encoding="utf-8")

@@ -150,10 +150,7 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def pass_pool(tmp_path: Path) -> pool.Pool:
     """A saved one-opponent pool whose opponent is a PASS agent."""
-    opponents = pool.Pool(
-        opponents={"pass": str(_write(tmp_path / "pass.py", PASS))},
-        weights={"pass": 1.0},
-    )
+    opponents = pool.Pool(opponents={"pass": str(_write(tmp_path / "pass.py", PASS))})
     opponents.save(config.POOL)
     return opponents
 
@@ -172,15 +169,14 @@ def strong_champion(tmp_path: Path) -> gate.Champion:
         opponents={
             "pass": str(_write(tmp_path / "pass.py", PASS)),
             "champion_1": str(kept),
-        },
-        weights={"pass": 0.5, "champion_1": 0.5},
+        }
     )
     opponents.save(config.POOL)
     champion = gate.Champion(
         name="champion_1",
         path=str(kept),
         tarball=str(tmp_path / "champion_1.tar.gz"),
-        result=_deep_result("champion_1", {"pass": 1.0, "champion_1": 0.5}, score=1.0),
+        result=_deep_result("champion_1", {"pass": 1.0}, score=1.0),
     )
     config.CHAMPION.parent.mkdir(parents=True, exist_ok=True)
     config.CHAMPION.write_text(champion.model_dump_json(), encoding="utf-8")
@@ -196,9 +192,9 @@ def stub_evaluator(
     Both evaluations are patched on the module rather than injected, because
     the alternative is a parameter on ``run`` that exists only for tests.
     Score is the source's length, so a child ranks above the shorter program
-    it was edited from by construction rather than by luck, and every rate is
-    keyed by the pool the evaluation was actually handed -- which is what
-    tells a re-scored champion from a frozen one.
+    it was edited from by construction rather than by luck, and the rates are
+    keyed by the pool the evaluation was handed, reduced through the real
+    `evaluator.opponents` so a champion here does not play itself either.
 
     Args:
         monkeypatch: The test's patcher.
@@ -215,12 +211,17 @@ def stub_evaluator(
         return min(0.99, len(agent.read_text(encoding="utf-8")) / 1000)
 
     def fast(
-        agent: Path, opponents: pool.Pool, rng: random.Random, workers: int
+        agent: Path,
+        program_id: str,
+        opponents: pool.Pool,
+        rng: random.Random,
+        workers: int,
     ) -> evaluator.FastResult:
         """The fast evaluation's shape, without its games."""
+        measured = evaluator.opponents(opponents, program_id, agent)
         rate = score(agent)
         return evaluator.FastResult(
-            fitness=rate, rates=dict.fromkeys(opponents.names(), rate), seeds=[1]
+            fitness=rate, rates=dict.fromkeys(measured.names(), rate), seeds=[1]
         )
 
     def deep(
@@ -230,7 +231,8 @@ def stub_evaluator(
         scored.append(program_id)
         if deep_crashes:
             raise RuntimeError("the candidate raised in its own seat")
-        return _deep_result(program_id, dict.fromkeys(opponents.names(), score(agent)))
+        measured = evaluator.opponents(opponents, program_id, agent)
+        return _deep_result(program_id, dict.fromkeys(measured.names(), score(agent)))
 
     monkeypatch.setattr(evaluator, "fast", fast)
     monkeypatch.setattr(evaluator, "deep", deep)
@@ -326,7 +328,12 @@ def test_a_better_child_is_deep_scored_and_promoted(
     assert champion.name in pool.Pool.load(config.POOL).names()
     assert gate.load_champion() == champion
     promotions = [record for record in deeps_of(records) if record["deep/promoted"]]
-    assert len(promotions) == 1 and promotions[0]["deep/score"] > 0.5
+    assert promotions and all(record["deep/score"] > 0.5 for record in promotions)
+    # The champion carries the result it was promoted on: a program the
+    # database holds, measured on the exam block, and what a session is then
+    # shown of the program it starts from.
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert champion.result.program_id in {p.id for p in database.programs}
     assert [record["sessions"] for record in sessions_of(records)] == [1, 2]
 
 
@@ -392,11 +399,13 @@ def test_the_seed_is_never_deep_scored_or_promoted(
     )
 
     assert config.DEEP_TOP_K == 3
-    # The child, then the champion it became being re-scored: never the seed,
-    # which was the best program in the database the whole time.
-    assert loop.SEED_ID not in scored
-    assert state.champion is not None
-    assert Path(state.champion.path).read_text() == PASS
+    # One deep evaluation, and it is the child's: never the seed's, though the
+    # seed was the best program in the database the whole time.
+    assert loop.SEED_ID not in scored and len(scored) == 1
+    # And nothing was promoted, because that child beats nobody -- which is
+    # what the seed would have been promoted on if it had been confirmed.
+    assert state.champion is None
+    assert not (config.FLOOR / "main.py").exists()
 
 
 def test_a_deep_evaluation_that_crashes_is_not_retried(
@@ -513,19 +522,21 @@ def test_a_program_is_deep_scored_once(
     assert sorted(scored) == sorted(set(scored))
 
 
-def test_the_champion_is_rescored_after_a_promotion(
+def test_a_promotion_costs_exactly_one_deep_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """The baseline is measured on the pool the promotion itself changed.
+    """Nothing is measured twice to promote once.
 
-    A champion's result at promotion was computed before it joined the pool,
-    before the weights renormalised and before weakness pressure moved them.
-    The rates it carries name the opponents it actually played, which is how
-    a frozen baseline and a fresh one tell each other apart.
+    The champion used to be re-scored after joining the pool, so that the
+    number a candidate was compared against had been measured on the pool as
+    it then stood. Nothing is compared against the champion any more -- the
+    gate asks only whether a candidate beat every opponent -- so that second
+    exam block bought nothing, and it cost ten minutes of the only two deep
+    slots there are.
     """
     tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path)
-    stub_evaluator(monkeypatch)
+    scored = stub_evaluator(monkeypatch)
 
     state = loop.run(
         sessions=1,
@@ -536,8 +547,8 @@ def test_the_champion_is_rescored_after_a_promotion(
         log=log,
     )
 
-    assert state.champion is not None
-    assert set(state.champion.result.rates) == {"pass", "champion_1"}
+    assert state.champion is not None and state.champion.name == "champion_1"
+    assert len(scored) == 1 and scored[0] == state.champion.result.program_id
 
 
 def test_the_pool_is_changed_on_the_loop_thread(
@@ -547,8 +558,8 @@ def test_the_pool_is_changed_on_the_loop_thread(
 
     ``gate.promote`` blocks for as long as packaging takes, so it runs in a
     thread. The pool is a different matter: it is the one object every other
-    session is reading -- `session` for its weights, `evaluate` for the copy
-    an evaluation keeps -- and adding a champion to it rebuilds those dicts.
+    session is reading -- `session` for the names it shows, `evaluate` for
+    the copy an evaluation keeps -- and adding a champion rebuilds that dict.
     Off the loop that is a dictionary changing size while a coroutine walks
     it, which is a run that dies or a score against a pool that never was.
     """
@@ -655,8 +666,7 @@ def test_a_broken_pool_opponent_stops_the_run(
     """An opponent crashing in its own seat halts the loop rather than the lineage."""
     tiny_run(tmp_path, monkeypatch)
     crasher = pool.Pool(
-        opponents={"crasher": str(_write(tmp_path / "crasher.py", CRASHER))},
-        weights={"crasher": 1.0},
+        opponents={"crasher": str(_write(tmp_path / "crasher.py", CRASHER))}
     )
     crasher.save(config.POOL)
     # A cold start would evaluate the seed against this pool before the loop

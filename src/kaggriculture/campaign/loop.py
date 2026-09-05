@@ -60,8 +60,8 @@ DEEP_FAILURE = "deep: "
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
     "SESSIONS SESSION_LIMIT_SECONDS GAME_LIMIT_SECONDS FAST_SEEDS DEEP_TOP_K "
-    "DEEP_CONCURRENCY CHAMPION_WEIGHT POOL_CAP RETIRE_THRESHOLD WEAKNESS_CAP "
-    "STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
+    "DEEP_CONCURRENCY POOL_CAP RETIRE_THRESHOLD STAGNATION_SESSIONS "
+    "CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
 
 # Prepended to the instruction under stagnation, so PROMPT.md says that this
@@ -179,7 +179,7 @@ def run(
     pool.save(config.POOL)
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
     if not database.programs:
-        seed = evaluator.fast(seed_agent, pool, rng, workers)
+        seed = evaluator.fast(seed_agent, SEED_ID, pool, rng, workers)
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
         database.add(_program(SEED_ID, stored, "", "seed", seed))
         LOGGER.info("seeded from %s at fast fitness %.3f", seed_agent, seed.fitness)
@@ -236,8 +236,8 @@ class Campaign:
         # A promotion renumbers the pool, writes the floor and re-scores the
         # champion; two gates doing that at once would race on all three.
         self.promotions = asyncio.Lock()
-        # Programs whose deep evaluation is in flight: their result is not in
-        # the database yet, so without this the next session gates them again.
+        # Programs the gate has taken: in flight, or crashed on the exam
+        # block. Neither has a result, so `gated` would send them again.
         self.gating: set[str] = set()
         self.group = asyncio.TaskGroup()
 
@@ -290,7 +290,7 @@ class Campaign:
         """
         program_id = f"p{uuid.uuid4().hex[:12]}"
         stagnant = self.state.sessions_since_promotion >= config.STAGNATION_SESSIONS
-        source, name, bar, rates = self.start(stagnant)
+        source, name, rates = self.start(stagnant)
         drawn, instruction = self.rng.choice(prompt.INSTRUCTIONS)
         if stagnant:
             note = STAGNATION_NOTE.format(
@@ -301,11 +301,7 @@ class Campaign:
             program_id,
             source,
             instruction,
-            None,
-            {"fitness": bar},
             rates,
-            self.pool.weights,
-            self.pool.weakest(rates) if rates else "",
             [f.reason for f in self.database.failures(name)][-3:],
             name,
         )
@@ -332,6 +328,7 @@ class Campaign:
             result = await asyncio.to_thread(
                 evaluator.fast,
                 stored,
+                program_id,
                 self.snapshot(),
                 random.Random(self.rng.random()),
                 self.workers,
@@ -374,14 +371,19 @@ class Campaign:
     async def gate(self, program: archive.Program) -> None:
         """Section 5: the sealed block, the promotion rule, and what follows a yes.
 
-        A promoted champion is re-scored on the pool its own promotion just
-        changed -- it is in that pool now, the weights renormalised and
-        weakness pressure moved them -- and that is the number the next
-        candidate is compared against.
+        The rule is absolute -- beat every pool opponent -- so a promotion
+        needs no measurement of the champion it replaces, and the result a
+        champion carries is the one it was promoted on.
         """
         try:
             async with self.deep:
-                result = await self.measure(Path(program.source_path), program.id)
+                result = await asyncio.to_thread(
+                    evaluator.deep,
+                    Path(program.source_path),
+                    program.id,
+                    self.snapshot(),
+                    self.workers,
+                )
         except OpponentCrash:
             raise
         except RuntimeError as error:
@@ -393,40 +395,28 @@ class Campaign:
         self.database.record_deep(program.id, result)
         async with self.promotions:
             baseline = self.state.champion
-            verdict, why = gate.promotion(result, baseline.result if baseline else None)
+            verdict, why = gate.promotion(result)
             LOGGER.info("%s deep %.4f: %s", program.id, result.score, why)
             if verdict:
                 # The file work in a thread; the pool it joins on the loop,
                 # where the other seven workers are reading it.
                 champion = await asyncio.to_thread(gate.promote, program, result)
                 gate.enroll(champion, self.pool)
-                gate.record(champion)
+                self.state.champion = gate.record(champion)
+                self.state.sessions_since_promotion = 0
                 artifact = wandb.Artifact(
                     champion.name, "champion", metadata=result.model_dump()
                 )
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
-                async with self.deep:
-                    rescored = await self.measure(Path(champion.path), champion.name)
-                # Both files carry it, so a restart resumes on the real bar.
-                self.state.champion = gate.record(
-                    champion.model_copy(update={"result": rescored})
-                )
-                self.state.sessions_since_promotion = 0
         self.log.log(self.deep_record(result, verdict, baseline))
-
-    async def measure(self, agent: Path, program_id: str) -> DeepResult:
-        """One deep evaluation on the sealed exam block, in a thread."""
-        return await asyncio.to_thread(
-            evaluator.deep, agent, program_id, self.snapshot(), self.workers
-        )
 
     def snapshot(self) -> Pool:
         """The pool as it stands, copied on the loop for one evaluation to keep."""
         return self.pool.model_copy(deep=True)
 
-    def start(self, stagnant: bool) -> tuple[Path, str, float, dict[str, float]]:
-        """The program this session edits, the name it goes by, and the bar to beat.
+    def start(self, stagnant: bool) -> tuple[Path, str, dict[str, float]]:
+        """The program this session edits, the name it goes by, and how it does.
 
         The name is a pool name or a database id, never a path: it is
         interpolated into the session's own feedback. Until the first
@@ -435,10 +425,9 @@ class Campaign:
         """
         champion = self.state.champion
         if champion is not None and not stagnant:
-            result = champion.result
-            return Path(champion.path), champion.name, result.score, result.rates
+            return Path(champion.path), champion.name, champion.result.rates
         program = self.rng.choice(self.database.top(10))
-        return Path(program.source_path), program.id, program.fitness, program.rates
+        return Path(program.source_path), program.id, program.rates
 
     def fail(self, started_from: str, instruction: str, reason: str) -> None:
         """Record an attempt that produced no program, and say why.
@@ -483,9 +472,9 @@ class Campaign:
     ) -> dict[str, float]:
         """Section 10: one deep evaluation, and whether it moved the floor.
 
-        ``baseline`` is the champion this was compared against, read before
-        the promotion: after it, a promoting result would be logged beside
-        the score of the champion it replaced -- itself.
+        ``baseline`` is the floor as it stood when this was judged, read
+        before the promotion: after it, a promoting result would be logged
+        beside the score of the champion it replaced -- itself.
         """
         record: dict[str, float] = {
             "sessions": self.state.sessions,

@@ -1,88 +1,75 @@
-"""A port of FAMOU's OpponentPool, checked on its own arithmetic."""
+"""The opponent pool: who is in it, who joins, and who makes way."""
 
 from pathlib import Path
-
-import pytest
 
 from kaggriculture.campaign import config, pool, roster
 
 
 def five() -> pool.Pool:
-    """A five-opponent pool with equal weights, for tests that mutate it."""
-    return pool.Pool(
-        opponents={name: f"/x/{name}.py" for name in ["a", "b", "c", "d", "e"]},
-        weights=dict.fromkeys(["a", "b", "c", "d", "e"], 0.2),
+    """A five-opponent pool, for tests that mutate it."""
+    return pool.Pool(opponents={name: f"/x/{name}.py" for name in "abcde"})
+
+
+def test_initial_pool_is_the_training_roster() -> None:
+    """Pool.initial() mirrors roster.TRAINING."""
+    p = pool.Pool.initial()
+
+    assert p.names() == list(roster.TRAINING)
+    assert p.opponents["v54"] == str(roster.TRAINING["v54"])
+
+
+def test_a_champion_joins_a_pool_that_is_not_full_and_nobody_leaves() -> None:
+    """Every champion is a gatekeeper the next candidate has to get past."""
+    p = five()
+
+    retired = p.add_champion("champ", "/x/champ.py", rates={})
+
+    assert retired is None
+    assert p.names() == [*"abcde", "champ"]
+
+
+def test_a_full_pool_retires_the_opponent_the_champion_beats_most_decisively() -> None:
+    """At the cap, the pool keeps the opponents that still separate programs.
+
+    An opponent the incoming champion beats nine times in ten no longer
+    tells one candidate from another, and it is the most beaten of those --
+    not the least weighted, there being no weights -- that makes way.
+    """
+    p = five()
+    for number in range(5):
+        p.add_champion(f"c{number}", f"/x/c{number}.py", rates={})
+    assert len(p.names()) == config.POOL_CAP
+
+    retired = p.add_champion(
+        "new", "/x/new.py", rates={"a": 0.96, "b": 0.99, "c": 0.5, "d": 0.97}
     )
 
-
-def test_initial_pool_is_the_training_roster_with_equal_weights() -> None:
-    """Pool.initial() mirrors roster.TRAINING with 1/n weights."""
-    p = pool.Pool.initial()
-    assert p.names() == list(roster.TRAINING)
-    assert all(abs(w - 1 / len(roster.TRAINING)) < 1e-12 for w in p.weights.values())
-
-
-def test_add_champion_gives_it_0_20_and_renormalises() -> None:
-    """A champion joins a non-full pool at CHAMPION_WEIGHT; nobody retires."""
-    p = five()
-    retired = p.add_champion("champ", "/x/champ.py", rates={})
-    assert retired is None
-    assert abs(sum(p.weights.values()) - 1.0) < 1e-12
-    assert abs(p.weights["champ"] - 0.20 / 1.20) < 1e-12
-    assert all(abs(p.weights[n] - 0.20 / 1.20) < 1e-12 for n in "abcde")
-
-
-def test_full_pool_retires_the_lowest_weight_opponent_the_champion_crushes() -> None:
-    """A full pool retires the lowest-weight opponent beaten at >= RETIRE_THRESHOLD."""
-    p = five()
-    for i in range(5):
-        p.add_champion(f"c{i}", f"/x/c{i}.py", rates={})
-    assert len(p.names()) == config.POOL_CAP
-    p.weights["b"] = 0.01
-    p.weights["a"] = 0.05
-    total = sum(p.weights.values())
-    p.weights = {k: v / total for k, v in p.weights.items()}
-    retired = p.add_champion("new", "/x/new.py", rates={"a": 0.99, "b": 0.97, "c": 0.5})
     assert retired == "b"
     assert "b" not in p.names() and "new" in p.names()
+    assert len(p.names()) == config.POOL_CAP
 
 
-def test_weakness_pressure_doubles_the_weakest_and_caps_at_half() -> None:
-    """Weakness pressure doubles one opponent's weight, capped at WEAKNESS_CAP."""
+def test_a_full_pool_of_opponents_that_still_matter_keeps_them_all() -> None:
+    """Nothing is retired to make room; the pool grows past the cap instead.
+
+    A cap that evicted an opponent nobody had crushed would throw away the
+    hardest matchups first, which are the ones a gate exists to ask about.
+    """
     p = five()
-    p.apply_weakness_pressure("c")
-    assert abs(p.weights["c"] - 0.4) < 1e-12
-    assert all(abs(p.weights[n] - 0.15) < 1e-12 for n in "abde")
-    p.apply_weakness_pressure("c")
-    assert abs(p.weights["c"] - 0.5) < 1e-12
-    assert abs(sum(p.weights.values()) - 1.0) < 1e-12
+    for number in range(5):
+        p.add_champion(f"c{number}", f"/x/c{number}.py", rates={})
 
+    retired = p.add_champion("new", "/x/new.py", rates=dict.fromkeys("abcde", 0.6))
 
-def test_weakest_and_weighted() -> None:
-    """weakest() picks the lowest rate; weighted() is the weight-dot-rate sum."""
-    p = five()
-    rates = {"a": 0.9, "b": 0.2, "c": 0.5, "d": 0.7, "e": 0.6}
-    assert p.weakest(rates) == "b"
-    assert abs(p.weighted(rates) - 0.58) < 1e-12
-
-
-def test_weighted_refuses_to_score_a_pool_member_it_has_no_rate_for() -> None:
-    """A partial sum reads as a low score; a missing measurement is not one."""
-    p = five()
-    with pytest.raises(KeyError, match="c"):
-        p.weighted({"a": 0.9, "b": 0.2, "d": 0.7, "e": 0.6})
-
-
-def test_weakness_pressure_refuses_a_pool_of_one() -> None:
-    """One opponent already carries the whole weight; there is nothing to scale."""
-    p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
-    with pytest.raises(ValueError, match="at least two"):
-        p.apply_weakness_pressure("a")
+    assert retired is None
+    assert len(p.names()) == config.POOL_CAP + 1
 
 
 def test_round_trips_through_json(tmp_path: Path) -> None:
     """save() then load() reproduces the same pool."""
     p = five()
-    p.apply_weakness_pressure("a")
+    p.add_champion("champ", "/x/champ.py", rates={})
+
     p.save(tmp_path / "pool.json")
+
     assert pool.Pool.load(tmp_path / "pool.json") == p

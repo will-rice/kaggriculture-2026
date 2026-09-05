@@ -43,11 +43,7 @@ def test_the_sandbox_holds_the_champion_as_child_py(tmp_path: Path) -> None:
         "p1",
         champion,
         IMPROVE,
-        None,
-        bar={"fitness": 0.42},
         rates={"v54": 0.3},
-        weights={"v54": 1.0},
-        weakest="v54",
         failures=[],
         started_from="champion_1",
     )
@@ -56,8 +52,15 @@ def test_the_sandbox_holds_the_champion_as_child_py(tmp_path: Path) -> None:
     assert not (box / "parent.py").exists()
 
 
-def test_the_feedback_states_the_bar(tmp_path: Path) -> None:
-    """The session is told the number it has to beat."""
+def test_the_feedback_states_the_bar_and_names_what_the_champion_loses_to(
+    tmp_path: Path,
+) -> None:
+    """The bar is absolute, and what stands in its way is named.
+
+    There is no number to clear any more: a candidate is promoted when it
+    beats every opponent in the pool, so the useful thing to tell a session
+    is which of them the program it starts from does not beat.
+    """
     monkeypatched_sandbox(tmp_path)
     champion = tmp_path / "champion.py"
     champion.write_text("def agent(o, c=None):\n    return {}\n")
@@ -66,17 +69,15 @@ def test_the_feedback_states_the_bar(tmp_path: Path) -> None:
         "p2",
         champion,
         IMPROVE,
-        None,
-        bar={"fitness": 0.42},
         rates={"v54": 0.3},
-        weights={"v54": 1.0},
-        weakest="v54",
         failures=[],
         started_from="champion_1",
     )
 
     feedback = (box / "feedback.md").read_text()
-    assert "0.42" in feedback and "v54" in feedback
+    assert "The champion does not beat: **v54**" in feedback
+    assert "| v54 | 0.300 |" in feedback
+    assert "`champion_1`" in feedback
 
 
 def test_there_are_five_full_instructions_and_they_differ() -> None:
@@ -100,11 +101,7 @@ def test_sandbox_has_every_required_file_and_no_opponent_path(tmp_path: Path) ->
         "abc",
         champion,
         IMPROVE,
-        None,
-        bar={"fitness": 0.5},
         rates={"v54": 0.1, "router_v1": 0.0},
-        weights={"v54": 0.5, "router_v1": 0.5},
-        weakest="router_v1",
         failures=["syntax: bad"],
         started_from="champion_1",
     )
@@ -123,31 +120,8 @@ def test_sandbox_has_every_required_file_and_no_opponent_path(tmp_path: Path) ->
     )
     assert "/data/kaggriculture" not in everything
     feedback = (box / "feedback.md").read_text()
-    assert "router_v1" in feedback and "weakest" in feedback.lower()
+    assert "router_v1" in feedback and "does not beat" in feedback
     assert "syntax: bad" in feedback
-
-
-def test_cross_sandbox_carries_the_inspiration(tmp_path: Path) -> None:
-    """A crossover session's sandbox carries inspiration.py and names it."""
-    monkeypatched_sandbox(tmp_path)
-    champion = tmp_path / "p.py"
-    champion.write_text("# champion\n")
-    other = tmp_path / "q.py"
-    other.write_text("# inspiration\n")
-    box = prompt.build_sandbox(
-        "xyz",
-        champion,
-        prompt.CROSS,
-        other,
-        bar={"fitness": 0.5},
-        rates={},
-        weights={},
-        weakest="",
-        failures=[],
-        started_from="champion_1",
-    )
-    assert (box / "inspiration.py").read_text() == "# inspiration\n"
-    assert "inspiration.py" in (box / "PROMPT.md").read_text()
 
 
 def test_prompt_states_the_instruction_the_bar_and_the_budget(tmp_path: Path) -> None:
@@ -159,11 +133,7 @@ def test_prompt_states_the_instruction_the_bar_and_the_budget(tmp_path: Path) ->
         "drawn",
         champion,
         prompt.INSTRUCTIONS[4][1],
-        None,
-        bar={"fitness": 0.5},
         rates={},
-        weights={},
-        weakest="",
         failures=[],
         started_from="champion_1",
     )
@@ -182,11 +152,7 @@ def test_agents_md_is_the_task_prompt_plus_harness_and_doctrine(tmp_path: Path) 
         "q",
         champion,
         IMPROVE,
-        None,
-        bar={"fitness": 0.5},
         rates={},
-        weights={},
-        weakest="",
         failures=[],
         started_from="champion_1",
     )
@@ -206,11 +172,7 @@ def test_agents_md_strips_the_stale_harness_block_and_rewrites_the_project_path(
         "r",
         champion,
         IMPROVE,
-        None,
-        bar={"fitness": 0.5},
         rates={},
-        weights={},
-        weakest="",
         failures=[],
         started_from="champion_1",
     )
@@ -226,12 +188,10 @@ def test_agents_md_strips_the_stale_harness_block_and_rewrites_the_project_path(
 
 
 def test_every_instruction_forbids_reading_opponent_source(tmp_path: Path) -> None:
-    """The doctrine is wrapped around every instruction, crossover included."""
+    """The doctrine is wrapped around every one of the five instructions."""
     monkeypatched_sandbox(tmp_path)
     champion = tmp_path / "p.py"
     champion.write_text("# champion\n")
-    other = tmp_path / "q.py"
-    other.write_text("# inspiration\n")
     forbidden = "do not read, request, or reconstruct any opponent's source"
 
     for index, (name, text) in enumerate(prompt.INSTRUCTIONS):
@@ -239,29 +199,11 @@ def test_every_instruction_forbids_reading_opponent_source(tmp_path: Path) -> No
             f"full-{index}",
             champion,
             text,
-            None,
-            bar={"fitness": 0.5},
             rates={},
-            weights={},
-            weakest="",
             failures=[],
             started_from="champion_1",
         )
         assert forbidden in (box / "PROMPT.md").read_text().lower(), name
-
-    cross_box = prompt.build_sandbox(
-        "cross-id",
-        champion,
-        prompt.CROSS,
-        other,
-        bar={"fitness": 0.5},
-        rates={},
-        weights={},
-        weakest="",
-        failures=[],
-        started_from="champion_1",
-    )
-    assert forbidden in (cross_box / "PROMPT.md").read_text().lower()
 
 
 def test_program_id_path_traversal_is_rejected(tmp_path: Path) -> None:
@@ -277,11 +219,7 @@ def test_program_id_path_traversal_is_rejected(tmp_path: Path) -> None:
                 bad_id,
                 champion,
                 IMPROVE,
-                None,
-                bar={"fitness": 0.5},
                 rates={},
-                weights={},
-                weakest="",
                 failures=[],
                 started_from="champion_1",
             )
@@ -303,11 +241,7 @@ def test_the_child_is_writable_even_when_the_champion_is_not(tmp_path: Path) -> 
         "p-readonly",
         champion,
         prompt.INSTRUCTIONS[0][1],
-        None,
-        bar={"fitness": 0.5},
         rates={"pass": 0.5},
-        weights={"pass": 1.0},
-        weakest="pass",
         failures=[],
         started_from="champion_1",
     )

@@ -27,80 +27,55 @@ def result(
     )
 
 
-def test_no_champion_promotes_anything_with_a_score() -> None:
-    """With no champion yet, any candidate is promoted."""
-    ok, why = gate.promotion(result("c", 0.3, 0.25, {"a": 0.3}), None)
-    assert ok
+def test_a_candidate_that_beats_every_opponent_is_promoted() -> None:
+    """The whole rule: strictly more than half the exam games against each."""
+    ok, why = gate.promotion(result("c", 0.7, 0.65, {"a": 0.51, "b": 0.9, "c": 0.6}))
+
+    assert ok and why == "beat every opponent"
 
 
-def test_lower_bound_must_beat_the_champion_point_estimate() -> None:
-    """The candidate's lower Wilson bound must exceed the champion's score."""
-    champ = result("k", 0.60, 0.55, {"a": 0.6})
-    assert not gate.promotion(result("c", 0.62, 0.58, {"a": 0.62}), champ)[0]
-    assert gate.promotion(result("c", 0.70, 0.65, {"a": 0.70}), champ)[0]
+def test_one_opponent_it_does_not_beat_is_enough_to_refuse() -> None:
+    """A champion is a gatekeeper and the program we would submit.
+
+    Something that loses to an opponent in the pool is a weak gatekeeper and
+    a weak submission, however well it does against the rest.
+    """
+    ok, why = gate.promotion(result("c", 0.8, 0.75, {"a": 0.99, "b": 0.99, "c": 0.4}))
+
+    assert not ok and why == "did not beat c at 0.400"
 
 
-def test_field_may_not_drop_more_than_two_points() -> None:
-    """A candidate that otherwise beats the bound still fails on field drop."""
-    champ = result("k", 0.60, 0.55, {"a": 0.6})
-    candidate = result("c", 0.70, 0.65, {"a": 0.70})
-    candidate = candidate.model_copy(update={"field": 0.57})
-    assert not gate.promotion(candidate, champ)[0]
+def test_the_reason_names_every_opponent_it_failed_against() -> None:
+    """This message is the campaign's answer to "why is nothing promoting?".
 
-
-def test_no_opponent_may_regress_beyond_noise() -> None:
-    """A single opponent regressing past the wider interval blocks promotion."""
-    champ = result("k", 0.60, 0.55, {"a": 0.9, "b": 0.3})
-    candidate = result("c", 0.70, 0.65, {"a": 0.6, "b": 0.8})
-    ok, why = gate.promotion(candidate, champ)
-    assert not ok and "a" in why
-
-
-def test_field_drop_of_exactly_the_tolerance_still_passes() -> None:
-    """A field drop of exactly FIELD_TOLERANCE is not a drop beyond it."""
-    champ = result("k", 0.60, 0.55, {"a": 0.6})
-    candidate = result("c", 0.70, 0.65, {"a": 0.70})
-    candidate = candidate.model_copy(
-        update={"field": champ.field - gate.FIELD_TOLERANCE}
+    Naming only the first would hide how far a lineage is from the bar, which
+    is the difference between one opponent to fix and four.
+    """
+    ok, why = gate.promotion(
+        result("c", 0.5, 0.45, {"a": 0.9, "b": 0.3, "c": 0.45, "d": 0.2})
     )
-    assert gate.promotion(candidate, champ)[0]
-
-
-def test_opponent_regression_of_exactly_the_width_still_passes() -> None:
-    """A rate exactly champion - width is not a regression beyond it.
-
-    Two opponents, because a slip against the champion's *best* is what this
-    clause bounds; a pool of one would make that same slip a drop in the
-    worst matchup, which the maximin clause refuses first.
-    """
-    champ = result("k", 0.60, 0.55, {"a": 0.9, "b": 0.2})
-    width = champ.intervals["a"][1] - champ.intervals["a"][0]
-    candidate = result("c", 0.70, 0.65, {"a": champ.rates["a"] - width, "b": 0.3})
-    assert gate.promotion(candidate, champ)[0]
-
-
-def test_a_higher_mean_with_a_worse_worst_matchup_is_refused() -> None:
-    """Fitness is a mean; a hard counter is what a mean is happy to hide.
-
-    The candidate is better on average and better against the opponent that
-    carries the weight, and worse against the one it already loses to. In a
-    non-transitive game that is the trade the finale punishes.
-    """
-    champ = result("k", 0.60, 0.55, {"a": 0.9, "b": 0.5})
-    candidate = result("c", 0.80, 0.75, {"a": 0.99, "b": 0.4})
-
-    ok, why = gate.promotion(candidate, champ)
 
     assert not ok
-    assert "b" in why and "0.400" in why and "0.500" in why
+    assert why == "did not beat b at 0.300, c at 0.450, d at 0.200"
 
 
-def test_a_candidate_that_raises_its_worst_matchup_is_promoted() -> None:
-    """The ratchet only has to hold the floor up, not every rate."""
-    champ = result("k", 0.60, 0.55, {"a": 0.9, "b": 0.5})
-    candidate = result("c", 0.70, 0.65, {"a": 0.85, "b": 0.6})
+def test_a_dead_heat_is_not_a_win() -> None:
+    """Half the games is not more than half, and the pool is full of near-ties."""
+    assert not gate.promotion(result("c", 0.75, 0.7, {"a": 0.9, "b": 0.5}))[0]
 
-    assert gate.promotion(candidate, champ)[0]
+
+def test_held_out_opponents_are_not_part_of_the_bar() -> None:
+    """They are the honest generalisation number, never the gate."""
+    candidate = result("c", 0.8, 0.75, {"a": 0.9, "b": 0.8}).model_copy(
+        update={"held_out": {"salemali7_2900": 0.1, "lynnsakurai_v5": 0.2}}
+    )
+
+    assert gate.promotion(candidate)[0]
+
+
+def test_a_promotion_asks_nothing_of_the_champion() -> None:
+    """The champion is in the pool, so beating it is part of beating them all."""
+    assert "champion" not in gate.promotion.__code__.co_varnames
 
 
 def _program(
@@ -145,7 +120,7 @@ def test_promote_leaves_a_tarball_the_champion_record_names(
 ) -> None:
     """A cut is uploading this file; nothing is built at cut time."""
     program = _program(tmp_path, monkeypatch)
-    p = pool.Pool(opponents={"a": "/x/a.py"}, weights={"a": 1.0})
+    p = pool.Pool(opponents={"a": "/x/a.py"})
 
     champion = gate.record(gate.promote(program, _result()))
     gate.enroll(champion, p)
@@ -166,12 +141,14 @@ def test_gate_runs_no_version_control() -> None:
 def test_promote_writes_a_read_only_floor_and_updates_the_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The floor is read-only, the champion keeps its own copy, the pool is saved."""
+    """The floor is read-only, the champion keeps its own copy, the pool is saved.
+
+    The floor is what ships and what a later promotion overwrites; the
+    champion's own copy is what the pool plays, and it is never written twice.
+    """
     program = _program(tmp_path, monkeypatch)
     source = Path(program.source_path)
-    p = pool.Pool(
-        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
-    )
+    p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
     champion = gate.record(gate.promote(program, _result()))
     gate.enroll(champion, p)
     assert champion.name == "champion_1"
@@ -186,7 +163,7 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
         and (kept.stat().st_mode & 0o777) == 0o444
     )
     saved = pool.Pool.load(config.POOL)
-    assert "champion_1" in saved.names() and saved.weights["b"] > saved.weights["a"]
+    assert "champion_1" in saved.names()
 
 
 def test_promote_refuses_a_champion_name_the_directory_already_holds(
@@ -218,9 +195,7 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     every earlier champion would be gone.
     """
     first = _program(tmp_path, monkeypatch, body="PASS")
-    p = pool.Pool(
-        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
-    )
+    p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
     gate.enroll(gate.promote(first, _result()), p)
 
     second = _program(tmp_path, monkeypatch, body="WATER")
@@ -269,10 +244,7 @@ def test_champion_numbering_survives_a_pool_retirement(
         (config.CHAMPIONS / f"champion_{number}.py").write_text("# past\n")
     # What a retirement leaves behind: three champions promoted, one of them
     # still in the pool.
-    retired = pool.Pool(
-        opponents={"a": "/x/a.py", "champion_3": "/x/c3.py"},
-        weights={"a": 0.5, "champion_3": 0.5},
-    )
+    retired = pool.Pool(opponents={"a": "/x/a.py", "champion_3": "/x/c3.py"})
     retired.save(config.POOL)
 
     champion = gate.promote(
@@ -301,9 +273,7 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
     last thing that campaign ever did.
     """
     program = _program(tmp_path, monkeypatch)
-    p = pool.Pool(
-        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
-    )
+    p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
 
     gate.enroll(gate.record(gate.promote(program, _result())), p)
 
@@ -317,9 +287,7 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
 ) -> None:
     """The champion counter reads the pool that was just saved, not a stale one."""
     program = _program(tmp_path, monkeypatch)
-    p = pool.Pool(
-        opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
-    )
+    p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
     gate.enroll(gate.record(gate.promote(program, _result())), p)
     reloaded = pool.Pool.load(config.POOL)
     champion = gate.promote(program, result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}))

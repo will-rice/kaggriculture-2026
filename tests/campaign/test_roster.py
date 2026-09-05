@@ -40,7 +40,7 @@ def test_a_champion_in_the_pool_resolves_while_a_stranger_still_raises(
     champion.parent.mkdir()
     champion.write_text("def agent(observation):\n    return {}\n", encoding="utf-8")
     registry = tmp_path / "pool.json"
-    pool.Pool(opponents={"gen7": str(champion)}, weights={"gen7": 1.0}).save(registry)
+    pool.Pool(opponents={"gen7": str(champion)}).save(registry)
     monkeypatch.setattr(config, "POOL", registry)
     assert roster.path("gen7") == champion
     with pytest.raises(KeyError):

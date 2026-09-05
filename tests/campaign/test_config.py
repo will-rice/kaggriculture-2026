@@ -94,17 +94,14 @@ def test_constants_match_the_spec_table() -> None:
     assert config.FAST_SEEDS == 4
     assert len(config.EXAM_SEEDS) == 64
     assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
-    assert config.CHAMPION_WEIGHT == 0.20
     assert (config.POOL_CAP, config.RETIRE_THRESHOLD) == (10, 0.95)
-    assert config.WEAKNESS_CAP == 0.5
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-6-astra"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
-    assert config.CROSS_PROBABILITY == 0.3
 
 
 def test_the_deleted_constants_are_gone() -> None:
-    """Islands, epochs and the call cap are not part of this system."""
+    """Islands, epochs, the call cap, crossover and weights are not this system."""
     for name in (
         "ISLANDS",
         "ISLAND_SIZE",
@@ -118,6 +115,9 @@ def test_the_deleted_constants_are_gone() -> None:
         "MUTATION_TIMEOUT_SECONDS",
         "CHECK_TIMEOUT_SECONDS",
         "WANDB_RUN_ID",
+        "CROSS_PROBABILITY",
+        "CHAMPION_WEIGHT",
+        "WEAKNESS_CAP",
     ):
         assert not hasattr(config, name), name
 

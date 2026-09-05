@@ -1,9 +1,16 @@
-"""The opponent pool: who a candidate is measured against, and how much each counts.
+"""The opponent pool: who a candidate is measured against.
 
-A port of the released FAMOU ``opponent_pool.py``: champions join at a fixed
-weight, weights renormalise, a full pool retires the lowest-weight opponent
-the new champion already beats, and weakness pressure doubles the weakest
-opponent's weight up to a cap. Paths are stored here and shown nowhere.
+Every opponent counts the same. The gate is an absolute standard -- a
+candidate is promoted when it beats *every* opponent here -- so there is no
+weight for a candidate to buy a promotion with, and nothing to bend toward
+the hardest opponent: beating that one outright is the requirement.
+
+Champions join as gatekeepers, so a later candidate has to beat every
+program the campaign has already confirmed as well as the vendored kernels.
+At ``POOL_CAP`` a joining champion retires whichever opponent it beats most
+decisively, provided it beats it by at least ``RETIRE_THRESHOLD``: the pool
+keeps the opponents that still separate programs. Paths are stored here and
+shown nowhere.
 """
 
 import time
@@ -15,20 +22,15 @@ from kaggriculture.campaign import config, roster
 
 
 class Pool(BaseModel):
-    """The set of opponents a candidate is measured against, with weights."""
+    """The set of opponents a candidate is measured against."""
 
     opponents: dict[str, str]
-    weights: dict[str, float]
     history: list[dict] = []
 
     @classmethod
     def initial(cls) -> "Pool":
-        """Build the pool from the training roster, with equal weights."""
-        names = list(roster.TRAINING)
-        return cls(
-            opponents={n: str(roster.TRAINING[n]) for n in names},
-            weights={n: 1.0 / len(names) for n in names},
-        )
+        """Build the pool from the training roster."""
+        return cls(opponents={n: str(p) for n, p in roster.TRAINING.items()})
 
     @classmethod
     def load(cls, path: Path) -> "Pool":
@@ -44,37 +46,13 @@ class Pool(BaseModel):
         """Every opponent currently in the pool."""
         return list(self.opponents)
 
-    def weighted(self, rates: dict[str, float]) -> float:
-        """Pool-weighted win rate over every pool opponent.
-
-        Args:
-            rates: Win rate per opponent name.
-
-        Returns:
-            The weight-dot-rate sum over the whole pool.
-
-        Raises:
-            KeyError: ``rates`` omits a pool member. Skipping it would return
-                a partial sum that reads as a low score rather than as the
-                missing measurement it is.
-        """
-        missing = [n for n in self.opponents if n not in rates]
-        if missing:
-            raise KeyError(f"no rate for pool opponent(s): {', '.join(missing)}")
-        return sum(self.weights[n] * rates[n] for n in self.opponents)
-
-    def weakest(self, rates: dict[str, float]) -> str:
-        """The pool opponent with the lowest rate in ``rates``."""
-        return min((n for n in self.opponents if n in rates), key=lambda n: rates[n])
-
     def add_champion(self, name: str, path: str, rates: dict[str, float]) -> str | None:
-        """Add at ``CHAMPION_WEIGHT``; retire one crushed opponent if the pool is full.
+        """Add ``name`` to the pool, retiring one opponent if it is full.
 
         Args:
             name: The champion's opponent name.
-            path: The champion's floor path.
-            rates: Win rates of the outgoing champion against current pool
-                opponents, keyed by name.
+            path: The champion's own immutable copy.
+            rates: The champion's win rate per current pool opponent.
 
         Returns:
             The name of the retired opponent, or None if none was retired.
@@ -82,17 +60,14 @@ class Pool(BaseModel):
         retired = None
         if len(self.opponents) >= config.POOL_CAP:
             crushed = [
-                (self.weights[n], n)
-                for n, r in rates.items()
-                if n in self.opponents and r >= config.RETIRE_THRESHOLD
+                (rate, n)
+                for n, rate in rates.items()
+                if n in self.opponents and rate >= config.RETIRE_THRESHOLD
             ]
             if crushed:
-                retired = min(crushed)[1]
+                retired = max(crushed)[1]
                 del self.opponents[retired]
-                del self.weights[retired]
         self.opponents[name] = path
-        self.weights[name] = config.CHAMPION_WEIGHT
-        self._rebalance()
         self.history.append(
             {
                 "action": "add_champion",
@@ -102,36 +77,3 @@ class Pool(BaseModel):
             }
         )
         return retired
-
-    def apply_weakness_pressure(self, name: str) -> None:
-        """Double ``name``'s weight up to ``WEAKNESS_CAP``, scaling the rest down.
-
-        Args:
-            name: The opponent to weight up.
-
-        Raises:
-            ValueError: The pool holds one opponent, whose weight is already
-                the whole of it; there is nothing to scale down.
-        """
-        if len(self.weights) < 2:
-            raise ValueError("weakness pressure needs a pool of at least two")
-        old = self.weights[name]
-        new = min(old * 2, config.WEAKNESS_CAP)
-        scale = (1.0 - new) / (1.0 - old)
-        for n in self.weights:
-            self.weights[n] = new if n == name else self.weights[n] * scale
-        self.history.append(
-            {
-                "action": "weakness_pressure",
-                "name": name,
-                "old": old,
-                "new": new,
-                "ts": time.time(),
-            }
-        )
-
-    def _rebalance(self) -> None:
-        """Renormalise weights to sum to 1."""
-        total = sum(self.weights.values())
-        for n in self.weights:
-            self.weights[n] /= total
