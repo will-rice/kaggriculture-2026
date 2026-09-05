@@ -1,226 +1,114 @@
-"""Islands, UCB, replacement, migration, reset — each on a hand-built archive."""
+"""The shared database: every program, its scores, and what failed."""
 
-import random
+import time
 from pathlib import Path
 
-from kaggriculture.campaign import archive, config
+import pytest
+
+from kaggriculture.campaign import archive
+from kaggriculture.campaign.evaluator import DeepResult
+
+AGENT = "def agent(o, c=None):\n    return {}\n"
 
 
-def make(tmp_path: Path) -> archive.Archive:
-    """A fresh archive backed by files under `tmp_path`."""
-    return archive.Archive(
-        path=tmp_path / "archive.jsonl", programs_dir=tmp_path / "programs"
+def make(tmp_path: Path) -> archive.Database:
+    """A fresh database backed by files under `tmp_path`."""
+    return archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+
+
+def program(db: archive.Database, name: str, fitness: float) -> archive.Program:
+    """Store a source and add a program with `fitness`."""
+    p = archive.Program(
+        id=name,
+        source_path=str(db.store(AGENT, name)),
+        started_from="",
+        instruction="improve",
+        fitness=fitness,
+        rates={"v54": fitness},
+        created=time.time(),
     )
+    db.add(p)
+    return p
 
 
-def test_seed_places_one_copy_on_every_island(tmp_path: Path) -> None:
-    """seed() writes one program with the given fitness to each island."""
-    a = make(tmp_path)
-    seed = tmp_path / "seed.py"
-    seed.write_text(
-        "def agent(o, c=None):\n"
-        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+def test_top_ranks_by_fitness(tmp_path: Path) -> None:
+    """`top` is the best programs by fitness, best first."""
+    db = make(tmp_path)
+    program(db, "a", 0.1)
+    program(db, "b", 0.7)
+    program(db, "c", 0.4)
+    assert [p.id for p in db.top(2)] == ["b", "c"]
+
+
+def test_a_deep_result_is_stored_on_the_program(tmp_path: Path) -> None:
+    """A confirmed program carries its deep result."""
+    db = make(tmp_path)
+    program(db, "a", 0.5)
+    result = DeepResult(
+        program_id="a",
+        score=0.6,
+        low=0.5,
+        high=0.7,
+        rates={"v54": 0.6},
+        intervals={"v54": (0.5, 0.7)},
+        field=0.6,
+        held_out={},
+        games=128,
     )
-    a.seed(seed, fitness=0.1)
-    assert [len(a.island(i)) for i in range(config.ISLANDS)] == [1] * config.ISLANDS
-    assert all(
-        p.kind == "seed" and p.mean == 0.1
-        for i in range(config.ISLANDS)
-        for p in a.island(i)
+    db.record_deep("a", result)
+    assert db.get("a").deep == result
+
+
+def test_the_log_survives_a_restart(tmp_path: Path) -> None:
+    """Everything replays: programs, deep results and failures."""
+    db = make(tmp_path)
+    program(db, "a", 0.5)
+    db.record_deep(
+        "a",
+        DeepResult(
+            program_id="a",
+            score=0.6,
+            low=0.5,
+            high=0.7,
+            rates={},
+            intervals={},
+            field=0.6,
+            held_out={},
+            games=128,
+        ),
     )
-
-
-def test_ucb_prefers_the_under_sampled_program_when_means_tie(tmp_path: Path) -> None:
-    """With tied means, UCB's exploration bonus favors the fewer-eval program."""
-    a = make(tmp_path)
-    many = a.insert(
-        archive.Program(
-            id="many",
-            island=0,
-            source_path="x",
-            parents=[],
-            kind="full",
-            fitness_sum=5.0,
-            n_evals=10,
-            status="ok",
-            reason="",
-            created=0.0,
+    db.record_failure(
+        archive.Failure(
+            started_from="a",
+            instruction="improve",
+            reason="syntax: bad",
+            created=time.time(),
         )
     )
-    few = a.insert(
-        archive.Program(
-            id="few",
-            island=0,
-            source_path="y",
-            parents=[],
-            kind="full",
-            fitness_sum=0.5,
-            n_evals=1,
-            status="ok",
-            reason="",
-            created=0.0,
-        )
-    )
-    assert many is None and few is None
-    assert a.ucb_parent(0, random.Random(0)).id == "few"
+
+    again = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+
+    assert [p.id for p in again.programs] == ["a"]
+    assert again.get("a").deep is not None
+    assert [f.reason for f in again.failures("a")] == ["syntax: bad"]
 
 
-def test_insert_replaces_the_worst_when_the_island_is_full(tmp_path: Path) -> None:
-    """A better child on a full island evicts the current worst program."""
-    a = make(tmp_path)
-    for i in range(config.ISLAND_SIZE):
-        a.insert(
-            archive.Program(
-                id=f"p{i}",
-                island=1,
-                source_path="x",
-                parents=[],
-                kind="full",
-                fitness_sum=i / 100,
-                n_evals=1,
-                status="ok",
-                reason="",
-                created=0.0,
+def test_failures_are_looked_up_by_what_they_started_from(tmp_path: Path) -> None:
+    """The prompt shows a lineage only its own failures."""
+    db = make(tmp_path)
+    for started, reason in (("a", "one"), ("b", "two"), ("a", "three")):
+        db.record_failure(
+            archive.Failure(
+                started_from=started,
+                instruction="improve",
+                reason=reason,
+                created=time.time(),
             )
         )
-    replaced = a.insert(
-        archive.Program(
-            id="new",
-            island=1,
-            source_path="x",
-            parents=[],
-            kind="full",
-            fitness_sum=0.5,
-            n_evals=1,
-            status="ok",
-            reason="",
-            created=0.0,
-        )
-    )
-    assert replaced is not None and replaced.id == "p0"
-    assert len(a.island(1)) == config.ISLAND_SIZE and "new" in {
-        p.id for p in a.island(1)
-    }
+    assert [f.reason for f in db.failures("a")] == ["one", "three"]
 
 
-def test_a_weaker_child_does_not_evict_anyone_from_a_full_island(
-    tmp_path: Path,
-) -> None:
-    """insert() on a full island drops a not-better child instead of evicting."""
-    a = make(tmp_path)
-    for i in range(config.ISLAND_SIZE):
-        a.insert(
-            archive.Program(
-                id=f"p{i}",
-                island=2,
-                source_path="x",
-                parents=[],
-                kind="full",
-                fitness_sum=0.5,
-                n_evals=1,
-                status="ok",
-                reason="",
-                created=0.0,
-            )
-        )
-    replaced = a.insert(
-        archive.Program(
-            id="weak",
-            island=2,
-            source_path="x",
-            parents=[],
-            kind="full",
-            fitness_sum=0.1,
-            n_evals=1,
-            status="ok",
-            reason="",
-            created=0.0,
-        )
-    )
-    assert (
-        replaced is not None and replaced.id == "weak"
-    )  # the child itself is what was dropped
-    assert "weak" not in {p.id for p in a.island(2)}
-
-
-def test_migration_copies_the_top_two_to_the_next_island_in_a_ring(
-    tmp_path: Path,
-) -> None:
-    """migrate() copies each island's top MIGRANTS to the next island, ring-wise."""
-    a = make(tmp_path)
-    for island in range(config.ISLANDS):
-        for j in range(3):
-            a.insert(
-                archive.Program(
-                    id=f"i{island}p{j}",
-                    island=island,
-                    source_path="x",
-                    parents=[],
-                    kind="full",
-                    fitness_sum=(island + 1) * (j + 1) / 20,
-                    n_evals=1,
-                    status="ok",
-                    reason="",
-                    created=0.0,
-                )
-            )
-    a.migrate()
-    last = config.ISLANDS - 1
-    ids_on_0 = {p.id for p in a.island(0)}
-    assert {f"i{last}p2", f"i{last}p1"} <= {
-        p.parents[0] for p in a.island(0) if p.kind == "migrant"
-    }
-    assert len(ids_on_0) == 5
-
-
-def test_reset_reseeds_the_worst_island_from_the_champion(tmp_path: Path) -> None:
-    """reset_worst_island() clears the weakest island, reseeds it from the champion."""
-    a = make(tmp_path)
-    for island in range(config.ISLANDS):
-        a.insert(
-            archive.Program(
-                id=f"i{island}",
-                island=island,
-                source_path="x",
-                parents=[],
-                kind="full",
-                fitness_sum=island / 10,
-                n_evals=1,
-                status="ok",
-                reason="",
-                created=0.0,
-            )
-        )
-    champion = a.top(1)[0]
-    reset = a.reset_worst_island(champion)
-    assert reset == 0
-    assert [p.kind for p in a.island(0)] == ["reset"] and a.island(0)[0].parents == [
-        champion.id
-    ]
-
-
-def test_the_log_replays_to_the_same_state(tmp_path: Path) -> None:
-    """A fresh Archive replaying the log reaches the same state as the original."""
-    a = make(tmp_path)
-    a.insert(
-        archive.Program(
-            id="p",
-            island=0,
-            source_path="x",
-            parents=[],
-            kind="full",
-            fitness_sum=0.3,
-            n_evals=1,
-            status="ok",
-            reason="",
-            created=0.0,
-        )
-    )
-    a.record_failure(0, ["p"], "full", "syntax")
-    b = archive.Archive(
-        path=tmp_path / "archive.jsonl", programs_dir=tmp_path / "programs"
-    )
-    assert [p.model_dump() for p in b.island(0)] == [
-        p.model_dump() for p in a.island(0)
-    ]
-    assert a.island(0)[0].mean == 0.3 and b.failures()[0].reason == "syntax"
+def test_get_raises_for_an_unknown_program(tmp_path: Path) -> None:
+    """An id the database does not hold is a programming error, not a None."""
+    with pytest.raises(KeyError, match="nope"):
+        make(tmp_path).get("nope")
