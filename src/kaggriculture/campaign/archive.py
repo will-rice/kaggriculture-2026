@@ -79,23 +79,29 @@ class Database:
                 self._apply(json.loads(line), persist=False)
 
     def _apply(self, event: dict, persist: bool = True) -> None:
-        """Persist one event (unless replaying) and fold it into state.
+        """Fold one event into state and, unless replaying, append it to the log.
+
+        The fold comes first and the line is written only once it has
+        succeeded, so an event that cannot be applied can never reach the
+        log. That is what makes a restart total: every line on disk is a
+        line this same code has already applied, so replaying them all
+        rebuilds exactly the state the writer had.
 
         Args:
             event: The event to apply.
-            persist: Append `event` to the log first. False during replay,
-                since the event already exists in the log being read.
+            persist: Append `event` to the log after folding it. False during
+                replay, since the event already exists in the log being read.
 
         Raises:
-            ValueError: The event names a type the database does not know.
+            ValueError: The event names a type the database does not know, or
+                adds a program id the database already holds.
+            KeyError: A deep result names a program the database does not hold.
         """
-        if persist:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event) + "\n")
         kind = event["event"]
         if kind == "program":
             program = Program.model_validate(event["program"])
+            if program.id in self._programs:
+                raise ValueError(f"duplicate program id: {program.id!r}")
             self._programs[program.id] = program
         elif kind == "deep":
             self.get(event["program_id"]).deep = DeepResult.model_validate(
@@ -105,6 +111,10 @@ class Database:
             self._failures.append(Failure.model_validate(event["failure"]))
         else:
             raise ValueError(f"unknown database event: {kind!r}")
+        if persist:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event) + "\n")
 
     @property
     def programs(self) -> list[Program]:
@@ -119,7 +129,11 @@ class Database:
         return target
 
     def add(self, program: Program) -> None:
-        """Add `program` to the database."""
+        """Add `program` to the database.
+
+        Raises:
+            ValueError: The database already holds a program with that id.
+        """
         self._apply({"event": "program", "program": program.model_dump()})
 
     def record_failure(self, failure: Failure) -> None:
@@ -127,7 +141,11 @@ class Database:
         self._apply({"event": "failure", "failure": failure.model_dump()})
 
     def record_deep(self, program_id: str, result: DeepResult) -> None:
-        """Attach the sealed-block result `result` to the program `program_id`."""
+        """Attach the sealed-block result `result` to the program `program_id`.
+
+        Raises:
+            KeyError: No program has that id; nothing is written.
+        """
         self._apply(
             {"event": "deep", "program_id": program_id, "deep": result.model_dump()}
         )

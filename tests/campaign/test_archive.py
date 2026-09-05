@@ -108,6 +108,43 @@ def test_failures_are_looked_up_by_what_they_started_from(tmp_path: Path) -> Non
     assert [f.reason for f in db.failures("a")] == ["one", "three"]
 
 
+def test_an_event_that_cannot_be_applied_is_never_logged(tmp_path: Path) -> None:
+    """A rejected write leaves the log exactly as it was, so a restart still works."""
+    db = make(tmp_path)
+    program(db, "a", 0.5)
+    log = tmp_path / "db.jsonl"
+    before = log.read_text(encoding="utf-8")
+
+    with pytest.raises(KeyError, match="ghost"):
+        db.record_deep(
+            "ghost",
+            DeepResult(
+                program_id="ghost",
+                score=0.6,
+                low=0.5,
+                high=0.7,
+                rates={},
+                intervals={},
+                field=0.6,
+                held_out={},
+                games=128,
+            ),
+        )
+
+    assert log.read_text(encoding="utf-8") == before
+    again = archive.Database(log, tmp_path / "programs")
+    assert [p.id for p in again.programs] == ["a"]
+
+
+def test_add_rejects_an_id_the_database_already_holds(tmp_path: Path) -> None:
+    """Two programs with one id would silently lose one; that is a bug, not a write."""
+    db = make(tmp_path)
+    program(db, "a", 0.5)
+    with pytest.raises(ValueError, match="duplicate program id: 'a'"):
+        program(db, "a", 0.9)
+    assert db.get("a").fitness == 0.5
+
+
 def test_get_raises_for_an_unknown_program(tmp_path: Path) -> None:
     """An id the database does not hold is a programming error, not a None."""
     with pytest.raises(KeyError, match="nope"):
