@@ -8,6 +8,10 @@ import pytest
 from kaggriculture.campaign import config, evaluator, field_gate, pool
 from kaggriculture.report import wilson_interval
 
+# Fits the smallest box the suite runs on: CORE_BUDGET clamps to 1 on a
+# 4-core CI runner.
+WORKERS = min(4, config.CORE_BUDGET)
+
 PASS = (
     "def agent(observation, configuration=None):\n"
     "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
@@ -36,7 +40,7 @@ def test_fast_draws_fresh_non_exam_seeds_and_weights_by_the_pool(
         opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")},
         weights={"v54": 1.0},
     )
-    result = evaluator.fast(agent, p, random.Random(1), workers=4)
+    result = evaluator.fast(agent, p, random.Random(1), workers=WORKERS)
     assert len(result.seeds) == config.FAST_SEEDS and not set(result.seeds) & set(
         config.EXAM_SEEDS
     )
@@ -54,8 +58,8 @@ def test_two_fast_calls_draw_different_seeds(tmp_path: Path) -> None:
     )
     rng = random.Random(2)
     assert (
-        evaluator.fast(agent, p, rng, workers=4).seeds
-        != evaluator.fast(agent, p, rng, workers=4).seeds
+        evaluator.fast(agent, p, rng, workers=WORKERS).seeds
+        != evaluator.fast(agent, p, rng, workers=WORKERS).seeds
     )
 
 
@@ -71,7 +75,7 @@ def test_deep_scores_the_exam_block_with_intervals_and_held_out(
         opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")},
         weights={"v54": 1.0},
     )
-    result = evaluator.deep(agent, "prog", p, workers=4)
+    result = evaluator.deep(agent, "prog", p, workers=WORKERS)
     assert result.program_id == "prog" and result.score == 0.0 and result.games == 4
     assert result.intervals["v54"][0] == 0.0 and result.intervals["v54"][1] < 1.0
     assert set(result.held_out) == set(evaluator.HELD_OUT)
@@ -104,7 +108,7 @@ def test_deep_bounds_are_the_pool_weighted_sum_of_the_per_opponent_bounds(
         },
         weights={"v54": 0.8, "v56": 0.2},
     )
-    result = evaluator.deep(agent, "prog", p, workers=4)
+    result = evaluator.deep(agent, "prog", p, workers=WORKERS)
     games = 2 * 8
     strong = wilson_interval(0.9 * games, games)
     weak = wilson_interval(0.1 * games, games)
@@ -129,7 +133,7 @@ def test_deep_diverts_what_a_candidate_writes_away_from_the_caller(
         opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")},
         weights={"v54": 1.0},
     )
-    evaluator.deep(agent, "prog", p, workers=4)
+    evaluator.deep(agent, "prog", p, workers=WORKERS)
     assert list(workspace.iterdir()) == []
     assert Path.cwd() == workspace
 
@@ -149,7 +153,7 @@ def test_deep_lets_a_crash_propagate_and_still_restores_the_cwd(
         weights={"v54": 1.0},
     )
     with pytest.raises(RuntimeError):
-        evaluator.deep(agent, "prog", p, workers=4)
+        evaluator.deep(agent, "prog", p, workers=WORKERS)
     assert Path.cwd() == workspace
 
 
@@ -193,7 +197,7 @@ def test_fast_diverts_what_a_candidate_writes_away_from_the_caller(
         weights={"v54": 1.0},
     )
 
-    evaluator.fast(agent, p, random_module.Random(3), workers=2)
+    evaluator.fast(agent, p, random_module.Random(3), workers=WORKERS)
 
     assert list(workspace.iterdir()) == []
     assert Path.cwd() == workspace

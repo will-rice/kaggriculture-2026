@@ -8,6 +8,10 @@ import pytest
 from kaggriculture.campaign import config, harness, roster
 from kaggriculture.constants import EPISODE_STEPS
 
+# Fits the smallest box the suite runs on: CORE_BUDGET clamps to 1 on a
+# 4-core CI runner.
+WORKERS = min(4, config.CORE_BUDGET)
+
 # An episode records `EPISODE_STEPS` states and so takes one fewer transition;
 # the terminal state is never acted on, so the last counter an agent sees is
 # two below the configured length. Measured on the reference engine, not
@@ -118,7 +122,7 @@ def test_play_refuses_a_path_where_a_name_belongs(pass_agent: Path) -> None:
 @pytest.mark.local_data
 def test_play_reports_both_seats_and_latency(pass_agent: Path) -> None:
     """Every seed is played from both seats, timing the candidate's own calls."""
-    games = harness.play(pass_agent, ["v54"], [1, 2], workers=2)
+    games = harness.play(pass_agent, ["v54"], [1, 2], workers=WORKERS)
     assert [(g.seed, g.seat) for g in games] == [(1, 0), (1, 1), (2, 0), (2, 1)]
     assert all(g.ours == 3000.0 for g in games)
     assert all(g.worst_step_seconds < 0.5 for g in games)
@@ -129,7 +133,7 @@ def test_play_passes_each_side_the_arguments_its_signature_declares(
     one_argument_agent: Path,
 ) -> None:
     """Both the candidate and the opponent here take one argument."""
-    games = harness.play(one_argument_agent, ["salemali7_2900"], [11], workers=2)
+    games = harness.play(one_argument_agent, ["salemali7_2900"], [11], workers=WORKERS)
     assert all(game.ours == 3000.0 and game.theirs > 3000.0 for game in games)
 
 
@@ -138,7 +142,7 @@ def test_play_gives_both_seats_the_step_counter(
     step_recording_agent: Path, tmp_path: Path
 ) -> None:
     """Seat one gets the counter the framework, not the interpreter, writes."""
-    harness.play(step_recording_agent, ["v54"], [11], workers=2)
+    harness.play(step_recording_agent, ["v54"], [11], workers=WORKERS)
     seen = {
         seat: int((tmp_path / f"seat{seat}.txt").read_text(encoding="utf-8"))
         for seat in (0, 1)
@@ -156,7 +160,7 @@ def test_a_crashing_opponent_is_a_failure_that_never_names_its_file(
     monkeypatch.setitem(roster.TRAINING, "crasher", hidden / "main.py")
 
     with pytest.raises(RuntimeError) as caught:
-        harness.play(pass_agent, ["crasher"], [11], workers=2)
+        harness.play(pass_agent, ["crasher"], [11], workers=WORKERS)
 
     message = str(caught.value)
     assert "crasher" in message and "ZeroDivisionError" in message
@@ -181,7 +185,7 @@ def test_a_crash_confined_to_opponent_seats_is_its_own_exception(
     monkeypatch.setitem(roster.TRAINING, "crasher", hidden / "main.py")
 
     with pytest.raises(harness.OpponentCrash) as caught:
-        harness.play(pass_agent, ["crasher"], [11], workers=2)
+        harness.play(pass_agent, ["crasher"], [11], workers=WORKERS)
 
     assert "crasher" in str(caught.value)
     assert "secret_dir" not in str(caught.value)
@@ -196,7 +200,7 @@ def test_a_crashing_candidate_is_the_candidates_own_failure(
     candidate.write_text(CRASHING_AGENT, encoding="utf-8")
 
     with pytest.raises(RuntimeError) as caught:
-        harness.play(candidate, ["v54"], [11], workers=2)
+        harness.play(candidate, ["v54"], [11], workers=WORKERS)
 
     assert not isinstance(caught.value, harness.OpponentCrash)
     assert "candidate" in str(caught.value)
@@ -220,7 +224,7 @@ def test_a_candidate_writing_files_leaves_nothing_in_the_callers_directory(
     workspace.mkdir()
     monkeypatch.chdir(workspace)
 
-    harness.play(candidate, ["v54"], [11], workers=2)
+    harness.play(candidate, ["v54"], [11], workers=WORKERS)
 
     assert list(workspace.iterdir()) == []
     assert Path.cwd() == workspace
@@ -234,7 +238,7 @@ def test_play_accepts_a_relative_candidate_path(
     (tmp_path / "main.py").write_text(PASS_AGENT, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
-    games = harness.play(Path("main.py"), ["v54"], [11], workers=2)
+    games = harness.play(Path("main.py"), ["v54"], [11], workers=WORKERS)
 
     assert all(game.error is None for game in games)
 
