@@ -4,6 +4,10 @@ The codex command is a class attribute so a test can replace it with ``true``
 or ``sleep``; the rest of the module never changes between the fake and the
 real thing.
 
+Both mutators are awaitable, because the loop runs many sessions at once on
+one event loop: codex is an ``asyncio`` child process, and the fake's file
+work goes to a thread so an ``edit`` that sleeps cannot stall the loop.
+
 Codex 0.147's ``--json`` output is one JSON object per line. Token usage
 lives on the ``turn.completed`` event, under ``usage.input_tokens`` and
 ``usage.output_tokens`` (verified against a real session log); other events
@@ -12,11 +16,11 @@ instead of writing ``child.py``; ``_last_message`` recovers the last
 ``agent_message`` text so the caller knows why.
 """
 
+import asyncio
 import json
 import logging
 import os
 import signal
-import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -58,7 +62,7 @@ class Mutation(BaseModel):
 class Mutator(Protocol):
     """Something that turns a sandbox into a child program, or a failure."""
 
-    def __call__(self, sandbox: Path, program_id: str) -> Mutation:
+    async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
         """Mutates the parent in ``sandbox`` into a child program.
 
         Args:
@@ -83,8 +87,10 @@ class CodexMutator:
     a timeout, killing only the direct child would orphan any grandchild
     still running, leaking a core the harness's ``config.CORE_BUDGET``
     assumes is free. The process runs in its own session
-    (``start_new_session=True``) so a timeout can kill the whole process
-    group with ``os.killpg``, not just codex itself.
+    (``start_new_session=True``) so a timeout -- or the cancellation that
+    shutting the loop down delivers -- can kill the whole process group with
+    ``os.killpg``, not just codex itself. Without the cancellation arm, a
+    killed loop would leave ``CODEX_CONCURRENCY`` sessions running.
     """
 
     COMMAND = [
@@ -112,7 +118,7 @@ class CodexMutator:
         self.model = model
         self.timeout = timeout
 
-    def __call__(self, sandbox: Path, program_id: str) -> Mutation:
+    async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
         """Runs one codex session in ``sandbox`` and returns its outcome.
 
         Args:
@@ -130,29 +136,21 @@ class CodexMutator:
             command += ["-m", self.model, "-C", str(sandbox)]
         log = sandbox / "codex.jsonl"
         with log.open("w", encoding="utf-8") as handle:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=handle,
-                stderr=subprocess.PIPE,
-                text=True,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=sandbox,
                 start_new_session=True,
             )
             try:
-                _, stderr = process.communicate(input=prompt, timeout=self.timeout)
-            except subprocess.TimeoutExpired:
-                # The process can exit between the timeout firing and this
-                # lookup, and a reaped pid has no process group: that is a
-                # call that finished too late to count, not a kill that
-                # failed, so it is recorded as the timeout it is.
-                try:
-                    pgid: int | None = os.getpgid(process.pid)
-                except ProcessLookupError:
-                    pgid = None
-                if pgid is not None:
-                    os.killpg(pgid, signal.SIGKILL)
-                process.wait()
+                _, stderr = await asyncio.wait_for(
+                    process.communicate(prompt.encode()), self.timeout
+                )
+            except TimeoutError:
+                pgid = kill_group(process)
+                await process.wait()
                 child = _written(sandbox)
                 LOGGER.warning(
                     "codex call for %s timed out after %ss, killed pgid %s; %s",
@@ -171,6 +169,17 @@ class CodexMutator:
                     input_tokens=tokens_in,
                     output_tokens=tokens_out,
                 )
+            except asyncio.CancelledError:
+                # The loop is shutting down. The session goes with it, whole
+                # process group and all, or a restart would find eight codex
+                # sessions still running against sandboxes nothing owns.
+                LOGGER.warning(
+                    "codex call for %s cancelled, killed pgid %s",
+                    program_id,
+                    kill_group(process),
+                )
+                await process.wait()
+                raise
         if process.returncode != 0:
             LOGGER.warning(
                 "codex call for %s exited %s", program_id, process.returncode
@@ -179,7 +188,7 @@ class CodexMutator:
                 program_id=program_id,
                 child=None,
                 status="exec_error",
-                reason=(stderr or "")[-500:],
+                reason=stderr.decode(errors="replace")[-500:] if stderr else "",
                 seconds=time.perf_counter() - started,
                 input_tokens=0,
                 output_tokens=0,
@@ -206,6 +215,25 @@ class CodexMutator:
             input_tokens=tokens_in,
             output_tokens=tokens_out,
         )
+
+
+def kill_group(process: asyncio.subprocess.Process) -> int | None:
+    """SIGKILL a session's whole process group and return the group it killed.
+
+    Args:
+        process: The codex child, started with ``start_new_session=True``.
+
+    Returns:
+        The process group killed, or None if the process had already been
+        reaped -- a call that finished too late to count, not a kill that
+        failed, so the caller reports it as whatever ended the wait.
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return None
+    os.killpg(pgid, signal.SIGKILL)
+    return pgid
 
 
 def _written(sandbox: Path) -> Path | None:
@@ -276,8 +304,12 @@ class FakeMutator:
         """
         self.edit = edit
 
-    def __call__(self, sandbox: Path, program_id: str) -> Mutation:
+    async def __call__(self, sandbox: Path, program_id: str) -> Mutation:
         """Writes ``sandbox / "child.py"`` as ``edit`` of the parent's source.
+
+        The edit runs in a thread, as the codex session it stands in for runs
+        in a child process: a dry run with a slow ``edit`` must exercise the
+        loop's concurrency rather than stall its single thread.
 
         Args:
             sandbox: A directory holding ``parent.py``.
@@ -286,17 +318,27 @@ class FakeMutator:
         Returns:
             A `Mutation` with status "ok".
         """
+        started = time.perf_counter()
         child = sandbox / "child.py"
-        child.write_text(
-            self.edit((sandbox / "parent.py").read_text(encoding="utf-8")),
-            encoding="utf-8",
-        )
+        await asyncio.to_thread(self.write, sandbox, child)
         return Mutation(
             program_id=program_id,
             child=child,
             status="ok",
             reason="",
-            seconds=0.0,
+            seconds=time.perf_counter() - started,
             input_tokens=0,
             output_tokens=0,
+        )
+
+    def write(self, sandbox: Path, child: Path) -> None:
+        """Read the parent, apply ``edit``, write the child. Runs in a thread.
+
+        Args:
+            sandbox: A directory holding ``parent.py``.
+            child: Where to write the edited source.
+        """
+        child.write_text(
+            self.edit((sandbox / "parent.py").read_text(encoding="utf-8")),
+            encoding="utf-8",
         )

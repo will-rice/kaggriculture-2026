@@ -112,9 +112,7 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
-    champion = gate.promote(
-        program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False
-    )
+    champion = gate.promote(program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p)
     assert champion.name == "champion_1"
     floor = config.FLOOR / "main.py"
     assert (
@@ -143,7 +141,7 @@ def test_promote_refuses_a_champion_name_the_directory_already_holds(
     stale.chmod(0o444)
 
     with pytest.raises(FileExistsError, match="champion_1.py already exists"):
-        gate.promote(program, result("p9", 0.7, 0.65, {"a": 0.9}), p, commit=False)
+        gate.promote(program, result("p9", 0.7, 0.65, {"a": 0.9}), p)
     assert stale.read_text() == "# an older champion\n"
     assert not (config.FLOOR / "main.py").exists()
 
@@ -162,13 +160,11 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
-    gate.promote(first, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False)
+    gate.promote(first, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p)
 
     second = _program_and_pool(tmp_path, monkeypatch, body="WATER")
     reloaded = pool.Pool.load(config.POOL)
-    gate.promote(
-        second, result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}), reloaded, commit=False
-    )
+    gate.promote(second, result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}), reloaded)
 
     saved = pool.Pool.load(config.POOL)
     one, two = saved.opponents["champion_1"], saved.opponents["champion_2"]
@@ -189,7 +185,7 @@ def test_promote_writes_the_champion_record_before_it_returns(
     )
     deep = result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5})
 
-    champion = gate.promote(program, deep, p, commit=False)
+    champion = gate.promote(program, deep, p)
 
     assert gate.load_champion() == champion
     assert champion.result == deep
@@ -204,36 +200,39 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
-    gate.promote(
-        program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=False
-    )
+    gate.promote(program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p)
     reloaded = pool.Pool.load(config.POOL)
     champion = gate.promote(
         program,
         result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}),
         reloaded,
-        commit=False,
     )
     assert champion.name == "champion_2"
 
 
-def test_a_failed_commit_is_logged_and_never_undoes_the_promotion(
+def test_a_failed_record_is_logged_and_never_undoes_the_promotion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A CalledProcessError from git is swallowed; the on-disk promotion stands."""
+    """A CalledProcessError from the recording command is swallowed.
+
+    ``promote`` has already written the floor, the champion's own copy and
+    the pool by the time ``commit_floor`` runs; a promotion that happened on
+    disk must never be undone by a record that failed to explain it.
+    """
     program = _program_and_pool(tmp_path, monkeypatch)
     p = pool.Pool(
         opponents={"a": "/x/a.py", "b": "/x/b.py"}, weights={"a": 0.5, "b": 0.5}
     )
 
     def failing_run(*args: object, **kwargs: object) -> None:
-        raise subprocess.CalledProcessError(1, ["git"], stderr="nothing to commit")
+        """Stand in for a repository that refuses the commit."""
+        raise subprocess.CalledProcessError(1, ["record"], stderr="nothing to commit")
 
+    champion = gate.promote(program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p)
     monkeypatch.setattr(gate.subprocess, "run", failing_run)
     with caplog.at_level(logging.WARNING):
-        champion = gate.promote(
-            program, result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5}), p, commit=True
-        )
+        gate.commit_floor(champion, program.id)
+
     assert champion.name == "champion_1"
     floor = config.FLOOR / "main.py"
     assert (floor.stat().st_mode & 0o777) == 0o444

@@ -37,7 +37,9 @@ PACKAGE_MODULES = ("__init__.py", "constants.py", "observation.py", "actions.py"
 # only: the library function is what the evaluator calls, and it plays the
 # whole exam block.
 SANDBOX_GAME_CAP = 16
-SANDBOX_WORKER_CAP = 8
+# Sessions run the harness on their own, outside the loop's core budget, so
+# `CODEX_CONCURRENCY` of them can take this many cores each at once.
+SANDBOX_WORKER_CAP = 4
 # The framework, not the interpreter, writes these onto every seat's
 # observation at call time. The port exports neither, so `_one` injects both.
 OVERAGE_SECONDS = 60
@@ -114,7 +116,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "campaign loop [--iterations N] [--workers N] [--concurrency N] "
+            "campaign loop [--calls N] [--workers N] [--concurrency N] "
             "[--seed-agent PATH] runs the evolution loop; campaign dry-run "
             "takes the same flags and runs it on a fake mutator."
         ),

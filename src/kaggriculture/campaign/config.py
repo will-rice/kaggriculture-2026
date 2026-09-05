@@ -70,17 +70,20 @@ MARKET_OPS: list[str] = [
     "SELL",
 ]
 
-# Spec §3. One iteration is one mutation per island.
+# Spec §3, with the schedule amended by the async-loop design: the loop has
+# no iterations, so migration, the epoch and the island reset are counted in
+# completed calls. 40/100/160 are the old 10/25/40 iterations x 4 islands, so
+# the wall-clock cadence is unchanged.
 ISLANDS = 4
 ISLAND_SIZE = 12
-MIGRATION_INTERVAL = 10
+MIGRATION_INTERVAL = 40
 MIGRANTS = 2
-RESET_INTERVAL = 40
+RESET_INTERVAL = 160
 UCB_C = 0.5
 CROSS_PROBABILITY = 0.3
 FAST_SEEDS = 4  # x both seats x every pool opponent
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
-EPOCH_INTERVAL = 25
+EPOCH_INTERVAL = 100
 DEEP_TOP_K = 3
 CHAMPION_WEIGHT = 0.20
 POOL_CAP = 10

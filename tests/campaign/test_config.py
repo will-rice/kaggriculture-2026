@@ -87,15 +87,18 @@ def test_fast_seed_range_never_touches_the_exam_block() -> None:
 
 
 def test_hyperparameters_match_the_spec_table() -> None:
-    """Evolution hyperparameters match Spec §3."""
+    """Evolution hyperparameters match Spec §3, with the async schedule."""
     assert (config.ISLANDS, config.ISLAND_SIZE) == (4, 12)
+    # Counted in completed calls, not iterations: the old 10/25/40 iterations
+    # times the four islands one iteration used to mutate at once, so the
+    # wall-clock cadence the numbers were tuned for is unchanged.
     assert (config.MIGRATION_INTERVAL, config.MIGRANTS, config.RESET_INTERVAL) == (
-        10,
-        2,
         40,
+        2,
+        160,
     )
     assert config.UCB_C == 0.5 and config.CROSS_PROBABILITY == 0.3
-    assert (config.FAST_SEEDS, config.EPOCH_INTERVAL, config.DEEP_TOP_K) == (4, 25, 3)
+    assert (config.FAST_SEEDS, config.EPOCH_INTERVAL, config.DEEP_TOP_K) == (4, 100, 3)
     assert (
         config.CHAMPION_WEIGHT,
         config.POOL_CAP,

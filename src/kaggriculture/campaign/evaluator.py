@@ -5,9 +5,7 @@ Deep plays the sealed exam block through the field gate, both seats, every
 pool opponent and the held-out set, and reports Wilson intervals.
 """
 
-import os
 import random
-import tempfile
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -109,9 +107,11 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
     """The gate: exam block x both seats x pool and held-out, with intervals.
 
     Playing a candidate executes it, and a candidate is evolved source that
-    may write files, so the games run with the working directory moved into a
-    scratch tree. The candidate is resolved to an absolute path first, because
-    a relative one stops resolving the moment that move happens.
+    may write files; ``harness._one`` runs every game in a scratch directory
+    in its own process, which is where that is contained. Nothing here moves
+    the working directory: the loop runs deep evaluations concurrently with
+    each other and with fast ones, and the working directory is one per
+    process, so a move here would be a race rather than an isolation.
 
     Args:
         agent: The candidate's ``main.py``.
@@ -131,16 +131,9 @@ def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
     """
     names = pool.names()
     opponents = names + [name for name in HELD_OUT if name not in names]
-    candidate = agent.resolve()
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="campaign-deep-") as sandbox:
-        os.chdir(sandbox)
-        try:
-            rates = field_gate.score_field(
-                candidate, seeds=config.EXAM_SEEDS, workers=workers, opponents=opponents
-            )
-        finally:
-            os.chdir(origin)
+    rates = field_gate.score_field(
+        agent, seeds=config.EXAM_SEEDS, workers=workers, opponents=opponents
+    )
     games = 2 * len(config.EXAM_SEEDS)
     intervals = {name: wilson_interval(rates[name] * games, games) for name in names}
     vendored = [name for name in VENDORED if name in names]

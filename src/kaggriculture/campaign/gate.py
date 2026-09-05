@@ -98,10 +98,8 @@ def promotion(candidate: DeepResult, champion: DeepResult | None) -> tuple[bool,
     return True, "promoted"
 
 
-def promote(
-    program: Program, result: DeepResult, pool: Pool, commit: bool = True
-) -> Champion:
-    """Keep the champion's own copy, write the floor, update the pool, commit.
+def promote(program: Program, result: DeepResult, pool: Pool) -> Champion:
+    """Keep the champion's own copy, write the floor and update the pool.
 
     Each champion is written once to ``CHAMPIONS/<name>.py`` and it is that
     path the pool registers, so a pool holding N champions holds N different
@@ -114,11 +112,12 @@ def promote(
         program: The archive entry being promoted.
         result: Its deep evaluation.
         pool: The opponent pool, updated and saved in place.
-        commit: Whether to ``git commit`` the served copy. Tests pass False
-            to skip git entirely.
 
     Returns:
         The champion record, exactly as ``config.CHAMPION`` now holds it.
+        Recording it in the repository is ``commit_floor``'s job: that runs
+        subprocesses, so the loop hands it to a thread rather than blocking
+        the event loop here.
     """
     number = 1 + sum(1 for n in pool.names() if n.startswith("champion_"))
     name = f"champion_{number}"
@@ -154,33 +153,44 @@ def promote(
     record = Champion(name=name, path=str(champion), result=result)
     _write_champion(record)
 
-    if commit:
-        message = (
-            f"feat: promote {program.id} to the floor as {name}\n\n"
-            f"deep {result.score:.4f} [{result.low:.4f}, {result.high:.4f}], "
-            f"field {result.field:.4f}"
-        )
-        try:
-            subprocess.run(
-                ["git", "add", str(SERVED)],
-                check=True,
-                cwd=config.ROOT,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ["git", "commit", "--no-verify", "-q", "-m", message],
-                check=True,
-                cwd=config.ROOT,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as error:
-            stderr = (error.stderr or "")[-300:]
-            LOGGER.warning("promotion commit failed for %s: %s", name, stderr)
-
     LOGGER.info("promoted %s to %s", program.id, name)
     return record
+
+
+def commit_floor(champion: Champion, program_id: str) -> None:
+    """Record a promotion that already happened on disk in the repository.
+
+    Blocking: two version-control subprocesses. The loop awaits this through
+    a thread so the event loop keeps dispatching while it runs.
+
+    Args:
+        champion: The record ``promote`` just wrote.
+        program_id: The archive id of the program that was promoted.
+    """
+    result = champion.result
+    message = (
+        f"feat: promote {program_id} to the floor as {champion.name}\n\n"
+        f"deep {result.score:.4f} [{result.low:.4f}, {result.high:.4f}], "
+        f"field {result.field:.4f}"
+    )
+    try:
+        subprocess.run(
+            ["git", "add", str(SERVED)],
+            check=True,
+            cwd=config.ROOT,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "--no-verify", "-q", "-m", message],
+            check=True,
+            cwd=config.ROOT,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "")[-300:]
+        LOGGER.warning("promotion commit failed for %s: %s", champion.name, stderr)
 
 
 def _write_champion(champion: Champion) -> None:

@@ -19,7 +19,7 @@ from typing import Literal
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as engine_module
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, harness
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +39,8 @@ _STALE_HARNESS_RE = re.compile(
 )
 
 # {project} is filled with ``config.ROOT`` at module load, so the commands are
-# right wherever this repository is checked out.
+# right wherever this repository is checked out; {workers} is the harness's own
+# cap, so the sandbox is never promised more cores than the command allows.
 HARNESS_SECTION = """
 ## Testing what you write
 
@@ -52,14 +53,14 @@ uv run --project {project} campaign play child.py --vs NAME... --seeds A-B --wor
   episode against itself; reports the worst per-step latency (budget 0.5 s).
 - `campaign play child.py --vs NAME... --seeds A-B --workers N` — plays the
   named opponents on the engine, both seats. Opponents x seeds x 2 seats may
-  not exceed 16 games and `--workers` may not exceed 8; the command refuses
+  not exceed 16 games and `--workers` may not exceed {workers}; the command refuses
   anything larger, because the rest of the box is running the loop. Opponent
   names are those in feedback.md. Seeds are your choice; the evaluator uses
   others.
 
 The evaluator measures for real after you finish; use these only to make
 sure the file runs and does what you intended.
-""".format(project=config.ROOT)
+""".format(project=config.ROOT, workers=harness.SANDBOX_WORKER_CAP)
 
 DOCTRINE = """
 ## Doctrine
