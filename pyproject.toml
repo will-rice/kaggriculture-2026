@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Agent for the Kaggriculture simulation competition on Kaggle."
 readme = "README.md"
 authors = [{ name = "Will Rice", email = "wrice20@gmail.com" }]
-# Kaggle runs agents on gcr.io/kaggle-images/python; pin low so anything that
-# runs locally also runs on the competition image.
-requires-python = ">=3.11"
+# Kaggle runs agents on gcr.io/kaggle-images/python, whose interpreter is
+# 3.12.13. Develop on the runner's own version: pinning below it leaves a gap
+# where a program could use something the local interpreter accepts and the
+# runner removed, and validation would pass it.
+requires-python = ">=3.12"
 dependencies = [
   "gitpython>=3.1.61",
   "kaggle-environments>=1.32.7",
