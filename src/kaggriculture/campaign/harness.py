@@ -9,6 +9,7 @@ import argparse
 import logging
 import random
 import shutil
+import sys
 import tarfile
 import tempfile
 from collections.abc import Callable, Sequence
@@ -77,8 +78,26 @@ class CheckReport(BaseModel):
 
 
 def main() -> None:
-    """``campaign play|check|package``."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    """``campaign play|check|package|loop|dry-run``."""
+    if len(sys.argv) > 1 and sys.argv[1] in ("loop", "dry-run"):
+        # The loop owns its own flags, so its arguments are forwarded rather
+        # than restated here. The import is local because `loop` imports this
+        # module, through the evaluator and the validator.
+        from kaggriculture.campaign import loop
+
+        arguments = sys.argv[2:]
+        if sys.argv[1] == "dry-run":
+            arguments.append("--dry-run")
+        loop.main(arguments)
+        return
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "campaign loop [--iterations N] [--workers N] [--concurrency N] "
+            "[--seed-agent PATH] runs the evolution loop; campaign dry-run "
+            "takes the same flags and runs it on a fake mutator."
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     play_parser = commands.add_parser("play")
     play_parser.add_argument("agent", type=Path)

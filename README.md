@@ -38,6 +38,21 @@ for how it was built.
 | `src/kaggriculture/campaign/task_prompt.md`                           | phase 1's product; a first draft is written by hand in Task 12                                                                                                  |
 | `tests/campaign/*.py`                                                 | one test module per source module                                                                                                                               |
 
+### Running the campaign
+
+```bash
+uv run campaign dry-run --iterations 2         # fake mutator, proves the pipeline
+nohup uv run campaign loop > run/campaign/loop.log 2>&1 &
+tail -f run/campaign/loop.log; tail -1 run/campaign/epochs.jsonl | python -m json.tool
+```
+
+`dry-run` swaps the codex mutator for one that copies the parent with a
+visible edit, so it exercises validation, evaluation, insertion and the
+promotion gate without spending a call. Both commands resume from
+`run/campaign/state.json` and the archive log, so a killed loop restarts
+where it stopped. Keep `--workers * --concurrency` inside the core budget:
+each mutation in flight runs an evaluation that forks that many processes.
+
 ## Quick Start
 
 ### 1. Install uv
@@ -74,7 +89,7 @@ uv run pre-commit install
 
 ```bash
 uv sync                        # install dependencies
-uv run campaign --help         # the campaign CLI (play / check / package)
+uv run campaign --help         # the campaign CLI (play / check / package / loop)
 uv run pytest                  # run the test suite
 uv run pre-commit run -a       # format, lint, type-check, test
 uv run package                 # writes submission.tar.gz for the served floor
