@@ -29,6 +29,8 @@ module-name = ["kaggriculture"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["kaggriculture"]
+# The local `wandb/` run directory would otherwise make ruff read wandb as ours.
+known-third-party = ["wandb"]
 
 [tool.ruff.lint]
 select = ["C", "E", "F", "I", "W", "D", "N", "B", "PTH", "ANN"]

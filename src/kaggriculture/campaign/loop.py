@@ -24,9 +24,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
+import wandb
 from pydantic import BaseModel
 
-import wandb
 from kaggriculture.campaign import archive as archive_module
 from kaggriculture.campaign import (
     config,
