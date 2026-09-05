@@ -30,7 +30,28 @@ def names() -> list[str]:
 
 
 def path(name: str) -> Path:
-    """Resolve a name; anything else is a KeyError, never a path lookup."""
+    """Resolve a name; anything else is a KeyError, never a path lookup.
+
+    A champion promoted into the opponent pool is an opponent the gate must
+    play, and it is not vendored, so the pool file is the second and last
+    place a name can resolve. It is read only on a roster miss, and the
+    import is local because ``pool`` imports this module.
+
+    Args:
+        name: An opponent name.
+
+    Returns:
+        The opponent's ``main.py``.
+
+    Raises:
+        KeyError: The name is in neither the roster nor the pool.
+    """
     if name in TRAINING:
         return TRAINING[name]
-    return HELD_OUT[name]
+    if name in HELD_OUT:
+        return HELD_OUT[name]
+    from kaggriculture.campaign.pool import Pool
+
+    if not config.POOL.exists():
+        raise KeyError(name)
+    return Path(Pool.load(config.POOL).opponents[name])
