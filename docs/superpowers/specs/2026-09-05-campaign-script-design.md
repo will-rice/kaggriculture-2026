@@ -273,9 +273,3 @@ timed out, whether it fell back, the model, tokens in and out, seconds, the
 child's fitness, the database's best fitness and size. Per deep evaluation:
 per-opponent rates and margins, `field`, held-out rates, the fast/deep rank
 correlation, and whether it promoted. Each promotion logs its tarball.
-
-## 11. Size
-
-`loop.py` under 520 lines, of which under 330 are code — blank, comment and
-docstring lines excluded. Two numbers, because a single budget is met by
-deleting docstrings, which is the wrong trade.
