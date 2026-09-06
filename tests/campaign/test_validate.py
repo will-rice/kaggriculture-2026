@@ -219,3 +219,33 @@ def test_a_candidate_that_exits_while_loading_is_a_crash_not_a_wait(
 
     assert verdict.status == "crashed" and "exited with code 3" in verdict.reason
     assert time.monotonic() - started < 15
+
+
+def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The campaign keeps no clocks of its own, and this is not one either.
+
+    A codex call runs until it is done, and codex calls return. Evolved source
+    does not have to: a module-level `while True` parses, imports `agent` as
+    the last callable, passes every static check, and then loads forever. The
+    thread validating it -- and the worker behind that thread -- would be gone
+    for the life of the campaign.
+
+    The bound is Kaggle's, not ours. It gives an agent a second per call, so
+    any program it would accept finishes `steps` calls inside
+    `steps * ACT_TIMEOUT` however slow it is; still running past that is not
+    slow, it is a program the ladder would have killed.
+    """
+    # The real constant, not a stand-in: sixty seconds of import allowance is
+    # right for a campaign and wrong for a suite that must fail fast.
+    monkeypatch.setattr(validate, "LOAD_ALLOWANCE", 2.0)
+    started = time.monotonic()
+
+    verdict = validate.validate(write(tmp_path, WEDGING_AGENT), steps=5)
+
+    assert verdict.status == "too_slow"
+    assert "5 calls at Kaggle's own" in verdict.reason
+    # Bounded by the steps asked for, so the suite pays five seconds and not
+    # the seven hundred a full episode would allow.
+    assert time.monotonic() - started < 60

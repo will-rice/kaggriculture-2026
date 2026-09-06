@@ -31,6 +31,7 @@ import multiprocessing
 import os
 import queue
 import tempfile
+import time
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Literal
@@ -254,27 +255,42 @@ def _dynamic_child(agent: str, steps: int, results: "Queue[dict]") -> None:
         results.put(_dynamic(Path(agent), steps).model_dump())
 
 
+# Seconds a candidate may take to import before it is called at all. Spawning
+# the child and importing the module are not the agent's per-call work, so
+# Kaggle's `actTimeout` does not cover them and neither should the deadline
+# below. Sixty seconds is sixty times the heaviest import in the opponent
+# roster: `v56` unpacks its tables in 0.95s and `pilkwang_economic` in 0.74s,
+# both far larger than anything the campaign has evolved.
+LOAD_ALLOWANCE = 60.0
+
+
 def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
     """`_dynamic` in a child process, waited on for as long as it takes.
 
-    The child process is isolation, not a clock: a candidate is evolved source
-    that may write files or take the interpreter down with it, and neither
-    should reach the thread validating it. There is no cap on how long it may
-    run. A program whose *steps* are too slow is still rejected -- that is
-    `harness.LATENCY_BUDGET`, which exists because Kaggle enforces a one
-    second `actTimeout` and a program over it cannot compete -- but a program
-    that is merely slow to finish is not something this decides.
+    The child process is isolation first: a candidate is evolved source that
+    may write files or take the interpreter down with it, and neither should
+    reach the thread validating it.
 
-    The cost of having no cap is a program that never returns at all: it holds
-    this worker for the life of the campaign, and nothing reclaims it.
+    The wait is bounded, but not by a budget of ours. Kaggle gives an agent
+    one second per call, so a program Kaggle would accept finishes ``steps``
+    calls inside ``steps * ACT_TIMEOUT`` -- plus ``LOAD_ALLOWANCE`` to import,
+    which is not per-call work -- however slow it is; anything still running
+    past that is not slow, it is a program the ladder would have killed.
+
+    The distinction matters because the campaign keeps no clocks of its own
+    any more: a codex call runs until it is done, and codex calls do return.
+    Evolved source does not have to. A module-level ``while True``
+    parses, imports `agent` as the last callable, passes every static check,
+    and then loads forever -- and without this the thread validating it, and
+    the worker behind that thread, are gone for the life of the campaign.
 
     Args:
         agent: The candidate's `main.py`.
         steps: How many turns `harness.check` plays before stopping.
 
     Returns:
-        The child's verdict; `crashed` if the child exited without reporting
-        one.
+        The child's verdict; `too_slow` if it outran what Kaggle itself
+        allows; `crashed` if the child exited without reporting one.
     """
     context = multiprocessing.get_context("spawn")
     results: "Queue[dict]" = context.Queue()
@@ -282,6 +298,8 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
         target=_dynamic_child, args=(str(agent.resolve()), steps, results)
     )
     process.start()
+    allowed = LOAD_ALLOWANCE + steps * harness.ACT_TIMEOUT
+    deadline = time.monotonic() + allowed
     while True:
         # Poll in short slices rather than blocking outright, so a child that
         # dies without reporting -- a module-level ``SystemExit``, a native
@@ -297,6 +315,17 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
                     reason=(
                         f"check process exited with code {process.exitcode} "
                         "before reporting"
+                    ),
+                )
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.join()
+                return Verdict(
+                    status="too_slow",
+                    reason=(
+                        f"still running after {allowed:.0f}s: {steps} calls "
+                        f"at Kaggle's own {harness.ACT_TIMEOUT}s each, and "
+                        f"{LOAD_ALLOWANCE:.0f}s to load"
                     ),
                 )
     process.join()

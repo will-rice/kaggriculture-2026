@@ -31,7 +31,10 @@ from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
 LOGGER = logging.getLogger(__name__)
 REFERENCE_SAMPLE = 0.02
-LATENCY_BUDGET = 0.5  # half of actTimeout
+# Kaggle's own per-call limit. Not ours, and not a budget we chose: a program
+# that exceeds it does not run on the ladder at all.
+ACT_TIMEOUT = 1.0
+LATENCY_BUDGET = ACT_TIMEOUT / 2
 # What `campaign play` allows a person at a terminal, enforced on the CLI
 # only: the library function is what the evaluator calls, and it plays the
 # whole exam block. Nothing in the campaign calls the command -- the loop
