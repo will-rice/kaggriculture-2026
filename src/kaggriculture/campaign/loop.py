@@ -59,6 +59,7 @@ from kaggriculture.campaign.mutate import (
     FakeMutator,
     Mutation,
     Mutator,
+    prepare_home,
     validate_model,
 )
 from kaggriculture.campaign.pool import Pool
@@ -107,11 +108,16 @@ def main(argv: list[str] | None = None) -> None:
             validate_model(config.CODEX_FALLBACK_MODEL)
     # 1. wandb, named for the model and the code that produced the run.
     log = _open_run(dry_run=args.dry_run)
-    mutator: Mutator = (
-        FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
-        if args.dry_run
-        else CodexMutator()
-    )
+    if args.dry_run:
+        mutator: Mutator = FakeMutator(
+            edit=lambda source: source + "\n# dry-run mutation\n"
+        )
+    else:
+        # Once, here, rather than per mutator: it deletes and rebuilds the
+        # directory the calls are running under, which a second campaign or a
+        # test suite doing it underneath a live one would break.
+        prepare_home()
+        mutator = CodexMutator()
     try:
         # 2-4. the event loop, the workers, and the gate they fire.
         run(args.sessions, mutator, args.workers, args.seed_agent, random.Random(), log)
@@ -149,7 +155,14 @@ def _isolate(root: Path) -> None:
     Args:
         root: The directory the dry run owns.
     """
-    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION"):
+    for name in (
+        "ARCHIVE",
+        "PROGRAMS",
+        "FLOOR",
+        "CHAMPIONS",
+        "CHAMPION",
+        "ROUND_HOME",
+    ):
         setattr(config, name, root / getattr(config, name).relative_to(config.RUN))
     config.POOL = root / "pool.json"
     LOGGER.info("dry run: every write goes under %s", root)

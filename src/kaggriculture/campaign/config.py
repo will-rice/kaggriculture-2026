@@ -155,6 +155,21 @@ SKILLS_OFF: list[str] = [
     "receiving-code-review",
 ]
 
+# The HOME a codex call runs under. Not the developer's, because a round is
+# given a temporary directory and one message with nobody behind it, and
+# `SKILLS_OFF` must be unreachable rather than merely unlisted: disabling a
+# skill stops codex offering it, but `using-superpowers` names
+# `superpowers:brainstorming` in its own text and the model then reads the file
+# off disk with `sed`, which is exactly what it did. What this holds is
+# `.agents/skills`, one symlink per skill the round may have, rebuilt at
+# startup so it follows whatever the developer's own directory holds.
+# `CODEX_HOME` is passed beside it and still points at the real login, because
+# codex derives it from HOME and the auth would go with it otherwise.
+ROUND_HOME = RUN / "codex-home"
+# Where the skills are symlinked from. Codex's other roots are left alone:
+# `$CODEX_HOME/skills` is still discovered, and holds none of `SKILLS_OFF`.
+HOST_SKILLS = Path.home() / ".agents" / "skills"
+
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
 # The current floor, the copy that ships, and every champion ever promoted.

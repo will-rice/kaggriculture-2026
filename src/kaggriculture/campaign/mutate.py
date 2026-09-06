@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -56,6 +57,48 @@ def skills_off() -> str:
     """
     entries = ",".join(f'{{name="{name}",enabled=false}}' for name in config.SKILLS_OFF)
     return f"skills.config=[{entries}]"
+
+
+def codex_home() -> Path:
+    """Where this login's codex state lives, however the environment names it.
+
+    Codex reads ``CODEX_HOME`` and otherwise ``$HOME/.codex``, and a round is
+    given a HOME of its own, so the default would resolve inside that and the
+    call would run with no ``auth.json`` and no model catalog.
+
+    Returns:
+        The directory holding this login's codex state.
+    """
+    named = os.environ.get("CODEX_HOME")
+    return Path(named) if named else Path.home() / ".codex"
+
+
+def prepare_home() -> None:
+    """Build ``config.ROUND_HOME``: every host skill except ``SKILLS_OFF``.
+
+    One symlink per skill, rebuilt from scratch, so a skill the developer adds
+    is offered to the next campaign and one they delete stops being offered.
+    Symlinks rather than copies because a skill is a directory of documents
+    that the round only reads, and a copy would go stale the moment either
+    side changed.
+    """
+    skills = config.ROUND_HOME / ".agents" / "skills"
+    shutil.rmtree(config.ROUND_HOME, ignore_errors=True)
+    skills.mkdir(parents=True)
+    kept = sorted(
+        skill
+        for skill in config.HOST_SKILLS.iterdir()
+        if skill.is_dir() and skill.name not in config.SKILLS_OFF
+    )
+    for skill in kept:
+        (skills / skill.name).symlink_to(skill, target_is_directory=True)
+    LOGGER.info(
+        "a round is given %d of %s's %d skills, without %s",
+        len(kept),
+        config.HOST_SKILLS,
+        len(kept) + len(config.SKILLS_OFF),
+        ", ".join(config.SKILLS_OFF),
+    )
 
 
 def known_models() -> set[str]:
@@ -297,7 +340,13 @@ class CodexMutator:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace,
                 start_new_session=True,
-                env={**os.environ, "CAMPAIGN_CODEX_MODEL": model},
+                env={
+                    **os.environ,
+                    "CAMPAIGN_CODEX_MODEL": model,
+                    # `config.ROUND_HOME` says why this is not the user's own.
+                    "HOME": str(config.ROUND_HOME),
+                    "CODEX_HOME": str(codex_home()),
+                },
             )
             try:
                 _, stderr = await asyncio.wait_for(

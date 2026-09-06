@@ -451,3 +451,96 @@ def _prompt_input(workspace: Path, home: Path, extra: list[str]) -> str:
         cwd=workspace,
         env={**os.environ, "HOME": str(home)},
     ).stdout
+
+
+def test_the_round_home_holds_every_host_skill_but_the_blocked_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlisted is not enough: the blocked ones must not be on disk to read.
+
+    Disabling a skill stops codex offering it, and the round read it anyway --
+    `using-superpowers` names `superpowers:brainstorming` in its own text, so
+    the model went and read the file with `sed`. Symlinks, and one per skill,
+    so a skill the developer adds is offered to the next campaign.
+    """
+    host = tmp_path / "host"
+    for name in ("gatekeeper-fixture", "worker-fixture", "helper-fixture"):
+        (host / name).mkdir(parents=True)
+        (host / name / "SKILL.md").write_text(f"name: {name}\n", encoding="utf-8")
+    (host / "loose-file.md").write_text("not a skill\n", encoding="utf-8")
+    monkeypatch.setattr(config, "HOST_SKILLS", host)
+    monkeypatch.setattr(config, "SKILLS_OFF", ["gatekeeper-fixture"])
+    monkeypatch.setattr(config, "ROUND_HOME", tmp_path / "round-home")
+
+    mutate.prepare_home()
+
+    skills = config.ROUND_HOME / ".agents" / "skills"
+    assert sorted(p.name for p in skills.iterdir()) == [
+        "helper-fixture",
+        "worker-fixture",
+    ]
+    assert (skills / "worker-fixture" / "SKILL.md").read_text() == (
+        "name: worker-fixture\n"
+    )
+    assert not (skills / "gatekeeper-fixture").exists()
+
+
+def test_the_round_home_is_rebuilt_rather_than_added_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skill blocked today must not survive from a campaign that allowed it."""
+    host = tmp_path / "host"
+    for name in ("kept-fixture", "blocked-later-fixture"):
+        (host / name).mkdir(parents=True)
+        (host / name / "SKILL.md").write_text(f"name: {name}\n", encoding="utf-8")
+    monkeypatch.setattr(config, "HOST_SKILLS", host)
+    monkeypatch.setattr(config, "ROUND_HOME", tmp_path / "round-home")
+    monkeypatch.setattr(config, "SKILLS_OFF", [])
+    mutate.prepare_home()
+    assert (config.ROUND_HOME / ".agents" / "skills" / "blocked-later-fixture").exists()
+
+    monkeypatch.setattr(config, "SKILLS_OFF", ["blocked-later-fixture"])
+    mutate.prepare_home()
+
+    skills = config.ROUND_HOME / ".agents" / "skills"
+    assert sorted(p.name for p in skills.iterdir()) == ["kept-fixture"]
+
+
+def test_a_call_runs_under_the_round_home_and_the_real_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HOME moves so the skills move; CODEX_HOME stays so the login does not.
+
+    Codex derives `CODEX_HOME` from `HOME`, so moving one and not the other
+    would take `auth.json` and the model catalog with it and every call in the
+    campaign would fail unauthenticated.
+    """
+    monkeypatch.setattr(config, "ROUND_HOME", tmp_path / "round-home")
+    box = tmp_path / "box"
+    box.mkdir()
+    (box / "child.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        ["bash", "-c", 'printf "# %s %s\\n" "$HOME" "$CODEX_HOME" >> child.py'],
+    )
+
+    mutation = asyncio.run(
+        mutate.CodexMutator(model="m", fallback="", timeout=30)(box, "go", "p1")
+    )
+
+    assert mutation.status == "ok"
+    written = (box / "child.py").read_text(encoding="utf-8")
+    assert written.endswith(f"# {config.ROUND_HOME} {mutate.codex_home()}\n")
+    assert mutate.codex_home() != config.ROUND_HOME / ".codex"
+
+
+def test_codex_home_is_read_from_the_environment_when_it_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A login kept somewhere other than `~/.codex` is still the login."""
+    monkeypatch.setenv("CODEX_HOME", "/elsewhere/codex")
+    assert mutate.codex_home() == Path("/elsewhere/codex")
+
+    monkeypatch.delenv("CODEX_HOME")
+    assert mutate.codex_home() == Path.home() / ".codex"
