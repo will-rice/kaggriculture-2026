@@ -63,7 +63,10 @@ def result(rates: dict[str, float], days: int = 2) -> evaluator.FastResult:
         },
         seeds=[1, 2, 3, 4],
         hardest=hardest,
-        states=[day(n, 3000.0 - n, 3000.0 + n) for n in range(days)],
+        states={
+            name: [day(n, 3000.0 - n, 3000.0 + n) for n in range(days)]
+            for name in rates
+        },
     )
 
 
@@ -123,18 +126,24 @@ def test_a_program_at_the_top_of_the_tournament_is_told_so() -> None:
     assert "| 1 | **champion_1** |" in text
 
 
-def test_the_states_are_one_game_day_by_day() -> None:
-    """One lost game against the hardest opponent, both sides, day by day."""
+def test_every_opponent_it_lost_to_is_shown_day_by_day() -> None:
+    """The losses, because that is where there is something to learn.
+
+    An opponent it never beats is one it has to learn to beat; one it already
+    beats has nothing left to teach, so `v56` at 0.9 gets no table.
+    """
     text = prompt.compose(
         "champion_1",
         result({"v54": 0.0, "v56": 0.9}, days=30),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
+        table("champion_1", {"v54": 0.0, "v56": 0.9}),
     )
 
-    assert "One game against `v54`, day by day" in text
+    assert "The matches it lost, day by day" in text
+    assert "### `v54`, won 0.000" in text
+    assert "### `v56`" not in text
     assert text.count("| WHEAT 12 | EGG 3 |") == 30
     assert "| 29 | 2971 | 3029 |" in text
     # The shed is hidden from a player at runtime; the author is not a player.
@@ -425,3 +434,42 @@ def test_a_sibling_with_no_docstring_is_still_shown_for_its_score(
     )
 
     assert "| bare | tune | 0.250 | - |" in text
+
+
+def test_the_game_shown_is_against_the_agent_directly_above() -> None:
+    """The next place, not the furthest one.
+
+    Under the absolute gate the worst matchup was the binding constraint, so
+    that was the game to study. Under a tournament it is usually just the
+    strongest agent in the pool, and a program at the bottom loses to it
+    sixteen games to nothing -- a different league, not a next step. Measured
+    on the live campaign, a round was being shown `router2929` at 0.000 while
+    the agent it had to overtake was `indarkarhana`, which it already took a
+    quarter of its games from.
+    """
+    rates = {"unreachable": 0.0, "rival": 0.25, "below": 0.9}
+    standings = {"unreachable": 3.0, "rival": 1.0, "champion_1": 0.0, "below": -2.0}
+
+    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
+
+    # Both losses are shown, worst first, so the agent it never beats leads.
+    assert text.index("### `unreachable`") < text.index("### `rival`")
+    # And the one it has to pass is marked, because that is the next place.
+    assert "### `rival`, won 0.250 -- directly above you" in text
+    # The opponent it already beats has nothing left to teach.
+    assert "### `below`" not in text
+
+
+def test_a_program_that_lost_nothing_is_told_so_rather_than_shown_nothing() -> None:
+    """A heading over no tables would read as a section that went missing.
+
+    It happens the moment a program beats the whole pool, which is also the
+    moment it is promoted, so the message says why there is nothing here.
+    """
+    rates = {"second": 0.6, "third": 0.9}
+    standings = {"champion_1": 2.0, "second": 1.0, "third": -1.0}
+
+    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
+
+    assert "beat every opponent in the pool" in text
+    assert "### `second`" not in text

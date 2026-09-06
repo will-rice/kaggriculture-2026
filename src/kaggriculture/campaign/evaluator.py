@@ -45,9 +45,15 @@ class FastResult(BaseModel):
         rates: Win rate per pool opponent, ties as half.
         margins: Bank margin per pool opponent.
         seeds: The seeds drawn for this call.
-        hardest: The opponent with the lowest win rate.
-        states: One game against ``hardest``, day by day -- the one it lost
-            by the most, which is a lost game whenever it lost any.
+        hardest: The opponent with the lowest win rate. The log line names it;
+            what a round is *shown* is chosen from the standings instead,
+            because the gate is a tournament and the agent to study is the one
+            directly above, not the one furthest away.
+        states: One game against each opponent, day by day: the narrowest
+            loss, or the narrowest win where it lost none. Every opponent,
+            because which one is worth showing depends on the standings and
+            those are not fitted until after this returns -- and the games are
+            played either way, so keeping their tables costs nothing.
     """
 
     fitness: float
@@ -56,7 +62,7 @@ class FastResult(BaseModel):
     margins: dict[str, harness.Margin]
     seeds: list[int]
     hardest: str
-    states: list[harness.Day]
+    states: dict[str, list[harness.Day]]
 
 
 class DeepResult(BaseModel):
@@ -148,12 +154,12 @@ def fast(
     exam block, so ranking pressure never touches the seeds the gate decides
     on and no two candidates are ranked on a block that could be memorised.
 
-    Every game is played with its day table recorded, because one of them
-    is what the loop shows a model of how its program played: the game
-    against the opponent it does worst against that it lost by the most.
-    Taking the minimum margin is what makes that a lost game whenever one
-    exists -- every loss is below every tie and every win -- and the
-    narrowest win when the program lost nothing at all.
+    Every game is played with its day table recorded, because one of them is
+    what the loop shows a model of how its program played. Which one is not
+    decided here: the gate is a tournament, so the game worth studying is the
+    one against the agent directly above in the standings, and those are not
+    fitted until these rates exist. So the narrowest game against every
+    opponent is kept and the caller picks.
 
     Args:
         agent: The candidate's ``main.py``.
@@ -181,10 +187,16 @@ def fast(
     # one it came closest to beating.
     margins = harness.margins(games, names)
     hardest = min(rates, key=lambda name: (rates[name], margins[name].mean))
-    shown = min(
-        (game for game in games if game.opponent == hardest),
-        key=lambda game: game.ours - game.theirs,
-    )
+    # The narrowest game against each: the one a small change would have
+    # flipped, which is what a round can act on. Taking the widest loss
+    # instead showed the failure at its starkest and the least reachable.
+    states = {
+        name: min(
+            (game for game in games if game.opponent == name),
+            key=lambda game: abs(game.ours - game.theirs),
+        ).days
+        for name in names
+    }
     return FastResult(
         fitness=_mean(rates),
         field=vendored_field(rates),
@@ -192,7 +204,7 @@ def fast(
         margins=margins,
         seeds=seeds,
         hardest=hardest,
-        states=shown.days,
+        states=states,
     )
 
 

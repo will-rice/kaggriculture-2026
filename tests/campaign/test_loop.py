@@ -248,7 +248,7 @@ def stub_evaluator(
             margins=dict.fromkeys(names, harness.Margin(mean=0.0, worst=0.0, best=0.0)),
             seeds=[1],
             hardest=names[0],
-            states=[],
+            states=dict.fromkeys(names, []),
         )
 
     def deep(
@@ -1243,7 +1243,10 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     assert "It 2 of 2 at " in message and "below pass" in message
     # And the standings themselves, so a round can see what it has to pass.
     assert "| rank | agent | rating |" in message
-    assert "One game against `pass`, day by day" in message
+    # PASS draws with PASS, and a draw is not a win, so the opponent it did
+    # not beat is shown day by day for the round to learn from.
+    assert "The matches it lost, day by day" in message
+    assert "### `pass`, won 0.500" in message
     assert message.count("\n| 2") + message.count("\n| 1") > 0
     assert "| 29 |" in message
 

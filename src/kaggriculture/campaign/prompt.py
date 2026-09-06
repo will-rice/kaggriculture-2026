@@ -194,42 +194,117 @@ def _verdict_lines(
     return lines
 
 
-def _states_lines(opponent: str, states: list[harness.Day]) -> list[str]:
-    """Render one game against ``opponent`` day by day.
+def _rival(
+    name: str, standings: dict[str, float], states: dict[str, list[harness.Day]]
+) -> str:
+    """The opponent directly above ``name``, whose game is worth studying.
+
+    The gate is a tournament, so the next place is taken from whoever is one
+    rung up -- not from the agent the program does worst against, which under
+    an absolute gate was the binding constraint and under this one is usually
+    just the strongest agent in the pool. A program at the bottom of the table
+    loses to that agent sixteen games to nothing; the one above it is a game
+    it sometimes wins.
 
     Args:
-        opponent: The opponent that game was against, by name.
-        states: The day table the loop recorded while playing it.
+        name: The program's own name in the standings.
+        standings: Every agent's rating from the tournament it is part of.
+        states: The day tables available, one per opponent played.
 
     Returns:
-        Lines of a markdown section: one row per day, both sides.
+        An opponent name with a day table, above ``name`` if there is one.
     """
-    lines = [
-        f"## One game against `{opponent}`, day by day",
-        "",
-        "The game it lost by the most, of those it played against the opponent "
-        "it does worst against. Each row is how that day closed. You are shown "
-        "both sides because you are the program's author; the program itself "
-        "cannot see the opponent's shed or seed while it plays.",
-        "",
-        "A farm column reads `crops / animals / weeds`, counted in tiles, and "
-        "`-` where there are none. Tiles are public, so the opponent's farm is "
-        "here on the same terms as yours; its seed and its carried inventory "
-        "are private and are not.",
-        "",
-        "| day | our bank | their bank | our farm | their farm | our seed | "
-        "our shed | their shed | our hands | their hands | prices |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ranked = [
+        agent
+        for agent in sorted(standings, key=lambda other: -standings[other])
+        if agent == name or agent in states
     ]
-    for day in states:
-        lines.append(
-            f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
-            f"{_farm(day.ours_plants, day.ours_animals, day.ours_weeds)} | "
-            f"{_farm(day.theirs_plants, day.theirs_animals, day.theirs_weeds)} | "
-            f"{_items(day.ours_seeds)} | "
-            f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
-            f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
+    place = ranked.index(name)
+    # Top of the table has nobody above it; then the nearest challenger below
+    # is what it has to stay ahead of.
+    above = ranked[place - 1] if place else ranked[1]
+    return above
+
+
+def _states_lines(
+    result: evaluator.FastResult, rival: str, standings: dict[str, float]
+) -> list[str]:
+    """Render one game against every opponent the program did not beat.
+
+    The losses, because that is where there is something to learn: an
+    opponent it never beats is one it has to learn to beat, and the opponent
+    it already beats has nothing left to teach. Worst first, so the agents it
+    has never taken a game from come before the ones it splits with.
+
+    One game each, and the closest one played -- the game a small change would
+    have flipped, rather than the widest loss, which shows the failure at its
+    starkest and least reachable.
+
+    Args:
+        result: The evaluation, for its rates and its day tables.
+        rival: The agent directly above in the standings, marked because
+            passing it is the next place available.
+        standings: Every agent's rating, to order what is shown.
+
+    Returns:
+        Lines of a markdown section: one table per opponent not beaten.
+    """
+    lost = sorted(
+        (
+            name
+            for name, rate in result.rates.items()
+            if rate <= 0.5 and name in result.states
+        ),
+        key=lambda name: (result.rates[name], result.margins[name].mean),
+    )
+    if not lost:
+        return [
+            "## Every match, day by day",
+            "",
+            "Nothing to show: this program beat every opponent in the pool.",
+        ]
+    lines = [
+        "## The matches it lost, day by day",
+        "",
+        f"One game against each of the {len(lost)} opponents it did not beat, "
+        "worst first. The ones at the top it has never taken a game from, and "
+        "those are the ones it has to learn to beat. Each is the closest game "
+        "played against that opponent -- the one a small change would have "
+        "flipped, rather than the widest loss, which shows the failure at its "
+        "starkest and least reachable.",
+        "",
+        "Each row is how that day closed. You are shown both sides because you "
+        "are the program's author; the program itself cannot see the "
+        "opponent's shed or seed while it plays. A farm column reads "
+        "`crops / animals / weeds`, counted in tiles, and `-` where there are "
+        "none. Tiles are public, so the opponent's farm is here on the same "
+        "terms as yours; its seed and carried inventory are private and are "
+        "not.",
+    ]
+    for opponent in lost:
+        mark = (
+            " -- directly above you, and the next place you can take"
+            if opponent == rival
+            else ""
         )
+        lines += [
+            "",
+            f"### `{opponent}`, won {result.rates[opponent]:.3f}{mark}",
+            "",
+            "| day | our bank | their bank | our farm | their farm | our seed | "
+            "our shed | their shed | our hands | their hands | prices |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for day in result.states[opponent]:
+            lines.append(
+                f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
+                f"{_farm(day.ours_plants, day.ours_animals, day.ours_weeds)} | "
+                f"{_farm(day.theirs_plants, day.theirs_animals, day.theirs_weeds)} | "
+                f"{_items(day.ours_seeds)} | "
+                f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
+                f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
+            )
+    del standings
     return lines
 
 
@@ -355,13 +430,14 @@ def compose(
     Returns:
         The whole message, for codex's standard input.
     """
+    rival = _rival(name, standings, result.states)
     parts = [
         TASK_PROMPT.read_text(encoding="utf-8"),
         PROGRAM_SECTION.format(name=name),
         IMPORTS_SECTION,
         DOCTRINE,
         "\n".join(_verdict_lines(name, result, standings)),
-        "\n".join(_states_lines(result.hardest, result.states)),
+        "\n".join(_states_lines(result, rival, standings)),
     ]
     # A lineage with nothing against it gets no section at all: a heading over
     # an empty list is noise in a message the model reads every round.
@@ -371,9 +447,9 @@ def compose(
         parts.append("\n".join(_failure_lines(name, failures)))
     parts.append(f"## Your instruction\n\n{instruction}\n")
     LOGGER.info(
-        "composed a round on %s (hardest: %s, %d prior, %d failures)",
+        "composed a round on %s (rival: %s, %d prior, %d failures)",
         name,
-        result.hardest,
+        rival,
         len(siblings),
         len(failures),
     )
