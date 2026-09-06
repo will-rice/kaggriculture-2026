@@ -715,13 +715,17 @@ class Campaign:
         The name is a pool name or a database id, never a path: it is
         interpolated raw into the session's own message, and it is also the
         pool entry the starting program is not scored against. Until the
-        first promotion there is no champion, so the seed generation starts
-        from the draw below and is told the seed's database id.
+        first promotion there is no champion, so every session starts from the
+        draw below -- which is why that draw has to be a selection and not a
+        shuffle.
         """
         champion = self.state.champion
         if champion is not None and not stagnant:
             return Path(champion.path), champion.name
-        program = self.rng.choice(self.database.top(10))
+        candidates = self.database.top(config.PARENT_POOL)
+        # Weighted by rank, not uniform: `config.PARENT_POOL` says why.
+        weights = [config.PARENT_DECAY**rank for rank in range(len(candidates))]
+        program = self.rng.choices(candidates, weights=weights)[0]
         return Path(program.source_path), program.id
 
     def fail(self, started_from: str, instruction: str, reason: str) -> None:

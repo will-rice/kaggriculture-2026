@@ -101,6 +101,25 @@ DEEP_CONCURRENCY = 2
 # one our programs beat outright, and losing it would cost the search the one
 # rate it can move.
 POOL_SIZE = 8
+# How many of the database's best a session may start from, and how sharply
+# the draw favours the better ones: weight `PARENT_DECAY ** rank`, so the best
+# is taken about half the time, the second a quarter, and the tenth almost
+# never.
+#
+# It was a uniform draw over ten, which is barely selection at all. With no
+# champion there is nothing else deciding where a session begins, so nine
+# sessions in ten started from something worse than the best program the
+# campaign had -- while only one child in ten improves on its parent and one
+# in five is worse. The population drifted down faster than selection pulled
+# it up: over 259 rated programs the best rating peaked at the fiftieth and
+# every cohort after was worse.
+#
+# Not fully greedy, because a parent is only half the move: the five
+# instructions and the model's own sampling are the other half, and a search
+# that always started from one program would explore with one hand.
+PARENT_POOL = 10
+PARENT_DECAY = 0.5
+
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
@@ -110,20 +129,24 @@ STAGNATION_SESSIONS = 40
 # model or a provider outage, looking busy and producing nothing. Eight is
 # one per worker: a single bad call is noise, eight is the machine.
 NO_VERDICT_LIMIT = 8
-# The first campaign spent nearly all its quota on gpt-6-astra and produced a
-# champion that beats one of six opponents; everything since is about the
-# setup, not the model, so which is the constraint is unknown. This block is
-# a calibration run on a lighter model: a session takes 8-25 minutes whatever
-# model runs it, so if luna reaches about the same field rate, the bottleneck
-# is the setup and the quota should buy volume instead of capability. Not the
-# smallest model on offer -- a session has to run the harness, read a JSONL
-# game log and edit a several-hundred-line program, and the smallest models
-# are likelier to fail at the mechanics than at the strategy, which would
-# answer the wrong question. `mutate.validate_model` checks this against the
-# login's own catalog at startup, because a typo here is hundreds of failed
-# sessions discovered one at a time -- not hypothetical: this login accepts
-# `gpt-6-astra` but refuses `gpt-5.6-astra` (probed 2026-09-05 on codex 0.153).
-CODEX_MODEL = "gpt-5.6-luna"
+# A step up from `luna` without `astra`'s cost. `gpt-6-astra` is the strongest
+# model this login has and is deliberately not used: the first campaign spent
+# nearly all of a quota on it, and quota is the constraint that binds here
+# rather than capability.
+#
+# The block before this ran on `luna` as a calibration, to find out whether
+# the setup or the model was the bottleneck. It produced 381 programs and the
+# search did not climb -- but that is confounded and is not luna's verdict:
+# for the whole of it a session drew its starting program uniformly from the
+# best ten, which is barely selection, and 95% of every rate measured was
+# saturated at nought or one. The experiment ran on a broken hill, so the
+# question it asked is still open.
+#
+# `mutate.validate_model` checks this against the login's own catalog at
+# startup, because a typo here is hundreds of failed sessions discovered one
+# at a time -- not hypothetical: this login accepts `gpt-6-astra` but refuses
+# `gpt-5.6-astra` (probed 2026-09-05 on codex 0.153).
+CODEX_MODEL = "gpt-5.6-terra"
 # The model retried once, in the same directory, when the first model's call
 # fails without a verdict -- a provider refusal or a codex crash -- so the
 # round still gets a child. Astra answered "Selected model is at capacity"

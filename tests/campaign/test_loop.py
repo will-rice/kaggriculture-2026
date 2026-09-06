@@ -1535,3 +1535,55 @@ def test_a_program_carries_the_rating_it_was_given(
     # The seed is scored before any pool is loaded, so it honestly has none.
     assert database.get("seed").rating is None
     assert database.get("seed").place == 0
+
+
+def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A uniform draw over ten is barely selection at all.
+
+    With no champion there is nothing else deciding where a session begins, so
+    a shuffle meant nine sessions in ten started from something worse than the
+    best program the campaign had -- while one child in ten improves on its
+    parent and one in five is worse. Over 259 rated programs the best rating
+    peaked at the fiftieth and every cohort after was worse than it.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    for rank in range(config.PARENT_POOL):
+        source = database.store(f"{PASS}# rank {rank}\n", f"p{rank}")
+        database.add(
+            archive.Program(
+                id=f"p{rank}",
+                source_path=str(source),
+                started_from="parent",
+                instruction="tune",
+                model="m",
+                fitness=0.5,
+                field=0.5,
+                # Rank 0 is the best; the draw should reflect that ordering.
+                rating=-float(rank),
+                created=float(rank),
+            )
+        )
+    campaign = loop.Campaign(
+        loop.State(),
+        database,
+        pass_pool(tmp_path),
+        mutate.FakeMutator(edit=lambda source: source),
+        WORKERS,
+        random.Random(11),
+        log,
+    )
+
+    drawn = [campaign.start(stagnant=False)[1] for _ in range(400)]
+
+    best = drawn.count("p0")
+    worst = drawn.count(f"p{config.PARENT_POOL - 1}")
+    assert best > len(drawn) * 0.35, f"the best was drawn only {best} times"
+    assert best > 10 * max(1, worst), "the best must dominate the tail"
+    # Still a search, not a hill climb: something other than the best is
+    # taken often enough that one program cannot own every session.
+    assert len(set(drawn)) >= 3
