@@ -8,6 +8,7 @@ import pytest
 
 from kaggriculture.campaign import archive
 from kaggriculture.campaign.evaluator import DeepResult
+from kaggriculture.campaign.harness import Margin
 
 AGENT = "def agent(o, c=None):\n    return {}\n"
 
@@ -17,8 +18,10 @@ def make(tmp_path: Path) -> archive.Database:
     return archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
 
 
-def program(db: archive.Database, name: str, fitness: float) -> archive.Program:
-    """Store a source and add a program with `fitness`."""
+def program(
+    db: archive.Database, name: str, fitness: float, margin: float = 0.0
+) -> archive.Program:
+    """Store a source and add a program with `fitness` and one bank margin."""
     p = archive.Program(
         id=name,
         source_path=str(db.store(AGENT, name)),
@@ -28,6 +31,7 @@ def program(db: archive.Database, name: str, fitness: float) -> archive.Program:
         fitness=fitness,
         field=0.5,
         rates={"v54": fitness},
+        margins={"v54": Margin(mean=margin, worst=margin, best=margin)},
         created=time.time(),
     )
     db.add(p)
@@ -172,3 +176,27 @@ def test_get_raises_for_an_unknown_program(tmp_path: Path) -> None:
     """An id the database does not hold is a programming error, not a None."""
     with pytest.raises(KeyError, match="nope"):
         make(tmp_path).get("nope")
+
+
+def test_top_breaks_a_tie_on_the_bank_margin(tmp_path: Path) -> None:
+    """Which of several programs that won nothing came closest to winning.
+
+    Until some program wins a game every fitness is 0.0, and sorting on
+    fitness alone leaves the ties in insertion order: the gate would spend
+    the exam block on the first three programs a campaign ever wrote and the
+    session draw would pick uniformly from the first ten, however they
+    played. The margins are the only signal there is before the first win.
+    """
+    db = make(tmp_path)
+    program(db, "first", 0.0, margin=-900.0)
+    program(db, "closest", 0.0, margin=-5.0)
+    program(db, "middling", 0.0, margin=-300.0)
+    assert [p.id for p in db.top(2)] == ["closest", "middling"]
+
+
+def test_the_margin_never_outranks_the_fitness(tmp_path: Path) -> None:
+    """A program that won is above one that only lost narrowly, always."""
+    db = make(tmp_path)
+    program(db, "narrow", 0.0, margin=-1.0)
+    program(db, "winner", 0.5, margin=-800.0)
+    assert [p.id for p in db.top(2)] == ["winner", "narrow"]

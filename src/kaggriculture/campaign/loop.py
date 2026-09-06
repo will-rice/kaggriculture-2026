@@ -274,6 +274,14 @@ class Campaign:
         self.rng = rng
         self.log = log
         self.remaining = 0
+        # Calls in a row that ran to no verdict. A call that never reached the
+        # model is nobody's failure, so it writes nothing and the worker
+        # simply starts another -- which, when the cause is the login, the
+        # model slug or the provider rather than one call, is a spin at full
+        # rate that leaves the database empty while every counter advances.
+        # It happened on this campaign's first launch: sixteen sessions in
+        # forty-seven seconds over a missing flag.
+        self.no_verdict = 0
         self.deep = asyncio.Semaphore(config.DEEP_CONCURRENCY)
         # A promotion renumbers the pool, writes the floor and re-scores the
         # champion; two gates doing that at once would race on all three.
@@ -460,7 +468,15 @@ class Campaign:
         """
         if mutation.status == "exec_error":
             LOGGER.warning("%s: no verdict (%s)", program_id, mutation.reason[:200])
+            self.no_verdict += 1
+            if self.no_verdict >= config.NO_VERDICT_LIMIT:
+                raise SystemExit(
+                    f"{self.no_verdict} calls in a row ran to no verdict, the "
+                    f"last on {config.CODEX_MODEL} and {config.CODEX_FALLBACK_MODEL}: "
+                    f"{mutation.reason[:200]}"
+                )
             return None
+        self.no_verdict = 0
         if mutation.child is None:
             self.fail(started_from, drawn, f"{mutation.status}: {mutation.reason}")
             return None
@@ -550,9 +566,25 @@ class Campaign:
             self.fail(program.id, program.instruction, f"{DEEP_FAILURE}{error}")
             return
         self.gating.discard(program.id)
-        self.database.record_deep(program.id, result)
         async with self.promotions:
             baseline = self.state.champion
+            # Two deep evaluations run at once, and each holds the pool as it
+            # was when it started. If the other one promoted while this was in
+            # flight, this result never played the new champion, and the rule
+            # -- beat every pool opponent -- would pass on a pool that no
+            # longer exists. Promoting that ships a program which never met
+            # the bar. Nothing is recorded, so `gated` sees a program with no
+            # deep result and sends it back for another exam block against the
+            # pool as it now stands.
+            missing = set(self.pool.names()) - {program.id} - set(result.rates)
+            if missing:
+                LOGGER.info(
+                    "%s deep: measured before %s joined the pool; re-queued",
+                    program.id,
+                    ", ".join(sorted(missing)),
+                )
+                return
+            self.database.record_deep(program.id, result)
             verdict, why = gate.promotion(result.rates)
             LOGGER.info("%s deep %.4f: %s", program.id, result.score, why)
             if verdict:

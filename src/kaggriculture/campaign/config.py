@@ -90,6 +90,12 @@ RETIRE_THRESHOLD = 0.95
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
+# Calls in a row that may run to no verdict before the campaign stops. A call
+# that never reached the model is nobody's failure and writes nothing, so
+# without this the loop spins at full rate on an expired login, a withdrawn
+# model or a provider outage, looking busy and producing nothing. Eight is
+# one per worker: a single bad call is noise, eight is the machine.
+NO_VERDICT_LIMIT = 8
 # The first campaign spent nearly all its quota on gpt-6-astra and produced a
 # champion that beats one of six opponents; everything since is about the
 # setup, not the model, so which is the constraint is unknown. This block is

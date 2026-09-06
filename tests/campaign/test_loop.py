@@ -1194,3 +1194,153 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     assert "One game against `pass`, day by day" in message
     assert message.count("\n| 2") + message.count("\n| 1") > 0
     assert "| 29 |" in message
+
+
+def test_calls_that_never_reach_a_verdict_stop_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A spin that looks healthy is the failure worth stopping the machine for.
+
+    A call that never reached the model is nobody's failure: it leaves no
+    ledger line, and the worker abandons the session and starts another
+    immediately. When the cause is the login, a withdrawn model or a provider
+    outage, every call ends the same way and the loop runs at full rate for
+    as long as nobody looks -- sessions and calls both climbing, the database
+    untouched. This campaign's first launch did exactly that, sixteen
+    sessions in forty-seven seconds, over a missing flag.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "SESSIONS", 1)
+    monkeypatch.setattr(config, "NO_VERDICT_LIMIT", 3)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    monkeypatch.setattr(
+        mutate.CodexMutator, "COMMAND", ["bash", "-c", "echo refused 1>&2; exit 1"]
+    )
+
+    with pytest.raises(SystemExit, match="3 calls in a row ran to no verdict"):
+        loop.run(
+            sessions=100,
+            mutator=mutate.CodexMutator(model="a", timeout=30),
+            workers=WORKERS,
+            seed_agent=_write(tmp_path / "seed.py", PASS),
+            rng=random.Random(0),
+            log=log,
+        )
+
+    # The seed and nothing else: three sessions ran and the database is as
+    # empty as it was before them, which is the state the limit exists to
+    # notice.
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert [program.id for program in database.programs] == ["seed"]
+
+
+def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """One refusal is noise. The limit is for the machine, not for a bad call.
+
+    A campaign of thousands of calls will have some of them refused -- astra
+    answered "Selected model is at capacity" twice in the first live hour --
+    so a running total would eventually stop a run that is working. Four
+    sessions here, refused on the first and the third, and the limit is two:
+    a count that did not reset on the call in between would end this
+    campaign, and it does not.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "SESSIONS", 1)
+    monkeypatch.setattr(config, "NO_VERDICT_LIMIT", 2)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    # One byte per call, and the odd-numbered ones fail: a marker file, not a
+    # closure, because the failure has to happen in the child process.
+    calls = tmp_path / "calls"
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        [
+            "bash",
+            "-c",
+            f"printf x >> {calls}; "
+            f"if [ $(($(wc -c < {calls}) % 2)) -eq 1 ]; then exit 1; fi; "
+            'printf "\n# edited\n" >> child.py',
+        ],
+    )
+
+    state = loop.run(
+        sessions=4,
+        mutator=mutate.CodexMutator(model="a", fallback="", timeout=30),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    assert state.sessions == 4
+    assert calls.read_bytes() == b"xxxx"
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert [program.id for program in database.programs][0] == "seed"
+    assert len(database.programs) == 3
+
+
+def test_a_deep_result_measured_before_a_new_opponent_joined_is_thrown_away(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """Two gates run at once, and the loser's pool is out of date when it lands.
+
+    Each deep evaluation holds the pool as it was when it started. If the
+    other one promoted in the meantime, this result never played the new
+    champion, and "beat every pool opponent" would be answered on a pool that
+    no longer exists -- shipping a program that never met the bar. The result
+    is dropped rather than recorded, so the program still has no deep result
+    and the next round sends it back for another exam block.
+
+    Nothing promotes here: every child is a comment longer than the seed, and
+    `stub_evaluator` scores by length, so each one loses to both opponents.
+    That keeps the real pool fixed and the one stale measurement the only
+    thing that moves.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "SESSIONS", 1)
+    opponents = pool.Pool(
+        opponents={
+            "pass": str(_write(tmp_path / "pass.py", PASS)),
+            "joiner": str(_write(tmp_path / "joiner.py", PASS)),
+        }
+    )
+    opponents.save(config.POOL)
+    monkeypatch.setattr(evaluator, "VENDORED", ["pass", "joiner"])
+    scored = stub_evaluator(monkeypatch)
+    measure = evaluator.deep
+
+    def stale(
+        agent: Path, program_id: str, opponents: pool.Pool, workers: int
+    ) -> evaluator.DeepResult:
+        """The first measurement lands as if ``joiner`` had joined during it."""
+        result = measure(agent, program_id, opponents, workers)
+        if len(scored) == 1:
+            del result.rates["joiner"]
+        return result
+
+    monkeypatch.setattr(evaluator, "deep", stale)
+
+    state = loop.run(
+        sessions=2,
+        mutator=mutate.FakeMutator(edit=lambda source: source + "\n# edited\n"),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    # Measured twice: once on the pool that had moved, once on the pool as it
+    # stands, and only the second is a verdict the campaign wrote down.
+    assert state.champion is None
+    stale_program = scored[0]
+    assert scored.count(stale_program) == 2
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert database.get(stale_program).deep is not None
+    assert len(deeps_of(records)) == len(scored) - 1

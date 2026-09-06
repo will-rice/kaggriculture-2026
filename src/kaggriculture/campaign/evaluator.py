@@ -175,7 +175,12 @@ def fast(
     seeds = rng.sample(config.FAST_SEED_RANGE, config.FAST_SEEDS)
     games = harness.play(agent, names, seeds, workers, days=True)
     rates = _rates(games, names)
-    hardest = min(rates, key=lambda name: rates[name])
+    # Ties on the rate are broken by the margin, because before the first win
+    # every rate is 0.0 and `min` would otherwise always name the first pool
+    # key -- so every session would be shown the same opponent rather than the
+    # one it came closest to beating.
+    margins = harness.margins(games, names)
+    hardest = min(rates, key=lambda name: (rates[name], margins[name].mean))
     shown = min(
         (game for game in games if game.opponent == hardest),
         key=lambda game: game.ours - game.theirs,
@@ -184,7 +189,7 @@ def fast(
         fitness=_mean(rates),
         field=vendored_field(rates),
         rates=rates,
-        margins=harness.margins(games, names),
+        margins=margins,
         seeds=seeds,
         hardest=hardest,
         states=shown.days,

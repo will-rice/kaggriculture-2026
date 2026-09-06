@@ -16,6 +16,19 @@ from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.harness import Margin
 
 
+def _mean_margin(program: "Program") -> float:
+    """Mean bank margin across the opponents a program was measured on.
+
+    The tie-break behind `Database.top`. A program with no margins scores
+    zero, which is neither the best nor the worst: a margin is a bank
+    difference and runs either side of zero. Only a record written before
+    margins existed has none, and this campaign started after they did.
+    """
+    if not program.margins:
+        return 0.0
+    return sum(m.mean for m in program.margins.values()) / len(program.margins)
+
+
 class Program(BaseModel):
     """One program the campaign kept.
 
@@ -162,10 +175,22 @@ class Database:
         )
 
     def top(self, k: int) -> list[Program]:
-        """Return the `k` best programs by fitness, best first."""
-        return sorted(self._programs.values(), key=lambda p: p.fitness, reverse=True)[
-            :k
-        ]
+        """Return the `k` best programs, best first.
+
+        Ranked on fitness, then on the mean bank margin across opponents.
+        The tie-break is what makes the opening hours a search rather than a
+        random walk: until some program wins a game every fitness is 0.0,
+        and sorting on fitness alone leaves ties in insertion order, so the
+        gate would confirm the first three programs ever written and the
+        session draw would pick uniformly from the first ten. The margins
+        say which of those zeroes came closest, which is the only signal
+        there is before the first win.
+        """
+        return sorted(
+            self._programs.values(),
+            key=lambda p: (p.fitness, _mean_margin(p)),
+            reverse=True,
+        )[:k]
 
     def get(self, program_id: str) -> Program:
         """Return the program `program_id`.

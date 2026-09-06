@@ -13,6 +13,7 @@ keeps the opponents that still separate programs. Paths are stored here and
 shown nowhere.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -38,9 +39,19 @@ class Pool(BaseModel):
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
     def save(self, path: Path) -> None:
-        """Save this pool to JSON at ``path``."""
+        """Save this pool to JSON at ``path``, atomically.
+
+        A temporary file and a rename, not a truncate-and-write: every
+        evaluation re-reads this file to resolve a champion's name, in a
+        thread, while a promotion rewrites it on the loop. A read landing
+        inside a truncate returns half a document, and the parse error that
+        follows is a `ValueError` that no handler catches, so it would take
+        the whole campaign down.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        scratch.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        scratch.replace(path)
 
     def names(self) -> list[str]:
         """Every opponent currently in the pool."""
