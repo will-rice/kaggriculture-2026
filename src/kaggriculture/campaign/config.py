@@ -79,7 +79,15 @@ SESSIONS = 8
 # skills this login has installed, which take as long as they take, and a cap
 # only ever cut one off before it had written anything.
 ROUNDS_PER_SESSION = 5
-FAST_SEEDS = 4  # x both seats x every pool opponent
+# Seeds a round is scored on, played in both seats against every pool
+# opponent. Four made a rate out of eight games, which is a standard error of
+# about 0.18: enough noise that a lucky program tops the draw, becomes what
+# the next session starts from, and passes its luck on rather than its
+# quality. The candidate that led the fast ranking at -1.65 came 13 of 13 at
+# -3.02 on the sealed block, a gap of 1.4 rating points that is what this
+# looks like. Eight halves the standard error and doubles a round's scoring to
+# about 90 seconds, against a codex call of two to five minutes.
+FAST_SEEDS = 8
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
 DEEP_TOP_K = 3
 # Deep evaluations in flight at once. Each is about ten minutes of games.

@@ -19,9 +19,17 @@ def make(tmp_path: Path) -> archive.Database:
 
 
 def program(
-    db: archive.Database, name: str, fitness: float, margin: float = 0.0
+    db: archive.Database,
+    name: str,
+    fitness: float,
+    margin: float = 0.0,
+    rating: float | None = None,
 ) -> archive.Program:
-    """Store a source and add a program with `fitness` and one bank margin."""
+    """Store a source and add a program with its scores and one bank margin.
+
+    ``rating`` defaults to ``fitness`` because most tests want the two to
+    agree and care about neither; the ones about ranking set it apart.
+    """
     p = archive.Program(
         id=name,
         source_path=str(db.store(AGENT, name)),
@@ -30,6 +38,7 @@ def program(
         model="gpt-5.6-luna",
         fitness=fitness,
         field=0.5,
+        rating=fitness if rating is None else rating,
         rates={"v54": fitness},
         margins={"v54": Margin(mean=margin, worst=margin, best=margin)},
         created=time.time(),
@@ -58,13 +67,47 @@ def test_a_program_with_no_model_is_a_bug_not_a_legacy_case() -> None:
         )
 
 
-def test_top_ranks_by_fitness(tmp_path: Path) -> None:
-    """`top` is the best programs by fitness, best first."""
+def test_top_ranks_by_rating(tmp_path: Path) -> None:
+    """`top` is the best programs by the measure the gate promotes on.
+
+    It picks who the exam block is spent on and what a session starts from,
+    and both want the same answer as the gate. Ranking on the mean win rate
+    instead had the search climbing a different hill: over 184 rated programs
+    the campaign peaked around the fiftieth and wandered after.
+    """
     db = make(tmp_path)
-    program(db, "a", 0.1)
-    program(db, "b", 0.7)
-    program(db, "c", 0.4)
-    assert [p.id for p in db.top(2)] == ["b", "c"]
+    # Fitness and rating deliberately disagree: `b` wins more games, `c` wins
+    # them against stronger opponents, and a rating is what says so.
+    program(db, "a", 0.1, rating=-2.0)
+    program(db, "b", 0.7, rating=0.1)
+    program(db, "c", 0.4, rating=1.5)
+
+    assert [p.id for p in db.top(2)] == ["c", "b"]
+
+
+def test_a_program_with_no_rating_sorts_below_every_rated_one(
+    tmp_path: Path,
+) -> None:
+    """The seed has none: it is scored before any pool is loaded.
+
+    Sorting it above the rated ones would make every session start from the
+    program nothing has been measured about.
+    """
+    db = make(tmp_path)
+    program(db, "rated_badly", 0.0, rating=-9.0)
+    unrated = archive.Program(
+        id="seed",
+        source_path=str(db.store(AGENT, "seed")),
+        started_from="",
+        instruction="seed",
+        model="",
+        fitness=0.9,
+        field=0.9,
+        created=time.time(),
+    )
+    db.add(unrated)
+
+    assert [p.id for p in db.top(2)] == ["rated_badly", "seed"]
 
 
 def test_a_deep_result_is_stored_on_the_program(tmp_path: Path) -> None:
@@ -181,22 +224,24 @@ def test_get_raises_for_an_unknown_program(tmp_path: Path) -> None:
 def test_top_breaks_a_tie_on_the_bank_margin(tmp_path: Path) -> None:
     """Which of several programs that won nothing came closest to winning.
 
-    Until some program wins a game every fitness is 0.0, and sorting on
-    fitness alone leaves the ties in insertion order: the gate would spend
-    the exam block on the first three programs a campaign ever wrote and the
-    session draw would pick uniformly from the first ten, however they
-    played. The margins are the only signal there is before the first win.
+    Until some program wins a game they all have the same rates and so the
+    same rating, and sorting on rating alone leaves the ties in insertion
+    order: the gate would spend the exam block on the first three programs a
+    campaign ever wrote and the session draw would pick uniformly from the
+    first ten, however they played. The margins are the only signal there is
+    before the first win, because a rating is blind to margin as the
+    competition is.
     """
     db = make(tmp_path)
-    program(db, "first", 0.0, margin=-900.0)
-    program(db, "closest", 0.0, margin=-5.0)
-    program(db, "middling", 0.0, margin=-300.0)
+    program(db, "first", 0.0, margin=-900.0, rating=-6.0)
+    program(db, "closest", 0.0, margin=-5.0, rating=-6.0)
+    program(db, "middling", 0.0, margin=-300.0, rating=-6.0)
     assert [p.id for p in db.top(2)] == ["closest", "middling"]
 
 
-def test_the_margin_never_outranks_the_fitness(tmp_path: Path) -> None:
-    """A program that won is above one that only lost narrowly, always."""
+def test_the_margin_never_outranks_the_rating(tmp_path: Path) -> None:
+    """A program that rates higher is above one that only lost narrowly."""
     db = make(tmp_path)
-    program(db, "narrow", 0.0, margin=-1.0)
-    program(db, "winner", 0.5, margin=-800.0)
+    program(db, "narrow", 0.0, margin=-1.0, rating=-3.0)
+    program(db, "winner", 0.5, margin=-800.0, rating=-1.0)
     assert [p.id for p in db.top(2)] == ["winner", "narrow"]

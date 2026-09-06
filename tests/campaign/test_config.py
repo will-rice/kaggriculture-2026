@@ -90,7 +90,10 @@ def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
     assert config.ROUNDS_PER_SESSION == 5
-    assert config.FAST_SEEDS == 4
+    # Eight, not four: eight games an opponent is a standard error near 0.18,
+    # and a lucky program topping the draw passes its luck to the next
+    # session rather than its quality.
+    assert config.FAST_SEEDS == 8
     assert len(config.EXAM_SEEDS) == 64
     assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
     assert config.POOL_SIZE == 8

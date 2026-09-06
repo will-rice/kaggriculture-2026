@@ -118,16 +118,20 @@ and add it to the opponent pool. The trigger is an event, not a schedule.
 
 AlphaEvolve's cascade: cheap first, and only what survives goes on.
 
-- **Fast** — `FAST_SEEDS = 4` fresh seeds, never the exam block, every pool
-  opponent, both seats. About a minute. This is what a round is scored on
-  and what enters the database. FAMOU's equivalent is 3 games per opponent
-  "for coarse population ranking".
+- **Fast** — `FAST_SEEDS = 8` fresh seeds, never the exam block, every pool
+  opponent, both seats. About ninety seconds. This is what a round is scored
+  on and what enters the database. FAMOU's equivalent is 3 games per opponent
+  "for coarse population ranking", and four seeds was that: eight games an
+  opponent is a standard error near 0.18, enough that a lucky program tops
+  the draw and passes its luck rather than its quality to the session that
+  starts from it. The candidate leading the fast ranking at −1.65 came 13 of
+  13 at −3.02 on the sealed block.
 - **Deep** — the sealed `EXAM_SEEDS = 64`, every pool opponent and every
   held-out opponent, both seats. Returns per-opponent rates with 95% Wilson
   intervals, the equal-weight rate over the vendored opponents (`field`),
   and the held-out rates. FAMOU: "final decisions use deep evaluation".
 
-A program entering the top `DEEP_TOP_K = 3` by fitness is deep-scored once,
+A program entering the top `DEEP_TOP_K = 3` by rating is deep-scored once,
 ever, bounded by `DEEP_CONCURRENCY = 2` at a time.
 
 **A program never plays itself.** The evaluator drops the pool entry
@@ -276,7 +280,7 @@ with uncommitted changes under `src/`.
 | ------------------------ | --------------------------- |
 | `SESSIONS` 8             | fits the machine            |
 | `ROUNDS_PER_SESSION` 5   | the only bound on a session |
-| `FAST_SEEDS` 4           | FAMOU 3 games/opponent      |
+| `FAST_SEEDS` 8           | 4 was too noisy to rank on  |
 | `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
 | `DEEP_TOP_K` 3           | FAMOU                       |
 | `DEEP_CONCURRENCY` 2     |                             |

@@ -8,6 +8,7 @@ database, so the ledger is the only place it is written down.
 """
 
 import json
+import math
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -186,29 +187,35 @@ class Database:
     def top(self, k: int) -> list[Program]:
         """Return the `k` best programs, best first.
 
-        Ranked on fitness -- the mean over the pool it was measured against
-        -- and not on ``field``, which is the mean over the vendored
-        incumbents alone and so is the one number comparable across the whole
-        campaign. That comparability is what this ranking does not need:
-        ``top`` picks who the exam block is spent on, and the exam block asks
-        whether a program beats every *current* pool opponent, champions
-        included. ``field`` cannot see the champions, which are the hardest
-        opponents in the pool. Fitness can, and its one flaw -- an old
-        program was measured against a smaller pool -- costs at most one exam
-        block per program, because nothing is ever measured twice.
+        Ranked on the Bradley-Terry rating, which is what the gate promotes on
+        and what the competition ranks by. It decides two things: who the exam
+        block is spent on, and which program a new session starts from. Both
+        want the same answer as the gate, and for a while they did not: this
+        ranked on ``fitness``, the mean win rate, so the search climbed one
+        hill while being judged on another. Over 184 rated programs the
+        campaign peaked around the fiftieth and wandered after -- a session
+        was as likely to start from the tenth best as the best, because
+        `fitness` did not agree with the gate about which was which.
 
-        Then on the mean bank margin across opponents.
-        The tie-break is what makes the opening hours a search rather than a
-        random walk: until some program wins a game every fitness is 0.0,
-        and sorting on fitness alone leaves ties in insertion order, so the
-        gate would confirm the first three programs ever written and the
-        session draw would pick uniformly from the first ten. The margins
-        say which of those zeroes came closest, which is the only signal
-        there is before the first win.
+        A mean win rate is also the wrong shape: it counts beating the pool's
+        weakest agent for as much as beating its strongest, while a rating
+        does not, and the pool is now the top of the tournament precisely so
+        that the difference matters.
+
+        Then on the mean bank margin across opponents. That tie-break is what
+        makes the opening hours a search rather than a random walk: until some
+        program wins a game every rating is the same number, sorting on rating
+        alone leaves the ties in insertion order, and the margins say which of
+        those came closest. A program with no rating at all -- the seed, or
+        anything written before the tournament -- sorts below every rated one
+        rather than above them.
         """
         return sorted(
             self._programs.values(),
-            key=lambda p: (p.fitness, _mean_margin(p)),
+            key=lambda p: (
+                p.rating if p.rating is not None else -math.inf,
+                _mean_margin(p),
+            ),
             reverse=True,
         )[:k]
 
