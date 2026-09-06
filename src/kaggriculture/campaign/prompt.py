@@ -70,6 +70,14 @@ docstring at its top what you changed and why. Your budget is {minutes}
 minutes; the call is stopped then and the file is scored as it stands, so keep
 it complete and runnable throughout.
 
+Nobody is reading this session. There is no human here to answer a question,
+approve a design, choose between options or confirm anything, and nothing you
+write in your reply is read by anyone. Any skill or process that would have you
+present something and wait for approval before writing code does not apply:
+plan as much as you like, but plan and then edit, and never stop to ask. The
+edited file is the only thing that leaves this call, and a call that ends
+without one is a round the campaign spent on nothing.
+
 The rules above cite probes by filename. Those files are not in your
 directory: take their numbers as verified and do not go looking.
 """

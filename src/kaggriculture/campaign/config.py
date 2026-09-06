@@ -127,6 +127,34 @@ ROUND_LIMIT_SECONDS = SESSION_LIMIT_SECONDS // ROUNDS_PER_SESSION
 # well under a second, so one still running after two minutes is stuck.
 GAME_LIMIT_SECONDS = 120
 
+# Skills a round is not shown. Codex discovers them from `~/.agents/skills`
+# among other roots, and this login's holds sixty; a round inherits every one
+# of them and is told to use whichever applies. Most are harmless and some are
+# useful, which is why this is a list and not a switch -- but a round is one
+# file, one message, a temporary directory and nobody watching, and these stop
+# to ask a person who is not there or manage a repository that is not there.
+# `brainstorming` is the clearest: "do NOT write any code ... until you have
+# presented a design and the user has approved it". Rounds that went to read
+# these produced no program at all, so the whole campaign made nothing for as
+# long as it ran. Verified against `codex debug prompt-input`, which renders
+# what the model is shown without spending a call.
+SKILLS_OFF: list[str] = [
+    # Waits for an approval that never comes.
+    "brainstorming",
+    # Ends by asking which execution approach to take.
+    "writing-plans",
+    # Presents a menu, waits for the answer, then merges or pushes.
+    "finishing-a-development-branch",
+    # Asks consent, then builds worktrees of a repository the round has not got.
+    "using-git-worktrees",
+    # Hours of orchestration, and subagents, inside a round of a few minutes.
+    "executing-plans",
+    "subagent-driven-development",
+    "dispatching-parallel-agents",
+    "requesting-code-review",
+    "receiving-code-review",
+]
+
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
 # The current floor, the copy that ships, and every champion ever promoted.

@@ -47,6 +47,17 @@ LOGGER = logging.getLogger(__name__)
 MODEL_CATALOG_COMMAND = ["codex", "debug", "models"]
 
 
+def skills_off() -> str:
+    """The ``-c`` override that hides ``config.SKILLS_OFF`` from a round.
+
+    Returns:
+        A ``skills.config`` assignment whose value is TOML: one inline table
+        per skill, each disabling it by name.
+    """
+    entries = ",".join(f'{{name="{name}",enabled=false}}' for name in config.SKILLS_OFF)
+    return f"skills.config=[{entries}]"
+
+
 def known_models() -> set[str]:
     """The model slugs this codex login's catalog reports.
 
@@ -185,6 +196,40 @@ class CodexMutator:
         self.fallback = fallback
         self.timeout = timeout
 
+    def arguments(self, model: str, workspace: Path) -> list[str]:
+        """The whole command line for one call, ``COMMAND`` and the rest.
+
+        The per-call half is added here rather than written into ``COMMAND``
+        because it needs the model and the directory, and because a test that
+        replaces ``COMMAND`` with a shell command wants none of it.
+
+        Args:
+            model: The model to request.
+            workspace: The directory holding ``child.py``.
+
+        Returns:
+            The argument list to execute.
+        """
+        command = [*self.COMMAND]
+        if command[0] != "codex":
+            return command
+        return command + [
+            "-m",
+            model,
+            "-C",
+            str(workspace),
+            # `config.SKILLS_OFF` says which and why. Codex reads
+            # `skills.config` from the user layer and from these session
+            # flags, so this turns them off for the round without touching
+            # anything the login has configured for itself.
+            "-c",
+            skills_off(),
+            # `config.SKILLS_OFF` says which and why. Codex reads
+            # `skills.config` from the user layer and from these session
+            # flags, so this turns them off for the round without touching
+            # anything the login has configured for itself.
+        ]
+
     async def __call__(
         self, workspace: Path, message: str, program_id: str
     ) -> Mutation:
@@ -242,9 +287,7 @@ class CodexMutator:
         # What the round was handed. A call that ends with the file exactly
         # as it found it has written nothing, however cleanly it exited.
         given = (workspace / "child.py").read_text(encoding="utf-8")
-        command = [*self.COMMAND]
-        if command[0] == "codex":
-            command += ["-m", model, "-C", str(workspace)]
+        command = self.arguments(model, workspace)
         log = workspace / "codex.jsonl"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
