@@ -36,7 +36,12 @@ class FastResult(BaseModel):
     is the game behind it.
 
     Attributes:
-        fitness: Mean win rate over the pool.
+        fitness: Mean win rate over the pool, which grows as champions join
+            it, so it ranks the database but does not compare across time.
+        field: Mean win rate over the vendored incumbents alone. They never
+            change, so this is the one number that means the same thing on
+            the first session and the thousandth -- it is what "the best is
+            rising" is measured on.
         rates: Win rate per pool opponent, ties as half.
         margins: Bank margin per pool opponent.
         seeds: The seeds drawn for this call.
@@ -46,6 +51,7 @@ class FastResult(BaseModel):
     """
 
     fitness: float
+    field: float
     rates: dict[str, float]
     margins: dict[str, harness.Margin]
     seeds: list[int]
@@ -176,12 +182,36 @@ def fast(
     )
     return FastResult(
         fitness=_mean(rates),
+        field=vendored_field(rates),
         rates=rates,
         margins=harness.margins(games, names),
         seeds=seeds,
         hardest=hardest,
         states=shown.days,
     )
+
+
+def vendored_field(rates: dict[str, float]) -> float:
+    """Mean win rate over the vendored incumbents in ``rates``.
+
+    The pool grows as champions join it, so a mean over the pool moves for
+    reasons that have nothing to do with a program improving. The vendored
+    kernels are fixed, so this number is comparable across the whole
+    campaign.
+
+    Args:
+        rates: Win rate per opponent name.
+
+    Returns:
+        The mean over the vendored names present.
+
+    Raises:
+        ValueError: None of them is present, so the field is undefined.
+    """
+    vendored = {name: rate for name, rate in rates.items() if name in VENDORED}
+    if not vendored:
+        raise ValueError("no vendored opponent was played; the field is undefined")
+    return _mean(vendored)
 
 
 def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:

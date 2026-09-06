@@ -26,6 +26,7 @@ def program(db: archive.Database, name: str, fitness: float) -> archive.Program:
         instruction="improve",
         model="gpt-5.6-luna",
         fitness=fitness,
+        field=0.5,
         rates={"v54": fitness},
         created=time.time(),
     )

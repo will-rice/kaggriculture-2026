@@ -34,6 +34,7 @@ def result(rates: dict[str, float], days: int = 2) -> evaluator.FastResult:
     hardest = min(rates, key=lambda name: rates[name])
     return evaluator.FastResult(
         fitness=sum(rates.values()) / len(rates),
+        field=0.5,
         rates=rates,
         margins={
             name: harness.Margin(mean=-100.0, worst=-300.0, best=50.0) for name in rates

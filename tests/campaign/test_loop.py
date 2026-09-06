@@ -239,6 +239,7 @@ def stub_evaluator(
         names = measured.names()
         return evaluator.FastResult(
             fitness=rate,
+            field=0.5,
             rates=dict.fromkeys(names, rate),
             margins=dict.fromkeys(names, harness.Margin(mean=0.0, worst=0.0, best=0.0)),
             seeds=[1],
@@ -720,6 +721,7 @@ def test_a_broken_pool_opponent_stops_the_run(
             instruction="seed",
             model="",
             fitness=0.5,
+            field=0.5,
             created=time.time(),
         )
     )

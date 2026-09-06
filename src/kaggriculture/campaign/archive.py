@@ -28,6 +28,9 @@ class Program(BaseModel):
             after the fact. Empty for the seed, which no model wrote.
         fitness: Mean pool win rate from the fast evaluation.
         rates: Fast-evaluation win rate per pool opponent.
+        field: Mean win rate over the vendored incumbents alone, which never
+            change, so it is comparable across the whole campaign where
+            ``fitness`` is not.
         margins: Fast-evaluation bank margin per pool opponent. Defaulted,
             so a program written before margins existed still loads.
         created: Unix timestamp.
@@ -40,6 +43,7 @@ class Program(BaseModel):
     instruction: str
     model: str
     fitness: float
+    field: float
     rates: dict[str, float] = {}
     margins: dict[str, Margin] = {}
     created: float

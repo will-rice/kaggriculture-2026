@@ -15,7 +15,7 @@ what wins to the campaign floor, `run/campaign/floor/agent/main.py`, which is
 what `uv run package` ships. See
 [docs/superpowers/specs/2026-09-05-campaign-script-design.md](docs/superpowers/specs/2026-09-05-campaign-script-design.md)
 for the design and
-[docs/superpowers/plans/2026-09-04-campaign-foundation.md](docs/superpowers/plans/2026-09-04-campaign-foundation.md)
+[docs/superpowers/plans/2026-09-05-campaign-script.md](docs/superpowers/plans/2026-09-05-campaign-script.md)
 for how it was built.
 
 | path                                                                  | responsibility                                                                                                                                                  |
@@ -31,11 +31,18 @@ for how it was built.
 | `src/kaggriculture/campaign/roster.py`                                | opponent names → paths (never exposed), training pool and held-out set                                                                                          |
 | `src/kaggriculture/campaign/harness.py`                               | `play`, `check`, `package`; the `campaign` CLI                                                                                                                  |
 | `src/kaggriculture/campaign/copycheck.py`                             | token-shingle similarity against opponent sources                                                                                                               |
-| `src/kaggriculture/campaign/validate.py`                              | `validate(agent) -> Verdict`: syntax, contract, imports, copy, load, latency                                                                                    |
-| `src/kaggriculture/campaign/field_gate.py`, `kernel_watch.py`         | moved from `scripts/`, imports fixed; Plan 2 folds `field_gate` into the evaluator                                                                              |
+| `src/kaggriculture/campaign/validate.py`                              | `validate(agent) -> Verdict`: syntax, contract, imports, copy check, a full game; no latency check                                                              |
+| `src/kaggriculture/campaign/archive.py`                               | the shared database: every program with its scores, its deep result and every failure, as an append-only log                                                    |
+| `src/kaggriculture/campaign/prompt.py`                                | composes the message a call is given: the game, the program, its verdict, the day states, one instruction                                                       |
+| `src/kaggriculture/campaign/mutate.py`                                | one `codex exec` call: a directory holding `child.py`, the message on stdin, a fallback model on a provider refusal                                             |
+| `src/kaggriculture/campaign/evaluator.py`                             | `fast` on fresh seeds and `deep` on the sealed block; a program never plays itself                                                                              |
+| `src/kaggriculture/campaign/pool.py`                                  | the opponents, counting equally; champions join, the crushed retire at `POOL_CAP`                                                                               |
+| `src/kaggriculture/campaign/gate.py`                                  | `promotion`: beat every pool opponent. `promote`: the tarball, the champion file, the floor, `champion.json`                                                    |
+| `src/kaggriculture/campaign/loop.py`                                  | the script: wandb, the event loop, `SESSIONS` workers, the gate they fire                                                                                       |
+| `src/kaggriculture/campaign/field_gate.py`, `kernel_watch.py`         | the vendored-field rate, and the ladder scan that finds new held-out opponents                                                                                  |
 | `src/kaggriculture/scripts/package.py`, `submit.py`                   | shipping, without the routes store                                                                                                                              |
 | `src/kaggriculture/served/main.py`                                    | the cold-start seed the loop begins from; not what ships                                                                                                        |
-| `src/kaggriculture/campaign/task_prompt.md`                           | phase 1's product; a first draft is written by hand in Task 12                                                                                                  |
+| `src/kaggriculture/campaign/task_prompt.md`                           | the game as a call is told it: objective, rules, verified economics, the interface, the doctrine                                                                |
 | `tests/campaign/*.py`                                                 | one test module per source module                                                                                                                               |
 
 ### Running the campaign

@@ -240,6 +240,7 @@ def _program(
         instruction=instruction,
         model=model,
         fitness=result.fitness,
+        field=result.field,
         rates=result.rates,
         margins=result.margins,
         created=time.time(),
@@ -421,6 +422,7 @@ class Campaign:
             "calls/seconds": mutation.seconds,
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
+            "database/top_field": max(p.field for p in self.database.programs),
         }
         if kept is not None:
             record["calls/fitness"] = kept[2].fitness

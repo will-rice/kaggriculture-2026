@@ -110,6 +110,7 @@ def _program(
         instruction="improve it",
         model="gpt-5.6-luna",
         fitness=0.5,
+        field=0.5,
         rates={"a": 0.5},
         created=0.0,
     )
