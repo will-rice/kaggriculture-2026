@@ -73,3 +73,27 @@ def test_round_trips_through_json(tmp_path: Path) -> None:
     p.save(tmp_path / "pool.json")
 
     assert pool.Pool.load(tmp_path / "pool.json") == p
+
+
+def test_a_vendored_incumbent_is_never_retired() -> None:
+    """`field` is a mean over the vendored incumbents, and it must stay one.
+
+    Retiring one changes what that mean is taken over without changing its
+    name, and a curve that rose afterwards would be a program getting better
+    or the field getting easier with no way to tell which. It is the number
+    the campaign is steered by, so a full pool retires a champion or nobody.
+    """
+    vendored = list(roster.TRAINING)
+    champions = [f"champion_{n}" for n in range(1, config.POOL_CAP - len(vendored) + 1)]
+    p = pool.Pool(opponents={n: f"/x/{n}.py" for n in vendored + champions})
+    assert len(p.names()) == config.POOL_CAP
+
+    # It crushes a vendored incumbent harder than any champion, and the
+    # champion it beat most decisively is the one that makes way.
+    rates = dict.fromkeys(vendored, 0.97) | dict.fromkeys(champions, 0.96)
+    rates["v56"] = 1.0
+    rates["champion_2"] = 0.99
+    retired = p.add_champion("champion_5", "/x/champion_5.py", rates)
+
+    assert retired == "champion_2"
+    assert set(vendored) <= set(p.names())

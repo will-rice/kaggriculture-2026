@@ -9,8 +9,14 @@ Champions join as gatekeepers, so a later candidate has to beat every
 program the campaign has already confirmed as well as the vendored kernels.
 At ``POOL_CAP`` a joining champion retires whichever opponent it beats most
 decisively, provided it beats it by at least ``RETIRE_THRESHOLD``: the pool
-keeps the opponents that still separate programs. Paths are stored here and
-shown nowhere.
+keeps the opponents that still separate programs. Only champions retire. The
+vendored incumbents are the basis of ``field``, the one campaign-long
+comparable number, so retiring one would change what that mean is taken over
+without changing its name -- and a rising curve would be a program getting
+better or the field getting easier, with no way to tell which. It follows
+that the cap is a soft one: a champion joining a full pool of champions it
+beat by less than ``RETIRE_THRESHOLD`` retires nobody. Paths are stored here
+and shown nowhere.
 """
 
 import os
@@ -60,6 +66,10 @@ class Pool(BaseModel):
     def add_champion(self, name: str, path: str, rates: dict[str, float]) -> str | None:
         """Add ``name`` to the pool, retiring one opponent if it is full.
 
+        Only a previous champion is ever retired, and only when the pool is
+        full and this one beat it decisively enough that it separates nothing.
+        A vendored incumbent stays for the life of the campaign.
+
         Args:
             name: The champion's opponent name.
             path: The champion's own immutable copy.
@@ -73,7 +83,9 @@ class Pool(BaseModel):
             crushed = [
                 (rate, n)
                 for n, rate in rates.items()
-                if n in self.opponents and rate >= config.RETIRE_THRESHOLD
+                if n in self.opponents
+                and n not in roster.TRAINING
+                and rate >= config.RETIRE_THRESHOLD
             ]
             if crushed:
                 retired = max(crushed)[1]

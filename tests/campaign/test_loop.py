@@ -150,6 +150,10 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rounds: int = 1) -
     """
     monkeypatch.setattr(config, "ROUNDS_PER_SESSION", rounds)
     run = tmp_path / "run"
+    # `RUN` is the root the other paths are relative to, and a dry run derives
+    # its own root from it, so a test that moved the leaves and left the root
+    # would have `_isolate` measuring one tree against another.
+    monkeypatch.setattr(config, "RUN", run)
     for name, relative in RUNTIME_PATHS.items():
         monkeypatch.setattr(config, name, run / relative)
     monkeypatch.setattr(config, "POOL", run / "pool.json")
@@ -817,7 +821,8 @@ def test_a_dirty_src_refuses_to_start(
 
     ``tiny_run`` first, though nothing here should reach a runtime path: this
     is one of two tests that call ``main``, and a `main` that stopped refusing
-    would otherwise open the live campaign's own files.
+    would otherwise reach for files under ``tmp_path`` rather than stopping at
+    the guard.
     """
     tiny_run(tmp_path, monkeypatch)
     _repository(tmp_path, monkeypatch)
@@ -882,8 +887,19 @@ def test_a_restart_resumes_state_json_and_champion_json(
     stub_evaluator(monkeypatch)
     state_file = config.ARCHIVE.with_name("state.json")
     state_file.parent.mkdir(parents=True, exist_ok=True)
+    # A champion in `state.json` too, and an older one: this is the kill the
+    # precedence exists for, and with the field left empty it would be enough
+    # for `champion.json` merely to be read rather than to win.
+    stale = gate.Champion(
+        name="champion_0",
+        path=str(tmp_path / "champion_0.py"),
+        tarball=str(tmp_path / "champion_0.tar.gz"),
+        result=_deep_result("champion_0", {"pass": 0.6}),
+    )
     state_file.write_text(
-        loop.State(sessions=7, sessions_since_promotion=3).model_dump_json(),
+        loop.State(
+            sessions=7, sessions_since_promotion=3, champion=stale
+        ).model_dump_json(),
         encoding="utf-8",
     )
 
@@ -898,6 +914,7 @@ def test_a_restart_resumes_state_json_and_champion_json(
 
     assert state.sessions == 7 and state.sessions_since_promotion == 3
     assert state.champion == champion
+    assert state.champion != stale
 
 
 def test_a_round_is_told_a_name_and_never_a_path(
@@ -920,6 +937,34 @@ def test_a_round_is_told_a_name_and_never_a_path(
 
     handed = mutator.seen[0]
     assert f"`{champion.name}`" in handed.message
+    assert str(tmp_path) not in handed.message
+    assert "/data/kaggriculture" not in handed.message
+    assert prompt.DOCTRINE in handed.message
+
+
+def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """`start`'s other branch, which is the one a campaign opens in.
+
+    Until the first promotion there is no champion to start from, so every
+    session draws from the database's top ten, and under stagnation a
+    campaign that has one comes back here. The draw holds a `Program`, whose
+    id and whose source path are two fields of the same record, so the
+    doctrine binds this branch exactly as it binds the champion's -- and
+    testing only the champion's left the branch that runs first uncovered.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    mutator = Recorder(edit=lambda source: source + "\n# edited\n")
+    seed = _write(tmp_path / "seed.py", PASS)
+
+    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    assert state.champion is None
+    handed = mutator.seen[0]
+    assert "`seed`" in handed.message
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture" not in handed.message
     assert prompt.DOCTRINE in handed.message
@@ -1344,3 +1389,71 @@ def test_a_deep_result_measured_before_a_new_opponent_joined_is_thrown_away(
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
     assert database.get(stale_program).deep is not None
     assert len(deeps_of(records)) == len(scored) - 1
+
+
+def test_a_dry_run_writes_nowhere_the_campaign_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run is the whole campaign with the call faked, so it must be moved.
+
+    It evaluates, inserts, gates and promotes for real. Left on the campaign's
+    own paths it does all of that to the live database, the live pool and the
+    live floor -- a running campaign silently corrupted by someone checking
+    that the plumbing works. Through ``main``, because the isolation is only
+    worth anything if the entry point applies it.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    _repository(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    stub_evaluator(monkeypatch)
+    live = pass_pool(tmp_path)
+    campaign = {
+        name: getattr(config, name)
+        for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "POOL")
+    }
+    seed = _write(tmp_path / "seed.py", PASS)
+
+    loop.main(
+        ["--sessions", "1", "--workers", "1", "--dry-run", "--seed-agent", str(seed)]
+    )
+
+    # It ran: a database, a state file and a pool of its own, all under the
+    # one directory a dry run owns.
+    dry = tmp_path / "run" / "dry-run"
+    assert config.ARCHIVE.is_relative_to(dry) and config.ARCHIVE.exists()
+    assert loop.state_file().is_relative_to(dry) and loop.state_file().exists()
+    assert config.POOL.is_relative_to(dry) and config.POOL.exists()
+    # And the campaign's own files are as they were: no database where one
+    # would be resumed from, and the pool still the one it was playing.
+    assert not campaign["ARCHIVE"].exists()
+    assert not campaign["CHAMPION"].exists()
+    assert not campaign["PROGRAMS"].exists()
+    assert pool.Pool.load(campaign["POOL"]).opponents == live.opponents
+
+
+def test_stagnation_says_nothing_before_there_is_a_champion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A campaign that has never promoted has no champion's line to be stuck in.
+
+    Sessions without a promotion are counted from the first one, so a fresh
+    campaign passes the stagnation threshold before it has anything to
+    stagnate from -- and it starts from the database's top ten either way,
+    because there is no champion to start from instead. Telling the model it
+    left the champion's line because that line is stuck would be a plain
+    falsehood in the one message it reads.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "STAGNATION_SESSIONS", 1)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda source: source + "\n# edited\n")
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    assert state.champion is None
+    assert state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+    assert len(mutator.seen) == 2
+    assert not any("no promotion" in seen.message for seen in mutator.seen)

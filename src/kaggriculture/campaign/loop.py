@@ -97,7 +97,9 @@ def main(argv: list[str] | None = None) -> None:
     """``campaign loop``: eight workers, each mutating the champion."""
     args = _arguments(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    if not args.dry_run:
+    if args.dry_run:
+        _isolate(config.RUN / "dry-run")
+    else:
         # A typo'd model is hundreds of failed sessions discovered one at a
         # time; caught here, before the run opens or a call is ever made.
         validate_model(config.CODEX_MODEL)
@@ -126,8 +128,31 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         "--workers", type=int, default=max(1, config.CORE_BUDGET // config.SESSIONS)
     )
     parser.add_argument("--seed-agent", type=Path, default=config.SERVED)
-    parser.add_argument("--dry-run", action="store_true", help="fake calls, no log")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="fake calls, no log, every write under run/campaign/dry-run",
+    )
     return parser.parse_args(argv)
+
+
+def _isolate(root: Path) -> None:
+    """Point every file the campaign writes at ``root``, for a dry run.
+
+    A dry run fakes the codex call and disables the log, but the rest of it
+    is the campaign: it evaluates, inserts, gates and promotes. Left on the
+    real paths it does that to the live database, the live pool and the live
+    floor, which is a campaign silently corrupted by someone checking that
+    the plumbing works. The pool moves too, so a dry run starts from the
+    roster rather than a live pool holding champions it will then retire.
+
+    Args:
+        root: The directory the dry run owns.
+    """
+    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION"):
+        setattr(config, name, root / getattr(config, name).relative_to(config.RUN))
+    config.POOL = root / "pool.json"
+    LOGGER.info("dry run: every write goes under %s", root)
 
 
 def _open_run(dry_run: bool) -> wandb.Run:
@@ -351,7 +376,13 @@ class Campaign:
                 scored. It is the floor, and the floor is a pool opponent, so
                 there is nothing left to run.
         """
-        stagnant = self.state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+        # A champion is what stagnation is measured against: with none, every
+        # session already starts from the draw, and the note below would tell
+        # a model that a line it never left is stuck.
+        stagnant = (
+            self.state.champion is not None
+            and self.state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+        )
         source, name = self.start(stagnant)
         # Not caught: a starting program that raises is a broken floor, and
         # the floor is in the pool, so the next evaluation of anything would

@@ -177,7 +177,18 @@ class Database:
     def top(self, k: int) -> list[Program]:
         """Return the `k` best programs, best first.
 
-        Ranked on fitness, then on the mean bank margin across opponents.
+        Ranked on fitness -- the mean over the pool it was measured against
+        -- and not on ``field``, which is the mean over the vendored
+        incumbents alone and so is the one number comparable across the whole
+        campaign. That comparability is what this ranking does not need:
+        ``top`` picks who the exam block is spent on, and the exam block asks
+        whether a program beats every *current* pool opponent, champions
+        included. ``field`` cannot see the champions, which are the hardest
+        opponents in the pool. Fitness can, and its one flaw -- an old
+        program was measured against a smaller pool -- costs at most one exam
+        block per program, because nothing is ever measured twice.
+
+        Then on the mean bank margin across opponents.
         The tie-break is what makes the opening hours a search rather than a
         random walk: until some program wins a game every fitness is 0.0,
         and sorting on fitness alone leaves ties in insertion order, so the
