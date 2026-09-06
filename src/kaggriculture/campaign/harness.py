@@ -73,10 +73,25 @@ class Day(BaseModel):
     is deliberate: this is what the author of a program is shown after the
     game, never what the program may read while playing one.
 
+    The banks say a program fell behind; the tile counts say what it was
+    doing instead. A row without them shows a shed filling and emptying with
+    no sight of the acreage that filled it, which is the half of the game a
+    policy actually decides. Tiles are public for both seats, so the
+    opponent's are here on the same footing as ours; its seeds are not, and
+    are not shown.
+
     Attributes:
         day: The day this row closed.
         ours_bank: The candidate's money.
         theirs_bank: The opponent's money.
+        ours_plants: The candidate's growing tiles, counted by crop.
+        theirs_plants: The opponent's growing tiles, counted by crop.
+        ours_animals: The candidate's animals, counted by species.
+        theirs_animals: The opponent's animals, counted by species.
+        ours_weeds: The candidate's tiles lost to weeds.
+        theirs_weeds: The opponent's tiles lost to weeds.
+        ours_seeds: The candidate's unplanted seed, by crop. Private, so the
+            opponent's has no counterpart here.
         ours_shed: The candidate's shed, zero counts dropped.
         theirs_shed: The opponent's shed, zero counts dropped.
         ours_hands: Hands the candidate holds, the farmer aside.
@@ -87,6 +102,13 @@ class Day(BaseModel):
     day: int
     ours_bank: float
     theirs_bank: float
+    ours_plants: dict[str, int]
+    theirs_plants: dict[str, int]
+    ours_animals: dict[str, int]
+    theirs_animals: dict[str, int]
+    ours_weeds: int
+    theirs_weeds: int
+    ours_seeds: dict[str, int]
     ours_shed: dict[str, int]
     theirs_shed: dict[str, int]
     ours_hands: int
@@ -300,6 +322,36 @@ def _failed(work: Work, player: int, error: Exception, worst: float) -> Game:
     )
 
 
+def _worked(tiles: list) -> tuple[dict[str, int], dict[str, int], int]:
+    """What a board is growing: crops by kind, animals by species, weeds.
+
+    A tile is ``None`` when it is owned and bare, the string ``"LOCKED"``
+    when it is not owned yet, and otherwise a dict with a ``kind``. Only
+    ``PLANT`` carries a crop and only a stocked pen carries an animal, so an
+    empty coop counts as neither and is not a row this needs to explain.
+
+    Args:
+        tiles: One farm's ``tiles`` grid, as the observation renders it.
+
+    Returns:
+        Crop counts, animal counts, and the number of tiles lost to weeds.
+    """
+    plants: dict[str, int] = {}
+    animals: dict[str, int] = {}
+    weeds = 0
+    for row in tiles:
+        for tile in row:
+            if not isinstance(tile, dict):
+                continue
+            if tile["kind"] == "WEED":
+                weeds += 1
+            elif crop := tile.get("crop"):
+                plants[crop] = plants.get(crop, 0) + 1
+            elif animal := tile.get("animal"):
+                animals[animal] = animals.get(animal, 0) + 1
+    return plants, animals, weeds
+
+
 def _day(engine: Engine, seat: int, day: int) -> Day:
     """The row for ``day``, read off the engine as that day closed.
 
@@ -309,14 +361,24 @@ def _day(engine: Engine, seat: int, day: int) -> Day:
         day: The day this row is for.
 
     Returns:
-        One ``Day``: both banks, both sheds, both hand counts, the prices.
+        One ``Day``: both banks, both farms, both sheds, our seed, both hand
+        counts, the prices.
     """
     ours = engine.observation(seat)
     theirs = render_private(engine.state.farms[1 - seat])["shed"]
+    ours_plants, ours_animals, ours_weeds = _worked(ours["farms"][seat]["tiles"])
+    their_plants, their_animals, their_weeds = _worked(ours["farms"][1 - seat]["tiles"])
     return Day(
         day=day,
         ours_bank=engine.bank(seat),
         theirs_bank=engine.bank(1 - seat),
+        ours_plants=ours_plants,
+        theirs_plants=their_plants,
+        ours_animals=ours_animals,
+        theirs_animals=their_animals,
+        ours_weeds=ours_weeds,
+        theirs_weeds=their_weeds,
+        ours_seeds={crop: n for crop, n in ours["private"]["seeds"].items() if n},
         ours_shed={item: n for item, n in ours["private"]["shed"].items() if n},
         theirs_shed={item: n for item, n in theirs.items() if n},
         ours_hands=len(ours["farms"][seat]["hands"]),

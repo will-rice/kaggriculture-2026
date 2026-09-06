@@ -203,6 +203,20 @@ class Database:
             reverse=True,
         )[:k]
 
+    def children(self, program_id: str) -> list[Program]:
+        """Every program written from `program_id`, best first.
+
+        What the next round is told has already been tried from where it
+        stands. Ordered like `top`, on fitness and then on the mean bank
+        margin, because before the first win every fitness is 0.0 and
+        insertion order says nothing about which attempt came closest.
+        """
+        return sorted(
+            (p for p in self._programs.values() if p.started_from == program_id),
+            key=lambda p: (p.fitness, _mean_margin(p)),
+            reverse=True,
+        )
+
     def get(self, program_id: str) -> Program:
         """Return the program `program_id`.
 

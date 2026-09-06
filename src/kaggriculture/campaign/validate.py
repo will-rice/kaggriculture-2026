@@ -31,14 +31,13 @@ import multiprocessing
 import os
 import queue
 import tempfile
-import time
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, copycheck, harness
+from kaggriculture.campaign import copycheck, harness
 
 # One file ships, so this is the whole surface a program may name. The
 # `kaggriculture` package and `ctypes` were once here, for the engine library
@@ -202,7 +201,7 @@ def _dynamic(agent: Path, steps: int) -> Verdict:
     """Load the candidate as Kaggle does, then play it on the reference engine.
 
     Everything here executes the candidate's own code, which is why the caller
-    runs it in a child process under a timeout. A load failure is exactly what
+    runs it in a child process. A load failure is exactly what
     `harness.check` would report as `crashed` a moment later, so it is
     reported the same way.
 
@@ -256,17 +255,26 @@ def _dynamic_child(agent: str, steps: int, results: "Queue[dict]") -> None:
 
 
 def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
-    """`_dynamic` in a child process, killed if still running after the cap.
+    """`_dynamic` in a child process, waited on for as long as it takes.
 
-    ``config.GAME_LIMIT_SECONDS`` is a liveness guard, not a speed target.
+    The child process is isolation, not a clock: a candidate is evolved source
+    that may write files or take the interpreter down with it, and neither
+    should reach the thread validating it. There is no cap on how long it may
+    run. A program whose *steps* are too slow is still rejected -- that is
+    `harness.LATENCY_BUDGET`, which exists because Kaggle enforces a one
+    second `actTimeout` and a program over it cannot compete -- but a program
+    that is merely slow to finish is not something this decides.
+
+    The cost of having no cap is a program that never returns at all: it holds
+    this worker for the life of the campaign, and nothing reclaims it.
 
     Args:
         agent: The candidate's `main.py`.
         steps: How many turns `harness.check` plays before stopping.
 
     Returns:
-        The child's verdict; `too_slow` if it did not finish in time;
-        `crashed` if the child exited without reporting one.
+        The child's verdict; `crashed` if the child exited without reporting
+        one.
     """
     context = multiprocessing.get_context("spawn")
     results: "Queue[dict]" = context.Queue()
@@ -274,15 +282,13 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
         target=_dynamic_child, args=(str(agent.resolve()), steps, results)
     )
     process.start()
-    deadline = time.monotonic() + config.GAME_LIMIT_SECONDS
     while True:
-        # Poll in short slices so a child that dies without reporting -- a
-        # module-level ``SystemExit``, a native crash, a failed spawn -- is
-        # seen at once instead of being read as slow after the whole cap.
+        # Poll in short slices rather than blocking outright, so a child that
+        # dies without reporting -- a module-level ``SystemExit``, a native
+        # crash, a failed spawn -- is seen at once instead of waiting on a
+        # queue nothing will ever write to.
         try:
-            payload = results.get(
-                timeout=min(1.0, max(0.0, deadline - time.monotonic()))
-            )
+            payload = results.get(timeout=1.0)
             break
         except queue.Empty:
             if process.exitcode is not None:
@@ -292,14 +298,6 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
                         f"check process exited with code {process.exitcode} "
                         "before reporting"
                     ),
-                )
-            if time.monotonic() >= deadline:
-                process.kill()
-                process.join()
-                cap = config.GAME_LIMIT_SECONDS
-                return Verdict(
-                    status="too_slow",
-                    reason=f"game stuck, still running after {cap}s",
                 )
     process.join()
     return Verdict.model_validate(payload)

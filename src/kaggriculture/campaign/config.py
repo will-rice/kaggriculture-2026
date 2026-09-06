@@ -117,10 +117,6 @@ CODEX_MODEL = "gpt-5.6-luna"
 # some of the time (two calls in the first live hour), which is why this
 # exists at all.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-# Liveness only, never speed: a 720-turn game of rule-based policies takes
-# well under a second, so one still running after two minutes is stuck.
-GAME_LIMIT_SECONDS = 120
-
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
 # The current floor, the copy that ships, and every champion ever promoted.

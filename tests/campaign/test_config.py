@@ -90,7 +90,6 @@ def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
     assert config.ROUNDS_PER_SESSION == 5
-    assert config.GAME_LIMIT_SECONDS == 120
     assert config.FAST_SEEDS == 4
     assert len(config.EXAM_SEEDS) == 64
     assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
@@ -105,9 +104,11 @@ def test_the_deleted_constants_are_gone() -> None:
 
     `SANDBOXES` went with the workspace a model used to be given: it gets a
     temporary directory holding one file now, and nothing under `run/` is a
-    model's to write. The two clocks went because a round runs the skills this
-    login has installed and they take as long as they take: a cap only ever
-    cut a call off before it had written anything.
+    model's to write. The three clocks went because the work they bounded
+    takes as long as it takes: the round cap only ever cut a call off before
+    it had written anything. The one limit left is `harness.LATENCY_BUDGET`,
+    which is not the campaign's -- it is half of Kaggle's own per-call
+    `actTimeout`, and a program over it cannot compete.
     """
     for name in (
         "SANDBOXES",
@@ -128,6 +129,7 @@ def test_the_deleted_constants_are_gone() -> None:
         "WEAKNESS_CAP",
         "ROUND_LIMIT_SECONDS",
         "SESSION_LIMIT_SECONDS",
+        "GAME_LIMIT_SECONDS",
     ):
         assert not hasattr(config, name), name
 

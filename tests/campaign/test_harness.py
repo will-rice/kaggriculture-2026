@@ -464,3 +464,49 @@ def test_package_places_main_and_the_licence_at_the_root(
     # A duplicated member is invisible to a set of names and to `tar -x`, which
     # simply overwrites; it doubles the upload and reads as a corrupt archive.
     assert sorted(listed) == sorted(names)
+
+
+# Buys three wheat seed, plants one, then waters. Seed purchases resolve after
+# unit actions, so the planting waits a step for the seed to arrive.
+PLANTING_AGENT = """
+def agent(observation, configuration=None):
+    step = observation["day"] * 24 + observation["hour"]
+    if step == 0:
+        return {"farmer": ["PASS"], "hands": [], "market": [["BUY_SEED", "WHEAT", 3]]}
+    if step == 1:
+        return {"farmer": ["PLANT", "WHEAT"], "hands": [], "market": []}
+    return {"farmer": ["WATER"], "hands": [], "market": []}
+"""
+
+
+def test_a_day_row_counts_what_each_farm_was_growing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The banks say a program fell behind; the tiles say what it did instead.
+
+    Without these the table shows a shed filling and emptying with no sight of
+    the acreage that filled it, which is the half of the game a policy
+    actually decides. Tiles are public, so the opponent's are here too; the
+    seed it holds is private and is not.
+    """
+    planter = tmp_path / "main.py"
+    planter.write_text(PLANTING_AGENT, encoding="utf-8")
+    hidden = tmp_path / "opponent"
+    hidden.mkdir()
+    (hidden / "main.py").write_text(PASS_AGENT, encoding="utf-8")
+    monkeypatch.setitem(roster.TRAINING, "idler", hidden / "main.py")
+
+    games = harness.play(planter, ["idler"], [11], workers=1, days=True)
+
+    for game in games:
+        opening = game.days[0]
+        # One tile under wheat, and the two seeds it bought but never planted.
+        assert opening.ours_plants == {"WHEAT": 1}
+        assert opening.ours_seeds == {"WHEAT": 2}
+        assert opening.ours_animals == {} and opening.ours_weeds == 0
+        # The opponent passes every turn, so its board stays bare all season.
+        assert all(row.theirs_plants == {} for row in game.days)
+        assert all(row.theirs_animals == {} for row in game.days)
+        # Neglected ground goes to weeds, which is a tile lost and worth
+        # seeing: this agent waters one tile and leaves the rest.
+        assert max(row.ours_weeds for row in game.days) > 0

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, roster, validate
+from kaggriculture.campaign import harness, roster, validate
 
 GOOD = """
 import math
@@ -177,25 +177,17 @@ def test_crash(tmp_path: Path) -> None:
 
 
 def test_too_slow(tmp_path: Path) -> None:
-    """An agent slower than the latency budget is `too_slow`, not `ok`."""
+    """An agent slower than the latency budget is `too_slow`, not `ok`.
+
+    The one clock the campaign still keeps, and it is not the campaign's: it
+    is `harness.LATENCY_BUDGET`, half of the one second `actTimeout` Kaggle
+    enforces per call. A program over it does not run on Kaggle, so promoting
+    one would ship an agent that cannot compete. How long validation takes
+    overall is not bounded; how long a single step takes is.
+    """
     verdict = validate.validate(write(tmp_path, SLOW_AGENT), steps=3)
     assert verdict.status == "too_slow"
-
-
-def test_a_candidate_that_never_finishes_loading_is_too_slow_not_a_hang(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unbounded loop at module level must cost the cap, not the run.
-
-    The load happens in a child process precisely so this file cannot wedge
-    the thread validating it -- and through that thread, the island it was
-    mutating -- for as long as the campaign runs.
-    """
-    monkeypatch.setattr(config, "GAME_LIMIT_SECONDS", 5)
-
-    verdict = validate.validate(write(tmp_path, WEDGING_AGENT))
-
-    assert verdict.status == "too_slow" and "stuck" in verdict.reason
+    assert verdict.worst_step_seconds > harness.LATENCY_BUDGET
 
 
 def test_what_a_candidate_writes_while_loading_lands_in_a_scratch_directory(
@@ -211,11 +203,16 @@ def test_what_a_candidate_writes_while_loading_lands_in_a_scratch_directory(
     assert list(workspace.iterdir()) == []
 
 
-def test_a_candidate_that_exits_while_loading_is_a_crash_not_slow(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_candidate_that_exits_while_loading_is_a_crash_not_a_wait(
+    tmp_path: Path,
 ) -> None:
-    """A dead child is reported at once and as what it was."""
-    monkeypatch.setattr(config, "GAME_LIMIT_SECONDS", 30)
+    """A dead child is reported at once and as what it was.
+
+    Nothing caps how long validation may take any more, so this is the only
+    thing between a child that will never report and a worker waiting on a
+    queue for the life of the campaign: the poll notices the process is gone
+    and says what happened to it.
+    """
     started = time.monotonic()
 
     verdict = validate.validate(write(tmp_path, EXITING_AGENT))

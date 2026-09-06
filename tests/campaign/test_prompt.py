@@ -1,6 +1,7 @@
 """What the composed message says, and what it must never say."""
 
 import re
+from pathlib import Path
 
 from kaggriculture.campaign import (
     archive,
@@ -21,6 +22,13 @@ def day(number: int, ours: float, theirs: float) -> harness.Day:
         day=number,
         ours_bank=ours,
         theirs_bank=theirs,
+        ours_plants={"WHEAT": 4},
+        theirs_plants={"MELON": 2},
+        ours_animals={},
+        theirs_animals={"COW": 1},
+        ours_weeds=0,
+        theirs_weeds=3,
+        ours_seeds={"WHEAT": 5},
         ours_shed={"WHEAT": 12},
         theirs_shed={"EGG": 3},
         ours_hands=2,
@@ -47,7 +55,7 @@ def result(rates: dict[str, float], days: int = 2) -> evaluator.FastResult:
 
 def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
     """The model edits child.py and stops; the campaign plays it."""
-    text = prompt.compose("champion_1", result({"v54": 0.3}), [], IMPROVE)
+    text = prompt.compose("champion_1", result({"v54": 0.3}), [], [], IMPROVE)
 
     assert "`child.py` in your working directory is `champion_1`" in text
     assert "Edit it in place and stop" in text
@@ -66,7 +74,7 @@ def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:
     """
     rates = {"v54": 0.3, "v56": 0.9}
 
-    text = prompt.compose("champion_1", result(rates), [], IMPROVE)
+    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE)
 
     assert f"It {gate.promotion(rates)[1]}." in text
     assert "It did not beat v54 at 0.300." in text
@@ -78,7 +86,7 @@ def test_a_program_that_beats_everything_is_told_so() -> None:
     """The bar is stated the same way whether or not it has been cleared."""
     rates = {"v54": 0.9, "v56": 0.8}
 
-    text = prompt.compose("champion_1", result(rates), [], IMPROVE)
+    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE)
 
     assert f"It {gate.promotion(rates)[1]}." in text
     assert "It beat every opponent." in text
@@ -88,7 +96,7 @@ def test_a_program_that_beats_everything_is_told_so() -> None:
 def test_the_states_are_one_game_day_by_day() -> None:
     """One lost game against the hardest opponent, both sides, day by day."""
     text = prompt.compose(
-        "champion_1", result({"v54": 0.0, "v56": 0.9}, days=30), [], IMPROVE
+        "champion_1", result({"v54": 0.0, "v56": 0.9}, days=30), [], [], IMPROVE
     )
 
     assert "One game against `v54`, day by day" in text
@@ -96,6 +104,9 @@ def test_the_states_are_one_game_day_by_day() -> None:
     assert "| 29 | 2971 | 3029 |" in text
     # The shed is hidden from a player at runtime; the author is not a player.
     assert "cannot see the opponent's shed" in text
+    # The production side of every row: what each farm was growing while the
+    # banks moved, ours with the seed it had not planted yet.
+    assert text.count("| WHEAT 4 / - / - | MELON 2 / COW 1 / 3 | WHEAT 5 |") == 30
 
 
 def test_the_message_names_opponents_and_never_a_path() -> None:
@@ -106,7 +117,7 @@ def test_the_message_names_opponents_and_never_a_path() -> None:
     does.
     """
     text = prompt.compose(
-        "champion_1", result({"v54": 0.1, "router_v1": 0.0}), [], IMPROVE
+        "champion_1", result({"v54": 0.1, "router_v1": 0.0}), [], [], IMPROVE
     )
 
     assert "/data/kaggriculture" not in text
@@ -123,7 +134,7 @@ def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
     than restated, because a model told a different set from the one that
     rejects it is worse than one told nothing.
     """
-    text = prompt.compose("champion_1", result({"v54": 0.5}), [], IMPROVE)
+    text = prompt.compose("champion_1", result({"v54": 0.5}), [], [], IMPROVE)
 
     for name in validate.ALLOWED_IMPORTS:
         assert f"`{name}`" in text, name
@@ -133,7 +144,7 @@ def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
 
 def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
     """The game's rules travel; the harness section does not, having nothing to run."""
-    text = prompt.compose("champion_1", result({"v54": 0.5}), [], IMPROVE)
+    text = prompt.compose("champion_1", result({"v54": 0.5}), [], [], IMPROVE)
 
     assert "Kaggriculture policy task" in text
     assert "never read opponent source" in text
@@ -178,7 +189,7 @@ def test_the_message_carries_the_lineages_recent_failures() -> None:
         failure("no_output: I rewrote the planner\nand left it in child.py"),
     ]
 
-    text = prompt.compose("champion_1", result({"v54": 0.5}), failures, IMPROVE)
+    text = prompt.compose("champion_1", result({"v54": 0.5}), failures, [], IMPROVE)
 
     assert "## Recent attempts on `champion_1` that produced nothing" in text
     assert "- contract: agent is shadowed by 'policy', the last callable" in text
@@ -191,7 +202,7 @@ def test_the_message_carries_the_lineages_recent_failures() -> None:
 
 def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
     """A heading over an empty list is noise in a message read every round."""
-    text = prompt.compose("champion_1", result({"v54": 0.5}), [], IMPROVE)
+    text = prompt.compose("champion_1", result({"v54": 0.5}), [], [], IMPROVE)
 
     assert "produced nothing" not in text
 
@@ -199,7 +210,127 @@ def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
 def test_every_instruction_reaches_the_message_whole() -> None:
     """The drawn instruction is the last thing said, and only that one."""
     for index, (name, text) in enumerate(prompt.INSTRUCTIONS):
-        message = prompt.compose("champion_1", result({"v54": 0.5}), [], text)
+        message = prompt.compose("champion_1", result({"v54": 0.5}), [], [], text)
         assert message.rstrip().endswith(text), name
         others = [t for i, (_, t) in enumerate(prompt.INSTRUCTIONS) if i != index]
         assert not [other for other in others if other in message], name
+
+
+def stored(
+    db: archive.Database, name: str, parent: str, fitness: float, docstring: str
+) -> archive.Program:
+    """Store a program whose source opens with ``docstring``, and add it."""
+    source = f'"""{docstring}"""\n\n\ndef agent(o, c=None):\n    return {{}}\n'
+    program = archive.Program(
+        id=name,
+        source_path=str(db.store(source, name)),
+        started_from=parent,
+        instruction="tune",
+        model="gpt-5.6-luna",
+        fitness=fitness,
+        field=fitness,
+        rates={"v54": fitness},
+        margins={"v54": harness.Margin(mean=-100.0, worst=-300.0, best=50.0)},
+        created=0.0,
+    )
+    db.add(program)
+    return program
+
+
+def test_the_message_says_what_has_already_been_made_of_the_program(
+    tmp_path: Path,
+) -> None:
+    """Sessions all start from the same program and must not repeat each other.
+
+    A round is told what earlier rounds made of exactly the program it holds,
+    and what those scored. Without it the only feedback crossing between
+    attempts is a failure that produced no program at all, so a direction that
+    was tried and measured as bad is indistinguishable from one never tried,
+    and the campaign re-explores it for as long as it runs. AlphaEvolve and
+    FAMOU both feed prior candidates' measured performance into the next
+    prompt.
+    """
+    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+    stored(db, "worse", "champion_1", 0.1, "Sold wheat on sight. Worse.")
+    stored(db, "better", "champion_1", 0.4, "Held wheat for the glut to lift.")
+    stored(db, "elsewhere", "champion_2", 0.9, "Another lineage entirely.")
+
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.5}),
+        [],
+        db.children("champion_1"),
+        IMPROVE,
+    )
+
+    assert "What has already been made of `champion_1`" in text
+    # Best first, so the row that says what to beat is the one read first.
+    assert text.index("better") < text.index("worse")
+    assert "Held wheat for the glut to lift." in text
+    assert "Sold wheat on sight. Worse." in text
+    assert "0.400" in text and "0.100" in text
+    # Another program's children are not this program's.
+    assert "elsewhere" not in text and "Another lineage entirely" not in text
+
+
+def test_only_the_best_few_siblings_are_shown_and_the_rest_are_counted(
+    tmp_path: Path,
+) -> None:
+    """A champion accumulates children for as long as it stands.
+
+    All of them would be most of the message and most of it noise, so the
+    count is stated and the best `SIBLINGS` are shown -- the ones that say
+    what the ceiling from here is.
+    """
+    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+    for n in range(prompt.SIBLINGS + 5):
+        stored(db, f"p{n}", "champion_1", n / 100, f"Attempt {n}.")
+
+    text = prompt.compose(
+        "champion_1", result({"v54": 0.5}), [], db.children("champion_1"), IMPROVE
+    )
+
+    assert f"{prompt.SIBLINGS + 5} program(s) have been written" in text
+    assert f"the best {prompt.SIBLINGS} of them" in text
+    assert "Attempt 12." in text  # the best
+    assert "Attempt 0." not in text  # the worst, cut
+
+
+def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> None:
+    """A heading over an empty table is noise in a message read every round."""
+    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+
+    text = prompt.compose(
+        "champion_1", result({"v54": 0.5}), [], db.children("champion_1"), IMPROVE
+    )
+
+    assert "already been made" not in text
+
+
+def test_a_sibling_with_no_docstring_is_still_shown_for_its_score(
+    tmp_path: Path,
+) -> None:
+    """The number is the point; the program's own account of itself is a bonus.
+
+    A round is asked for a docstring saying what it changed, and mostly writes
+    one. Dropping the row when it did not would hide a measured result over a
+    missing comment.
+    """
+    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+    bare = archive.Program(
+        id="bare",
+        source_path=str(db.store("def agent(o, c=None):\n    return {}\n", "bare")),
+        started_from="champion_1",
+        instruction="tune",
+        model="gpt-5.6-luna",
+        fitness=0.25,
+        field=0.25,
+        created=0.0,
+    )
+    db.add(bare)
+
+    text = prompt.compose(
+        "champion_1", result({"v54": 0.5}), [], db.children("champion_1"), IMPROVE
+    )
+
+    assert "| bare | tune | 0.250 | - |" in text

@@ -13,6 +13,7 @@ composed by it, the first included, so the model never sees a round that is
 shaped differently from the others.
 """
 
+import ast
 import logging
 from pathlib import Path
 
@@ -89,6 +90,16 @@ directory: take their numbers as verified and do not go looking.
 # and the parser error or the exception that matters comes first.
 RECENT_FAILURES = 3
 REASON_CHARS = 200
+
+# How many already-scored siblings are shown, and how much of each one's own
+# account of itself. Best first, so the list is both the ceiling reached from
+# here and the directions already measured. Without it eight workers start
+# every session from the same program knowing nothing of each other, and the
+# same dead end is re-explored in parallel for as long as the campaign runs;
+# AlphaEvolve and FAMOU both feed prior candidates' measured performance into
+# the next prompt, and this is that.
+SIBLINGS = 8
+CHANGE_CHARS = 160
 
 # FAMOU appendix C.2's five rewrite instructions. One is drawn per session, so
 # eight workers starting from the same champion are pushed eight different
@@ -180,17 +191,81 @@ def _states_lines(opponent: str, states: list[harness.Day]) -> list[str]:
         "The game it lost by the most, of those it played against the opponent "
         "it does worst against. Each row is how that day closed. You are shown "
         "both sides because you are the program's author; the program itself "
-        "cannot see the opponent's shed while it plays.",
+        "cannot see the opponent's shed or seed while it plays.",
         "",
-        "| day | our bank | their bank | our shed | their shed | our hands | "
-        "their hands | prices |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "A farm column reads `crops / animals / weeds`, counted in tiles, and "
+        "`-` where there are none. Tiles are public, so the opponent's farm is "
+        "here on the same terms as yours; its seed and its carried inventory "
+        "are private and are not.",
+        "",
+        "| day | our bank | their bank | our farm | their farm | our seed | "
+        "our shed | their shed | our hands | their hands | prices |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for day in states:
         lines.append(
             f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
+            f"{_farm(day.ours_plants, day.ours_animals, day.ours_weeds)} | "
+            f"{_farm(day.theirs_plants, day.theirs_animals, day.theirs_weeds)} | "
+            f"{_items(day.ours_seeds)} | "
             f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
             f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
+        )
+    return lines
+
+
+def _summary(program: archive.Program) -> str:
+    """A program's own account of what it changed: its module docstring.
+
+    Every round is asked to say in a docstring at the top of the file what it
+    changed and why, so this is the author's summary rather than ours. Its
+    absence is not a failure -- the program still ran and still scored, and
+    the row is worth showing for the number alone.
+
+    Args:
+        program: The stored program to read.
+
+    Returns:
+        The docstring collapsed onto one line and cut, or "" if there is none.
+    """
+    source = Path(program.source_path).read_text(encoding="utf-8")
+    try:
+        docstring = ast.get_docstring(ast.parse(source))
+    except SyntaxError:
+        # It was validated before it was stored, so this is a file changed
+        # underneath us rather than a program that never parsed.
+        return ""
+    return " ".join((docstring or "").split())[:CHANGE_CHARS]
+
+
+def _sibling_lines(name: str, siblings: list[archive.Program]) -> list[str]:
+    """Render what earlier rounds made of this same program, and what it scored.
+
+    Args:
+        name: The program they were all written from, by name.
+        siblings: Its children, best first.
+
+    Returns:
+        Lines of a markdown section: one row per attempt.
+    """
+    shown = siblings[:SIBLINGS]
+    lines = [
+        f"## What has already been made of `{name}`",
+        "",
+        f"{len(siblings)} program(s) have been written from `{name}` and scored, "
+        f"the best {len(shown)} of them below. These are results, not mistakes: "
+        "each one ran and was played against the same pool on the same terms as "
+        "the table above. A direction here has been measured, so repeating it "
+        "spends a round to learn what this table already says; the rate to beat "
+        "from where you stand is the best of them.",
+        "",
+        "| attempt | instruction | win rate | what it changed |",
+        "| --- | --- | --- | --- |",
+    ]
+    for program in shown:
+        lines.append(
+            f"| {program.id} | {program.instruction} | {program.fitness:.3f} | "
+            f"{_summary(program) or '-'} |"
         )
     return lines
 
@@ -228,10 +303,16 @@ def _items(counts: dict[str, int]) -> str:
     return ", ".join(f"{item} {n}" for item, n in counts.items()) or "-"
 
 
+def _farm(plants: dict[str, int], animals: dict[str, int], weeds: int) -> str:
+    """Render one side's worked tiles as ``crops / animals / weeds``."""
+    return f"{_items(plants)} / {_items(animals)} / {weeds or '-'}"
+
+
 def compose(
     name: str,
     result: evaluator.FastResult,
     failures: list[archive.Failure],
+    siblings: list[archive.Program],
     instruction: str,
 ) -> str:
     """Compose the message for one round.
@@ -244,6 +325,8 @@ def compose(
         failures: Every failure the ledger holds against that program, oldest
             first. The caller hands over what it has and this cuts it to the
             last few, so a caller cannot forget to.
+        siblings: Programs already written from ``name`` and scored, best
+            first. Cut to ``SIBLINGS`` here for the same reason.
         instruction: The drawn instruction's text, one of ``INSTRUCTIONS``'
             second elements, with any stagnation note the caller prepended.
 
@@ -260,13 +343,16 @@ def compose(
     ]
     # A lineage with nothing against it gets no section at all: a heading over
     # an empty list is noise in a message the model reads every round.
+    if siblings:
+        parts.append("\n".join(_sibling_lines(name, siblings)))
     if failures:
         parts.append("\n".join(_failure_lines(name, failures)))
     parts.append(f"## Your instruction\n\n{instruction}\n")
     LOGGER.info(
-        "composed a round on %s (hardest: %s, %d failures)",
+        "composed a round on %s (hardest: %s, %d prior, %d failures)",
         name,
         result.hardest,
+        len(siblings),
         len(failures),
     )
     return "\n".join(parts)

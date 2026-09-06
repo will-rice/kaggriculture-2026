@@ -79,7 +79,7 @@ DEEP_FAILURE = "deep: "
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
     "SESSIONS ROUNDS_PER_SESSION "
-    "GAME_LIMIT_SECONDS FAST_SEEDS DEEP_TOP_K DEEP_CONCURRENCY POOL_CAP "
+    "FAST_SEEDS DEEP_TOP_K DEEP_CONCURRENCY POOL_CAP "
     "RETIRE_THRESHOLD STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
 
@@ -399,7 +399,8 @@ class Campaign:
         rounds = 0
         for _ in range(config.ROUNDS_PER_SESSION):
             failures = self.database.failures(name)
-            message = prompt.compose(name, result, failures, instruction)
+            siblings = self.database.children(name)
+            message = prompt.compose(name, result, failures, siblings, instruction)
             outcome = await self.round(source, name, result, message, drawn)
             rounds += 1
             if outcome is None:

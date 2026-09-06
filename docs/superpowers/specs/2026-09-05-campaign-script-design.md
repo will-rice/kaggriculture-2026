@@ -216,10 +216,11 @@ turn. A step time measured here would not predict Kaggle's anyway, and a
 program slow enough to matter is a rewrite in a compiled language, not a
 rejection.
 
-**One time limit, liveness, not speed.** A validation game
-(`GAME_LIMIT_SECONDS`, because a 720-turn game takes under a second, so one
-still running after two minutes is stuck). A codex call has none: it runs
-until it is done.
+**No time limits of our own.** A codex call runs until it is done and so does
+a validation game. The one limit left is not ours: `harness.LATENCY_BUDGET`,
+half of the one second `actTimeout` Kaggle enforces per call, because a
+program over it cannot compete. A program that never returns at all holds its
+worker, and nothing reclaims it.
 
 **Validation**, before any game is played for score: it parses; `agent` is
 the last top-level callable, by reading the file and by loading it through
@@ -251,7 +252,6 @@ with uncommitted changes under `src/`.
 | ------------------------ | --------------------------- |
 | `SESSIONS` 8             | fits the machine            |
 | `ROUNDS_PER_SESSION` 5   | the only bound on a session |
-| `GAME_LIMIT_SECONDS` 120 | liveness                    |
 | `FAST_SEEDS` 4           | FAMOU 3 games/opponent      |
 | `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
 | `DEEP_TOP_K` 3           | FAMOU                       |
