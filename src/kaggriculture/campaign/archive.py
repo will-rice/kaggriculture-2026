@@ -44,6 +44,13 @@ class Program(BaseModel):
         field: Mean win rate over the vendored incumbents alone, which never
             change, so it is comparable across the whole campaign where
             ``fitness`` is not.
+        rating: Its Bradley-Terry rating in the tournament that scored it --
+            the measure the gate promotes on and the competition ranks by.
+            Defaulted, so a program written before the tournament still loads;
+            such a program has no rating rather than a rating of zero, and
+            `place` says the same about where it came.
+        place: Where it finished in that tournament, 1 being top. Zero for a
+            program from before there was one.
         margins: Fast-evaluation bank margin per pool opponent. Defaulted,
             so a program written before margins existed still loads.
         created: Unix timestamp.
@@ -57,6 +64,8 @@ class Program(BaseModel):
     model: str
     fitness: float
     field: float
+    rating: float | None = None
+    place: int = 0
     rates: dict[str, float] = {}
     margins: dict[str, Margin] = {}
     created: float

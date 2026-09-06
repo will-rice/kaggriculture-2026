@@ -265,8 +265,15 @@ def _program(
     instruction: str,
     model: str,
     result: FastResult,
+    standings: dict[str, float] | None = None,
 ) -> archive.Program:
-    """One database entry, stamped now."""
+    """One database entry, stamped now.
+
+    ``standings`` is the tournament this program's evaluation was part of. It
+    is optional because the cold start seeds the database before any pool is
+    loaded, and a program with no rating is honestly recorded as having none.
+    """
+    ranked = sorted(standings or {}, key=lambda name: -(standings or {})[name])
     return archive.Program(
         id=program_id,
         source_path=str(source),
@@ -275,6 +282,8 @@ def _program(
         model=model,
         fitness=result.fitness,
         field=result.field,
+        rating=None if standings is None else standings[program_id],
+        place=0 if standings is None else 1 + ranked.index(program_id),
         rates=result.rates,
         margins=result.margins,
         created=time.time(),
@@ -491,8 +500,22 @@ class Campaign:
             "database/top": self.database.top(1)[0].fitness,
             "database/top_field": max(p.field for p in self.database.programs),
         }
+        rated = [p.rating for p in self.database.programs if p.rating is not None]
+        if rated:
+            record["database/top_rating"] = max(rated)
         if kept is not None:
-            record["calls/fitness"] = kept[2].fitness
+            source, program_id, result = kept
+            del source
+            record["calls/fitness"] = result.fitness
+            record["calls/field"] = result.field
+            table = gate.standing(
+                program_id, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+            )
+            record["calls/rating"] = table[program_id]
+            record["calls/place"] = 1 + sorted(
+                table, key=lambda name: -table[name]
+            ).index(program_id)
+            record["calls/pool"] = len(result.rates)
         self.log.log(record)
         if mutation.status == "exec_error":
             # No verdict, and no failure on the lineage either: there is
@@ -551,8 +574,13 @@ class Campaign:
         except RuntimeError as error:
             self.fail(started_from, drawn, f"fast: {error}")
             return None
+        table = gate.standing(
+            program_id, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+        )
         self.database.add(
-            _program(program_id, stored, started_from, drawn, mutation.model, result)
+            _program(
+                program_id, stored, started_from, drawn, mutation.model, result, table
+            )
         )
         LOGGER.info("%s %s fast %.3f", program_id, drawn, result.fitness)
         for program in self.database.top(config.DEEP_TOP_K):
@@ -675,7 +703,7 @@ class Campaign:
                 )
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
-        self.log.log(self.deep_record(result, verdict, baseline))
+        self.log.log(self.deep_record(result, verdict, baseline, table))
 
     def snapshot(self) -> Pool:
         """The pool as it stands, copied on the loop for one evaluation to keep."""
@@ -724,13 +752,24 @@ class Campaign:
         )
 
     def deep_record(
-        self, result: DeepResult, promoted: bool, baseline: Champion | None
+        self,
+        result: DeepResult,
+        promoted: bool,
+        baseline: Champion | None,
+        standings: dict[str, float],
     ) -> dict[str, float]:
         """Section 10: one deep evaluation, and whether it moved the floor.
 
         ``baseline`` is the floor as it stood when this was judged, read
         before the promotion: after it, a promoting result would be logged
         beside the score of the champion it replaced -- itself.
+
+        Args:
+            result: The sealed-block measurement.
+            promoted: Whether it cleared the gate.
+            baseline: The floor as it stood when this was judged.
+            standings: The tournament that decided it, so the rating and the
+                place go on the record beside the win rates behind them.
         """
         record: dict[str, float] = {
             "sessions": self.state.sessions,
@@ -739,6 +778,12 @@ class Campaign:
             "deep/high": result.high,
             "deep/field": result.field,
             "deep/promoted": int(promoted),
+            "deep/rating": standings[result.program_id],
+            "deep/place": 1
+            + sorted(standings, key=lambda name: -standings[name]).index(
+                result.program_id
+            ),
+            "deep/pool": len(result.rates),
             **{f"deep/rate/{name}": rate for name, rate in result.rates.items()},
             **{f"deep/margin/{n}": m.mean for n, m in result.margins.items()},
             **{f"deep/held_out/{n}": rate for n, rate in result.held_out.items()},

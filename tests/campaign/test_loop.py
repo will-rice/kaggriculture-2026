@@ -1464,3 +1464,71 @@ def test_stagnation_says_nothing_before_there_is_a_champion(
     assert state.sessions_since_promotion >= config.STAGNATION_SESSIONS
     assert len(mutator.seen) == 2
     assert not any("no promotion" in seen.message for seen in mutator.seen)
+
+
+def test_a_round_logs_the_win_rate_and_the_place_it_bought(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """Both halves of the story, because they answer different questions.
+
+    The rating is what the gate promotes on and what the competition ranks by,
+    so it is the one that says whether the campaign is winning. The win rate
+    over the pool is what a rating is made of, and it stays plotted because a
+    rating moves for two reasons -- the program got better, or the pool got
+    harder -- and only the pair tells you which.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+
+    loop.run(
+        sessions=1,
+        mutator=mutate.FakeMutator(edit=lambda source: f"{source}\n# edited\n"),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    call = calls_of(records)[-1]
+    assert 0.0 <= call["calls/fitness"] <= 1.0
+    assert call["calls/pool"] == 1
+    assert isinstance(call["calls/rating"], float)
+    assert call["calls/place"] >= 1
+    # The best rating so far, so the curve has a ratchet on it and not just
+    # whatever the last round happened to score.
+    assert "database/top_rating" in call
+
+
+def test_a_program_carries_the_rating_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Stored, not recomputed: the pool moves, and a rating is of its moment.
+
+    Refitting an old program against today's pool would answer a different
+    question from the one its evaluation asked, and `database/top_rating` is
+    meant to be the best any round actually achieved.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+
+    loop.run(
+        sessions=1,
+        mutator=mutate.FakeMutator(edit=lambda source: f"{source}\n# edited\n"),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    child = next(p for p in database.programs if p.id != "seed")
+    assert child.rating is not None
+    assert child.place >= 1
+    # The seed is scored before any pool is loaded, so it honestly has none.
+    assert database.get("seed").rating is None
+    assert database.get("seed").place == 0
