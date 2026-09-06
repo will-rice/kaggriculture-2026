@@ -129,24 +129,24 @@ STAGNATION_SESSIONS = 40
 # model or a provider outage, looking busy and producing nothing. Eight is
 # one per worker: a single bad call is noise, eight is the machine.
 NO_VERDICT_LIMIT = 8
-# A step up from `luna` without `astra`'s cost. `gpt-6-astra` is the strongest
-# model this login has and is deliberately not used: the first campaign spent
-# nearly all of a quota on it, and quota is the constraint that binds here
-# rather than capability.
+# The cheap model, on purpose. `gpt-6-astra` is the strongest this login has
+# and is not used: the first campaign spent nearly all of a quota on it, and
+# quota is the constraint that binds here rather than capability. `terra` was
+# tried briefly and reverted for the same reason.
 #
-# The block before this ran on `luna` as a calibration, to find out whether
-# the setup or the model was the bottleneck. It produced 381 programs and the
-# search did not climb -- but that is confounded and is not luna's verdict:
-# for the whole of it a session drew its starting program uniformly from the
-# best ten, which is barely selection, and 95% of every rate measured was
-# saturated at nought or one. The experiment ran on a broken hill, so the
-# question it asked is still open.
+# The 381-program block that ran on this model is not evidence against it. A
+# session drew its starting program uniformly from the best ten for the whole
+# of it, which is barely selection, and 95% of every rate measured was
+# saturated at nought or one. That search ran on a broken hill, so "setup or
+# model?" is still open -- and it is the search that is being fixed first,
+# because a stronger model climbing the same broken hill would only cost more
+# to learn the same thing.
 #
 # `mutate.validate_model` checks this against the login's own catalog at
 # startup, because a typo here is hundreds of failed sessions discovered one
 # at a time -- not hypothetical: this login accepts `gpt-6-astra` but refuses
 # `gpt-5.6-astra` (probed 2026-09-05 on codex 0.153).
-CODEX_MODEL = "gpt-5.6-terra"
+CODEX_MODEL = "gpt-5.6-luna"
 # The model retried once, in the same directory, when the first model's call
 # fails without a verdict -- a provider refusal or a codex crash -- so the
 # round still gets a child. Astra answered "Selected model is at capacity"

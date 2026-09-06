@@ -102,7 +102,7 @@ def test_constants_match_the_spec_table() -> None:
     # candidates no better than a coin while costing a game a round.
     assert config.POOL_SIZE < len(roster.TRAINING)
     assert config.STAGNATION_SESSIONS == 40
-    assert config.CODEX_MODEL == "gpt-5.6-terra"
+    assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
 
 
