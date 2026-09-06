@@ -78,7 +78,7 @@ DEEP_FAILURE = "deep: "
 
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
-    "SESSIONS ROUNDS_PER_SESSION SESSION_LIMIT_SECONDS ROUND_LIMIT_SECONDS "
+    "SESSIONS ROUNDS_PER_SESSION "
     "GAME_LIMIT_SECONDS FAST_SEEDS DEEP_TOP_K DEEP_CONCURRENCY POOL_CAP "
     "RETIRE_THRESHOLD STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
@@ -365,8 +365,8 @@ class Campaign:
         from the champion. Depth within, breadth across.
 
         The session ends when a round clears the bar, when a call never ran to
-        a verdict, or at whichever of ``ROUNDS_PER_SESSION`` and
-        ``SESSION_LIMIT_SECONDS`` comes first. A round that was rejected is
+        a verdict, or after ``ROUNDS_PER_SESSION`` rounds. A round that was
+        rejected is
         not the end of one: the reason goes in the ledger and the next round's
         message carries it back, which is what "your program did not parse" is
         worth.
@@ -396,7 +396,6 @@ class Campaign:
         if stagnant:
             note = STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
             instruction = note + instruction
-        deadline = time.monotonic() + config.SESSION_LIMIT_SECONDS
         rounds = 0
         for _ in range(config.ROUNDS_PER_SESSION):
             failures = self.database.failures(name)
@@ -409,9 +408,6 @@ class Campaign:
             cleared, why = gate.promotion(result.rates)
             if cleared:
                 LOGGER.info("%s %s: the session is done", name, why)
-                break
-            if time.monotonic() >= deadline:
-                LOGGER.info("%s: session budget spent after %d rounds", name, rounds)
                 break
         self.finish(rounds)
 
@@ -455,7 +451,6 @@ class Campaign:
         record: dict[str, float | str] = {
             "calls": self.state.calls,
             "calls/ok": int(mutation.child is not None),
-            "calls/timed_out": int(mutation.status == "timeout"),
             "calls/fallback": int(mutation.fallback),
             "calls/model": mutation.model,
             "calls/input_tokens": mutation.input_tokens,

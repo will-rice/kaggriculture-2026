@@ -90,10 +90,6 @@ def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
     assert config.ROUNDS_PER_SESSION == 5
-    assert config.ROUND_LIMIT_SECONDS == 3600
-    # Derived, and asserted as the derivation: a round cap raised without the
-    # session budget following would end every session after its first round.
-    assert config.SESSION_LIMIT_SECONDS == 5 * 3600
     assert config.GAME_LIMIT_SECONDS == 120
     assert config.FAST_SEEDS == 4
     assert len(config.EXAM_SEEDS) == 64
@@ -105,11 +101,13 @@ def test_constants_match_the_spec_table() -> None:
 
 
 def test_the_deleted_constants_are_gone() -> None:
-    """Islands, epochs, the call cap, crossover, weights and the sandboxes.
+    """Islands, epochs, the call cap, crossover, weights, sandboxes, clocks.
 
     `SANDBOXES` went with the workspace a model used to be given: it gets a
     temporary directory holding one file now, and nothing under `run/` is a
-    model's to write.
+    model's to write. The two clocks went because a round runs the skills this
+    login has installed and they take as long as they take: a cap only ever
+    cut a call off before it had written anything.
     """
     for name in (
         "SANDBOXES",
@@ -128,6 +126,8 @@ def test_the_deleted_constants_are_gone() -> None:
         "CROSS_PROBABILITY",
         "CHAMPION_WEIGHT",
         "WEAKNESS_CAP",
+        "ROUND_LIMIT_SECONDS",
+        "SESSION_LIMIT_SECONDS",
     ):
         assert not hasattr(config, name), name
 

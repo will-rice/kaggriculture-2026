@@ -18,7 +18,6 @@ from pathlib import Path
 
 from kaggriculture.campaign import (
     archive,
-    config,
     evaluator,
     gate,
     harness,
@@ -66,9 +65,10 @@ another message like this one asking you to improve it again.
 
 `child.py` must stay one self-contained file whose last top-level callable is
 `agent(observation, configuration)` -- that is what Kaggle loads. Say in a
-docstring at its top what you changed and why. Your budget is {minutes}
-minutes; the call is stopped then and the file is scored as it stands, so keep
-it complete and runnable throughout.
+docstring at its top what you changed and why. There is no time limit on this
+call: take as long as the work needs. Keep the file complete and runnable as
+you go all the same, so that what it holds is always something that could be
+scored.
 
 Nobody is reading this session. There is no human here to answer a question,
 approve a design, choose between options or confirm anything, and nothing you
@@ -252,7 +252,7 @@ def compose(
     """
     parts = [
         TASK_PROMPT.read_text(encoding="utf-8"),
-        PROGRAM_SECTION.format(name=name, minutes=config.ROUND_LIMIT_SECONDS // 60),
+        PROGRAM_SECTION.format(name=name),
         IMPORTS_SECTION,
         DOCTRINE,
         "\n".join(_verdict_lines(name, result)),

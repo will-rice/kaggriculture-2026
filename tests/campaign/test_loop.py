@@ -689,7 +689,7 @@ def test_a_provider_failure_is_not_the_lineages_failure(
 
     state = loop.run(
         sessions=1,
-        mutator=mutate.CodexMutator(model="a", fallback="b", timeout=30),
+        mutator=mutate.CodexMutator(model="a", fallback="b"),
         workers=WORKERS,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),
@@ -771,7 +771,7 @@ def test_cancellation_kills_the_session_process_group(
     threading.Thread(target=interrupt, daemon=True).start()
     state = loop.run(
         sessions=1,
-        mutator=mutate.CodexMutator(timeout=60),
+        mutator=mutate.CodexMutator(),
         workers=WORKERS,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),
@@ -1110,7 +1110,7 @@ def test_a_round_that_writes_nothing_feeds_the_next_one(
 
     loop.run(
         sessions=1,
-        mutator=mutate.CodexMutator(model="a", fallback="", timeout=30),
+        mutator=mutate.CodexMutator(model="a", fallback=""),
         workers=WORKERS,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),
@@ -1174,22 +1174,6 @@ def test_the_instruction_is_drawn_once_a_session(
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
     stamped = {p.instruction for p in database.programs if p.id != loop.SEED_ID}
     assert len(stamped) == 1
-
-
-def test_the_session_budget_ends_it_before_the_rounds_do(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """A session is bounded by whichever of the two comes first."""
-    tiny_run(tmp_path, monkeypatch, rounds=3)
-    monkeypatch.setattr(config, "SESSION_LIMIT_SECONDS", 0)
-    pass_pool(tmp_path)
-    stub_evaluator(monkeypatch)
-    seed = _write(tmp_path / "seed.py", PASS)
-    mutator = Recorder(edit=lambda source: source + "# a round\n")
-
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
-
-    assert len(mutator.seen) == 1
 
 
 def test_a_round_is_given_one_file_and_the_directory_is_removed(
@@ -1266,7 +1250,7 @@ def test_calls_that_never_reach_a_verdict_stop_the_campaign(
     with pytest.raises(SystemExit, match="3 calls in a row ran to no verdict"):
         loop.run(
             sessions=100,
-            mutator=mutate.CodexMutator(model="a", timeout=30),
+            mutator=mutate.CodexMutator(model="a"),
             workers=WORKERS,
             seed_agent=_write(tmp_path / "seed.py", PASS),
             rng=random.Random(0),
@@ -1314,7 +1298,7 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
 
     state = loop.run(
         sessions=4,
-        mutator=mutate.CodexMutator(model="a", fallback="", timeout=30),
+        mutator=mutate.CodexMutator(model="a", fallback=""),
         workers=WORKERS,
         seed_agent=_write(tmp_path / "seed.py", PASS),
         rng=random.Random(0),

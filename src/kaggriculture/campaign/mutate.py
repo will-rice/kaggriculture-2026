@@ -89,8 +89,8 @@ class Mutation(BaseModel):
             nothing to evaluate. A timed-out call that had already
             written ``child.py`` still yields it: the file is what gets
             evaluated, however the call ended.
-        status: "ok", "no_output" (ran but wrote nothing usable), "timeout",
-            or "exec_error".
+        status: "ok", "no_output" (ran but wrote nothing usable), or
+            "exec_error".
         reason: Free-form explanation; empty on "ok". An "exec_error" carries
             the provider's own failure message when the transcript has one.
         seconds: Wall-clock time the call took.
@@ -103,7 +103,7 @@ class Mutation(BaseModel):
 
     program_id: str
     child: Path | None
-    status: Literal["ok", "no_output", "timeout", "exec_error"]
+    status: Literal["ok", "no_output", "exec_error"]
     reason: str
     seconds: float
     input_tokens: int
@@ -134,19 +134,20 @@ class Mutator(Protocol):
 class CodexMutator:
     """Runs one ``codex exec`` over one file and reports the result.
 
-    ``COMMAND`` is overridden by tests (e.g. to ``["true"]`` or
-    ``["sleep", "N"]``) to exercise the no-output and timeout paths without
-    spending a real codex call; the ``-m``/``-C`` flags are only appended
-    when the command actually is codex.
+    ``COMMAND`` is overridden by tests (e.g. to ``["true"]``) to exercise the
+    no-output and failure paths without spending a real codex call; the
+    ``-m``/``-C`` flags are only appended when the command actually is codex.
 
-    Codex spawns shell commands as tool calls in ``workspace-write`` mode; on
-    a timeout, killing only the direct child would orphan any grandchild
-    still running, leaking a core the harness's ``config.CORE_BUDGET``
-    assumes is free. The process runs in its own session
-    (``start_new_session=True``) so a timeout -- or the cancellation that
-    shutting the loop down delivers -- can kill the whole process group with
-    ``os.killpg``, not just codex itself. Without the cancellation arm, a
-    killed loop would leave ``SESSIONS`` codex calls running.
+    A call runs until it is done. There is no cap: a round runs the skills
+    this login has installed, and the only cap this ever had cut calls off
+    before they had written anything. So the one thing that ends a call early
+    is the cancellation that shutting the loop down delivers. Codex spawns
+    shell commands as tool calls in ``workspace-write`` mode, and killing only
+    the direct child would orphan any grandchild still running, leaking a core
+    that ``config.CORE_BUDGET`` assumes is free; the process runs in its own
+    session (``start_new_session=True``) so the cancellation arm can take the
+    whole process group with ``os.killpg``. Without it, a killed loop would
+    leave ``SESSIONS`` codex calls running.
     """
 
     # `--skip-git-repo-check` because a call runs in a temporary directory
@@ -168,7 +169,6 @@ class CodexMutator:
         self,
         model: str = config.CODEX_MODEL,
         fallback: str = config.CODEX_FALLBACK_MODEL,
-        timeout: float = config.ROUND_LIMIT_SECONDS,
     ) -> None:
         """Initializes the mutator.
 
@@ -177,13 +177,9 @@ class CodexMutator:
             fallback: The model to retry on, once, when a call on ``model``
                 fails without a verdict (the provider refused or codex
                 crashed); "" to never retry.
-            timeout: Seconds to allow the codex call before killing it. One
-                round's share of the session budget, so five of them and
-                their scoring fit inside it.
         """
         self.model = model
         self.fallback = fallback
-        self.timeout = timeout
 
     async def __call__(
         self, workspace: Path, message: str, program_id: str
@@ -257,31 +253,7 @@ class CodexMutator:
                 env={**os.environ, "CAMPAIGN_CODEX_MODEL": model},
             )
             try:
-                _, stderr = await asyncio.wait_for(
-                    process.communicate(message.encode()), self.timeout
-                )
-            except TimeoutError:
-                pgid = kill_group(process)
-                await process.wait()
-                child = _written(workspace, given)
-                LOGGER.warning(
-                    "codex call for %s timed out after %ss, killed pgid %s; %s",
-                    program_id,
-                    self.timeout,
-                    pgid,
-                    "keeping the child it had written" if child else "no child",
-                )
-                tokens_in, tokens_out = await asyncio.to_thread(_tokens, log)
-                return Mutation(
-                    program_id=program_id,
-                    child=child,
-                    status="timeout",
-                    reason=f"{self.timeout}s (pgid {pgid})",
-                    seconds=time.perf_counter() - started,
-                    input_tokens=tokens_in,
-                    output_tokens=tokens_out,
-                    model=model,
-                )
+                _, stderr = await process.communicate(message.encode())
             except asyncio.CancelledError:
                 # The loop is shutting down. The call goes with it, whole
                 # process group and all, or a restart would find eight codex

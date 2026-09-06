@@ -52,7 +52,9 @@ def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
     assert "`child.py` in your working directory is `champion_1`" in text
     assert "Edit it in place and stop" in text
     assert "the campaign plays" in text
-    assert f"{config.ROUND_LIMIT_SECONDS // 60}\nminutes" in text.replace(" ", "\n")
+    # Whitespace-normalised: the paragraph is wrapped, so the sentence this
+    # is about spans a line break in the source.
+    assert "no time limit on this call" in " ".join(text.split())
 
 
 def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:

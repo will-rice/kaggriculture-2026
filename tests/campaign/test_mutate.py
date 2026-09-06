@@ -112,42 +112,6 @@ def test_codex_mutator_reports_no_output_when_the_file_is_left_as_it_was(
     assert (box / "codex.jsonl").exists()
 
 
-def test_codex_mutator_reports_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A codex call that outlives its timeout is reported as "timeout"."""
-    box = workspace(tmp_path)
-    monkeypatch.setattr(mutate.CodexMutator, "COMMAND", ["sleep", "5"])
-    result = asyncio.run(mutate.CodexMutator(timeout=1)(box, MESSAGE, "p3"))
-    assert result.status == "timeout"
-    assert (box / "codex.jsonl").exists()
-
-
-def test_a_timed_out_session_still_yields_the_child_it_wrote(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The cap bounds a round's wall clock, not whether its work counts.
-
-    Whatever ``child.py`` holds when the cap fires is what the loop scores,
-    so a call killed after it had written a complete program must not have
-    that thrown away.
-    """
-    box = workspace(tmp_path)
-    monkeypatch.setattr(
-        mutate.CodexMutator,
-        "COMMAND",
-        [
-            "bash",
-            "-c",
-            "printf 'def agent(o, c=None):\\n    return {}\\n' > child.py; sleep 30",
-        ],
-    )
-    result = asyncio.run(mutate.CodexMutator(timeout=2)(box, MESSAGE, "p8"))
-    assert result.status == "timeout"
-    assert result.child == box / "child.py"
-    assert "def agent" in (box / "child.py").read_text()
-
-
 # The provider's capacity refusal, as codex records it: the provider's error
 # is a JSON string inside the event's own message.
 CAPACITY = json.dumps(
@@ -241,30 +205,6 @@ def test_codex_mutator_no_output_reason_carries_the_last_agent_message(
     assert result.input_tokens == 10 and result.output_tokens == 5
 
 
-def test_codex_mutator_kills_the_whole_process_group_on_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A timeout kills the process group, not just codex, so no orphan survives."""
-    box = workspace(tmp_path)
-    monkeypatch.setattr(
-        mutate.CodexMutator, "COMMAND", ["bash", "-c", "sleep 30 & sleep 30"]
-    )
-    result = asyncio.run(mutate.CodexMutator(timeout=1)(box, MESSAGE, "p7"))
-    assert result.status == "timeout"
-    pgid = int(result.reason.split("pgid ")[1].rstrip(")"))
-    for _ in range(20):
-        survivors = subprocess.run(
-            ["pgrep", "-g", str(pgid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if survivors.returncode != 0:
-            break
-        time.sleep(0.1)
-    else:
-        pytest.fail(f"process group {pgid} still has a member after the timeout kill")
-
-
 def test_cancelling_a_call_kills_the_whole_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -288,9 +228,7 @@ def test_cancelling_a_call_kills_the_whole_process_group(
 
     async def cancel_mid_session() -> None:
         """Start the call, wait for the group to exist, then cancel it."""
-        call = asyncio.ensure_future(
-            mutate.CodexMutator(timeout=30)(box, MESSAGE, "p9")
-        )
+        call = asyncio.ensure_future(mutate.CodexMutator()(box, MESSAGE, "p9"))
         while not pgid_file.exists():
             await asyncio.sleep(0.05)
         call.cancel()

@@ -74,9 +74,10 @@ MARKET_OPS: list[str] = [
 # evaluations. Spec section 8.
 SESSIONS = 8
 # Codex calls in one session, each continuing from the program the last one
-# produced. A session ends at whichever of this count and
-# `SESSION_LIMIT_SECONDS` comes first, and that budget is this many rounds of
-# `ROUND_LIMIT_SECONDS`, so ordinarily it is this count that ends a session.
+# produced, and the only thing that ends a session besides a round clearing the
+# bar or failing. There is no clock on a round or on a session: a round runs the
+# skills this login has installed, which take as long as they take, and a cap
+# only ever cut one off before it had written anything.
 ROUNDS_PER_SESSION = 5
 FAST_SEEDS = 4  # x both seats x every pool opponent
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
@@ -116,22 +117,6 @@ CODEX_MODEL = "gpt-5.6-luna"
 # some of the time (two calls in the first live hour), which is why this
 # exists at all.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-# The cap on one codex call, and the constant the session budget is derived
-# from rather than the other way about. A round inherits the skills this login
-# has installed and is meant to: it brainstorms, plans, writes a test and only
-# then edits, and that is a process built for a session measured in hours, not
-# the five minutes a 1500-second session divided five ways left it. At five
-# minutes the calls did not come back slow, they did not come back at all --
-# every one killed at the cap with nothing written and no completion event,
-# because the process had not reached the edit yet. Wall clock per round is
-# not what is scarce here; rounds that produce a program are. Whatever
-# `child.py` holds when this fires is still what gets scored, so the cap
-# bounds a round's length and never whether it yields something.
-ROUND_LIMIT_SECONDS = 3600
-# The session's own budget, checked between rounds; the round that overruns it
-# is the last one. Derived, so raising the round cap cannot silently leave a
-# session ending after its first round.
-SESSION_LIMIT_SECONDS = ROUNDS_PER_SESSION * ROUND_LIMIT_SECONDS
 # Liveness only, never speed: a 720-turn game of rule-based policies takes
 # well under a second, so one still running after two minutes is stuck.
 GAME_LIMIT_SECONDS = 120

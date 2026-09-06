@@ -178,15 +178,14 @@ cannot poison the next. A fresh call also cannot anchor on its own earlier
 hypothesis: the program embodies its prior work and the verdict says what
 that work achieved.
 
-Bounded by `ROUNDS_PER_SESSION = 5` and `SESSION_LIMIT_SECONDS`, whichever
-comes first. That budget is derived: `ROUND_LIMIT_SECONDS = 3600` is the
-constant, and the session's is five of them. A round inherits the skills the
-login has installed and is meant to -- it brainstorms, plans, writes a test and
-only then edits -- and that process does not fit five minutes. At five minutes
-the calls did not come back slow, they did not come back at all: every one was
-killed at the cap having written nothing, because it had not reached the edit.
-Wall clock per round is not the scarce thing; rounds that produce a program
-are.
+Bounded by `ROUNDS_PER_SESSION = 5`, and by nothing else. A call runs until it
+is done and a session runs its rounds. A round inherits the skills the login
+has installed and is meant to -- it brainstorms, plans, writes a test and only
+then edits -- and there is no honest number of seconds for that. The one cap
+this ever had did not make slow rounds finish sooner: it killed every one of
+them before it reached the edit, and the campaign produced nothing at all for
+as long as it stood. Wall clock is not the scarce thing here; rounds that
+produce a program are.
 
 **Two models.** `CODEX_MODEL`, falling back once to `CODEX_FALLBACK_MODEL`
 when the provider refuses the turn or codex dies. A failure on both is
@@ -217,10 +216,10 @@ turn. A step time measured here would not predict Kaggle's anyway, and a
 program slow enough to matter is a rewrite in a compiled language, not a
 rejection.
 
-**Two time limits, both liveness, neither about speed.** A session
-(`SESSION_LIMIT_SECONDS`) and a validation game (`GAME_LIMIT_SECONDS`,
-because a 720-turn game takes under a second, so one still running after
-two minutes is stuck).
+**One time limit, liveness, not speed.** A validation game
+(`GAME_LIMIT_SECONDS`, because a 720-turn game takes under a second, so one
+still running after two minutes is stuck). A codex call has none: it runs
+until it is done.
 
 **Validation**, before any game is played for score: it parses; `agent` is
 the last top-level callable, by reading the file and by loading it through
@@ -248,21 +247,19 @@ with uncommitted changes under `src/`.
 
 ## 8. Constants
 
-| constant                   | source                                |
-| -------------------------- | ------------------------------------- |
-| `SESSIONS` 8               | fits the machine                      |
-| `ROUNDS_PER_SESSION` 5     | with scoring, fits the session limit  |
-| `ROUND_LIMIT_SECONDS` 3600 | a full skill process reaches the edit |
-| `SESSION_LIMIT_SECONDS`    | derived: five rounds of the above     |
-| `GAME_LIMIT_SECONDS` 120   | liveness                              |
-| `FAST_SEEDS` 4             | FAMOU 3 games/opponent                |
-| `EXAM_SEEDS` 64, sealed    | FAMOU 20 games/opponent               |
-| `DEEP_TOP_K` 3             | FAMOU                                 |
-| `DEEP_CONCURRENCY` 2       |                                       |
-| `POOL_CAP` 10              |                                       |
-| `RETIRE_THRESHOLD` 0.95    |                                       |
-| `STAGNATION_SESSIONS` 40   |                                       |
-| `CORE_BUDGET` cores - 8    |                                       |
+| constant                 | source                      |
+| ------------------------ | --------------------------- |
+| `SESSIONS` 8             | fits the machine            |
+| `ROUNDS_PER_SESSION` 5   | the only bound on a session |
+| `GAME_LIMIT_SECONDS` 120 | liveness                    |
+| `FAST_SEEDS` 4           | FAMOU 3 games/opponent      |
+| `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
+| `DEEP_TOP_K` 3           | FAMOU                       |
+| `DEEP_CONCURRENCY` 2     |                             |
+| `POOL_CAP` 10            |                             |
+| `RETIRE_THRESHOLD` 0.95  |                             |
+| `STAGNATION_SESSIONS` 40 |                             |
+| `CORE_BUDGET` cores - 8  |                             |
 
 ## 9. Deliberately not built
 
