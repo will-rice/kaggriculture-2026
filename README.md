@@ -73,6 +73,22 @@ The commit hook runs the fast suite; run `uv run pytest -m slow` before
 pushing, which is where the tests that play real games against the vendored
 corpus live.
 
+## The Rust engine
+
+`rust/` is a Rust port of the reference interpreter, bit-for-bit: the same
+rules in the same order, CPython's random stream for weeds and shop unlocks,
+and observations laid out like the reference's. It steps about 2,000 times
+faster than `env.step`. `rust/python/` wraps it as the `kaggriculture_engine`
+Python module, and `uv run replay-corpus` replays recorded Kaggle episodes
+through it and compares every recorded field. `tests/rust/` proves both
+against the installed reference. See [rust/README.md](rust/README.md).
+
+```bash
+uv sync --group rust
+uv run maturin develop --release --uv -m rust/python/Cargo.toml
+uv run replay-corpus --episodes 50 -v     # needs the archives under /data/kaggriculture/episodes
+```
+
 ## Quick Start
 
 ### 1. Install uv

@@ -42,7 +42,13 @@ exclude = [".venv"]
 convention = "google"
 
 [tool.ty.environment]
-root = ["./src"]
+# The repository root as well as src/, so tests can import their own package
+# (tests/rust shares its policies between modules) and the research scripts
+# under docs/ can import their sibling `_common`.
+root = ["./src", "."]
+# The Rust bindings' stub file is their type surface, so ty can check code
+# that imports `kaggriculture_engine` without the extension being built.
+extra-paths = ["./rust/python"]
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::DeprecationWarning"]
@@ -55,7 +61,11 @@ addopts = "-m 'not slow'"
 # loop runs; the suite is what lives under tests/.
 testpaths = ["tests"]
 
+[dependency-groups]
+rust = ["maturin>=1.8,<2"]
+
 [project.scripts]
 package = "kaggriculture.scripts.package:main"
 submit = "kaggriculture.scripts.submit:main"
 campaign = "kaggriculture.campaign.harness:main"
+replay-corpus = "kaggriculture.scripts.replay_corpus:main"

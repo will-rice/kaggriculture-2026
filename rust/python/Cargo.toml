@@ -1,0 +1,25 @@
+[package]
+name = "kaggriculture-engine-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the Rust port of the Kaggriculture reference interpreter"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "kaggriculture_engine"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Renamed so the crate does not collide with the `kaggriculture_engine`
+# Python module defined in lib.rs.
+engine = { package = "kaggriculture-engine", path = ".." }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+serde_json = { version = "1.0", features = [
+  "preserve_order",
+  "float_roundtrip",
+] }
+
+[lints]
+workspace = true

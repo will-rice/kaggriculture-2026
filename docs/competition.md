@@ -43,7 +43,10 @@ confirmed against the interpreter source):
   dead days at the end — harvesting on cap rather than on `max_yield_day` is
   worth roughly 45% more bank in local play.
 - The shed is not a tile. Its access points are exactly `(4,4)`, `(5,4)`,
-  `(4,5)`, `(5,5)`, and `DROP`/`PICKUP` only work from an **unlocked** one.
+  `(4,5)`, `(5,5)`. `DROP`/`PICKUP` work from any of them, **locked or not**:
+  the engine resolves shed operations before its `LOCKED` guard (verified
+  against 1.32.7 by `tests/rust/test_differential.py`, whose scripted hand
+  picks up from `(5,4)` with only NW unlocked).
 - Hands spawn on those four tiles even when locked; a hand landing on `(5,5)`
   with only NW unlocked is walled in and wastes its wage for the day.
 - `DIG` fails on an occupied coop or pasture, only clearing empty structures.
