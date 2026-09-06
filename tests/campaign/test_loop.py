@@ -485,22 +485,32 @@ def test_eight_workers_run_at_once(
 ) -> None:
     """Every worker's session is in flight together, not one after another.
 
-    Each session stamps the moment its agent starts editing and the moment it
-    stops; the latest start lands before the earliest stop only if all eight
-    overlapped.
+    A barrier rather than two timestamps compared afterwards. Each session
+    blocks in its edit until all ``SESSIONS`` of them have arrived, so the run
+    can only finish if they genuinely overlapped -- if any pair were
+    serialised the barrier would never fill and the wait would time out.
+
+    The timestamp version of this asserted that the latest start preceded the
+    earliest stop, which is the same claim measured badly: it held only while
+    the runner scheduled eight threads promptly, and it failed on CI by seven
+    tenths of a millisecond. Widening the sleep would have bought margin and
+    weakened the claim; the barrier removes the timing from it altogether.
     """
     tiny_run(tmp_path, monkeypatch)
     strong_champion(tmp_path)
     stub_evaluator(monkeypatch)
-    starts: list[float] = []
-    stops: list[float] = []
+    # Generous, because it is not a measurement: nothing is being timed, and
+    # this only stops a real serialisation from hanging the suite instead of
+    # failing it.
+    gate = threading.Barrier(config.SESSIONS, timeout=120)
+    # A list, because `append` is atomic and `+= 1` from eight threads is not.
+    arrived: list[int] = []
 
     def edit(source: str) -> str:
-        """Hold the session open long enough for the others to have started."""
-        starts.append(time.time())
-        time.sleep(0.5)
-        stops.append(time.time())
-        return f"{source}\n# session {len(starts)}\n"
+        """Block until every other session has reached this point too."""
+        index = gate.wait()
+        arrived.append(index)
+        return f"{source}\n# session {index}\n"
 
     state = loop.run(
         sessions=config.SESSIONS,
@@ -512,8 +522,8 @@ def test_eight_workers_run_at_once(
     )
 
     assert state.sessions == config.SESSIONS
-    assert len(starts) == len(stops) == config.SESSIONS
-    assert max(starts) < min(stops)
+    assert sorted(arrived) == list(range(config.SESSIONS))
+    assert not gate.broken
 
 
 def test_a_promotion_changes_what_the_next_session_starts_from(
