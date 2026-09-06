@@ -45,7 +45,7 @@ import uuid
 from pathlib import Path
 
 import wandb
-from git import Repo
+from git import Git, Repo
 from pydantic import BaseModel
 
 # `gate` is also the name of a `Campaign` method, so annotations in the class
@@ -141,11 +141,13 @@ def _open_run(dry_run: bool) -> wandb.Run:
     Exits on uncommitted changes under ``src/``: a run named by a hash has to
     be that hash.
     """
-    repo = Repo(config.ROOT)
-    dirty = repo.git.status("--porcelain", "--", "src")
+    # `Git` is bound to the directory and runs there. `Repo.git` is not: in a
+    # linked worktree `Repo` resolves to the shared git directory with no
+    # working tree of its own, and `git status` fails outright there.
+    dirty = Git(config.ROOT).status("--porcelain", "--", "src")
     if dirty:
         raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
-    name = f"{config.CODEX_MODEL}-{repo.head.commit.hexsha[:7]}"
+    name = f"{config.CODEX_MODEL}-{Repo(config.ROOT).head.commit.hexsha[:7]}"
     log = wandb.init(
         entity=config.WANDB_ENTITY,
         project=config.WANDB_PROJECT,
