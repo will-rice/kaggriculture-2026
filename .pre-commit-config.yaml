@@ -13,34 +13,23 @@ repos:
       - id: prettier-format
   - repo: local
     hooks:
-      # `src/kaggriculture/served/` holds the cold-start seed, and the seed is
-      # a promoted champion: evolved code, verified by the deep evaluation
-      # rather than by lint. Formatting it rewrites the bytes the evaluation
-      # measured and the pool still plays, and what lint asks for beyond
-      # formatting cannot be given without editing the program -- four
-      # `C901` complex-structure findings ask for its control flow to be
-      # restructured. Nothing writes here any more; the exclusion is about
-      # what the file is, not who wrote it.
       - id: ruff-format
         name: ruff-format
         language: system
         entry: uv run ruff format
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
-        exclude: ^src/kaggriculture/served/
         pass_filenames: true
       - id: ruff
         name: ruff
         language: system
         entry: uv run ruff check --fix
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
-        exclude: ^src/kaggriculture/served/
         pass_filenames: true
       - id: ty
         name: ty
         language: system
-        entry: uv run ty check --exclude src/kaggriculture/served src tests main.py
+        entry: uv run ty check src tests main.py
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
-        exclude: ^src/kaggriculture/served/
         pass_filenames: false
       # The Rust engine is linted like the Python: formatting, then clippy
       # with the workspace's deny-level lint set, across every crate in
