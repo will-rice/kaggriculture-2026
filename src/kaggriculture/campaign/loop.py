@@ -316,9 +316,12 @@ class Campaign:
         continues from its own previous program; a new session starts again
         from the champion. Depth within, breadth across.
 
-        The session ends when a round clears the bar, when a round produces
-        nothing to continue from, or at whichever of ``ROUNDS_PER_SESSION``
-        and ``SESSION_LIMIT_SECONDS`` comes first.
+        The session ends when a round clears the bar, when a call never ran to
+        a verdict, or at whichever of ``ROUNDS_PER_SESSION`` and
+        ``SESSION_LIMIT_SECONDS`` comes first. A round that was rejected is
+        not the end of one: the reason goes in the ledger and the next round's
+        message carries it back, which is what "your program did not parse" is
+        worth.
 
         Raises:
             RuntimeError: The program this session starts from cannot be
@@ -331,17 +334,20 @@ class Campaign:
         # the floor is in the pool, so the next evaluation of anything would
         # raise too. The run stops rather than mutating what cannot play.
         result = await self.measure(source, name)
+        # Drawn once, for the whole session: rounds go deeper on one line and
+        # sessions go wider, so a session that drew "a completely different
+        # algorithm" three times out of five would be three first rounds
+        # rather than one line taken further.
+        drawn, instruction = self.rng.choice(prompt.INSTRUCTIONS)
+        if stagnant:
+            note = STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
+            instruction = note + instruction
         deadline = time.monotonic() + config.SESSION_LIMIT_SECONDS
         rounds = 0
         for _ in range(config.ROUNDS_PER_SESSION):
-            drawn, instruction = self.rng.choice(prompt.INSTRUCTIONS)
-            if stagnant:
-                note = STAGNATION_NOTE.format(
-                    sessions=self.state.sessions_since_promotion
-                )
-                instruction = note + instruction
-            message = prompt.compose(name, result, instruction)
-            outcome = await self.round(source, name, message, drawn)
+            failures = self.database.failures(name)
+            message = prompt.compose(name, result, failures, instruction)
+            outcome = await self.round(source, name, result, message, drawn)
             rounds += 1
             if outcome is None:
                 break
@@ -356,7 +362,7 @@ class Campaign:
         self.finish(rounds)
 
     async def round(
-        self, source: Path, name: str, message: str, drawn: str
+        self, source: Path, name: str, result: FastResult, message: str, drawn: str
     ) -> tuple[Path, str, FastResult] | None:
         """One round: one codex call on one file, and the loop's verdict on it.
 
@@ -368,12 +374,16 @@ class Campaign:
         Args:
             source: The program this round starts from.
             name: What that program is called, for the failures it earns.
+            result: The loop's verdict on that program, carried through so a
+                rejected round hands the same program to the next one.
             message: The composed prompt for this round.
             drawn: The name of the drawn instruction, recorded on the program.
 
         Returns:
-            The program to continue from, its id and its verdict, or None if
-            this round produced nothing to continue from.
+            The program the next round continues from, its id and its verdict.
+            That is what this round wrote, or what it started from when the
+            round was rejected. None when the call never ran to a verdict, and
+            the session ends there.
         """
         program_id = f"p{uuid.uuid4().hex[:12]}"
         box = Path(tempfile.mkdtemp(prefix="campaign-round-"))
@@ -403,7 +413,15 @@ class Campaign:
         if kept is not None:
             record["calls/fitness"] = kept[2].fitness
         self.log.log(record)
-        return kept
+        if mutation.status == "exec_error":
+            # No verdict, and no failure on the lineage either: there is
+            # nothing to tell a next round, so the worker starts a new
+            # session rather than spending the rest of this one's budget.
+            return None
+        # A rejected round continues from what it started from. Its reason is
+        # in the ledger and the next message carries it back, which is worth
+        # more than throwing away the rounds that remain.
+        return kept if kept is not None else (source, name, result)
 
     async def keep(
         self, mutation: Mutation, started_from: str, drawn: str, program_id: str

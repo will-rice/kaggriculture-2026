@@ -664,9 +664,11 @@ def test_a_provider_failure_is_not_the_lineages_failure(
     """A session that never ran to a verdict leaves no failure on the lineage.
 
     A failure becomes the lineage's feedback in the next prompt; a model at
-    capacity is not something the next child can fix.
+    capacity is not something the next child can fix. So this is the one
+    outcome that ends the session outright -- there is nothing to tell a next
+    round -- and the two rounds it had left go to a fresh session instead.
     """
-    tiny_run(tmp_path, monkeypatch)
+    tiny_run(tmp_path, monkeypatch, rounds=3)
     pass_pool(tmp_path)
     stub_evaluator(monkeypatch)
     monkeypatch.setattr(
@@ -996,13 +998,18 @@ def test_a_round_that_clears_the_bar_ends_the_session(
     assert len(mutator.seen) == 1
 
 
-def test_a_round_that_writes_nothing_ends_the_session(
+def test_a_round_that_writes_nothing_feeds_the_next_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     log: wandb.Run,
     records: list[tuple[float, dict]],
 ) -> None:
-    """A round with no program leaves nothing for the next one to continue from."""
+    """A rejected round spends its own budget and nothing more.
+
+    Every round here is refused, so nothing reaches the database; the session
+    still runs the rounds it was given, because the next one starts from the
+    same program with this one's reason in front of it.
+    """
     tiny_run(tmp_path, monkeypatch, rounds=3)
     pass_pool(tmp_path)
     stub_evaluator(monkeypatch)
@@ -1017,10 +1024,63 @@ def test_a_round_that_writes_nothing_ends_the_session(
         log=log,
     )
 
-    assert [record["sessions/rounds"] for record in sessions_of(records)] == [1]
-    assert '"no_output' in config.ARCHIVE.read_text()
+    assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
+    assert config.ARCHIVE.read_text().count('"no_output') == 3
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
     assert [program.id for program in database.programs] == [loop.SEED_ID]
+
+
+def test_a_rejected_round_is_the_next_rounds_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A program that did not parse is exactly what a next attempt can fix.
+
+    The first round writes something that will not compile. Validation is the
+    real one, so the reason in the second round's message is the one the
+    campaign recorded, and the file that round is handed is the unchanged
+    program the first round started from -- four remaining rounds are not
+    thrown away over a fixable mistake.
+    """
+    tiny_run(tmp_path, monkeypatch, rounds=2)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    written = iter(["def agent(observation, configuration=None)\n", SELLER])
+    mutator = Recorder(edit=lambda _: next(written))
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    first, second = mutator.seen
+    assert "produced nothing" not in first.message
+    assert "- syntax: " in second.message
+    assert second.child == first.child == PASS
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert [p.started_from for p in database.programs] == ["", loop.SEED_ID]
+
+
+def test_the_instruction_is_drawn_once_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Rounds deepen one line; it is a new session that goes wider.
+
+    Five rounds drawing for themselves would draw "a completely different
+    algorithm" more than once in most sessions, which is several first rounds
+    rather than one line taken further. The draw belongs to the session, and
+    every program a session writes is stamped with it.
+    """
+    tiny_run(tmp_path, monkeypatch, rounds=5)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda source: source + "# a round\n")
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    given = {handed.message.split("## Your instruction")[1] for handed in mutator.seen}
+    assert len(mutator.seen) == 5 and len(given) == 1
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    stamped = {p.instruction for p in database.programs if p.id != loop.SEED_ID}
+    assert len(stamped) == 1
 
 
 def test_the_session_budget_ends_it_before_the_rounds_do(

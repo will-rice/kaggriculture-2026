@@ -6,16 +6,24 @@ It edits that file and stops. The loop plays every game, so there is nothing
 here about running a harness, no engine to read and no workspace to manage --
 and no file we assemble that an opponent's path could leak through.
 
-The message is spec section 4's five parts, in order: the game, the program,
-the verdict on it, the states behind that verdict, and the instruction. One
-function composes it and every round is composed by it, the first included,
-so the model never sees a round that is shaped differently from the others.
+The message is spec section 4's six parts, in order: the game, the program,
+the verdict on it, the states behind that verdict, the lineage's recent
+failures, and the instruction. One function composes it and every round is
+composed by it, the first included, so the model never sees a round that is
+shaped differently from the others.
 """
 
 import logging
 from pathlib import Path
 
-from kaggriculture.campaign import config, evaluator, gate, harness, validate
+from kaggriculture.campaign import (
+    archive,
+    config,
+    evaluator,
+    gate,
+    harness,
+    validate,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,11 +74,19 @@ The rules above cite probes by filename. Those files are not in your
 directory: take their numbers as verified and do not go looking.
 """
 
-# FAMOU appendix C.2's five rewrite instructions. One is drawn per round, so
+# How many of a lineage's failures are sent, and how much of each. The last
+# few are what a next attempt can act on; an older one is about a program two
+# rounds back. A reason is free-form -- a codex call's own last message is one
+# -- so it is collapsed onto a line and cut, because the message has a budget
+# and the parser error or the exception that matters comes first.
+RECENT_FAILURES = 3
+REASON_CHARS = 200
+
+# FAMOU appendix C.2's five rewrite instructions. One is drawn per session, so
 # eight workers starting from the same champion are pushed eight different
-# ways and a lineage is pushed a different way each round. The caller draws
-# the pair, records the name on the program it produces, and hands ``compose``
-# the text.
+# ways while the rounds within a session go deeper on the one they drew. The
+# caller draws the pair, records the name on every program it produces, and
+# hands ``compose`` the text.
 INSTRUCTIONS: tuple[tuple[str, str], ...] = (
     ("improve", "Improve child.py's performance against the pool."),
     (
@@ -171,12 +187,45 @@ def _states_lines(opponent: str, states: list[harness.Day]) -> list[str]:
     return lines
 
 
+def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
+    """Render the most recent rounds on this lineage that produced no program.
+
+    A rejected round leaves nothing behind but its reason, and "your program
+    did not parse" is exactly what a next attempt can act on. Only the last
+    `RECENT_FAILURES` are sent: an older one is about a program the lineage
+    has since moved past.
+
+    Args:
+        name: The program those rounds were editing, by name.
+        failures: Every failure the ledger holds against it, oldest first.
+
+    Returns:
+        Lines of a markdown section, one bullet per failure.
+    """
+    lines = [
+        f"## Recent attempts on `{name}` that produced nothing",
+        "",
+        "These were rejected before a single game was played, so no score came "
+        "back from any of them and `child.py` is unchanged by them. They are "
+        "mistakes to avoid, not results to build on.",
+        "",
+    ]
+    for failure in failures[-RECENT_FAILURES:]:
+        lines.append(f"- {' '.join(failure.reason.split())[:REASON_CHARS]}")
+    return lines
+
+
 def _items(counts: dict[str, int]) -> str:
     """Render a shed or a price list as ``WHEAT 12, EGG 3``; "-" when empty."""
     return ", ".join(f"{item} {n}" for item, n in counts.items()) or "-"
 
 
-def compose(name: str, result: evaluator.FastResult, instruction: str) -> str:
+def compose(
+    name: str,
+    result: evaluator.FastResult,
+    failures: list[archive.Failure],
+    instruction: str,
+) -> str:
     """Compose the message for one round.
 
     Args:
@@ -184,6 +233,9 @@ def compose(name: str, result: evaluator.FastResult, instruction: str) -> str:
             database id. It is interpolated raw, so it must never be a path.
         result: The loop's fast evaluation of that program: the verdict, and
             the day table of one game behind it.
+        failures: Every failure the ledger holds against that program, oldest
+            first. The caller hands over what it has and this cuts it to the
+            last few, so a caller cannot forget to.
         instruction: The drawn instruction's text, one of ``INSTRUCTIONS``'
             second elements, with any stagnation note the caller prepended.
 
@@ -197,7 +249,16 @@ def compose(name: str, result: evaluator.FastResult, instruction: str) -> str:
         DOCTRINE,
         "\n".join(_verdict_lines(name, result)),
         "\n".join(_states_lines(result.hardest, result.states)),
-        f"## Your instruction\n\n{instruction}\n",
     ]
-    LOGGER.info("composed a round on %s (hardest: %s)", name, result.hardest)
+    # A lineage with nothing against it gets no section at all: a heading over
+    # an empty list is noise in a message the model reads every round.
+    if failures:
+        parts.append("\n".join(_failure_lines(name, failures)))
+    parts.append(f"## Your instruction\n\n{instruction}\n")
+    LOGGER.info(
+        "composed a round on %s (hardest: %s, %d failures)",
+        name,
+        result.hardest,
+        len(failures),
+    )
     return "\n".join(parts)

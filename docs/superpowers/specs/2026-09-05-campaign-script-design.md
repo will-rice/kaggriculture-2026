@@ -50,11 +50,13 @@ workers.
 
 ```
 while True:
-    program = champion                      # or a top-ten draw when stagnant
+    program     = champion                  # or a top-ten draw when stagnant
+    instruction = draw(INSTRUCTIONS)        # once: the rounds deepen one line
     for round in range(ROUNDS_PER_SESSION):
-        prompt  = compose(rules, program, verdict, day states, instruction)
+        prompt  = compose(rules, program, verdict, days, failures, instruction)
         child   = await codex(prompt)       # writes one file, then stops
-        if not validate(child): record why; break
+        if the call never reached a verdict: break
+        if not validate(child): record why; continue   # the next round is told
         result  = score(child, pool)        # the loop plays; the model never does
         program = database.add(child, result)
         if program is in the top DEEP_TOP_K and has no deep result:
@@ -72,7 +74,15 @@ next. There are no islands and no worker identity in any record: the
 concurrency is the only structure.
 
 **Rounds go deeper, sessions go wider.** A round continues from its own
-previous program; a new session starts again from the champion.
+previous program; a new session starts again from the champion. The
+instruction is drawn once a session for the same reason: five independent
+draws would ask one lineage to start over three times.
+
+**A rejected round is not the end of a session.** It records why and the next
+round is told, because "your program did not parse" is what a model can act
+on and four remaining rounds are too much to spend on a fixable mistake. The
+one thing that does end a session early is a call that never ran to a verdict
+(section 6): nothing about the lineage caused it, so there is nothing to say.
 
 ## 4. What the model is given
 
@@ -82,13 +92,14 @@ no workspace to manage.
 
 The prompt is:
 
-| part            | content                                                                                                                                                                           |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| the game        | objective, rules, verified economics, the interface, and the doctrine: never read, request or reconstruct an opponent's program                                                   |
-| the program     | `child.py` is the program to improve; edit it and stop                                                                                                                            |
-| the verdict     | its win rate against each opponent, the bank margins, and the opponents it does not beat                                                                                          |
-| the states      | one lost game against the opponent it does worst against, day by day: both banks, both sheds, both hand counts, market prices                                                     |
-| the instruction | one of five, drawn uniformly (FAMOU appendix C.2): improve it; a completely different algorithm; a novel approach inspired by it; restructure its components; tune constants only |
+| part            | content                                                                                                                                                                                       |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the game        | objective, rules, verified economics, the interface, and the doctrine: never read, request or reconstruct an opponent's program                                                               |
+| the program     | `child.py` is the program to improve; edit it and stop                                                                                                                                        |
+| the verdict     | its win rate against each opponent, the bank margins, and the opponents it does not beat                                                                                                      |
+| the states      | one lost game against the opponent it does worst against, day by day: both banks, both sheds, both hand counts, market prices                                                                 |
+| the failures    | the last three rounds on this lineage that were rejected before a game, and why; the section is absent when there are none                                                                    |
+| the instruction | one of five, drawn uniformly per session (FAMOU appendix C.2): improve it; a completely different algorithm; a novel approach inspired by it; restructure its components; tune constants only |
 
 **The bar** is beating every opponent, stated in the prompt, and it is the
 same condition the gate applies.
