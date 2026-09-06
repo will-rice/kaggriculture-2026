@@ -28,7 +28,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import signal
 import subprocess
 import time
@@ -46,59 +45,6 @@ LOGGER = logging.getLogger(__name__)
 # lookup, not a model turn, so no quota is spent running it. A test replaces
 # this with a command that prints a small catalog of its own.
 MODEL_CATALOG_COMMAND = ["codex", "debug", "models"]
-
-
-def skills_off() -> str:
-    """The ``-c`` override that hides ``config.SKILLS_OFF`` from a round.
-
-    Returns:
-        A ``skills.config`` assignment whose value is TOML: one inline table
-        per skill, each disabling it by name.
-    """
-    entries = ",".join(f'{{name="{name}",enabled=false}}' for name in config.SKILLS_OFF)
-    return f"skills.config=[{entries}]"
-
-
-def codex_home() -> Path:
-    """Where this login's codex state lives, however the environment names it.
-
-    Codex reads ``CODEX_HOME`` and otherwise ``$HOME/.codex``, and a round is
-    given a HOME of its own, so the default would resolve inside that and the
-    call would run with no ``auth.json`` and no model catalog.
-
-    Returns:
-        The directory holding this login's codex state.
-    """
-    named = os.environ.get("CODEX_HOME")
-    return Path(named) if named else Path.home() / ".codex"
-
-
-def prepare_home() -> None:
-    """Build ``config.ROUND_HOME``: every host skill except ``SKILLS_OFF``.
-
-    One symlink per skill, rebuilt from scratch, so a skill the developer adds
-    is offered to the next campaign and one they delete stops being offered.
-    Symlinks rather than copies because a skill is a directory of documents
-    that the round only reads, and a copy would go stale the moment either
-    side changed.
-    """
-    skills = config.ROUND_HOME / ".agents" / "skills"
-    shutil.rmtree(config.ROUND_HOME, ignore_errors=True)
-    skills.mkdir(parents=True)
-    kept = sorted(
-        skill
-        for skill in config.HOST_SKILLS.iterdir()
-        if skill.is_dir() and skill.name not in config.SKILLS_OFF
-    )
-    for skill in kept:
-        (skills / skill.name).symlink_to(skill, target_is_directory=True)
-    LOGGER.info(
-        "a round is given %d of %s's %d skills, without %s",
-        len(kept),
-        config.HOST_SKILLS,
-        len(kept) + len(config.SKILLS_OFF),
-        ", ".join(config.SKILLS_OFF),
-    )
 
 
 def known_models() -> set[str]:
@@ -239,40 +185,6 @@ class CodexMutator:
         self.fallback = fallback
         self.timeout = timeout
 
-    def arguments(self, model: str, workspace: Path) -> list[str]:
-        """The whole command line for one call, ``COMMAND`` and the rest.
-
-        The per-call half is added here rather than written into ``COMMAND``
-        because it needs the model and the directory, and because a test that
-        replaces ``COMMAND`` with a shell command wants none of it.
-
-        Args:
-            model: The model to request.
-            workspace: The directory holding ``child.py``.
-
-        Returns:
-            The argument list to execute.
-        """
-        command = [*self.COMMAND]
-        if command[0] != "codex":
-            return command
-        return command + [
-            "-m",
-            model,
-            "-C",
-            str(workspace),
-            # `config.SKILLS_OFF` says which and why. Codex reads
-            # `skills.config` from the user layer and from these session
-            # flags, so this turns them off for the round without touching
-            # anything the login has configured for itself.
-            "-c",
-            skills_off(),
-            # `config.SKILLS_OFF` says which and why. Codex reads
-            # `skills.config` from the user layer and from these session
-            # flags, so this turns them off for the round without touching
-            # anything the login has configured for itself.
-        ]
-
     async def __call__(
         self, workspace: Path, message: str, program_id: str
     ) -> Mutation:
@@ -330,7 +242,9 @@ class CodexMutator:
         # What the round was handed. A call that ends with the file exactly
         # as it found it has written nothing, however cleanly it exited.
         given = (workspace / "child.py").read_text(encoding="utf-8")
-        command = self.arguments(model, workspace)
+        command = [*self.COMMAND]
+        if command[0] == "codex":
+            command += ["-m", model, "-C", str(workspace)]
         log = workspace / "codex.jsonl"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
@@ -340,13 +254,7 @@ class CodexMutator:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace,
                 start_new_session=True,
-                env={
-                    **os.environ,
-                    "CAMPAIGN_CODEX_MODEL": model,
-                    # `config.ROUND_HOME` says why this is not the user's own.
-                    "HOME": str(config.ROUND_HOME),
-                    "CODEX_HOME": str(codex_home()),
-                },
+                env={**os.environ, "CAMPAIGN_CODEX_MODEL": model},
             )
             try:
                 _, stderr = await asyncio.wait_for(

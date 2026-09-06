@@ -178,8 +178,15 @@ cannot poison the next. A fresh call also cannot anchor on its own earlier
 hypothesis: the program embodies its prior work and the verdict says what
 that work achieved.
 
-Bounded by `ROUNDS_PER_SESSION = 5` and `SESSION_LIMIT_SECONDS = 1500`,
-whichever comes first.
+Bounded by `ROUNDS_PER_SESSION = 5` and `SESSION_LIMIT_SECONDS`, whichever
+comes first. That budget is derived: `ROUND_LIMIT_SECONDS = 3600` is the
+constant, and the session's is five of them. A round inherits the skills the
+login has installed and is meant to -- it brainstorms, plans, writes a test and
+only then edits -- and that process does not fit five minutes. At five minutes
+the calls did not come back slow, they did not come back at all: every one was
+killed at the cap having written nothing, because it had not reached the edit.
+Wall clock per round is not the scarce thing; rounds that produce a program
+are.
 
 **Two models.** `CODEX_MODEL`, falling back once to `CODEX_FALLBACK_MODEL`
 when the provider refuses the turn or codex dies. A failure on both is
@@ -241,20 +248,21 @@ with uncommitted changes under `src/`.
 
 ## 8. Constants
 
-| constant                     | source                               |
-| ---------------------------- | ------------------------------------ |
-| `SESSIONS` 8                 | fits the machine                     |
-| `ROUNDS_PER_SESSION` 5       | with scoring, fits the session limit |
-| `SESSION_LIMIT_SECONDS` 1500 | measured; FAMOU 300                  |
-| `GAME_LIMIT_SECONDS` 120     | liveness                             |
-| `FAST_SEEDS` 4               | FAMOU 3 games/opponent               |
-| `EXAM_SEEDS` 64, sealed      | FAMOU 20 games/opponent              |
-| `DEEP_TOP_K` 3               | FAMOU                                |
-| `DEEP_CONCURRENCY` 2         |                                      |
-| `POOL_CAP` 10                |                                      |
-| `RETIRE_THRESHOLD` 0.95      |                                      |
-| `STAGNATION_SESSIONS` 40     |                                      |
-| `CORE_BUDGET` cores - 8      |                                      |
+| constant                   | source                                |
+| -------------------------- | ------------------------------------- |
+| `SESSIONS` 8               | fits the machine                      |
+| `ROUNDS_PER_SESSION` 5     | with scoring, fits the session limit  |
+| `ROUND_LIMIT_SECONDS` 3600 | a full skill process reaches the edit |
+| `SESSION_LIMIT_SECONDS`    | derived: five rounds of the above     |
+| `GAME_LIMIT_SECONDS` 120   | liveness                              |
+| `FAST_SEEDS` 4             | FAMOU 3 games/opponent                |
+| `EXAM_SEEDS` 64, sealed    | FAMOU 20 games/opponent               |
+| `DEEP_TOP_K` 3             | FAMOU                                 |
+| `DEEP_CONCURRENCY` 2       |                                       |
+| `POOL_CAP` 10              |                                       |
+| `RETIRE_THRESHOLD` 0.95    |                                       |
+| `STAGNATION_SESSIONS` 40   |                                       |
+| `CORE_BUDGET` cores - 8    |                                       |
 
 ## 9. Deliberately not built
 

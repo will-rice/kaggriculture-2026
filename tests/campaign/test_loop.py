@@ -96,7 +96,7 @@ WORKERS = max(1, min(2, config.CORE_BUDGET // config.SESSIONS))
 # second call would otherwise resolve paths the first call had replaced.
 RUNTIME_PATHS = {
     name: getattr(config, name).relative_to(config.RUN)
-    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "ROUND_HOME")
+    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION")
 }
 EXAM_SEEDS = config.EXAM_SEEDS
 
@@ -1409,15 +1409,7 @@ def test_a_dry_run_writes_nowhere_the_campaign_reads(
     live = pass_pool(tmp_path)
     campaign = {
         name: getattr(config, name)
-        for name in (
-            "ARCHIVE",
-            "PROGRAMS",
-            "FLOOR",
-            "CHAMPIONS",
-            "CHAMPION",
-            "POOL",
-            "ROUND_HOME",
-        )
+        for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "POOL")
     }
     seed = _write(tmp_path / "seed.py", PASS)
 

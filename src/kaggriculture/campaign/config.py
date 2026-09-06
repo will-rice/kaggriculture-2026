@@ -75,8 +75,8 @@ MARKET_OPS: list[str] = [
 SESSIONS = 8
 # Codex calls in one session, each continuing from the program the last one
 # produced. A session ends at whichever of this count and
-# `SESSION_LIMIT_SECONDS` comes first: five rounds of codex plus a minute of
-# scoring each fits inside 1500 seconds.
+# `SESSION_LIMIT_SECONDS` comes first, and that budget is this many rounds of
+# `ROUND_LIMIT_SECONDS`, so ordinarily it is this count that ends a session.
 ROUNDS_PER_SESSION = 5
 FAST_SEEDS = 4  # x both seats x every pool opponent
 FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
@@ -116,59 +116,25 @@ CODEX_MODEL = "gpt-5.6-luna"
 # some of the time (two calls in the first live hour), which is why this
 # exists at all.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-# The session's own budget, checked between rounds; the round that overruns
-# it is the last one. Measured on the first live iteration (2026-09-05).
-SESSION_LIMIT_SECONDS = 1500
-# One round's share of that budget, and the cap on a single codex call.
-# Whatever `child.py` holds when it fires is what the loop scores, so the cap
-# bounds a round's wall clock, not whether it yields a program.
-ROUND_LIMIT_SECONDS = SESSION_LIMIT_SECONDS // ROUNDS_PER_SESSION
+# The cap on one codex call, and the constant the session budget is derived
+# from rather than the other way about. A round inherits the skills this login
+# has installed and is meant to: it brainstorms, plans, writes a test and only
+# then edits, and that is a process built for a session measured in hours, not
+# the five minutes a 1500-second session divided five ways left it. At five
+# minutes the calls did not come back slow, they did not come back at all --
+# every one killed at the cap with nothing written and no completion event,
+# because the process had not reached the edit yet. Wall clock per round is
+# not what is scarce here; rounds that produce a program are. Whatever
+# `child.py` holds when this fires is still what gets scored, so the cap
+# bounds a round's length and never whether it yields something.
+ROUND_LIMIT_SECONDS = 3600
+# The session's own budget, checked between rounds; the round that overruns it
+# is the last one. Derived, so raising the round cap cannot silently leave a
+# session ending after its first round.
+SESSION_LIMIT_SECONDS = ROUNDS_PER_SESSION * ROUND_LIMIT_SECONDS
 # Liveness only, never speed: a 720-turn game of rule-based policies takes
 # well under a second, so one still running after two minutes is stuck.
 GAME_LIMIT_SECONDS = 120
-
-# Skills a round is not shown. Codex discovers them from `~/.agents/skills`
-# among other roots, and this login's holds sixty; a round inherits every one
-# of them and is told to use whichever applies. Most are harmless and some are
-# useful, which is why this is a list and not a switch -- but a round is one
-# file, one message, a temporary directory and nobody watching, and these stop
-# to ask a person who is not there or manage a repository that is not there.
-# `brainstorming` is the clearest: "do NOT write any code ... until you have
-# presented a design and the user has approved it". Rounds that went to read
-# these produced no program at all, so the whole campaign made nothing for as
-# long as it ran. Verified against `codex debug prompt-input`, which renders
-# what the model is shown without spending a call.
-SKILLS_OFF: list[str] = [
-    # Waits for an approval that never comes.
-    "brainstorming",
-    # Ends by asking which execution approach to take.
-    "writing-plans",
-    # Presents a menu, waits for the answer, then merges or pushes.
-    "finishing-a-development-branch",
-    # Asks consent, then builds worktrees of a repository the round has not got.
-    "using-git-worktrees",
-    # Hours of orchestration, and subagents, inside a round of a few minutes.
-    "executing-plans",
-    "subagent-driven-development",
-    "dispatching-parallel-agents",
-    "requesting-code-review",
-    "receiving-code-review",
-]
-
-# The HOME a codex call runs under. Not the developer's, because a round is
-# given a temporary directory and one message with nobody behind it, and
-# `SKILLS_OFF` must be unreachable rather than merely unlisted: disabling a
-# skill stops codex offering it, but `using-superpowers` names
-# `superpowers:brainstorming` in its own text and the model then reads the file
-# off disk with `sed`, which is exactly what it did. What this holds is
-# `.agents/skills`, one symlink per skill the round may have, rebuilt at
-# startup so it follows whatever the developer's own directory holds.
-# `CODEX_HOME` is passed beside it and still points at the real login, because
-# codex derives it from HOME and the auth would go with it otherwise.
-ROUND_HOME = RUN / "codex-home"
-# Where the skills are symlinked from. Codex's other roots are left alone:
-# `$CODEX_HOME/skills` is still discovered, and holds none of `SKILLS_OFF`.
-HOST_SKILLS = Path.home() / ".agents" / "skills"
 
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
