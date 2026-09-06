@@ -42,6 +42,7 @@ import signal
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import wandb
@@ -65,6 +66,12 @@ from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import spearman
 
 LOGGER = logging.getLogger(__name__)
+
+# Threads the loop needs at once: one per session for whichever blocking step
+# it is on -- scoring a program, validating one, reading a transcript, and
+# never two at once within a session -- plus one per deep evaluation in
+# flight, plus the one a promotion packages on.
+THREADS = config.SESSIONS + config.DEEP_CONCURRENCY + 1
 
 # The database id of the program a cold start seeds itself from. Until the
 # first promotion there is no champion, so this is the name the first
@@ -328,8 +335,21 @@ class Campaign:
                 time it arrives here.
         """
         self.remaining = sessions
-        work = asyncio.ensure_future(self.work())
         running = asyncio.get_running_loop()
+        # `asyncio.to_thread` otherwise borrows the default executor, which is
+        # sized `cpu_count + 4`. Every thread this loop asks for is waiting on
+        # a subprocess or a file, never computing, so the core count is the
+        # wrong basis: on a four-core machine that pool is eight threads
+        # against eight sessions and two deep evaluations, and the sessions
+        # that cannot get one simply do not run -- silently, because nothing
+        # fails, they just queue. Sized here to what the loop actually asks
+        # for at once, so the same campaign runs the same way on any machine.
+        running.set_default_executor(
+            ThreadPoolExecutor(
+                max_workers=THREADS, thread_name_prefix="campaign-blocking"
+            )
+        )
+        work = asyncio.ensure_future(self.work())
         for number in (signal.SIGINT, signal.SIGTERM):
             running.add_signal_handler(number, work.cancel)
         try:

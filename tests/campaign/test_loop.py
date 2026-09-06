@@ -495,14 +495,26 @@ def test_eight_workers_run_at_once(
     the runner scheduled eight threads promptly, and it failed on CI by seven
     tenths of a millisecond. Widening the sleep would have bought margin and
     weakened the claim; the barrier removes the timing from it altogether.
+
+    Run as if on a one-core machine, because that is the condition that found
+    the defect underneath. `asyncio.to_thread` borrows a default executor
+    sized `cpu_count + 4`, and every thread here waits on a subprocess or a
+    file rather than computing, so the core count is the wrong basis: on CI's
+    four cores that pool was eight threads against eight sessions and two deep
+    evaluations, and the sessions that could not get one simply queued. The
+    loop now brings a pool sized by its own concurrency, and pinning
+    `cpu_count` at one proves it on any machine -- without the pinning this
+    passes on a large box whatever the loop does.
     """
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
     tiny_run(tmp_path, monkeypatch)
     strong_champion(tmp_path)
     stub_evaluator(monkeypatch)
-    # Generous, because it is not a measurement: nothing is being timed, and
-    # this only stops a real serialisation from hanging the suite instead of
-    # failing it.
-    gate = threading.Barrier(config.SESSIONS, timeout=120)
+    # Not a measurement: the sessions reach this in well under a second when
+    # they run at all, so thirty seconds is sixty times the margin the old
+    # timestamps asked for. It exists only so a real serialisation fails the
+    # suite instead of hanging it.
+    gate = threading.Barrier(config.SESSIONS, timeout=30)
     # A list, because `append` is atomic and `+= 1` from eight threads is not.
     arrived: list[int] = []
 
