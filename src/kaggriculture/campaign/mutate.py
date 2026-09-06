@@ -149,9 +149,13 @@ class CodexMutator:
     killed loop would leave ``SESSIONS`` codex calls running.
     """
 
+    # `--skip-git-repo-check` because a call runs in a temporary directory
+    # holding one file, not in a repository: codex refuses an untrusted
+    # directory otherwise, and the directory is deliberately not one.
     COMMAND = [
         "codex",
         "exec",
+        "--skip-git-repo-check",
         "-s",
         "workspace-write",
         "-c",
