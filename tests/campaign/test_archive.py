@@ -3,6 +3,7 @@
 import time
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from kaggriculture.campaign import archive
@@ -23,12 +24,33 @@ def program(db: archive.Database, name: str, fitness: float) -> archive.Program:
         source_path=str(db.store(AGENT, name)),
         started_from="",
         instruction="improve",
+        model="gpt-5.6-luna",
         fitness=fitness,
         rates={"v54": fitness},
         created=time.time(),
     )
     db.add(p)
     return p
+
+
+def test_a_program_with_no_model_is_a_bug_not_a_legacy_case() -> None:
+    """Every program is written by a call that used a model; nothing defaults it.
+
+    The campaign is starting fresh, and the old-format log this would have
+    tolerated is moved aside at cutover rather than replayed, so there is no
+    record to stay compatible with.
+    """
+    with pytest.raises(pydantic.ValidationError, match="model"):
+        archive.Program.model_validate(
+            {
+                "id": "a",
+                "source_path": "x",
+                "started_from": "",
+                "instruction": "improve",
+                "fitness": 0.5,
+                "created": 0.0,
+            }
+        )
 
 
 def test_top_ranks_by_fitness(tmp_path: Path) -> None:

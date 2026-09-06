@@ -54,7 +54,13 @@ from kaggriculture.campaign import archive, config, evaluator, gate, prompt, val
 from kaggriculture.campaign.evaluator import DeepResult, FastResult
 from kaggriculture.campaign.gate import Champion
 from kaggriculture.campaign.harness import OpponentCrash
-from kaggriculture.campaign.mutate import CodexMutator, FakeMutator, Mutation, Mutator
+from kaggriculture.campaign.mutate import (
+    CodexMutator,
+    FakeMutator,
+    Mutation,
+    Mutator,
+    validate_model,
+)
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import spearman
 
@@ -91,6 +97,12 @@ def main(argv: list[str] | None = None) -> None:
     """``campaign loop``: eight workers, each mutating the champion."""
     args = _arguments(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    if not args.dry_run:
+        # A typo'd model is hundreds of failed sessions discovered one at a
+        # time; caught here, before the run opens or a call is ever made.
+        validate_model(config.CODEX_MODEL)
+        if config.CODEX_FALLBACK_MODEL:
+            validate_model(config.CODEX_FALLBACK_MODEL)
     # 1. wandb, named for the model and the code that produced the run.
     log = _open_run(dry_run=args.dry_run)
     mutator: Mutator = (

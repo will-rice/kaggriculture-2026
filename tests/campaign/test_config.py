@@ -98,7 +98,7 @@ def test_constants_match_the_spec_table() -> None:
     assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
     assert (config.POOL_CAP, config.RETIRE_THRESHOLD) == (10, 0.95)
     assert config.STAGNATION_SESSIONS == 40
-    assert config.CODEX_MODEL == "gpt-6-astra"
+    assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
 
 

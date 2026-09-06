@@ -90,12 +90,25 @@ RETIRE_THRESHOLD = 0.95
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
-# Probed 2026-09-05 on codex 0.153: the ChatGPT login accepts `gpt-6-astra`
-# ("our most capable model for complex, demanding work") but not `gpt-5.6-astra`.
-CODEX_MODEL = "gpt-6-astra"
-# Astra answers "Selected model is at capacity" some of the time (two calls
-# in the first live hour). A call that fails on the first model is retried
-# once on this one, in the same directory, so the round still gets a child.
+# The first campaign spent nearly all its quota on gpt-6-astra and produced a
+# champion that beats one of six opponents; everything since is about the
+# setup, not the model, so which is the constraint is unknown. This block is
+# a calibration run on a lighter model: a session takes 8-25 minutes whatever
+# model runs it, so if luna reaches about the same field rate, the bottleneck
+# is the setup and the quota should buy volume instead of capability. Not the
+# smallest model on offer -- a session has to run the harness, read a JSONL
+# game log and edit a several-hundred-line program, and the smallest models
+# are likelier to fail at the mechanics than at the strategy, which would
+# answer the wrong question. `mutate.validate_model` checks this against the
+# login's own catalog at startup, because a typo here is hundreds of failed
+# sessions discovered one at a time -- not hypothetical: this login accepts
+# `gpt-6-astra` but refuses `gpt-5.6-astra` (probed 2026-09-05 on codex 0.153).
+CODEX_MODEL = "gpt-5.6-luna"
+# The model retried once, in the same directory, when the first model's call
+# fails without a verdict -- a provider refusal or a codex crash -- so the
+# round still gets a child. Astra answered "Selected model is at capacity"
+# some of the time (two calls in the first live hour), which is why this
+# exists at all.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 # The session's own budget, checked between rounds; the round that overruns
 # it is the last one. Measured on the first live iteration (2026-09-05).

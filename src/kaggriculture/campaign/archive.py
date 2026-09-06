@@ -25,8 +25,7 @@ class Program(BaseModel):
         started_from: The id this program was edited from; "" for the seed.
         instruction: The mutation instruction the round was given.
         model: The model that wrote it, so a block of quota can be judged
-            after the fact. Defaulted, and empty for the seed, which no model
-            wrote.
+            after the fact. Empty for the seed, which no model wrote.
         fitness: Mean pool win rate from the fast evaluation.
         rates: Fast-evaluation win rate per pool opponent.
         margins: Fast-evaluation bank margin per pool opponent. Defaulted,
@@ -39,7 +38,7 @@ class Program(BaseModel):
     source_path: str
     started_from: str
     instruction: str
-    model: str = ""
+    model: str
     fitness: float
     rates: dict[str, float] = {}
     margins: dict[str, Margin] = {}

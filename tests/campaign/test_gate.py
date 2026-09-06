@@ -108,6 +108,7 @@ def _program(
         source_path=str(source),
         started_from="",
         instruction="improve it",
+        model="gpt-5.6-luna",
         fitness=0.5,
         rates={"a": 0.5},
         created=0.0,

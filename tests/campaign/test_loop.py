@@ -718,6 +718,7 @@ def test_a_broken_pool_opponent_stops_the_run(
             source_path=str(stored),
             started_from="",
             instruction="seed",
+            model="",
             fitness=0.5,
             created=time.time(),
         )
@@ -813,7 +814,7 @@ def test_a_dirty_src_refuses_to_start(
     """A run named by a revision has to be that revision.
 
     ``tiny_run`` first, though nothing here should reach a runtime path: this
-    is the one test that calls ``main``, and a `main` that stopped refusing
+    is one of two tests that call ``main``, and a `main` that stopped refusing
     would otherwise open the live campaign's own files.
     """
     tiny_run(tmp_path, monkeypatch)
@@ -823,6 +824,28 @@ def test_a_dirty_src_refuses_to_start(
 
     with pytest.raises(SystemExit, match="src/agent.py"):
         loop.main(["--sessions", "0", "--dry-run"])
+
+
+def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo'd model is caught before wandb opens or a call is ever made.
+
+    Real ``--dry-run`` never reaches ``validate_model`` -- a fake mutator
+    spends no codex call -- so this is the other of the two tests that call
+    ``main``, and it never runs with ``--dry-run``: a dirty-``src`` check or
+    a live wandb run would otherwise have to be arranged just to reach the
+    check this test is about.
+    """
+    monkeypatch.setattr(config, "CODEX_MODEL", "gpt-5.6-astra")
+    monkeypatch.setattr(
+        mutate,
+        "MODEL_CATALOG_COMMAND",
+        ["printf", "%s", '{"models":[{"slug":"gpt-6-astra"}]}'],
+    )
+
+    with pytest.raises(SystemExit, match="gpt-5.6-astra"):
+        loop.main(["--sessions", "0"])
 
 
 def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
@@ -974,6 +997,29 @@ def test_a_session_is_rounds_and_each_continues_from_the_last(
     assert all(program.rates for program in written)
     assert len(calls_of(records)) == 3
     assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
+
+
+def test_the_database_records_which_model_wrote_each_program(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A program remembers which model wrote it.
+
+    That is what lets a block of quota be judged after the fact, even once
+    ``config.CODEX_MODEL`` has moved on to another value. The seed carries no
+    model: no session wrote it.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda source: source + "# a round\n")
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
+
+    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    assert database.get(loop.SEED_ID).model == ""
+    written = [p for p in database.programs if p.id != loop.SEED_ID]
+    assert len(written) == 1 and written[0].model == "recorder"
 
 
 def test_a_round_that_clears_the_bar_ends_the_session(

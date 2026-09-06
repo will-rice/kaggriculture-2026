@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -39,6 +40,44 @@ from pydantic import BaseModel
 from kaggriculture.campaign import config
 
 LOGGER = logging.getLogger(__name__)
+
+# Reads the model catalog this login's codex is entitled to -- a local
+# lookup, not a model turn, so no quota is spent running it. A test replaces
+# this with a command that prints a small catalog of its own.
+MODEL_CATALOG_COMMAND = ["codex", "debug", "models"]
+
+
+def known_models() -> set[str]:
+    """The model slugs this codex login's catalog reports.
+
+    Returns:
+        Every ``slug`` in ``MODEL_CATALOG_COMMAND``'s JSON output.
+    """
+    output = subprocess.run(
+        MODEL_CATALOG_COMMAND, capture_output=True, check=True, text=True
+    ).stdout
+    return {model["slug"] for model in json.loads(output)["models"]}
+
+
+def validate_model(model: str) -> None:
+    """Fails fast when ``model`` is not a slug this codex login recognizes.
+
+    A typo'd model is hundreds of failed sessions discovered one at a time --
+    this login accepts ``gpt-6-astra`` but refuses ``gpt-5.6-astra``, so it is
+    not hypothetical. Called once at startup, before any session spends a
+    call on a name that was never going to work.
+
+    Args:
+        model: The model to check.
+
+    Raises:
+        SystemExit: ``model`` is not in ``known_models()``.
+    """
+    if model not in known_models():
+        raise SystemExit(
+            f"{model!r} is not a model this codex login knows about "
+            "(run `codex debug models` to check the spelling)"
+        )
 
 
 class Mutation(BaseModel):

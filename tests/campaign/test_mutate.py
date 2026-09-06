@@ -313,6 +313,47 @@ def test_cancelling_a_call_kills_the_whole_process_group(
         pytest.fail(f"process group {pgid} survived the cancellation")
 
 
+# A stand-in for `codex debug models`: a local catalog lookup, not a model
+# turn, so a real one costs nothing to run -- but these tests replace it
+# anyway, so a typo in the constant cannot make a whole suite depend on
+# whatever this login happens to be entitled to today.
+def catalog(*slugs: str) -> list[str]:
+    """A command printing a catalog of exactly ``slugs``, standing in for codex."""
+    body = json.dumps({"models": [{"slug": slug} for slug in slugs]})
+    return ["printf", "%s", body]
+
+
+def test_known_models_is_exactly_the_catalogs_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``known_models`` reads slugs from the catalog command, nothing else."""
+    monkeypatch.setattr(
+        mutate, "MODEL_CATALOG_COMMAND", catalog("gpt-6-astra", "gpt-5.6-luna")
+    )
+    assert mutate.known_models() == {"gpt-6-astra", "gpt-5.6-luna"}
+
+
+def test_validate_model_accepts_a_slug_the_catalog_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model this login's catalog knows about passes without complaint."""
+    monkeypatch.setattr(mutate, "MODEL_CATALOG_COMMAND", catalog("gpt-5.6-luna"))
+    mutate.validate_model("gpt-5.6-luna")
+
+
+def test_validate_model_refuses_a_typo_and_names_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo'd model is refused before it costs a single session.
+
+    This is not hypothetical: this login accepts ``gpt-6-astra`` but refuses
+    ``gpt-5.6-astra``.
+    """
+    monkeypatch.setattr(mutate, "MODEL_CATALOG_COMMAND", catalog("gpt-6-astra"))
+    with pytest.raises(SystemExit, match="gpt-5.6-astra"):
+        mutate.validate_model("gpt-5.6-astra")
+
+
 @pytest.mark.skipif(
     not os.environ.get("CAMPAIGN_CODEX"),
     reason="set CAMPAIGN_CODEX=1 to spend a real codex call",
