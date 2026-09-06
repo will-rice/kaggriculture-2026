@@ -13,6 +13,13 @@ discount (spec section 5.6): ``indarkarhana`` against ``lynnsakurai_v5``
 scores 0.165, so that held-out opponent is close to independent of the pool;
 ``v54`` against ``v56`` scores 0.737, so the two Kaito lineages are close to
 one opponent counted twice in the field average.
+
+The published field clones itself heavily, so a name is not an opponent. Of
+nine kernels pulled on 2026-09-06, three were dropped: ``flexonafft`` ships
+byte-identical C++ to ``avioon``, ``yhay81/three-day-shop-router`` is the C++
+build of the router ``lynnsakurai_threeday`` already is in pure Python, and
+``kaitofukami``'s packing was not one this could read. Counting those as
+opponents would have bought evaluation cost and no resolution.
 """
 
 from pathlib import Path
@@ -20,12 +27,28 @@ from pathlib import Path
 from kaggriculture.campaign import config
 
 TRAINING: dict[str, Path] = {
+    # Harvested 2026-09-01 and before.
     "router_v1": config.AGENTS / "yhay81_router_v1" / "main.py",
     "router2929": config.OPPONENTS / "yhay81_router2929" / "main.py",
     "v54": config.OPPONENTS / "kaito_v54" / "main.py",
     "v56": config.OPPONENTS / "kaito_v56" / "main.py",
     "shopforge": config.OPPONENTS / "tetsutani_shopforge" / "main.py",
     "indarkarhana": config.OPPONENTS / "indarkarhana_top10" / "main.py",
+    # Harvested 2026-09-06, from kernels last run 2026-09-02 to 09-05. The
+    # pool the campaign was gating on had stopped being the ladder it is
+    # aiming at: five of these are by authors the roster held nothing from.
+    "boatlee_v29": config.OPPONENTS / "boatlee_v29" / "main.py",
+    "lynnsakurai_threeday": config.OPPONENTS / "lynnsakurai_threeday" / "main.py",
+    "pilkwang_economic": config.OPPONENTS / "pilkwang_economic" / "main.py",
+    "tetsutani_shape0905": config.OPPONENTS / "tetsutani_shape0905" / "main.py",
+    "thomastschinkel_router": config.OPPONENTS / "thomastschinkel_router" / "main.py",
+    # C++: a policy plus a 108KB tape, built on first load and cached as
+    # `agent.so` beside its `main.py`. That build takes about a hundred
+    # seconds and games run one per process, many at once, so the binary is
+    # built once by hand when the opponent is installed and never during an
+    # evaluation. If it is ever missing, the first game to reach it pays the
+    # compile and the rest race it.
+    "avioon_apex_v7": config.OPPONENTS / "avioon_apex_v7" / "main.py",
 }
 HELD_OUT: dict[str, Path] = {
     "salemali7_2900": config.OPPONENTS / "salemali7_2900" / "main.py",

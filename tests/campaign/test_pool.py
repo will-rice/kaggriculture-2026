@@ -10,6 +10,20 @@ def five() -> pool.Pool:
     return pool.Pool(opponents={name: f"/x/{name}.py" for name in "abcde"})
 
 
+def filled() -> pool.Pool:
+    """`five()` topped up with champions until it stands exactly at the cap.
+
+    Derived from `config.POOL_CAP` rather than written out, because the cap
+    moves with the vendored roster it has to clear: a test that spelled out
+    ten stopped meaning "a full pool" the moment six opponents were added.
+    """
+    p = five()
+    for number in range(config.POOL_CAP - len(p.names())):
+        p.add_champion(f"c{number}", f"/x/c{number}.py", rates={})
+    assert len(p.names()) == config.POOL_CAP
+    return p
+
+
 def test_initial_pool_is_the_training_roster() -> None:
     """Pool.initial() mirrors roster.TRAINING."""
     p = pool.Pool.initial()
@@ -35,10 +49,7 @@ def test_a_full_pool_retires_the_opponent_the_champion_beats_most_decisively() -
     tells one candidate from another, and it is the most beaten of those --
     not the least weighted, there being no weights -- that makes way.
     """
-    p = five()
-    for number in range(5):
-        p.add_champion(f"c{number}", f"/x/c{number}.py", rates={})
-    assert len(p.names()) == config.POOL_CAP
+    p = filled()
 
     retired = p.add_champion(
         "new", "/x/new.py", rates={"a": 0.96, "b": 0.99, "c": 0.5, "d": 0.97}
@@ -55,9 +66,7 @@ def test_a_full_pool_of_opponents_that_still_matter_keeps_them_all() -> None:
     A cap that evicted an opponent nobody had crushed would throw away the
     hardest matchups first, which are the ones a gate exists to ask about.
     """
-    p = five()
-    for number in range(5):
-        p.add_champion(f"c{number}", f"/x/c{number}.py", rates={})
+    p = filled()
 
     retired = p.add_champion("new", "/x/new.py", rates=dict.fromkeys("abcde", 0.6))
 
@@ -85,6 +94,7 @@ def test_a_vendored_incumbent_is_never_retired() -> None:
     """
     vendored = list(roster.TRAINING)
     champions = [f"champion_{n}" for n in range(1, config.POOL_CAP - len(vendored) + 1)]
+    assert champions, "the cap must leave room for at least one champion"
     p = pool.Pool(opponents={n: f"/x/{n}.py" for n in vendored + champions})
     assert len(p.names()) == config.POOL_CAP
 
@@ -92,8 +102,8 @@ def test_a_vendored_incumbent_is_never_retired() -> None:
     # champion it beat most decisively is the one that makes way.
     rates = dict.fromkeys(vendored, 0.97) | dict.fromkeys(champions, 0.96)
     rates["v56"] = 1.0
-    rates["champion_2"] = 0.99
-    retired = p.add_champion("champion_5", "/x/champion_5.py", rates)
+    rates[champions[1]] = 0.99
+    retired = p.add_champion("champion_new", "/x/champion_new.py", rates)
 
-    assert retired == "champion_2"
+    assert retired == champions[1]
     assert set(vendored) <= set(p.names())

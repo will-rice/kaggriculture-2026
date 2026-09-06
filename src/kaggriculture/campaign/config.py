@@ -84,7 +84,11 @@ FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
 DEEP_TOP_K = 3
 # Deep evaluations in flight at once. Each is about ten minutes of games.
 DEEP_CONCURRENCY = 2
-POOL_CAP = 10
+# The pool's ceiling, and it must stay above the vendored roster: those never
+# retire, so a cap at or below their count is not a cap but a permanent
+# overflow, and `add_champion` would look for something to retire on every
+# promotion and never find one. Twelve vendored plus room for four champions.
+POOL_CAP = 16
 # A joining champion retires the opponent it beats at least this
 # decisively, if the pool is full.
 RETIRE_THRESHOLD = 0.95

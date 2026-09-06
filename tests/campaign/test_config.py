@@ -7,7 +7,7 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
     SHOPS,
 )
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, roster
 
 
 def test_exam_seeds_are_the_sealed_block() -> None:
@@ -93,7 +93,11 @@ def test_constants_match_the_spec_table() -> None:
     assert config.FAST_SEEDS == 4
     assert len(config.EXAM_SEEDS) == 64
     assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
-    assert (config.POOL_CAP, config.RETIRE_THRESHOLD) == (10, 0.95)
+    assert (config.POOL_CAP, config.RETIRE_THRESHOLD) == (16, 0.95)
+    # The vendored roster never retires, so a cap that did not clear it would
+    # leave the pool permanently over and `add_champion` hunting for a
+    # retirement it can never make.
+    assert config.POOL_CAP > len(roster.TRAINING)
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"

@@ -242,6 +242,11 @@ run/
 # Kaggle skill caches: regenerable from the competition, and binary churn on
 # every ingest. The findings that matter are written up in docs/, not here.
 data/*.db
+# Other competitors' pulled notebooks, megabytes of them. What the campaign
+# actually plays is extracted out to /data/kaggriculture/opponents; this is
+# only the cache the extraction read.
+data/notebooks/
+data/kernel_research/
 
 # Compiled engine bridge and the scratch file build.build() lands from:
 # rebuildable from bridge.cpp, never source.

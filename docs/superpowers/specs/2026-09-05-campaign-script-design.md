@@ -162,8 +162,11 @@ committed to git — every write is under `run/campaign`.
 FAMOU section 4.4: the new champion "becomes a high-weight gatekeeper, so
 later candidates must outperform both original opponents and all previous
 champions". Here it simply joins, since all opponents count equally. At
-`POOL_CAP = 10` the opponent the champion beats most decisively retires,
-and only if it is beaten at `RETIRE_THRESHOLD = 0.95` or better.
+`POOL_CAP = 16` the opponent the champion beats most decisively retires, and
+only if it is beaten at `RETIRE_THRESHOLD = 0.95` or better and is not
+vendored. The vendored roster is the basis of `field` and never retires, so
+the cap has to clear it: at or below the roster's count it would not be a cap
+but a permanent overflow.
 
 **Held-out** opponents are scored and never trained against:
 `salemali7_2900`, `lynnsakurai_v5`, and each new ladder kernel found, which
@@ -256,7 +259,7 @@ with uncommitted changes under `src/`.
 | `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
 | `DEEP_TOP_K` 3           | FAMOU                       |
 | `DEEP_CONCURRENCY` 2     |                             |
-| `POOL_CAP` 10            |                             |
+| `POOL_CAP` 16            |                             |
 | `RETIRE_THRESHOLD` 0.95  |                             |
 | `STAGNATION_SESSIONS` 40 |                             |
 | `CORE_BUDGET` cores - 8  |                             |
