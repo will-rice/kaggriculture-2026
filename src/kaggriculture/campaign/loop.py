@@ -86,8 +86,8 @@ DEEP_FAILURE = "deep: "
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
     "SESSIONS ROUNDS_PER_SESSION "
-    "FAST_SEEDS DEEP_TOP_K DEEP_CONCURRENCY POOL_CAP "
-    "RETIRE_THRESHOLD STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
+    "FAST_SEEDS DEEP_TOP_K DEEP_CONCURRENCY POOL_SIZE "
+    "STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
 
 # Prepended to the instruction under stagnation, so the message says that this
@@ -420,13 +420,23 @@ class Campaign:
         for _ in range(config.ROUNDS_PER_SESSION):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
-            message = prompt.compose(name, result, failures, siblings, instruction)
+            standings = gate.standing(
+                name, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+            )
+            message = prompt.compose(
+                name, result, failures, siblings, instruction, standings
+            )
             outcome = await self.round(source, name, result, message, drawn)
             rounds += 1
             if outcome is None:
                 break
             source, name, result = outcome
-            cleared, why = gate.promotion(result.rates)
+            cleared, why = gate.promotion(
+                gate.standing(
+                    name, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+                ),
+                name,
+            )
             if cleared:
                 LOGGER.info("%s %s: the session is done", name, why)
                 break
@@ -605,6 +615,16 @@ class Campaign:
                     self.snapshot(),
                     self.workers,
                 )
+                # The gate is the tournament: the candidate's row was just
+                # played on the sealed block, and the pool's own pairings are
+                # kept, so this is a fit over both and no more games.
+                table = await asyncio.to_thread(
+                    gate.standing,
+                    program.id,
+                    result.rates,
+                    self.snapshot(),
+                    2 * len(config.EXAM_SEEDS),
+                )
         except OpponentCrash:
             raise
         except RuntimeError as error:
@@ -632,13 +652,22 @@ class Campaign:
                 )
                 return
             self.database.record_deep(program.id, result)
-            verdict, why = gate.promotion(result.rates)
+            verdict, why = gate.promotion(table, program.id)
             LOGGER.info("%s deep %.4f: %s", program.id, result.score, why)
             if verdict:
                 # The file work in a thread; the pool it joins on the loop,
                 # where the other seven workers are reading it.
                 champion = await asyncio.to_thread(gate.promote, program, result)
                 gate.enroll(champion, self.pool)
+                # The pool is the top of the tournament: the champion has just
+                # joined it and the weakest opponent makes way, so the field a
+                # candidate has to finish above is the strongest one there is.
+                dropped = self.pool.trim(
+                    {**table, champion.name: table[program.id]}, config.POOL_SIZE
+                )
+                if dropped:
+                    self.pool.save(config.POOL)
+                    LOGGER.info("pool: %s made way", ", ".join(dropped))
                 self.state.champion = gate.record(champion)
                 self.state.sessions_since_promotion = 0
                 artifact = wandb.Artifact(

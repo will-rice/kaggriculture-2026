@@ -1,11 +1,28 @@
 """The one place a candidate becomes the floor.
 
-The promotion rule is one question: does this candidate beat every opponent
-in the pool? A champion is two things at once -- the program we would submit
-and a gatekeeper every later candidate has to get past -- and a program that
-loses to four of the six vendored kernels is no good as either. Nothing is
-compared with the champion, because the champion is in the pool: beating it
-is part of beating them all.
+The gate is a tournament. Every agent plays every other -- the candidate
+against the pool and the pool against itself -- one Bradley-Terry fit ranks
+them all, and a candidate is promoted when it comes out top. That is the
+competition's own reading of better: the finale is a single Bradley-Terry
+tournament over the episodes that keep running past the deadline, and a
+leaderboard position is a skill rating.
+
+It used to ask something else -- beat *every* opponent -- which is a minimum
+where the ladder takes a strength-weighted view. Measured on the pool as it
+stood on 2026-09-06, exactly one published agent cleared that bar, and the
+second-strongest agent in the whole field was turned away for a single
+matchup at 0.062 while winning 78.6% of everything else.
+
+The pool is dynamic -- a champion joins and the weakest opponent makes way --
+and the tournament is over the pool as it stands. What is not replayed is the
+pool's games against itself: those are constants, so they are measured once
+and kept, and only a new member's pairings ever run. The candidate's own row
+is always played fresh, because a candidate has no history.
+
+Champions accumulating in the pool are what makes the chain a ratchet: each
+promotion came top of a field that already held every champion before it. The
+held-out opponents, never part of the tournament, are what would show a
+co-evolutionary cycle if the chain ever went in a circle.
 
 A promotion also produces the artefact a cut uploads: the program is
 packaged into `champions/<name>.tar.gz`, so a cut is one command -- upload
@@ -33,11 +50,12 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, harness
+from kaggriculture.campaign import config, harness, rating, roster
 from kaggriculture.campaign.archive import Program
 from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.pool import Pool
@@ -67,37 +85,140 @@ class Champion(BaseModel):
     result: DeepResult
 
 
-def promotion(rates: dict[str, float]) -> tuple[bool, str]:
-    """Whether a program clears the bar: it beats every pool opponent.
+def tournament(
+    candidate: Path,
+    name: str,
+    pool: Pool,
+    seeds: Sequence[int],
+    workers: int,
+    kept: Path = config.FIELD,
+) -> dict[str, float]:
+    """Play every pairing among the candidate and the pool, and rate them all.
 
-    One clause, absolute. "Beats" means strictly more than half the games
-    against that opponent over both seats: a dead heat at 0.5 is not a win
-    and does not pass. Held-out opponents are measured and logged but are
-    never in this dict -- they are the generalisation number, not the bar.
+    This is the gate. Not the candidate's results against a field measured
+    earlier -- the pool is dynamic, champions join it and the weakest leave,
+    so a pairing played against last week's pool is not a result in this
+    tournament. Every agent plays every other, here, now.
 
-    This is the campaign's only reading of "did it win", and it is applied
-    twice: to a candidate's sealed-block rates, where it decides a promotion,
-    and to a round's fast rates, where it is the verdict the loop sends the
-    model and the condition that ends a session. Two implementations would
-    let a model believe it had cleared a bar the gate then refused.
-
-    The reason names every opponent the program failed to beat and its rate
-    against each, because when nothing is promoting for a week that list is
-    what says why.
+    The candidate's row is played every time -- it is a new program and has no
+    history. The pool's pairings against each other are played once and kept,
+    because they are constants: fixed files, seeded games, and no opponent
+    drawing on randomness. So a gate normally costs the candidate's row alone,
+    and only a pool that has just gained a champion pays for anything more.
 
     Args:
-        rates: Win rate per pool opponent.
+        candidate: The program under consideration.
+        name: What to call it in the standings; must not be a pool name.
+        pool: The opponents, as they stand.
+        seeds: Episode seeds; each pairing is played on all of them, both
+            seats, so a pairing is ``2 * len(seeds)`` games.
+        workers: Processes to fan the games over.
+        kept: Where the pool's own pairings live between gates.
 
     Returns:
-        Whether it clears the bar, and a reason (why not, or "beat every
-        opponent").
+        A rating per agent, the candidate included, from one fit over every
+        pairing in the tournament.
+
+    Raises:
+        ValueError: ``name`` is already a pool opponent.
+        OpponentCrash: A pool opponent raised in its own seat.
     """
-    lost = sorted((name, rate) for name, rate in rates.items() if rate <= 0.5)
-    if lost:
-        return False, "did not beat " + ", ".join(
-            f"{name} at {rate:.3f}" for name, rate in lost
+    opponents = pool.names()
+    if name in opponents:
+        raise ValueError(f"{name} is already in the pool")
+    games = 2 * len(seeds)
+
+    field = rating.Field.load(kept)
+    absent = field.missing(opponents)
+    if absent:
+        LOGGER.info(
+            "tournament: %d pairing(s) never played, measuring them", len(absent)
         )
-    return True, "beat every opponent"
+        for one, two in absent:
+            field.record(one, two, _rate(roster.path(one), two, seeds, workers))
+        field.games = games
+        field.save(kept)
+
+    results = field.results(opponents)
+    for two in opponents:
+        results.append((name, two, _rate(candidate, two, seeds, workers), games))
+    return rating.standings(results)
+
+
+def _rate(agent: Path, opponent: str, seeds: Sequence[int], workers: int) -> float:
+    """``agent``'s win rate against ``opponent`` over ``seeds``, both seats."""
+    played = harness.play_unsealed(agent, [opponent], list(seeds), workers)
+    return sum(
+        1.0 if game.ours > game.theirs else 0.5 if game.ours == game.theirs else 0.0
+        for game in played
+    ) / len(played)
+
+
+def standing(
+    name: str,
+    rates: dict[str, float],
+    pool: Pool,
+    games: int,
+    kept: Path = config.FIELD,
+) -> dict[str, float]:
+    """The same tournament, over games already played: no new ones.
+
+    A round has just measured its program against every pool opponent, and the
+    pool's own pairings are kept, so the standings that verdict needs are a
+    fit and nothing more. That is what lets the loop tell a model where it
+    ranks after every round rather than only at the gate.
+
+    Args:
+        name: The program's name in the standings.
+        rates: Its win rate against each pool opponent.
+        pool: The opponents those rates are against.
+        games: Games behind each rate.
+        kept: Where the pool's own pairings live.
+
+    Returns:
+        A rating per agent, the program included.
+    """
+    field = rating.Field.load(kept)
+    opponents = [n for n in pool.names() if n in rates]
+    results = field.results(opponents)
+    results += [(name, two, rates[two], games) for two in opponents]
+    return rating.standings(results)
+
+
+def promotion(standings: dict[str, float], name: str) -> tuple[bool, str]:
+    """Whether the candidate beat the pool: it came out top of the tournament.
+
+    One clause, and it is the competition's own reading of better. The finale
+    is a single Bradley-Terry tournament and a leaderboard position is a skill
+    rating, so the gate asks what the ladder asks: not "did it beat every
+    opponent", which is a minimum and which the ladder never asks, but "did it
+    rank above them all".
+
+    The two differ exactly where the field is not transitive. Measured on the
+    pool as it stood on 2026-09-06, the second-strongest published agent wins
+    78.6% of everything and loses one matchup at 0.062: top of a tournament,
+    and turned away by a rule that wants no weakness.
+
+    Args:
+        standings: Every agent's rating from one tournament.
+        name: The candidate's name in those standings.
+
+    Returns:
+        Whether to promote, and a reason either way.
+    """
+    ranked = sorted(standings, key=lambda agent: -standings[agent])
+    if ranked[0] == name:
+        second = ranked[1]
+        return True, (
+            f"top of the tournament at {standings[name]:+.3f}, "
+            f"above {second} at {standings[second]:+.3f}"
+        )
+    best = ranked[0]
+    place = ranked.index(name) + 1
+    return False, (
+        f"{place} of {len(ranked)} at {standings[name]:+.3f}, "
+        f"below {best} at {standings[best]:+.3f}"
+    )
 
 
 def promote(program: Program, result: DeepResult) -> Champion:
@@ -173,13 +294,9 @@ def enroll(champion: Champion, pool: Pool) -> None:
         champion: The record ``promote`` returned.
         pool: The opponent pool, updated and saved in place.
     """
-    retired = pool.add_champion(champion.name, champion.path, champion.result.rates)
+    pool.add_champion(champion.name, champion.path)
     pool.save(config.POOL)
-    LOGGER.info(
-        "%s joined the pool%s",
-        champion.name,
-        f", retiring {retired}" if retired else "",
-    )
+    LOGGER.info("%s joined the pool", champion.name)
 
 
 def record(champion: Champion) -> Champion:

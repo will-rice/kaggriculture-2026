@@ -128,21 +128,27 @@ INSTRUCTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _verdict_lines(name: str, result: evaluator.FastResult) -> list[str]:
-    """Render what the loop measured about ``name``, and the bar it is short of.
+def _verdict_lines(
+    name: str, result: evaluator.FastResult, standings: dict[str, float]
+) -> list[str]:
+    """Render what the loop measured about ``name``, and where it placed.
 
-    The bar and the sentence naming what it did not beat both come from
-    ``gate.promotion``, the one function that decides whether a program has
-    won, so a model cannot be told it has cleared something the gate refuses.
+    The verdict comes from ``gate.promotion``, the one function that decides
+    whether a program has won, so a model cannot be told it has cleared
+    something the gate refuses. The standings go in whole: a place in a
+    tournament says more than a yes or a no, and every place gained is
+    progress the next round can aim at.
 
     Args:
         name: The program's name -- a pool name or a database id, never a path.
         result: The loop's own fast evaluation of it.
+        standings: Every agent's rating from the tournament that evaluation is
+            part of, this program included.
 
     Returns:
         Lines of a markdown section naming opponents only.
     """
-    cleared, why = gate.promotion(result.rates)
+    cleared, why = gate.promotion(standings, name)
     lines = [
         f"## The verdict on `{name}`",
         "",
@@ -163,14 +169,27 @@ def _verdict_lines(name: str, result: evaluator.FastResult) -> list[str]:
         "",
         f"It {why}.",
         "",
-        "The bar is beating every opponent above: more than half the games "
-        "against each, over both seats. Nothing else is measured, and an "
-        "average over the pool promotes nothing. "
+        "The bar is a Bradley-Terry tournament, which is how the competition "
+        "itself ranks the field: every agent plays every other, one strength "
+        "per agent is fitted from all of it at once, and the ranking is what "
+        "counts. Beating a strong opponent is worth more than beating a weak "
+        "one, and one bad matchup is absorbed rather than fatal -- there is "
+        "no opponent you must beat, only a field you must finish above. "
         + (
-            "Clear it again on the sealed block and it becomes the champion."
+            "Top of it. Do it again on the sealed block and it is the champion."
             if cleared
-            else "The opponents it does not beat are what a promotion turns on."
+            else "Every place gained is progress, whoever it comes against."
         ),
+        "",
+        "| rank | agent | rating |",
+        "| --- | --- | --- |",
+    ]
+    lines += [
+        f"| {place} | {'**' + agent + '**' if agent == name else agent} "
+        f"| {value:+.3f} |"
+        for place, (agent, value) in enumerate(
+            sorted(standings.items(), key=lambda pair: -pair[1]), start=1
+        )
     ]
     return lines
 
@@ -314,6 +333,7 @@ def compose(
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
+    standings: dict[str, float],
 ) -> str:
     """Compose the message for one round.
 
@@ -329,6 +349,8 @@ def compose(
             first. Cut to ``SIBLINGS`` here for the same reason.
         instruction: The drawn instruction's text, one of ``INSTRUCTIONS``'
             second elements, with any stagnation note the caller prepended.
+        standings: Every agent's rating from the tournament this program's
+            results are part of, itself included.
 
     Returns:
         The whole message, for codex's standard input.
@@ -338,7 +360,7 @@ def compose(
         PROGRAM_SECTION.format(name=name),
         IMPORTS_SECTION,
         DOCTRINE,
-        "\n".join(_verdict_lines(name, result)),
+        "\n".join(_verdict_lines(name, result, standings)),
         "\n".join(_states_lines(result.hardest, result.states)),
     ]
     # A lineage with nothing against it gets no section at all: a heading over

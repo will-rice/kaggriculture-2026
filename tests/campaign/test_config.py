@@ -93,11 +93,11 @@ def test_constants_match_the_spec_table() -> None:
     assert config.FAST_SEEDS == 4
     assert len(config.EXAM_SEEDS) == 64
     assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
-    assert (config.POOL_CAP, config.RETIRE_THRESHOLD) == (16, 0.95)
-    # The vendored roster never retires, so a cap that did not clear it would
-    # leave the pool permanently over and `add_champion` hunting for a
-    # retirement it can never make.
-    assert config.POOL_CAP > len(roster.TRAINING)
+    assert config.POOL_SIZE == 8
+    # Smaller than the roster on purpose: the pool is the top of the
+    # tournament, and an opponent every candidate already beats separates two
+    # candidates no better than a coin while costing a game a round.
+    assert config.POOL_SIZE < len(roster.TRAINING)
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
@@ -134,6 +134,9 @@ def test_the_deleted_constants_are_gone() -> None:
         "ROUND_LIMIT_SECONDS",
         "SESSION_LIMIT_SECONDS",
         "GAME_LIMIT_SECONDS",
+        # Went with the retirement rule the pool's `trim` replaced.
+        "POOL_CAP",
+        "RETIRE_THRESHOLD",
     ):
         assert not hasattr(config, name), name
 

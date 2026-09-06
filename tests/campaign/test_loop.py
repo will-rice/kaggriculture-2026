@@ -631,12 +631,10 @@ def test_the_pool_is_changed_on_the_loop_thread(
     threads: list[str] = []
     add_champion = pool.Pool.add_champion
 
-    def watched(
-        self: pool.Pool, name: str, path: str, rates: dict[str, float]
-    ) -> str | None:
+    def watched(self: pool.Pool, name: str, path: str) -> None:
         """The real pool change, with a note of the thread that made it."""
         threads.append(threading.current_thread().name)
-        return add_champion(self, name, path, rates)
+        add_champion(self, name, path)
 
     monkeypatch.setattr(pool.Pool, "add_champion", watched)
 
@@ -1240,8 +1238,11 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
 
     message = mutator.seen[0].message
     assert f"The verdict on `{loop.SEED_ID}`" in message
-    # PASS against PASS is a dead heat, and a dead heat is not a win.
-    assert "It did not beat pass at 0.500." in message
+    # PASS against PASS is a dead heat, so the seed is not top of a
+    # tournament it shares with the opponent it drew against.
+    assert "It 2 of 2 at " in message and "below pass" in message
+    # And the standings themselves, so a round can see what it has to pass.
+    assert "| rank | agent | rating |" in message
     assert "One game against `pass`, day by day" in message
     assert message.count("\n| 2") + message.count("\n| 1") > 0
     assert "| 29 |" in message

@@ -27,59 +27,69 @@ def result(
     )
 
 
-def test_a_candidate_that_beats_every_opponent_is_promoted() -> None:
-    """The whole rule: strictly more than half the exam games against each."""
-    ok, why = gate.promotion({"a": 0.51, "b": 0.9, "c": 0.6})
+def test_the_top_of_the_tournament_is_promoted() -> None:
+    """The gate is a place, not a clean sweep.
 
-    assert ok and why == "beat every opponent"
-
-
-def test_one_opponent_it_does_not_beat_is_enough_to_refuse() -> None:
-    """A champion is a gatekeeper and the program we would submit.
-
-    Something that loses to an opponent in the pool is a weak gatekeeper and
-    a weak submission, however well it does against the rest.
+    The finale is a single Bradley-Terry tournament and a leaderboard position
+    is a skill rating, so coming out top of the pool is what promotion means.
     """
-    ok, why = gate.promotion({"a": 0.99, "b": 0.99, "c": 0.4})
+    ok, why = gate.promotion({"c": 1.2, "a": 0.4, "b": -0.9}, "c")
 
-    assert not ok and why == "did not beat c at 0.400"
+    assert ok
+    assert "top of the tournament" in why and "+1.200" in why
+    # Named, so the log says what it had to get past.
+    assert "a" in why and "+0.400" in why
 
 
-def test_the_reason_names_every_opponent_it_failed_against() -> None:
-    """This message is the campaign's answer to "why is nothing promoting?".
-
-    Naming only the first would hide how far a lineage is from the bar, which
-    is the difference between one opponent to fix and four.
-    """
-    ok, why = gate.promotion({"a": 0.9, "b": 0.3, "c": 0.45, "d": 0.2})
+def test_second_place_is_not_promoted_however_close() -> None:
+    """A floor that rose on anything but the best would not be the best."""
+    ok, why = gate.promotion({"a": 0.9001, "c": 0.9000, "b": -0.5}, "c")
 
     assert not ok
-    assert why == "did not beat b at 0.300, c at 0.450, d at 0.200"
+    assert "2 of 3" in why and "below a" in why
 
 
-def test_a_dead_heat_is_not_a_win() -> None:
-    """Half the games is not more than half, and the pool is full of near-ties."""
-    assert not gate.promotion({"a": 0.9, "b": 0.5})[0]
+def test_the_reason_says_where_it_placed_not_who_it_failed_to_beat() -> None:
+    """A place is something a next round can aim at; a list of losses is not.
+
+    The absolute rule this replaced named every opponent a program did not
+    beat, which for a program that beat none of them was the whole pool and
+    told it nothing about which to attack first.
+    """
+    ok, why = gate.promotion({"a": 2.0, "b": 1.0, "c": 0.0, "mine": -1.0}, "mine")
+
+    assert not ok
+    assert why.startswith("4 of 4")
+    assert "below a" in why
 
 
-def test_held_out_opponents_are_not_part_of_the_bar() -> None:
+def test_one_bad_matchup_does_not_sink_a_top_rating() -> None:
+    """Where the tournament and the old absolute rule actually disagree.
+
+    Measured on the pool of 2026-09-06, the second-strongest published agent
+    wins 78.6% of everything and loses one matchup at 0.062. The rule this
+    replaced turned that agent away; a tournament ranks it where it belongs.
+    """
+    # `mine` is rated top despite the standings being the only thing the gate
+    # reads -- the rate that would have failed an absolute rule is inside the
+    # fit, not beside it.
+    assert gate.promotion({"mine": 1.5, "a": 1.0, "b": 0.2}, "mine")[0]
+
+
+def test_held_out_opponents_are_not_part_of_the_tournament() -> None:
     """They are the honest generalisation number, never the gate.
 
-    The gate is handed a deep result's ``rates``, and those are the pool
-    opponents alone: a candidate beaten badly by everything held out is
-    promoted all the same, because it is the pool it has to get past.
+    The standings are over pool opponents alone, so a candidate beaten badly
+    by everything held out is promoted all the same: it is the pool it has to
+    finish above, and the held-out rates are what would show a co-evolutionary
+    cycle rather than what stops one.
     """
     candidate = result("c", 0.8, 0.75, {"a": 0.9, "b": 0.8}).model_copy(
         update={"held_out": {"salemali7_2900": 0.1, "lynnsakurai_v5": 0.2}}
     )
 
-    assert gate.promotion(candidate.rates)[0]
+    assert gate.promotion({"c": 1.0, "a": 0.1, "b": -0.4}, "c")[0]
     assert not set(candidate.rates) & set(candidate.held_out)
-
-
-def test_a_promotion_asks_nothing_of_the_champion() -> None:
-    """The champion is in the pool, so beating it is part of beating them all."""
-    assert "champion" not in gate.promotion.__code__.co_varnames
 
 
 def _program(

@@ -135,21 +135,34 @@ matching the program being scored, so every metric is over real opponents.
 
 ### 5.2 Promotion
 
-**A candidate is promoted when it wins the majority of the sealed games
-against every pool opponent.** That is the rule, entire: one clause, no
-weights, no comparison with the champion, no tolerance. Ties at exactly
-half do not pass. Held-out opponents are measured and logged but are not
-part of the gate.
+**A candidate is promoted when it comes out top of a Bradley-Terry
+tournament over itself and the pool.** That is the rule, entire: one fit, one
+place, no weights and no tolerance. Held-out opponents are measured and
+logged but are not in the tournament.
 
-Why absolute rather than relative: the champion joins the pool as a
-gatekeeper and is the program we would submit. Promoting something that
-loses to four of six kernels adds a weak gatekeeper and ships a weak agent.
-The only question the gate must answer is whether a candidate is strong
-enough to be both.
+Why a tournament: it is what the competition does. The finale is a single
+Bradley-Terry pass over the episodes that keep running past the deadline, and
+a leaderboard position is a skill rating. A gate that asks anything else
+selects for something the ladder does not pay for.
 
-The failure message names every opponent the candidate failed to beat and
-its rate against each. That message is the campaign's main diagnostic for
-why nothing is promoting.
+This replaced an absolute rule -- beat _every_ opponent -- which is a minimum
+where the ladder takes a strength-weighted view. On the pool as measured
+2026-09-06, exactly one published agent cleared that bar, and the
+second-strongest agent in the whole field was turned away for one matchup at
+0.062 while winning 78.6% of everything else. The two rules agree only where
+the field is transitive, and it is 95% transitive: 10 rock-paper-scissors
+triples out of 220.
+
+**Cost.** The candidate's row is played every gate. The pool's games against
+each other are played once and kept in `run/campaign/field.json`, because
+they are constants -- fixed files, seeded games, and no opponent drawing on
+randomness (`test_no_opponent_draws_on_randomness`). Only a new member's
+pairings ever run, so a champion joining costs its own row and nothing else.
+
+The failure message gives the candidate's place and the agent above it. A
+place is something the next round can aim at; the list of every opponent it
+failed to beat, which the old rule gave, was the whole pool for a program
+that beat none of them.
 
 On a pass: package the program into `champions/<name>.tar.gz`, the file a
 cut uploads; write the champion file, the floor and `champion.json`; add it
@@ -161,12 +174,20 @@ committed to git — every write is under `run/campaign`.
 
 FAMOU section 4.4: the new champion "becomes a high-weight gatekeeper, so
 later candidates must outperform both original opponents and all previous
-champions". Here it simply joins, since all opponents count equally. At
-`POOL_CAP = 16` the opponent the champion beats most decisively retires, and
-only if it is beaten at `RETIRE_THRESHOLD = 0.95` or better and is not
-vendored. The vendored roster is the basis of `field` and never retires, so
-the cap has to clear it: at or below the roster's count it would not be a cap
-but a permanent overflow.
+champions". Here it simply joins, since all opponents count equally.
+
+**The pool is the top of the tournament.** It keeps the highest-rated
+`POOL_SIZE = 8`, on the same rating the gate promotes on, so the pool and the
+bar cannot drift apart. An opponent every candidate already beats separates
+two candidates no better than a coin and costs a game a round to say so.
+Measured 2026-09-06 over the campaign's own programs, a pool of the top six
+separated them almost twice as widely as all twelve did, at half the games.
+
+Champions accumulating in the pool are the ratchet: each promotion came top of
+a field that already held every champion before it. Nothing external anchors
+the chain and nothing needs to -- a rating is only meaningful as a difference
+inside one fit, and the gate only ever takes differences inside one fit. The
+held-out opponents are what would show a cycle if the chain went in a circle.
 
 **Held-out** opponents are scored and never trained against:
 `salemali7_2900`, `lynnsakurai_v5`, and each new ladder kernel found, which
@@ -259,8 +280,7 @@ with uncommitted changes under `src/`.
 | `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
 | `DEEP_TOP_K` 3           | FAMOU                       |
 | `DEEP_CONCURRENCY` 2     |                             |
-| `POOL_CAP` 16            |                             |
-| `RETIRE_THRESHOLD` 0.95  |                             |
+| `POOL_SIZE` 8            | the pool is the top of it   |
 | `STAGNATION_SESSIONS` 40 |                             |
 | `CORE_BUDGET` cores - 8  |                             |
 
@@ -270,9 +290,11 @@ with uncommitted changes under `src/`.
   starts from the champion, so a subpopulation adds nothing the champion
   does not carry. Diversity is the five instructions, the model's sampling,
   and the stagnation branch.
-- **Weights and weakness pressure** (FAMOU 4.4, 4.5). An absolute gate
-  demands beating the hardest opponent outright, which is what bending
-  weights toward it approximated.
+- **Weights and weakness pressure** (FAMOU 4.4, 4.5). Bradley-Terry already
+  weights an opponent by its strength, fitted from the results rather than
+  chosen: beating the field's best is worth more than beating its worst
+  because the fit says so. Bending weights by hand would be guessing at what
+  the tournament measures.
 - **A daily call cap.** The provider's limits are the limits.
 - **A workspace for the model.** It gets a prompt and one file. The loop
   plays every game, so the measurement is ours and the cores are accounted

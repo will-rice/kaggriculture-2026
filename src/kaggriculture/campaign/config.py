@@ -84,14 +84,15 @@ FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
 DEEP_TOP_K = 3
 # Deep evaluations in flight at once. Each is about ten minutes of games.
 DEEP_CONCURRENCY = 2
-# The pool's ceiling, and it must stay above the vendored roster: those never
-# retire, so a cap at or below their count is not a cap but a permanent
-# overflow, and `add_champion` would look for something to retire on every
-# promotion and never find one. Twelve vendored plus room for four champions.
-POOL_CAP = 16
-# A joining champion retires the opponent it beats at least this
-# decisively, if the pool is full.
-RETIRE_THRESHOLD = 0.95
+# Opponents the pool keeps: the top this many by Bradley-Terry rating, the
+# weakest making way as champions out-rate them. Measured on 2026-09-06 over
+# the campaign's own programs, a pool of the top six separated them almost
+# twice as widely as all twelve did and at half the games -- a weak opponent
+# every candidate already beats tells two candidates apart no better than a
+# coin. Eight rather than six for headroom: the sixth-ranked agent today is
+# one our programs beat outright, and losing it would cost the search the one
+# rate it can move.
+POOL_SIZE = 8
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
@@ -121,6 +122,13 @@ CODEX_MODEL = "gpt-5.6-luna"
 # some of the time (two calls in the first live hour), which is why this
 # exists at all.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
+# The pool's own pairings, kept between gates because they are constants: the
+# opponents are fixed files, the games are seeded, and none of them draws on
+# randomness. Derived state, not a committed artifact -- a pool that gains a
+# champion has that champion's pairings measured and added, and one that loses
+# an opponent simply stops asking for its row.
+FIELD = RUN / "field.json"
+
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
 # The current floor, the copy that ships, and every champion ever promoted.
