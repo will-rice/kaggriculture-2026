@@ -441,7 +441,7 @@ def test_the_seed_is_never_deep_scored_or_promoted(
     assert config.DEEP_TOP_K == 3
     # One deep evaluation, and it is the child's: never the seed's, though the
     # seed was the best program in the database the whole time.
-    assert loop.SEED_ID not in scored and len(scored) == 1
+    assert config.SEED_ID not in scored and len(scored) == 1
     # And nothing was promoted, because that child beats nobody -- which is
     # what the seed would have been promoted on if it had been confirmed.
     assert state.champion is None
@@ -1059,7 +1059,7 @@ def test_a_session_is_rounds_and_each_continues_from_the_last(
     handed = [given.child for given in mutator.seen]
     assert handed == [PASS, PASS + "# a round\n", PASS + "# a round\n" * 2]
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    written = [p for p in database.programs if p.id != loop.SEED_ID]
+    written = [p for p in database.programs if p.id != config.SEED_ID]
     assert len(written) == 3
     assert all(program.rates for program in written)
     assert len(calls_of(records)) == 3
@@ -1084,8 +1084,8 @@ def test_the_database_records_which_model_wrote_each_program(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
 
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    assert database.get(loop.SEED_ID).model == ""
-    written = [p for p in database.programs if p.id != loop.SEED_ID]
+    assert database.get(config.SEED_ID).model == ""
+    written = [p for p in database.programs if p.id != config.SEED_ID]
     assert len(written) == 1 and written[0].model == "recorder"
 
 
@@ -1140,7 +1140,7 @@ def test_a_round_that_writes_nothing_feeds_the_next_one(
     assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
     assert config.ARCHIVE.read_text().count('"no_output') == 3
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    assert [program.id for program in database.programs] == [loop.SEED_ID]
+    assert [program.id for program in database.programs] == [config.SEED_ID]
 
 
 def test_a_rejected_round_is_the_next_rounds_feedback(
@@ -1168,7 +1168,7 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     assert "- syntax: " in second.message
     assert second.child == first.child == PASS
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    assert [p.started_from for p in database.programs] == ["", loop.SEED_ID]
+    assert [p.started_from for p in database.programs] == ["", config.SEED_ID]
 
 
 def test_the_instruction_is_drawn_once_a_session(
@@ -1192,7 +1192,7 @@ def test_the_instruction_is_drawn_once_a_session(
     given = {handed.message.split("## Your instruction")[1] for handed in mutator.seen}
     assert len(mutator.seen) == 5 and len(given) == 1
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    stamped = {p.instruction for p in database.programs if p.id != loop.SEED_ID}
+    stamped = {p.instruction for p in database.programs if p.id != config.SEED_ID}
     assert len(stamped) == 1
 
 
@@ -1237,7 +1237,7 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
 
     message = mutator.seen[0].message
-    assert f"The verdict on `{loop.SEED_ID}`" in message
+    assert f"The verdict on `{config.SEED_ID}`" in message
     # PASS against PASS is a dead heat, so the seed is not top of a
     # tournament it shares with the opponent it drew against.
     assert "It 2 of 2 at " in message and "below pass" in message

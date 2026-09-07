@@ -162,6 +162,14 @@ FIELD = RUN / "field.json"
 
 ARCHIVE = RUN / "archive.jsonl"
 PROGRAMS = RUN / "programs"
+# The database id of the program a cold start seeds itself from, and the copy
+# the cold start writes under `PROGRAMS`. That copy is the campaign's lineage:
+# every program descends from it, and it cannot change once written, which the
+# file it was read from can -- harvesting an opponent's author again rewrites
+# that file in place. So the copy check exempts this, not `SEED`, and the seed
+# and the exemption cannot drift apart however a run was started.
+SEED_ID = "seed"
+SEED_PROGRAM = PROGRAMS / f"{SEED_ID}.py"
 # The current floor, the copy that ships, and every champion ever promoted.
 # `FLOOR/main.py` is overwritten each promotion; `CHAMPIONS/<name>.py` is
 # written once and is what the pool points at, so a pool of N champions holds

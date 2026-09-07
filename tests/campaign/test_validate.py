@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, harness, roster, validate
+from kaggriculture.campaign import config, copycheck, harness, roster, validate
 
 GOOD = """
 import math
@@ -252,7 +252,9 @@ def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
 
 
 @pytest.mark.local_data
-def test_the_seed_passes_the_gate_it_will_be_measured_by() -> None:
+def test_the_seed_passes_the_gate_it_will_be_measured_by(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A cold start seeds from `config.SEED`, so the gate has to accept it.
 
     Every check at once, which is the point: it is a published agent, so the
@@ -260,5 +262,16 @@ def test_the_seed_passes_the_gate_it_will_be_measured_by() -> None:
     `base64` and `zlib` have to be importable; and it has to load and play
     inside Kaggle's own per-call second like anything else. Any one of those
     failing is a campaign that seeds and then rejects every child it has.
+
+    `SEED_PROGRAM` is pointed at the same file because that is what a cold
+    start does -- it copies the seed there before anything is validated --
+    rather than leaning on whatever the box is running today.
     """
-    assert validate.validate(config.SEED).status == "ok"
+    monkeypatch.setattr(config, "SEED_PROGRAM", config.SEED)
+    copycheck._lineage.cache_clear()
+    copycheck._corpus.cache_clear()
+    try:
+        assert validate.validate(config.SEED).status == "ok"
+    finally:
+        copycheck._lineage.cache_clear()
+        copycheck._corpus.cache_clear()

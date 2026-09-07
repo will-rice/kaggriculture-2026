@@ -75,8 +75,11 @@ THREADS = config.SESSIONS + config.DEEP_CONCURRENCY + 1
 
 # The database id of the program a cold start seeds itself from. Until the
 # first promotion there is no champion, so this is the name the first
-# sessions are told they are editing and the bar their verdict quotes.
-SEED_ID = "seed"
+# sessions are told they are editing and the bar their verdict quotes. It
+# lives in `config` because `copycheck` needs the file it names -- the stored
+# copy is what the campaign's lineage actually is -- and two modules agreeing
+# on a magic string is how they come to disagree on one.
+SEED_ID = config.SEED_ID
 
 # Prefix of the failure a crashed deep evaluation leaves in the ledger.
 # `gated` reads it back, so the exam block is spent on a program once even
@@ -134,11 +137,10 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--workers", type=int, default=max(1, config.CORE_BUDGET // config.SESSIONS)
     )
-    # Defaults to the one file `copycheck` exempts, so the ordinary launch
-    # cannot seed from one program while the gate stands down for another.
-    # It stays a flag because a restart from a saved snapshot is a real thing
-    # to want; that is an explicit act, and the cold start logs which file it
-    # actually took.
+    # Whatever this names is copied to `config.SEED_PROGRAM`, and that copy is
+    # what `copycheck` exempts, so a run started from a snapshot exempts the
+    # snapshot and a run started from the default exempts the default. There
+    # is nothing here for the gate to disagree with.
     parser.add_argument("--seed-agent", type=Path, default=config.SEED)
     parser.add_argument(
         "--dry-run",

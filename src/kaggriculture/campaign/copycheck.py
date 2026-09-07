@@ -100,21 +100,31 @@ def _lineage() -> frozenset[tuple[str, ...]]:
     """Shingles of the published agent a cold start seeds from.
 
     The gate asks whether a candidate lifted from an opponent it was never
-    given, and the seed is the one opponent it *was* given: `config.SEED` is
-    what a cold start copies into the database, and every program in the
-    campaign descends from it. A child that still resembles its own ancestor
-    has copied nothing.
+    given, and the seed is the one opponent it *was* given. A child that still
+    resembles its own ancestor has copied nothing.
 
-    Empty where the opponents are not installed, because `_corpus` is empty
-    there too -- `rglob` over a directory that is not on this machine yields
-    nothing, so there is nothing for a lineage to be exempt from. The two
-    have to agree: CI carries no `/data`, and a lineage that raised where the
-    corpus quietly returns nothing would take the suite down on every machine
-    that is not the box.
+    This reads the campaign's own copy under `PROGRAMS`, not the file that
+    copy was made from. The two are byte-identical the moment a cold start
+    writes one, and they do not stay that way: a published agent is vendored
+    under a path named for its author, and harvesting that author again
+    rewrites it in place. Reading the source file would then exempt whatever
+    was harvested last while the campaign still descends from what it was
+    seeded with -- and would exempt the wrong thing precisely when the pool
+    is being refreshed, which is when the gate matters most. Reading the
+    stored copy also means the seed and the exemption cannot disagree however
+    a run was started, which no amount of defaulting two paths to the same
+    constant can promise.
+
+    Empty before a cold start has written one, and on a machine with no run
+    directory at all. `_corpus` is empty in the same conditions -- `rglob`
+    over a directory that is not there yields nothing -- so there is nothing
+    for a lineage to be exempt from either way. CI is that machine: a lineage
+    that raised where the corpus quietly returns nothing would take the suite
+    down everywhere but the box.
     """
-    if not config.SEED.exists():
+    if not config.SEED_PROGRAM.exists():
         return frozenset()
-    return frozenset(shingles(config.SEED.read_text(encoding="utf-8")))
+    return frozenset(shingles(config.SEED_PROGRAM.read_text(encoding="utf-8")))
 
 
 @functools.lru_cache(maxsize=1)

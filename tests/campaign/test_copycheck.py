@@ -153,7 +153,7 @@ def test_a_machine_without_the_opponents_has_no_lineage_either(
     degrade the same way: reading the seed eagerly turns every unmarked test
     in this file into a `FileNotFoundError` everywhere but the box.
     """
-    monkeypatch.setattr(config, "SEED", Path("/nonexistent/seed.py"))
+    monkeypatch.setattr(config, "SEED_PROGRAM", Path("/nonexistent/seed.py"))
     copycheck._lineage.cache_clear()
     copycheck._corpus.cache_clear()
     try:
@@ -164,27 +164,38 @@ def test_a_machine_without_the_opponents_has_no_lineage_either(
 
 
 @pytest.mark.local_data
-def test_the_seed_lineage_is_exempt() -> None:
-    """The agent the campaign starts from cannot be a copy of itself.
+def test_the_seed_is_exempt_and_every_other_opponent_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The campaign must not fail its own gate, and nothing else may pass it.
 
-    Every program descends from `config.SEED`, so without the exemption the
-    gate rejects the whole campaign rather than a copy: the seed scores 1.000
-    against its own roster copy, and a child that has not yet rewritten every
-    line scores close behind it.
+    Every program descends from the stored seed, so without the exemption the
+    gate rejects the whole campaign rather than a copy -- the seed scores
+    1.000 against the file it was copied from, and a child that has not
+    rewritten every line scores just behind it.
+
+    The other half matters as much. The exemption is by similarity rather than
+    by name, so a corpus that drifted -- another author republishing the
+    seed's kernel, a threshold moved -- could quietly empty itself and leave
+    nothing to catch a lift at all. Seeding from one opponent must not stand
+    the gate down for a different one.
+
+    Seeded here rather than read from the live campaign, so this measures the
+    rule instead of whatever the box happens to be running today.
     """
-    source = config.SEED.read_text(encoding="utf-8")
-    _, score = copycheck.against_opponents(source)
-    assert score < copycheck.THRESHOLD
+    seeded = roster.path("shopforge").read_text(encoding="utf-8")
+    seed = tmp_path / "seed.py"
+    seed.write_text(seeded, encoding="utf-8")
+    monkeypatch.setattr(config, "SEED_PROGRAM", seed)
+    copycheck._lineage.cache_clear()
+    copycheck._corpus.cache_clear()
+    try:
+        _, score = copycheck.against_opponents(seeded)
+        assert score < copycheck.THRESHOLD
 
-
-@pytest.mark.local_data
-def test_the_exemption_is_the_seed_and_nothing_else() -> None:
-    """Standing the gate down for one lineage must not stand it down at all.
-
-    The exemption is by similarity, not by name, so a corpus that drifted --
-    another author republishing the seed's kernel, a threshold moved -- could
-    quietly empty itself and leave nothing to catch a lift. Every opponent
-    but the seed has to still be in there.
-    """
-    covered = {key.split(":", 1)[0] for key in copycheck._corpus()}
-    assert set(roster.names()) - covered == {config.SEED.parent.name}
+        other = roster.path("v54").read_text(encoding="utf-8")
+        name, other_score = copycheck.against_opponents(other)
+        assert other_score >= copycheck.THRESHOLD and name.startswith("v54")
+    finally:
+        copycheck._lineage.cache_clear()
+        copycheck._corpus.cache_clear()
