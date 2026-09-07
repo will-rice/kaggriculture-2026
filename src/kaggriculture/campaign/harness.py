@@ -186,7 +186,7 @@ class CheckReport(BaseModel):
 
 
 def main() -> None:
-    """``campaign play|check|package|loop|dry-run``."""
+    """``campaign play|check|package|harvest|loop|dry-run``."""
     if len(sys.argv) > 1 and sys.argv[1] in ("loop", "dry-run"):
         # The loop owns its own flags, so its arguments are forwarded rather
         # than restated here. The import is local because `loop` imports this
@@ -219,8 +219,21 @@ def main() -> None:
     package_parser.add_argument(
         "--output", type=Path, default=Path("submission.tar.gz")
     )
+    harvest_parser = commands.add_parser("harvest")
+    harvest_parser.add_argument(
+        "--limit", type=int, default=5, help="new kernels to take"
+    )
+    harvest_parser.add_argument(
+        "--author", default=None, help="only this kernel author"
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if args.command == "harvest":
+        # Local because `harvest` imports this module for `check`.
+        from kaggriculture.campaign import harvest as harvesting
+
+        harvesting.harvest(args.limit, config.LIVE.pool, args.author)
+        return
     if args.command == "play":
         first, last = (int(part) for part in args.seeds.split("-"))
         seeds = range(first, last + 1)
