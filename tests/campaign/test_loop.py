@@ -321,6 +321,7 @@ class Recorder:
         )
 
 
+@pytest.mark.slow
 def test_the_pool_plays_itself_before_anything_is_judged_against_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -360,6 +361,7 @@ def test_the_pool_plays_itself_before_anything_is_judged_against_it(
     assert field.games == 2 * config.GATE_SEEDS
 
 
+@pytest.mark.slow
 def test_a_better_child_is_promoted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -402,6 +404,7 @@ def test_a_better_child_is_promoted(
     assert [record["sessions"] for record in sessions_of(records)] == [1, 2]
 
 
+@pytest.mark.slow
 def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -474,6 +477,7 @@ def test_the_seed_is_never_promoted(
     assert not (paths.floor / "main.py").exists()
 
 
+@pytest.mark.slow
 def test_eight_workers_run_at_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -533,6 +537,7 @@ def test_eight_workers_run_at_once(
     assert not gate.broken
 
 
+@pytest.mark.slow
 def test_a_promotion_changes_what_the_next_session_starts_from(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -557,6 +562,7 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     assert "champion_1" in mutator.seen[1].message
 
 
+@pytest.mark.slow
 def test_a_program_is_gated_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -784,6 +790,7 @@ def test_cancellation_kills_the_session_process_group(
         pytest.fail(f"process group {pgid} outlived the loop that started it")
 
 
+@pytest.mark.slow
 def test_stagnation_switches_the_starting_program(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -909,6 +916,7 @@ def test_a_restart_resumes_state_json_and_champion_json(
     assert state.champion != stale
 
 
+@pytest.mark.slow
 def test_a_round_is_told_a_name_and_never_a_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -1012,6 +1020,7 @@ def _gate_result(
     )
 
 
+@pytest.mark.slow
 def test_a_session_is_rounds_and_each_continues_from_the_last(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1171,6 +1180,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     assert not handed.where.exists()
 
 
+@pytest.mark.slow
 def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -1374,6 +1384,13 @@ def test_a_dry_run_writes_only_under_the_root_it_was_given(
     stub_evaluator(monkeypatch)
     root = tmp_path / "run"
     seed = _write(tmp_path / "seed.py", PASS)
+    # A pool of its own, because a dry run that finds none falls back to the
+    # whole vendored roster -- and the start plays the pool's own pairings, so
+    # this test would spend 66 of them on real opponents to assert something
+    # about directories. It was 571 seconds of a 894-second suite.
+    dry_pool = root / "dry-run" / "pool.json"
+    dry_pool.parent.mkdir(parents=True, exist_ok=True)
+    pool.Pool(opponents={"pass": str(_write(tmp_path / "dry.py", PASS))}).save(dry_pool)
 
     loop.main(
         [

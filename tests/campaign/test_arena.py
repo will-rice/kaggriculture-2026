@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import arena
 
 PASS_AGENT = """
@@ -26,6 +28,7 @@ def test_outcomes_plays_both_seats_and_scores_ties_as_half(tmp_path: Path) -> No
     assert arena.summarize(scores, {"mirror": str(agent)}) == {"mirror": 0.5}
 
 
+@pytest.mark.slow
 def test_a_crashing_agent_is_a_failure_not_a_loss(tmp_path: Path) -> None:
     """A raising agent must not silently bank its untouched 3000 as a loss."""
     good = tmp_path / "pass.py"
@@ -39,6 +42,7 @@ def test_a_crashing_agent_is_a_failure_not_a_loss(tmp_path: Path) -> None:
     assert scores.failures and "seat" in scores.failures[0]
 
 
+@pytest.mark.slow
 def test_a_failing_league_member_does_not_shift_the_next_members_scores(
     tmp_path: Path,
 ) -> None:

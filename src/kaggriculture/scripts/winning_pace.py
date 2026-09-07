@@ -20,6 +20,7 @@ played, not a constant of the game.
 """
 
 import argparse
+import collections
 import logging
 import statistics
 from pathlib import Path
@@ -39,6 +40,50 @@ TABLE = Path(__file__).resolve().parents[1] / "campaign" / "winning_pace.md"
 DAYS = 30
 LAST_HOUR = 23
 
+# Stretches the season is read in. Not equal thirds: the field's behaviour
+# changes at the points these divide on -- land and animals stop after the
+# teens, and the last three days are their own thing, which is where our
+# champion diverges from the winners.
+BANDS: tuple[tuple[int, int], ...] = ((0, 10), (10, 20), (20, 27), (27, 30))
+
+
+def _band(day: int) -> str:
+    """The stretch a day falls in, named as it is printed."""
+    for low, high in BANDS:
+        if low <= day < high:
+            return f"days {low}-{high - 1}"
+    raise ValueError(f"day {day} is outside the season")
+
+
+def _decisions(episode: tapes.Episode, winner: int) -> dict[str, Any]:
+    """Every order, planting and unit action the winning side took.
+
+    Read from the actions rather than the observations: what a farm *held* is
+    the pace table's question, and this one is what its author decided.
+    """
+    market: dict[str, collections.Counter] = collections.defaultdict(
+        collections.Counter
+    )
+    planted: dict[str, collections.Counter] = collections.defaultdict(
+        collections.Counter
+    )
+    moves: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    first: dict[str, int] = {}
+    for index, step in enumerate(episode.steps):
+        action = step[winner].get("action") or {}
+        day = index // 24
+        for order in action.get("market") or ():
+            name = order[0] if isinstance(order, list) else str(order)
+            market[_band(day)][name] += 1
+            first.setdefault(name, day)
+        for move in [action.get("farmer") or [], *(action.get("hands") or [])]:
+            if not move:
+                continue
+            moves[_band(day)][move[0]] += 1
+            if move[0] == "PLANT" and len(move) > 1:
+                planted[_band(day)][move[1]] += 1
+    return {"market": market, "planted": planted, "moves": moves, "first": first}
+
 
 def main() -> None:
     """``winning-pace``: rebuild the reference table from the corpus."""
@@ -48,7 +93,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     rows = pace(args.episodes)
-    TABLE.write_text(render(rows), encoding="utf-8")
+    TABLE.write_text(render(rows) + "\n" + decisions(rows), encoding="utf-8")
     LOGGER.info("wrote %s from %d episodes", TABLE, rows["episodes"])
 
 
@@ -66,6 +111,14 @@ def pace(episodes: int) -> dict[str, Any]:
     planted: list[list[int]] = [[] for _ in range(DAYS)]
     animals: list[list[int]] = [[] for _ in range(DAYS)]
     hands: list[list[int]] = [[] for _ in range(DAYS)]
+    market: dict[str, collections.Counter] = collections.defaultdict(
+        collections.Counter
+    )
+    planted_crops: dict[str, collections.Counter] = collections.defaultdict(
+        collections.Counter
+    )
+    moves: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    first: dict[str, list[int]] = collections.defaultdict(list)
     used = 0
     for index in tqdm(range(episodes), desc="episodes"):
         try:
@@ -86,12 +139,25 @@ def pace(episodes: int) -> dict[str, Any]:
             planted[day].append(grown)
             animals[day].append(built)
             hands[day].append(hired)
+        taken = _decisions(episode, winner)
+        for band, counts in taken["market"].items():
+            market[band].update(counts)
+        for band, counts in taken["planted"].items():
+            planted_crops[band].update(counts)
+        for band, counts in taken["moves"].items():
+            moves[band].update(counts)
+        for name, day in taken["first"].items():
+            first[name].append(day)
     return {
         "episodes": used,
         "banks": banks,
         "planted": planted,
         "animals": animals,
         "hands": hands,
+        "market": market,
+        "planted_crops": planted_crops,
+        "moves": moves,
+        "first": first,
     }
 
 
@@ -141,6 +207,73 @@ def render(rows: dict[str, Any]) -> str:
             f"| {statistics.median(rows['animals'][day]):.0f} "
             f"| {statistics.median(rows['hands'][day]):.0f} |"
         )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def decisions(rows: dict[str, Any]) -> str:
+    """The same games read as decisions: what was ordered, planted and spent.
+
+    The pace table says what a winner held. This says what it did to get
+    there, which is the half a policy is actually written in.
+    """
+    used = max(rows["episodes"], 1)
+    lines = [
+        "## What the ladder's winners do",
+        "",
+        "The same games, read as decisions. Counts are per game; shares are of "
+        "that stretch's total, so a row says what the winning side spent its "
+        "attention on rather than how much of it there was.",
+        "",
+        "### When each market order first appears",
+        "",
+        "| order | median first day | games it appears in |",
+        "| --- | --- | --- |",
+    ]
+    for name in sorted(rows["first"], key=lambda n: -len(rows["first"][n])):
+        days = sorted(rows["first"][name])
+        lines.append(f"| {name} | {days[len(days) // 2]} | {len(days)}/{used} |")
+
+    orders = sorted({name for band in rows["market"].values() for name in band})
+    lines += [
+        "",
+        "### Market orders per game",
+        "",
+        "| stretch | " + " | ".join(orders) + " |",
+        "| --- |" + " --- |" * len(orders),
+    ]
+    for low, _high in BANDS:
+        band = _band(low)
+        counts = " | ".join(
+            f"{rows['market'][band][name] / used:.1f}" for name in orders
+        )
+        lines.append(f"| {band} | {counts} |")
+
+    lines += ["", "### What gets planted", "", "| stretch | mix |", "| --- | --- |"]
+    for low, _high in BANDS:
+        band = _band(low)
+        total = sum(rows["planted_crops"][band].values()) or 1
+        mix = ", ".join(
+            f"{crop} {count / total:.0%}"
+            for crop, count in rows["planted_crops"][band].most_common(4)
+        )
+        lines.append(f"| {band} | {mix or '-'} |")
+
+    lines += [
+        "",
+        "### Where the turns go",
+        "",
+        "| stretch | share of all unit actions |",
+        "| --- | --- |",
+    ]
+    for low, _high in BANDS:
+        band = _band(low)
+        total = sum(rows["moves"][band].values()) or 1
+        share = ", ".join(
+            f"{name} {count / total:.0%}"
+            for name, count in rows["moves"][band].most_common(6)
+        )
+        lines.append(f"| {band} | {share} |")
     lines.append("")
     return "\n".join(lines)
 
