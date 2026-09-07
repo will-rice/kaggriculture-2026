@@ -104,7 +104,16 @@ def _lineage() -> frozenset[tuple[str, ...]]:
     what a cold start copies into the database, and every program in the
     campaign descends from it. A child that still resembles its own ancestor
     has copied nothing.
+
+    Empty where the opponents are not installed, because `_corpus` is empty
+    there too -- `rglob` over a directory that is not on this machine yields
+    nothing, so there is nothing for a lineage to be exempt from. The two
+    have to agree: CI carries no `/data`, and a lineage that raised where the
+    corpus quietly returns nothing would take the suite down on every machine
+    that is not the box.
     """
+    if not config.SEED.exists():
+        return frozenset()
     return frozenset(shingles(config.SEED.read_text(encoding="utf-8")))
 
 

@@ -143,6 +143,26 @@ def test_similarity_is_symmetric_and_bounded() -> None:
     assert 0.0 <= copycheck.similarity(a, b) <= 1.0
 
 
+def test_a_machine_without_the_opponents_has_no_lineage_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seed is under `/data`, and CI does not have `/data`.
+
+    `_corpus` already degrades to empty there, because `rglob` over a
+    directory that is not on the machine yields nothing. The lineage has to
+    degrade the same way: reading the seed eagerly turns every unmarked test
+    in this file into a `FileNotFoundError` everywhere but the box.
+    """
+    monkeypatch.setattr(config, "SEED", Path("/nonexistent/seed.py"))
+    copycheck._lineage.cache_clear()
+    copycheck._corpus.cache_clear()
+    try:
+        assert copycheck._lineage() == frozenset()
+    finally:
+        copycheck._lineage.cache_clear()
+        copycheck._corpus.cache_clear()
+
+
 @pytest.mark.local_data
 def test_the_seed_lineage_is_exempt() -> None:
     """The agent the campaign starts from cannot be a copy of itself.
