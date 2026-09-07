@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, pool, roster
+from kaggriculture.campaign import pool, roster
 
 
 @pytest.mark.local_data
@@ -35,13 +35,22 @@ def test_no_roster_path_is_ever_relative_or_inside_the_repo() -> None:
 def test_a_champion_in_the_pool_resolves_while_a_stranger_still_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Champions join the pool, not the roster, but the gate still plays them."""
+    """Champions join the pool, not the roster, but the gate still plays them.
+
+    The pool is given rather than looked up: a module-level one would be a
+    global a run cannot replace, which is how a dry run came to resolve names
+    through the live campaign's file. Passing nothing means the roster alone,
+    so a champion is a `KeyError` until someone names where it lives.
+    """
     champion = tmp_path / "gen7" / "main.py"
     champion.parent.mkdir()
     champion.write_text("def agent(observation):\n    return {}\n", encoding="utf-8")
     registry = tmp_path / "pool.json"
     pool.Pool(opponents={"gen7": str(champion)}).save(registry)
-    monkeypatch.setattr(config, "POOL", registry)
-    assert roster.path("gen7") == champion
+
+    assert roster.path("gen7", registry) == champion
     with pytest.raises(KeyError):
-        roster.path("no_such_opponent")
+        roster.path("no_such_opponent", registry)
+    # Without one, only the roster answers.
+    with pytest.raises(KeyError):
+        roster.path("gen7")

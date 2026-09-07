@@ -482,6 +482,7 @@ def play(
     seeds: Sequence[int],
     workers: int,
     days: bool = False,
+    pool: Path | None = None,
 ) -> list[Game]:
     """Play every (opponent, seed, seat) on the port, sampling the reference engine.
 
@@ -497,6 +498,8 @@ def play(
         workers: Processes to fan the games over, at most ``config.CORE_BUDGET``.
         days: Record each game's day table. The gate asks for them because one
             of these games is what a model is shown of how its program played.
+        pool: The pool file a champion's name resolves through; the
+            roster alone when it is None.
 
     Returns:
         One ``Game`` per opponent, seed and seat, in that order.
@@ -510,15 +513,17 @@ def play(
     """
     if workers > config.CORE_BUDGET:
         raise ValueError(f"workers exceeds CORE_BUDGET ({config.CORE_BUDGET})")
-    paths = {name: roster.path(name) for name in opponents}
+    paths = {name: roster.path(name, pool) for name in opponents}
     work = [
         (str(agent), name, str(paths[name]), seed, seat, days)
         for name in opponents
         for seed in seeds
         for seat in (0, 1)
     ]
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
-        games = list(pool.map(_one, work))
+    # Named `executor` rather than `pool`, which is what this was: the
+    # opponent pool arrived as a parameter and quietly shadowed it.
+    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
+        games = list(executor.map(_one, work))
     # A crash is a failure, never a score: an agent that raised banked its
     # untouched opening money and would otherwise read as an ordinary loss,
     # which is the same rule `arena.run_banks` enforces on the reference

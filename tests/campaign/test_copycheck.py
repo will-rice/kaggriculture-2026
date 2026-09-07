@@ -152,8 +152,13 @@ def test_an_agent_the_roster_never_named_is_still_in_the_corpus() -> None:
     named = {roster.path(name).parent.name for name in roster.names()}
 
     assert covered - named, "the corpus is only the roster; the scan is not live"
-    # And every registered opponent is still in there, the seed aside.
-    assert named - covered == {config.SEED.parent.name}
+    # Every registered opponent is in there too. Nothing is exempt here
+    # because no seed was named -- exempting is something a run asks for.
+    assert named - covered == set()
+
+    # And with one named, it is that one and only that one.
+    exempt = {key.split(":", 1)[0] for key in copycheck._corpus(config.SEED)}
+    assert covered - exempt == {config.SEED.parent.name}
 
 
 def test_similarity_is_symmetric_and_bounded() -> None:
@@ -173,14 +178,10 @@ def test_a_machine_without_the_opponents_has_no_lineage_either(
     degrade the same way: reading the seed eagerly turns every unmarked test
     in this file into a `FileNotFoundError` everywhere but the box.
     """
-    monkeypatch.setattr(config, "SEED_PROGRAM", Path("/nonexistent/seed.py"))
-    copycheck._lineage.cache_clear()
-    copycheck._corpus.cache_clear()
-    try:
-        assert copycheck._lineage() == frozenset()
-    finally:
-        copycheck._lineage.cache_clear()
-        copycheck._corpus.cache_clear()
+    assert copycheck._lineage(Path("/nonexistent/seed.py")) == frozenset()
+    # And none at all is the same answer, which is what a caller that
+    # does not belong to a run passes.
+    assert copycheck._lineage(None) == frozenset()
 
 
 @pytest.mark.local_data
@@ -206,15 +207,14 @@ def test_the_seed_is_exempt_and_every_other_opponent_is_not(
     seeded = roster.path("shopforge").read_text(encoding="utf-8")
     seed = tmp_path / "seed.py"
     seed.write_text(seeded, encoding="utf-8")
-    monkeypatch.setattr(config, "SEED_PROGRAM", seed)
     copycheck._lineage.cache_clear()
     copycheck._corpus.cache_clear()
     try:
-        _, score = copycheck.against_opponents(seeded)
+        _, score = copycheck.against_opponents(seeded, seed)
         assert score < copycheck.THRESHOLD
 
         other = roster.path("v54").read_text(encoding="utf-8")
-        name, other_score = copycheck.against_opponents(other)
+        name, other_score = copycheck.against_opponents(other, seed)
         assert other_score >= copycheck.THRESHOLD
         assert name.startswith(roster.path("v54").parent.name)
     finally:

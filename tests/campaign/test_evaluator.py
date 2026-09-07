@@ -72,12 +72,16 @@ def test_a_program_in_the_pool_is_never_played_against_itself(
     other.write_text(PASS, encoding="utf-8")
     monkeypatch.setattr(config, "GATE_SEEDS", 1)
     monkeypatch.setattr(evaluator, "VENDORED", ["other"])
-    # Names resolve to paths through the saved pool, so it has to be on disk.
-    monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
+    # Names resolve to paths through the saved pool, so it has to be on disk
+    # and the evaluation has to be told where it is -- there is no module-level
+    # pool to fall back on, which is the point.
+    registry = tmp_path / "pool.json"
     p = pool.Pool(opponents={"other": str(other), "champion_1": str(champion)})
-    p.save(config.POOL)
+    p.save(registry)
 
-    ranked = evaluator.score(champion, "champion_1", p, random.Random(4), WORKERS)
+    ranked = evaluator.score(
+        champion, "champion_1", p, random.Random(4), WORKERS, registry
+    )
 
     assert set(ranked.rates) == {"other"} and set(ranked.intervals) == {"other"}
     # One opponent left, so the mean over them is that opponent's rate.

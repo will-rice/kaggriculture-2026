@@ -263,15 +263,15 @@ def test_the_seed_passes_the_gate_it_will_be_measured_by(
     inside Kaggle's own per-call second like anything else. Any one of those
     failing is a campaign that seeds and then rejects every child it has.
 
-    `SEED_PROGRAM` is pointed at the same file because that is what a cold
-    start does -- it copies the seed there before anything is validated --
+    The seed is handed in because that is what a cold start does -- it
+    copies the seed into the run and validates against that copy --
     rather than leaning on whatever the box is running today.
     """
-    monkeypatch.setattr(config, "SEED_PROGRAM", config.SEED)
     copycheck._lineage.cache_clear()
     copycheck._corpus.cache_clear()
     try:
-        assert validate.validate(config.SEED).status == "ok"
+        verdict = validate.validate(config.SEED, seed=config.SEED)
+        assert verdict.status == "ok", verdict.reason
     finally:
         copycheck._lineage.cache_clear()
         copycheck._corpus.cache_clear()

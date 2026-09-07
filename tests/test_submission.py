@@ -28,7 +28,7 @@ def test_the_entrypoint_is_the_campaign_floor() -> None:
     cold start begins from `served/main.py` while the ladder gets whatever
     the campaign has actually promoted.
     """
-    assert ENTRYPOINT == config.FLOOR / "main.py"
+    assert ENTRYPOINT == config.LIVE.floor / "main.py"
     assert ENTRYPOINT != config.SERVED
 
 

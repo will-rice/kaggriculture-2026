@@ -70,7 +70,7 @@ def names() -> list[str]:
     return [*TRAINING, *UNPOOLED]
 
 
-def path(name: str) -> Path:
+def path(name: str, pool: Path | None = None) -> Path:
     """Resolve a name; anything else is a KeyError, never a path lookup.
 
     A champion promoted into the opponent pool is an opponent the gate must
@@ -80,6 +80,11 @@ def path(name: str) -> Path:
 
     Args:
         name: An opponent name.
+        pool: The pool file a champion's name resolves through. None
+            means the roster and nothing else, which is right for a
+            caller that only ever names vendored opponents -- and is
+            the honest default, since a module-level pool would be a
+            global that a run cannot replace.
 
     Returns:
         The opponent's ``main.py``.
@@ -93,6 +98,6 @@ def path(name: str) -> Path:
         return UNPOOLED[name]
     from kaggriculture.campaign.pool import Pool
 
-    if not config.POOL.exists():
+    if pool is None or not pool.exists():
         raise KeyError(name)
-    return Path(Pool.load(config.POOL).opponents[name])
+    return Path(Pool.load(pool).opponents[name])

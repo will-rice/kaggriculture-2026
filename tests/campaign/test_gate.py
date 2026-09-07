@@ -58,21 +58,21 @@ def test_a_field_measured_over_other_games_is_thrown_away_not_extended(
     the truth is 0.5 and the file claims 1.0. Surviving the tournament is what
     proves the cache was reused.
     """
-    monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
+    paths = _paths(tmp_path)
     agents = {}
     for name in ("one", "two"):
         path = tmp_path / f"{name}.py"
         path.write_text(PASS, encoding="utf-8")
         agents[name] = str(path)
     opponents = pool.Pool(opponents=agents)
-    opponents.save(config.POOL)
+    opponents.save(paths.pool)
 
-    kept = tmp_path / "field.json"
+    kept = paths.field
     stale = rating.Field(games=2)
     stale.record("one", "two", 1.0)
     stale.save(kept)
 
-    gate.refresh(opponents, seeds=[1, 2], workers=1, kept=kept)
+    gate.refresh(opponents, seeds=[1, 2], workers=1, paths=paths)
 
     field = rating.Field.load(kept)
     assert field.games == 4
@@ -92,23 +92,23 @@ def test_a_new_pool_member_has_its_pairings_played(
     beating it drops its rating far enough that topping the standings is easy.
     Each promotion would buy the next one cheaply.
     """
-    monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
+    paths = _paths(tmp_path)
     agents = {}
     for name in ("one", "two"):
         path = tmp_path / f"{name}.py"
         path.write_text(PASS, encoding="utf-8")
         agents[name] = str(path)
-    kept = tmp_path / "field.json"
+    kept = paths.field
     before = pool.Pool(opponents=dict(list(agents.items())[:1]))
-    before.save(config.POOL)
-    gate.refresh(before, seeds=[1], workers=1, kept=kept)
+    before.save(paths.pool)
+    gate.refresh(before, seeds=[1], workers=1, paths=paths)
 
     # The champion arrives, and its pairing against the incumbent is absent.
     joined = pool.Pool(opponents=agents)
-    joined.save(config.POOL)
+    joined.save(paths.pool)
     assert rating.Field.load(kept).results(joined.names()) == []
 
-    measured = gate.refresh(joined, seeds=[1], workers=1, kept=kept)
+    measured = gate.refresh(joined, seeds=[1], workers=1, paths=paths)
 
     assert measured == [("one", "two")]
     assert len(rating.Field.load(kept).results(joined.names())) == 1
@@ -176,19 +176,20 @@ def test_the_standings_are_over_the_pool_and_nothing_else() -> None:
     assert set(candidate.rates) == {"a", "b"}
 
 
+def _paths(tmp_path: Path) -> config.Run:
+    """The run a test promotes into: its own directory, its own pool."""
+    return config.Run(root=tmp_path, pool=tmp_path / "pool.json")
+
+
 def _program(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = "PASS"
 ) -> archive.Program:
-    """Patch every path a promotion writes into tmp_path and build a candidate.
+    """A run of its own under tmp_path, and a candidate to promote into it.
 
-    The live campaign's own ``run/campaign`` and pool file must never be a
-    destination of the suite, so all five are redirected before a promotion
-    is attempted.
+    The live campaign's ``run/campaign`` and pool file must never be a
+    destination of the suite. They cannot be: a promotion writes into the run
+    it is handed, and this hands it one made here.
     """
-    monkeypatch.setattr(config, "FLOOR", tmp_path / "floor" / "agent")
-    monkeypatch.setattr(config, "CHAMPIONS", tmp_path / "champions")
-    monkeypatch.setattr(config, "CHAMPION", tmp_path / "champion.json")
-    monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
     # Not a destination either, and redirected so that a promotion which
     # wrongly wrote there would write here instead of into the checkout.
     monkeypatch.setattr(config, "SERVED", tmp_path / "src" / "served" / "main.py")
@@ -219,14 +220,18 @@ def test_promote_leaves_a_tarball_the_champion_record_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cut is uploading this file; nothing is built at cut time."""
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     p = pool.Pool(opponents={"a": "/x/a.py"})
 
-    champion = gate.record(gate.promote(program, _result()))
-    gate.enroll(champion, p)
+    champion = gate.record(
+        paths=paths,
+        champion=gate.promote(paths=paths, program=program, result=_result()),
+    )
+    gate.enroll(champion, p, paths)
 
     tarball = Path(champion.tarball)
-    assert tarball.exists() and tarball.parent == config.CHAMPIONS
+    assert tarball.exists() and tarball.parent == paths.champions
     with tarfile.open(tarball) as tar:
         names = tar.getnames()
     assert sorted(names) == ["LICENSE", "main.py"]
@@ -246,23 +251,27 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
     The floor is what ships and what a later promotion overwrites; the
     champion's own copy is what the pool plays, and it is never written twice.
     """
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     source = Path(program.source_path)
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
-    champion = gate.record(gate.promote(program, _result()))
-    gate.enroll(champion, p)
+    champion = gate.record(
+        paths=paths,
+        champion=gate.promote(paths=paths, program=program, result=_result()),
+    )
+    gate.enroll(champion, p, paths)
     assert champion.name == "champion_1"
-    floor = config.FLOOR / "main.py"
+    floor = paths.floor / "main.py"
     assert (
         floor.read_text() == source.read_text()
         and (floor.stat().st_mode & 0o777) == 0o444
     )
-    kept = config.CHAMPIONS / "champion_1.py"
+    kept = paths.champions / "champion_1.py"
     assert (
         kept.read_text() == source.read_text()
         and (kept.stat().st_mode & 0o777) == 0o444
     )
-    saved = pool.Pool.load(config.POOL)
+    saved = pool.Pool.load(paths.pool)
     assert "champion_1" in saved.names()
 
 
@@ -270,18 +279,19 @@ def test_promote_refuses_a_champion_name_the_directory_already_holds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A champion file nothing wrote is a disagreement, not something to overwrite."""
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
-    config.CHAMPIONS.mkdir(parents=True)
-    stale = config.CHAMPIONS / "champion_1.py"
+    paths.champions.mkdir(parents=True)
+    stale = paths.champions / "champion_1.py"
     stale.write_text("# an older champion\n", encoding="utf-8")
     stale.chmod(0o444)
-    third = config.CHAMPIONS / "champion_3.py"
+    third = paths.champions / "champion_3.py"
     third.write_text("# and a third\n", encoding="utf-8")
 
     with pytest.raises(FileExistsError, match="champion_3.py already exists"):
-        gate.promote(program, _result())
+        gate.promote(paths=paths, program=program, result=_result())
     assert stale.read_text() == "# an older champion\n"
-    assert not (config.FLOOR / "main.py").exists()
+    assert not (paths.floor / "main.py").exists()
 
 
 def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
@@ -294,20 +304,27 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     promoted last, so the pool would hold N copies of the newest agent and
     every earlier champion would be gone.
     """
+    paths = _paths(tmp_path)
     first = _program(tmp_path, monkeypatch, body="PASS")
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
-    gate.enroll(gate.promote(first, _result()), p)
+    gate.enroll(gate.promote(paths=paths, program=first, result=_result()), p, paths)
 
     second = _program(tmp_path, monkeypatch, body="WATER")
-    reloaded = pool.Pool.load(config.POOL)
-    gate.enroll(gate.promote(second, result("p9", 0.8, {"a": 0.9, "b": 0.6})), reloaded)
+    reloaded = pool.Pool.load(paths.pool)
+    gate.enroll(
+        gate.promote(
+            paths=paths, program=second, result=result("p9", 0.8, {"a": 0.9, "b": 0.6})
+        ),
+        reloaded,
+        paths,
+    )
 
-    saved = pool.Pool.load(config.POOL)
+    saved = pool.Pool.load(paths.pool)
     one, two = saved.opponents["champion_1"], saved.opponents["champion_2"]
     assert one != two
     assert Path(one).read_text() == Path(first.source_path).read_text()
     assert Path(two).read_text() == Path(second.source_path).read_text()
-    floor = config.FLOOR / "main.py"
+    floor = paths.floor / "main.py"
     assert floor.read_text() == Path(second.source_path).read_text()
 
 
@@ -315,12 +332,15 @@ def test_promote_writes_the_champion_record_before_it_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`champion.json` is what a restart trusts, so `record` writes it whole."""
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     deep = _result()
 
-    champion = gate.record(gate.promote(program, deep))
+    champion = gate.record(
+        paths=paths, champion=gate.promote(paths=paths, program=program, result=deep)
+    )
 
-    assert gate.load_champion() == champion
+    assert gate.load_champion(paths) == champion
     assert champion.result == deep
     assert Path(champion.path).read_text() == Path(program.source_path).read_text()
 
@@ -336,20 +356,25 @@ def test_champion_numbering_survives_a_pool_retirement(
     file already exists, and the `FileExistsError` that follows escapes into
     the campaign's task group and stops the run.
     """
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
-    config.CHAMPIONS.mkdir(parents=True)
+    paths.champions.mkdir(parents=True)
     for number in (1, 2, 3):
-        (config.CHAMPIONS / f"champion_{number}.py").write_text("# past\n")
+        (paths.champions / f"champion_{number}.py").write_text("# past\n")
     # What a retirement leaves behind: three champions promoted, one of them
     # still in the pool.
     retired = pool.Pool(opponents={"a": "/x/a.py", "champion_3": "/x/c3.py"})
-    retired.save(config.POOL)
+    retired.save(paths.pool)
 
-    champion = gate.promote(program, result("p9", 0.9, {"a": 0.99, "champion_3": 0.99}))
-    gate.enroll(gate.record(champion), retired)
+    champion = gate.promote(
+        paths=paths,
+        program=program,
+        result=result("p9", 0.9, {"a": 0.99, "champion_3": 0.99}),
+    )
+    gate.enroll(gate.record(champion, paths), retired, paths)
 
     assert champion.name == "champion_4"
-    assert sorted(p.name for p in config.CHAMPIONS.glob("champion_*.py")) == [
+    assert sorted(p.name for p in paths.champions.glob("champion_*.py")) == [
         "champion_1.py",
         "champion_2.py",
         "champion_3.py",
@@ -368,10 +393,18 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
     has uncommitted changes -- so the first promotion would have been the
     last thing that campaign ever did.
     """
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
 
-    gate.enroll(gate.record(gate.promote(program, _result())), p)
+    gate.enroll(
+        gate.record(
+            paths=paths,
+            champion=gate.promote(paths=paths, program=program, result=_result()),
+        ),
+        p,
+        paths,
+    )
 
     assert not config.SERVED.exists()
     assert not (tmp_path / "src").exists()
@@ -382,10 +415,20 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The champion counter reads the pool that was just saved, not a stale one."""
+    paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
-    gate.enroll(gate.record(gate.promote(program, _result())), p)
-    reloaded = pool.Pool.load(config.POOL)
-    champion = gate.promote(program, result("p9", 0.8, {"a": 0.9, "b": 0.6}))
-    gate.enroll(gate.record(champion), reloaded)
+    gate.enroll(
+        gate.record(
+            paths=paths,
+            champion=gate.promote(paths=paths, program=program, result=_result()),
+        ),
+        p,
+        paths,
+    )
+    reloaded = pool.Pool.load(paths.pool)
+    champion = gate.promote(
+        paths=paths, program=program, result=result("p9", 0.8, {"a": 0.9, "b": 0.6})
+    )
+    gate.enroll(gate.record(champion, paths), reloaded, paths)
     assert champion.name == "champion_2"

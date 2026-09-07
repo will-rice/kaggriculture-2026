@@ -64,7 +64,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class Champion(BaseModel):
-    """The promoted floor, as ``config.CHAMPION`` records it.
+    """The promoted floor, as the runs ``champion.json`` records it.
 
     ``record`` writes it the moment the champion is in the pool, and it is
     preferred over ``state.json`` on restart: ``state.json`` is written after
@@ -73,7 +73,7 @@ class Champion(BaseModel):
 
     Attributes:
         name: The champion's pool name, e.g. "champion_3".
-        path: The immutable copy under ``config.CHAMPIONS`` the pool plays.
+        path: The immutable copy under the runs ``champions`` the pool plays.
         tarball: The archive a cut uploads, written by this promotion.
         result: The measurement it was promoted on, which is also what a
             session is shown of the program it starts from.
@@ -89,7 +89,7 @@ def refresh(
     pool: Pool,
     seeds: Sequence[int],
     workers: int,
-    kept: Path | None = None,
+    paths: config.Run,
 ) -> list[tuple[str, str]]:
     """Play the pool's own pairings that have never been played, and keep them.
 
@@ -115,7 +115,7 @@ def refresh(
         seeds: Episode seeds; each pairing is played on all of them, both
             seats, so a pairing is ``2 * len(seeds)`` games.
         workers: Processes to fan the games over.
-        kept: Where the pool's own pairings live between gates.
+        paths: The run whose field the pairings are kept in.
 
     Returns:
         The pairings measured, empty when the field already held them all.
@@ -126,13 +126,7 @@ def refresh(
     opponents = pool.names()
     games = 2 * len(seeds)
 
-    # Resolved here rather than defaulted in the signature: a default is
-    # evaluated once, at definition, so `kept=config.FIELD` captured the
-    # path as it was at import and no amount of monkeypatching moved it.
-    # A dry run and every test that promoted therefore wrote their
-    # champions into the live campaign's pairings.
-    kept = kept or config.FIELD
-    field = rating.Field.load(kept)
+    field = rating.Field.load(paths.field)
     # The cache carries one game count for every pairing in it, so a field
     # measured at a different count cannot be extended -- recording a new
     # pairing would relabel the old ones as having been played over games they
@@ -153,15 +147,25 @@ def refresh(
         return []
     LOGGER.info("field: %d pairing(s) never played, measuring them", len(absent))
     for one, two in absent:
-        field.record(one, two, _rate(roster.path(one), two, seeds, workers))
+        field.record(
+            one,
+            two,
+            _rate(roster.path(one, paths.pool), two, seeds, workers, paths.pool),
+        )
     field.games = games
-    field.save(kept)
+    field.save(paths.field)
     return absent
 
 
-def _rate(agent: Path, opponent: str, seeds: Sequence[int], workers: int) -> float:
+def _rate(
+    agent: Path,
+    opponent: str,
+    seeds: Sequence[int],
+    workers: int,
+    pool: Path | None = None,
+) -> float:
     """``agent``'s win rate against ``opponent`` over ``seeds``, both seats."""
-    played = harness.play(agent, [opponent], list(seeds), workers)
+    played = harness.play(agent, [opponent], list(seeds), workers, pool=pool)
     return sum(
         1.0 if game.ours > game.theirs else 0.5 if game.ours == game.theirs else 0.0
         for game in played
@@ -173,7 +177,7 @@ def standing(
     rates: dict[str, float],
     pool: Pool,
     games: int,
-    kept: Path | None = None,
+    paths: config.Run,
 ) -> dict[str, float]:
     """The same tournament, over games already played: no new ones.
 
@@ -187,18 +191,12 @@ def standing(
         rates: Its win rate against each pool opponent.
         pool: The opponents those rates are against.
         games: Games behind each rate.
-        kept: Where the pool's own pairings live.
+        paths: The run whose field the pairings are kept in.
 
     Returns:
         A rating per agent, the program included.
     """
-    # Resolved here rather than defaulted in the signature: a default is
-    # evaluated once, at definition, so `kept=config.FIELD` captured the
-    # path as it was at import and no amount of monkeypatching moved it.
-    # A dry run and every test that promoted therefore wrote their
-    # champions into the live campaign's pairings.
-    kept = kept or config.FIELD
-    field = rating.Field.load(kept)
+    field = rating.Field.load(paths.field)
     opponents = [n for n in pool.names() if n in rates]
     results = field.results(opponents)
     results += [(name, two, rates[two], games) for two in opponents]
@@ -241,11 +239,11 @@ def promotion(standings: dict[str, float], name: str) -> tuple[bool, str]:
     )
 
 
-def promote(program: Program, result: Result) -> Champion:
+def promote(program: Program, result: Result, paths: config.Run) -> Champion:
     """The file half of a promotion: the tarball, the champion's copy, the floor.
 
     Every file this writes is one nothing else owns, so it is safe to call
-    in a thread; the pool and ``config.CHAMPION`` are ``enroll`` and
+    in a thread; the pool and ``champion.json`` are ``enroll`` and
     ``record``, on the loop thread.
 
     Each champion is written once to ``CHAMPIONS/<name>.py`` and it is that
@@ -258,6 +256,7 @@ def promote(program: Program, result: Result) -> Champion:
     Args:
         program: The archive entry being promoted.
         result: Its measurement.
+        paths: The run the champion is written into.
 
     Returns:
         The champion record, for ``enroll`` and ``record`` to act on.
@@ -268,9 +267,9 @@ def promote(program: Program, result: Result) -> Champion:
     # Numbered off the champions directory, which only ever grows. Counting
     # the pool's `champion_` members instead would renumber after a
     # retirement and hand the sixth promotion a name the fifth already has.
-    number = 1 + sum(1 for _ in config.CHAMPIONS.glob("champion_*.py"))
+    number = 1 + sum(1 for _ in paths.champions.glob("champion_*.py"))
     name = f"champion_{number}"
-    kept = config.CHAMPIONS / f"{name}.py"
+    kept = paths.champions / f"{name}.py"
     if kept.exists():
         raise FileExistsError(
             f"{kept} already exists: something other than a promotion has "
@@ -283,16 +282,16 @@ def promote(program: Program, result: Result) -> Champion:
         # writes a file at a time and can fail part way through; a half-built
         # archive under `champions/` would be a cut waiting to upload it.
         built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
-        config.CHAMPIONS.mkdir(parents=True, exist_ok=True)
-        tarball = config.CHAMPIONS / f"{name}.tar.gz"
+        paths.champions.mkdir(parents=True, exist_ok=True)
+        tarball = paths.champions / f"{name}.tar.gz"
         shutil.move(str(built), str(tarball))
 
     code = source.read_text(encoding="utf-8")
     kept.write_text(code, encoding="utf-8")
     kept.chmod(0o444)
 
-    config.FLOOR.mkdir(parents=True, exist_ok=True)
-    floor = config.FLOOR / "main.py"
+    paths.floor.mkdir(parents=True, exist_ok=True)
+    floor = paths.floor / "main.py"
     if floor.exists():
         floor.chmod(0o644)
     floor.write_text(code, encoding="utf-8")
@@ -302,7 +301,7 @@ def promote(program: Program, result: Result) -> Champion:
     return Champion(name=name, path=str(kept), tarball=str(tarball), result=result)
 
 
-def enroll(champion: Champion, pool: Pool) -> None:
+def enroll(champion: Champion, pool: Pool, paths: config.Run) -> None:
     """Put ``champion`` in the pool, as a gatekeeper every later candidate faces.
 
     Mutates ``pool`` in place, so it belongs on whichever thread owns it --
@@ -313,33 +312,35 @@ def enroll(champion: Champion, pool: Pool) -> None:
     Args:
         champion: The record ``promote`` returned.
         pool: The opponent pool, updated and saved in place.
+        paths: The run whose pool file it is saved to.
     """
     pool.add_champion(champion.name, champion.path)
-    pool.save(config.POOL)
+    pool.save(paths.pool)
     LOGGER.info("%s joined the pool", champion.name)
 
 
-def record(champion: Champion) -> Champion:
-    """Write ``config.CHAMPION`` atomically: a temporary file, then a rename.
+def record(champion: Champion, paths: config.Run) -> Champion:
+    """Write the run's ``champion.json`` atomically: a temp file, then a rename.
 
     A reader never sees a half-written record, and the file exists in full or
     not at all -- which is what lets ``loop.run`` trust it over ``state.json``.
 
     Args:
         champion: The record to write.
+        paths: The run it is written into.
 
     Returns:
         ``champion``, so a caller can write and keep it in one expression.
     """
-    config.CHAMPION.parent.mkdir(parents=True, exist_ok=True)
-    scratch = config.CHAMPION.with_name(f"{config.CHAMPION.name}.{os.getpid()}.tmp")
+    paths.champion.parent.mkdir(parents=True, exist_ok=True)
+    scratch = paths.champion.with_name(f"{paths.champion.name}.{os.getpid()}.tmp")
     scratch.write_text(champion.model_dump_json(indent=2), encoding="utf-8")
-    scratch.replace(config.CHAMPION)
+    scratch.replace(paths.champion)
     return champion
 
 
-def load_champion() -> Champion | None:
+def load_champion(paths: config.Run) -> Champion | None:
     """The promoted champion on disk, or None if nothing has been promoted."""
-    if not config.CHAMPION.exists():
+    if not paths.champion.exists():
         return None
-    return Champion.model_validate_json(config.CHAMPION.read_text(encoding="utf-8"))
+    return Champion.model_validate_json(paths.champion.read_text(encoding="utf-8"))

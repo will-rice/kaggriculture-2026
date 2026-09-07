@@ -18,7 +18,7 @@ from pathlib import Path
 from kaggriculture.campaign import config, harness, validate
 
 REPO_ROOT = config.ROOT
-ENTRYPOINT = config.FLOOR / "main.py"
+ENTRYPOINT = config.LIVE.floor / "main.py"
 SUBMISSION = REPO_ROOT / "submission.tar.gz"
 
 
@@ -73,7 +73,7 @@ def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
         RuntimeError: If the entrypoint fails any check, the shadowed-agent
             check included.
     """
-    verdict = validate.validate(entrypoint)
+    verdict = validate.validate(entrypoint, seed=config.LIVE.seed_program)
     if verdict.status != "ok":
         raise RuntimeError(
             f"{entrypoint} must not ship: {verdict.status}: {verdict.reason}"

@@ -9,6 +9,7 @@ resembling one; what this module buys is that nothing the loop composes has
 to *print* a path to do its job.
 """
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -167,33 +168,100 @@ CODEX_MODEL = "gpt-5.6-luna"
 # some of the time (two calls in the first live hour), which is why this
 # exists at all.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-# The pool's own pairings, kept between gates because they are constants: the
-# opponents are fixed files, the games are seeded, and none of them draws on
-# randomness. Derived state, not a committed artifact -- a pool that gains a
-# champion has that champion's pairings measured and added, and one that loses
-# an opponent simply stops asking for its row.
-FIELD = RUN / "field.json"
-
-ARCHIVE = RUN / "archive.jsonl"
-PROGRAMS = RUN / "programs"
-# The database id of the program a cold start seeds itself from, and the copy
-# the cold start writes under `PROGRAMS`. That copy is the campaign's lineage:
-# every program descends from it, and it cannot change once written, which the
-# file it was read from can -- harvesting an opponent's author again rewrites
-# that file in place. So the copy check exempts this, not `SEED`, and the seed
+SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
+# The database id of the program a cold start seeds itself from. The copy the
+# cold start writes under a run's `programs` is the campaign's lineage: every
+# program descends from it, and it cannot change once written, which the file
+# it was read from can -- harvesting an opponent's author again rewrites that
+# file in place. So the copy check exempts that copy, not `SEED`, and the seed
 # and the exemption cannot drift apart however a run was started.
 SEED_ID = "seed"
-SEED_PROGRAM = PROGRAMS / f"{SEED_ID}.py"
-# The current floor, the copy that ships, and every champion ever promoted.
-# `FLOOR/main.py` is overwritten each promotion; `CHAMPIONS/<name>.py` is
-# written once and is what the pool points at, so a pool of N champions holds
-# N different programs rather than N references to the newest one.
-FLOOR = RUN / "floor" / "agent"
-CHAMPIONS = RUN / "champions"
-SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
-# The promoted champion, written atomically by the gate before it returns, so
-# a kill between the promotion and the next `state.json` write cannot lose it.
-CHAMPION = RUN / "champion.json"
+
+
+@dataclasses.dataclass(frozen=True)
+class Run:
+    """Every file one campaign writes, derived from the directory it owns.
+
+    These were module constants, and a test isolated itself by reaching into
+    this module and swapping them. That works only while every reader looks
+    the value up at call time, and one did not: `gate.refresh` took
+    `kept: Path = FIELD`, a default evaluated once at definition, so no patch
+    ever moved it and a dry run wrote its champions into the live campaign's
+    pairings. The live `field.json` ended up holding `champion_1` through
+    `champion_9` and an opponent called `pass`.
+
+    A run is constructed instead, and passed. There is no global left to
+    patch, so there is none to patch wrongly, and a test gets a whole campaign
+    of its own by naming a directory.
+
+    `pool` is given rather than derived: the live one deliberately sits
+    outside the run directory, so that it is not a sibling of anything a codex
+    call is handed.
+
+    Attributes:
+        root: The directory this campaign owns.
+        pool: The file listing the opponents, wherever it lives.
+    """
+
+    root: Path
+    pool: Path
+
+    @property
+    def archive(self) -> Path:
+        """The append-only log of every program and failure."""
+        return self.root / "archive.jsonl"
+
+    @property
+    def programs(self) -> Path:
+        """Where a program's source is stored, by id."""
+        return self.root / "programs"
+
+    @property
+    def seed_program(self) -> Path:
+        """The cold start's own copy of the seed: the campaign's lineage."""
+        return self.programs / f"{SEED_ID}.py"
+
+    @property
+    def field(self) -> Path:
+        """The pool's own pairings, kept between gates.
+
+        They are constants: the opponents are fixed files and none of them
+        draws on randomness. Derived state, not a committed artifact -- a pool
+        that gains a champion has that champion's pairings measured and added,
+        and one that loses an opponent stops asking for its row.
+        """
+        return self.root / "field.json"
+
+    @property
+    def floor(self) -> Path:
+        """The current floor, overwritten every promotion."""
+        return self.root / "floor" / "agent"
+
+    @property
+    def champions(self) -> Path:
+        """Every champion ever promoted, each written once.
+
+        The pool points at these rather than at the floor, so a pool holding N
+        champions holds N different programs rather than N references to the
+        newest one.
+        """
+        return self.root / "champions"
+
+    @property
+    def champion(self) -> Path:
+        """The promoted champion, written before the gate returns.
+
+        Preferred over `state` on restart: a kill between the promotion and
+        the next state write would otherwise lose it.
+        """
+        return self.root / "champion.json"
+
+    @property
+    def state(self) -> Path:
+        """What a restart resumes: the session count and the champion."""
+        return self.root / "state.json"
+
+
 # Metrics go to one wandb run per campaign, resumed across restarts by its
 # fixed id. Starting a fresh campaign (a new `run/campaign`) means a new id
 # here, or its curves land on top of the old run's.
@@ -202,6 +270,10 @@ WANDB_PROJECT = "kaggriculture-2026"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of anything a codex call is given.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"
+# The campaign this checkout runs. Everything that writes takes a `Run`, so
+# this is the only place the live one is named -- a dry run and a test each
+# construct their own and nothing has to be swapped out from under anyone.
+LIVE = Run(root=RUN, pool=POOL)
 # The published agent a cold start begins from, and the one number that says
 # why it rather than another: fit over `FIELD` on 2026-09-06 it rated +1.78
 # against +0.64 for the next opponent and -2.67 for the last, so it is the

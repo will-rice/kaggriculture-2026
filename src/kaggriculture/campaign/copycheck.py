@@ -129,7 +129,7 @@ def _engine_header_bytes() -> set[bytes]:
 
 
 @functools.lru_cache(maxsize=1)
-def _lineage() -> frozenset[tuple[str, ...]]:
+def _lineage(seed: Path | None) -> frozenset[tuple[str, ...]]:
     """Shingles of the published agent a cold start seeds from.
 
     The gate asks whether a candidate lifted from an opponent it was never
@@ -155,13 +155,13 @@ def _lineage() -> frozenset[tuple[str, ...]]:
     that raised where the corpus quietly returns nothing would take the suite
     down everywhere but the box.
     """
-    if not config.SEED_PROGRAM.exists():
+    if seed is None or not seed.exists():
         return frozenset()
-    return frozenset(shingles(config.SEED_PROGRAM.read_text(encoding="utf-8")))
+    return frozenset(shingles(seed.read_text(encoding="utf-8")))
 
 
 @functools.lru_cache(maxsize=1)
-def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
+def _corpus(seed: Path | None = None) -> dict[str, frozenset[tuple[str, ...]]]:
     """Every opponent's shingle sets, keyed `"<name>:<relative path>"`.
 
     The seed's own lineage is left out, by the same threshold the gate judges
@@ -181,7 +181,7 @@ def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
     day and the corpus does not change underneath it.
     """
     engine_bytes = _engine_header_bytes()
-    lineage = _lineage()
+    lineage = _lineage(seed)
     corpus: dict[str, frozenset[tuple[str, ...]]] = {}
     exempt: list[str] = []
     for root in CORPUS_ROOTS:
@@ -206,11 +206,19 @@ def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
     return corpus
 
 
-def against_opponents(source: str) -> tuple[str, float]:
-    """The most similar opponent file and its score."""
+def against_opponents(source: str, seed: Path | None = None) -> tuple[str, float]:
+    """The most similar opponent file and its score.
+
+    Args:
+        source: The candidate.
+        seed: The program the campaign was seeded from, whose lineage is
+            exempt. Defaulted to none, which exempts nothing -- the
+            stricter answer, and the right one for a caller that does
+            not belong to a run.
+    """
     candidate = frozenset(shingles(source))
     worst_name, worst = "", 0.0
-    for name, shingle_set in _corpus().items():
+    for name, shingle_set in _corpus(seed).items():
         score = _jaccard(candidate, shingle_set)
         if score > worst:
             worst_name, worst = name, score

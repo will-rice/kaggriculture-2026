@@ -99,8 +99,17 @@ def main(argv: list[str] | None = None) -> None:
     """``campaign loop``: eight workers, each mutating the champion."""
     args = _arguments(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    # A dry run is the whole campaign with the call faked, so it writes
+    # everything a real one does -- into a directory of its own. It used
+    # to get there by reassigning this module's constants, which is the
+    # same global mutation the tests used and failed at in the same
+    # place: a path captured in a default argument never moved.
+    root = args.run_root / "dry-run" if args.dry_run else args.run_root
+    paths = config.Run(
+        root=root, pool=root / "pool.json" if args.dry_run else config.POOL
+    )
     if args.dry_run:
-        _isolate(config.RUN / "dry-run")
+        LOGGER.info("dry run: every write goes under %s", paths.root)
     else:
         # A typo'd model is hundreds of failed sessions discovered one at a
         # time; caught here, before the run opens or a call is ever made.
@@ -116,7 +125,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     try:
         # 2-4. the event loop, the workers, and the gate they fire.
-        run(args.sessions, mutator, args.workers, args.seed_agent, random.Random(), log)
+        run(
+            args.sessions,
+            mutator,
+            args.workers,
+            args.seed_agent,
+            random.Random(),
+            log,
+            paths,
+        )
     finally:
         log.finish()
 
@@ -129,36 +146,22 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--workers", type=int, default=max(1, config.CORE_BUDGET // config.SESSIONS)
     )
-    # Whatever this names is copied to `config.SEED_PROGRAM`, and that copy is
+    # Whatever this names is copied to the run's `seed_program`, and that copy is
     # what `copycheck` exempts, so a run started from a snapshot exempts the
     # snapshot and a run started from the default exempts the default. There
     # is nothing here for the gate to disagree with.
     parser.add_argument("--seed-agent", type=Path, default=config.SEED)
+    # The directory this campaign owns. A flag rather than a constant so a
+    # dry run and a test each name their own, instead of reaching into this
+    # module to move one -- which is what used to happen, and what silently
+    # failed against a path captured in a default argument.
+    parser.add_argument("--run-root", type=Path, default=config.RUN)
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="fake calls, no log, every write under run/campaign/dry-run",
     )
     return parser.parse_args(argv)
-
-
-def _isolate(root: Path) -> None:
-    """Point every file the campaign writes at ``root``, for a dry run.
-
-    A dry run fakes the codex call and disables the log, but the rest of it
-    is the campaign: it evaluates, inserts, gates and promotes. Left on the
-    real paths it does that to the live database, the live pool and the live
-    floor, which is a campaign silently corrupted by someone checking that
-    the plumbing works. The pool moves too, so a dry run starts from the
-    roster rather than a live pool holding champions it will then retire.
-
-    Args:
-        root: The directory the dry run owns.
-    """
-    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "FIELD"):
-        setattr(config, name, root / getattr(config, name).relative_to(config.RUN))
-    config.POOL = root / "pool.json"
-    LOGGER.info("dry run: every write goes under %s", root)
 
 
 def _open_run(dry_run: bool) -> wandb.Run:
@@ -197,9 +200,9 @@ def _open_run(dry_run: bool) -> wandb.Run:
     return log
 
 
-def state_file() -> Path:
+def state_file(paths: config.Run) -> Path:
     """Where the state a restart resumes from lives, beside the database."""
-    return config.ARCHIVE.with_name("state.json")
+    return paths.state
 
 
 class State(BaseModel):
@@ -223,13 +226,14 @@ def run(
     seed_agent: Path,
     rng: random.Random,
     log: wandb.Run,
+    paths: config.Run,
 ) -> State:
     """Load what a restart resumes, seed an empty database, drive the workers.
 
     ``sessions`` is how many this run starts; what is in flight when the last
     is taken is drained. Returns the state as of the last completed session.
     """
-    resume = state_file()
+    resume = state_file(paths)
     state = (
         State.model_validate_json(resume.read_text(encoding="utf-8"))
         if resume.exists()
@@ -238,14 +242,14 @@ def run(
     # `state.json` is written after every session, `champion.json` the moment
     # a champion is in the pool. A kill in between leaves the first stale, so
     # the second wins: otherwise the gate would restart with no baseline.
-    champion = gate.load_champion()
+    champion = gate.load_champion(paths)
     if champion is not None:
         state.champion = champion
         LOGGER.info("resuming on champion %s from champion.json", champion.name)
-    pool = Pool.load(config.POOL) if config.POOL.exists() else Pool.initial()
+    pool = Pool.load(paths.pool) if paths.pool.exists() else Pool.initial()
     # A champion's name resolves through the pool file, so the pool on disk
     # must be current before anything plays a game.
-    pool.save(config.POOL)
+    pool.save(paths.pool)
     # Before anything is judged against this pool, the pool has to have played
     # itself. `standing` fits over the pairings that exist and plays nothing,
     # and `Field.results` returns only what it holds, so a tournament run
@@ -259,17 +263,20 @@ def run(
     # twelve-agent pool -- and every start after that finds them already
     # played and measures nothing.
     measured = gate.refresh(
-        pool, rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS), workers
+        pool,
+        rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+        workers,
+        paths,
     )
     if measured:
         LOGGER.info("field: measured %d pool pairing(s) before starting", len(measured))
-    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
+    database = archive.Database(paths.archive, paths.programs)
     if not database.programs:
-        seed = evaluator.score(seed_agent, SEED_ID, pool, rng, workers)
+        seed = evaluator.score(seed_agent, SEED_ID, pool, rng, workers, paths.pool)
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
         database.add(_program(SEED_ID, stored, "", "seed", "", seed))
         LOGGER.info("seeded from %s at fast fitness %.3f", seed_agent, seed.fitness)
-    campaign = Campaign(state, database, pool, mutator, workers, rng, log)
+    campaign = Campaign(state, database, pool, mutator, workers, rng, log, paths)
     asyncio.run(campaign.drive(sessions))
     return campaign.state
 
@@ -322,6 +329,7 @@ class Campaign:
         workers: int,
         rng: random.Random,
         log: wandb.Run,
+        paths: config.Run,
     ) -> None:
         self.state = state
         self.database = database
@@ -330,6 +338,9 @@ class Campaign:
         self.workers = workers
         self.rng = rng
         self.log = log
+        # Every file this campaign writes, so nothing here reaches for a
+        # module-level path and no test has to swap one out from under it.
+        self.paths = paths
         self.remaining = 0
         # Calls in a row that ran to no verdict. A call that never reached the
         # model is nobody's failure, so it writes nothing and the worker
@@ -443,7 +454,7 @@ class Campaign:
             failures = self.database.failures(name)
             siblings = self.database.children(name)
             standings = gate.standing(
-                name, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
+                name, result.rates, self.snapshot(), 2 * config.GATE_SEEDS, self.paths
             )
             message = prompt.compose(
                 name, result, failures, siblings, instruction, standings
@@ -455,7 +466,11 @@ class Campaign:
             source, name, result = outcome
             cleared, why = gate.promotion(
                 gate.standing(
-                    name, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
+                    name,
+                    result.rates,
+                    self.snapshot(),
+                    2 * config.GATE_SEEDS,
+                    self.paths,
                 ),
                 name,
             )
@@ -522,7 +537,11 @@ class Campaign:
             record["calls/fitness"] = result.fitness
             record["calls/field"] = result.field
             table = gate.standing(
-                program_id, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
+                program_id,
+                result.rates,
+                self.snapshot(),
+                2 * config.GATE_SEEDS,
+                self.paths,
             )
             record["calls/rating"] = table[program_id]
             record["calls/place"] = 1 + sorted(
@@ -573,7 +592,9 @@ class Campaign:
         if mutation.child is None:
             self.fail(started_from, drawn, f"{mutation.status}: {mutation.reason}")
             return None
-        verdict = await asyncio.to_thread(validate.validate, mutation.child)
+        verdict = await asyncio.to_thread(
+            validate.validate, mutation.child, 720, self.paths.seed_program
+        )
         if verdict.status != "ok":
             self.fail(started_from, drawn, f"{verdict.status}: {verdict.reason}")
             return None
@@ -588,7 +609,7 @@ class Campaign:
             self.fail(started_from, drawn, f"gate: {error}")
             return None
         table = gate.standing(
-            program_id, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
+            program_id, result.rates, self.snapshot(), 2 * config.GATE_SEEDS, self.paths
         )
         self.database.add(
             _program(
@@ -636,8 +657,10 @@ class Campaign:
                 # The file work in a thread; the pool it joins on the loop,
                 # where the other seven workers are reading it.
                 program = self.database.get(program_id)
-                champion = await asyncio.to_thread(gate.promote, program, result)
-                gate.enroll(champion, self.pool)
+                champion = await asyncio.to_thread(
+                    gate.promote, program, result, self.paths
+                )
+                gate.enroll(champion, self.pool, self.paths)
                 # The pool is the top of the tournament: the champion has just
                 # joined it and the weakest opponent makes way, so the field a
                 # candidate has to finish above is the strongest one there is.
@@ -645,9 +668,9 @@ class Campaign:
                     {**table, champion.name: table[program_id]}, config.POOL_SIZE
                 )
                 if dropped:
-                    self.pool.save(config.POOL)
+                    self.pool.save(self.paths.pool)
                     LOGGER.info("pool: %s made way", ", ".join(dropped))
-                self.state.champion = gate.record(champion)
+                self.state.champion = gate.record(champion, self.paths)
                 self.state.sessions_since_promotion = 0
                 # Last, and after the record, because it is the only slow step
                 # here: the champion joined the pool with no pairings of its
@@ -674,6 +697,7 @@ class Campaign:
                     self.snapshot(),
                     self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
                     self.workers,
+                    self.paths,
                 )
                 LOGGER.info(
                     "field: %d new pairing(s) for %s", len(measured), champion.name
@@ -699,6 +723,7 @@ class Campaign:
             self.snapshot(),
             random.Random(self.rng.random()),
             self.workers,
+            self.paths.pool,
         )
 
     def snapshot(self) -> Pool:
@@ -740,7 +765,7 @@ class Campaign:
         """Count the session, persist the state, and log its line."""
         self.state.sessions += 1
         self.state.sessions_since_promotion += 1
-        resume = state_file()
+        resume = state_file(self.paths)
         resume.parent.mkdir(parents=True, exist_ok=True)
         resume.write_text(self.state.model_dump_json(indent=2), encoding="utf-8")
         self.log.log(

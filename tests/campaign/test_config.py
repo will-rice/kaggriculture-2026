@@ -136,13 +136,15 @@ def test_the_deleted_constants_are_gone() -> None:
 def test_runtime_paths_live_under_run_campaign() -> None:
     """All runtime paths live under the run campaign directory."""
     for path in (
-        config.ARCHIVE,
-        config.PROGRAMS,
-        config.FLOOR,
-        config.CHAMPIONS,
-        config.CHAMPION,
+        config.LIVE.archive,
+        config.LIVE.programs,
+        config.LIVE.floor,
+        config.LIVE.champions,
+        config.LIVE.champion,
+        config.LIVE.field,
+        config.LIVE.state,
     ):
-        assert config.RUN in path.parents
+        assert config.LIVE.root in path.parents
 
 
 def test_the_pool_file_is_not_a_sibling_of_the_run_directory() -> None:
@@ -153,5 +155,5 @@ def test_the_pool_file_is_not_a_sibling_of_the_run_directory() -> None:
 
 def test_each_champion_keeps_its_own_file_apart_from_the_floor() -> None:
     """A pool of N champions must be able to hold N different programs."""
-    assert config.CHAMPIONS != config.FLOOR
-    assert config.FLOOR not in config.CHAMPIONS.parents
+    assert config.LIVE.champions != config.LIVE.floor
+    assert config.LIVE.floor not in config.LIVE.champions.parents

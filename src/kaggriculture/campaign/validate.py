@@ -342,12 +342,14 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
     return Verdict.model_validate(payload)
 
 
-def validate(agent: Path, steps: int = 720) -> Verdict:
+def validate(agent: Path, steps: int = 720, seed: Path | None = None) -> Verdict:
     """Run every check, cheapest first, and return the first one that fails.
 
     Args:
         agent: The candidate's `main.py`.
         steps: How many turns `harness.check` plays before stopping.
+        seed: The program this campaign was seeded from, whose lineage
+            the copy check exempts. None exempts nothing.
 
     Returns:
         The first failing `Verdict`, or `status="ok"`.
@@ -367,7 +369,7 @@ def validate(agent: Path, steps: int = 720) -> Verdict:
     # not as an incidental import the whitelist happens not to name -- the
     # whitelist exists to bound what our own candidates may do, and a copy
     # is not one of ours to bound.
-    offender, score = copycheck.against_opponents(source)
+    offender, score = copycheck.against_opponents(source, seed)
     if score >= copycheck.THRESHOLD:
         name = offender.split(":", 1)[0]
         return Verdict(status="copy", reason=f"{score:.3f} similar to {name}")

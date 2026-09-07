@@ -136,7 +136,12 @@ def opponents(pool: Pool, program_id: str, agent: Path) -> Pool:
 
 
 def score(
-    agent: Path, program_id: str, pool: Pool, rng: random.Random, workers: int
+    agent: Path,
+    program_id: str,
+    pool: Pool,
+    rng: random.Random,
+    workers: int,
+    pool_file: Path | None = None,
 ) -> Result:
     """Mean win rate over ``GATE_SEEDS`` fresh seeds, both seats.
 
@@ -158,6 +163,8 @@ def score(
         pool: The opponents to measure against.
         rng: The generator the seeds are drawn from.
         workers: Processes to fan the games over.
+        pool_file: Where a champion's name resolves from, since the
+            roster only knows the vendored opponents.
 
     Returns:
         The mean fitness, the per-opponent rates and margins, the seeds
@@ -170,7 +177,7 @@ def score(
     measured = opponents(pool, program_id, agent)
     names = measured.names()
     seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
-    games = harness.play(agent, names, seeds, workers, days=True)
+    games = harness.play(agent, names, seeds, workers, days=True, pool=pool_file)
     rates = _rates(games, names)
     # Ties on the rate are broken by the margin, because before the first win
     # every rate is 0.0 and `min` would otherwise always name the first pool
