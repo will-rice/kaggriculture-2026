@@ -27,11 +27,9 @@ import logging
 from kaggriculture.campaign import dataset, tapes
 
 LOGGER = logging.getLogger(__name__)
-# How many of the ladder's teams to name at the end, and the fewest games a
-# team must have played to be one of them. A team that played twice and won
-# both is not the strongest agent on the ladder.
-SHOWN = 15
-LEAST = 30
+# How many of the ladder's teams to name at the end.
+SHOWN = 25
+LEAST = dataset.LEAST
 
 
 def main() -> None:
@@ -60,11 +58,20 @@ def main() -> None:
     corpus = tapes.archives(arguments.since)
     LOGGER.info("reading %d archives into %s", len(corpus), arguments.database)
     dataset.build(corpus, arguments.database, arguments.workers)
+    rated = dataset.rate(arguments.database, LEAST)
     LOGGER.info("%s", dataset.summarise(arguments.database))
 
-    LOGGER.info("\n%-40s%8s%8s", "team", "games", "won")
-    for team, games, rate in dataset.leaderboard(arguments.database, LEAST)[:SHOWN]:
-        LOGGER.info("%-40s%8d%7.0f%%", team[:38], games, 100 * rate)
+    LOGGER.info("\n%4s  %-38s%8s%8s%9s", "#", "team", "games", "won", "rating")
+    for team, games, wins, value, place in dataset.ladder(arguments.database)[:SHOWN]:
+        LOGGER.info(
+            "%4d  %-38s%8d%7.0f%%%+9.3f",
+            place,
+            team[:36],
+            games,
+            100 * wins / games,
+            value,
+        )
+    LOGGER.info("\n%d teams rated of %d that played", rated, len(corpus) and rated)
 
 
 if __name__ == "__main__":

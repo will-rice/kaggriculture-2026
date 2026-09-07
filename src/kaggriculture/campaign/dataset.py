@@ -42,7 +42,7 @@ from typing import Any
 
 from tqdm import tqdm
 
-from kaggriculture.campaign import config, tapes
+from kaggriculture.campaign import config, rating, tapes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +52,10 @@ DATABASE = config.EPISODES.parent / "corpus.sqlite"
 # Processes to divide the archives over. The same reasoning as
 # `paired.WORKERS`: the campaign loop is usually running while this is.
 WORKERS = 8
+# The fewest games a team must have played to be rated. A team that played
+# twice and won both is not the strongest agent on the ladder, and a rating
+# fitted from two games is the prior wearing a number.
+LEAST = 40
 # A season, and the hours in a day. A day's row is that day at its last hour,
 # which is what both players saw before their final decision in it.
 DAYS = 30
@@ -132,6 +136,13 @@ CREATE TABLE IF NOT EXISTS prices (
     price      INTEGER,
     stock      INTEGER
 );
+CREATE TABLE IF NOT EXISTS teams (
+    team       TEXT PRIMARY KEY,
+    games      INTEGER,
+    wins       INTEGER,
+    rating     REAL,
+    place      INTEGER
+);
 """
 # Built after the load, not before: an index makes every insert cost a tree
 # walk, and there are twenty million of them.
@@ -144,6 +155,8 @@ CREATE INDEX IF NOT EXISTS moves_day ON moves (episode, seat, day);
 CREATE INDEX IF NOT EXISTS prices_day ON prices (episode, day);
 """
 TABLES = ("episodes", "days", "holdings", "orders", "moves", "prices")
+# Written by `rate` after the load, from what the load produced.
+DERIVED = ("teams",)
 
 
 def build(corpus: list[Path], database: Path = DATABASE, workers: int = WORKERS) -> int:
@@ -393,7 +406,7 @@ def counts(database: Path = DATABASE) -> dict[str, int]:
     try:
         return {
             table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608 - table names are this module's own constants
-            for table in TABLES
+            for table in TABLES + DERIVED
         }
     finally:
         connection.close()
@@ -415,6 +428,112 @@ def summarise(database: Path = DATABASE) -> str:
         connection.close()
     lines.append(f"{teams} distinct teams, {span[0]} to {span[1]}")
     return "\n".join(lines)
+
+
+def rate(database: Path = DATABASE, least: int = LEAST) -> int:
+    """Fit one Bradley-Terry strength per team and store it in ``teams``.
+
+    A win rate says who won and takes no view on who they played; over a
+    ladder where hundreds of teams meet unevenly that is most of the number.
+    The agent this campaign was seeded from wins 74% of 668 games and rates
+    46th of 160, and the difference between those two readings is the
+    schedule.
+
+    Only teams inside the largest connected group are rated: a team whose
+    opponents all fell below ``least`` has no path to a comparison, and a
+    rating fitted for it would be the prior wearing a number.
+
+    Args:
+        database: The dataset, already built.
+        least: The fewest games a team must have played to be rated.
+
+    Returns:
+        How many teams were rated.
+    """
+    connection = sqlite3.connect(database)
+    try:
+        # `rate` is its own entry point, run against a database `build` may
+        # have written before this table existed.
+        connection.executescript(SCHEMA)
+        played = connection.execute(
+            "SELECT team_0, team_1, winner FROM episodes WHERE winner IS NOT NULL"
+        ).fetchall()
+        rows = _rate(played, least)
+        connection.execute("DELETE FROM teams")
+        connection.executemany("INSERT INTO teams VALUES (?,?,?,?,?)", rows)
+        connection.commit()
+        return len(rows)
+    finally:
+        connection.close()
+
+
+def _rate(played: list[tuple], least: int) -> list[tuple]:
+    """Every rated team as a `teams` row, strongest first."""
+    counts: dict[str, list[int]] = {}
+    for one, two, winner in played:
+        counts.setdefault(one, [0, 0])[0] += 1
+        counts.setdefault(two, [0, 0])[0] += 1
+        counts[one][1] += int(winner == 0)
+        counts[two][1] += int(winner == 1)
+    kept = {team for team, (games, _) in counts.items() if games >= least}
+
+    pairs: dict[tuple[str, str], list[int]] = {}
+    for one, two, winner in played:
+        if one == two or one not in kept or two not in kept:
+            continue
+        first, second = (one, two) if one < two else (two, one)
+        tally = pairs.setdefault((first, second), [0, 0])
+        tally[0] += int((winner == 0) == (one == first))
+        tally[1] += 1
+
+    joined = _connected(pairs)
+    results = [
+        (one, two, won / total, total)
+        for (one, two), (won, total) in pairs.items()
+        if one in joined and two in joined
+    ]
+    if not results:
+        return []
+    strengths = rating.standings(results)
+    ordered = sorted(strengths.items(), key=lambda pair: -pair[1])
+    return [
+        (team, counts[team][0], counts[team][1], value, place)
+        for place, (team, value) in enumerate(ordered, start=1)
+    ]
+
+
+def _connected(pairs: dict[tuple[str, str], list[int]]) -> set[str]:
+    """The largest group of teams joined by games, so every rating compares."""
+    neighbours: dict[str, set[str]] = {}
+    for one, two in pairs:
+        neighbours.setdefault(one, set()).add(two)
+        neighbours.setdefault(two, set()).add(one)
+    seen: set[str] = set()
+    best: set[str] = set()
+    for start in neighbours:
+        if start in seen:
+            continue
+        group, queue = {start}, [start]
+        while queue:
+            for other in neighbours[queue.pop()]:
+                if other not in group:
+                    group.add(other)
+                    queue.append(other)
+        seen |= group
+        if len(group) > len(best):
+            best = group
+    return best
+
+
+def ladder(database: Path = DATABASE) -> list[tuple]:
+    """Every rated team, strongest first, as `rate` stored them."""
+    connection = sqlite3.connect(database)
+    try:
+        return connection.execute(
+            "SELECT team, games, wins, rating, place FROM teams ORDER BY place"
+        ).fetchall()
+    finally:
+        connection.close()
 
 
 def leaderboard(database: Path = DATABASE, least: int = 30) -> list[tuple]:

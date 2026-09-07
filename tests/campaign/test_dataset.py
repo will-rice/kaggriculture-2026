@@ -266,3 +266,73 @@ def test_the_ladder_is_read_off_the_corpus(tmp_path: Path) -> None:
     standing = dataset.leaderboard(tmp_path / "corpus.sqlite", least=3)
 
     assert standing == [("Ada", 3, 2 / 3), ("Grace", 3, 1 / 3)]
+
+
+def test_a_rating_is_not_a_win_rate(tmp_path: Path) -> None:
+    """Who they played is most of what a win rate says.
+
+    Here Ada beats Cyd every time and Cyd beats Bea every time, so Ada is
+    strongest -- but Bea's record is the best in the table, because Bea only
+    ever played Dot, who is worse than everyone. A win rate ranks Bea first
+    and a Bradley-Terry fit does not, which is the whole reason for the
+    column: the agent this campaign was seeded from wins 74% of 668 games and
+    rates 46th.
+    """
+    games: list[tapes.Episode] = []
+
+    def series(one: str, two: str, won: int, lost: int) -> None:
+        """``one`` beats ``two`` that many times, and loses the rest."""
+        for banks in [(900.0, 300.0)] * won + [(300.0, 900.0)] * lost:
+            games.append(game(len(games) + 1, banks, [one, two]))
+
+    # Ada's 60% is against Cyd, who is far above Dot. Bea's 90% is against Dot
+    # alone -- the same 90% Cyd manages against Dot, so Bea has shown nothing
+    # Cyd has not, and nothing at all against anyone above Dot.
+    series("Ada", "Cyd", 6, 4)
+    series("Cyd", "Dot", 9, 1)
+    series("Bea", "Dot", 9, 1)
+    connection = built(tmp_path, games)
+    connection.close()
+    database = tmp_path / "corpus.sqlite"
+
+    dataset.rate(database, least=10)
+
+    connection = sqlite3.connect(database)
+    rated = [
+        team for (team,) in connection.execute("SELECT team FROM teams ORDER BY place")
+    ]
+    by_rate = [team for team, _, _ in dataset.leaderboard(database, least=10)]
+
+    # Bea has the best record in the table and is not the best agent in it.
+    assert by_rate[0] == "Bea"
+    assert rated[0] == "Ada"
+    assert rated.index("Ada") < rated.index("Bea")
+    assert rated[-1] == "Dot"
+
+
+def test_a_rating_needs_both_enough_games_and_a_path_to_the_field(
+    tmp_path: Path,
+) -> None:
+    """Two ways to have no comparison, and both leave a team unrated.
+
+    A team that played twice has a record and not evidence. A pair that only
+    ever played each other cannot be placed against anyone else however many
+    games they played. Fitting a number for either produces the prior wearing
+    a rating, which reads exactly like a measurement.
+    """
+    games = [game(n, (900.0, 300.0), ["Ada", "Cyd"]) for n in range(1, 7)]
+    games += [game(n, (900.0, 300.0), ["Far", "Off"]) for n in range(7, 13)]
+    # Played once, won it. Not the best agent on this ladder.
+    games.append(game(13, (900.0, 300.0), ["Cameo", "Ada"]))
+    connection = built(tmp_path, games)
+    connection.close()
+    database = tmp_path / "corpus.sqlite"
+
+    dataset.rate(database, least=6)
+
+    connection = sqlite3.connect(database)
+    rated = {team for (team,) in connection.execute("SELECT team FROM teams")}
+
+    assert "Cameo" not in rated
+    # One island or the other, never both: they share no game.
+    assert rated in ({"Ada", "Cyd"}, {"Far", "Off"})
