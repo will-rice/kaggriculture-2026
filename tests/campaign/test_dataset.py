@@ -180,8 +180,8 @@ def test_a_day_carries_the_husbandry_a_tile_count_cannot_show(tmp_path: Path) ->
 def test_every_day_of_the_season_is_present(tmp_path: Path) -> None:
     """Including the last, which closes on the final step no action follows.
 
-    `paired.sides` lost that day twice, and both times every claim about the
-    close came back with zero support rather than with an error.
+    The tape walk this replaced lost that day twice, and both times every
+    claim about the close came back with zero support rather than an error.
     """
     connection = built(tmp_path, [game(1004, (900.0, 300.0), ["Ada", "Grace"])])
 

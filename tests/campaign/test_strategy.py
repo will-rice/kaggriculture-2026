@@ -1,4 +1,10 @@
-"""A claim is what could be wrong; the form is what decides whether it is."""
+"""A claim is a question put to the corpus; the corpus supplies the answer.
+
+The direction is the thing this module exists to keep out of a caller's
+hands. The first version let a form carry its own answer, so a plausible
+sentence could be written and then confirmed -- and eleven of them were,
+before a bigger corpus refuted ten.
+"""
 
 from pathlib import Path
 
@@ -7,52 +13,107 @@ import pytest
 from kaggriculture.campaign import strategy
 
 
-def form(quantity: str = "planted", day: int = 20, leads: bool = True) -> strategy.Form:
-    """A measurable statement, defaulted to one that is true."""
-    return strategy.Form(quantity=quantity, day=day, winner_leads=leads)
+def form(quantity: str = "planted", day: int = 20) -> strategy.Form:
+    """A question: what to compare, and when. No answer attached."""
+    return strategy.Form(quantity=quantity, day=day)
 
 
-def test_a_game_that_ties_on_the_quantity_is_not_evidence() -> None:
-    """Neither for nor against: it is left out of the count, not halved.
+def claim(
+    store: strategy.Strategies,
+    quantity: str = "planted",
+    day: int = 20,
+    support: int = 4000,
+    agreement: float = 0.8,
+) -> strategy.Claim:
+    """A claim the corpus has already spoken about."""
+    made = store.propose(form(quantity, day))
+    store.record(made.id, support=support, agreement=agreement)
+    return made
 
-    Counting ties as disagreement would refuse every claim about a quantity
-    the two sides usually match on, and counting them as agreement would
-    confirm any claim at all about one.
+
+def test_a_form_carries_no_direction(tmp_path: Path) -> None:
+    """The flaw the whole rewrite is about.
+
+    "Winners carry more in the shed" was written, then measured, then
+    confirmed at 82% of 49 games -- and over thirteen thousand games it is
+    50%. Writing the hypothesis and grading it are the same act when the
+    direction is proposed, so a form names a quantity and a day and stops.
     """
-    rule = form()
-
-    assert rule.holds(winner=10, loser=4) is True
-    assert rule.holds(winner=4, loser=10) is False
-    assert rule.holds(winner=7, loser=7) is None
+    assert set(form().model_dump()) == {"quantity", "day"}
 
 
-def test_a_claim_can_be_that_the_winner_trails() -> None:
-    """Often the interesting one.
+def test_the_corpus_decides_which_way_it_goes(tmp_path: Path) -> None:
+    """Above the bar the stronger side leads; below it, the stronger trails.
 
-    Winners hold *less* bank on day eight and issue *fewer* hire orders than
-    the side that loses; a store that could only say "more" could not hold
-    either finding.
+    Both are findings, and the second is often the interesting one: the
+    strong agents sell *less* than the weak ones, which no one would have
+    proposed.
     """
-    rule = form("bank", day=8, leads=False)
+    store = strategy.Strategies(tmp_path / "strategies.jsonl")
 
-    assert rule.holds(winner=3_731, loser=8_187) is True
-    assert rule.holds(winner=8_187, loser=3_731) is False
+    leads = claim(store, "planted", 5, agreement=0.80)
+    trails = claim(store, "sold_units", 20, agreement=0.20)
+    neither = claim(store, "bank", 8, agreement=0.52)
+
+    assert leads.status == "leads" and leads.ahead() is True
+    assert trails.status == "trails" and trails.ahead() is False
+    assert neither.status == "open"
+    with pytest.raises(ValueError, match="is open"):
+        neither.ahead()
 
 
-def test_a_claim_selects_the_program_that_is_not_doing_it() -> None:
-    """What makes a claim worth showing is not that it is true.
+def test_a_claim_nobody_has_measured_enough_says_nothing(tmp_path: Path) -> None:
+    """Support is a bar, not a formality.
 
-    It is that this program is on the wrong side of it. That is what keeps
-    the message the size of the gap rather than the size of the store.
+    Eight of eleven claims cleared at sixty games and one survived fourteen
+    thousand. A share without a count behind it reads exactly like a finding.
     """
-    rule = form("planted", day=20, leads=True)
+    store = strategy.Strategies(tmp_path / "strategies.jsonl")
 
-    assert rule.wrong_side(ours=12, theirs=58) is True
-    assert rule.wrong_side(ours=58, theirs=12) is False
-    assert rule.wrong_side(ours=30, theirs=30) is False
+    thin = claim(store, support=strategy.SUPPORT - 1, agreement=0.95)
+
+    assert thin.status == "open"
+    assert not thin.settled
+    store.record(thin.id, support=strategy.SUPPORT, agreement=0.95)
+    assert thin.settled
 
 
-def test_a_claim_about_something_unmeasurable_is_refused(tmp_path: Path) -> None:
+def test_an_open_claim_never_puts_a_program_on_a_side(tmp_path: Path) -> None:
+    """With no direction there is no wrong side to be on.
+
+    A claim that cannot say which way it goes must not be shown to a round as
+    though it could.
+    """
+    store = strategy.Strategies(tmp_path / "strategies.jsonl")
+    open_claim = claim(store, agreement=0.5)
+    settled = claim(store, "shed", 12, agreement=0.8)
+
+    assert open_claim.wrong_side(ours=1, theirs=99) is False
+    # The stronger side holds more shed, and this program holds less.
+    assert settled.wrong_side(ours=1, theirs=99) is True
+    assert settled.wrong_side(ours=99, theirs=1) is False
+    assert settled.wrong_side(ours=5, theirs=5) is False
+
+
+def test_a_trailing_claim_puts_the_program_that_does_more_on_the_wrong_side(
+    tmp_path: Path,
+) -> None:
+    """The direction has to reach selection, or half the findings invert.
+
+    The strong agents sell less. A program that sells more is the one that
+    needs telling, and reading the direction off the agreement rather than
+    off a stored flag is what makes that come out right.
+    """
+    store = strategy.Strategies(tmp_path / "strategies.jsonl")
+    sells_less = claim(store, "sold_units", 20, agreement=0.15)
+
+    assert sells_less.wrong_side(ours=5000, theirs=2000) is True
+    assert sells_less.wrong_side(ours=2000, theirs=5000) is False
+
+
+def test_a_claim_about_something_the_dataset_cannot_measure_is_refused(
+    tmp_path: Path,
+) -> None:
     """The store is claims with evidence; one that cannot be checked is prose.
 
     Refused at the point of writing rather than stored and quietly never
@@ -62,37 +123,50 @@ def test_a_claim_about_something_unmeasurable_is_refused(tmp_path: Path) -> None
     store = strategy.Strategies(tmp_path / "strategies.jsonl")
 
     with pytest.raises(ValueError, match="unmeasurable"):
-        store.propose(form("vibes"), "winners have better vibes", [1])
+        store.propose(form("vibes"))
     with pytest.raises(ValueError, match="outside the season"):
-        store.propose(form(day=44), "on day forty-four", [1])
+        store.propose(form(day=44))
 
 
-def test_evidence_decides_the_status_and_prose_never_does(tmp_path: Path) -> None:
-    """The form decides. The sentence is commentary on it.
+def test_the_quantities_are_the_datasets_own_columns() -> None:
+    """One list, read off the schema, so the two cannot drift apart.
 
-    Written the other way round, a model that says "winners keep planting to
-    the last day" would have produced a rule; measured, that is a 69%
-    tendency over 43 games. Both are worth having and they are not the same.
+    A column added to the extraction is a question that can be asked about
+    it, with nothing to remember to update -- and a claim can never name a
+    column that is not there.
+    """
+    assert "sold_units" in strategy.QUANTITIES
+    assert "watered" in strategy.QUANTITIES
+    assert "bank" in strategy.QUANTITIES
+    # The keys of a day row are not quantities to compare sides on.
+    assert not {"episode", "seat", "day", "team"} & strategy.QUANTITIES
+
+
+def test_prose_is_attached_after_the_measurement_and_never_decides(
+    tmp_path: Path,
+) -> None:
+    """A sentence is commentary on a finding, not a way of making one.
+
+    A claim with no sentence is still shown, because the measurement is the
+    finding; a sentence can only ever be added to one the corpus settled.
     """
     store = strategy.Strategies(tmp_path / "strategies.jsonl")
-    claim = store.propose(form(), "winners keep planting to the last day", [11, 22])
+    made = claim(store, "shed", 12, support=4102, agreement=0.78)
 
-    assert claim.status == "proposed"  # nothing measured yet
-    store.record(claim.id, support=10, agreement=1.0)
-    assert claim.status == "proposed"  # ten games is not evidence
-    store.record(claim.id, support=43, agreement=0.69)
-    assert claim.status == "confirmed"
-    store.record(claim.id, support=400, agreement=0.31)
-    assert claim.status == "refuted"
-    assert "69%" not in claim.says() and "31%" in claim.says()
+    assert made.reads() == made.says()
+    assert "78% of 4102 games" in made.says()
+
+    store.describe(made.id, "the strong agents keep a fuller shed")
+    assert made.reads().startswith("the strong agents keep a fuller shed -- ")
+    assert made.says() in made.reads()
 
 
-def test_the_same_form_twice_is_one_claim_with_two_sources(tmp_path: Path) -> None:
-    """Two readers arriving at one statement is more evidence, not more work."""
+def test_the_same_question_asked_twice_is_one_claim(tmp_path: Path) -> None:
+    """The grammar is enumerated every run, so re-proposing is the normal case."""
     store = strategy.Strategies(tmp_path / "strategies.jsonl")
 
-    first = store.propose(form(), "expand early", [1])
-    again = store.propose(form(), "worded quite differently", [2])
+    first = store.propose(form())
+    again = store.propose(form())
 
     assert again.id == first.id
     assert len(store.claims) == 1
@@ -101,32 +175,39 @@ def test_the_same_form_twice_is_one_claim_with_two_sources(tmp_path: Path) -> No
 def test_the_log_survives_a_restart_and_keeps_both_measurements(
     tmp_path: Path,
 ) -> None:
-    """A claim confirmed at sixty games and refuted at four hundred keeps both.
+    """A claim settled over one corpus and undone over a bigger one keeps both.
 
-    The second does not erase the first: what changed is the evidence, and a
-    store that overwrote it would lose the fact that the corpus once said
-    otherwise.
+    What changed is the evidence, and a store that overwrote it would lose
+    the fact that the corpus once said otherwise -- which is the single most
+    useful thing this store has recorded.
     """
     path = tmp_path / "strategies.jsonl"
     store = strategy.Strategies(path)
-    claim = store.propose(form(), "expand early", [1])
-    store.record(claim.id, support=60, agreement=0.80)
-    store.record(claim.id, support=400, agreement=0.30)
+    made = claim(store, support=600, agreement=0.80)
+    store.record(made.id, support=13431, agreement=0.50)
 
     again = strategy.Strategies(path)
 
-    assert again.get(claim.id).status == "refuted"
+    assert again.get(made.id).status == "open"
     assert path.read_text(encoding="utf-8").count('"evidence"') == 2
 
 
-def test_confirmed_claims_come_back_strongest_first(tmp_path: Path) -> None:
-    """A round sees the best-evidenced first, because the message has a budget."""
-    store = strategy.Strategies(tmp_path / "strategies.jsonl")
-    weak = store.propose(form("hands", 12), "hands", [1])
-    strong = store.propose(form("planted", 12), "planted", [1])
-    unmeasured = store.propose(form("shed", 12), "shed", [1])
-    store.record(weak.id, support=40, agreement=0.70)
-    store.record(strong.id, support=40, agreement=0.95)
+def test_settled_claims_come_back_by_how_far_they_separate_the_sides(
+    tmp_path: Path,
+) -> None:
+    """A round has a budget, so the clearest separation is shown first.
 
-    assert [claim.id for claim in store.confirmed()] == [strong.id, weak.id]
-    assert unmeasured.id not in {claim.id for claim in store.confirmed()}
+    Distance from a coin flip, not raw agreement: a claim at 15% separates
+    the sides exactly as sharply as one at 85%, and reading it as the weaker
+    of the two would bury every finding about doing less of something.
+    """
+    store = strategy.Strategies(tmp_path / "strategies.jsonl")
+    mild = claim(store, "planted", 5, agreement=0.70)
+    sharp_low = claim(store, "sold_units", 20, agreement=0.10)
+    sharp_high = claim(store, "shed", 12, agreement=0.93)
+    unmeasured = store.propose(form("weeds", 29))
+
+    order = [c.id for c in store.settled()]
+
+    assert order == [sharp_high.id, sharp_low.id, mild.id]
+    assert unmeasured.id not in order

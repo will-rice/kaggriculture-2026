@@ -1,23 +1,31 @@
-"""Claims about how the ladder's winners play, and the evidence for each.
+"""Claims about how the ladder's strongest agents play, and the evidence.
 
 The tables in ``winning_pace.md`` are a snapshot: true when they were measured
 and unattached to any statement about why. A claim is the other thing -- a
-sentence that could be wrong, with a form that says how to find out.
+statement that could be wrong, with a form that says how to find out.
 
-Every claim carries both. The prose is what a reader wrote about a game; the
-form is what gets measured, and it is the form that decides. That order
-matters, because a model asked what a winner did differently will write
-something plausible whether or not it is true, and today it wrote that winners
-keep planting to the last day. Measured over 43 paired games that is a 69%
-tendency and not a rule -- which is a useful thing to know and a different
-thing from what the sentence said.
+Two things decide whether such a statement means anything, and the first
+version of this got the second one wrong.
 
-A form is deliberately small: a quantity, a day, and which side leads. That is
-enough to do three jobs at once. It verifies a claim, by counting the games
-that agree. It selects one, by asking whether the program being judged is on
-the wrong side of it. And it ranks what is selected, by how far off that
-program is. Retrieval is arithmetic rather than a search over sentences, so
-the store can grow without the message growing.
+**Paired.** A claim is measured inside single games, comparing the two sides
+at the same day's close. Same map, same prices, same opponent, so what is left
+when they differ is what the two players did. An average over the corpus would
+compare farms that never met.
+
+**Rated.** The comparison is between the stronger and the weaker *agent*, not
+between the winner and the loser of that game. Half of every ladder's winners
+are the weaker side having a good day, and measured that way eleven claims
+over thirteen thousand games all came back between 45% and 60% -- noise, and
+one of them was the reverse of what the same corpus says when the sides are
+compared by rating instead.
+
+**The direction is measured, not proposed.** A form names a quantity and a
+day; it does not say which way it goes. That is what the corpus answers, and
+the reason is the whole history of this module: a person writing "winners
+carry more in the shed" and then confirming it has proposed a hypothesis and
+graded their own paper. A form is a question, an agreement above `CONFIRM`
+says the stronger side leads, one below `REFUTE` says it trails, and anything
+between says the quantity does not separate them.
 
 The log is append-only and replayed, like the program database: a claim
 confirmed over sixty games and refuted over four hundred keeps both records,
@@ -32,108 +40,132 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-# What a claim may be about: the quantities the paired walk measures for both
-# sides of a game. A claim naming anything else cannot be checked, and is
-# refused rather than stored unverifiable.
-QUANTITIES: frozenset[str] = frozenset(
-    {
-        "bank",
-        "planted",
-        "ripe",
-        "pens",
-        "hands",
-        "quadrants",
-        "shed",
-        "seeds",
-        "sells",
-        "hires",
-        "land",
-    }
-)
-DAYS = 30
-# Share of differing games a claim must reach to be confirmed, and the share
-# below which it is refuted. Between them it stays proposed: 60% over twenty
-# games is not evidence, and saying so is the point of keeping the count.
-CONFIRM = 0.65
-REFUTE = 0.35
-SUPPORT = 25
+from kaggriculture.campaign import dataset
 
+# What a claim may be about: every column of a day row that is a number, which
+# is every quantity the extraction measures for both sides. A claim naming
+# anything else cannot be checked and is refused rather than stored
+# unverifiable.
+#
+# Read off the schema rather than listed here, so a column added to the
+# dataset is a claim that can be made about it, and there is no second list to
+# keep in step.
+QUANTITIES: frozenset[str] = frozenset(
+    line.split()[0]
+    for line in dataset.SCHEMA[
+        dataset.SCHEMA.index("days (") : dataset.SCHEMA.index("holdings (")
+    ].splitlines()
+    if line.startswith("    ")
+) - {"episode", "seat", "day", "team"}
+DAYS = dataset.DAYS
 # The store the round prompt reads, kept in the package beside
 # ``winning_pace.md`` and for the same reason: both are measurements of the
 # public ladder rather than of any one run, so they belong to the code that
 # reads them and not to a run directory that a fresh campaign starts without.
 # Rebuilt and re-measured by ``uv run strategies``.
 STORE = Path(__file__).with_name("strategies.jsonl")
+# Share of differing games at which a claim is settled one way or the other.
+# Between them it says nothing: 60% over twenty games is not evidence, and
+# saying so is the point of keeping the count.
+CONFIRM = 0.65
+REFUTE = 0.35
+SUPPORT = 200
 
 
 class Form(BaseModel):
-    """The measurable half of a claim: who leads on what, and when.
+    """The measurable half of a claim: what to compare, and when.
+
+    Deliberately without a direction. `winner_leads` used to live here and it
+    was the flaw: a form carrying its own answer lets a plausible sentence be
+    written first and confirmed second, which is how "winners keep planting to
+    the last day" became a finding at 69% and noise at 47%.
 
     Attributes:
-        quantity: One of `QUANTITIES`, measured for both sides at a day's end.
+        quantity: One of `QUANTITIES`, compared for both sides at a day's end.
         day: The day the comparison is made on.
-        winner_leads: Whether the claim is that the winner is ahead on it.
-            False is a real claim and often the interesting one -- winners
-            hold *less* bank on day eight and issue *fewer* hire orders.
     """
 
     quantity: str
     day: int
-    winner_leads: bool
 
-    def holds(self, winner: float, loser: float) -> bool | None:
-        """Whether one game agrees, or None when it cannot say.
+    def leads(self, ours: float, theirs: float) -> bool | None:
+        """Whether we are ahead on this quantity, or None when level.
 
-        A game where both sides are equal on this quantity is not evidence
-        either way and is left out of the count rather than scored as a half.
-        """
-        if winner == loser:
-            return None
-        return (winner > loser) is self.winner_leads
-
-    def wrong_side(self, ours: float, theirs: float) -> bool:
-        """Whether a program being judged is on the losing side of this claim.
-
-        What makes a claim worth showing a round: not that it is true, but
-        that this program is not doing it.
+        Level is not evidence either way and is left out of the count rather
+        than scored as a half.
         """
         if ours == theirs:
-            return False
-        return (ours > theirs) is not self.winner_leads
+            return None
+        return ours > theirs
 
 
 class Claim(BaseModel):
-    """One statement about winning play, with what has been measured of it.
+    """One statement about strong play, with what has been measured of it.
 
     Attributes:
         id: Stable identifier, so evidence can be recorded against it later.
-        form: The measurable statement. This is what decides.
-        prose: What a reader said about it. Commentary on the form, never
-            the other way round.
-        source: Episode seeds the claim was proposed from.
-        support: Games measured in which the two sides differed.
-        agreement: Share of those that agreed with the form.
+        form: What is compared. This is what decides.
+        prose: What a reader said about it, or "" for a form nobody has
+            written up. Commentary on the measurement, never the other way
+            round.
+        support: Games measured in which the two sides differed and one was
+            rated clearly above the other.
+        agreement: Share of those in which the stronger side led.
         created: Unix timestamp.
     """
 
     id: str
     form: Form
-    prose: str
-    source: list[int] = []
+    prose: str = ""
     support: int = 0
     agreement: float = 0.0
     created: float
 
     @property
-    def status(self) -> Literal["proposed", "confirmed", "refuted"]:
-        """Confirmed, refuted, or still waiting on evidence."""
+    def status(self) -> Literal["open", "leads", "trails"]:
+        """What the corpus says, or "open" while it has not said anything."""
         if self.support < SUPPORT:
-            return "proposed"
+            return "open"
         if self.agreement >= CONFIRM:
-            return "confirmed"
+            return "leads"
         if self.agreement <= REFUTE:
-            return "refuted"
-        return "proposed"
+            return "trails"
+        return "open"
+
+    @property
+    def settled(self) -> bool:
+        """Whether the corpus separates the two sides on this at all."""
+        return self.status != "open"
+
+    def ahead(self) -> bool:
+        """Whether the stronger side is the one with more of this.
+
+        Raises:
+            ValueError: The claim is open, so there is no direction to give
+                and a caller guessing one would be inventing a finding.
+        """
+        if not self.settled:
+            raise ValueError(f"{self.form.quantity} on day {self.form.day} is open")
+        return self.status == "leads"
+
+    def wrong_side(self, ours: float, theirs: float) -> bool:
+        """Whether a program being judged plays this the other way round.
+
+        What makes a claim worth showing a round: not that it is true, but
+        that this program is not doing it.
+        """
+        if ours == theirs or not self.settled:
+            return False
+        return (ours > theirs) is not self.ahead()
+
+    def reads(self) -> str:
+        """The claim as one cell: the measurement, and any sentence about it.
+
+        The measurement first and always. A claim with nobody's sentence
+        attached is still a finding; a sentence without the measurement is
+        what this module exists to stop being one.
+        """
+        return f"{self.prose} -- {self.says()}" if self.prose else self.says()
 
     def says(self) -> str:
         """Exactly what was compared, and what the corpus said.
@@ -142,10 +174,11 @@ class Claim(BaseModel):
         shown, and two readable sentences saying the same thing read as
         emphasis rather than as a claim and its evidence.
         """
-        side = "ahead" if self.form.winner_leads else "behind"
+        side = "more" if self.status == "leads" else "less"
+        share = self.agreement if self.status == "leads" else 1 - self.agreement
         return (
-            f"day {self.form.day}, `{self.form.quantity}`, winner {side}: "
-            f"{self.agreement:.0%} of {self.support} games"
+            f"day {self.form.day}, `{self.form.quantity}`, stronger side has "
+            f"{side}: {share:.0%} of {self.support} games"
         )
 
 
@@ -189,6 +222,8 @@ class Strategies:
             claim = self.get(event["id"])
             claim.support = int(event["support"])
             claim.agreement = float(event["agreement"])
+        elif kind == "prose":
+            self.get(event["id"]).prose = str(event["prose"]).strip()
         else:
             raise ValueError(f"unknown strategy event: {kind!r}")
         if persist:
@@ -211,12 +246,12 @@ class Strategies:
             raise KeyError(claim_id)
         return self._claims[claim_id]
 
-    def propose(self, form: Form, prose: str, source: list[int]) -> Claim:
-        """Record a new claim, unmeasured.
+    def propose(self, form: Form, prose: str = "") -> Claim:
+        """Record a question to put to the corpus, unmeasured.
 
-        Returns the claim, or the one already stored when an identical form
-        has been proposed before: the same statement arrived at twice is one
-        statement with more sources, not two claims to measure separately.
+        Returns the claim, or the one already stored when the same form has
+        been proposed before: the same comparison arrived at twice is one
+        question, not two to measure separately.
         """
         for claim in self._claims.values():
             if claim.form == form:
@@ -225,7 +260,6 @@ class Strategies:
             id=uuid.uuid4().hex[:12],
             form=form,
             prose=prose.strip(),
-            source=source,
             created=time.time(),
         )
         self._apply({"event": "claim", "claim": claim.model_dump()})
@@ -250,9 +284,17 @@ class Strategies:
             }
         )
 
-    def confirmed(self) -> list[Claim]:
-        """Confirmed claims, strongest evidence first."""
+    def describe(self, claim_id: str, prose: str) -> None:
+        """Attach a sentence to a claim the corpus has already settled.
+
+        Written after the measurement and never before it, which is the whole
+        arrangement: a sentence cannot become a finding by being persuasive.
+        """
+        self._apply({"event": "prose", "id": claim_id, "prose": prose})
+
+    def settled(self) -> list[Claim]:
+        """Every claim the corpus separates the sides on, strongest first."""
         return sorted(
-            (claim for claim in self._claims.values() if claim.status == "confirmed"),
-            key=lambda claim: (-claim.agreement, -claim.support),
+            (claim for claim in self._claims.values() if claim.settled),
+            key=lambda claim: (-abs(claim.agreement - 0.5), -claim.support),
         )

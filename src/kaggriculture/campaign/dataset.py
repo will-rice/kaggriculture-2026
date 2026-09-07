@@ -1,10 +1,10 @@
 """Every recorded game as a queryable table, so a question costs a query.
 
-`paired.tally` answers one shape of question -- does the winner lead on this
-quantity on this day -- and answers it by re-reading the corpus, which is
-twenty-odd minutes for every question anyone thinks of. That is the wrong way
-round: the parse is what costs, and it is the same parse whatever is being
-asked. So the corpus is parsed once into SQLite and the questions become SQL.
+Every question about the recorded games used to mean another walk of the
+archives: twenty-odd minutes to learn one number, and the same parse each
+time whatever was being asked. That is the wrong way round -- the parse is
+the cost and it does not depend on the question -- so the corpus is parsed
+once into SQLite and the questions become SQL.
 
 It also fixes what the questions could be about. Eleven numbers per side per
 day, read from one hour in twenty-four, is a small corner of what a tape
@@ -50,7 +50,8 @@ LOGGER = logging.getLogger(__name__)
 # shape and it is far too big for the repository.
 DATABASE = config.EPISODES.parent / "corpus.sqlite"
 # Processes to divide the archives over. The same reasoning as
-# `paired.WORKERS`: the campaign loop is usually running while this is.
+# the loop is usually running while this is, and the loop is what must not
+# slow down.
 WORKERS = 8
 # The fewest games a team must have played to be rated. A team that played
 # twice and won both is not the strongest agent on the ladder, and a rating
@@ -63,6 +64,25 @@ HOURS = 24
 LAST_HOUR = HOURS - 1
 # What a tile says it is when it holds nothing worth counting.
 BARE = ("EMPTY", "WEED", "TILLED")
+# The market verbs a day row carries a running total of, as
+# ``column stem: verb``. Cumulative through that day and stored on the day
+# rather than left to be summed out of `orders`, so that comparing two sides
+# on what they have bought and sold is the same self-join as comparing them
+# on anything else -- and so that it is one indexed row rather than a scan of
+# twenty-three million.
+#
+# Both the count and the units: "sells more" measured as a count of orders
+# said the stronger side sells more, and measured in units it sells less than
+# half as much. They are different claims and the corpus answers them
+# differently.
+TALLIED = (
+    ("sell", "SELL"),
+    ("buy", "BUY_PRODUCT"),
+    ("seed", "BUY_SEED"),
+    ("animal", "BUY_ANIMAL"),
+)
+# Counted but never summed: neither carries a quantity in the tape.
+COUNTED = (("hire", "HIRE"), ("land", "BUY_LAND"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS episodes (
@@ -101,7 +121,17 @@ CREATE TABLE IF NOT EXISTS days (
     fed        INTEGER,
     hungry_worst INTEGER,
     cared      INTEGER,
-    plant_age  REAL
+    plant_age  REAL,
+    sell_orders   INTEGER,
+    sold_units    INTEGER,
+    buy_orders    INTEGER,
+    bought_units  INTEGER,
+    seed_orders   INTEGER,
+    seed_units    INTEGER,
+    animal_orders INTEGER,
+    animal_units  INTEGER,
+    hire_orders   INTEGER,
+    land_orders   INTEGER
 );
 CREATE TABLE IF NOT EXISTS holdings (
     episode    TEXT,
@@ -242,9 +272,9 @@ def _insert(
             winner,
         ),
     )
-    connection.executemany(
-        "INSERT INTO orders VALUES (?,?,?,?,?,?,?)", _orders(episode, key)
-    )
+    submitted = list(_orders(episode, key))
+    connection.executemany("INSERT INTO orders VALUES (?,?,?,?,?,?,?)", submitted)
+    running = _running(submitted)
     connection.executemany(
         "INSERT INTO moves VALUES (?,?,?,?,?,?,?)", _moves(episode, key)
     )
@@ -252,17 +282,25 @@ def _insert(
         # Addressed by day rather than walked, which is why there is no
         # special case for the last one here: day 29 hour 23 is step 719 and
         # a season is exactly 720 steps, so the close of the season is the
-        # final state by construction. `paired.sides` walks the steps instead
-        # and needs an extra line to reach the same state; it lost day 29
-        # twice for want of it. A short tape raises here rather than filing
-        # some mid-season state under day 29.
+        # final state by construction. The walk this replaced stepped through
+        # the tape instead and needed an extra line to reach that state; it
+        # silently had no day 29 at all, twice. A short tape raises here
+        # rather than filing some mid-season state under day 29.
         step = episode.steps[day * HOURS + LAST_HOUR]
         for seat in (0, 1):
             observation = step[seat]["observation"]
             connection.execute(
                 "INSERT INTO days VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (key, seat, day, teams[seat], *_day(observation, seat, day)),
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                "?,?,?,?,?,?,?,?,?,?)",
+                (
+                    key,
+                    seat,
+                    day,
+                    teams[seat],
+                    *_day(observation, seat, day),
+                    *running[seat][day],
+                ),
             )
             connection.executemany(
                 "INSERT INTO holdings VALUES (?,?,?,?,?,?)",
@@ -276,6 +314,44 @@ def _insert(
                 for item, price in (market.get("prices") or {}).items()
             ),
         )
+
+
+def _running(submitted: list[tuple]) -> dict[int, list[tuple[int, ...]]]:
+    """Each side's market activity as a running total through every day.
+
+    Cumulative rather than per-day, because every claim about trading is
+    about the season so far -- "has sold more by day twenty" -- and a per-day
+    figure would make one quiet day look like a different strategy.
+
+    Args:
+        submitted: The rows `_orders` produced for one game.
+
+    Returns:
+        ``{seat: [totals for day 0, day 1, ...]}``, each a tuple ordered as
+        the day row's trailing columns.
+    """
+    counts: dict[int, dict[int, dict[str, list[int]]]] = {0: {}, 1: {}}
+    for _, seat, day, _, verb, _, quantity in submitted:
+        tally = counts[seat].setdefault(day, {}).setdefault(verb, [0, 0])
+        tally[0] += 1
+        tally[1] += int(quantity or 0)
+    out: dict[int, list[tuple[int, ...]]] = {}
+    for seat in (0, 1):
+        total: dict[str, list[int]] = {}
+        rows = []
+        for day in range(DAYS):
+            for verb, tally in counts[seat].get(day, {}).items():
+                running = total.setdefault(verb, [0, 0])
+                running[0] += tally[0]
+                running[1] += tally[1]
+            row: list[int] = []
+            for _, verb in TALLIED:
+                row += total.get(verb, [0, 0])
+            for _, verb in COUNTED:
+                row.append(total.get(verb, [0, 0])[0])
+            rows.append(tuple(row))
+        out[seat] = rows
+    return out
 
 
 def _tiles(farm: dict[str, Any]) -> list[dict[str, Any]]:

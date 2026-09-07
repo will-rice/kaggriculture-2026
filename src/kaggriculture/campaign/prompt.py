@@ -357,26 +357,29 @@ def _states_lines(
 
 
 def _both_sides(day: harness.Day) -> dict[str, tuple[float, float]]:
-    """The claim quantities a round's own game measures for both players.
+    """The dataset's quantities that a round's own game also measures.
 
-    Four of `strategy.QUANTITIES`, and the store may hold confirmed claims
-    about the other seven that no round will ever be shown. That is a real
-    limit and it is here rather than hidden:
+    The store now asks about every column of a day row -- some thirty of them
+    -- and a round's day table carries a handful. The overlap is what a claim
+    can be shown for, and the gap is real rather than hidden:
 
     - `seeds` is private. A program sees its own and never the opponent's, so
-      a day table carries one side of it and there is nothing to compare.
-    - `sells`, `hires` and `land` are orders. A day table is a state at a
-      moment; nothing in it counts what was submitted to get there.
-    - `ripe`, `quadrants` and `pens` are measured on a tape by reading tiles,
-      and a day table does not carry the tiles -- it carries counts derived
-      from them. `pens` is the trap: a tape counts coop and pasture tiles and
-      a day table counts animals by species, so comparing them would be two
-      different quantities sharing one name, which is the kind of measurement
-      that agrees with itself and is wrong.
+      there is one side of it and nothing to compare.
+    - The order totals -- `sold_units`, `hire_orders` and the rest -- count
+      what was submitted. A day table is a state at a moment and counts
+      nothing.
+    - `watered`, `dry_worst`, `fed` and the husbandry columns are read off
+      tiles, and a day table carries counts derived from tiles rather than
+      the tiles.
 
-    Closing that gap means widening `harness.Day`, which changes every game
-    already recorded. Until then a claim about hiring is measured, kept, and
-    not shown.
+    `pens` is the one to be careful of and is deliberately absent: the
+    dataset counts coop and pasture tiles, a day table counts animals by
+    species, and comparing them would be two quantities sharing a name --
+    a measurement that agrees with itself and is wrong.
+
+    Closing the gap means widening `harness.Day`, which changes every game
+    already recorded. Until then such a claim is measured, kept, and not
+    shown.
     """
     return {
         "bank": (day.ours_bank, day.theirs_bank),
@@ -389,6 +392,7 @@ def _both_sides(day: harness.Day) -> dict[str, tuple[float, float]]:
             float(sum(day.ours_shed.values())),
             float(sum(day.theirs_shed.values())),
         ),
+        "weeds": (float(day.ours_weeds), float(day.theirs_weeds)),
     }
 
 
@@ -419,14 +423,14 @@ def _against(
             if pair is None:
                 continue
             seen += 1
-            wrong += claim.form.wrong_side(*pair)
+            wrong += claim.wrong_side(*pair)
     return wrong, seen
 
 
 def selected(
     store: strategy.Strategies, states: dict[str, list[harness.Day]]
 ) -> list[tuple[int, int, strategy.Claim]]:
-    """The confirmed claims this program is on the wrong side of, worst first.
+    """The settled claims this program plays the other way round, worst first.
 
     Not the claims that are true -- those are a reading list. The ones worth a
     round's attention are the true ones this program is not doing, which is
@@ -444,10 +448,14 @@ def selected(
         the program is furthest from first.
     """
     scored = []
-    for claim in store.confirmed():
+    for claim in store.settled():
         wrong, seen = _against(claim, states)
         if seen and wrong / seen > MOSTLY:
-            scored.append((wrong / seen, claim.agreement, wrong, seen, claim))
+            # Ordered by how far this program is from the claim, then by how
+            # far the corpus separates the sides on it -- a claim at 90% is
+            # a firmer thing to be told than one at 66%.
+            separation = abs(claim.agreement - 0.5)
+            scored.append((wrong / seen, separation, wrong, seen, claim))
     scored.sort(key=lambda row: (-row[0], -row[1]))
     return [(wrong, seen, claim) for _, _, wrong, seen, claim in scored[:MOST_CLAIMS]]
 
@@ -465,29 +473,32 @@ def _claim_lines(claims: list[tuple[int, int, strategy.Claim]]) -> list[str]:
     if not claims:
         return []
     lines = [
-        "## What the ladder's winners do that this program does not",
+        "## What the strongest agents on the ladder do differently",
         "",
-        "Measured over the recorded games of the public ladder -- the agents "
-        "at the top of it, none of whom publish a kernel, so their games are "
-        "the only view of them there is. Each claim was checked inside single "
-        "games, comparing the two players at the same day's close: same map, "
-        "same prices, same opponent, one of them lost. So a difference here "
-        "is about what the two players did and not about the game they were "
-        "given.",
+        "Measured over every recorded game of the public ladder. The agents "
+        "at the top of it publish no kernels, so their games are the only "
+        "view of them there is, and none of them is in the pool above.",
         "",
-        "Every claim below cleared that corpus *and* is one your program is "
-        "on the other side of in most of its own games above. They are "
-        "tendencies of strong play, not rules of the game: a claim that held "
-        "in 70% of games is a claim that failed in 30%, and a program that "
-        "wins by breaking one has beaten the claim rather than the other way "
-        "round. Worst first.",
+        "Each line was checked inside single games, comparing the two players "
+        "at the same day's close -- same map, same prices, same opponent -- "
+        "so a difference is about what the two players did and not about the "
+        "game they were given. The comparison is between the stronger and the "
+        "weaker *agent*, by a rating fitted over the whole field, and not "
+        "between the winner and the loser of that game: about half of all "
+        "games are won by the weaker side, and measured that way none of "
+        "these separates at all.",
         "",
-        "| what the winners do | what was compared, and what it held in "
-        "| your games on the other side |",
-        "| --- | --- | --- |",
+        "Every line below is one your own games put you on the other side of. "
+        "They are tendencies of strong play, not rules of the game: a "
+        "tendency holding in 70% of games fails in the other 30%, and a "
+        "program that wins by breaking one has beaten it rather than the "
+        "other way round. Furthest first.",
+        "",
+        "| what the corpus says | your games on the other side |",
+        "| --- | --- |",
     ]
     for wrong, seen, claim in claims:
-        lines.append(f"| {claim.prose} | {claim.says()} | {wrong} of {seen} |")
+        lines.append(f"| {claim.reads()} | {wrong} of {seen} |")
     return lines
 
 
