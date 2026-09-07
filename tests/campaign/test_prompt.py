@@ -119,6 +119,31 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
     )
 
 
+def test_the_message_carries_the_winners_pace() -> None:
+    """A round is shown its own day-by-day play and nothing to read it against.
+
+    The agents at the top of the leaderboard publish no kernels, so their
+    recorded games are the only view of them there is -- and the pool, built
+    from published work, cannot supply it. The table is measured by
+    `winning-pace` over the replay archive and travels whole.
+    """
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.0}, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", {"v54": 0.0}),
+    )
+
+    assert "How the ladder's winners play" in text
+    assert "| day | median bank | top decile | planted tiles" in text
+    # Thirty days of it, and the pace to beat beside the pace to match.
+    assert prompt.WINNING_PACE.read_text(encoding="utf-8").rstrip() in text
+    # Aggregate only: no opponent is named and no path of theirs appears.
+    assert "/data" not in text
+
+
 def test_the_templates_own_note_is_not_sent_to_the_model() -> None:
     """The file explains itself at the top, and that note is not the prompt.
 

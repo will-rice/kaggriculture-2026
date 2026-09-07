@@ -34,6 +34,14 @@ TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
 # be read end to end -- what a round is told, and in what order -- without
 # reconstructing it from `compose`.
 ROUND_PROMPT = Path(__file__).with_name("round_prompt.md")
+# How the ladder's winners actually play, day by day, measured over the
+# public replay archive by `winning-pace`. It is here because the message
+# already gives a round its own banks and tiles each day and gives it
+# nothing to read them against -- and because the agents at the top of the
+# leaderboard publish no kernels, so their games are the only view of them
+# there is. A snapshot of how the field played, not a constant of the game:
+# rebuild it when the ladder has moved.
+WINNING_PACE = Path(__file__).with_name("winning_pace.md")
 
 # Rendered from the gate's own whitelist, so the model is never told a
 # different set from the one that rejects it. One file ships, so this list is
@@ -453,6 +461,7 @@ def compose(
     # template puts each on its own line, so an empty one leaves no gap.
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
+        pace=WINNING_PACE.read_text(encoding="utf-8").rstrip("\n"),
         name=name,
         imports=IMPORTS,
         seeds=len(result.seeds),
