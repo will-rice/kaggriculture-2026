@@ -105,31 +105,41 @@ REASON_CHARS = 200
 SIBLINGS = 8
 CHANGE_CHARS = 160
 
-# FAMOU appendix C.2's five rewrite instructions. One is drawn per session, so
-# eight workers starting from the same champion are pushed eight different
-# ways while the rounds within a session go deeper on the one they drew. The
-# caller draws the pair, records the name on every program it produces, and
-# hands ``compose`` the text.
-INSTRUCTIONS: tuple[tuple[str, str], ...] = (
-    ("improve", "Improve child.py's performance against the pool."),
-    (
-        "different",
-        "Replace child.py with a completely different algorithm for the same game.",
-    ),
-    (
-        "inspired",
-        "Create a novel approach inspired by child.py that works fundamentally "
-        "differently.",
-    ),
-    (
-        "restructure",
-        "Redesign child.py's core components, keeping what the verdict says wins.",
-    ),
-    (
-        "tune",
-        "Tune child.py's constants and thresholds only; keep its structure.",
-    ),
+# The instruction, and there is one. It says the bar the gate actually applies
+# -- finish top of the standings -- rather than naming a way to go about it.
+#
+# There were five, FAMOU appendix C.2's rewrites, drawn one per session on the
+# theory that eight workers starting from one champion would otherwise explore
+# in one direction. Measured over the 476 programs of the first router-seeded
+# run, that is not what they bought:
+#
+#     different      134 programs   mean fitness 0.000   best 0.000
+#     inspired       125            mean 0.013           best 0.911
+#     restructure     84            mean 0.844           best 0.940
+#     improve         70            mean 0.825           best 0.969
+#     tune            62            mean 0.883           best 0.964
+#
+# Every one of the 134 `different` programs scored exactly nought, and
+# `inspired` landed once in 125. Together they are 54% of every call the
+# campaign made. The cause is the seed: "replace it with a completely
+# different algorithm" costs nothing against a thirty-line skeleton and means
+# deleting a rated agent when the program is a published one, and a farm bot
+# written from scratch loses every game to this pool. The three that survived
+# are within 0.06 of each other, which is three ways of saying the same thing.
+#
+# What varies between sessions is the program they start from and what the
+# siblings section says has already been tried from it. That was always the
+# real source of spread; the draw was noise on top of it.
+INSTRUCTION = (
+    "Change `child.py` so that it finishes top of the standings above. Every "
+    "agent listed there is one you have to place above, and the one directly "
+    "above you is the nearest of them -- but the bar is the whole table, not "
+    "that one agent. How you get there is yours to choose: tune what is there, "
+    "restructure it, or replace whatever part of it is losing you games."
 )
+# Recorded on every program, so the database keeps saying what a round was
+# asked for even though there is now only one answer.
+INSTRUCTION_NAME = "beat"
 
 
 def _verdict_lines(
@@ -427,8 +437,8 @@ def compose(
             last few, so a caller cannot forget to.
         siblings: Programs already written from ``name`` and scored, best
             first. Cut to ``SIBLINGS`` here for the same reason.
-        instruction: The drawn instruction's text, one of ``INSTRUCTIONS``'
-            second elements, with any stagnation note the caller prepended.
+        instruction: ``INSTRUCTION``, with any stagnation note the caller
+            prepended.
         standings: Every agent's rating from the tournament this program's
             results are part of, itself included.
 

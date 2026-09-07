@@ -13,7 +13,7 @@ from kaggriculture.campaign import (
     validate,
 )
 
-IMPROVE = prompt.INSTRUCTIONS[0][1]
+IMPROVE = prompt.INSTRUCTION
 
 
 def table(
@@ -221,13 +221,22 @@ def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
     assert "700000" not in text
 
 
-def test_there_are_five_full_instructions_and_they_differ() -> None:
-    """FAMOU C.2's variants, so eight workers on one champion diverge."""
-    names = [name for name, _ in prompt.INSTRUCTIONS]
-    texts = [text for _, text in prompt.INSTRUCTIONS]
-    assert len(prompt.INSTRUCTIONS) == 5
-    assert len(set(names)) == 5 and len(set(texts)) == 5
-    assert all("child.py" in text for text in texts)
+def test_the_instruction_states_the_bar_and_not_a_method() -> None:
+    """One instruction, and it says what the gate asks rather than how.
+
+    There were five drawn per session. Two of them told a round to
+    replace the program with something else, which cost 54% of every
+    call the campaign made and returned 259 programs of which one
+    scored above nought -- because the program is a rated agent now,
+    and a farm bot written from scratch loses every game to this pool.
+    The three that survived were within 0.06 of each other.
+    """
+    assert "child.py" in prompt.INSTRUCTION
+    assert "top of the standings" in prompt.INSTRUCTION
+    # It must not prescribe one route to the top: naming a method is
+    # what the five did, and three of them named the same one.
+    for route in ("tune", "restructure", "replace"):
+        assert route in prompt.INSTRUCTION
 
 
 def failure(reason: str) -> archive.Failure:
@@ -288,20 +297,18 @@ def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
     assert "produced nothing" not in text
 
 
-def test_every_instruction_reaches_the_message_whole() -> None:
-    """The drawn instruction is the last thing said, and only that one."""
-    for index, (name, text) in enumerate(prompt.INSTRUCTIONS):
-        message = prompt.compose(
-            "champion_1",
-            result({"v54": 0.5}),
-            [],
-            [],
-            text,
-            table("champion_1", {"v54": 0.5}),
-        )
-        assert message.rstrip().endswith(text), name
-        others = [t for i, (_, t) in enumerate(prompt.INSTRUCTIONS) if i != index]
-        assert not [other for other in others if other in message], name
+def test_the_instruction_reaches_the_message_whole() -> None:
+    """It is the last thing said, and it arrives uncut."""
+    message = prompt.compose(
+        "champion_1",
+        result({"v54": 0.5}),
+        [],
+        [],
+        prompt.INSTRUCTION,
+        table("champion_1", {"v54": 0.5}),
+    )
+
+    assert message.rstrip().endswith(prompt.INSTRUCTION)
 
 
 def stored(

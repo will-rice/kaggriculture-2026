@@ -412,11 +412,12 @@ class Campaign:
         # the floor is in the pool, so the next evaluation of anything would
         # raise too. The run stops rather than mutating what cannot play.
         result = await self.measure(source, name)
-        # Drawn once, for the whole session: rounds go deeper on one line and
-        # sessions go wider, so a session that drew "a completely different
-        # algorithm" three times out of five would be three first rounds
-        # rather than one line taken further.
-        drawn, instruction = self.rng.choice(prompt.INSTRUCTIONS)
+        # One instruction, the same every round: the bar the gate applies.
+        # There were five drawn per session, and two of them -- "a completely
+        # different algorithm" and "a novel approach inspired by this one" --
+        # took 54% of every call the campaign made and returned 476 programs
+        # of which one scored above nought. See `prompt.INSTRUCTION`.
+        drawn, instruction = prompt.INSTRUCTION_NAME, prompt.INSTRUCTION
         if stagnant:
             note = STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
             instruction = note + instruction

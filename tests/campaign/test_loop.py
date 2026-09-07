@@ -1097,31 +1097,6 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     assert [p.started_from for p in database.programs] == ["", config.SEED_ID]
 
 
-def test_the_instruction_is_drawn_once_a_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """Rounds deepen one line; it is a new session that goes wider.
-
-    Five rounds drawing for themselves would draw "a completely different
-    algorithm" more than once in most sessions, which is several first rounds
-    rather than one line taken further. The draw belongs to the session, and
-    every program a session writes is stamped with it.
-    """
-    tiny_run(tmp_path, monkeypatch, rounds=5)
-    pass_pool(tmp_path)
-    stub_evaluator(monkeypatch)
-    seed = _write(tmp_path / "seed.py", PASS)
-    mutator = Recorder(edit=lambda source: source + "# a round\n")
-
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log)
-
-    given = {handed.message.split("## Your instruction")[1] for handed in mutator.seen}
-    assert len(mutator.seen) == 5 and len(given) == 1
-    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    stamped = {p.instruction for p in database.programs if p.id != config.SEED_ID}
-    assert len(stamped) == 1
-
-
 def test_a_round_is_given_one_file_and_the_directory_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
