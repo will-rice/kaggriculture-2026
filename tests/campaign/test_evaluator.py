@@ -160,12 +160,19 @@ def test_score_lets_a_crash_propagate_and_still_restores_the_cwd(
     assert Path.cwd() == workspace
 
 
-def test_an_empty_field_is_named_rather_than_divided_by_zero() -> None:
+def test_a_pool_of_champions_has_no_field_and_that_is_not_fatal() -> None:
     """A pool of nothing but champions has no vendored field to average.
 
-    ``field`` is the one number comparable across the whole campaign, so a
-    pool that has trimmed away its last published opponent has to say so
-    rather than report a mean over nothing.
+    That is where this campaign is going: champions join on every promotion
+    and the weakest opponent makes way, so the published agents leave one at a
+    time and the last leaves for good. It used to raise there -- and
+    `ValueError` is not the `RuntimeError` a round catches, so it would have
+    gone up through the task group and stopped the campaign at its most
+    successful moment. Measured live: the pool reached seven champions and one
+    published agent, tied last, in two hours.
+
+    What is lost is a number, not the gate.
     """
-    with pytest.raises(ValueError, match="no vendored opponent"):
-        evaluator.vendored_field({"champion_1": 0.5})
+    assert evaluator.vendored_field({"champion_1": 0.5, "champion_2": 0.9}) is None
+    # And it is still the mean while any of them remain.
+    assert evaluator.vendored_field({"champion_1": 0.5, "v54": 0.8}) == 0.8

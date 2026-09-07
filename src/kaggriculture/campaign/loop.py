@@ -526,7 +526,7 @@ class Campaign:
             "calls/seconds": mutation.seconds,
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
-            "database/top_field": max(p.field for p in self.database.programs),
+            **_top_field(self.database.programs),
         }
         rated = [p.rating for p in self.database.programs if p.rating is not None]
         if rated:
@@ -535,7 +535,8 @@ class Campaign:
             source, program_id, result = kept
             del source
             record["calls/fitness"] = result.fitness
-            record["calls/field"] = result.field
+            if result.field is not None:
+                record["calls/field"] = result.field
             table = gate.standing(
                 program_id,
                 result.rates,
@@ -799,7 +800,7 @@ class Campaign:
         record: dict[str, float] = {
             "sessions": self.state.sessions,
             "gate/score": result.fitness,
-            "gate/field": result.field,
+            **({} if result.field is None else {"gate/field": result.field}),
             "gate/promoted": int(promoted),
             "gate/rating": standings[result.program_id],
             "gate/place": 1
@@ -813,6 +814,17 @@ class Campaign:
         if baseline is not None:
             record["gate/champion"] = baseline.result.fitness
         return record
+
+
+def _top_field(programs: list[archive.Program]) -> dict[str, float]:
+    """The best field score so far, or nothing once there is no field.
+
+    A pool that has trimmed away its last published opponent has no fixed
+    reference left to average over, so the series simply stops rather than
+    reporting a number that means something different from the one before it.
+    """
+    scored = [p.field for p in programs if p.field is not None]
+    return {"database/top_field": max(scored)} if scored else {}
 
 
 def _first(failures: BaseExceptionGroup) -> BaseException:

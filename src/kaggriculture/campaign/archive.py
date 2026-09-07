@@ -43,7 +43,7 @@ class Program(BaseModel):
         rates: Fast-evaluation win rate per pool opponent.
         field: Mean win rate over the vendored incumbents alone, which never
             change, so it is comparable across the whole campaign where
-            ``fitness`` is not.
+            ``fitness`` is not. None once the pool holds none of them.
         rating: Its Bradley-Terry rating in the tournament that scored it --
             the measure the gate promotes on and the competition ranks by.
             Defaulted, so a program written before the tournament still loads;
@@ -62,7 +62,7 @@ class Program(BaseModel):
     instruction: str
     model: str
     fitness: float
-    field: float
+    field: float | None = None
     rating: float | None = None
     place: int = 0
     rates: dict[str, float] = {}

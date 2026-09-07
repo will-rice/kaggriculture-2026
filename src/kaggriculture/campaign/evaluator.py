@@ -56,7 +56,8 @@ class Result(BaseModel):
             it, so it ranks the database but does not compare across time.
         field: Mean win rate over the vendored incumbents alone. They never
             change, so this is the one number that means the same thing on
-            the first session and the thousandth.
+            the first session and the thousandth -- and None once the pool
+            has trimmed the last of them away.
         rates: Win rate per pool opponent, ties as half.
         margins: Bank margin per pool opponent.
         intervals: Wilson interval per pool opponent, so a rate is read with
@@ -77,7 +78,7 @@ class Result(BaseModel):
 
     program_id: str
     fitness: float
-    field: float
+    field: float | None
     rates: dict[str, float]
     margins: dict[str, harness.Margin]
     intervals: dict[str, tuple[float, float]] = {}
@@ -212,7 +213,7 @@ def score(
     )
 
 
-def vendored_field(rates: dict[str, float]) -> float:
+def vendored_field(rates: dict[str, float]) -> float | None:
     """Mean win rate over the vendored incumbents in ``rates``.
 
     The pool grows as champions join it, so a mean over the pool moves for
@@ -224,12 +225,21 @@ def vendored_field(rates: dict[str, float]) -> float:
         rates: Win rate per opponent name.
 
     Returns:
-        The mean over the vendored names present.
+        The mean over the vendored names present, or None when the pool
+        holds none of them.
 
-    Raises:
-        ValueError: None of them is present, so the field is undefined.
+    None rather than an error, because a pool of nothing but champions
+    is where this campaign is going: they join on every promotion and
+    the weakest opponent makes way, so the published agents leave one
+    at a time and the last of them leaves for good. Raising there would
+    kill the run at its most successful moment -- and did nearly:
+    `ValueError` is not the `RuntimeError` a round catches, so it would
+    have gone up through the task group and stopped the campaign.
+
+    What is lost is a number, not the gate. `field` is the one metric
+    comparable across the whole campaign because the vendored agents
+    never change; without them there is nothing fixed to compare to,
+    and the promotion chain is what says the search is moving.
     """
     vendored = {name: rate for name, rate in rates.items() if name in VENDORED}
-    if not vendored:
-        raise ValueError("no vendored opponent was played; the field is undefined")
-    return _mean(vendored)
+    return _mean(vendored) if vendored else None
