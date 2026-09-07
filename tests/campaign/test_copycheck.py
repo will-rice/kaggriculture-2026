@@ -91,7 +91,9 @@ def test_a_verbatim_opponent_scores_one() -> None:
     """An opponent's own file matches itself, near-exactly."""
     source = roster.path("v54").read_text(encoding="utf-8")
     name, score = copycheck.against_opponents(source)
-    assert name.startswith("v54") and score > 0.99
+    # Named for the directory it is vendored under, which is what the
+    # corpus is built from now -- the roster's nickname is not a file.
+    assert name.startswith(roster.path("v54").parent.name) and score > 0.99
 
 
 def test_the_skeleton_scores_near_zero() -> None:
@@ -134,6 +136,24 @@ def test_a_reformatted_lift_is_still_caught() -> None:
     candidate = SKELETON + "\n" + reformatted
     _, score = copycheck.against_opponents(candidate)
     assert score >= copycheck.THRESHOLD
+
+
+@pytest.mark.local_data
+def test_an_agent_the_roster_never_named_is_still_in_the_corpus() -> None:
+    """The corpus is what is on disk, not what the harness is allowed to play.
+
+    Those were the same list while opponents arrived by hand-editing the
+    roster. They stop being the same the moment the pool takes a harvested
+    agent nobody registered -- and a gate keyed on the roster would let a
+    candidate copy that one freely, silently, and precisely because it is
+    new, which is to say precisely when it is the strongest thing in the pool.
+    """
+    covered = {key.split(":", 1)[0] for key in copycheck._corpus()}
+    named = {roster.path(name).parent.name for name in roster.names()}
+
+    assert covered - named, "the corpus is only the roster; the scan is not live"
+    # And every registered opponent is still in there, the seed aside.
+    assert named - covered == {config.SEED.parent.name}
 
 
 def test_similarity_is_symmetric_and_bounded() -> None:
@@ -195,7 +215,8 @@ def test_the_seed_is_exempt_and_every_other_opponent_is_not(
 
         other = roster.path("v54").read_text(encoding="utf-8")
         name, other_score = copycheck.against_opponents(other)
-        assert other_score >= copycheck.THRESHOLD and name.startswith("v54")
+        assert other_score >= copycheck.THRESHOLD
+        assert name.startswith(roster.path("v54").parent.name)
     finally:
         copycheck._lineage.cache_clear()
         copycheck._corpus.cache_clear()

@@ -95,6 +95,19 @@ directory: take their numbers as verified and do not go looking.
 RECENT_FAILURES = 3
 REASON_CHARS = 200
 
+# Day tables shown, at 30 rows each. Every opponent the program did not beat
+# outright earns one, worst first, and this bounds a message that is otherwise
+# a whole pool's worth of games -- twelve of them is 360 rows of eleven
+# columns, most of it about opponents the program is already close to.
+#
+# The cut used to be a rate at or below 0.5, which was right for a lineage
+# losing nearly everything and inverted the moment the campaign was seeded
+# from a strong agent: a program winning 0.875 against eight opponents was
+# told "nothing to show", so the better a program got the less it was shown of
+# how it played. The games it loses one in eight of are exactly the ones it
+# has to win to top the standings.
+MOST_TABLES = 6
+
 # How many already-scored siblings are shown, and how much of each one's own
 # account of itself. Best first, so the list is both the ceiling reached from
 # here and the directions already measured. Without it eight workers start
@@ -244,12 +257,15 @@ def _rival(
 def _states_lines(
     result: evaluator.Result, rival: str, standings: dict[str, float]
 ) -> list[str]:
-    """Render one game against every opponent the program did not beat.
+    """Render one game against every opponent that took a game off the program.
 
-    The losses, because that is where there is something to learn: an
-    opponent it never beats is one it has to learn to beat, and the opponent
-    it already beats has nothing left to teach. Worst first, so the agents it
-    has never taken a game from come before the ones it splits with.
+    The losses, because that is where there is something to learn -- and a
+    loss is a game lost, not a matchup lost. An opponent beaten 0.875 has
+    taken one game in eight, and those are precisely the games that decide
+    whether the program finishes top; only an opponent it has beaten every
+    single time has nothing left to teach. Worst first, capped at
+    ``MOST_TABLES``, so the agents it has never taken a game from come before
+    the ones it splits with.
 
     One game each, and the closest one played -- the game a small change would
     have flipped, rather than the widest loss, which shows the failure at its
@@ -268,25 +284,28 @@ def _states_lines(
         (
             name
             for name, rate in result.rates.items()
-            if rate <= 0.5 and name in result.states
+            if rate < 1.0 and name in result.states
         ),
         key=lambda name: (result.rates[name], result.margins[name].mean),
-    )
+    )[:MOST_TABLES]
     if not lost:
         return [
             "## Every match, day by day",
             "",
-            "Nothing to show: this program beat every opponent in the pool.",
+            "Nothing to show: this program won every game against every "
+            "opponent in the pool.",
         ]
     lines = [
         "## The matches it lost, day by day",
         "",
-        f"One game against each of the {len(lost)} opponents it did not beat, "
-        "worst first. The ones at the top it has never taken a game from, and "
-        "those are the ones it has to learn to beat. Each is the closest game "
-        "played against that opponent -- the one a small change would have "
-        "flipped, rather than the widest loss, which shows the failure at its "
-        "starkest and least reachable.",
+        f"One game against each of the {len(lost)} opponents that took a game "
+        "off it, worst first. A rate below 1.000 is a game lost, and those are "
+        "the games that decide where it finishes: the ones at the top it has "
+        "never beaten at all, and the ones lower down it beats most of the "
+        "time and still drops points to. Each table is the closest game played "
+        "against that opponent -- the one a small change would have flipped, "
+        "rather than the widest loss, which shows the failure at its starkest "
+        "and least reachable.",
         "",
         "Each row is how that day closed. You are shown both sides because you "
         "are the program's author; the program itself cannot see the "

@@ -130,24 +130,73 @@ def test_a_program_at_the_top_of_the_tournament_is_told_so() -> None:
     assert "| 1 | **champion_1** |" in text
 
 
-def test_every_opponent_it_lost_to_is_shown_day_by_day() -> None:
+def test_every_opponent_that_took_a_game_is_shown_day_by_day() -> None:
     """The losses, because that is where there is something to learn.
 
-    An opponent it never beats is one it has to learn to beat; one it already
-    beats has nothing left to teach, so `v56` at 0.9 gets no table.
+    A loss is a game lost, not a matchup lost. The cut used to be a rate at or
+    below 0.5, which was right while the lineage lost nearly everything and
+    inverted the moment the campaign was seeded from a strong agent: a program
+    winning 0.875 against eight opponents was told "nothing to show", so the
+    better it got the less it was shown. Only an opponent beaten every single
+    time has nothing left to teach.
     """
+    rates = {"v54": 0.0, "v56": 0.9, "shopforge": 1.0}
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.0, "v56": 0.9}, days=30),
+        result(rates, days=30),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.0, "v56": 0.9}),
+        table("champion_1", rates),
     )
 
     assert "The matches it lost, day by day" in text
+    # Never beaten, so first; and 0.9 still drops a game in ten, so it is here
+    # too -- that is the one this used to hide.
     assert "### `v54`, won 0.000" in text
-    assert "### `v56`" not in text
+    assert "### `v56`, won 0.900" in text
+    assert text.index("`v54`") < text.index("`v56`")
+    # Beaten every time: nothing left to learn from it.
+    assert "### `shopforge`" not in text
+
+
+def test_a_program_that_wins_everything_is_told_so_rather_than_shown_nothing() -> None:
+    """The empty case has to mean what it says, because it reads as an all-clear."""
+    rates = {"v54": 1.0, "v56": 1.0}
+    text = prompt.compose(
+        "champion_1", result(rates), [], [], IMPROVE, table("champion_1", rates)
+    )
+
+    assert "won every game against every opponent" in text
+
+
+def test_the_tables_shown_are_bounded() -> None:
+    """A whole pool of day tables is most of the message and most of it noise."""
+    rates = {f"agent_{n}": 0.5 for n in range(12)}
+    text = prompt.compose(
+        "champion_1",
+        result(rates, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", rates),
+    )
+
+    assert text.count("### `agent_") == prompt.MOST_TABLES
+    assert text.count("| WHEAT 12 | EGG 3 |") == 30 * prompt.MOST_TABLES
+
+
+def test_a_shown_game_carries_every_column_of_every_day() -> None:
+    """One table is the whole game: thirty days, both farms, both sheds."""
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.0}, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", {"v54": 0.0}),
+    )
+
     assert text.count("| WHEAT 12 | EGG 3 |") == 30
     assert "| 29 | 2971 | 3029 |" in text
     # The shed is hidden from a player at runtime; the author is not a player.
@@ -458,7 +507,7 @@ def test_the_game_shown_is_against_the_agent_directly_above() -> None:
     the agent it had to overtake was `indarkarhana`, which it already took a
     quarter of its games from.
     """
-    rates = {"unreachable": 0.0, "rival": 0.25, "below": 0.9}
+    rates = {"unreachable": 0.0, "rival": 0.25, "below": 1.0}
     standings = {"unreachable": 3.0, "rival": 1.0, "champion_1": 0.0, "below": -2.0}
 
     text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
@@ -467,20 +516,5 @@ def test_the_game_shown_is_against_the_agent_directly_above() -> None:
     assert text.index("### `unreachable`") < text.index("### `rival`")
     # And the one it has to pass is marked, because that is the next place.
     assert "### `rival`, won 0.250 -- directly above you" in text
-    # The opponent it already beats has nothing left to teach.
+    # Beaten every single time, so nothing left to teach.
     assert "### `below`" not in text
-
-
-def test_a_program_that_lost_nothing_is_told_so_rather_than_shown_nothing() -> None:
-    """A heading over no tables would read as a section that went missing.
-
-    It happens the moment a program beats the whole pool, which is also the
-    moment it is promoted, so the message says why there is nothing here.
-    """
-    rates = {"second": 0.6, "third": 0.9}
-    standings = {"champion_1": 2.0, "second": 1.0, "third": -1.0}
-
-    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
-
-    assert "beat every opponent in the pool" in text
-    assert "### `second`" not in text

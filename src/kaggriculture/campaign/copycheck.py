@@ -4,8 +4,9 @@ Independent programs that solve the same game share vocabulary (the op
 names, the item names) but not eight consecutive tokens; a lifted block
 does — and stays sharing them under non-semantic reformatting, because the
 tokenizer sees words, numbers, and lone punctuation characters, never
-whitespace or quote style. Measured on the roster corpus (39 files, ~42k
-shingles):
+whitespace or quote style. Measured on the corpus as it was when the
+threshold was chosen (39 files, ~42k shingles; it is larger now, and the
+independent floor below is re-measured by the tests on every run):
 
 - a verbatim opponent file (`v54:main.py` fed back in) scores 1.0.
 - the PASS skeleton (~10 lines) scores 0.0062 against its best match.
@@ -26,8 +27,11 @@ the smaller of the two lifted-block scores (0.152), rounded down for
 margin: sqrt(0.0066 * 0.152) ~= 0.032, so THRESHOLD = 0.03 sits about
 4.5x above the independent floor and 5x below the weakest lift.
 
-One opponent is exempt: the published agent `config.SEED` starts the
-campaign from, which every program then descends from. See `_corpus`.
+The corpus is every source file under `CORPUS_ROOTS`, not the roster's
+names -- copying is about what a session could reach, and the pool now
+takes agents the roster never named. One agent is exempt: the published
+one the campaign was seeded from, which every program descends from.
+See `CORPUS_ROOTS` and `_corpus`.
 """
 
 import functools
@@ -35,7 +39,7 @@ import logging
 import re
 from pathlib import Path
 
-from kaggriculture.campaign import config, roster
+from kaggriculture.campaign import config
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,35 @@ K = 8
 THRESHOLD = 0.03
 CORPUS_SUFFIXES = (".py", ".cpp", ".inc", ".hpp")
 ENGINE_DIR = Path(__file__).parent / "engine"
+
+# Where opponent source lives. The corpus is every file under these, not the
+# roster's names: the roster says who the harness may *play*, and copying is
+# about what a session could reach. Those were the same list while opponents
+# arrived by hand-editing the roster, and stop being the same the moment the
+# pool takes a harvested agent the roster never named -- at which point a gate
+# keyed on the roster would let a candidate copy it freely, silently, and only
+# for the opponents that matter most, because a fresh harvest is the strongest
+# thing in the pool.
+#
+# It is also the safer failure. A file added under one of these roots is
+# copy-checked with no registration step to forget; a file removed simply
+# stops being in the corpus.
+CORPUS_ROOTS = (config.OPPONENTS, config.AGENTS)
+
+
+def _key(root: Path, file: Path) -> str:
+    """Name a corpus file ``"<agent>:<path within it>"``.
+
+    An opponent is usually a directory -- ``kaito_v54/main.py`` -- and
+    sometimes a loose file, so the agent is the first path component when
+    there is one below the root and the file's own stem when there is not.
+    `validate` splits on the colon to name a copy without naming a path.
+    """
+    relative = file.relative_to(root)
+    if len(relative.parts) == 1:
+        return f"{relative.stem}:{relative.name}"
+    return f"{relative.parts[0]}:{Path(*relative.parts[1:])}"
+
 
 # Identifiers/keywords, numbers, or a single punctuation character. Quote
 # characters are excluded from the punctuation class so `"x"` and `'x'`
@@ -151,8 +184,7 @@ def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
     lineage = _lineage()
     corpus: dict[str, frozenset[tuple[str, ...]]] = {}
     exempt: list[str] = []
-    for name in roster.names():
-        root = roster.path(name).parent
+    for root in CORPUS_ROOTS:
         for file in sorted(root.rglob("*")):
             if not file.is_file() or file.suffix not in CORPUS_SUFFIXES:
                 continue
@@ -160,7 +192,7 @@ def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
             if raw in engine_bytes:
                 continue
             text = raw.decode("utf-8", errors="replace")
-            key = f"{name}:{file.relative_to(root)}"
+            key = _key(root, file)
             shingle_set = frozenset(shingles(text))
             if _jaccard(shingle_set, lineage) >= THRESHOLD:
                 exempt.append(key)
