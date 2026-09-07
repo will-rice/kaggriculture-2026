@@ -28,64 +28,25 @@ from kaggriculture.campaign import (
 LOGGER = logging.getLogger(__name__)
 
 TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
+# The whole message, in order, with the measured parts left as placeholders.
+# It is a file rather than a pile of string constants so that the set-up can
+# be read end to end -- what a round is told, and in what order -- without
+# reconstructing it from `compose`.
+ROUND_PROMPT = Path(__file__).with_name("round_prompt.md")
 
 # Rendered from the gate's own whitelist, so the model is never told a
 # different set from the one that rejects it. One file ships, so this list is
 # the program's whole dependency surface.
-IMPORTS_SECTION = """
-## What your program may import
+IMPORTS = ", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS))
 
-Your program is one file, and that file ships alone: nothing is packaged
-beside it. It may import only these modules, and an import of anything else is
-rejected before the program is scored.
-
-{names}
-""".format(names=", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS)))
-
-DOCTRINE = """
-## Doctrine
-
-The program in front of you began as a published agent, and building on
-published work is what this competition allows. It is yours to change however
-far you like -- rewrite any part of it, or all of it.
-
-Every other opponent is closed. Never read one's source, never ask for it,
-never reconstruct it: the gate rejects code that resembles any opponent your
-lineage did not start from. You are given their names and what your program
-scored against them, and that is the whole of what you may know about them.
-"""
-
-# What the model is asked to do with the file, stated the same way every
-# round: one edit, then stop. The campaign measures; it does not.
-PROGRAM_SECTION = """
-## The program
-
-`child.py` in your working directory is `{name}`, and it is the only file
-there. It is the program to improve.
-
-Edit it in place and stop. Do not run anything and do not report anything back
-in your reply: whatever `child.py` holds when you finish is what the campaign
-plays, against every opponent below, and the result comes back to you as
-another message like this one asking you to improve it again.
-
-`child.py` must stay one self-contained file whose last top-level callable is
-`agent(observation, configuration)` -- that is what Kaggle loads. Say in a
-docstring at its top what you changed and why. There is no time limit on this
-call: take as long as the work needs. Keep the file complete and runnable as
-you go all the same, so that what it holds is always something that could be
-scored.
-
-Nobody is reading this session. There is no human here to answer a question,
-approve a design, choose between options or confirm anything, and nothing you
-write in your reply is read by anyone. Any skill or process that would have you
-present something and wait for approval before writing code does not apply:
-plan as much as you like, but plan and then edit, and never stop to ask. The
-edited file is the only thing that leaves this call, and a call that ends
-without one is a round the campaign spent on nothing.
-
-The rules above cite probes by filename. Those files are not in your
-directory: take their numbers as verified and do not go looking.
-"""
+# The one line that differs between a program that topped the tournament and
+# one that did not. Everything else in that paragraph is the same either way,
+# so only this is chosen here; the rest is in the template.
+PLACED_TOP = (
+    "Top of it, so this program is the champion and every later candidate has "
+    "to beat it."
+)
+PLACED_BELOW = "Every place gained is progress, whoever it comes against."
 
 # How many of a lineage's failures are sent, and how much of each. The last
 # few are what a next attempt can act on; an older one is about a program two
@@ -155,71 +116,48 @@ INSTRUCTION = (
 INSTRUCTION_NAME = "beat"
 
 
-def _verdict_lines(
-    name: str, result: evaluator.Result, standings: dict[str, float]
-) -> list[str]:
-    """Render what the loop measured about ``name``, and where it placed.
+def _template() -> str:
+    """`round_prompt.md` without the note at the top explaining it.
 
-    The verdict comes from ``gate.promotion``, the one function that decides
-    whether a program has won, so a model cannot be told it has cleared
-    something the gate refuses. The standings go in whole: a place in a
-    tournament says more than a yes or a no, and every place gained is
-    progress the next round can aim at.
-
-    Args:
-        name: The program's name -- a pool name or a database id, never a path.
-        result: The loop's own fast evaluation of it.
-        standings: Every agent's rating from the tournament that evaluation is
-            part of, this program included.
-
-    Returns:
-        Lines of a markdown section naming opponents only.
+    That note is for whoever reads the file, not for the model, and it names
+    the placeholders it documents -- which `str.format` would substitute,
+    printing every section of the message twice. Stripping it is what keeps
+    the file self-explanatory without the explanation becoming part of what a
+    round is sent.
     """
-    cleared, why = gate.promotion(standings, name)
-    lines = [
-        f"## The verdict on `{name}`",
-        "",
-        f"Played over {len(result.seeds)} seeds, both seats, against every "
-        "opponent in the pool. The margin is your bank minus theirs at the "
-        "final state.",
-        "",
-        "| opponent | win rate | mean margin | worst | best |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for opponent, rate in result.rates.items():
-        margin = result.margins[opponent]
-        lines.append(
-            f"| {opponent} | {rate:.3f} | {margin.mean:+.0f} | "
-            f"{margin.worst:+.0f} | {margin.best:+.0f} |"
-        )
-    lines += [
-        "",
-        f"It {why}.",
-        "",
-        "The bar is a Bradley-Terry tournament, which is how the competition "
-        "itself ranks the field: every agent plays every other, one strength "
-        "per agent is fitted from all of it at once, and the ranking is what "
-        "counts. Beating a strong opponent is worth more than beating a weak "
-        "one, and one bad matchup is absorbed rather than fatal -- there is "
-        "no opponent you must beat, only a field you must finish above. "
-        + (
-            "Top of it, so this program is the champion and every later "
-            "candidate has to beat it."
-            if cleared
-            else "Every place gained is progress, whoever it comes against."
-        ),
-        "",
-        "| rank | agent | rating |",
-        "| --- | --- | --- |",
-    ]
-    lines += [
+    text = ROUND_PROMPT.read_text(encoding="utf-8")
+    if text.startswith("<!--"):
+        text = text[text.index("-->") + len("-->") :].lstrip("\n")
+    return text
+
+
+def _rate_rows(result: evaluator.Result) -> str:
+    """One row per pool opponent: the rate, and how far apart the banks ended.
+
+    A win rate says how often and a margin says by how much, which is what
+    separates an opponent a program nearly beats from one it is nowhere near.
+    """
+    return "\n".join(
+        f"| {opponent} | {rate:.3f} | {result.margins[opponent].mean:+.0f} | "
+        f"{result.margins[opponent].worst:+.0f} | "
+        f"{result.margins[opponent].best:+.0f} |"
+        for opponent, rate in result.rates.items()
+    )
+
+
+def _standing_rows(name: str, standings: dict[str, float]) -> str:
+    """The tournament table, best first, with this program marked.
+
+    It goes in whole. A place says more than a yes or a no, and every place
+    gained is progress the next round can aim at.
+    """
+    return "\n".join(
         f"| {place} | {'**' + agent + '**' if agent == name else agent} "
         f"| {value:+.3f} |"
         for place, (agent, value) in enumerate(
             sorted(standings.items(), key=lambda pair: -pair[1]), start=1
         )
-    ]
-    return lines
+    )
 
 
 def _rival(
@@ -465,21 +403,24 @@ def compose(
         The whole message, for codex's standard input.
     """
     rival = _rival(name, standings, result.states)
-    parts = [
-        TASK_PROMPT.read_text(encoding="utf-8"),
-        PROGRAM_SECTION.format(name=name),
-        IMPORTS_SECTION,
-        DOCTRINE,
-        "\n".join(_verdict_lines(name, result, standings)),
-        "\n".join(_states_lines(result, rival, standings)),
-    ]
+    cleared, why = gate.promotion(standings, name)
     # A lineage with nothing against it gets no section at all: a heading over
-    # an empty list is noise in a message the model reads every round.
-    if siblings:
-        parts.append("\n".join(_sibling_lines(name, siblings)))
-    if failures:
-        parts.append("\n".join(_failure_lines(name, failures)))
-    parts.append(f"## Your instruction\n\n{instruction}\n")
+    # an empty list is noise in a message the model reads every round. The
+    # template puts each on its own line, so an empty one leaves no gap.
+    message = _template().format(
+        task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
+        name=name,
+        imports=IMPORTS,
+        seeds=len(result.seeds),
+        rates=_rate_rows(result),
+        verdict=why,
+        placing=PLACED_TOP if cleared else PLACED_BELOW,
+        standings=_standing_rows(name, standings),
+        states="\n".join(_states_lines(result, rival, standings)) + "\n",
+        siblings="\n".join(_sibling_lines(name, siblings)) + "\n" if siblings else "",
+        failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
+        instruction=instruction,
+    )
     LOGGER.info(
         "composed a round on %s (rival: %s, %d prior, %d failures)",
         name,
@@ -487,4 +428,4 @@ def compose(
         len(siblings),
         len(failures),
     )
-    return "\n".join(parts)
+    return message

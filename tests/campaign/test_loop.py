@@ -46,7 +46,6 @@ from kaggriculture.campaign import (
     loop,
     mutate,
     pool,
-    prompt,
 )
 
 PASS = (
@@ -884,7 +883,9 @@ def test_a_round_is_told_a_name_and_never_a_path(
     assert f"`{champion.name}`" in handed.message
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture" not in handed.message
-    assert prompt.DOCTRINE in handed.message
+    # The doctrine lives in `round_prompt.md` now, so this asserts on what
+    # was actually delivered rather than on a constant that could drift.
+    assert "Every other opponent is closed" in handed.message
 
 
 def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
@@ -912,7 +913,9 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     assert "`seed`" in handed.message
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture" not in handed.message
-    assert prompt.DOCTRINE in handed.message
+    # The doctrine lives in `round_prompt.md` now, so this asserts on what
+    # was actually delivered rather than on a constant that could drift.
+    assert "Every other opponent is closed" in handed.message
 
 
 def _repository(root: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:

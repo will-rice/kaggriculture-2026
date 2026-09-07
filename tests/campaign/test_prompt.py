@@ -71,6 +71,70 @@ def result(rates: dict[str, float], days: int = 2) -> evaluator.Result:
     )
 
 
+def test_the_template_and_compose_agree_on_every_placeholder() -> None:
+    """A placeholder in one and not the other is a `KeyError` in a live round.
+
+    `str.format` fails on a name the caller did not supply and silently keeps
+    one the template does not use, so the two drift in opposite ways and only
+    the first is loud. This is what `PromptTemplate(validate_template=True)`
+    would buy from langchain-core, in eight lines and without the framework.
+    """
+    supplied = {
+        "task",
+        "name",
+        "imports",
+        "seeds",
+        "rates",
+        "verdict",
+        "placing",
+        "standings",
+        "states",
+        "siblings",
+        "failures",
+        "instruction",
+    }
+    template = prompt._template()
+    used = {
+        match.group(1) for match in re.finditer(r"(?<!\{)\{([a-z_]+)\}(?!\})", template)
+    }
+
+    assert used == supplied, f"template {used - supplied}, compose {supplied - used}"
+    # And composing really does supply exactly those, rather than the set
+    # above being a second thing to keep in step.
+    prompt.compose(
+        "champion_1",
+        result({"v54": 0.0}),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", {"v54": 0.0}),
+    )
+
+
+def test_the_templates_own_note_is_not_sent_to_the_model() -> None:
+    """The file explains itself at the top, and that note is not the prompt.
+
+    It is also a trap rather than merely noise: the note names the
+    placeholders it documents, so `str.format` substitutes them and every
+    section of the message is rendered twice -- silently, in a message nobody
+    reads end to end. Found exactly that way.
+    """
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.0}, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", {"v54": 0.0}),
+    )
+
+    assert prompt.ROUND_PROMPT.read_text(encoding="utf-8").startswith("<!--")
+    assert "<!--" not in text
+    assert "the parts the campaign" not in text
+    # One opponent, one table, thirty days: rendered once.
+    assert text.count("### `v54`") == 1
+
+
 def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
     """The model edits child.py and stops; the campaign plays it."""
     text = prompt.compose(
