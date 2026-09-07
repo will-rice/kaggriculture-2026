@@ -46,6 +46,7 @@ from kaggriculture.campaign import (
     loop,
     mutate,
     pool,
+    rating,
 )
 
 PASS = (
@@ -320,6 +321,44 @@ class Recorder:
             output_tokens=0,
             model="recorder",
         )
+
+
+def test_the_pool_plays_itself_before_anything_is_judged_against_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A tournament needs the pool's own pairings, and only a start builds them.
+
+    `standing` fits over what the field holds and plays nothing, so against a
+    pool that has never played itself every opponent is rated purely by how
+    the one candidate did against it. That is not a tournament, it is a row.
+
+    A promotion used to be the only thing that filled the field in, which
+    worked for exactly as long as something else had built the file first.
+    """
+    tiny_run(tmp_path, monkeypatch)
+    opponents = pool.Pool(
+        opponents={
+            "one": str(_write(tmp_path / "one.py", PASS)),
+            "two": str(_write(tmp_path / "two.py", PASS)),
+        }
+    )
+    opponents.save(config.POOL)
+    monkeypatch.setattr(evaluator, "VENDORED", ["one", "two"])
+    stub_evaluator(monkeypatch)
+    assert not config.FIELD.exists()
+
+    loop.run(
+        sessions=1,
+        mutator=mutate.FakeMutator(edit=lambda source: source + "\n# edited\n"),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+    )
+
+    field = rating.Field.load(config.FIELD)
+    assert field.results(["one", "two"]), "the pool never played itself"
+    assert field.games == 2 * config.GATE_SEEDS
 
 
 def test_a_better_child_is_promoted(

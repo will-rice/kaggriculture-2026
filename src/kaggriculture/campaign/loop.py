@@ -246,6 +246,23 @@ def run(
     # A champion's name resolves through the pool file, so the pool on disk
     # must be current before anything plays a game.
     pool.save(config.POOL)
+    # Before anything is judged against this pool, the pool has to have played
+    # itself. `standing` fits over the pairings that exist and plays nothing,
+    # and `Field.results` returns only what it holds, so a tournament run
+    # against a pool with no pairings of its own is fitted from the
+    # candidate's rows alone -- every opponent rated purely by how this one
+    # program did against it, which is not a tournament.
+    #
+    # Only a promotion used to fill this in, which was fine for exactly as
+    # long as something else had built the file first. Nothing does now, so a
+    # cold start pays for the pool's own games once -- 66 pairings on a
+    # twelve-agent pool -- and every start after that finds them already
+    # played and measures nothing.
+    measured = gate.refresh(
+        pool, rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS), workers
+    )
+    if measured:
+        LOGGER.info("field: measured %d pool pairing(s) before starting", len(measured))
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
     if not database.programs:
         seed = evaluator.score(seed_agent, SEED_ID, pool, rng, workers)
