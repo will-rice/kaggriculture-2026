@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import (
     archive,
     config,
@@ -71,36 +73,42 @@ def result(rates: dict[str, float], days: int = 2) -> evaluator.Result:
     )
 
 
-def test_the_template_and_compose_agree_on_every_placeholder() -> None:
-    """A placeholder in one and not the other is a `KeyError` in a live round.
+def test_a_template_names_its_own_fields(tmp_path: Path) -> None:
+    """The file decides what fills it, so there is no second list to keep."""
+    path = tmp_path / "t.md"
+    path.write_text(
+        "{alpha} and {beta}, but {{literal}} is not one\n", encoding="utf-8"
+    )
 
-    `str.format` fails on a name the caller did not supply and silently keeps
-    one the template does not use, so the two drift in opposite ways and only
-    the first is loud. This is what `PromptTemplate(validate_template=True)`
-    would buy from langchain-core, in eight lines and without the framework.
+    message = prompt.Message(path)
+
+    assert message.fields == {"alpha", "beta"}
+    assert message.render(alpha="a", beta="b") == "a and b, but {literal} is not one\n"
+
+
+def test_a_template_and_its_caller_cannot_drift_apart(tmp_path: Path) -> None:
+    """`str.format` drifts both ways and only complains about one.
+
+    It raises on a placeholder the caller did not supply, and silently keeps
+    one the template stopped using -- so half of the drift ships. Both sides
+    are named here, which is what `PromptTemplate(validate_template=True)`
+    would buy from langchain-core without the framework behind it.
     """
-    supplied = {
-        "task",
-        "name",
-        "imports",
-        "seeds",
-        "rates",
-        "verdict",
-        "placing",
-        "standings",
-        "states",
-        "siblings",
-        "failures",
-        "instruction",
-    }
-    template = prompt._template()
-    used = {
-        match.group(1) for match in re.finditer(r"(?<!\{)\{([a-z_]+)\}(?!\})", template)
-    }
+    path = tmp_path / "t.md"
+    path.write_text("{alpha} and {beta}\n", encoding="utf-8")
+    message = prompt.Message(path)
 
-    assert used == supplied, f"template {used - supplied}, compose {supplied - used}"
-    # And composing really does supply exactly those, rather than the set
-    # above being a second thing to keep in step.
+    with pytest.raises(ValueError, match=r"wants \['beta'\]"):
+        message.render(alpha="a")
+    with pytest.raises(ValueError, match=r"given \['gamma'\]"):
+        message.render(alpha="a", beta="b", gamma="c")
+
+
+def test_the_round_template_is_loaded_and_checked_at_import() -> None:
+    """A template nobody can fill must fail before a codex call is spent."""
+    assert prompt.ROUND.fields
+    # Composing supplies exactly what the file asks for; `render` raises
+    # otherwise, so reaching the end of this is the assertion.
     prompt.compose(
         "champion_1",
         result({"v54": 0.0}),

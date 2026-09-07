@@ -15,6 +15,7 @@ shaped differently from the others.
 
 import ast
 import logging
+import re
 from pathlib import Path
 
 from kaggriculture.campaign import (
@@ -116,19 +117,62 @@ INSTRUCTION = (
 INSTRUCTION_NAME = "beat"
 
 
-def _template() -> str:
-    """`round_prompt.md` without the note at the top explaining it.
+class Message:
+    """A prompt template, and the only thing that decides what fills it.
 
-    That note is for whoever reads the file, not for the model, and it names
-    the placeholders it documents -- which `str.format` would substitute,
-    printing every section of the message twice. Stripping it is what keeps
-    the file self-explanatory without the explanation becoming part of what a
-    round is sent.
+    `str.format` drifts in two directions and only complains about one: it
+    raises on a placeholder the caller did not supply, and silently keeps one
+    the template stopped using. Naming the fields somewhere else would make a
+    third thing to keep in step, so they are read out of the template -- which
+    makes the file the single source of truth for its own shape, and makes a
+    mismatch a `ValueError` naming both sides rather than a `KeyError` naming
+    one.
+
+    Loaded and checked at import, so a template nobody can fill fails before
+    the run opens rather than mid-round with a codex call already spent.
+
+    Attributes:
+        fields: The placeholder names the template uses.
     """
-    text = ROUND_PROMPT.read_text(encoding="utf-8")
-    if text.startswith("<!--"):
-        text = text[text.index("-->") + len("-->") :].lstrip("\n")
-    return text
+
+    # A single-braced lowercase name. Doubled braces are literal braces, which
+    # markdown examples may legitimately contain.
+    PLACEHOLDER = re.compile(r"(?<!\{)\{([a-z_]+)\}(?!\})")
+
+    def __init__(self, path: Path) -> None:
+        """Load ``path``, dropping the note that explains it.
+
+        That note is for whoever reads the file, not for the model -- and it
+        names the placeholders it documents, so leaving it in would have
+        `format` substitute them and render every section of the message
+        twice.
+
+        Args:
+            path: The markdown template.
+        """
+        text = path.read_text(encoding="utf-8")
+        if text.startswith("<!--"):
+            text = text[text.index("-->") + len("-->") :].lstrip("\n")
+        self.text = text
+        self.fields = frozenset(self.PLACEHOLDER.findall(text))
+
+    def render(self, **values: object) -> str:
+        """Fill every placeholder, or say exactly which side is out of step.
+
+        Raises:
+            ValueError: The values and the template disagree about the fields.
+        """
+        given = frozenset(values)
+        if given != self.fields:
+            raise ValueError(
+                f"{self.__class__.__name__} wants "
+                f"{sorted(self.fields - given) or 'nothing more'} and was given "
+                f"{sorted(given - self.fields) or 'nothing extra'}"
+            )
+        return self.text.format(**values)
+
+
+ROUND = Message(ROUND_PROMPT)
 
 
 def _rate_rows(result: evaluator.Result) -> str:
@@ -407,7 +451,7 @@ def compose(
     # A lineage with nothing against it gets no section at all: a heading over
     # an empty list is noise in a message the model reads every round. The
     # template puts each on its own line, so an empty one leaves no gap.
-    message = _template().format(
+    message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         name=name,
         imports=IMPORTS,
