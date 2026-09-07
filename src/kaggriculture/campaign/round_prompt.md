@@ -18,6 +18,10 @@ Placeholders, all filled on every round:
   {placing}      one line on what that place means, promotion or progress
   {standings}    the tournament table, this program marked
   {states}       one day-by-day game against each opponent that took a game
+  {claims}       what the ladder's winners do that this program does not --
+                 confirmed over the recorded corpus and selected against this
+                 program's own games, so it is empty for a program already
+                 doing all of it
   {siblings}     other programs written from this one, or empty
   {failures}     the lineage's recent rejected attempts, or empty
   {instruction}  what to do, and under stagnation why the start moved
@@ -105,6 +109,7 @@ you must finish above. {placing}
 {standings}
 
 {states}
+{claims}
 {siblings}
 {failures}
 

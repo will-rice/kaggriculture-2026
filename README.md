@@ -65,11 +65,42 @@ round beats every opponent, or at whichever of `ROUNDS_PER_SESSION` and
 
 The model is a mutation operator: it plays nothing and measures nothing, so
 every game goes through the one pool that knows how many cores there are, and
-the verdict it is sent is the same rule the promotion gate applies. A program
-entering the top `DEEP_TOP_K` is confirmed on the sealed exam block, and one
-that beats every opponent there becomes the champion and joins the pool.
-`--sessions` is how many sessions to run; whatever is in flight when the last
-one is taken is drained.
+the verdict it is sent is the same rule the promotion gate applies. There is
+one measurement, over `GATE_SEEDS` fresh seeds, and a program that finishes top
+of the Bradley-Terry standings on it becomes the champion and joins the pool.
+There were two — a cheap ranking to shortlist on and a sealed block to confirm
+— and the cheap one selected the luckiest program rather than the best: 78 of
+471 topped it and none survived the block. Re-measuring cannot fix that, so
+there is now one gate deep enough to select on. `--sessions` is how many
+sessions to run; whatever is in flight when the last one is taken is drained.
+
+### What a round is told about the ladder
+
+The pool is built from published kernels, and the agents at the top of the
+leaderboard publish none — so the strongest play in the competition appears
+nowhere in the pool and only in the public replay archive. Two commands mine
+it, and both write files the round prompt reads:
+
+```bash
+uv run winning-pace 400   # campaign/winning_pace.md: what winners held each day
+uv run strategies         # campaign/strategies.jsonl: what winners did differently
+```
+
+`winning-pace` is a median over winning sides: a reference to read a program's
+own day tables against. `strategies` is paired — it compares the two players
+_inside_ one game, where the map, the prices and the opponent are shared, so
+what is left when they differ is what the two players did. Each claim names a
+quantity, a day and which side leads, and the corpus confirms or refutes it by
+the count. A round is then shown only the confirmed claims its own games put it
+on the wrong side of, so the section is short, specific to that program, and
+empty for a program already doing all of it.
+
+`strategies` reads every game there is, in parallel over the daily archives,
+rather than a sample: measured over sixty games eight of the first eleven
+claims cleared the bar, and over four hundred only six did. Selecting a claim
+for scoring highly on a sample is the same winner's curse the promotion gate
+was rebuilt to avoid. Re-run both as archives land — the log keeps every
+measurement, so a claim confirmed early and refuted later keeps both records.
 
 `dry-run` swaps the codex call for one that copies the parent with a visible
 edit, so it exercises validation, evaluation, insertion and the promotion gate

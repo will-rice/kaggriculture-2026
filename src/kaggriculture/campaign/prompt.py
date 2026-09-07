@@ -8,9 +8,20 @@ and no file we assemble that an opponent's path could leak through.
 
 The message is spec section 4's six parts, in order: the game, the program,
 the verdict on it, the states behind that verdict, the lineage's recent
-failures, and the instruction. One function composes it and every round is
-composed by it, the first included, so the model never sees a round that is
-shaped differently from the others.
+failures, and the instruction -- and one part the spec did not have, between
+the states and the lineage: what the recorded ladder's winners do that this
+program does not. One function composes it and every round is composed by it,
+the first included, so the model never sees a round that is shaped differently
+from the others.
+
+Two of those parts come from the public replay archive rather than from
+anything the campaign played, and they are not the same thing. `winning_pace`
+is what the winners held on each day, a median over the corpus; the claim
+store is what the winners did *differently*, measured inside single games
+where both sides had the same map and the same prices and one of them lost.
+The first is a reference to read a program's own day tables against. The
+second is selected: only the claims this program is on the other side of
+reach it.
 """
 
 import ast
@@ -23,6 +34,7 @@ from kaggriculture.campaign import (
     evaluator,
     gate,
     harness,
+    strategy,
     validate,
 )
 
@@ -42,6 +54,18 @@ ROUND_PROMPT = Path(__file__).with_name("round_prompt.md")
 # there is. A snapshot of how the field played, not a constant of the game:
 # rebuild it when the ladder has moved.
 WINNING_PACE = Path(__file__).with_name("winning_pace.md")
+
+# How many claims a round is shown. The store is meant to grow -- every day's
+# archives can propose more -- and the message is not, so what bounds it is
+# not the size of the store but how many of its claims this particular program
+# is on the wrong side of. Five is enough to be actionable and few enough that
+# each one is read.
+MOST_CLAIMS = 5
+# A claim is selected when the program is on the other side of it in more than
+# this share of its recorded games. Half, because one game against one
+# opponent is a matchup and not a habit: a program that plants late against
+# the one opponent that rushes it is not a program that plants late.
+MOSTLY = 0.5
 
 # Rendered from the gate's own whitelist, so the model is never told a
 # different set from the one that rejects it. One file ships, so this list is
@@ -332,6 +356,141 @@ def _states_lines(
     return lines
 
 
+def _both_sides(day: harness.Day) -> dict[str, tuple[float, float]]:
+    """The claim quantities a round's own game measures for both players.
+
+    Four of `strategy.QUANTITIES`, and the store may hold confirmed claims
+    about the other seven that no round will ever be shown. That is a real
+    limit and it is here rather than hidden:
+
+    - `seeds` is private. A program sees its own and never the opponent's, so
+      a day table carries one side of it and there is nothing to compare.
+    - `sells`, `hires` and `land` are orders. A day table is a state at a
+      moment; nothing in it counts what was submitted to get there.
+    - `ripe`, `quadrants` and `pens` are measured on a tape by reading tiles,
+      and a day table does not carry the tiles -- it carries counts derived
+      from them. `pens` is the trap: a tape counts coop and pasture tiles and
+      a day table counts animals by species, so comparing them would be two
+      different quantities sharing one name, which is the kind of measurement
+      that agrees with itself and is wrong.
+
+    Closing that gap means widening `harness.Day`, which changes every game
+    already recorded. Until then a claim about hiring is measured, kept, and
+    not shown.
+    """
+    return {
+        "bank": (day.ours_bank, day.theirs_bank),
+        "planted": (
+            float(sum(day.ours_plants.values())),
+            float(sum(day.theirs_plants.values())),
+        ),
+        "hands": (float(day.ours_hands), float(day.theirs_hands)),
+        "shed": (
+            float(sum(day.ours_shed.values())),
+            float(sum(day.theirs_shed.values())),
+        ),
+    }
+
+
+def _against(
+    claim: strategy.Claim, states: dict[str, list[harness.Day]]
+) -> tuple[int, int]:
+    """How many of this program's recorded games sit on the wrong side of a claim.
+
+    Every game played, not only the ones whose tables the message shows: what
+    is being asked is how this program plays, and six tables were chosen to
+    bound a message rather than to describe it.
+
+    Args:
+        claim: The claim to check.
+        states: One recorded game per opponent, day by day.
+
+    Returns:
+        ``(wrong, seen)`` -- games on the other side of the claim, and games
+        that could say either way. ``seen`` is zero for a quantity a day
+        table does not carry, and for a day nobody reached.
+    """
+    wrong = seen = 0
+    for days in states.values():
+        for day in days:
+            if day.day != claim.form.day:
+                continue
+            pair = _both_sides(day).get(claim.form.quantity)
+            if pair is None:
+                continue
+            seen += 1
+            wrong += claim.form.wrong_side(*pair)
+    return wrong, seen
+
+
+def selected(
+    store: strategy.Strategies, states: dict[str, list[harness.Day]]
+) -> list[tuple[int, int, strategy.Claim]]:
+    """The confirmed claims this program is on the wrong side of, worst first.
+
+    Not the claims that are true -- those are a reading list. The ones worth a
+    round's attention are the true ones this program is not doing, which is
+    why a claim carries a form and not only a sentence: the same form that
+    counts the corpus decides whether this program is the exception. That is
+    also what keeps the message the size of the gap rather than the size of
+    the store.
+
+    Args:
+        store: The claims and what has been measured of them.
+        states: One recorded game per opponent, day by day.
+
+    Returns:
+        ``(wrong, seen, claim)`` for at most ``MOST_CLAIMS`` claims, the ones
+        the program is furthest from first.
+    """
+    scored = []
+    for claim in store.confirmed():
+        wrong, seen = _against(claim, states)
+        if seen and wrong / seen > MOSTLY:
+            scored.append((wrong / seen, claim.agreement, wrong, seen, claim))
+    scored.sort(key=lambda row: (-row[0], -row[1]))
+    return [(wrong, seen, claim) for _, _, wrong, seen, claim in scored[:MOST_CLAIMS]]
+
+
+def _claim_lines(claims: list[tuple[int, int, strategy.Claim]]) -> list[str]:
+    """Render what the corpus confirmed and this program is not doing.
+
+    Args:
+        claims: What `selected` returned, worst first.
+
+    Returns:
+        Lines of a markdown section, or nothing at all when the program is
+        already on the right side of everything the corpus has confirmed.
+    """
+    if not claims:
+        return []
+    lines = [
+        "## What the ladder's winners do that this program does not",
+        "",
+        "Measured over the recorded games of the public ladder -- the agents "
+        "at the top of it, none of whom publish a kernel, so their games are "
+        "the only view of them there is. Each claim was checked inside single "
+        "games, comparing the two players at the same day's close: same map, "
+        "same prices, same opponent, one of them lost. So a difference here "
+        "is about what the two players did and not about the game they were "
+        "given.",
+        "",
+        "Every claim below cleared that corpus *and* is one your program is "
+        "on the other side of in most of its own games above. They are "
+        "tendencies of strong play, not rules of the game: a claim that held "
+        "in 70% of games is a claim that failed in 30%, and a program that "
+        "wins by breaking one has beaten the claim rather than the other way "
+        "round. Worst first.",
+        "",
+        "| what the winners do | what was compared, and what it held in "
+        "| your games on the other side |",
+        "| --- | --- | --- |",
+    ]
+    for wrong, seen, claim in claims:
+        lines.append(f"| {claim.prose} | {claim.says()} | {wrong} of {seen} |")
+    return lines
+
+
 def _summary(program: archive.Program) -> str:
     """A program's own account of what it changed: its module docstring.
 
@@ -456,6 +615,9 @@ def compose(
     """
     rival = _rival(name, standings, result.states)
     cleared, why = gate.promotion(standings, name)
+    # Opened here rather than at import, so a store the daily measurement
+    # has rewritten reaches a campaign that is already running.
+    claims = selected(strategy.Strategies(strategy.STORE), result.states)
     # A lineage with nothing against it gets no section at all: a heading over
     # an empty list is noise in a message the model reads every round. The
     # template puts each on its own line, so an empty one leaves no gap.
@@ -470,15 +632,17 @@ def compose(
         placing=PLACED_TOP if cleared else PLACED_BELOW,
         standings=_standing_rows(name, standings),
         states="\n".join(_states_lines(result, rival, standings)) + "\n",
+        claims="\n".join(_claim_lines(claims)) + "\n" if claims else "",
         siblings="\n".join(_sibling_lines(name, siblings)) + "\n" if siblings else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         instruction=instruction,
     )
     LOGGER.info(
-        "composed a round on %s (rival: %s, %d prior, %d failures)",
+        "composed a round on %s (rival: %s, %d prior, %d failures, %d claims)",
         name,
         rival,
         len(siblings),
         len(failures),
+        len(claims),
     )
     return message

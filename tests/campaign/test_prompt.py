@@ -12,6 +12,7 @@ from kaggriculture.campaign import (
     gate,
     harness,
     prompt,
+    strategy,
     validate,
 )
 
@@ -615,3 +616,119 @@ def test_the_game_shown_is_against_the_agent_directly_above() -> None:
     assert "### `rival`, won 0.250 -- directly above you" in text
     # Beaten every single time, so nothing left to teach.
     assert "### `below`" not in text
+
+
+def store(tmp_path: Path, *claims: tuple[str, int, bool, float]) -> strategy.Strategies:
+    """A claim store holding exactly what a test wants measured.
+
+    Built rather than monkeypatched, and passed in: `selected` takes the store
+    because a test that has to reach into the module to change where it reads
+    from is a test of the reaching.
+    """
+    opened = strategy.Strategies(tmp_path / "strategies.jsonl")
+    for quantity, when, leads, agreement in claims:
+        claim = opened.propose(
+            strategy.Form(quantity=quantity, day=when, winner_leads=leads),
+            f"winners {'lead on' if leads else 'trail on'} {quantity}",
+            [],
+        )
+        opened.record(claim.id, support=100, agreement=agreement)
+    return opened
+
+
+def test_a_claim_this_program_already_follows_is_not_shown(tmp_path: Path) -> None:
+    """What makes a claim worth a round is not that it is true.
+
+    Every confirmed claim is true of the corpus by construction, so a section
+    listing them would be the same paragraph every round on every program. The
+    one thing that differs between programs is which of them this program is
+    not doing.
+    """
+    # The day table has this program ahead on planted tiles in every game.
+    chosen = prompt.selected(
+        store(tmp_path, ("planted", 1, True, 0.9)), result({"v54": 0.3}).states
+    )
+
+    assert chosen == []
+
+
+def test_the_claims_shown_are_the_ones_this_program_breaks_worst_first(
+    tmp_path: Path,
+) -> None:
+    """A round that reads one claim should read the one it is furthest from."""
+    # This program trails on bank and leads on planted in every recorded game,
+    # so it is on the wrong side of two of these four and of neither of the
+    # other two.
+    chosen = prompt.selected(
+        store(
+            tmp_path,
+            ("bank", 1, True, 0.95),
+            ("planted", 1, False, 0.70),
+            ("planted", 1, True, 0.99),
+            ("bank", 1, False, 0.99),
+        ),
+        result({"v54": 0.3, "v16": 0.5}).states,
+    )
+
+    assert [
+        (claim.form.quantity, claim.form.winner_leads) for _, _, claim in chosen
+    ] == [("bank", True), ("planted", False)]
+    # Both opponents, and the row says the count rather than the share.
+    assert [(wrong, seen) for wrong, seen, _ in chosen] == [(2, 2), (2, 2)]
+
+
+def test_a_claim_the_corpus_has_not_confirmed_never_reaches_a_round(
+    tmp_path: Path,
+) -> None:
+    """The measurement decides what is shown, not the sentence.
+
+    A proposed claim reads exactly like a confirmed one -- it is a sentence
+    about winning play either way -- and telling a round to act on one the
+    corpus refused is worse than telling it nothing.
+    """
+    weak = store(tmp_path, ("bank", 1, True, 0.40))
+
+    assert weak.claims[0].status == "proposed"
+    assert prompt.selected(weak, result({"v54": 0.3}).states) == []
+
+
+def test_a_claim_a_day_table_cannot_carry_is_kept_and_not_shown(
+    tmp_path: Path,
+) -> None:
+    """Hire orders are the store's clearest finding and cannot be selected.
+
+    A day table is a state at a moment and does not count what was submitted
+    to reach it, so there is no value to put this program on a side of. It
+    stays measured in the store; it does not become a claim about a program
+    whose orders nobody counted.
+    """
+    assert "hires" in strategy.QUANTITIES
+
+    chosen = prompt.selected(
+        store(tmp_path, ("hires", 1, False, 0.71)), result({"v54": 0.3}).states
+    )
+
+    assert chosen == []
+
+
+def test_the_claim_section_disappears_when_there_is_nothing_to_say() -> None:
+    """A heading over an empty list is noise in a message read every round.
+
+    The live store decides this one, so it asserts the shape of the message
+    rather than a particular claim: either the section is there with its table
+    under it, or it is not there at all.
+    """
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.3}, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", {"v54": 0.3}),
+    )
+
+    heading = "## What the ladder's winners do that this program does not"
+    if heading in text:
+        assert text.count("| what the winners do |") == 1
+    else:
+        assert "what the winners do" not in text
