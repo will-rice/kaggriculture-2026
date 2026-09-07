@@ -155,7 +155,7 @@ def _isolate(root: Path) -> None:
     Args:
         root: The directory the dry run owns.
     """
-    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION"):
+    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "FIELD"):
         setattr(config, name, root / getattr(config, name).relative_to(config.RUN))
     config.POOL = root / "pool.json"
     LOGGER.info("dry run: every write goes under %s", root)
@@ -630,13 +630,28 @@ class Campaign:
                 if dropped:
                     self.pool.save(config.POOL)
                     LOGGER.info("pool: %s made way", ", ".join(dropped))
-                # The champion joined the pool with no pairings of its own, and
-                # `standing` plays nothing -- so until these are measured it
-                # sits in every tournament on one edge, the row of whichever
-                # candidate is being judged against it, and beating it drops
-                # its rating far enough to make topping the standings easy.
-                # Each promotion would buy the next one cheaply. Measured after
-                # the trim, so nothing is played for an opponent just dropped.
+                self.state.champion = gate.record(champion)
+                self.state.sessions_since_promotion = 0
+                # Last, and after the record, because it is the only slow step
+                # here: the champion joined the pool with no pairings of its
+                # own and `standing` plays nothing, so these have to be played
+                # -- and a first promotion is a whole pool's worth of them.
+                # Until they exist the champion sits in every tournament on one
+                # edge, the row of whichever candidate is being judged against
+                # it, and beating it drops its rating far enough to make
+                # topping the standings easy; each promotion would buy the next
+                # one cheaply.
+                #
+                # Interrupting this is now harmless. `field.missing` is what
+                # decides what to play, so a refresh that never finished leaves
+                # pairings absent and the next promotion plays them. Ordered
+                # the other way round -- and it was -- a kill in the middle
+                # left the pool holding a champion that `champion.json` had
+                # never heard of, which is exactly what happened the first time
+                # this ever promoted.
+                #
+                # Measured after the trim, so nothing is played for an opponent
+                # that just made way.
                 measured = await asyncio.to_thread(
                     gate.refresh,
                     self.snapshot(),
@@ -646,8 +661,6 @@ class Campaign:
                 LOGGER.info(
                     "field: %d new pairing(s) for %s", len(measured), champion.name
                 )
-                self.state.champion = gate.record(champion)
-                self.state.sessions_since_promotion = 0
                 artifact = wandb.Artifact(
                     champion.name, "champion", metadata=result.model_dump()
                 )

@@ -95,7 +95,7 @@ WORKERS = max(1, min(2, config.CORE_BUDGET // config.SESSIONS))
 # second call would otherwise resolve paths the first call had replaced.
 RUNTIME_PATHS = {
     name: getattr(config, name).relative_to(config.RUN)
-    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION")
+    for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "FIELD")
 }
 
 
@@ -1317,7 +1317,15 @@ def test_a_dry_run_writes_nowhere_the_campaign_reads(
     live = pass_pool(tmp_path)
     campaign = {
         name: getattr(config, name)
-        for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION", "POOL")
+        for name in (
+            "ARCHIVE",
+            "PROGRAMS",
+            "FLOOR",
+            "CHAMPIONS",
+            "CHAMPION",
+            "POOL",
+            "FIELD",
+        )
     }
     seed = _write(tmp_path / "seed.py", PASS)
 
@@ -1336,6 +1344,13 @@ def test_a_dry_run_writes_nowhere_the_campaign_reads(
     assert not campaign["ARCHIVE"].exists()
     assert not campaign["CHAMPION"].exists()
     assert not campaign["PROGRAMS"].exists()
+    # The field cache too. It is the one a promotion writes, it was
+    # not on this list, and a dry run that promoted therefore wrote
+    # its champions into the live campaign's pairings -- which is how
+    # the real one came to hold `champion_1` through `champion_9` and
+    # an opponent called `pass`, none of which the campaign has ever
+    # played.
+    assert not campaign["FIELD"].exists()
     assert pool.Pool.load(campaign["POOL"]).opponents == live.opponents
 
 

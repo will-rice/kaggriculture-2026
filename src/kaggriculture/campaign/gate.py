@@ -89,7 +89,7 @@ def refresh(
     pool: Pool,
     seeds: Sequence[int],
     workers: int,
-    kept: Path = config.FIELD,
+    kept: Path | None = None,
 ) -> list[tuple[str, str]]:
     """Play the pool's own pairings that have never been played, and keep them.
 
@@ -126,6 +126,12 @@ def refresh(
     opponents = pool.names()
     games = 2 * len(seeds)
 
+    # Resolved here rather than defaulted in the signature: a default is
+    # evaluated once, at definition, so `kept=config.FIELD` captured the
+    # path as it was at import and no amount of monkeypatching moved it.
+    # A dry run and every test that promoted therefore wrote their
+    # champions into the live campaign's pairings.
+    kept = kept or config.FIELD
     field = rating.Field.load(kept)
     # The cache carries one game count for every pairing in it, so a field
     # measured at a different count cannot be extended -- recording a new
@@ -167,7 +173,7 @@ def standing(
     rates: dict[str, float],
     pool: Pool,
     games: int,
-    kept: Path = config.FIELD,
+    kept: Path | None = None,
 ) -> dict[str, float]:
     """The same tournament, over games already played: no new ones.
 
@@ -186,6 +192,12 @@ def standing(
     Returns:
         A rating per agent, the program included.
     """
+    # Resolved here rather than defaulted in the signature: a default is
+    # evaluated once, at definition, so `kept=config.FIELD` captured the
+    # path as it was at import and no amount of monkeypatching moved it.
+    # A dry run and every test that promoted therefore wrote their
+    # champions into the live campaign's pairings.
+    kept = kept or config.FIELD
     field = rating.Field.load(kept)
     opponents = [n for n in pool.names() if n in rates]
     results = field.results(opponents)
