@@ -51,7 +51,7 @@ def test_a_field_measured_over_other_games_is_thrown_away_not_extended(
     with a pairing played over another and every old rate is relabelled as
     having been played over games it never was -- silently, because nothing
     fails, and consequentially, because the Bradley-Terry fit weights each
-    rate by that number. Only changing `FAST_SEEDS` can reach it, which is
+    rate by that number. Only changing `GATE_SEEDS` can reach it, which is
     exactly when nobody would be looking.
 
     The cached rate here is a lie: a PASS agent draws with a PASS agent, so
@@ -72,13 +72,46 @@ def test_a_field_measured_over_other_games_is_thrown_away_not_extended(
     stale.record("one", "two", 1.0)
     stale.save(kept)
 
-    gate.tournament(
-        Path(agents["one"]), "candidate", opponents, seeds=[1, 2], workers=1, kept=kept
-    )
+    gate.refresh(opponents, seeds=[1, 2], workers=1, kept=kept)
 
     field = rating.Field.load(kept)
     assert field.games == 4
     assert field.rates["one"]["two"] == 0.5
+
+
+def test_a_new_pool_member_has_its_pairings_played(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A champion joins with no pairings, and `standing` plays nothing.
+
+    `Field.results` returns only the pairings it holds, so an opponent with
+    none is absent from the fit rather than an error. For the vendored
+    opponents that never matters -- they were measured once. For a champion it
+    is the whole ratchet: until its own pairings exist it sits in every
+    tournament on the single edge of whoever is being judged against it, and
+    beating it drops its rating far enough that topping the standings is easy.
+    Each promotion would buy the next one cheaply.
+    """
+    monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
+    agents = {}
+    for name in ("one", "two"):
+        path = tmp_path / f"{name}.py"
+        path.write_text(PASS, encoding="utf-8")
+        agents[name] = str(path)
+    kept = tmp_path / "field.json"
+    before = pool.Pool(opponents=dict(list(agents.items())[:1]))
+    before.save(config.POOL)
+    gate.refresh(before, seeds=[1], workers=1, kept=kept)
+
+    # The champion arrives, and its pairing against the incumbent is absent.
+    joined = pool.Pool(opponents=agents)
+    joined.save(config.POOL)
+    assert rating.Field.load(kept).results(joined.names()) == []
+
+    measured = gate.refresh(joined, seeds=[1], workers=1, kept=kept)
+
+    assert measured == [("one", "two")]
+    assert len(rating.Field.load(kept).results(joined.names())) == 1
 
 
 def test_the_top_of_the_tournament_is_promoted() -> None:

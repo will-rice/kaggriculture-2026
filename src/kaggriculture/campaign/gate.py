@@ -85,47 +85,45 @@ class Champion(BaseModel):
     result: Result
 
 
-def tournament(
-    candidate: Path,
-    name: str,
+def refresh(
     pool: Pool,
     seeds: Sequence[int],
     workers: int,
     kept: Path = config.FIELD,
-) -> dict[str, float]:
-    """Play every pairing among the candidate and the pool, and rate them all.
+) -> list[tuple[str, str]]:
+    """Play the pool's own pairings that have never been played, and keep them.
 
-    This is the gate. Not the candidate's results against a field measured
-    earlier -- the pool is dynamic, champions join it and the weakest leave,
-    so a pairing played against last week's pool is not a result in this
-    tournament. Every agent plays every other, here, now.
+    `standing` fits a tournament over pairings that already exist and plays
+    nothing. That is what makes a verdict cheap enough to give every round --
+    and it means a pairing nobody has played is silently absent from the fit,
+    because `Field.results` returns only what it holds.
 
-    The candidate's row is played every time -- it is a new program and has no
-    history. The pool's pairings against each other are played once and kept,
-    because they are constants: fixed files, seeded games, and no opponent
-    drawing on randomness. So a gate normally costs the candidate's row alone,
-    and only a pool that has just gained a champion pays for anything more.
+    Which is fine for the vendored opponents, whose pairings were measured
+    once and never change, and wrong for a champion. A champion joins the pool
+    the moment it is promoted and has no pairings at all, so until they are
+    played it appears in every tournament with a single edge: the row of
+    whichever candidate is being judged against it. Its rating is then
+    inferred almost entirely from that one result -- beat it, and its rating
+    falls far enough that topping the standings is easy. Each promotion would
+    make the next one cheaper, which is the ratchet running backwards.
+
+    So this is called after a promotion, and it is the only thing that writes
+    the field.
 
     Args:
-        candidate: The program under consideration.
-        name: What to call it in the standings; must not be a pool name.
-        pool: The opponents, as they stand.
+        pool: The opponents as they stand, the new champion included.
         seeds: Episode seeds; each pairing is played on all of them, both
             seats, so a pairing is ``2 * len(seeds)`` games.
         workers: Processes to fan the games over.
         kept: Where the pool's own pairings live between gates.
 
     Returns:
-        A rating per agent, the candidate included, from one fit over every
-        pairing in the tournament.
+        The pairings measured, empty when the field already held them all.
 
     Raises:
-        ValueError: ``name`` is already a pool opponent.
         OpponentCrash: A pool opponent raised in its own seat.
     """
     opponents = pool.names()
-    if name in opponents:
-        raise ValueError(f"{name} is already in the pool")
     games = 2 * len(seeds)
 
     field = rating.Field.load(kept)
@@ -137,7 +135,7 @@ def tournament(
     # keeping them mislabelled is worse than paying for them again.
     if field.rates and field.games != games:
         LOGGER.info(
-            "field was measured over %d games and this tournament plays %d: "
+            "field was measured over %d games and this gate plays %d: "
             "discarding %d cached pairing(s) and measuring them again",
             field.games,
             games,
@@ -145,19 +143,14 @@ def tournament(
         )
         field = rating.Field()
     absent = field.missing(opponents)
-    if absent:
-        LOGGER.info(
-            "tournament: %d pairing(s) never played, measuring them", len(absent)
-        )
-        for one, two in absent:
-            field.record(one, two, _rate(roster.path(one), two, seeds, workers))
-        field.games = games
-        field.save(kept)
-
-    results = field.results(opponents)
-    for two in opponents:
-        results.append((name, two, _rate(candidate, two, seeds, workers), games))
-    return rating.standings(results)
+    if not absent:
+        return []
+    LOGGER.info("field: %d pairing(s) never played, measuring them", len(absent))
+    for one, two in absent:
+        field.record(one, two, _rate(roster.path(one), two, seeds, workers))
+    field.games = games
+    field.save(kept)
+    return absent
 
 
 def _rate(agent: Path, opponent: str, seeds: Sequence[int], workers: int) -> float:

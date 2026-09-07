@@ -629,6 +629,22 @@ class Campaign:
                 if dropped:
                     self.pool.save(config.POOL)
                     LOGGER.info("pool: %s made way", ", ".join(dropped))
+                # The champion joined the pool with no pairings of its own, and
+                # `standing` plays nothing -- so until these are measured it
+                # sits in every tournament on one edge, the row of whichever
+                # candidate is being judged against it, and beating it drops
+                # its rating far enough to make topping the standings easy.
+                # Each promotion would buy the next one cheaply. Measured after
+                # the trim, so nothing is played for an opponent just dropped.
+                measured = await asyncio.to_thread(
+                    gate.refresh,
+                    self.snapshot(),
+                    self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+                    self.workers,
+                )
+                LOGGER.info(
+                    "field: %d new pairing(s) for %s", len(measured), champion.name
+                )
                 self.state.champion = gate.record(champion)
                 self.state.sessions_since_promotion = 0
                 artifact = wandb.Artifact(
