@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import harness, roster, validate
+from kaggriculture.campaign import config, harness, roster, validate
 
 GOOD = """
 import math
@@ -249,3 +249,16 @@ def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
     # Bounded by the steps asked for, so the suite pays five seconds and not
     # the seven hundred a full episode would allow.
     assert time.monotonic() - started < 60
+
+
+@pytest.mark.local_data
+def test_the_seed_passes_the_gate_it_will_be_measured_by() -> None:
+    """A cold start seeds from `config.SEED`, so the gate has to accept it.
+
+    Every check at once, which is the point: it is a published agent, so the
+    copy gate has to exempt its lineage; it carries a compressed table, so
+    `base64` and `zlib` have to be importable; and it has to load and play
+    inside Kaggle's own per-call second like anything else. Any one of those
+    failing is a campaign that seeds and then rejects every child it has.
+    """
+    assert validate.validate(config.SEED).status == "ok"

@@ -25,6 +25,9 @@ THRESHOLD is the log-midpoint between the independent score (0.0066) and
 the smaller of the two lifted-block scores (0.152), rounded down for
 margin: sqrt(0.0066 * 0.152) ~= 0.032, so THRESHOLD = 0.03 sits about
 4.5x above the independent floor and 5x below the weakest lift.
+
+One opponent is exempt: the published agent `config.SEED` starts the
+campaign from, which every program then descends from. See `_corpus`.
 """
 
 import functools
@@ -32,7 +35,7 @@ import logging
 import re
 from pathlib import Path
 
-from kaggriculture.campaign import roster
+from kaggriculture.campaign import config, roster
 
 logger = logging.getLogger(__name__)
 
@@ -93,14 +96,42 @@ def _engine_header_bytes() -> set[bytes]:
 
 
 @functools.lru_cache(maxsize=1)
+def _lineage() -> frozenset[tuple[str, ...]]:
+    """Shingles of the published agent a cold start seeds from.
+
+    The gate asks whether a candidate lifted from an opponent it was never
+    given, and the seed is the one opponent it *was* given: `config.SEED` is
+    what a cold start copies into the database, and every program in the
+    campaign descends from it. A child that still resembles its own ancestor
+    has copied nothing.
+    """
+    return frozenset(shingles(config.SEED.read_text(encoding="utf-8")))
+
+
+@functools.lru_cache(maxsize=1)
 def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
     """Every opponent's shingle sets, keyed `"<name>:<relative path>"`.
+
+    The seed's own lineage is left out, by the same threshold the gate judges
+    on. A corpus file that close to `config.SEED` cannot tell a lifted block
+    from an inherited one, because every candidate inherits that block
+    legitimately -- keeping it would reject the whole campaign rather than a
+    copy. Measured on 2026-09-07 that excludes exactly one file of 53, the
+    seed's own roster copy at 1.000; the next highest scores 0.003, so the
+    other eleven opponents are gated exactly as they were.
+
+    The exemption is by similarity rather than by name because this field
+    republishes itself: `pilkwang_economic` and `v58` are 0.995 apart under
+    two different authors, and a seed with a twin like that must exempt the
+    twin or reject every child it will ever have.
 
     Cached for the process: `against_opponents` runs hundreds of times a
     day and the corpus does not change underneath it.
     """
     engine_bytes = _engine_header_bytes()
+    lineage = _lineage()
     corpus: dict[str, frozenset[tuple[str, ...]]] = {}
+    exempt: list[str] = []
     for name in roster.names():
         root = roster.path(name).parent
         for file in sorted(root.rglob("*")):
@@ -111,9 +142,16 @@ def _corpus() -> dict[str, frozenset[tuple[str, ...]]]:
                 continue
             text = raw.decode("utf-8", errors="replace")
             key = f"{name}:{file.relative_to(root)}"
-            corpus[key] = frozenset(shingles(text))
+            shingle_set = frozenset(shingles(text))
+            if _jaccard(shingle_set, lineage) >= THRESHOLD:
+                exempt.append(key)
+                continue
+            corpus[key] = shingle_set
     total = sum(len(shingle_set) for shingle_set in corpus.values())
     logger.info("copycheck corpus: %d files, %d shingles", len(corpus), total)
+    # Logged every time, because this line is the gate standing down. An
+    # exemption that quietly grew a second entry is how a real copy gets in.
+    logger.info("copycheck exempts the seed lineage: %s", ", ".join(exempt) or "none")
     return corpus
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import copycheck, roster
+from kaggriculture.campaign import config, copycheck, roster
 
 SKELETON = Path("src/kaggriculture/served/main.py").read_text(encoding="utf-8")
 
@@ -141,3 +141,30 @@ def test_similarity_is_symmetric_and_bounded() -> None:
     a, b = "x = 1\ny = x + 2\n" * 20, "y = 2\nx = y + 1\n" * 20
     assert copycheck.similarity(a, b) == copycheck.similarity(b, a)
     assert 0.0 <= copycheck.similarity(a, b) <= 1.0
+
+
+@pytest.mark.local_data
+def test_the_seed_lineage_is_exempt() -> None:
+    """The agent the campaign starts from cannot be a copy of itself.
+
+    Every program descends from `config.SEED`, so without the exemption the
+    gate rejects the whole campaign rather than a copy: the seed scores 1.000
+    against its own roster copy, and a child that has not yet rewritten every
+    line scores close behind it.
+    """
+    source = config.SEED.read_text(encoding="utf-8")
+    _, score = copycheck.against_opponents(source)
+    assert score < copycheck.THRESHOLD
+
+
+@pytest.mark.local_data
+def test_the_exemption_is_the_seed_and_nothing_else() -> None:
+    """Standing the gate down for one lineage must not stand it down at all.
+
+    The exemption is by similarity, not by name, so a corpus that drifted --
+    another author republishing the seed's kernel, a threshold moved -- could
+    quietly empty itself and leave nothing to catch a lift. Every opponent
+    but the seed has to still be in there.
+    """
+    covered = {key.split(":", 1)[0] for key in copycheck._corpus()}
+    assert set(roster.names()) - covered == {config.SEED.parent.name}

@@ -134,7 +134,12 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--workers", type=int, default=max(1, config.CORE_BUDGET // config.SESSIONS)
     )
-    parser.add_argument("--seed-agent", type=Path, default=config.SERVED)
+    # Defaults to the one file `copycheck` exempts, so the ordinary launch
+    # cannot seed from one program while the gate stands down for another.
+    # It stays a flag because a restart from a saved snapshot is a real thing
+    # to want; that is an explicit act, and the cold start logs which file it
+    # actually took.
+    parser.add_argument("--seed-agent", type=Path, default=config.SEED)
     parser.add_argument(
         "--dry-run",
         action="store_true",

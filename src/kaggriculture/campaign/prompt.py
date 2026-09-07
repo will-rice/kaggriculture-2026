@@ -45,10 +45,14 @@ rejected before the program is scored.
 DOCTRINE = """
 ## Doctrine
 
-Never read an opponent's source, never ask for it, never reconstruct it: the
-gate rejects code that resembles any opponent's. You are given their names and
-what your program scored against them, and that is the whole of what you may
-know about them. Your agent is ours.
+The program in front of you began as a published agent, and building on
+published work is what this competition allows. It is yours to change however
+far you like -- rewrite any part of it, or all of it.
+
+Every other opponent is closed. Never read one's source, never ask for it,
+never reconstruct it: the gate rejects code that resembles any opponent your
+lineage did not start from. You are given their names and what your program
+scored against them, and that is the whole of what you may know about them.
 """
 
 # What the model is asked to do with the file, stated the same way every

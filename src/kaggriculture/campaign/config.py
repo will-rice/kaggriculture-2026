@@ -180,3 +180,25 @@ WANDB_PROJECT = "kaggriculture-2026"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of anything a codex call is given.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"
+# The published agent a cold start begins from, and the one number that says
+# why it rather than another: fit over `FIELD` on 2026-09-06 it rated +1.78
+# against +0.64 for the next opponent and -2.67 for the last, so it is the
+# top of the field by a clear point of rating.
+#
+# The campaign spent 381 programs evolving upward from a thirty-line skeleton
+# and never once topped the tournament -- 95% of every rate it measured was a
+# shutout, because a program that loses every game to eleven of twelve
+# opponents has no gradient to climb. Starting from the strongest published
+# agent starts the search where the gradient is: every opponent is within
+# reach of it, so an edit that helps shows up as a rate that moves.
+#
+# What makes this legitimate is the competition's own sharing rule -- this
+# agent is published, and published code is the field's to build on -- and
+# what makes it worth anything is the gate, which is unchanged: a candidate
+# is promoted only when it tops the tournament, and this agent is *in* that
+# tournament. Tying the seed does not promote. Only beating it does.
+#
+# It is 619 lines in one file, which matters: a round hands the model the
+# whole program, and the 3,778-line `shopforge` or the 316KB tuned kernels
+# would spend a call being read rather than improved.
+SEED = OPPONENTS / "thomastschinkel_router" / "main.py"
