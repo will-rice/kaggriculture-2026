@@ -229,7 +229,11 @@ def test_cancelling_a_call_kills_the_whole_process_group(
     async def cancel_mid_session() -> None:
         """Start the call, wait for the group to exist, then cancel it."""
         call = asyncio.ensure_future(mutate.CodexMutator()(box, MESSAGE, "p9"))
-        while not pgid_file.exists():
+        # Non-empty, not merely present: the shell's `>` creates the file
+        # before `ps` has written a word into it, so waiting on existence
+        # alone reads "" back on a loaded box and the test fails parsing an
+        # empty string rather than on the process group it is about.
+        while not pgid_file.exists() or not pgid_file.read_text().strip():
             await asyncio.sleep(0.05)
         call.cancel()
         with pytest.raises(asyncio.CancelledError):
