@@ -36,10 +36,22 @@ SINCE = "2026-08-15"
 
 
 class Episode(BaseModel):
-    """One recorded episode."""
+    """One recorded episode.
+
+    Attributes:
+        seed: The seed the engine was created with.
+        engine_version: Which engine played it; only `ENGINE` is read.
+        info: The archive's own header for the game -- ``TeamNames`` names
+            both agents and ``EpisodeId`` is Kaggle's own id for it. Carried
+            because who played is the thing that turns "what did the winner
+            do" into "what do the strong agents do", and half the games on a
+            ladder are won by the weaker side.
+        steps: Every recorded step, both seats.
+    """
 
     seed: int
     engine_version: str
+    info: dict[str, Any] = {}
     steps: list[list[dict[str, Any]]]
 
     @property
@@ -82,6 +94,7 @@ def _episode(raw: dict[str, Any]) -> Episode:
     return Episode(
         seed=int(raw["info"]["seed"]),
         engine_version=str(raw["module_version"]),
+        info=raw["info"],
         steps=raw["steps"],
     )
 
@@ -202,8 +215,4 @@ def qualifying(i: int, since: str = SINCE) -> Episode:
     archive, name = _index(since).ref(i)
     with zipfile.ZipFile(archive) as opened:
         raw = json.loads(opened.read(name))
-    return Episode(
-        seed=int(raw["info"]["seed"]),
-        engine_version=str(raw["module_version"]),
-        steps=raw["steps"],
-    )
+    return _episode(raw)
