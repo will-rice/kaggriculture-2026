@@ -1,18 +1,26 @@
-"""Two evaluations: a fast one for ranking, a deep one that decides.
+"""One evaluation, which is also the gate.
 
-Fast plays fresh non-exam seeds through the harness; deep plays the sealed
-exam block through the field gate, both seats, every pool opponent and the
-held-out set, and reports Wilson intervals. Every opponent counts the same
--- the gate asks whether a candidate beats each of them, not what it
-averages -- so both scores are the plain mean of the per-opponent rates and
-neither is the number a promotion turns on.
+``score`` plays fresh seeds through the harness, both seats, against every
+pool opponent, and reports the per-opponent rates with Wilson intervals.
+Every opponent counts the same -- the gate asks whether a candidate beats
+each of them, not what it averages -- so the fitness is the plain mean of
+the per-opponent rates, and the promotion turns on the tournament fitted
+over them rather than on that mean.
 
-Neither plays a program against itself. A champion is a member of the pool
-it is re-scored on, and its own bytes in the other seat are a structural
-0.5 that no metric should carry: ``opponents`` drops that entry before any
-game is played, so the mean score, the per-opponent rates, ``field``
-and the intervals are all over real opponents and nothing downstream has to
-know the mirror ever existed.
+There were two evaluations here: a cheap ranking on eight seeds and a sealed
+sixty-four-seed block that decided promotions. The cheap one did not rank.
+Over 471 programs it named 78 of them the best in the tournament and the
+block promoted none. The seeds were redrawn every call, so nothing was being
+fitted; the ranking was simply the maximum of an estimator with a standard
+error of 0.125, and the maximum of a noisy estimator is the luckiest program
+rather than the best one. A second measurement cannot undo that -- only games
+can -- so there is one measurement, deep enough to select on.
+
+It never plays a program against itself. A champion is a member of the pool
+it is re-scored on, and its own bytes in the other seat are a structural 0.5
+that no metric should carry: ``opponents`` drops that entry before any game
+is played, so the fitness, the rates, ``field`` and the intervals are all
+over real opponents and nothing downstream has to know the mirror existed.
 """
 
 import random
@@ -20,31 +28,42 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, field_gate, harness, roster
+from kaggriculture.campaign import config, harness, roster
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
 
 VENDORED = list(roster.TRAINING)
-HELD_OUT = list(roster.HELD_OUT)
 
 
-class FastResult(BaseModel):
-    """A ranking measurement on seeds nothing else has seen.
+class Result(BaseModel):
+    """The measurement, and the only one there is.
 
-    It is also the whole of what a model is told about the program it is
-    asked to improve: the rates and margins are the verdict, and ``states``
-    is the game behind it.
+    There were two: a cheap ranking on eight random seeds and a sealed block
+    of sixty-four that decided promotions. The cheap one selected the luckiest
+    program rather than the best -- 78 of 471 topped it and none survived the
+    block -- and the block could not fix that, because selecting the maximum
+    of a noisy estimator is biased however you re-measure it afterwards. So
+    there is one measurement now, deep enough to select on, and the promotion
+    is decided on it.
+
+    It is also the whole of what a model is told about the program it is asked
+    to improve: the rates and margins are the verdict, and ``states`` is the
+    game behind it.
 
     Attributes:
+        program_id: The program this measures.
         fitness: Mean win rate over the pool, which grows as champions join
             it, so it ranks the database but does not compare across time.
         field: Mean win rate over the vendored incumbents alone. They never
             change, so this is the one number that means the same thing on
-            the first session and the thousandth -- it is what "the best is
-            rising" is measured on.
+            the first session and the thousandth.
         rates: Win rate per pool opponent, ties as half.
         margins: Bank margin per pool opponent.
-        seeds: The seeds drawn for this call.
+        intervals: Wilson interval per pool opponent, so a rate is read with
+            the width of the thing behind it.
+        games: Games played against each opponent: ``2 * GATE_SEEDS``.
+        seeds: The seeds drawn for this call. Fresh every time, which is what
+            makes every measurement a held-out one.
         hardest: The opponent with the lowest win rate. The log line names it;
             what a round is *shown* is chosen from the standings instead,
             because the gate is a tournament and the agent to study is the one
@@ -56,45 +75,16 @@ class FastResult(BaseModel):
             played either way, so keeping their tables costs nothing.
     """
 
+    program_id: str
     fitness: float
     field: float
     rates: dict[str, float]
     margins: dict[str, harness.Margin]
+    intervals: dict[str, tuple[float, float]] = {}
+    games: int = 0
     seeds: list[int]
     hardest: str
     states: dict[str, list[harness.Day]]
-
-
-class DeepResult(BaseModel):
-    """The gate's verdict on one program over the sealed exam block.
-
-    Attributes:
-        program_id: The program this measures.
-        score: Mean win rate over the pool opponents only.
-        low: Conservative lower bound on ``score``: the mean of the
-            per-opponent Wilson lower bounds. Each of those holds at 95%, so
-            their mean is at least as wide as the exact interval would be.
-        high: Conservative upper bound on ``score``, by the same mean of the
-            per-opponent Wilson upper bounds.
-        rates: Win rate per pool opponent.
-        margins: Bank margin per pool opponent. Defaulted, so a result
-            written before margins existed still loads out of the log.
-        intervals: Wilson interval per pool opponent.
-        field: Mean rate over the vendored opponents still in the pool.
-        held_out: Win rate per held-out opponent; never part of ``score``.
-        games: Games played against each opponent.
-    """
-
-    program_id: str
-    score: float
-    low: float
-    high: float
-    rates: dict[str, float]
-    margins: dict[str, harness.Margin] = {}
-    intervals: dict[str, tuple[float, float]]
-    field: float
-    held_out: dict[str, float]
-    games: int
 
 
 def _mean(rates: dict[str, float]) -> float:
@@ -145,14 +135,15 @@ def opponents(pool: Pool, program_id: str, agent: Path) -> Pool:
     return Pool(opponents={n: p for n, p in pool.opponents.items() if n != program_id})
 
 
-def fast(
+def score(
     agent: Path, program_id: str, pool: Pool, rng: random.Random, workers: int
-) -> FastResult:
-    """Mean win rate over ``FAST_SEEDS`` fresh seeds, both seats.
+) -> Result:
+    """Mean win rate over ``GATE_SEEDS`` fresh seeds, both seats.
 
-    The seeds are drawn per call from ``FAST_SEED_RANGE``, which excludes the
-    exam block, so ranking pressure never touches the seeds the gate decides
-    on and no two candidates are ranked on a block that could be memorised.
+    The seeds are drawn per call from the whole range, so no two programs are
+    ranked on the same maps and none is ever measured on maps it or its
+    ancestors were selected on. That is what a held-out set is for, and it is
+    why there is no longer one: redrawing every call gives it continuously.
 
     Every game is played with its day table recorded, because one of them is
     what the loop shows a model of how its program played. Which one is not
@@ -178,7 +169,7 @@ def fast(
     """
     measured = opponents(pool, program_id, agent)
     names = measured.names()
-    seeds = rng.sample(config.FAST_SEED_RANGE, config.FAST_SEEDS)
+    seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
     games = harness.play(agent, names, seeds, workers, days=True)
     rates = _rates(games, names)
     # Ties on the rate are broken by the margin, because before the first win
@@ -197,11 +188,17 @@ def fast(
         ).days
         for name in names
     }
-    return FastResult(
+    played = 2 * len(seeds)
+    return Result(
+        program_id=program_id,
         fitness=_mean(rates),
         field=vendored_field(rates),
         rates=rates,
         margins=margins,
+        intervals={
+            name: wilson_interval(rate * played, played) for name, rate in rates.items()
+        },
+        games=played,
         seeds=seeds,
         hardest=hardest,
         states=states,
@@ -229,55 +226,3 @@ def vendored_field(rates: dict[str, float]) -> float:
     if not vendored:
         raise ValueError("no vendored opponent was played; the field is undefined")
     return _mean(vendored)
-
-
-def deep(agent: Path, program_id: str, pool: Pool, workers: int) -> DeepResult:
-    """The gate: exam block x both seats x pool and held-out, with intervals.
-
-    Playing a candidate executes it, and a candidate is evolved source that
-    may write files; ``harness._one`` runs every game in a scratch directory
-    in its own process, which is where that is contained. Nothing here moves
-    the working directory: the loop runs deep evaluations concurrently with
-    each other and with fast ones, and the working directory is one per
-    process, so a move here would be a race rather than an isolation.
-
-    Args:
-        agent: The candidate's ``main.py``.
-        program_id: The program this measurement belongs to, and the pool
-            entry it is therefore not played against.
-        pool: The opponents that count towards the score.
-        workers: Processes to fan the games over.
-
-    Returns:
-        The mean score with its interval, the per-opponent rates, margins and
-        intervals, the vendored-field rate, and the held-out rates.
-
-    Raises:
-        RuntimeError: A side raised during a game. A crashed candidate is a
-            failed evaluation, never a zero score, so this propagates.
-        ValueError: The pool holds no vendored opponent, so there is no field
-            to average over.
-    """
-    measured = opponents(pool, program_id, agent)
-    names = measured.names()
-    played = names + [name for name in HELD_OUT if name not in names]
-    rates, margins = field_gate.score_field(
-        agent, seeds=config.EXAM_SEEDS, workers=workers, opponents=played
-    )
-    games = 2 * len(config.EXAM_SEEDS)
-    intervals = {name: wilson_interval(rates[name] * games, games) for name in names}
-    vendored = [name for name in VENDORED if name in names]
-    if not vendored:
-        raise ValueError("pool holds no vendored opponent; field is undefined")
-    return DeepResult(
-        program_id=program_id,
-        score=_mean({name: rates[name] for name in names}),
-        low=_mean({n: bounds[0] for n, bounds in intervals.items()}),
-        high=_mean({n: bounds[1] for n, bounds in intervals.items()}),
-        rates={name: rates[name] for name in names},
-        margins={name: margins[name] for name in names},
-        intervals=intervals,
-        field=sum(rates[name] for name in vendored) / len(vendored),
-        held_out={name: rates[name] for name in HELD_OUT},
-        games=games,
-    )

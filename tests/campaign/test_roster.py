@@ -14,9 +14,9 @@ def test_every_roster_entry_exists_on_disk() -> None:
         assert roster.path(name).exists(), name
 
 
-def test_training_and_held_out_do_not_overlap() -> None:
-    """The held-out set is only held out while nothing trains against it."""
-    assert not set(roster.TRAINING) & set(roster.HELD_OUT)
+def test_the_pooled_and_unpooled_rosters_do_not_overlap() -> None:
+    """One name, one file: a pool entry cannot also be an unpooled one."""
+    assert not set(roster.TRAINING) & set(roster.UNPOOLED)
 
 
 def test_an_unknown_name_is_an_error_not_a_path() -> None:

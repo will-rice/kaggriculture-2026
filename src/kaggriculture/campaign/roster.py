@@ -50,7 +50,16 @@ TRAINING: dict[str, Path] = {
     # compile and the rest race it.
     "avioon_apex_v7": config.OPPONENTS / "avioon_apex_v7" / "main.py",
 }
-HELD_OUT: dict[str, Path] = {
+# Opponents we hold that the pool does not include. They were the held-out
+# set, played on the sealed block and never trained against, and that job is
+# gone: seeds are drawn fresh for every evaluation now, so every rate the gate
+# reads was already measured on maps the program was never selected on, and a
+# frozen pair of agents adds nothing a fresh draw does not.
+#
+# They stay on the roster because the copy check walks it. A file we hold that
+# no gate plays is still a file a session could reach, and a candidate that
+# resembled one would be a copy whether or not it ever met it in a game.
+UNPOOLED: dict[str, Path] = {
     "salemali7_2900": config.OPPONENTS / "salemali7_2900" / "main.py",
     "lynnsakurai_v5": config.OPPONENTS / "lynnsakurai_v5" / "main.py",
 }
@@ -58,7 +67,7 @@ HELD_OUT: dict[str, Path] = {
 
 def names() -> list[str]:
     """Every name the harness accepts."""
-    return [*TRAINING, *HELD_OUT]
+    return [*TRAINING, *UNPOOLED]
 
 
 def path(name: str) -> Path:
@@ -80,8 +89,8 @@ def path(name: str) -> Path:
     """
     if name in TRAINING:
         return TRAINING[name]
-    if name in HELD_OUT:
-        return HELD_OUT[name]
+    if name in UNPOOLED:
+        return UNPOOLED[name]
     from kaggriculture.campaign.pool import Pool
 
     if not config.POOL.exists():

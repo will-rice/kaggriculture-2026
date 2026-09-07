@@ -185,7 +185,7 @@ def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
             )
         ]
 
-    monkeypatch.setattr(harness, "play_unsealed", record)
+    monkeypatch.setattr(harness, "play", record)
 
     kernel_watch.gate(candidate, gate_seeds=1, workers=1)
 

@@ -37,7 +37,7 @@ ACT_TIMEOUT = 1.0
 LATENCY_BUDGET = ACT_TIMEOUT / 2
 # What `campaign play` allows a person at a terminal, enforced on the CLI
 # only: the library function is what the evaluator calls, and it plays the
-# whole exam block. Nothing in the campaign calls the command -- the loop
+# whole gate. Nothing in the campaign calls the command -- the loop
 # plays every game anything is scored on -- so these bound a hand-run check
 # beside a live campaign, and nothing else.
 SANDBOX_GAME_CAP = 16
@@ -485,38 +485,18 @@ def play(
 ) -> list[Game]:
     """Play every (opponent, seed, seat) on the port, sampling the reference engine.
 
-    Args:
-        agent: The candidate's ``main.py``.
-        opponents: Roster names; a path here is a KeyError.
-        seeds: Episode seeds; an exam seed here is a ValueError.
-        workers: Processes to fan the games over, at most ``config.CORE_BUDGET``.
-        days: Record each game's day table. The ranking evaluation asks for
-            them because one of these games is what a model is shown of how
-            its program played.
-
-    Returns:
-        One ``Game`` per opponent, seed and seat, in that order.
-
-    Raises:
-        ValueError: An exam seed, or more workers than the core budget.
-        KeyError: An opponent name not in the roster.
-        OpponentCrash: Only opponent seats raised; the pool is broken.
-        RuntimeError: The candidate raised during a game, or the
-            reference-engine sample disagreed with the port.
-    """
-    return _play(agent, opponents, seeds, workers, sealed=True, days=days)
-
-
-def play_unsealed(
-    agent: Path, opponents: Sequence[str], seeds: Sequence[int], workers: int
-) -> list[Game]:
-    """``play`` for the gate: the exam seeds are allowed. Never exposed on the CLI.
+    There was a second entry point here, ``play_unsealed``, and a check that
+    refused to play a reserved block of seeds through this one. Both are gone
+    with the block itself: every seed is drawn fresh now, so there is nothing
+    to keep anything away from.
 
     Args:
         agent: The candidate's ``main.py``.
         opponents: Roster names; a path here is a KeyError.
-        seeds: Episode seeds, exam seeds included.
+        seeds: Episode seeds.
         workers: Processes to fan the games over, at most ``config.CORE_BUDGET``.
+        days: Record each game's day table. The gate asks for them because one
+            of these games is what a model is shown of how its program played.
 
     Returns:
         One ``Game`` per opponent, seed and seat, in that order.
@@ -528,20 +508,6 @@ def play_unsealed(
         RuntimeError: The candidate raised during a game, or the
             reference-engine sample disagreed with the port.
     """
-    return _play(agent, opponents, seeds, workers, sealed=False, days=False)
-
-
-def _play(
-    agent: Path,
-    opponents: Sequence[str],
-    seeds: Sequence[int],
-    workers: int,
-    sealed: bool,
-    days: bool,
-) -> list[Game]:
-    """Shared body of ``play`` and ``play_unsealed``; only the exam check differs."""
-    if sealed and any(seed in config.EXAM_SEEDS for seed in seeds):
-        raise ValueError("exam seeds are sealed; the harness will not play them")
     if workers > config.CORE_BUDGET:
         raise ValueError(f"workers exceeds CORE_BUDGET ({config.CORE_BUDGET})")
     paths = {name: roster.path(name) for name in opponents}

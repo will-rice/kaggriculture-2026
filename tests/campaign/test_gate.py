@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import archive, config, evaluator, gate, pool, rating
+from kaggriculture.campaign import (
+    archive,
+    config,
+    evaluator,
+    gate,
+    harness,
+    pool,
+    rating,
+)
 
 PASS = (
     "def agent(observation, configuration=None):\n"
@@ -14,21 +22,22 @@ PASS = (
 
 
 def result(
-    pid: str, score: float, low: float, rates: dict[str, float], width: float = 0.05
-) -> evaluator.DeepResult:
-    """A hand-built DeepResult with symmetric per-opponent intervals."""
-    return evaluator.DeepResult(
+    pid: str, score: float, rates: dict[str, float], width: float = 0.05
+) -> evaluator.Result:
+    """A hand-built Result with symmetric per-opponent intervals."""
+    return evaluator.Result(
         program_id=pid,
-        score=score,
-        low=low,
-        high=min(1.0, score + (score - low)),
+        fitness=score,
+        field=score,
         rates=rates,
+        margins={n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in rates},
         intervals={
             n: (max(0.0, r - width), min(1.0, r + width)) for n, r in rates.items()
         },
-        field=score,
-        held_out={},
-        games=128,
+        games=64,
+        seeds=[1, 2],
+        hardest=min(rates, default=""),
+        states={},
     )
 
 
@@ -121,20 +130,17 @@ def test_one_bad_matchup_does_not_sink_a_top_rating() -> None:
     assert gate.promotion({"mine": 1.5, "a": 1.0, "b": 0.2}, "mine")[0]
 
 
-def test_held_out_opponents_are_not_part_of_the_tournament() -> None:
-    """They are the honest generalisation number, never the gate.
+def test_the_standings_are_over_the_pool_and_nothing_else() -> None:
+    """The gate is a place in one tournament, not a score against a set.
 
-    The standings are over pool opponents alone, so a candidate beaten badly
-    by everything held out is promoted all the same: it is the pool it has to
-    finish above, and the held-out rates are what would show a co-evolutionary
-    cycle rather than what stops one.
+    There is no held-out set any more and no second measurement: seeds
+    are drawn fresh every evaluation, so every rate here was already
+    measured on maps this program was never selected on.
     """
-    candidate = result("c", 0.8, 0.75, {"a": 0.9, "b": 0.8}).model_copy(
-        update={"held_out": {"salemali7_2900": 0.1, "lynnsakurai_v5": 0.2}}
-    )
+    candidate = result("c", 0.8, {"a": 0.9, "b": 0.8})
 
     assert gate.promotion({"c": 1.0, "a": 0.1, "b": -0.4}, "c")[0]
-    assert not set(candidate.rates) & set(candidate.held_out)
+    assert set(candidate.rates) == {"a", "b"}
 
 
 def _program(
@@ -171,9 +177,9 @@ def _program(
     )
 
 
-def _result() -> evaluator.DeepResult:
+def _result() -> evaluator.Result:
     """The deep result the promotion tests promote on."""
-    return result("p9", 0.7, 0.65, {"a": 0.9, "b": 0.5})
+    return result("p9", 0.7, {"a": 0.9, "b": 0.5})
 
 
 def test_promote_leaves_a_tarball_the_champion_record_names(
@@ -261,9 +267,7 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
 
     second = _program(tmp_path, monkeypatch, body="WATER")
     reloaded = pool.Pool.load(config.POOL)
-    gate.enroll(
-        gate.promote(second, result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6})), reloaded
-    )
+    gate.enroll(gate.promote(second, result("p9", 0.8, {"a": 0.9, "b": 0.6})), reloaded)
 
     saved = pool.Pool.load(config.POOL)
     one, two = saved.opponents["champion_1"], saved.opponents["champion_2"]
@@ -308,9 +312,7 @@ def test_champion_numbering_survives_a_pool_retirement(
     retired = pool.Pool(opponents={"a": "/x/a.py", "champion_3": "/x/c3.py"})
     retired.save(config.POOL)
 
-    champion = gate.promote(
-        program, result("p9", 0.9, 0.85, {"a": 0.99, "champion_3": 0.99})
-    )
+    champion = gate.promote(program, result("p9", 0.9, {"a": 0.99, "champion_3": 0.99}))
     gate.enroll(gate.record(champion), retired)
 
     assert champion.name == "champion_4"
@@ -351,6 +353,6 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
     gate.enroll(gate.record(gate.promote(program, _result())), p)
     reloaded = pool.Pool.load(config.POOL)
-    champion = gate.promote(program, result("p9", 0.8, 0.75, {"a": 0.9, "b": 0.6}))
+    champion = gate.promote(program, result("p9", 0.8, {"a": 0.9, "b": 0.6}))
     gate.enroll(gate.record(champion), reloaded)
     assert champion.name == "champion_2"

@@ -133,7 +133,7 @@ INSTRUCTIONS: tuple[tuple[str, str], ...] = (
 
 
 def _verdict_lines(
-    name: str, result: evaluator.FastResult, standings: dict[str, float]
+    name: str, result: evaluator.Result, standings: dict[str, float]
 ) -> list[str]:
     """Render what the loop measured about ``name``, and where it placed.
 
@@ -180,7 +180,8 @@ def _verdict_lines(
         "one, and one bad matchup is absorbed rather than fatal -- there is "
         "no opponent you must beat, only a field you must finish above. "
         + (
-            "Top of it. Do it again on the sealed block and it is the champion."
+            "Top of it, so this program is the champion and every later "
+            "candidate has to beat it."
             if cleared
             else "Every place gained is progress, whoever it comes against."
         ),
@@ -231,7 +232,7 @@ def _rival(
 
 
 def _states_lines(
-    result: evaluator.FastResult, rival: str, standings: dict[str, float]
+    result: evaluator.Result, rival: str, standings: dict[str, float]
 ) -> list[str]:
     """Render one game against every opponent the program did not beat.
 
@@ -408,7 +409,7 @@ def _farm(plants: dict[str, int], animals: dict[str, int], weeds: int) -> str:
 
 def compose(
     name: str,
-    result: evaluator.FastResult,
+    result: evaluator.Result,
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,

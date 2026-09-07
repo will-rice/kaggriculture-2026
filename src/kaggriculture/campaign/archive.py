@@ -13,7 +13,6 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.harness import Margin
 
 
@@ -55,7 +54,6 @@ class Program(BaseModel):
         margins: Fast-evaluation bank margin per pool opponent. Defaulted,
             so a program written before margins existed still loads.
         created: Unix timestamp.
-        deep: The sealed-block result, once it has one.
     """
 
     id: str
@@ -70,7 +68,6 @@ class Program(BaseModel):
     rates: dict[str, float] = {}
     margins: dict[str, Margin] = {}
     created: float
-    deep: DeepResult | None = None
 
 
 class Failure(BaseModel):
@@ -129,7 +126,6 @@ class Database:
         Raises:
             ValueError: The event names a type the database does not know, or
                 adds a program id the database already holds.
-            KeyError: A deep result names a program the database does not hold.
         """
         kind = event["event"]
         if kind == "program":
@@ -137,10 +133,6 @@ class Database:
             if program.id in self._programs:
                 raise ValueError(f"duplicate program id: {program.id!r}")
             self._programs[program.id] = program
-        elif kind == "deep":
-            self.get(event["program_id"]).deep = DeepResult.model_validate(
-                event["deep"]
-            )
         elif kind == "failure":
             self._failures.append(Failure.model_validate(event["failure"]))
         else:
@@ -173,16 +165,6 @@ class Database:
     def record_failure(self, failure: Failure) -> None:
         """Record an attempt that produced no program."""
         self._apply({"event": "failure", "failure": failure.model_dump()})
-
-    def record_deep(self, program_id: str, result: DeepResult) -> None:
-        """Attach the sealed-block result `result` to the program `program_id`.
-
-        Raises:
-            KeyError: No program has that id; nothing is written.
-        """
-        self._apply(
-            {"event": "deep", "program_id": program_id, "deep": result.model_dump()}
-        )
 
     def top(self, k: int) -> list[Program]:
         """Return the `k` best programs, best first.

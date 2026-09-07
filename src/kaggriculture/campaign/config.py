@@ -1,6 +1,6 @@
 """Every path and constant the campaign shares.
 
-Opponent paths and the exam seeds are written here and nowhere else. That
+Opponent paths are written here and nowhere else. That
 does not hide them -- ``codex exec -s workspace-write`` restricts writes, not
 reads, and a round's directory sits in the system temporary tree with the
 repository a walk away. What keeps a candidate from copying an opponent is
@@ -27,9 +27,6 @@ OPPONENTS = Path("/data/kaggriculture/opponents")
 AGENTS = Path("/data/kaggriculture/agents")
 EPISODES = Path("/data/kaggriculture/episodes")
 ENGINE_LIBRARY = Path(__file__).parent / "engine" / "kaggriculture_engine.so"
-
-# Measurement only. The deep evaluation plays these; nothing else may.
-EXAM_SEEDS: tuple[int, ...] = tuple(range(700_000, 700_064))
 
 # Cores the arena and the engine may use between them. Eight are left for
 # codex sessions, the loop, and the box's own tenants.
@@ -79,19 +76,36 @@ SESSIONS = 8
 # skills this login has installed, which take as long as they take, and a cap
 # only ever cut one off before it had written anything.
 ROUNDS_PER_SESSION = 5
-# Seeds a round is scored on, played in both seats against every pool
-# opponent. Four made a rate out of eight games, which is a standard error of
-# about 0.18: enough noise that a lucky program tops the draw, becomes what
-# the next session starts from, and passes its luck on rather than its
-# quality. The candidate that led the fast ranking at -1.65 came 13 of 13 at
-# -3.02 on the sealed block, a gap of 1.4 rating points that is what this
-# looks like. Eight halves the standard error and doubles a round's scoring to
-# about 90 seconds, against a codex call of two to five minutes.
-FAST_SEEDS = 8
-FAST_SEED_RANGE = range(1, 600_000)  # never the exam block
-DEEP_TOP_K = 3
-# Deep evaluations in flight at once. Each is about ten minutes of games.
-DEEP_CONCURRENCY = 2
+# Seeds a program is scored on: drawn fresh every evaluation and played in
+# both seats against every pool opponent. This is the whole measurement -- one
+# gate, one number, and promotion decided on it.
+#
+# There used to be two, a cheap ranking on eight seeds and a sealed block of
+# sixty-four that promoted. The cheap one did not work. Over 471 programs it
+# called 78 of them the best in the tournament and the block promoted none of
+# them: its rating climbed 1.43 -> 2.16 while the block's score sat flat
+# between 0.798 and 0.859, and the best block score belonged to the very first
+# program measured.
+#
+# That gap was never overfitting -- the seeds are redrawn every call, so there
+# is nothing to fit. It is the winner's curse. A rate over sixteen games has a
+# standard error of 0.125, and taking the maximum over hundreds of such
+# estimates returns the luckiest program rather than the best one. Selection
+# on a noisy estimator is biased upward by construction, and no second
+# measurement fixes that; only games do.
+#
+# Thirty-two seeds is 64 games a pairing and a standard error of 0.062, a
+# quarter of the variance the eight-seed ranking selected on. It costs
+# throughput -- about 31 programs an hour against 60 -- and that is the trade
+# being made deliberately: 471 programs at the old depth bought no measurable
+# improvement at all.
+GATE_SEEDS = 32
+# The whole space. Nothing is reserved any more: a set held back exists to
+# give a number the search cannot steer, and drawing fresh seeds every
+# evaluation already does that -- no program is ever measured on maps it or
+# its ancestors were selected on. The reserved block was a held-out set for a
+# search that is always, structurally, held out.
+GATE_SEED_RANGE = range(1, 1_000_000)
 # Opponents the pool keeps: the top this many by Bradley-Terry rating, the
 # weakest making way as champions out-rate them. Measured on 2026-09-06 over
 # the campaign's own programs, a pool of the top six separated them almost

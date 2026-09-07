@@ -98,7 +98,6 @@ RUNTIME_PATHS = {
     name: getattr(config, name).relative_to(config.RUN)
     for name in ("ARCHIVE", "PROGRAMS", "FLOOR", "CHAMPIONS", "CHAMPION")
 }
-EXAM_SEEDS = config.EXAM_SEEDS
 
 
 @pytest.fixture
@@ -129,24 +128,21 @@ def calls_of(records: list[tuple[float, dict]]) -> list[dict]:
     return [record for _, record in records if "calls/ok" in record]
 
 
-def deeps_of(records: list[tuple[float, dict]]) -> list[dict]:
-    """The per-deep-evaluation records, in the order the loop logged them."""
-    return [record for _, record in records if "deep/promoted" in record]
+def gates_of(records: list[tuple[float, dict]]) -> list[dict]:
+    """The per-gate records, in the order the loop logged them."""
+    return [record for _, record in records if "gate/promoted" in record]
 
 
 def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rounds: int = 1) -> None:
     """Point every runtime path at ``tmp_path`` and shrink the loop to one seed.
 
-    The one-opponent test pool stands in for the vendored field and the real
-    held-out set is dropped: these tests measure the pipeline, not a field,
-    and playing the held-out opponents would cost games nothing asserts on.
+    The one-opponent test pool stands in for the vendored field: these
+    tests measure the pipeline, not a field.
 
     ``rounds`` is one by default, because a test that is not about rounds
     should cost one call and one evaluation; the tests that are about rounds
     ask for more. It is the only constant here that decides behaviour rather
     than cost, which is why it is a parameter and not a line in the body.
-    ``DEEP_TOP_K`` used to be set to one, which configured away the only
-    values at which the gate has more than one program to choose between.
     """
     monkeypatch.setattr(config, "ROUNDS_PER_SESSION", rounds)
     run = tmp_path / "run"
@@ -157,10 +153,8 @@ def tiny_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rounds: int = 1) -
     for name, relative in RUNTIME_PATHS.items():
         monkeypatch.setattr(config, name, run / relative)
     monkeypatch.setattr(config, "POOL", run / "pool.json")
-    monkeypatch.setattr(config, "EXAM_SEEDS", EXAM_SEEDS[:2])
-    monkeypatch.setattr(config, "FAST_SEEDS", 1)
+    monkeypatch.setattr(config, "GATE_SEEDS", 1)
     monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
-    monkeypatch.setattr(evaluator, "HELD_OUT", [])
 
 
 def pass_pool(tmp_path: Path) -> pool.Pool:
@@ -191,33 +185,31 @@ def strong_champion(tmp_path: Path) -> gate.Champion:
         name="champion_1",
         path=str(kept),
         tarball=str(tmp_path / "champion_1.tar.gz"),
-        result=_deep_result("champion_1", {"pass": 1.0}, score=1.0),
+        result=_gate_result("champion_1", {"pass": 1.0}, score=1.0),
     )
     config.CHAMPION.parent.mkdir(parents=True, exist_ok=True)
     config.CHAMPION.write_text(champion.model_dump_json(), encoding="utf-8")
     return champion
 
 
-def stub_evaluator(
-    monkeypatch: pytest.MonkeyPatch, deep_crashes: bool = False
-) -> list[str]:
-    """Answer both evaluations from the source itself, without playing a game.
+def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> list[str]:
+    """Answer the evaluation from the source itself, without playing a game.
 
     A scheduling test needs a fitness to rank on, not a game to produce one.
-    Both evaluations are patched on the module rather than injected, because
-    the alternative is a parameter on ``run`` that exists only for tests.
-    Score is the source's length, so a child ranks above the shorter program
-    it was edited from by construction rather than by luck, and the rates are
-    keyed by the pool the evaluation was handed, reduced through the real
+    It is patched on the module rather than injected, because the alternative
+    is a parameter on ``run`` that exists only for tests. Score is the
+    source's length, so a child ranks above the shorter program it was edited
+    from by construction rather than by luck, and the rates are keyed by the
+    pool the evaluation was handed, reduced through the real
     `evaluator.opponents` so a champion here does not play itself either.
 
     Args:
         monkeypatch: The test's patcher.
-        deep_crashes: Whether every deep evaluation raises, as one does when
-            the candidate fails in its own seat on the exam block.
+        crashes: Whether every evaluation raises, as one does when the
+            candidate fails in its own seat.
 
     Returns:
-        The program ids handed to the deep evaluation, in order.
+        The program ids handed to the evaluation, in order.
     """
     scored: list[str] = []
 
@@ -225,44 +217,39 @@ def stub_evaluator(
         """A stand-in fitness: longer source, higher score, never a full 1.0."""
         return min(0.99, len(agent.read_text(encoding="utf-8")) / 1000)
 
-    def fast(
+    def measure(
         agent: Path,
         program_id: str,
         opponents: pool.Pool,
         rng: random.Random,
         workers: int,
-    ) -> evaluator.FastResult:
-        """The fast evaluation's shape, without its games.
+    ) -> evaluator.Result:
+        """The evaluation's shape, without its games.
 
         No day table: a scheduling test asserts on what the loop did with a
         number, never on the states behind it, and the only game that could
         produce one is the game this stands in for.
         """
+        scored.append(program_id)
+        if crashes:
+            raise RuntimeError("the candidate raised in its own seat")
         measured = evaluator.opponents(opponents, program_id, agent)
         rate = score(agent)
         names = measured.names()
-        return evaluator.FastResult(
+        return evaluator.Result(
+            program_id=program_id,
             fitness=rate,
             field=0.5,
             rates=dict.fromkeys(names, rate),
             margins=dict.fromkeys(names, harness.Margin(mean=0.0, worst=0.0, best=0.0)),
+            intervals=dict.fromkeys(names, (0.0, 1.0)),
+            games=2,
             seeds=[1],
             hardest=names[0],
             states=dict.fromkeys(names, []),
         )
 
-    def deep(
-        agent: Path, program_id: str, opponents: pool.Pool, workers: int
-    ) -> evaluator.DeepResult:
-        """The deep evaluation's shape, without its games."""
-        scored.append(program_id)
-        if deep_crashes:
-            raise RuntimeError("the candidate raised in its own seat")
-        measured = evaluator.opponents(opponents, program_id, agent)
-        return _deep_result(program_id, dict.fromkeys(measured.names(), score(agent)))
-
-    monkeypatch.setattr(evaluator, "fast", fast)
-    monkeypatch.setattr(evaluator, "deep", deep)
+    monkeypatch.setattr(evaluator, "score", measure)
     return scored
 
 
@@ -336,7 +323,7 @@ class Recorder:
         )
 
 
-def test_a_better_child_is_deep_scored_and_promoted(
+def test_a_better_child_is_promoted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     log: wandb.Run,
@@ -361,14 +348,14 @@ def test_a_better_child_is_deep_scored_and_promoted(
 
     assert state.sessions == 2
     champion = state.champion
-    assert champion is not None and champion.result.score > 0.5
+    assert champion is not None and champion.result.fitness > 0.5
     assert Path(champion.path).read_text() == SELLER
     assert (config.FLOOR / "main.py").read_text() == SELLER
     assert Path(champion.tarball).exists()
     assert champion.name in pool.Pool.load(config.POOL).names()
     assert gate.load_champion() == champion
-    promotions = [record for record in deeps_of(records) if record["deep/promoted"]]
-    assert promotions and all(record["deep/score"] > 0.5 for record in promotions)
+    promotions = [record for record in gates_of(records) if record["gate/promoted"]]
+    assert promotions and all(record["gate/score"] > 0.5 for record in promotions)
     # The champion carries the result it was promoted on: a program the
     # database holds, measured on the exam block, and what a session is then
     # shown of the program it starts from.
@@ -412,17 +399,19 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     loop._open_run(dry_run=True).finish()
 
 
-def test_the_seed_is_never_deep_scored_or_promoted(
+def test_the_seed_is_never_promoted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """The gate confirms programs sessions wrote, not the one the campaign began on.
+    """The gate judges programs sessions wrote, not the one the campaign began on.
 
-    At the production ``DEEP_TOP_K`` the seed shares the top three with the
-    first children, and a child that ranks below it leaves the seed the best
-    program in the database. Confirming it would promote it -- there is no
-    champion to beat on a cold start -- and `champion_1` would join the pool
-    at a fifth of the weight as an opponent that loses to everything, a
-    constant added to every candidate's score that separates none of them.
+    The seed can be the best program in the database -- on a cold start with a
+    child that ranks below it, it is -- and there is no champion for it to
+    beat, so anything that put it through the gate would promote it. That
+    would make `champion_1` an opponent every candidate already beats: a
+    constant added to every score that separates none of them.
+
+    It is structural rather than a rule now. The gate runs at the end of a
+    round, on the program that round produced, and no round produces the seed.
     """
     tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path)
@@ -438,46 +427,11 @@ def test_the_seed_is_never_deep_scored_or_promoted(
         log=log,
     )
 
-    assert config.DEEP_TOP_K == 3
-    # One deep evaluation, and it is the child's: never the seed's, though the
-    # seed was the best program in the database the whole time.
-    assert config.SEED_ID not in scored and len(scored) == 1
-    # And nothing was promoted, because that child beats nobody -- which is
-    # what the seed would have been promoted on if it had been confirmed.
+    # It is measured -- at the cold start, and again when a session begins
+    # from it -- and never judged: the gate runs on what a round produced.
+    assert config.SEED_ID in scored
     assert state.champion is None
     assert not (config.FLOOR / "main.py").exists()
-
-
-def test_a_deep_evaluation_that_crashes_is_not_retried(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """The exam block is spent on a program once, whatever it costs the program.
-
-    A candidate that raises in its own seat is the lineage's failure, and it
-    is recorded as one. What must not happen is the program keeping its place
-    in the top three with no result to show for it: every later insert would
-    send it back through the gate, and each retry is ten minutes of the exam
-    block holding one of the two deep slots. Three restarts, so the ledger --
-    not just the in-flight set -- is what has to remember.
-    """
-    tiny_run(tmp_path, monkeypatch)
-    strong_champion(tmp_path)
-    scored = stub_evaluator(monkeypatch, deep_crashes=True)
-    seed = _write(tmp_path / "seed.py", PASS)
-    for session in range(3):
-        mutator = mutate.FakeMutator(edit=lambda s, n=session: f"{s}\n# child {n}\n")
-        loop.run(1, mutator, WORKERS, seed, random.Random(session), log)
-
-    assert len(scored) == 3
-    assert sorted(scored) == sorted(set(scored))
-    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    crashed = [
-        failure
-        for program in database.programs
-        for failure in database.failures(program.id)
-    ]
-    assert len(crashed) == 3
-    assert all(failure.reason.startswith("deep: ") for failure in crashed)
 
 
 def test_eight_workers_run_at_once(
@@ -562,7 +516,7 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     assert "champion_1" in mutator.seen[1].message
 
 
-def test_a_program_is_deep_scored_once(
+def test_a_program_is_gated_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """A program the gate has already confirmed is never sent through it again.
@@ -582,35 +536,6 @@ def test_a_program_is_deep_scored_once(
 
     assert len(scored) > 2
     assert sorted(scored) == sorted(set(scored))
-
-
-def test_a_promotion_costs_exactly_one_deep_evaluation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """Nothing is measured twice to promote once.
-
-    The champion used to be re-scored after joining the pool, so that the
-    number a candidate was compared against had been measured on the pool as
-    it then stood. Nothing is compared against the champion any more -- the
-    gate asks only whether a candidate beat every opponent -- so that second
-    exam block bought nothing, and it cost ten minutes of the only two deep
-    slots there are.
-    """
-    tiny_run(tmp_path, monkeypatch)
-    pass_pool(tmp_path)
-    scored = stub_evaluator(monkeypatch)
-
-    state = loop.run(
-        sessions=1,
-        mutator=mutate.FakeMutator(edit=lambda _: SELLER),
-        workers=WORKERS,
-        seed_agent=_write(tmp_path / "seed.py", PASS),
-        rng=random.Random(0),
-        log=log,
-    )
-
-    assert state.champion is not None and state.champion.name == "champion_1"
-    assert len(scored) == 1 and scored[0] == state.champion.result.program_id
 
 
 def test_the_pool_is_changed_on_the_loop_thread(
@@ -914,7 +839,7 @@ def test_a_restart_resumes_state_json_and_champion_json(
         name="champion_0",
         path=str(tmp_path / "champion_0.py"),
         tarball=str(tmp_path / "champion_0.tar.gz"),
-        result=_deep_result("champion_0", {"pass": 0.6}),
+        result=_gate_result("champion_0", {"pass": 0.6}),
     )
     state_file.write_text(
         loop.State(
@@ -1015,23 +940,24 @@ def _write(path: Path, source: str) -> Path:
     return path
 
 
-def _deep_result(
+def _gate_result(
     program_id: str, rates: dict[str, float], score: float | None = None
-) -> evaluator.DeepResult:
-    """A hand-built deep result standing in for one the gate wrote."""
+) -> evaluator.Result:
+    """A hand-built result standing in for one the gate measured."""
     point = sum(rates.values()) / len(rates) if score is None else score
-    return evaluator.DeepResult(
+    return evaluator.Result(
         program_id=program_id,
-        score=point,
-        low=max(0.0, point - 0.05),
-        high=min(1.0, point + 0.05),
+        fitness=point,
+        field=point,
         rates=rates,
+        margins={n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in rates},
         intervals={
             n: (max(0.0, r - 0.05), min(1.0, r + 0.05)) for n, r in rates.items()
         },
-        field=point,
-        held_out={},
         games=4,
+        seeds=[1],
+        hardest=min(rates, default=""),
+        states={},
     )
 
 
@@ -1338,25 +1264,19 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
     assert len(database.programs) == 3
 
 
-def test_a_deep_result_measured_before_a_new_opponent_joined_is_thrown_away(
+def test_a_result_measured_before_a_new_opponent_joined_does_not_promote(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     log: wandb.Run,
     records: list[tuple[float, dict]],
 ) -> None:
-    """Two gates run at once, and the loser's pool is out of date when it lands.
+    """Eight sessions gate at once, and a slow one's pool is out of date.
 
-    Each deep evaluation holds the pool as it was when it started. If the
-    other one promoted in the meantime, this result never played the new
-    champion, and "beat every pool opponent" would be answered on a pool that
-    no longer exists -- shipping a program that never met the bar. The result
-    is dropped rather than recorded, so the program still has no deep result
-    and the next round sends it back for another exam block.
-
-    Nothing promotes here: every child is a comment longer than the seed, and
-    `stub_evaluator` scores by length, so each one loses to both opponents.
-    That keeps the real pool fixed and the one stale measurement the only
-    thing that moves.
+    Each evaluation holds the pool as it was when it started. If another
+    session promoted in the meantime, this result never played the new
+    champion, and topping the tournament would be answered on a pool that no
+    longer exists -- shipping a program that never met the bar. It is not
+    promoted; the next round measures against the pool as it now stands.
     """
     tiny_run(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SESSIONS", 1)
@@ -1369,21 +1289,24 @@ def test_a_deep_result_measured_before_a_new_opponent_joined_is_thrown_away(
     opponents.save(config.POOL)
     monkeypatch.setattr(evaluator, "VENDORED", ["pass", "joiner"])
     scored = stub_evaluator(monkeypatch)
-    measure = evaluator.deep
+    measure = evaluator.score
 
     def stale(
-        agent: Path, program_id: str, opponents: pool.Pool, workers: int
-    ) -> evaluator.DeepResult:
-        """The first measurement lands as if ``joiner`` had joined during it."""
-        result = measure(agent, program_id, opponents, workers)
-        if len(scored) == 1:
-            del result.rates["joiner"]
+        agent: Path,
+        program_id: str,
+        opponents: pool.Pool,
+        rng: random.Random,
+        workers: int,
+    ) -> evaluator.Result:
+        """Every measurement lands as if ``joiner`` had joined during it."""
+        result = measure(agent, program_id, opponents, rng, workers)
+        result.rates.pop("joiner", None)
         return result
 
-    monkeypatch.setattr(evaluator, "deep", stale)
+    monkeypatch.setattr(evaluator, "score", stale)
 
     state = loop.run(
-        sessions=2,
+        sessions=1,
         mutator=mutate.FakeMutator(edit=lambda source: source + "\n# edited\n"),
         workers=WORKERS,
         seed_agent=_write(tmp_path / "seed.py", PASS),
@@ -1391,14 +1314,11 @@ def test_a_deep_result_measured_before_a_new_opponent_joined_is_thrown_away(
         log=log,
     )
 
-    # Measured twice: once on the pool that had moved, once on the pool as it
-    # stands, and only the second is a verdict the campaign wrote down.
+    # A child longer than its parent tops the tournament every time here, so
+    # without the check it would promote on a pool it never finished playing.
     assert state.champion is None
-    stale_program = scored[0]
-    assert scored.count(stale_program) == 2
-    database = archive.Database(config.ARCHIVE, config.PROGRAMS)
-    assert database.get(stale_program).deep is not None
-    assert len(deeps_of(records)) == len(scored) - 1
+    assert not gates_of(records)
+    assert len(scored) > 1
 
 
 def test_a_dry_run_writes_nowhere_the_campaign_reads(

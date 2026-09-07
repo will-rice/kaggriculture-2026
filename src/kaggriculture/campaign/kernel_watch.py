@@ -62,7 +62,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--author", default=None, help="only this kernel author")
     parser.add_argument("--limit", type=int, default=5, help="new kernels to process")
-    parser.add_argument("--gate-seeds", type=int, default=64, help="exam seeds to play")
+    parser.add_argument("--gate-seeds", type=int, default=64, help="seeds to play")
     parser.add_argument("--workers", type=int, default=20)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -126,7 +126,7 @@ def report(ref: str, gate_seeds: int, workers: int) -> None:
 
     Args:
         ref: The kernel ref to process.
-        gate_seeds: How many exam seeds to play, both seat orderings.
+        gate_seeds: How many seeds to play, both seat orderings.
         workers: Arena processes.
     """
     # A compiled kernel is tried first, because its main.py extracts perfectly
@@ -597,7 +597,7 @@ def resolved_entrypoint(path: Path) -> str:
 
 
 def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float, int]:
-    """Play one candidate against the field lineages over the exam seeds.
+    """Play one candidate against the field lineages over a fixed block.
 
     This deliberately does not gate against our own served agent. Doing so asks
     "does this beat us", and the agent worth adopting is the one that beats the
@@ -609,7 +609,7 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
 
     Args:
         path: The candidate agent file.
-        gate_seeds: How many exam seeds, both seat orderings.
+        gate_seeds: How many seeds, both seat orderings.
         workers: Arena processes.
 
     Returns:
@@ -618,7 +618,7 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     import os
     import tempfile
 
-    from kaggriculture.campaign import config, roster
+    from kaggriculture.campaign import roster
     from kaggriculture.campaign.field_gate import score_field
     from kaggriculture.report import wilson_interval
 
@@ -630,7 +630,7 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     # every relative path a caller might pass -- the daily scan's own kernel
     # directories included -- stops resolving the moment the sandbox does.
     absolute = path.resolve()
-    seeds = config.EXAM_SEEDS[:gate_seeds]
+    seeds = tuple(range(700_000, 700_000 + gate_seeds))
     origin = Path.cwd()
     with tempfile.TemporaryDirectory(prefix="kernel-watch-gate-") as sandbox:
         os.chdir(sandbox)

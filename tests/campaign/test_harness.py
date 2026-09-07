@@ -110,12 +110,6 @@ def pass_agent(tmp_path: Path) -> Path:
     return path
 
 
-def test_play_refuses_exam_seeds(pass_agent: Path) -> None:
-    """The exam seeds belong to the deep evaluation; the harness will not spend them."""
-    with pytest.raises(ValueError, match="exam"):
-        harness.play(pass_agent, ["v54"], [config.EXAM_SEEDS[0]], workers=1)
-
-
 def test_play_refuses_a_path_where_a_name_belongs(pass_agent: Path) -> None:
     """A sandbox may name an opponent, never point at one."""
     with pytest.raises(KeyError):

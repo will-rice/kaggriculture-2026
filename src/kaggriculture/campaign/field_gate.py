@@ -1,6 +1,6 @@
 """Per-opponent win rates and margins on a fixed seed block, both seats.
 
-The exam block (``config.EXAM_SEEDS``) is the one this is meant for; the
+A fixed block of seeds is what this is meant for; the
 harness refuses it, so this module plays through the engine directly.
 """
 
@@ -30,7 +30,7 @@ def score_field(
         which is the difference between an opponent nearly beaten and one that
         is out of reach.
     """
-    games = harness.play_unsealed(candidate, opponents, seeds, workers)
+    games = harness.play(candidate, opponents, seeds, workers)
     names = list(opponents)
     rates: dict[str, float] = {}
     for name in names:

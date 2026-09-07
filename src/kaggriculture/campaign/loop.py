@@ -22,7 +22,7 @@ next mutation prompt".
 One event loop on one thread owns the database, the pool, the state and the
 wandb run, so none of them needs a lock. Everything that blocks is awaited
 elsewhere: a codex call is a child process in its own group, and validation,
-both evaluators, a promotion's file work and a round's directory removal go
+the evaluation, a promotion's file work and a round's directory removal go
 to threads. Each of those touches only what is its own -- `gate.promote`
 writes files nothing else has -- while the pool that promotion joins is
 changed here, on the loop, where the other seven workers are reading it.
@@ -52,7 +52,7 @@ from pydantic import BaseModel
 # `gate` is also the name of a `Campaign` method, so annotations in the class
 # body cannot see this module -- hence `Champion` imported by name below.
 from kaggriculture.campaign import archive, config, evaluator, gate, prompt, validate
-from kaggriculture.campaign.evaluator import DeepResult, FastResult
+from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.gate import Champion
 from kaggriculture.campaign.harness import OpponentCrash
 from kaggriculture.campaign.mutate import (
@@ -63,15 +63,13 @@ from kaggriculture.campaign.mutate import (
     validate_model,
 )
 from kaggriculture.campaign.pool import Pool
-from kaggriculture.report import spearman
 
 LOGGER = logging.getLogger(__name__)
 
 # Threads the loop needs at once: one per session for whichever blocking step
 # it is on -- scoring a program, validating one, reading a transcript, and
-# never two at once within a session -- plus one per deep evaluation in
-# flight, plus the one a promotion packages on.
-THREADS = config.SESSIONS + config.DEEP_CONCURRENCY + 1
+# never two at once within a session -- plus the one a promotion packages on.
+THREADS = config.SESSIONS + 1
 
 # The database id of the program a cold start seeds itself from. Until the
 # first promotion there is no champion, so this is the name the first
@@ -81,15 +79,9 @@ THREADS = config.SESSIONS + config.DEEP_CONCURRENCY + 1
 # on a magic string is how they come to disagree on one.
 SEED_ID = config.SEED_ID
 
-# Prefix of the failure a crashed deep evaluation leaves in the ledger.
-# `gated` reads it back, so the exam block is spent on a program once even
-# across a restart.
-DEEP_FAILURE = "deep: "
-
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
-    "SESSIONS ROUNDS_PER_SESSION "
-    "FAST_SEEDS DEEP_TOP_K DEEP_CONCURRENCY POOL_SIZE "
+    "SESSIONS ROUNDS_PER_SESSION GATE_SEEDS POOL_SIZE "
     "STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
 
@@ -199,7 +191,7 @@ def _open_run(dry_run: bool) -> wandb.Run:
     log.define_metric("sessions")
     log.define_metric("calls")
     log.define_metric("sessions/*", step_metric="sessions")
-    log.define_metric("deep/*", step_metric="sessions")
+    log.define_metric("gate/*", step_metric="sessions")
     log.define_metric("calls/*", step_metric="calls")
     log.define_metric("database/*", step_metric="calls")
     return log
@@ -214,7 +206,7 @@ class State(BaseModel):
     """What survives a restart, written after every session.
 
     ``champion`` is the whole floor in one field -- the file every session
-    starts from, the name the pool knows it by, and its deep result on the
+    starts from, the name the pool knows it by, and its gate result on the
     pool as that promotion left it -- so a champion cannot be half present.
     """
 
@@ -256,7 +248,7 @@ def run(
     pool.save(config.POOL)
     database = archive.Database(config.ARCHIVE, config.PROGRAMS)
     if not database.programs:
-        seed = evaluator.fast(seed_agent, SEED_ID, pool, rng, workers)
+        seed = evaluator.score(seed_agent, SEED_ID, pool, rng, workers)
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
         database.add(_program(SEED_ID, stored, "", "seed", "", seed))
         LOGGER.info("seeded from %s at fast fitness %.3f", seed_agent, seed.fitness)
@@ -271,7 +263,7 @@ def _program(
     started_from: str,
     instruction: str,
     model: str,
-    result: FastResult,
+    result: Result,
     standings: dict[str, float] | None = None,
 ) -> archive.Program:
     """One database entry, stamped now.
@@ -330,13 +322,9 @@ class Campaign:
         # It happened on this campaign's first launch: sixteen sessions in
         # forty-seven seconds over a missing flag.
         self.no_verdict = 0
-        self.deep = asyncio.Semaphore(config.DEEP_CONCURRENCY)
-        # A promotion renumbers the pool, writes the floor and re-scores the
-        # champion; two gates doing that at once would race on all three.
+        # A promotion renumbers the pool, writes the floor and joins the
+        # champion; eight sessions promoting at once would race on all three.
         self.promotions = asyncio.Lock()
-        # Programs the gate has taken: in flight, or crashed on the exam
-        # block. Neither has a result, so `gated` would send them again.
-        self.gating: set[str] = set()
         self.group = asyncio.TaskGroup()
 
     async def drive(self, sessions: int) -> None:
@@ -356,7 +344,7 @@ class Campaign:
         # sized `cpu_count + 4`. Every thread this loop asks for is waiting on
         # a subprocess or a file, never computing, so the core count is the
         # wrong basis: on a four-core machine that pool is eight threads
-        # against eight sessions and two deep evaluations, and the sessions
+        # against eight sessions, and the sessions
         # that cannot get one simply do not run -- silently, because nothing
         # fails, they just queue. Sized here to what the loop actually asks
         # for at once, so the same campaign runs the same way on any machine.
@@ -437,7 +425,7 @@ class Campaign:
             failures = self.database.failures(name)
             siblings = self.database.children(name)
             standings = gate.standing(
-                name, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+                name, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
             )
             message = prompt.compose(
                 name, result, failures, siblings, instruction, standings
@@ -449,7 +437,7 @@ class Campaign:
             source, name, result = outcome
             cleared, why = gate.promotion(
                 gate.standing(
-                    name, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+                    name, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
                 ),
                 name,
             )
@@ -459,8 +447,8 @@ class Campaign:
         self.finish(rounds)
 
     async def round(
-        self, source: Path, name: str, result: FastResult, message: str, drawn: str
-    ) -> tuple[Path, str, FastResult] | None:
+        self, source: Path, name: str, result: Result, message: str, drawn: str
+    ) -> tuple[Path, str, Result] | None:
         """One round: one codex call on one file, and the loop's verdict on it.
 
         The call is given a directory holding ``child.py`` and nothing else --
@@ -516,7 +504,7 @@ class Campaign:
             record["calls/fitness"] = result.fitness
             record["calls/field"] = result.field
             table = gate.standing(
-                program_id, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+                program_id, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
             )
             record["calls/rating"] = table[program_id]
             record["calls/place"] = 1 + sorted(
@@ -536,7 +524,7 @@ class Campaign:
 
     async def keep(
         self, mutation: Mutation, started_from: str, drawn: str, program_id: str
-    ) -> tuple[Path, str, FastResult] | None:
+    ) -> tuple[Path, str, Result] | None:
         """Validate what a call wrote, score it, insert it, and gate the top K.
 
         A call that never ran to a verdict -- the provider refused, or codex
@@ -579,126 +567,64 @@ class Campaign:
         except OpponentCrash:
             raise
         except RuntimeError as error:
-            self.fail(started_from, drawn, f"fast: {error}")
+            self.fail(started_from, drawn, f"gate: {error}")
             return None
         table = gate.standing(
-            program_id, result.rates, self.snapshot(), 2 * config.FAST_SEEDS
+            program_id, result.rates, self.snapshot(), 2 * config.GATE_SEEDS
         )
         self.database.add(
             _program(
                 program_id, stored, started_from, drawn, mutation.model, result, table
             )
         )
-        LOGGER.info("%s %s fast %.3f", program_id, drawn, result.fitness)
-        for program in self.database.top(config.DEEP_TOP_K):
-            if self.gated(program):
-                self.gating.add(program.id)
-                self.group.create_task(self.gate(program))
+        LOGGER.info("%s %s gate %.3f", program_id, drawn, result.fitness)
+        await self.consider(program_id, result, table)
         return stored, program_id, result
 
-    async def measure(self, source: Path, program_id: str) -> FastResult:
-        """Play ``source`` against the pool as it stands, off the loop thread.
+    async def consider(
+        self, program_id: str, result: Result, table: dict[str, float]
+    ) -> None:
+        """Promote ``program_id`` if it topped the tournament it was just in.
 
-        This is the campaign's only measurement of a round, and the only one
-        a model is ever shown: the model plays nothing, so the seeds, the
-        seating and the reading of "won" are all ours.
+        This is the whole gate. There was a second one -- the best three
+        programs went on to a sealed block and only that could promote -- and
+        it is gone, because the ranking that chose those three was noise: 78
+        of 471 programs topped it and none of them survived the block. One
+        measurement deep enough to select on decides, and it decides here,
+        against the pool this program actually played.
+
+        Under `promotions` because a promotion renumbers the pool, writes the
+        floor and enrolls a champion, and eight sessions reach this line.
         """
-        return await asyncio.to_thread(
-            evaluator.fast,
-            source,
-            program_id,
-            self.snapshot(),
-            random.Random(self.rng.random()),
-            self.workers,
-        )
-
-    def gated(self, program: archive.Program) -> bool:
-        """Whether the gate still owes this program a measurement.
-
-        The seed is excluded by its empty ``started_from``, which nothing
-        else has: it sits in the top K on a cold start, and confirming it
-        would promote a program no session wrote and nothing has beaten --
-        `champion_1` an opponent that loses to everything and separates
-        nobody. Everything else is measured once, ever: once it has a result,
-        once one is in flight, and once it has crashed on the exam block,
-        that last through the ledger so a restart resumes no retries.
-        """
-        return (
-            bool(program.started_from)
-            and program.deep is None
-            and program.id not in self.gating
-            and not any(
-                failure.reason.startswith(DEEP_FAILURE)
-                for failure in self.database.failures(program.id)
-            )
-        )
-
-    async def gate(self, program: archive.Program) -> None:
-        """Section 5: the sealed block, the promotion rule, and what follows a yes.
-
-        The rule is absolute -- beat every pool opponent -- so a promotion
-        needs no measurement of the champion it replaces, and the result a
-        champion carries is the one it was promoted on. It is the same rule,
-        the same function, that told the model whether its round had won.
-        """
-        try:
-            async with self.deep:
-                result = await asyncio.to_thread(
-                    evaluator.deep,
-                    Path(program.source_path),
-                    program.id,
-                    self.snapshot(),
-                    self.workers,
-                )
-                # The gate is the tournament: the candidate's row was just
-                # played on the sealed block, and the pool's own pairings are
-                # kept, so this is a fit over both and no more games.
-                table = await asyncio.to_thread(
-                    gate.standing,
-                    program.id,
-                    result.rates,
-                    self.snapshot(),
-                    2 * len(config.EXAM_SEEDS),
-                )
-        except OpponentCrash:
-            raise
-        except RuntimeError as error:
-            # Against the program itself, not its lineage: this is what
-            # `gated` reads to stop the exam block being spent on it again.
-            self.fail(program.id, program.instruction, f"{DEEP_FAILURE}{error}")
-            return
-        self.gating.discard(program.id)
         async with self.promotions:
             baseline = self.state.champion
-            # Two deep evaluations run at once, and each holds the pool as it
-            # was when it started. If the other one promoted while this was in
-            # flight, this result never played the new champion, and the rule
-            # -- beat every pool opponent -- would pass on a pool that no
-            # longer exists. Promoting that ships a program which never met
-            # the bar. Nothing is recorded, so `gated` sees a program with no
-            # deep result and sends it back for another exam block against the
-            # pool as it now stands.
-            missing = set(self.pool.names()) - {program.id} - set(result.rates)
+            # The pool is copied per evaluation and eight run at once, so one
+            # can promote while another is mid-game. A result that never
+            # played the new champion cannot be said to have topped the pool
+            # it is being judged against, and promoting it would ship a
+            # program that never met the bar. The next round measures against
+            # the pool as it now stands.
+            missing = set(self.pool.names()) - {program_id} - set(result.rates)
             if missing:
                 LOGGER.info(
-                    "%s deep: measured before %s joined the pool; re-queued",
-                    program.id,
+                    "%s: measured before %s joined the pool; not promoted",
+                    program_id,
                     ", ".join(sorted(missing)),
                 )
                 return
-            self.database.record_deep(program.id, result)
-            verdict, why = gate.promotion(table, program.id)
-            LOGGER.info("%s deep %.4f: %s", program.id, result.score, why)
+            verdict, why = gate.promotion(table, program_id)
             if verdict:
+                LOGGER.info("%s %s", program_id, why)
                 # The file work in a thread; the pool it joins on the loop,
                 # where the other seven workers are reading it.
+                program = self.database.get(program_id)
                 champion = await asyncio.to_thread(gate.promote, program, result)
                 gate.enroll(champion, self.pool)
                 # The pool is the top of the tournament: the champion has just
                 # joined it and the weakest opponent makes way, so the field a
                 # candidate has to finish above is the strongest one there is.
                 dropped = self.pool.trim(
-                    {**table, champion.name: table[program.id]}, config.POOL_SIZE
+                    {**table, champion.name: table[program_id]}, config.POOL_SIZE
                 )
                 if dropped:
                     self.pool.save(config.POOL)
@@ -710,7 +636,23 @@ class Campaign:
                 )
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
-        self.log.log(self.deep_record(result, verdict, baseline, table))
+            self.log.log(self.promotion_record(result, verdict, baseline, table))
+
+    async def measure(self, source: Path, program_id: str) -> Result:
+        """Play ``source`` against the pool as it stands, off the loop thread.
+
+        This is the campaign's only measurement of a round, and the only one
+        a model is ever shown: the model plays nothing, so the seeds, the
+        seating and the reading of "won" are all ours.
+        """
+        return await asyncio.to_thread(
+            evaluator.score,
+            source,
+            program_id,
+            self.snapshot(),
+            random.Random(self.rng.random()),
+            self.workers,
+        )
 
     def snapshot(self) -> Pool:
         """The pool as it stands, copied on the loop for one evaluation to keep."""
@@ -762,21 +704,21 @@ class Campaign:
             }
         )
 
-    def deep_record(
+    def promotion_record(
         self,
-        result: DeepResult,
+        result: Result,
         promoted: bool,
         baseline: Champion | None,
         standings: dict[str, float],
     ) -> dict[str, float]:
-        """Section 10: one deep evaluation, and whether it moved the floor.
+        """Section 10: one program judged, and whether it moved the floor.
 
         ``baseline`` is the floor as it stood when this was judged, read
         before the promotion: after it, a promoting result would be logged
         beside the score of the champion it replaced -- itself.
 
         Args:
-            result: The sealed-block measurement.
+            result: The measurement it was judged on.
             promoted: Whether it cleared the gate.
             baseline: The floor as it stood when this was judged.
             standings: The tournament that decided it, so the rating and the
@@ -784,28 +726,20 @@ class Campaign:
         """
         record: dict[str, float] = {
             "sessions": self.state.sessions,
-            "deep/score": result.score,
-            "deep/low": result.low,
-            "deep/high": result.high,
-            "deep/field": result.field,
-            "deep/promoted": int(promoted),
-            "deep/rating": standings[result.program_id],
-            "deep/place": 1
+            "gate/score": result.fitness,
+            "gate/field": result.field,
+            "gate/promoted": int(promoted),
+            "gate/rating": standings[result.program_id],
+            "gate/place": 1
             + sorted(standings, key=lambda name: -standings[name]).index(
                 result.program_id
             ),
-            "deep/pool": len(result.rates),
-            **{f"deep/rate/{name}": rate for name, rate in result.rates.items()},
-            **{f"deep/margin/{n}": m.mean for n, m in result.margins.items()},
-            **{f"deep/held_out/{n}": rate for n, rate in result.held_out.items()},
+            "gate/pool": len(result.rates),
+            **{f"gate/rate/{name}": rate for name, rate in result.rates.items()},
+            **{f"gate/margin/{n}": m.mean for n, m in result.margins.items()},
         }
         if baseline is not None:
-            record["deep/champion"] = baseline.result.score
-        both = [(p.fitness, p.deep.score) for p in self.database.programs if p.deep]
-        if len(both) > 2:
-            record["deep/rho_fast_deep"] = spearman(
-                [f for f, _ in both], [d for _, d in both]
-            )
+            record["gate/champion"] = baseline.result.fitness
         return record
 
 

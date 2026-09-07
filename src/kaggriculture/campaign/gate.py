@@ -20,9 +20,9 @@ and kept, and only a new member's pairings ever run. The candidate's own row
 is always played fresh, because a candidate has no history.
 
 Champions accumulating in the pool are what makes the chain a ratchet: each
-promotion came top of a field that already held every champion before it. The
-held-out opponents, never part of the tournament, are what would show a
-co-evolutionary cycle if the chain ever went in a circle.
+promotion came top of a field that already held every champion before it,
+on seeds drawn fresh for that tournament and never seen by the lineage
+being judged.
 
 A promotion also produces the artefact a cut uploads: the program is
 packaged into `champions/<name>.tar.gz`, so a cut is one command -- upload
@@ -57,7 +57,7 @@ from pydantic import BaseModel
 
 from kaggriculture.campaign import config, harness, rating, roster
 from kaggriculture.campaign.archive import Program
-from kaggriculture.campaign.evaluator import DeepResult
+from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
@@ -75,14 +75,14 @@ class Champion(BaseModel):
         name: The champion's pool name, e.g. "champion_3".
         path: The immutable copy under ``config.CHAMPIONS`` the pool plays.
         tarball: The archive a cut uploads, written by this promotion.
-        result: The deep evaluation it was promoted on, which is also what a
+        result: The measurement it was promoted on, which is also what a
             session is shown of the program it starts from.
     """
 
     name: str
     path: str
     tarball: str
-    result: DeepResult
+    result: Result
 
 
 def tournament(
@@ -162,7 +162,7 @@ def tournament(
 
 def _rate(agent: Path, opponent: str, seeds: Sequence[int], workers: int) -> float:
     """``agent``'s win rate against ``opponent`` over ``seeds``, both seats."""
-    played = harness.play_unsealed(agent, [opponent], list(seeds), workers)
+    played = harness.play(agent, [opponent], list(seeds), workers)
     return sum(
         1.0 if game.ours > game.theirs else 0.5 if game.ours == game.theirs else 0.0
         for game in played
@@ -236,7 +236,7 @@ def promotion(standings: dict[str, float], name: str) -> tuple[bool, str]:
     )
 
 
-def promote(program: Program, result: DeepResult) -> Champion:
+def promote(program: Program, result: Result) -> Champion:
     """The file half of a promotion: the tarball, the champion's copy, the floor.
 
     Every file this writes is one nothing else owns, so it is safe to call
@@ -252,7 +252,7 @@ def promote(program: Program, result: DeepResult) -> Champion:
 
     Args:
         program: The archive entry being promoted.
-        result: Its deep evaluation.
+        result: Its measurement.
 
     Returns:
         The champion record, for ``enroll`` and ``record`` to act on.

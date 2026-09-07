@@ -7,7 +7,6 @@ import pydantic
 import pytest
 
 from kaggriculture.campaign import archive
-from kaggriculture.campaign.evaluator import DeepResult
 from kaggriculture.campaign.harness import Margin
 
 AGENT = "def agent(o, c=None):\n    return {}\n"
@@ -110,43 +109,10 @@ def test_a_program_with_no_rating_sorts_below_every_rated_one(
     assert [p.id for p in db.top(2)] == ["rated_badly", "seed"]
 
 
-def test_a_deep_result_is_stored_on_the_program(tmp_path: Path) -> None:
-    """A confirmed program carries its deep result."""
-    db = make(tmp_path)
-    program(db, "a", 0.5)
-    result = DeepResult(
-        program_id="a",
-        score=0.6,
-        low=0.5,
-        high=0.7,
-        rates={"v54": 0.6},
-        intervals={"v54": (0.5, 0.7)},
-        field=0.6,
-        held_out={},
-        games=128,
-    )
-    db.record_deep("a", result)
-    assert db.get("a").deep == result
-
-
 def test_the_log_survives_a_restart(tmp_path: Path) -> None:
-    """Everything replays: programs, deep results and failures."""
+    """Everything replays: the programs and the failures beside them."""
     db = make(tmp_path)
     program(db, "a", 0.5)
-    db.record_deep(
-        "a",
-        DeepResult(
-            program_id="a",
-            score=0.6,
-            low=0.5,
-            high=0.7,
-            rates={},
-            intervals={},
-            field=0.6,
-            held_out={},
-            games=128,
-        ),
-    )
     db.record_failure(
         archive.Failure(
             started_from="a",
@@ -159,7 +125,6 @@ def test_the_log_survives_a_restart(tmp_path: Path) -> None:
     again = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
 
     assert [p.id for p in again.programs] == ["a"]
-    assert again.get("a").deep is not None
     assert [f.reason for f in again.failures("a")] == ["syntax: bad"]
 
 
@@ -185,21 +150,8 @@ def test_an_event_that_cannot_be_applied_is_never_logged(tmp_path: Path) -> None
     log = tmp_path / "db.jsonl"
     before = log.read_text(encoding="utf-8")
 
-    with pytest.raises(KeyError, match="ghost"):
-        db.record_deep(
-            "ghost",
-            DeepResult(
-                program_id="ghost",
-                score=0.6,
-                low=0.5,
-                high=0.7,
-                rates={},
-                intervals={},
-                field=0.6,
-                held_out={},
-                games=128,
-            ),
-        )
+    with pytest.raises(ValueError, match="duplicate"):
+        program(db, "a", 0.9)
 
     assert log.read_text(encoding="utf-8") == before
     again = archive.Database(log, tmp_path / "programs")

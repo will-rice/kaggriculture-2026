@@ -10,11 +10,6 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
 from kaggriculture.campaign import config, roster
 
 
-def test_exam_seeds_are_the_sealed_block() -> None:
-    """The deep evaluation plays these seeds and nothing else may."""
-    assert config.EXAM_SEEDS == tuple(range(700_000, 700_064))
-
-
 def test_item_order_matches_the_engine_port_enum() -> None:
     """sim.hpp's Item enum is WHEAT..FERTILIZER then GOOSE, COW, SHEEP."""
     assert config.ITEMS == [
@@ -81,21 +76,15 @@ def test_core_budget_leaves_headroom() -> None:
     assert 1 <= config.CORE_BUDGET <= max(1, (os.cpu_count() or 1) - 8)
 
 
-def test_fast_seed_range_never_touches_the_exam_block() -> None:
-    """The fast seed range never overlaps with the exam seed block."""
-    assert not set(config.FAST_SEED_RANGE) & set(config.EXAM_SEEDS)
-
-
 def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
     assert config.ROUNDS_PER_SESSION == 5
-    # Eight, not four: eight games an opponent is a standard error near 0.18,
-    # and a lucky program topping the draw passes its luck to the next
-    # session rather than its quality.
-    assert config.FAST_SEEDS == 8
-    assert len(config.EXAM_SEEDS) == 64
-    assert (config.DEEP_TOP_K, config.DEEP_CONCURRENCY) == (3, 2)
+    # Thirty-two, not eight: at eight the gate called 78 of 471
+    # programs the best in the tournament and none of them held up,
+    # because selecting the maximum of an estimator with a standard
+    # error of 0.125 returns the luckiest program, not the best one.
+    assert config.GATE_SEEDS == 32
     assert config.POOL_SIZE == 8
     # Smaller than the roster on purpose: the pool is the top of the
     # tournament, and an opponent every candidate already beats separates two

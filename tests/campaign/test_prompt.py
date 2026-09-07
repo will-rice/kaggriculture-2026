@@ -51,10 +51,11 @@ def day(number: int, ours: float, theirs: float) -> harness.Day:
     )
 
 
-def result(rates: dict[str, float], days: int = 2) -> evaluator.FastResult:
+def result(rates: dict[str, float], days: int = 2) -> evaluator.Result:
     """A fast evaluation standing in for one the loop played."""
     hardest = min(rates, key=lambda name: rates[name])
-    return evaluator.FastResult(
+    return evaluator.Result(
+        program_id="p1",
         fitness=sum(rates.values()) / len(rates),
         field=0.5,
         rates=rates,
@@ -120,7 +121,10 @@ def test_a_program_at_the_top_of_the_tournament_is_told_so() -> None:
 
     assert f"It {gate.promotion(standings, 'champion_1')[1]}." in text
     assert "top of the tournament" in text
-    assert "sealed block" in text
+    # Topping it *is* the promotion now; there is no second block to clear,
+    # and telling a round otherwise would describe a gate that no longer runs.
+    assert "this program is the champion" in text
+    assert "sealed" not in text
     # The whole table, so a round can see who it has yet to pass.
     assert "| rank | agent | rating |" in text
     assert "| 1 | **champion_1** |" in text
