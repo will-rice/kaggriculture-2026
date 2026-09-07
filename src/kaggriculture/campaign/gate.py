@@ -129,6 +129,21 @@ def tournament(
     games = 2 * len(seeds)
 
     field = rating.Field.load(kept)
+    # The cache carries one game count for every pairing in it, so a field
+    # measured at a different count cannot be extended -- recording a new
+    # pairing would relabel the old ones as having been played over games they
+    # were not, and the fit weights by that number. The rates are a cache of
+    # constants and re-measuring them is what the cache exists to avoid, but
+    # keeping them mislabelled is worse than paying for them again.
+    if field.rates and field.games != games:
+        LOGGER.info(
+            "field was measured over %d games and this tournament plays %d: "
+            "discarding %d cached pairing(s) and measuring them again",
+            field.games,
+            games,
+            sum(len(row) for row in field.rates.values()) // 2,
+        )
+        field = rating.Field()
     absent = field.missing(opponents)
     if absent:
         LOGGER.info(

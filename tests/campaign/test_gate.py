@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import archive, config, evaluator, gate, pool
+from kaggriculture.campaign import archive, config, evaluator, gate, pool, rating
+
+PASS = (
+    "def agent(observation, configuration=None):\n"
+    "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+)
 
 
 def result(
@@ -25,6 +30,46 @@ def result(
         held_out={},
         games=128,
     )
+
+
+def test_a_field_measured_over_other_games_is_thrown_away_not_extended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One game count covers the whole cache, so a changed one invalidates it.
+
+    `Field.games` is a single number for every pairing in the file, and
+    recording a new pairing sets it. Extend a field measured over one count
+    with a pairing played over another and every old rate is relabelled as
+    having been played over games it never was -- silently, because nothing
+    fails, and consequentially, because the Bradley-Terry fit weights each
+    rate by that number. Only changing `FAST_SEEDS` can reach it, which is
+    exactly when nobody would be looking.
+
+    The cached rate here is a lie: a PASS agent draws with a PASS agent, so
+    the truth is 0.5 and the file claims 1.0. Surviving the tournament is what
+    proves the cache was reused.
+    """
+    monkeypatch.setattr(config, "POOL", tmp_path / "pool.json")
+    agents = {}
+    for name in ("one", "two"):
+        path = tmp_path / f"{name}.py"
+        path.write_text(PASS, encoding="utf-8")
+        agents[name] = str(path)
+    opponents = pool.Pool(opponents=agents)
+    opponents.save(config.POOL)
+
+    kept = tmp_path / "field.json"
+    stale = rating.Field(games=2)
+    stale.record("one", "two", 1.0)
+    stale.save(kept)
+
+    gate.tournament(
+        Path(agents["one"]), "candidate", opponents, seeds=[1, 2], workers=1, kept=kept
+    )
+
+    field = rating.Field.load(kept)
+    assert field.games == 4
+    assert field.rates["one"]["two"] == 0.5
 
 
 def test_the_top_of_the_tournament_is_promoted() -> None:
