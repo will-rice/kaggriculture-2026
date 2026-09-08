@@ -1,0 +1,551 @@
+<title>Kaggriculture Build Order</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  rel="stylesheet"
+  href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400&family=Source+Sans+3:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap"
+/>
+<style>
+  :root {
+    --ground: #f6f6f3;
+    --raised: #ffffff;
+    --ink: #14181a;
+    --quiet: #5d6863;
+    --hair: #d9dcd6;
+    --strong: #0f6b52;
+    --rest: #b0722a;
+    --wash: rgba(15, 107, 82, 0.08);
+    --display: "Newsreader", Georgia, "Times New Roman", serif;
+    --body: "Source Sans 3", -apple-system, "Segoe UI", sans-serif;
+    --data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+    --measure: 68ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #101312;
+      --raised: #181c1b;
+      --ink: #e7ebe7;
+      --quiet: #97a29c;
+      --hair: #2b312f;
+      --strong: #56c39a;
+      --rest: #dda059;
+      --wash: rgba(86, 195, 154, 0.1);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #101312;
+    --raised: #181c1b;
+    --ink: #e7ebe7;
+    --quiet: #97a29c;
+    --hair: #2b312f;
+    --strong: #56c39a;
+    --rest: #dda059;
+    --wash: rgba(86, 195, 154, 0.1);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3.25rem;
+  }
+  .measure {
+    max-width: var(--measure);
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--display);
+    font-weight: 600;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 {
+    font-size: clamp(2.3rem, 5vw, 3.4rem);
+    line-height: 1.08;
+    letter-spacing: -0.015em;
+  }
+  h2 {
+    font-size: 1.65rem;
+    line-height: 1.2;
+  }
+  h3 {
+    font-size: 1.1rem;
+  }
+  p {
+    margin: 0;
+  }
+  .lede {
+    font-family: var(--display);
+    font-size: 1.24rem;
+    line-height: 1.5;
+    color: var(--quiet);
+  }
+
+  .eyebrow {
+    font-family: var(--data);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    color: var(--quiet);
+    margin: 0;
+  }
+  header {
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+  .census {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 2.25rem;
+    font-family: var(--data);
+    font-size: 0.82rem;
+    color: var(--quiet);
+    border-top: 1px solid var(--hair);
+    padding-top: 0.9rem;
+  }
+  .census b {
+    color: var(--ink);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  section {
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+
+  .note {
+    border-left: 3px solid var(--strong);
+    background: var(--wash);
+    padding: 1.1rem 1.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-width: var(--measure);
+  }
+  .note .eyebrow {
+    color: var(--strong);
+  }
+
+  .scroll {
+    overflow-x: auto;
+  }
+  table {
+    border-collapse: collapse;
+    font-family: var(--data);
+    font-size: 0.8rem;
+    width: 100%;
+  }
+  caption {
+    caption-side: top;
+    text-align: left;
+    font-family: var(--body);
+    font-size: 0.9rem;
+    color: var(--quiet);
+    padding-bottom: 0.6rem;
+  }
+  th,
+  td {
+    padding: 0.38rem 0.6rem;
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  th:first-child,
+  td:first-child {
+    text-align: left;
+  }
+  thead th {
+    color: var(--quiet);
+    font-weight: 500;
+    border-bottom: 1px solid var(--hair);
+  }
+  tbody tr + tr td {
+    border-top: 1px solid var(--hair);
+  }
+  td.who {
+    font-weight: 500;
+  }
+  .who.t {
+    color: var(--strong);
+  }
+  .who.r {
+    color: var(--rest);
+  }
+  tr.gap td {
+    border-top-width: 0;
+    padding-top: 0.9rem;
+  }
+  .lead {
+    background: var(--wash);
+    border-radius: 2px;
+  }
+
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 2rem;
+  }
+  figure {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  figcaption {
+    font-size: 0.88rem;
+    color: var(--quiet);
+  }
+  svg {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+  .key {
+    display: flex;
+    gap: 1.1rem;
+    font-family: var(--data);
+    font-size: 0.74rem;
+  }
+  .key span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 2px;
+    display: inline-block;
+  }
+
+  .findings {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1.6rem 2.25rem;
+  }
+  .finding {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .finding .num {
+    font-family: var(--data);
+    font-size: 1.5rem;
+    color: var(--strong);
+    font-variant-numeric: tabular-nums;
+  }
+  .finding h3 {
+    font-size: 1rem;
+  }
+  .finding p {
+    font-size: 0.93rem;
+    color: var(--quiet);
+  }
+
+  footer {
+    border-top: 1px solid var(--hair);
+    padding-top: 1.2rem;
+    font-family: var(--data);
+    font-size: 0.76rem;
+    color: var(--quiet);
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+</style>
+
+<div class="page">
+  <header>
+    <p class="eyebrow">
+      Replay corpus &middot; engine 1.32.7 &middot; $first to $last &middot;
+      rebuilt $generated
+    </p>
+    <h1>What the strong farms<br />do differently</h1>
+    <p class="lede measure">
+      Every recorded ladder game, read by rating rather than by who happened to
+      win. The agents at the top of the leaderboard publish no kernels — their
+      games are the only view of them there is.
+    </p>
+    <div class="census">
+      <span><b>$games</b> games</span>
+      <span><b>$teams</b> rated agents</span>
+      <span><b>$days_rows</b> day records</span>
+      <span><b>$orders</b> market orders</span>
+      <span><b>$moves</b> commands</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="note">
+      <p class="eyebrow">How these are grouped</p>
+      <p>
+        Every comparison below is the
+        <strong>top $top rated agents against the bottom $tail</strong>, by a
+        Bradley-Terry fit over the whole corpus — never the winner against the
+        loser of a given game. That distinction is not pedantry. Grouped by game
+        outcome, eleven quantities measured over thirteen thousand games all
+        came back between <strong>45% and 60%</strong>: noise. About half of
+        every ladder's winners are the weaker agent having a good day, and that
+        swamps the signal. Regrouped by rating, the same corpus separates
+        cleanly — and reverses the sign of one of them.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">The shape of the field</p>
+    <h2>Nobody is running away with it</h2>
+    <div class="findings">
+      <div class="finding">
+        <span class="num">$margin_share</span>
+        <h3>Mean winning margin</h3>
+        <p>
+          $margin coins on a mean final bank of $bank. The field is packed
+          tight; small edges decide games.
+        </p>
+      </div>
+      <div class="finding">
+        <span class="num">$won_a / $won_b</span>
+        <h3>Seat advantage</h3>
+        <p>
+          Wins to the first seat against the second, and $drawn draws. Going
+          first is worth nothing measurable.
+        </p>
+      </div>
+      <div class="finding">
+        <span class="num">$premium</span>
+        <h3>Top $top bank premium</h3>
+        <p>
+          $top_final against $tail_final. The strongest agents finish ahead by
+          less than a tenth.
+        </p>
+      </div>
+      <div class="finding">
+        <span class="num">$spread</span>
+        <h3>Rating spread, log-odds</h3>
+        <p>End to end across every agent with forty games or more.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Finding one</p>
+    <h2>They buy capacity early and run poor doing it</h2>
+    <p class="measure">
+      Through the first ten days the strong agents hold <em>less</em> cash than
+      the field. They are spending it — on land, on quadrants, on animals, on
+      hands. The bank crosses over around day twelve and never comes back.
+    </p>
+
+    <div class="charts">
+      <figure>
+        <svg
+          viewBox="0 0 330 150"
+          role="img"
+          aria-label="Quadrants unlocked by day, top rated against the rest of the field."
+        >
+          <g
+            font-family="IBM Plex Mono, monospace"
+            font-size="8"
+            fill="var(--quiet)"
+          >
+            <text x="4" y="26">3</text>
+            <text x="4" y="70">2</text>
+            <text x="4" y="114">1</text>
+            <text x="34" y="132">d0</text>
+            <text x="120" y="132">d8</text>
+            <text x="214" y="132">d20</text>
+            <text x="296" y="132">d29</text>
+          </g>
+          <g stroke="var(--hair)" stroke-width="1">
+            <line x1="30" y1="22" x2="320" y2="22"></line>
+            <line x1="30" y1="66" x2="320" y2="66"></line>
+            <line x1="30" y1="110" x2="320" y2="110"></line>
+          </g>
+          <polyline
+            fill="none"
+            stroke="var(--rest)"
+            stroke-width="2"
+            stroke-linejoin="round"
+            points="$quad_tail"
+          ></polyline>
+          <polyline
+            fill="none"
+            stroke="var(--strong)"
+            stroke-width="2.5"
+            stroke-linejoin="round"
+            points="$quad_top"
+          ></polyline>
+        </svg>
+        <figcaption>
+          Quadrants unlocked. The top open their second and third quadrant days
+          ahead of the field; both sides finish at three.
+        </figcaption>
+      </figure>
+
+      <figure>
+        <svg
+          viewBox="0 0 330 150"
+          role="img"
+          aria-label="Units sold per side in six-day bands, top rated against the rest of the field."
+        >
+          <g
+            font-family="IBM Plex Mono, monospace"
+            font-size="8"
+            fill="var(--quiet)"
+          >
+            <text x="10" y="114">0</text>
+            <text x="36" y="132">d0–5</text>
+            <text x="94" y="132">d6–11</text>
+            <text x="152" y="132">d12–17</text>
+            <text x="212" y="132">d18–23</text>
+            <text x="270" y="132">d24–29</text>
+          </g>
+          <g stroke="var(--hair)" stroke-width="1">
+            <line x1="30" y1="8" x2="320" y2="8"></line>
+            <line x1="30" y1="110" x2="320" y2="110"></line>
+          </g>
+          <text
+            x="24"
+            y="11"
+            font-family="IBM Plex Mono, monospace"
+            font-size="8"
+            fill="var(--quiet)"
+            text-anchor="end"
+          >
+            $sell_peak
+          </text>
+          <g>$sell_bars</g>
+        </svg>
+        <figcaption>
+          Units sold per game, per side. The weak field liquidates at the close;
+          the top sell steadily from day twelve and finish richer.
+        </figcaption>
+      </figure>
+    </div>
+
+    <div class="key">
+      <span
+        ><i class="swatch" style="background: var(--strong)"></i> top $top
+        rated</span
+      >
+      <span
+        ><i class="swatch" style="background: var(--rest)"></i> bottom $tail
+        rated</span
+      >
+    </div>
+
+    <div class="scroll">
+      <table>
+        <caption>
+          Mean holdings by day. Shaded cells mark where the top lead by a fifth
+          or more.
+        </caption>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th></th>
+            $day_heads
+          </tr>
+        </thead>
+        <tbody>
+          $build_rows
+        </tbody>
+      </table>
+    </div>
+    <p class="measure">
+      Seed is the exception that confirms the reading: the top hold roughly
+      <em>half</em> the unplanted seed of the field from day six onward. They
+      are not stockpiling inputs, they are putting them in the ground.
+    </p>
+  </section>
+
+  <section>
+    <p class="eyebrow">Finding two</p>
+    <h2>The strong are net buyers</h2>
+    <p class="measure">
+      After hiring, the top agents' busiest market activity is
+      <em>buying</em> wheat. The weak field's is dumping fertilizer — the input
+      the top are applying to their own fields. Across the season the top move
+      <strong>$top_sold</strong> units against the field's
+      <strong>$tail_sold</strong>, and finish richer. Selling is not the
+      constraint. Capacity is.
+    </p>
+  </section>
+
+  <section>
+    <p class="eyebrow">Cross-check</p>
+    <h2>The same story, measured a second way</h2>
+    <p class="measure">
+      Independently of the tables above, every quantity was crossed with every
+      day and put to the corpus as a paired within-game comparison between the
+      stronger and weaker agent — $asked questions, of which
+      <strong>$settled settled</strong> on enough games to count. The widest
+      separations are all the same finding.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Quantity</th>
+            <th>Day</th>
+            <th>Stronger side has</th>
+            <th>Games</th>
+            <th>Agreement</th>
+          </tr>
+        </thead>
+        <tbody>
+          $claim_rows
+        </tbody>
+      </table>
+    </div>
+    <p class="measure">
+      Expansion in the first week, at ninety to a hundred percent agreement.
+      Nothing about the endgame appears until far down the list.
+    </p>
+  </section>
+
+  <section>
+    <div class="note">
+      <p class="eyebrow">What it means for the campaign</p>
+      <p>
+        The build order is the lever, and it is early. Land and quadrants by day
+        five, animals from day zero, fertilizer applied rather than sold, seed
+        in the ground rather than the store, and a crew large enough to work it
+        — accepting a thinner bank until day twelve. What almost nothing turns
+        on is the endgame: the field's losers are distinguished mainly by
+        panic-selling their produce in the last six days.
+      </p>
+    </div>
+    <p class="measure">
+      Two honest limits. This is observational — strong agents differ in many
+      ways at once, so “sells less” may be a consequence of a production
+      strategy rather than a cause of winning. And the top $top are a moving
+      target: the ladder turns over, which is why this page is rebuilt from the
+      corpus rather than written once.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Corpus: $games clean engine-1.32.7 episodes, $first to $last, extracted
+      from the public replay archive. Ratings: Bradley-Terry MM fit over all of
+      them, agents with forty games or more. Rebuilt $generated.
+    </p>
+    <p>Aggregate only — no opponent source was read, and no agent is named.</p>
+  </footer>
+</div>

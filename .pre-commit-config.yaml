@@ -11,11 +11,15 @@ repos:
     rev: v1.0.7
     hooks:
       - id: prettier-format
-        # Generated nightly by `build-order` from the corpus. Prettier pads
-        # markdown table cells to align them, so leaving it in means the
-        # generator and the hook rewrite the same file forever, and every
-        # rebuild lands as a diff nobody made.
-        exclude: ^src/kaggriculture/campaign/build_order\.md$
+        # Both generated nightly from the corpus. Prettier rewrites whitespace
+        # in what it touches, so leaving them in means the generator and the
+        # hook rewrite the same files forever and every rebuild lands as a diff
+        # nobody made. The report *template* is source and stays formatted.
+        exclude: |
+          (?x)^(
+            src/kaggriculture/campaign/build_order\.md|
+            docs/reports/ladder\.html
+          )$
   - repo: local
     hooks:
       - id: ruff-format

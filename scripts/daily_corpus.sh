@@ -27,4 +27,7 @@ uv run extract-corpus
 echo "=== $(date -u +%FT%TZ) measuring claims ==="
 uv run strategies
 
+echo "=== $(date -u +%FT%TZ) rendering the report ==="
+uv run report
+
 echo "=== $(date -u +%FT%TZ) done ==="
