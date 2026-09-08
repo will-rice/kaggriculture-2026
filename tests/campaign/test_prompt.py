@@ -142,7 +142,10 @@ def test_the_message_carries_the_build_order() -> None:
     )
 
     assert "How the strongest agents build" in text
-    assert "| quadrants |" in text and "| fertilised |" in text
+    # Matched loosely: the table is generated and then formatted, and prettier
+    # pads markdown cells to align them.
+    assert re.search(r"\|\s*quadrants\s*\|", text)
+    assert re.search(r"\|\s*fertilised\s*\|", text)
     # It travels whole: a table cut in half is a table nobody can read down.
     assert prompt.BUILD_ORDER.read_text(encoding="utf-8").rstrip() in text
     # Aggregate only: no opponent is named and no path of theirs appears.
