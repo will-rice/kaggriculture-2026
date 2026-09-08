@@ -92,6 +92,11 @@ def ratings(
         for two in rates[one]:
             if two not in rates or one not in rates[two]:
                 raise ValueError(f"pairing {one} vs {two} has no mirror")
+    if not names:
+        # No games on the record, which is a cold start rather than an error:
+        # the first candidate of a run is measured before anything has been
+        # played, and a rating over nobody is nobody rated.
+        return {}
     strength = dict.fromkeys(names, 1.0)
     for _ in range(ITERATIONS):
         updated = {}
@@ -144,11 +149,22 @@ class Field(BaseModel):
 
     Attributes:
         rates: ``rates[a][b]``, a's win rate against b, ties as half.
-        games: Games behind each rate. One number, because every pairing is
-            played on the same seeds in both seats.
+        played: ``played[a][b]``, games behind that rate.
+        games: The depth pairings were measured at before the count was kept
+            per pairing. Read when `played` has no entry, so a field written
+            by the older code keeps its weights instead of being discarded.
+
+    The count used to be one number for the whole field, on the reasoning
+    that every pairing is played on the same seeds. It is per pairing now,
+    because a single number cannot be extended: changing the gate's depth
+    made every cached rate mislabelled, and the only safe thing was to throw
+    away the lot and play them again. That is two hundred and eighty pairings
+    of history, and the rating this campaign is now steered by is fitted over
+    exactly that history.
     """
 
     rates: dict[str, dict[str, float]] = {}
+    played: dict[str, dict[str, int]] = {}
     games: int = 0
 
     @classmethod
@@ -184,28 +200,52 @@ class Field(BaseModel):
             if two not in self.rates.get(one, {})
         ]
 
-    def record(self, one: str, two: str, rate: float) -> None:
+    def record(self, one: str, two: str, rate: float, games: int) -> None:
         """Keep a measured pairing, both ways round.
 
         Args:
             one: An agent.
             two: The agent it played.
             rate: One's win rate against two, ties as half.
+            games: How many games that rate is over, kept per pairing so a
+                field measured at one depth can be extended at another.
         """
         self.rates.setdefault(one, {})[two] = rate
         self.rates.setdefault(two, {})[one] = 1.0 - rate
+        self.played.setdefault(one, {})[two] = games
+        self.played.setdefault(two, {})[one] = games
+
+    def depth(self, one: str, two: str) -> int:
+        """Games behind one pairing, falling back to the field-wide count.
+
+        The fallback is what lets a field written before the count was kept
+        per pairing go on being used rather than being thrown away.
+        """
+        return self.played.get(one, {}).get(two, self.games)
 
     def results(self, names: list[str]) -> list[tuple[str, str, float, int]]:
-        """The kept pairings among ``names``, as `standings` takes them.
-
-        Restricted rather than returned whole, because an opponent that has
-        left the pool is not in this tournament even though its games are
-        still on the record: dropping it costs nothing, and if it ever comes
-        back its pairings are still here.
-        """
+        """The kept pairings among ``names``, as `standings` takes them."""
         return [
-            (one, two, self.rates[one][two], self.games)
+            (one, two, self.rates[one][two], self.depth(one, two))
             for index, one in enumerate(names)
             for two in names[index + 1 :]
             if two in self.rates.get(one, {})
+        ]
+
+    def everything(self) -> list[tuple[str, str, float, int]]:
+        """Every pairing on the record, whoever is in the pool today.
+
+        What a rating is fitted over. Restricting it to the current pool was
+        right when the pool was the tournament and a candidate played all of
+        it; it is wrong now that a candidate plays a sample, because then the
+        agents it did not draw are exactly what place it against the ones it
+        did. The record has never been trimmed -- forty-four agents and two
+        hundred and eighty pairings at the time this was written -- so this is
+        the whole history and it costs a dictionary walk.
+        """
+        return [
+            (one, two, rate, self.depth(one, two))
+            for one, against in self.rates.items()
+            for two, rate in against.items()
+            if one < two
         ]

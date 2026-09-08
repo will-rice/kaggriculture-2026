@@ -88,14 +88,14 @@ def test_a_pairing_given_from_one_side_only_is_not_a_tournament() -> None:
 
 def test_kept_pairings_survive_a_round_trip(tmp_path: Path) -> None:
     """What is kept is what is read back, or a gate re-measures for nothing."""
-    field = Field(games=64)
-    field.record("a", "b", 0.75)
+    field = Field()
+    field.record("a", "b", 0.75, 64)
     path = tmp_path / "field.json"
 
     field.save(path)
 
     back = Field.load(path)
-    assert back.rates == field.rates and back.games == 64
+    assert back.rates == field.rates and back.played == field.played
     assert back.results(["a", "b"]) == [("a", "b", 0.75, 64)]
 
 
@@ -112,28 +112,55 @@ def test_only_a_new_member_s_pairings_are_missing() -> None:
     Three opponents already played each other, so a fourth joining leaves
     three pairings to measure rather than the six a fresh tournament would.
     """
-    field = Field(games=64)
+    field = Field()
     for one, two in (("a", "b"), ("a", "c"), ("b", "c")):
-        field.record(one, two, 0.5)
+        field.record(one, two, 0.5, 64)
 
     absent = field.missing(["a", "b", "c", "champion_1"])
 
     assert absent == [("a", "champion_1"), ("b", "champion_1"), ("c", "champion_1")]
 
 
-def test_an_opponent_that_left_the_pool_is_not_in_the_tournament() -> None:
-    """Its games stay on the record; it just is not asked about.
+def test_the_whole_record_is_what_a_rating_is_fitted_over() -> None:
+    """Every pairing anyone has played, not the pool as it stands today.
 
-    A pool that trims an opponent should not pay to re-measure it if that
-    opponent ever comes back, and should not be rated against it meanwhile.
+    Restricting the fit to the current pool was right while the pool *was*
+    the tournament and a candidate played all of it. A candidate now draws a
+    sample, so the agents it did not draw are exactly what place it against
+    the ones it did -- and nothing leaves the pool any more regardless.
     """
-    field = Field(games=64)
-    for one, two in (("a", "b"), ("a", "gone"), ("b", "gone")):
-        field.record(one, two, 0.5)
+    field = Field()
+    for one, two in (("a", "b"), ("a", "old"), ("b", "old")):
+        field.record(one, two, 0.5, 64)
 
+    assert sorted(field.everything()) == [
+        ("a", "b", 0.5, 64),
+        ("a", "old", 0.5, 64),
+        ("b", "old", 0.5, 64),
+    ]
+    # And a subset is still available for a caller that wants one.
     assert field.results(["a", "b"]) == [("a", "b", 0.5, 64)]
-    assert field.missing(["a", "b"]) == []
-    assert "gone" in field.rates
+
+
+def test_a_field_written_before_the_count_was_per_pairing_keeps_its_weights(
+    tmp_path: Path,
+) -> None:
+    """The campaign's own field.json is such a file, and it is the history.
+
+    Two hundred and eighty pairings measured at 64 games, written when the
+    count was one number for the whole field. Reading them at a default of
+    zero would weight every one of them out of the fit.
+    """
+    path = tmp_path / "field.json"
+    path.write_text(
+        '{"rates": {"a": {"b": 0.75}, "b": {"a": 0.25}}, "games": 64}',
+        encoding="utf-8",
+    )
+
+    field = Field.load(path)
+
+    assert field.depth("a", "b") == 64
+    assert field.everything() == [("a", "b", 0.75, 64)]
 
 
 @pytest.mark.local_data

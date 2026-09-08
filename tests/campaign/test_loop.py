@@ -221,6 +221,7 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         rng: random.Random,
         workers: int,
         pool_file: Path | None = None,
+        standings: dict[str, float] | None = None,
     ) -> evaluator.Result:
         """The evaluation's shape, without its games.
 
@@ -233,7 +234,9 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             raise RuntimeError("the candidate raised in its own seat")
         measured = evaluator.opponents(opponents, program_id, agent)
         rate = score(agent)
-        names = measured.names()
+        # The draw the real evaluation would make, so a test sees the same
+        # opponents the gate would: a sample, not the whole pool.
+        names = measured.sample(standings or {}, rng, exclude=program_id)
         return evaluator.Result(
             program_id=program_id,
             fitness=rate,
@@ -1078,11 +1081,13 @@ def test_the_database_records_which_model_wrote_each_program(
 def test_a_round_that_clears_the_bar_ends_the_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """There is nothing left to ask for once a program beats every opponent.
+    """There is nothing left to ask for once a program clears the bar.
 
     The condition is `gate.promotion` on the round's own rates -- the same
-    function, on the same reading of a win, that the message told the model
-    it had to clear.
+    function, on the same reading of better, that the message told the model
+    it had to clear. The bar is a rating margin above the floor now rather
+    than a rank, so a program can lead the field and still be asked to go
+    again; what ends the session is clearing, and it ends it immediately.
     """
     paths = tiny_run(tmp_path, monkeypatch, rounds=3)
     pass_pool(tmp_path, paths)
@@ -1092,9 +1097,11 @@ def test_a_round_that_clears_the_bar_ends_the_session(
     # opponent, which is what beating them all means.
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
-    assert len(mutator.seen) == 1
+    # Ended before the round cap, and ended because the floor moved.
+    assert 0 < len(mutator.seen) < 3
+    assert state.champion is not None
 
 
 def test_a_round_that_writes_nothing_feeds_the_next_one(
@@ -1337,6 +1344,7 @@ def test_a_result_measured_before_a_new_opponent_joined_does_not_promote(
         rng: random.Random,
         workers: int,
         pool_file: Path | None = None,
+        standings: dict[str, float] | None = None,
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
         result = measure(agent, program_id, opponents, rng, workers, pool_file)
@@ -1566,3 +1574,114 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     # Still a search, not a hill climb: something other than the best is
     # taken often enough that one program cannot own every session.
     assert len(set(drawn)) >= 3
+
+
+def _record_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> loop.Campaign:
+    """A campaign built only far enough to compose a promotion record.
+
+    `promotion_record` reads its arguments and the state counter and nothing
+    else, so nothing here plays a game.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    return loop.Campaign(
+        loop.State(),
+        archive.Database(paths.archive, paths.programs),
+        pass_pool(tmp_path, paths),
+        mutate.FakeMutator(edit=lambda source: source),
+        WORKERS,
+        random.Random(11),
+        log,
+        paths,
+    )
+
+
+def _champion(name: str, fitness: float) -> gate.Champion:
+    """The floor as ``champion.json`` records it, for a record that needs one."""
+    return gate.Champion(
+        name=name,
+        path=f"/nowhere/{name}.py",
+        tarball=f"/nowhere/{name}.tar.gz",
+        result=_gate_result(name, {"v54": fitness}),
+    )
+
+
+def test_only_a_promotion_writes_the_champion_series(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """`gate/score` carries every program judged; this carries the floor.
+
+    A few dozen champions among many hundreds of candidates is not a series
+    anyone can read off the same key, and the question the campaign is
+    actually asking -- is the floor still rising -- is about the champions.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    result = _gate_result("p1", {"champion_2": 0.7, "v54": 0.9})
+    standings = {"p1": 1.0, "champion_2": 0.0, "v54": -1.0}
+    floor = _champion("champion_2", 0.5)
+
+    refused = campaign.promotion_record(result, False, floor, standings)
+    promoted = campaign.promotion_record(result, True, floor, standings)
+
+    assert "champion/win_rate" not in refused
+    assert promoted["champion/win_rate"] == result.fitness
+
+
+def test_the_champion_series_says_what_it_did_to_the_one_it_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The win rate is against a pool that strengthens with every promotion.
+
+    So it does not compare down the campaign: champion_30 scoring 0.62
+    against seven champions is a different feat from champion_3 scoring 0.62
+    against seven published kernels. The head-to-head against the floor it
+    replaced always means the same thing, and a run of them near 0.5 is a
+    search that has stopped finding anything.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    result = _gate_result("p1", {"champion_2": 0.72, "v54": 0.9})
+    standings = {"p1": 1.0, "champion_2": 0.0, "v54": -1.0}
+
+    record = campaign.promotion_record(
+        result, True, _champion("champion_2", 0.5), standings
+    )
+
+    assert record["champion/over_previous"] == 0.72
+
+
+def test_the_first_champion_has_nothing_to_be_compared_against(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """No floor yet, so the head-to-head is absent rather than invented.
+
+    A zero here would put a point on the chart saying the first champion
+    never beat anything.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    result = _gate_result("p1", {"v54": 0.9})
+
+    record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
+
+    assert record["champion/win_rate"] == result.fitness
+    assert "champion/over_previous" not in record
+
+
+def test_no_metric_is_frozen_at_a_score_nothing_can_earn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """`database/top_field` was the maximum of a score nothing could earn.
+
+    `field` averages the published opponents *in the pool*, and champions
+    trim them out one at a time until none is left; after that every program
+    scores None and drops out of the maximum. The series sat at 0.901 for 243
+    programs -- a value held by the seed itself, so the chart read "nothing
+    has ever beaten the starting program" when it meant "nothing since the
+    hundredth has been measured at all".
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    result = _gate_result("p1", {"v54": 0.9})
+
+    record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
+
+    assert not any("top_field" in key for key in record)

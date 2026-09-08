@@ -1,8 +1,11 @@
-"""The opponent pool: who is in it, who joins, and who makes way."""
+"""The opponent pool: who is in it, who joins, and who a gate draws from it."""
 
+import random
 from pathlib import Path
 
-from kaggriculture.campaign import pool, roster
+import pytest
+
+from kaggriculture.campaign import config, pool, roster
 
 
 def five() -> pool.Pool:
@@ -34,47 +37,84 @@ def test_a_champion_joins_and_nothing_leaves_with_it() -> None:
     assert p.history[-1]["action"] == "add_champion"
 
 
-def test_trim_keeps_the_highest_rated_and_names_who_left() -> None:
-    """The pool is the top of the tournament, so the weakest make way.
+def test_the_draw_always_contains_every_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anchors are what a rating is calibrated against, so they are not a draw.
 
-    An opponent every candidate already beats separates two candidates no
-    better than a coin does, and it costs a game a round to learn that.
+    Every candidate needs direct edges to fixed points spanning the range. Left
+    to chance, a champion is rated through a chain of overlapping pool eras --
+    and that chain is measurably wrong: it put champion_37 at 0.994 against
+    champion_1, which beats it 0.729 in the games themselves.
+    """
+    monkeypatch.setattr(config, "GATE_ANCHORS", ("a", "e"))
+    monkeypatch.setattr(config, "GATE_OPPONENTS", 3)
+    monkeypatch.setattr(config, "GATE_CONTENDERS", 1)
+    p = five()
+
+    for seed in range(20):
+        drawn = p.sample({"b": 5.0}, random.Random(seed))
+        assert {"a", "e"} <= set(drawn)
+        assert len(drawn) == 3
+
+
+def test_the_draw_contains_the_highest_rated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Topping the field still means beating the best of it.
+
+    A candidate that never played the leaders cannot be said to have out-rated
+    them, however well it did against the rest.
+    """
+    monkeypatch.setattr(config, "GATE_ANCHORS", ())
+    monkeypatch.setattr(config, "GATE_OPPONENTS", 2)
+    monkeypatch.setattr(config, "GATE_CONTENDERS", 2)
+    p = five()
+
+    drawn = p.sample(
+        {"a": -9.0, "b": 5.0, "c": 4.0, "d": -1.0, "e": 0.0}, random.Random(1)
+    )
+
+    assert set(drawn) == {"b", "c"}
+
+
+def test_the_rest_of_the_draw_is_random_and_reaches_the_whole_pool() -> None:
+    """Coverage, and the only way a counter is ever found.
+
+    The pool used to drop its lowest-rated members, which is how champion_1 --
+    the one agent that counters our current champion -- stopped being played
+    thirty promotions ago. Rating low against the field and beating *us* are
+    different facts, and only the second one matters.
     """
     p = five()
-    standings = {"a": 2.0, "b": -1.0, "c": 1.0, "d": -3.0, "e": 0.0}
+    seen: set[str] = set()
 
-    dropped = p.trim(standings, size=3)
+    for seed in range(60):
+        seen |= set(p.sample({}, random.Random(seed)))
 
-    assert p.names() == ["a", "c", "e"]
-    # Weakest first, which is the order they would have gone in one at a time.
-    assert dropped == ["d", "b"]
-    assert p.history[-1] == {**p.history[-1], "action": "trim", "dropped": ["b", "d"]}
+    assert seen == set("abcde")
 
 
-def test_trim_keeps_everything_when_the_pool_is_already_small_enough() -> None:
-    """No churn for its own sake: a pool under the size is left alone."""
+def test_a_pool_smaller_than_the_draw_is_played_whole() -> None:
+    """A cold start has twelve opponents and asks for sixteen."""
     p = five()
 
-    dropped = p.trim(dict.fromkeys("abcde", 0.0), size=8)
+    drawn = p.sample({}, random.Random(0))
 
-    assert dropped == []
-    assert p.names() == list("abcde")
-    assert not [entry for entry in p.history if entry["action"] == "trim"]
+    assert sorted(drawn) == list("abcde")
 
 
-def test_an_opponent_with_no_rating_is_the_first_to_go() -> None:
-    """A pool member the tournament did not rank cannot be defended.
+def test_the_candidate_is_never_drawn_against_itself() -> None:
+    """A champion is a member of the pool it is scored on.
 
-    It happens when a champion joins between a tournament and the trim that
-    follows it: the standings name the champion under its own id, not its
-    pool name, and anything else unrated was not in that tournament at all.
+    Its own bytes in the other seat are a structural 0.5 that says nothing
+    about the program and would enter the rate, the rating and the gate.
     """
     p = five()
 
-    dropped = p.trim({"a": 1.0, "b": 0.5}, size=2)
+    drawn = p.sample({}, random.Random(0), exclude="c")
 
-    assert p.names() == ["a", "b"]
-    assert set(dropped) == {"c", "d", "e"}
+    assert "c" not in drawn
 
 
 def test_round_trips_through_json(tmp_path: Path) -> None:

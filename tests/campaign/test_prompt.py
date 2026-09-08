@@ -210,15 +210,21 @@ def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:
     assert "| v56 | 0.900 |" in text
 
 
-def test_a_program_at_the_top_of_the_tournament_is_told_so() -> None:
-    """The verdict is a place, and the top of the table is stated as one."""
+def test_a_program_that_clears_the_bar_is_told_by_how_much() -> None:
+    """The verdict is a rating gap now, not a place.
+
+    A place had no margin in it and, over a sampled draw, was not even a
+    place -- it was top of whichever sixteen opponents the candidate happened
+    to draw. The gap says how far above the floor it sits, on one scale.
+    """
     rates = {"v54": 0.9, "v56": 0.8}
     standings = table("champion_1", rates, place="top")
 
     text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
 
     assert f"It {gate.promotion(standings, 'champion_1')[1]}." in text
-    assert "top of the tournament" in text
+    # No floor in these standings, so leading the field is the bar.
+    assert "with no floor yet" in text
     # Topping it *is* the promotion now; there is no second block to clear,
     # and telling a round otherwise would describe a gate that no longer runs.
     assert "this program is the champion" in text

@@ -143,6 +143,7 @@ def score(
     rng: random.Random,
     workers: int,
     pool_file: Path | None = None,
+    standings: dict[str, float] | None = None,
 ) -> Result:
     """Mean win rate over ``GATE_SEEDS`` fresh seeds, both seats.
 
@@ -166,6 +167,9 @@ def score(
         workers: Processes to fan the games over.
         pool_file: Where a champion's name resolves from, since the
             roster only knows the vendored opponents.
+        standings: Ratings the contenders are chosen by. Without them the
+            draw is anchors plus a random remainder, which is what a cold
+            start has and is enough to fit the first ratings from.
 
     Returns:
         The mean fitness, the per-opponent rates and margins, the seeds
@@ -176,7 +180,13 @@ def score(
             failed evaluation, never a zero score, so this propagates.
     """
     measured = opponents(pool, program_id, agent)
-    names = measured.names()
+    # A sample, not the pool. Nothing leaves the pool any more, so it is
+    # everything the campaign has produced or harvested and a candidate cannot
+    # play all of it -- sixty opponents is nearly four thousand games for one
+    # verdict. A rating does not need it to: the fit spans every pairing on
+    # the record, so a candidate adds sixteen edges and is placed against the
+    # rest through them.
+    names = measured.sample(standings or {}, rng, exclude=program_id)
     seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
     games = harness.play(agent, names, seeds, workers, days=True, pool=pool_file)
     rates = _rates(games, names)

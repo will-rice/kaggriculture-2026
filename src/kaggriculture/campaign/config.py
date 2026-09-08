@@ -100,22 +100,63 @@ ROUNDS_PER_SESSION = 5
 # throughput -- about 31 programs an hour against 60 -- and that is the trade
 # being made deliberately: 471 programs at the old depth bought no measurable
 # improvement at all.
-GATE_SEEDS = 32
+# Sixteen now rather than thirty-two, because the same budget buys twice as
+# many opponents and a rating is fitted over all of a candidate's edges. Eight
+# opponents at 64 games each and sixteen at 32 each are the same 512 games; the
+# second tells you more, because a rating's precision comes from the whole
+# graph and one more opponent is a whole new comparison where one more seed is
+# a slightly tighter old one.
+GATE_SEEDS = 16
 # The whole space. Nothing is reserved any more: a set held back exists to
 # give a number the search cannot steer, and drawing fresh seeds every
 # evaluation already does that -- no program is ever measured on maps it or
 # its ancestors were selected on. The reserved block was a held-out set for a
 # search that is always, structurally, held out.
 GATE_SEED_RANGE = range(1, 1_000_000)
-# Opponents the pool keeps: the top this many by Bradley-Terry rating, the
-# weakest making way as champions out-rate them. Measured on 2026-09-06 over
-# the campaign's own programs, a pool of the top six separated them almost
-# twice as widely as all twelve did and at half the games -- a weak opponent
-# every candidate already beats tells two candidates apart no better than a
-# coin. Eight rather than six for headroom: the sixth-ranked agent today is
-# one our programs beat outright, and losing it would cost the search the one
-# rate it can move.
-POOL_SIZE = 8
+# Opponents drawn for one gate. The pool itself is now everything the campaign
+# has ever produced or harvested and nothing leaves it, so this is a sample
+# and not the pool: a rating is fitted over every pairing anyone has ever
+# played, and each candidate only has to add its own edges to that graph.
+#
+# The pool used to keep the top eight by rating and drop the rest, on the
+# reasoning that an opponent every candidate beats separates two candidates no
+# better than a coin. That is true of a *win rate* and false of a rating, and
+# it cost us: champion_1 was trimmed out long ago, and champion_37 -- thirty
+# promotions later, rated five log-odds above it -- beats it only 0.729 of the
+# time. A field this non-transitive keeps its counters or walks past them.
+GATE_OPPONENTS = 16
+# How the sixteen are chosen. Anchors are played every single gate: they span
+# the strength range and they are what keeps the graph connected, so a new
+# champion is never rated through a chain of thirty overlapping pool eras.
+# Measured 2026-09-07, that chain predicted champion_37 would beat champion_1
+# 0.994 of the time; it beats it 0.729.
+#
+# Contenders are the highest rated, because topping the field still means
+# beating the best of it. The remainder is drawn at random from everything
+# else, which is both coverage -- the graph would otherwise go stale
+# everywhere except the top -- and how a counter gets found rather than
+# quietly discarded.
+GATE_ANCHORS = (
+    "champion_1",
+    "champion_10",
+    "champion_20",
+    "champion_30",
+    "thomastschinkel_router",
+    "router_v1",
+)
+GATE_CONTENDERS = 6
+# How far above the champion's rating a candidate must sit to replace it, in
+# log-odds. Promotion used to mean topping a tournament of eight, which is a
+# rank and so has no margin in it at all: a candidate a hair above the
+# champion promoted, and the hair was usually noise.
+#
+# A rating has units, so the bar can be stated. 0.15 log-odds is about a 54%
+# head-to-head, and at sixteen seeds a pairing the standard error on a
+# candidate's rating is well inside that -- which is the point. Selecting the
+# maximum of a noisy estimator is biased upward by construction, and this is
+# the guard: 78 of 471 programs once topped a noisy gate and none of them
+# survived a deeper measurement.
+PROMOTION_MARGIN = 0.15
 # How many of the database's best a session may start from, and how sharply
 # the draw favours the better ones: weight `PARENT_DECAY ** rank`, so the best
 # is taken about half the time, the second a quarter, and the tenth almost

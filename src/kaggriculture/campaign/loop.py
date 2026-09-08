@@ -51,7 +51,15 @@ from pydantic import BaseModel
 
 # `gate` is also the name of a `Campaign` method, so annotations in the class
 # body cannot see this module -- hence `Champion` imported by name below.
-from kaggriculture.campaign import archive, config, evaluator, gate, prompt, validate
+from kaggriculture.campaign import (
+    archive,
+    config,
+    evaluator,
+    gate,
+    prompt,
+    rating,
+    validate,
+)
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.gate import Champion
 from kaggriculture.campaign.harness import OpponentCrash
@@ -81,8 +89,8 @@ SEED_ID = config.SEED_ID
 
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
-    "SESSIONS ROUNDS_PER_SESSION GATE_SEEDS POOL_SIZE "
-    "STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
+    "SESSIONS ROUNDS_PER_SESSION GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
+    "PROMOTION_MARGIN STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
 
 # Prepended to the instruction under stagnation, so the message says that this
@@ -257,19 +265,21 @@ def run(
     # candidate's rows alone -- every opponent rated purely by how this one
     # program did against it, which is not a tournament.
     #
-    # Only a promotion used to fill this in, which was fine for exactly as
-    # long as something else had built the file first. Nothing does now, so a
-    # cold start pays for the pool's own games once -- 66 pairings on a
-    # twelve-agent pool -- and every start after that finds them already
-    # played and measures nothing.
-    measured = gate.refresh(
-        pool,
-        rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
-        workers,
-        paths,
-    )
-    if measured:
-        LOGGER.info("field: measured %d pool pairing(s) before starting", len(measured))
+    # The anchors are what a rating is calibrated against, and they are played
+    # by every gate, so they have to be connected to each other before the
+    # first one runs. Only their own pairings -- fifteen of them, once -- and
+    # never the pool's, which no longer has a bounded number of pairs.
+    anchors = [name for name in config.GATE_ANCHORS if name in pool.opponents]
+    for anchor in anchors:
+        measured = gate.refresh(
+            anchor,
+            anchors,
+            rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+            workers,
+            paths,
+        )
+        if measured:
+            LOGGER.info("field: %d anchor pairing(s) for %s", len(measured), anchor)
     database = archive.Database(paths.archive, paths.programs)
     if not database.programs:
         seed = evaluator.score(seed_agent, SEED_ID, pool, rng, workers, paths.pool)
@@ -454,7 +464,7 @@ class Campaign:
             failures = self.database.failures(name)
             siblings = self.database.children(name)
             standings = gate.standing(
-                name, result.rates, self.snapshot(), 2 * config.GATE_SEEDS, self.paths
+                name, result.rates, 2 * config.GATE_SEEDS, self.paths
             )
             message = prompt.compose(
                 name, result, failures, siblings, instruction, standings
@@ -465,14 +475,9 @@ class Campaign:
                 break
             source, name, result = outcome
             cleared, why = gate.promotion(
-                gate.standing(
-                    name,
-                    result.rates,
-                    self.snapshot(),
-                    2 * config.GATE_SEEDS,
-                    self.paths,
-                ),
+                gate.standing(name, result.rates, 2 * config.GATE_SEEDS, self.paths),
                 name,
+                self.floor(),
             )
             if cleared:
                 LOGGER.info("%s %s: the session is done", name, why)
@@ -526,7 +531,6 @@ class Campaign:
             "calls/seconds": mutation.seconds,
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
-            **_top_field(self.database.programs),
         }
         rated = [p.rating for p in self.database.programs if p.rating is not None]
         if rated:
@@ -538,11 +542,7 @@ class Campaign:
             if result.field is not None:
                 record["calls/field"] = result.field
             table = gate.standing(
-                program_id,
-                result.rates,
-                self.snapshot(),
-                2 * config.GATE_SEEDS,
-                self.paths,
+                program_id, result.rates, 2 * config.GATE_SEEDS, self.paths
             )
             record["calls/rating"] = table[program_id]
             record["calls/place"] = 1 + sorted(
@@ -610,7 +610,7 @@ class Campaign:
             self.fail(started_from, drawn, f"gate: {error}")
             return None
         table = gate.standing(
-            program_id, result.rates, self.snapshot(), 2 * config.GATE_SEEDS, self.paths
+            program_id, result.rates, 2 * config.GATE_SEEDS, self.paths
         )
         self.database.add(
             _program(
@@ -652,7 +652,7 @@ class Campaign:
                     ", ".join(sorted(missing)),
                 )
                 return
-            verdict, why = gate.promotion(table, program_id)
+            verdict, why = gate.promotion(table, program_id, self.floor())
             if verdict:
                 LOGGER.info("%s %s", program_id, why)
                 # The file work in a thread; the pool it joins on the loop,
@@ -661,16 +661,14 @@ class Campaign:
                 champion = await asyncio.to_thread(
                     gate.promote, program, result, self.paths
                 )
+                # Nothing leaves. The pool kept the highest-rated eight until
+                # now, and it had discarded champion_1 -- which counters our
+                # current champion at 0.729 where its rating says 0.994. In a
+                # field this non-transitive, rating low against everyone and
+                # beating *us* are different facts, and the trim could only
+                # see the first.
                 gate.enroll(champion, self.pool, self.paths)
-                # The pool is the top of the tournament: the champion has just
-                # joined it and the weakest opponent makes way, so the field a
-                # candidate has to finish above is the strongest one there is.
-                dropped = self.pool.trim(
-                    {**table, champion.name: table[program_id]}, config.POOL_SIZE
-                )
-                if dropped:
-                    self.pool.save(self.paths.pool)
-                    LOGGER.info("pool: %s made way", ", ".join(dropped))
+                LOGGER.info("pool: %d opponents", len(self.pool.names()))
                 self.state.champion = gate.record(champion, self.paths)
                 self.state.sessions_since_promotion = 0
                 # Last, and after the record, because it is the only slow step
@@ -691,11 +689,13 @@ class Campaign:
                 # never heard of, which is exactly what happened the first time
                 # this ever promoted.
                 #
-                # Measured after the trim, so nothing is played for an opponent
-                # that just made way.
+                # Its edges to the agents it will be compared against, which
+                # is the sample any later candidate would draw -- not every
+                # missing pair in the pool, which now grows with its square.
                 measured = await asyncio.to_thread(
                     gate.refresh,
-                    self.snapshot(),
+                    champion.name,
+                    self.snapshot().sample(table, self.rng, exclude=champion.name),
                     self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
                     self.workers,
                     self.paths,
@@ -710,12 +710,28 @@ class Campaign:
                 self.log.log_artifact(artifact)
             self.log.log(self.promotion_record(result, verdict, baseline, table))
 
+    def floor(self) -> str | None:
+        """The champion's name, or None before there is one.
+
+        The bar a candidate has to clear by `config.PROMOTION_MARGIN`. Read
+        from state rather than passed down, because eight workers reach the
+        gate concurrently and the floor may have moved since a round began --
+        which is the correct behaviour: a candidate is judged against the
+        champion that stands when it is judged.
+        """
+        return self.state.champion.name if self.state.champion else None
+
     async def measure(self, source: Path, program_id: str) -> Result:
         """Play ``source`` against the pool as it stands, off the loop thread.
 
         This is the campaign's only measurement of a round, and the only one
         a model is ever shown: the model plays nothing, so the seeds, the
         seating and the reading of "won" are all ours.
+
+        The opponents are a draw from the whole pool rather than the whole
+        pool, so the ratings on the record are handed down for it -- the
+        contenders are the highest rated, and without them the draw would be
+        anchors and noise.
         """
         return await asyncio.to_thread(
             evaluator.score,
@@ -725,6 +741,7 @@ class Campaign:
             random.Random(self.rng.random()),
             self.workers,
             self.paths.pool,
+            rating.standings(rating.Field.load(self.paths.field).everything()),
         )
 
     def snapshot(self) -> Pool:
@@ -813,18 +830,50 @@ class Campaign:
         }
         if baseline is not None:
             record["gate/champion"] = baseline.result.fitness
+        if promoted:
+            # The series to watch. `gate/score` carries every program judged,
+            # promoted or not, so the champions are a few dozen points buried
+            # among hundreds; this is only ever written when the floor moves.
+            record["champion/win_rate"] = result.fitness
+            # The series to watch, and the only one that compares across the
+            # whole campaign. A rating on one scale, anchored on the agents
+            # that never change, so champion 3's number and champion 30's are
+            # the same measurement -- unlike a win rate, which is against a
+            # field that gains a champion every promotion.
+            #
+            # It cannot saturate, which a win rate does: measured against the
+            # twelve published kernels, champion_1 scored 0.922 and
+            # champion_37 scored 0.938, while beating champion_20 -- itself
+            # far above champion_1 -- 0.885 of the time. Log-odds have no
+            # ceiling and go on separating agents that both beat the floor
+            # every time.
+            record["champion/rating"] = _anchored(standings, result.program_id)
+            if baseline is not None and baseline.name in result.rates:
+                # What it did to the champion it replaced, head to head. The
+                # win rate above is against a pool that strengthens with every
+                # promotion, so it is not comparable across the campaign; this
+                # is always the same comparison -- the new floor against the
+                # old one -- and a run of these near 0.5 is a search that has
+                # stopped finding anything.
+                record["champion/over_previous"] = result.rates[baseline.name]
         return record
 
 
-def _top_field(programs: list[archive.Program]) -> dict[str, float]:
-    """The best field score so far, or nothing once there is no field.
+def _anchored(standings: dict[str, float], name: str) -> float:
+    """One agent's rating, measured from the anchors rather than the mean.
 
-    A pool that has trimmed away its last published opponent has no fixed
-    reference left to average over, so the series simply stops rather than
-    reporting a number that means something different from the one before it.
+    A Bradley-Terry fit is only defined up to an additive constant, and
+    `rating.standings` centres it on the mean of everyone in it. That mean
+    climbs as champions are added, so the same agent's number would fall
+    over a campaign that only ever improved -- the scale sliding underneath
+    the series it is meant to be.
+
+    The anchors are fixed files that never change, so pinning them at zero
+    fixes the origin. Every gate plays them, which is what makes them
+    available here at all.
     """
-    scored = [p.field for p in programs if p.field is not None]
-    return {"database/top_field": max(scored)} if scored else {}
+    fixed = [standings[a] for a in config.GATE_ANCHORS if a in standings]
+    return standings[name] - (sum(fixed) / len(fixed) if fixed else 0.0)
 
 
 def _first(failures: BaseExceptionGroup) -> BaseException:

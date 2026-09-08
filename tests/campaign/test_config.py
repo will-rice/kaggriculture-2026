@@ -7,7 +7,7 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
     SHOPS,
 )
 
-from kaggriculture.campaign import config, roster
+from kaggriculture.campaign import config
 
 
 def test_item_order_matches_the_engine_port_enum() -> None:
@@ -80,16 +80,20 @@ def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
     assert config.ROUNDS_PER_SESSION == 5
-    # Thirty-two, not eight: at eight the gate called 78 of 471
-    # programs the best in the tournament and none of them held up,
-    # because selecting the maximum of an estimator with a standard
-    # error of 0.125 returns the luckiest program, not the best one.
-    assert config.GATE_SEEDS == 32
-    assert config.POOL_SIZE == 8
-    # Smaller than the roster on purpose: the pool is the top of the
-    # tournament, and an opponent every candidate already beats separates two
-    # candidates no better than a coin while costing a game a round.
-    assert config.POOL_SIZE < len(roster.TRAINING)
+    # Sixteen seeds over sixteen opponents, which is the same 512 games the
+    # gate cost at thirty-two seeds over eight. The budget went into
+    # opponents because a rating's precision comes from the whole graph: one
+    # more opponent is a whole new comparison, one more seed a slightly
+    # tighter old one.
+    assert config.GATE_SEEDS == 16
+    assert config.GATE_OPPONENTS == 16
+    assert 2 * config.GATE_SEEDS * config.GATE_OPPONENTS == 512
+    # Every anchor is played by every gate, so they cannot fill the draw --
+    # there has to be room for the contenders and the random remainder that
+    # finds a counter.
+    assert len(config.GATE_ANCHORS) + config.GATE_CONTENDERS < config.GATE_OPPONENTS
+    # A bar with units in it. A rank had none, and promoted on a hair.
+    assert config.PROMOTION_MARGIN > 0
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"

@@ -6,23 +6,36 @@ tournament over this pool, which is how the competition itself ranks a field.
 There is no weight for a candidate to buy a promotion with and no single
 opponent it must beat -- only a field it has to finish above.
 
-Champions join as gatekeepers, so a later candidate has to beat every
-program the campaign has already confirmed as well as the vendored kernels.
-The pool is the top of the tournament. A champion joins it and `trim` keeps
-the highest-rated ``POOL_SIZE``, so the field a candidate has to finish above
-is the strongest one there is and the weakest opponent makes way. Rating is
-what decides, and it is the same rating the gate promotes on, so the pool and
-the bar cannot drift apart. Paths are stored here and shown nowhere.
+Champions join as gatekeepers, so a later candidate has to beat every program
+the campaign has already confirmed as well as the vendored kernels. Nothing
+leaves. The pool used to keep the highest-rated eight and drop the rest, on
+the reasoning that an opponent every candidate beats separates two candidates
+no better than a coin.
+
+That reasoning holds for a win rate and fails for a rating, and it cost us a
+real thing: champion_1 was trimmed out early, and champion_37 -- promoted
+thirty times later and rated five log-odds above it -- beats it only 0.729 of
+the time, where a rating fitted through the surviving chain says 0.994. The
+pool had discarded the one agent that counters our champion, and no gate could
+have noticed, because the gate only ever saw what the pool still held.
+
+So the pool keeps everything and `sample` draws the opponents for one gate
+from it: anchors that span the range and are played every time, the
+highest-rated contenders, and a random remainder. A rating is fitted over
+every pairing anyone has ever played, so a candidate only has to add its own
+edges to that graph rather than meet the whole field. Paths are stored here
+and shown nowhere.
 """
 
 import math
 import os
+import random
 import time
 from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import roster
+from kaggriculture.campaign import config, roster
 
 
 class Pool(BaseModel):
@@ -60,41 +73,66 @@ class Pool(BaseModel):
         """Every opponent currently in the pool."""
         return list(self.opponents)
 
-    def trim(self, standings: dict[str, float], size: int) -> list[str]:
-        """Keep the ``size`` highest-rated opponents; drop and name the rest.
+    def sample(
+        self,
+        standings: dict[str, float],
+        rng: random.Random,
+        exclude: str = "",
+    ) -> list[str]:
+        """The opponents for one gate, drawn three ways from the whole pool.
 
-        The pool exists to tell candidates apart, and an opponent every
-        candidate beats does that no better than a coin: it costs a game a
-        round and buys nothing. Rating is what says which those are, and it
-        is the same rating the gate promotes on, so the pool and the bar
-        cannot drift apart.
+        A candidate cannot play a pool of hundreds -- that is thousands of
+        games for one verdict -- and with a rating it does not have to. The
+        fit is over every pairing the campaign has ever played, so a
+        candidate contributes its own edges and is placed against agents it
+        never met through the ones it did.
+
+        What it plays has to be chosen rather than drawn flat, because the
+        three things a gate needs are different things:
+
+        - **Anchors**, every time. `config.GATE_ANCHORS` spans the strength
+          range and never changes, so every candidate has direct edges to
+          fixed points at every level. Without them a champion is rated
+          through a chain of overlapping pool eras, and that chain is
+          measurably wrong: it put champion_37 at 0.994 against champion_1,
+          which beats it 0.729 in the games themselves.
+        - **Contenders**, the highest rated. Topping the field still means
+          beating the best of it, and a candidate that never played the
+          leaders cannot be said to have.
+        - **The rest, at random.** Coverage, so the graph does not go stale
+          everywhere but the top -- and the only way a counter is found
+          rather than quietly never played again.
 
         Args:
-            standings: A rating per opponent, from one fit over the pool.
-            size: How many to keep.
+            standings: A rating per opponent; anything unrated sorts last.
+            rng: The generator the random remainder is drawn from.
+            exclude: A name never to draw, so a champion in the pool is not
+                measured against itself.
 
         Returns:
-            The names dropped, weakest first.
+            Opponent names, at most `config.GATE_OPPONENTS` of them.
         """
-        ranked = sorted(self.opponents, key=lambda n: -standings.get(n, -math.inf))
-        dropped = ranked[size:]
-        for name in dropped:
-            del self.opponents[name]
-        if dropped:
-            self.history.append(
-                {"action": "trim", "dropped": dropped, "ts": time.time()}
-            )
-        return list(reversed(dropped))
+        available = [name for name in self.opponents if name != exclude]
+        drawn = [name for name in config.GATE_ANCHORS if name in available]
+        rated = sorted(
+            (name for name in available if name not in drawn),
+            key=lambda name: -standings.get(name, -math.inf),
+        )
+        drawn += rated[: config.GATE_CONTENDERS]
+        remainder = list(rated[config.GATE_CONTENDERS :])
+        room = config.GATE_OPPONENTS - len(drawn)
+        if room > 0:
+            drawn += rng.sample(remainder, min(room, len(remainder)))
+        return drawn[: config.GATE_OPPONENTS]
 
     def add_champion(self, name: str, path: str) -> None:
         """Put ``name`` in the pool as an opponent every later candidate faces.
 
-        Nothing leaves here. Who leaves is `trim`'s decision and it takes it
-        on rating, from the same tournament that promoted this champion, so
-        the pool and the bar cannot drift apart. Adding and trimming were one
-        method once, with a retirement rule of its own -- an opponent beaten
-        at 0.95 or better made way -- and that rule could keep an opponent no
-        candidate had crushed but every candidate beat.
+        Nothing ever leaves. There was a trim that kept the highest-rated
+        eight, and it discarded champion_1 -- which counters our current
+        champion at 0.729 where the rating says 0.994. A field this
+        non-transitive cannot afford to drop an agent for rating low, because
+        rating low against the field and beating *us* are different facts.
 
         Args:
             name: The champion's opponent name.

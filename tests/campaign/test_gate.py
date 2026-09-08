@@ -41,91 +41,133 @@ def result(
     )
 
 
-def test_a_field_measured_over_other_games_is_thrown_away_not_extended(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_field_measured_at_another_depth_is_kept_and_extended(
+    tmp_path: Path,
 ) -> None:
-    """One game count covers the whole cache, so a changed one invalidates it.
+    """The count is kept per pairing, so changing the gate's depth costs nothing.
 
-    `Field.games` is a single number for every pairing in the file, and
-    recording a new pairing sets it. Extend a field measured over one count
-    with a pairing played over another and every old rate is relabelled as
-    having been played over games it never was -- silently, because nothing
-    fails, and consequentially, because the Bradley-Terry fit weights each
-    rate by that number. Only changing `GATE_SEEDS` can reach it, which is
-    exactly when nobody would be looking.
+    It used to be one number for the whole field, on the reasoning that every
+    pairing is played on the same seeds. That could not be extended: measuring
+    anything at a new depth relabelled every cached rate as having been played
+    over games it was not, and the only safe response was to discard the lot.
 
-    The cached rate here is a lie: a PASS agent draws with a PASS agent, so
-    the truth is 0.5 and the file claims 1.0. Surviving the tournament is what
-    proves the cache was reused.
+    Discarding the lot now means discarding the campaign's history -- two
+    hundred and eighty pairings -- and the rating everything is steered by is
+    fitted over exactly that history.
     """
     paths = _paths(tmp_path)
     agents = {}
-    for name in ("one", "two"):
+    for name in ("one", "two", "three"):
         path = tmp_path / f"{name}.py"
         path.write_text(PASS, encoding="utf-8")
         agents[name] = str(path)
-    opponents = pool.Pool(opponents=agents)
-    opponents.save(paths.pool)
+    pool.Pool(opponents=agents).save(paths.pool)
 
-    kept = paths.field
-    stale = rating.Field(games=2)
-    stale.record("one", "two", 1.0)
-    stale.save(kept)
+    older = rating.Field(games=64)
+    older.record("one", "two", 1.0, 64)
+    older.save(paths.field)
 
-    gate.refresh(opponents, seeds=[1, 2], workers=1, paths=paths)
+    gate.refresh("three", ["one", "two"], seeds=[1], workers=1, paths=paths)
 
-    field = rating.Field.load(kept)
-    assert field.games == 4
-    assert field.rates["one"]["two"] == 0.5
+    field = rating.Field.load(paths.field)
+    # The old pairing survives at its own depth; the new ones carry theirs.
+    assert field.rates["one"]["two"] == 1.0
+    assert field.depth("one", "two") == 64
+    assert field.depth("three", "one") == 2
 
 
-def test_a_new_pool_member_has_its_pairings_played(
+def test_a_new_champion_has_its_own_edges_played(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A champion joins with no pairings, and `standing` plays nothing.
 
-    `Field.results` returns only the pairings it holds, so an opponent with
-    none is absent from the fit rather than an error. For the vendored
-    opponents that never matters -- they were measured once. For a champion it
-    is the whole ratchet: until its own pairings exist it sits in every
-    tournament on the single edge of whoever is being judged against it, and
-    beating it drops its rating far enough that topping the standings is easy.
-    Each promotion would buy the next one cheaply.
+    `Field` returns only the pairings it holds, so an agent with none is
+    absent from the fit rather than an error. For an opponent that has been
+    around that never matters. For a champion it is the whole ratchet: until
+    its own pairings exist it sits in every fit on the single edge of whoever
+    is being judged against it, and beating it drops its rating far enough to
+    make topping the field easy. Each promotion would buy the next cheaply.
     """
     paths = _paths(tmp_path)
     agents = {}
-    for name in ("one", "two"):
+    for name in ("one", "two", "champ"):
         path = tmp_path / f"{name}.py"
         path.write_text(PASS, encoding="utf-8")
         agents[name] = str(path)
-    kept = paths.field
-    before = pool.Pool(opponents=dict(list(agents.items())[:1]))
-    before.save(paths.pool)
-    gate.refresh(before, seeds=[1], workers=1, paths=paths)
+    pool.Pool(opponents=agents).save(paths.pool)
 
-    # The champion arrives, and its pairing against the incumbent is absent.
-    joined = pool.Pool(opponents=agents)
-    joined.save(paths.pool)
-    assert rating.Field.load(kept).results(joined.names()) == []
+    measured = gate.refresh("champ", ["one", "two"], seeds=[1], workers=1, paths=paths)
 
-    measured = gate.refresh(joined, seeds=[1], workers=1, paths=paths)
-
-    assert measured == [("one", "two")]
-    assert len(rating.Field.load(kept).results(joined.names())) == 1
+    assert measured == [("champ", "one"), ("champ", "two")]
+    # Its own edges and nobody else's: what the pool's other members owe each
+    # other is not a promotion's business, and with nothing ever leaving the
+    # pool "every missing pair" grows with its square.
+    field = rating.Field.load(paths.field)
+    assert set(field.rates["champ"]) == {"one", "two"}
+    assert "two" not in field.rates.get("one", {})
 
 
-def test_the_top_of_the_tournament_is_promoted() -> None:
-    """The gate is a place, not a clean sweep.
+def test_edges_already_on_the_record_are_not_played_again(
+    tmp_path: Path,
+) -> None:
+    """A pairing is a constant: fixed files on fixed seeds, measured once."""
+    paths = _paths(tmp_path)
+    agents = {}
+    for name in ("one", "champ"):
+        path = tmp_path / f"{name}.py"
+        path.write_text(PASS, encoding="utf-8")
+        agents[name] = str(path)
+    pool.Pool(opponents=agents).save(paths.pool)
 
-    The finale is a single Bradley-Terry tournament and a leaderboard position
-    is a skill rating, so coming out top of the pool is what promotion means.
+    gate.refresh("champ", ["one"], seeds=[1], workers=1, paths=paths)
+    again = gate.refresh("champ", ["one"], seeds=[1], workers=1, paths=paths)
+
+    assert again == []
+
+
+def test_a_candidate_must_out_rate_the_floor_by_the_margin() -> None:
+    """The bar is a rating gap, not a rank.
+
+    A rank has no margin in it -- a candidate a hair above the champion topped
+    the table and promoted, and at these sample sizes the hair is usually
+    noise. And a rank over a *sample* is not a rank at all: a candidate draws
+    sixteen opponents out of dozens, so "top of the table" would mean top of
+    whichever sixteen it happened to draw, and an easy draw would promote.
     """
-    ok, why = gate.promotion({"c": 1.2, "a": 0.4, "b": -0.9}, "c")
+    margin = config.PROMOTION_MARGIN
 
-    assert ok
-    assert "top of the tournament" in why and "+1.200" in why
-    # Named, so the log says what it had to get past.
-    assert "a" in why and "+0.400" in why
+    clear, why = gate.promotion(
+        {"mine": 1.0, "floor": 1.0 - margin, "other": 0.0}, "mine", "floor"
+    )
+    assert clear and "above floor" in why
+
+    # Ahead of the floor, and by less than the bar.
+    close, why = gate.promotion(
+        {"mine": 1.0, "floor": 1.0 - margin / 2, "other": 0.0}, "mine", "floor"
+    )
+    assert not close and "the bar is" in why
+
+
+def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
+    """Top of the table and level with the champion promotes nothing.
+
+    Under the old rule this was the whole test: rank first and you are in.
+    It is exactly the case the margin exists for.
+    """
+    ranked = {"mine": 2.0, "floor": 2.0 - config.PROMOTION_MARGIN / 3, "third": 0.0}
+
+    clear, _ = gate.promotion(ranked, "mine", "floor")
+
+    assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
+    assert not clear
+
+
+def test_before_there_is_a_floor_the_field_is_the_bar() -> None:
+    """The first promotion of a run has nothing to be a margin above."""
+    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None)[0]
+    assert not gate.promotion({"mine": 0.4, "a": 0.5}, "mine", None)[0]
+    # And a floor the fit has never heard of is no floor either.
+    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", "gone")[0]
 
 
 def test_second_place_is_not_promoted_however_close() -> None:
