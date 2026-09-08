@@ -202,7 +202,7 @@ def standing(
 def promotion(
     standings: dict[str, float], name: str, champion: str | None = None
 ) -> tuple[bool, str]:
-    """Whether the candidate out-rates the floor by more than the margin.
+    """Whether the candidate tops the field *and* clears the floor by the margin.
 
     The bar used to be a rank -- top of a Bradley-Terry tournament over the
     eight pool opponents. A rank was the right shape while the pool *was* the
@@ -219,10 +219,17 @@ def promotion(
     opponents out of dozens, so "top of the table" would mean top of whichever
     sixteen it happened to draw, and an easy draw would promote.
 
-    A rating has units and one scale for everyone, so the bar can be stated
-    outright: sit `config.PROMOTION_MARGIN` log-odds above the floor. That is
-    a ratchet -- each champion is measurably better than the one before, on a
-    scale anchored by agents that never change.
+    So the bar is both, and they answer different questions. Topping the field
+    says this is the best agent there is; clearing the floor by
+    `config.PROMOTION_MARGIN` says it is measurably better than the one it
+    replaces, rather than a hair ahead on noise.
+
+    Neither alone is enough. A rank has no margin in it, and over a sampled
+    draw it is estimated through the fit rather than measured. A gap over the
+    floor is directly measured -- the floor is drawn every round -- but says
+    nothing about the rest of the field, and the two came apart within an hour
+    of the pool growing: candidates promoted at third and fourth of 64 for
+    clearing a floor that was no longer the best agent in it.
 
     Args:
         standings: Every agent's rating, from one fit over the whole record.
@@ -236,26 +243,26 @@ def promotion(
     ranked = sorted(standings, key=lambda agent: -standings[agent])
     place = ranked.index(name) + 1
     mine = standings[name]
-    if champion is None or champion not in standings:
-        # Nothing to beat yet, so the field is the bar. This is the first
-        # promotion of a run and it happens once.
-        if ranked[0] == name:
-            return True, f"top of {len(ranked)} at {mine:+.3f}, with no floor yet"
+    if place != 1:
         best = ranked[0]
         return False, (
             f"{place} of {len(ranked)} at {mine:+.3f}, "
             f"below {best} at {standings[best]:+.3f}"
         )
+    if champion is None or champion not in standings:
+        # The first promotion of a run, and it happens once.
+        return True, f"top of {len(ranked)} at {mine:+.3f}, with no floor yet"
     floor = standings[champion]
     gap = mine - floor
     if gap >= config.PROMOTION_MARGIN:
         return True, (
-            f"{mine:+.3f}, {gap:+.3f} above {champion} at {floor:+.3f} "
-            f"({place} of {len(ranked)})"
+            f"top of {len(ranked)} at {mine:+.3f}, "
+            f"{gap:+.3f} above {champion} at {floor:+.3f}"
         )
     return False, (
-        f"{mine:+.3f}, {gap:+.3f} against {champion} at {floor:+.3f} "
-        f"and the bar is {config.PROMOTION_MARGIN:+.3f} ({place} of {len(ranked)})"
+        f"top of {len(ranked)} at {mine:+.3f} but only {gap:+.3f} above "
+        f"{champion} at {floor:+.3f}, and the bar is "
+        f"{config.PROMOTION_MARGIN:+.3f}"
     )
 
 

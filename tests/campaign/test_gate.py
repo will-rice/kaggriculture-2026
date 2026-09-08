@@ -151,8 +151,9 @@ def test_a_candidate_must_out_rate_the_floor_by_the_margin() -> None:
 def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
     """Top of the table and level with the champion promotes nothing.
 
-    Under the old rule this was the whole test: rank first and you are in.
-    It is exactly the case the margin exists for.
+    Rank alone has no margin in it, and over a sampled draw a rank is
+    estimated through the fit rather than measured. It is exactly the case the
+    margin exists for.
     """
     ranked = {"mine": 2.0, "floor": 2.0 - config.PROMOTION_MARGIN / 3, "third": 0.0}
 
@@ -160,6 +161,28 @@ def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
 
     assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
     assert not clear
+
+
+def test_clearing_the_floor_is_not_enough_without_topping_the_field() -> None:
+    """The two questions came apart within an hour of the pool growing.
+
+    Candidates promoted at third and fourth of sixty-four for clearing a floor
+    that was no longer the best agent in the field. Beating the agent you
+    replace says the ratchet turned; being the best says it is worth turning.
+    """
+    ranked = {
+        "leader": 3.0,
+        "runner_up": 2.5,
+        "mine": 2.0,
+        "floor": 2.0 - 2 * config.PROMOTION_MARGIN,
+    }
+
+    clear, why = gate.promotion(ranked, "mine", "floor")
+
+    # Comfortably past the floor, and third of four.
+    assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
+    assert not clear
+    assert "3 of 4" in why and "below leader" in why
 
 
 def test_before_there_is_a_floor_the_field_is_the_bar() -> None:
