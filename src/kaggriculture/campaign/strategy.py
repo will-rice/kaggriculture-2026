@@ -58,12 +58,15 @@ QUANTITIES: frozenset[str] = frozenset(
     if line.startswith("    ")
 ) - {"episode", "seat", "day", "team"}
 DAYS = dataset.DAYS
-# The store the round prompt reads, kept in the package beside
-# ``winning_pace.md`` and for the same reason: both are measurements of the
-# public ladder rather than of any one run, so they belong to the code that
-# reads them and not to a run directory that a fresh campaign starts without.
-# Rebuilt and re-measured by ``uv run strategies``.
-STORE = Path(__file__).with_name("strategies.jsonl")
+# The store the round prompt reads, beside the corpus it is measured from.
+#
+# Not inside the package, though it started there next to ``winning_pace.md``.
+# That works for a file committed once and read by whoever has the checkout,
+# and breaks the moment it is rebuilt daily: the job runs from its own
+# worktree with its own copy of the package, so it would rewrite a store in
+# one checkout while the campaign read a stale one from another. A measurement
+# of the public ladder belongs with the ladder's other measurements.
+STORE = dataset.DATABASE.with_name("strategies.jsonl")
 # Share of differing games at which a claim is settled one way or the other.
 # Between them it says nothing: 60% over twenty games is not evidence, and
 # saying so is the point of keeping the count.
