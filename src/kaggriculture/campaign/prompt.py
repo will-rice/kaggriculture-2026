@@ -28,6 +28,7 @@ import ast
 import logging
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from kaggriculture.campaign import (
     archive,
@@ -383,25 +384,45 @@ def _both_sides(day: harness.Day) -> dict[str, tuple[float, float]]:
     return {name: (value, day.theirs[name]) for name, value in day.ours.items()}
 
 
-def _against(
-    claim: strategy.Claim, states: dict[str, list[harness.Day]]
-) -> tuple[int, int]:
-    """How many of this program's recorded games sit on the wrong side of a claim.
+class Gap(NamedTuple):
+    """One claim a program is on the wrong side of, and by how much.
 
-    Every game played, not only the ones whose tables the message shows: what
-    is being asked is how this program plays, and six tables were chosen to
-    bound a message rather than to describe it.
+    Attributes:
+        claim: What the corpus settled.
+        wrong: Its own games sitting on the other side of it.
+        seen: Its own games that could speak to it either way.
+        ours: What it averaged on that quantity, over those games.
+        theirs: What its opponents averaged, over the same games.
+    """
+
+    claim: strategy.Claim
+    wrong: int
+    seen: int
+    ours: float
+    theirs: float
+
+
+def _against(claim: strategy.Claim, states: dict[str, list[harness.Day]]) -> Gap:
+    """Measure one program against one claim, over every game it played.
+
+    Every game, not only the ones whose tables the message prints: what is
+    being asked is how this program plays, and six tables were chosen to bound
+    a message rather than to describe it.
+
+    The figures travel with the verdict. A claim that says only "you are on the
+    wrong side of `hungry_worst` on day seven" names a quantity the day table
+    does not print, so a round would be told it is behind on something it
+    cannot find a number for anywhere in the message.
 
     Args:
         claim: The claim to check.
         states: One recorded game per opponent, day by day.
 
     Returns:
-        ``(wrong, seen)`` -- games on the other side of the claim, and games
-        that could say either way. ``seen`` is zero for a quantity a day
-        table does not carry, and for a day nobody reached.
+        A `Gap`; ``seen`` is zero for a day nobody reached.
     """
     wrong = seen = 0
+    mine = yours = 0.0
     for days in states.values():
         for day in days:
             if day.day != claim.form.day:
@@ -411,12 +432,16 @@ def _against(
                 continue
             seen += 1
             wrong += claim.wrong_side(*pair)
-    return wrong, seen
+            mine += pair[0]
+            yours += pair[1]
+    return Gap(
+        claim, wrong, seen, mine / seen if seen else 0.0, yours / seen if seen else 0.0
+    )
 
 
 def selected(
     store: strategy.Strategies, states: dict[str, list[harness.Day]]
-) -> list[tuple[int, int, strategy.Claim]]:
+) -> list[Gap]:
     """The settled claims this program plays the other way round, worst first.
 
     Not the claims that are true -- those are a reading list. The ones worth a
@@ -431,27 +456,27 @@ def selected(
         states: One recorded game per opponent, day by day.
 
     Returns:
-        ``(wrong, seen, claim)`` for at most ``MOST_CLAIMS`` claims, the ones
-        the program is furthest from first.
+        At most ``MOST_CLAIMS`` gaps, the ones the program is furthest from
+        first, each carrying its own figures.
     """
     scored = []
     for claim in store.settled():
-        wrong, seen = _against(claim, states)
-        if seen and wrong / seen > MOSTLY:
+        gap = _against(claim, states)
+        if gap.seen and gap.wrong / gap.seen > MOSTLY:
             # Ordered by how far this program is from the claim, then by how
-            # far the corpus separates the sides on it -- a claim at 90% is
-            # a firmer thing to be told than one at 66%.
+            # far the corpus separates the sides on it -- a claim at 90% is a
+            # firmer thing to be told than one at 66%.
             separation = abs(claim.agreement - 0.5)
-            scored.append((wrong / seen, separation, wrong, seen, claim))
+            scored.append((gap.wrong / gap.seen, separation, gap))
     scored.sort(key=lambda row: (-row[0], -row[1]))
-    return [(wrong, seen, claim) for _, _, wrong, seen, claim in scored[:MOST_CLAIMS]]
+    return [gap for _, _, gap in scored[:MOST_CLAIMS]]
 
 
-def _claim_lines(claims: list[tuple[int, int, strategy.Claim]]) -> list[str]:
+def _claim_lines(claims: list[Gap]) -> list[str]:
     """Render what the corpus confirmed and this program is not doing.
 
     Args:
-        claims: What `selected` returned, worst first.
+        claims: What `selected` returned, furthest first.
 
     Returns:
         Lines of a markdown section, or nothing at all when the program is
@@ -481,11 +506,14 @@ def _claim_lines(claims: list[tuple[int, int, strategy.Claim]]) -> list[str]:
         "program that wins by breaking one has beaten it rather than the "
         "other way round. Furthest first.",
         "",
-        "| what the corpus says | your games on the other side |",
-        "| --- | --- |",
+        "| what the corpus says | yours | theirs | games on the other side |",
+        "| --- | --- | --- | --- |",
     ]
-    for wrong, seen, claim in claims:
-        lines.append(f"| {claim.reads()} | {wrong} of {seen} |")
+    for gap in claims:
+        lines.append(
+            f"| {gap.claim.reads()} | {gap.ours:,.1f} | {gap.theirs:,.1f} "
+            f"| {gap.wrong} of {gap.seen} |"
+        )
     return lines
 
 

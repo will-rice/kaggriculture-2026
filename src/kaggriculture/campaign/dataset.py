@@ -111,7 +111,6 @@ CREATE TABLE IF NOT EXISTS days (
     bare       INTEGER,
     quadrants  INTEGER,
     hands      INTEGER,
-    hires      INTEGER,
     seeds      INTEGER,
     shed       INTEGER,
     shops      INTEGER,
@@ -402,8 +401,11 @@ def measures(
         "weeds": float(sum(1 for tile in tiles if tile.get("kind") == "WEED")),
         "bare": float(sum(1 for tile in tiles if tile.get("kind") in BARE)),
         "quadrants": float(len(farm.get("unlocked_quadrants") or [])),
+        # `hires_today` is not a second quantity: over all 977,520 day rows of
+        # the corpus it never once differed from the hand count, so measuring
+        # both put the same finding in two claims and spent two of the five
+        # slots a round is shown on one fact.
         "hands": float(len(farm.get("hands") or [])),
-        "hires": float(farm.get("hires_today") or 0),
         "seeds": float(sum((private.get("seeds") or {}).values())),
         "shed": float(sum((private.get("shed") or {}).values())),
         "shops": float(len((town or {}).get("unlocked_shops") or [])),

@@ -741,9 +741,12 @@ def test_the_claims_shown_are_the_ones_this_program_breaks_worst_first(
         result({"v54": 0.3, "v16": 0.5}).states,
     )
 
-    assert [claim.form.quantity for _, _, claim in chosen] == ["bank", "planted"]
+    assert [gap.claim.form.quantity for gap in chosen] == ["bank", "planted"]
     # Both opponents, and the row says the count rather than the share.
-    assert [(wrong, seen) for wrong, seen, _ in chosen] == [(2, 2), (2, 2)]
+    assert [(gap.wrong, gap.seen) for gap in chosen] == [(2, 2), (2, 2)]
+    # And each carries the figures behind it, so a round is not told it is
+    # behind on something it can find no number for.
+    assert chosen[0].ours == 2999.0 and chosen[0].theirs == 3001.0
 
 
 def test_a_claim_the_corpus_has_not_settled_never_reaches_a_round(
@@ -793,10 +796,13 @@ def test_the_two_quantities_the_corpus_decides_on_can_be_selected_on(
         store(tmp_path, ("quadrants", 1, 0.99), ("fertilised", 1, 0.95)), played.states
     )
 
-    assert {claim.form.quantity for _, _, claim in chosen} == {
+    assert {gap.claim.form.quantity for gap in chosen} == {
         "quadrants",
         "fertilised",
     }
+    # One quadrant against three, and the row says so.
+    quads = next(g for g in chosen if g.claim.form.quantity == "quadrants")
+    assert (quads.ours, quads.theirs) == (1.0, 3.0)
 
 
 def test_a_claim_a_day_table_cannot_carry_is_kept_and_not_shown(
@@ -834,7 +840,7 @@ def test_a_claim_the_corpus_reversed_selects_the_program_that_does_more(
         store(tmp_path, ("planted", 1, 0.05)), result({"v54": 0.3}).states
     )
 
-    assert [claim.form.quantity for _, _, claim in chosen] == ["planted"]
+    assert [gap.claim.form.quantity for gap in chosen] == ["planted"]
 
 
 def test_the_claim_section_disappears_when_there_is_nothing_to_say() -> None:
