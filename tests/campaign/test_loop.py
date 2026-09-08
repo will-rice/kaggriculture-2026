@@ -29,7 +29,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -222,6 +222,7 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         workers: int,
         pool_file: Path | None = None,
         standings: dict[str, float] | None = None,
+        always: Sequence[str] = (),
     ) -> evaluator.Result:
         """The evaluation's shape, without its games.
 
@@ -236,7 +237,7 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         rate = score(agent)
         # The draw the real evaluation would make, so a test sees the same
         # opponents the gate would: a sample, not the whole pool.
-        names = measured.sample(standings or {}, rng, exclude=program_id)
+        names = measured.sample(standings or {}, rng, program_id, always)
         return evaluator.Result(
             program_id=program_id,
             fitness=rate,
@@ -1310,19 +1311,23 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
     assert len(database.programs) == 3
 
 
-def test_a_result_measured_before_a_new_opponent_joined_does_not_promote(
+def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     log: wandb.Run,
     records: list[tuple[float, dict]],
 ) -> None:
-    """Eight sessions gate at once, and a slow one's pool is out of date.
+    """A candidate plays a draw, so it has never played everyone.
 
-    Each evaluation holds the pool as it was when it started. If another
-    session promoted in the meantime, this result never played the new
-    champion, and topping the tournament would be answered on a pool that no
-    longer exists -- shipping a program that never met the bar. It is not
-    promoted; the next round measures against the pool as it now stands.
+    The gate used to demand every pool opponent. That was right while the pool
+    *was* the tournament and a candidate played all eight of it, and it became
+    unsatisfiable the moment the pool grew past the draw: sixteen opponents out
+    of sixty-one leaves forty-five missing every time. Live, it blocked 232
+    candidates and every promotion for seven hours -- silently, because the
+    only line that records a gate sat below the return.
+
+    What still has to hold is the floor, which `must_play` draws every time and
+    the gate checks by name.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SESSIONS", 1)
@@ -1345,6 +1350,7 @@ def test_a_result_measured_before_a_new_opponent_joined_does_not_promote(
         workers: int,
         pool_file: Path | None = None,
         standings: dict[str, float] | None = None,
+        always: Sequence[str] = (),
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
         result = measure(agent, program_id, opponents, rng, workers, pool_file)
@@ -1353,7 +1359,7 @@ def test_a_result_measured_before_a_new_opponent_joined_does_not_promote(
 
     monkeypatch.setattr(evaluator, "score", stale)
 
-    state = loop.run(
+    loop.run(
         sessions=1,
         mutator=mutate.FakeMutator(edit=lambda source: source + "\n# edited\n"),
         workers=WORKERS,
@@ -1363,10 +1369,17 @@ def test_a_result_measured_before_a_new_opponent_joined_does_not_promote(
         paths=paths,
     )
 
-    # A child longer than its parent tops the tournament every time here, so
-    # without the check it would promote on a pool it never finished playing.
-    assert state.champion is None
-    assert not gates_of(records)
+    # The verdict is what matters, not which way it went: an opponent this
+    # program never drew must not stop it being judged at all. A gate record
+    # exists for every program the gate ruled on, and for seven hours live
+    # there were none of them -- which is the shape of the failure this
+    # catches, and the reason nobody saw it.
+    gates = gates_of(records)
+    assert gates, "the gate returned before it judged anything"
+    # And judged it, rather than turning it away for a draw it never made.
+    # `gate/stale` marks the second, which is what ran 232 times live.
+    assert "gate/stale" not in gates[0]
+    assert "gate/score" in gates[0] and "gate/promoted" in gates[0]
     assert len(scored) > 1
 
 
@@ -1605,6 +1618,56 @@ def _champion(name: str, fitness: float) -> gate.Champion:
         tarball=f"/nowhere/{name}.tar.gz",
         result=_gate_result(name, {"v54": fitness}),
     )
+
+
+def test_the_gate_asks_for_the_floor_and_not_the_whole_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A candidate plays a draw, so it can never have played everyone.
+
+    The gate used to demand every pool opponent, which was right while the
+    pool *was* the tournament and a candidate played all eight of it. Under a
+    sampled draw it is unsatisfiable by construction -- sixteen opponents out
+    of sixty-one leaves forty-five missing every time -- and it blocked every
+    promotion for seven hours without one line of evidence, because the only
+    thing that logs a gate sits below the return.
+
+    What still has to hold is the floor: the bar is a rating gap against that
+    one named agent, and a gap against an agent this program never played is
+    not a measurement.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    campaign.state.champion = _champion("champion_2", 0.5)
+
+    # Played the floor and a handful of others; nowhere near the whole pool.
+    assert campaign.floor() == "champion_2"
+    played = {"champion_2": 0.8, "v54": 0.9}
+    assert campaign.floor() in played
+
+    # And a result from before this floor existed has no gap to measure.
+    stale = {"champion_1": 0.8, "v54": 0.9}
+    assert campaign.floor() not in stale
+
+
+def test_the_draw_always_holds_the_leader_and_the_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Two questions that are usually one agent, and must not be left to dice.
+
+    The champion has out-rated the field since the ratchet started, so the top
+    of the standings and the floor are the same name -- but they are different
+    questions, and when they come apart both have to be played: the leader
+    because topping the field means beating it, the floor because the bar is a
+    gap over that specific agent.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    campaign.state.champion = _champion("champion_2", 0.5)
+
+    same = campaign.must_play({"champion_2": 2.0, "v54": 1.0})
+    apart = campaign.must_play({"v54": 2.0, "champion_2": 1.0})
+
+    assert same == ["champion_2"]
+    assert apart == ["v54", "champion_2"]
 
 
 def test_only_a_promotion_writes_the_champion_series(

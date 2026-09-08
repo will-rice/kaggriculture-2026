@@ -78,6 +78,49 @@ def test_the_draw_contains_the_highest_rated(
     assert set(drawn) == {"b", "c"}
 
 
+def test_the_leader_is_drawn_however_the_dice_fall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Topping the field means beating the best of it.
+
+    Left to the draw, a candidate could be turned away for never having met
+    the leader -- rejected for the sampler's luck rather than for anything it
+    did. The floor rides along for the same reason: the promotion bar is a
+    rating gap over that one named agent.
+    """
+    monkeypatch.setattr(config, "GATE_ANCHORS", ())
+    monkeypatch.setattr(config, "GATE_OPPONENTS", 2)
+    monkeypatch.setattr(config, "GATE_CONTENDERS", 0)
+    p = five()
+
+    for seed in range(30):
+        drawn = p.sample({}, random.Random(seed), always=["a", "e"])
+        assert drawn[:2] == ["a", "e"]
+
+
+def test_an_always_name_the_pool_does_not_hold_is_ignored() -> None:
+    """A cold start has no floor and no leader, and asks for both."""
+    p = five()
+
+    drawn = p.sample({}, random.Random(0), always=["nobody", "a"])
+
+    assert "nobody" not in drawn and "a" in drawn
+
+
+def test_the_candidate_is_not_drawn_against_itself_even_when_always_named() -> None:
+    """A champion is the floor *and* a pool member, and would be drawn twice.
+
+    Its own bytes in the other seat are a structural 0.5 that says nothing
+    about the program, and the gate would then read a rating gap of zero
+    against itself.
+    """
+    p = five()
+
+    drawn = p.sample({}, random.Random(0), exclude="c", always=["c", "a"])
+
+    assert "c" not in drawn and "a" in drawn
+
+
 def test_the_rest_of_the_draw_is_random_and_reaches_the_whole_pool() -> None:
     """Coverage, and the only way a counter is ever found.
 

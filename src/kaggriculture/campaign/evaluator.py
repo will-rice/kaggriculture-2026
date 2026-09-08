@@ -24,6 +24,7 @@ over real opponents and nothing downstream has to know the mirror existed.
 """
 
 import random
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -144,6 +145,7 @@ def score(
     workers: int,
     pool_file: Path | None = None,
     standings: dict[str, float] | None = None,
+    always: Sequence[str] = (),
 ) -> Result:
     """Mean win rate over ``GATE_SEEDS`` fresh seeds, both seats.
 
@@ -170,6 +172,9 @@ def score(
         standings: Ratings the contenders are chosen by. Without them the
             draw is anchors plus a random remainder, which is what a cold
             start has and is enough to fit the first ratings from.
+        always: Opponents to draw whatever the dice say -- the top-ranked
+            agent, which topping the field means beating, and the floor,
+            which a promotion is measured as a gap over.
 
     Returns:
         The mean fitness, the per-opponent rates and margins, the seeds
@@ -186,7 +191,7 @@ def score(
     # verdict. A rating does not need it to: the fit spans every pairing on
     # the record, so a candidate adds sixteen edges and is placed against the
     # rest through them.
-    names = measured.sample(standings or {}, rng, exclude=program_id)
+    names = measured.sample(standings or {}, rng, program_id, always)
     seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
     games = harness.play(agent, names, seeds, workers, days=True, pool=pool_file)
     rates = _rates(games, names)

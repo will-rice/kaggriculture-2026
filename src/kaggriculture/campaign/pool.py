@@ -31,6 +31,7 @@ import math
 import os
 import random
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -78,6 +79,7 @@ class Pool(BaseModel):
         standings: dict[str, float],
         rng: random.Random,
         exclude: str = "",
+        always: Sequence[str] = (),
     ) -> list[str]:
         """The opponents for one gate, drawn three ways from the whole pool.
 
@@ -96,9 +98,13 @@ class Pool(BaseModel):
           through a chain of overlapping pool eras, and that chain is
           measurably wrong: it put champion_37 at 0.994 against champion_1,
           which beats it 0.729 in the games themselves.
-        - **Contenders**, the highest rated. Topping the field still means
-          beating the best of it, and a candidate that never played the
-          leaders cannot be said to have.
+        - **Contenders**, the highest rated, and ``always`` on top of them.
+          Topping the field means beating the best of it, so the top-ranked
+          agent is drawn every time rather than left to the dice -- a
+          candidate rejected because it happened not to draw the leader would
+          be rejected for the sampler's luck. The floor is drawn for the same
+          reason: a promotion is a rating gap over it, and a gap against an
+          agent you never played is not measurable.
         - **The rest, at random.** Coverage, so the graph does not go stale
           everywhere but the top -- and the only way a counter is found
           rather than quietly never played again.
@@ -108,12 +114,19 @@ class Pool(BaseModel):
             rng: The generator the random remainder is drawn from.
             exclude: A name never to draw, so a champion in the pool is not
                 measured against itself.
+            always: Names to include whatever the draw says -- the top-ranked
+                agent and the floor. Ignored where the pool does not hold
+                them, which is the cold start.
 
         Returns:
             Opponent names, at most `config.GATE_OPPONENTS` of them.
         """
         available = [name for name in self.opponents if name != exclude]
-        drawn = [name for name in config.GATE_ANCHORS if name in available]
+        wanted = [*config.GATE_ANCHORS, *always]
+        drawn: list[str] = []
+        for name in wanted:
+            if name in available and name not in drawn:
+                drawn.append(name)
         rated = sorted(
             (name for name in available if name not in drawn),
             key=lambda name: -standings.get(name, -math.inf),

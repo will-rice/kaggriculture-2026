@@ -639,17 +639,37 @@ class Campaign:
         async with self.promotions:
             baseline = self.state.champion
             # The pool is copied per evaluation and eight run at once, so one
-            # can promote while another is mid-game. A result that never
-            # played the new champion cannot be said to have topped the pool
-            # it is being judged against, and promoting it would ship a
-            # program that never met the bar. The next round measures against
-            # the pool as it now stands.
-            missing = set(self.pool.names()) - {program_id} - set(result.rates)
-            if missing:
+            # can promote while another is mid-game, and a result measured
+            # against a floor that has since moved cannot be promoted over the
+            # new one: the bar is a rating gap against a named agent, and a
+            # gap against an agent this program never played is not a
+            # measurement. The next round measures against the floor as it now
+            # stands.
+            #
+            # It used to demand every pool opponent, which was right while the
+            # pool *was* the tournament and a candidate played all eight of
+            # it. Under a sampled draw it is unsatisfiable by construction --
+            # sixteen opponents drawn from sixty-one leaves forty-five
+            # "missing" every time -- and it silently blocked every promotion
+            # for seven hours, invisibly, because the record below is the only
+            # thing that logs a gate and this returned above it.
+            floor = self.floor()
+            if floor is not None and floor not in result.rates:
                 LOGGER.info(
-                    "%s: measured before %s joined the pool; not promoted",
+                    "%s: measured before %s became the floor; not promoted",
                     program_id,
-                    ", ".join(sorted(missing)),
+                    floor,
+                )
+                # Marked, so a gate that turned a program away for being stale
+                # is distinguishable in the record from one that judged it and
+                # said no. Told apart nowhere, seven hours of rejections read
+                # exactly like seven hours of candidates that were not good
+                # enough.
+                self.log.log(
+                    {
+                        **self.promotion_record(result, False, baseline, table),
+                        "gate/stale": 1,
+                    }
                 )
                 return
             verdict, why = gate.promotion(table, program_id, self.floor())
@@ -732,7 +752,14 @@ class Campaign:
         pool, so the ratings on the record are handed down for it -- the
         contenders are the highest rated, and without them the draw would be
         anchors and noise.
+
+        The leader and the floor are drawn every time rather than left to the
+        dice. Topping the field means beating the best of it, and a promotion
+        is a rating gap over the floor: a candidate that happened not to draw
+        either would be turned away for the sampler's luck rather than for
+        anything it did.
         """
+        table = rating.standings(rating.Field.load(self.paths.field).everything())
         return await asyncio.to_thread(
             evaluator.score,
             source,
@@ -741,8 +768,23 @@ class Campaign:
             random.Random(self.rng.random()),
             self.workers,
             self.paths.pool,
-            rating.standings(rating.Field.load(self.paths.field).everything()),
+            table,
+            self.must_play(table),
         )
+
+    def must_play(self, standings: dict[str, float]) -> list[str]:
+        """The opponents every candidate is drawn against: the leader and the floor.
+
+        Usually one agent. The champion has out-rated the field since the
+        ratchet started, so the top of the standings and the floor are the
+        same name -- but they are different questions, and when they come
+        apart both have to be played: the leader because topping the field
+        means beating it, the floor because the promotion bar is a gap over
+        that specific agent.
+        """
+        floor = self.floor()
+        ranked = sorted(standings, key=lambda name: -standings[name])
+        return list(dict.fromkeys(ranked[:1] + ([floor] if floor else [])))
 
     def snapshot(self) -> Pool:
         """The pool as it stands, copied on the loop for one evaluation to keep."""
