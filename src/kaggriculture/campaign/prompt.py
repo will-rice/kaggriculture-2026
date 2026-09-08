@@ -367,43 +367,20 @@ def _states_lines(
 
 
 def _both_sides(day: harness.Day) -> dict[str, tuple[float, float]]:
-    """The dataset's quantities that a round's own game also measures.
+    """Every quantity the corpus measures, for both sides of one recorded day.
 
-    The store now asks about every column of a day row -- some thirty of them
-    -- and a round's day table carries a handful. The overlap is what a claim
-    can be shown for, and the gap is real rather than hidden:
+    All thirty of them, and it is one line because a `Day` now carries what
+    `dataset.measures` defines rather than a hand-picked few. That matters
+    more than it looks: this used to be a literal mapping of the handful the
+    day row happened to name, so a settled claim about anything else was
+    measured, stored, and silently dropped here -- including the two widest
+    separations in the whole corpus, which had been added to the day *table*
+    and not to this.
 
-    - `seeds` is private. A program sees its own and never the opponent's, so
-      there is one side of it and nothing to compare.
-    - The order totals -- `sold_units`, `hire_orders` and the rest -- count
-      what was submitted. A day table is a state at a moment and counts
-      nothing.
-    - `watered`, `dry_worst`, `fed` and the husbandry columns are read off
-      tiles, and a day table carries counts derived from tiles rather than
-      the tiles.
-
-    `pens` is the one to be careful of and is deliberately absent: the
-    dataset counts coop and pasture tiles, a day table counts animals by
-    species, and comparing them would be two quantities sharing a name --
-    a measurement that agrees with itself and is wrong.
-
-    Closing the gap means widening `harness.Day`, which changes every game
-    already recorded. Until then such a claim is measured, kept, and not
-    shown.
+    A claim about a quantity nobody measured still cannot be selected, and
+    that is now the same statement as "a quantity the dataset does not have".
     """
-    return {
-        "bank": (day.ours_bank, day.theirs_bank),
-        "planted": (
-            float(sum(day.ours_plants.values())),
-            float(sum(day.theirs_plants.values())),
-        ),
-        "hands": (float(day.ours_hands), float(day.theirs_hands)),
-        "shed": (
-            float(sum(day.ours_shed.values())),
-            float(sum(day.theirs_shed.values())),
-        ),
-        "weeds": (float(day.ours_weeds), float(day.theirs_weeds)),
-    }
+    return {name: (value, day.theirs[name]) for name, value in day.ours.items()}
 
 
 def _against(

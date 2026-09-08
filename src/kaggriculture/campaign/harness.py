@@ -25,7 +25,7 @@ from kaggle_environments.core import Environment
 from kaggle_environments.utils import Struct, structify
 from pydantic import BaseModel
 
-from kaggriculture.campaign import arena, config, roster
+from kaggriculture.campaign import arena, config, dataset, roster
 from kaggriculture.campaign.engine.wrapper import Engine, render_private
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
@@ -104,16 +104,23 @@ class Day(BaseModel):
         ours_fertilised: Growing tiles of the candidate's still under
             fertilizer on this day.
         theirs_fertilised: The opponent's, on the same terms.
+        ours: Every quantity `dataset.measures` defines, for the candidate.
+        theirs: The same, for the opponent.
         prices: The shared market's price per product.
 
-    Quadrants and fertilizer are here because the corpus says they are where
-    the game is decided and nothing showed them. Measured over 16,292 recorded
-    ladder games grouped by fitted rating, the sharpest separations in the
-    whole field are `fertilised` on day five (100% of 313 paired games) and
-    quadrants on day three (99% of 208) -- the strong open their second and
-    third quadrant two to three days ahead and keep fertilizer on the ground
-    rather than selling it. A round was shown its banks, its tiles and its
-    shed, and could not see either.
+    The named fields are the ones the message renders as a table, and they
+    are chosen for a reader: sixty columns is not a table anyone can follow.
+    `ours` and `theirs` carry all thirty quantities the corpus measures, which
+    is what the claim selector reads -- so a finding can be put to a program
+    whether or not there is room to print it.
+
+    That split exists because the two were confused once. Quadrants and
+    fertilizer were added as named fields and rendered in the table, which
+    made them visible to a reader and left them invisible to the selector, and
+    the two sharpest separations in the whole corpus went on being measured,
+    stored and shown to nobody. `fertilised` on day five separates the
+    stronger side from the weaker in 100% of 313 paired games and quadrants on
+    day three in 99% of 208.
     """
 
     day: int
@@ -135,6 +142,8 @@ class Day(BaseModel):
     theirs_quadrants: int = 0
     ours_fertilised: int = 0
     theirs_fertilised: int = 0
+    ours: dict[str, float] = {}
+    theirs: dict[str, float] = {}
     prices: dict[str, int]
 
 
@@ -403,20 +412,48 @@ def _worked(tiles: list) -> tuple[dict[str, int], dict[str, int], int]:
     return plants, animals, weeds
 
 
-def _day(engine: Engine, seat: int, day: int) -> Day:
+def _tally(traded: dict[int, dict[str, list[int]]], actions: Sequence[Any]) -> None:
+    """Fold one turn's market orders, both sides, into their running totals.
+
+    Counted before the day's row is taken, not after. The order a side submits
+    while looking at the close of a day is that day's last decision, and the
+    extraction attributes it the same way -- an order at step ``t`` belongs to
+    the state at ``t-1`` it was chosen from. Counted after, every day's trading
+    would be reported one day late.
+
+    Args:
+        traded: Running totals by seat, ``{verb: [orders, units]}``.
+        actions: What each player returned this turn. A candidate's action is
+            whatever its code produced, so nothing here assumes a shape.
+    """
+    for player, action in enumerate(actions):
+        orders = action.get("market") if isinstance(action, dict) else None
+        for order in orders or ():
+            parts = list(order) if isinstance(order, list | tuple) else [order]
+            running = traded[player].setdefault(str(parts[0]), [0, 0])
+            running[0] += 1
+            running[1] += int(parts[2]) if len(parts) > 2 else 0
+
+
+def _day(
+    engine: Engine, seat: int, day: int, traded: dict[int, dict[str, list[int]]]
+) -> Day:
     """The row for ``day``, read off the engine as that day closed.
 
     Args:
         engine: The episode, standing at the state that closed ``day``.
         seat: The seat the candidate holds.
         day: The day this row is for.
+        traded: Each seat's running market totals, by engine player index.
 
     Returns:
         One ``Day``: both banks, both farms, both sheds, our seed, both hand
         counts, the prices.
     """
     ours = engine.observation(seat)
-    theirs = render_private(engine.state.farms[1 - seat])["shed"]
+    mine_private = render_private(engine.state.farms[seat])
+    yours_private = render_private(engine.state.farms[1 - seat])
+    theirs = yours_private["shed"]
     mine = ours["farms"][seat]
     yours = ours["farms"][1 - seat]
     ours_plants, ours_animals, ours_weeds = _worked(mine["tiles"])
@@ -435,6 +472,12 @@ def _day(engine: Engine, seat: int, day: int) -> Day:
         theirs_quadrants=len(yours.get("unlocked_quadrants") or []),
         ours_fertilised=_fertilised(mine["tiles"], day),
         theirs_fertilised=_fertilised(yours["tiles"], day),
+        ours=dataset.measures(
+            mine, mine_private, ours.get("town") or {}, day, traded[seat]
+        ),
+        theirs=dataset.measures(
+            yours, yours_private, ours.get("town") or {}, day, traded[1 - seat]
+        ),
         ours_seeds={crop: n for crop, n in ours["private"]["seeds"].items() if n},
         ours_shed={item: n for item, n in ours["private"]["shed"].items() if n},
         theirs_shed={item: n for item, n in theirs.items() if n},
@@ -492,6 +535,7 @@ def _play_one(work: Work) -> Game:
     conf = configuration()
     worst = 0.0
     rows: list[Day] = []
+    traded: dict[int, dict[str, list[int]]] = {0: {}, 1: {}}
     while not engine.done:
         actions = []
         for player, agent in enumerate(agents):
@@ -510,14 +554,15 @@ def _play_one(work: Work) -> Game:
             elapsed = perf_counter() - started
             if player == seat:
                 worst = max(worst, elapsed)
+        _tally(traded, actions)
         # The last hour of the day, before the step that ends it takes the
         # hands away with it. The final day never reaches this branch: its
         # hour 23 is the terminal state, which is the row below.
         if days and engine.state.hour == LAST_HOUR:
-            rows.append(_day(engine, seat, engine.state.day))
+            rows.append(_day(engine, seat, engine.state.day, traded))
         engine.step(actions[0], actions[1])
     if days:
-        rows.append(_day(engine, seat, engine.state.day))
+        rows.append(_day(engine, seat, engine.state.day, traded))
     ours, theirs = engine.bank(seat), engine.bank(1 - seat)
     return Game(
         opponent=opponent_name,

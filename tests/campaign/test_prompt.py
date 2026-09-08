@@ -8,6 +8,7 @@ import pytest
 from kaggriculture.campaign import (
     archive,
     config,
+    dataset,
     evaluator,
     gate,
     harness,
@@ -33,9 +34,21 @@ def table(
     return standings
 
 
+def measured(**held: float) -> dict[str, float]:
+    """A full measures dict: what is named, and zero for everything else.
+
+    Every quantity, not a chosen few -- a `Day` whose measures are partial is
+    a day the selector can only half read, and the point of the dict is that
+    it is total.
+    """
+    return dict.fromkeys(dataset.COLUMNS, 0.0) | held
+
+
 def day(number: int, ours: float, theirs: float) -> harness.Day:
     """One row of a day table, with something in every field."""
     return harness.Day(
+        ours=measured(bank=ours, planted=4, hands=2, shed=12, seeds=5, weeds=0),
+        theirs=measured(bank=theirs, planted=2, hands=1, shed=3, weeds=3),
         day=number,
         ours_bank=ours,
         theirs_bank=theirs,
@@ -187,8 +200,8 @@ def test_a_round_can_see_the_two_columns_the_corpus_decides_on(tmp_path: Path) -
         )
         for n in range(2)
     ]
-    measured = result(rates)
-    scored = measured.model_copy(update={"states": {"v54": days}})
+    played = result(rates)
+    scored = played.model_copy(update={"states": {"v54": days}})
 
     text = prompt.compose(
         "champion_1", scored, [], [], IMPROVE, table("champion_1", rates)
@@ -746,6 +759,44 @@ def test_a_claim_the_corpus_has_not_settled_never_reaches_a_round(
 
     assert unsettled.claims[0].status == "open"
     assert prompt.selected(unsettled, result({"v54": 0.3}).states) == []
+
+
+def test_the_two_quantities_the_corpus_decides_on_can_be_selected_on(
+    tmp_path: Path,
+) -> None:
+    """Rendering them in the table is not the same as being able to select.
+
+    `harness.Day` carries quadrants and fertilizer, and the day tables show
+    them -- but the bridge the selector reads did not, so the two widest
+    separations in 16,292 games were visible to a reader and invisible to the
+    thing that decides what a round is told. Shipped exactly that way once.
+    """
+    # The day table has this program on one quadrant against three.
+    days = [
+        result({"v54": 0.3})
+        .states["v54"][0]
+        .model_copy(
+            update={
+                "day": 1,
+                "ours_quadrants": 1,
+                "theirs_quadrants": 3,
+                "ours_fertilised": 0,
+                "theirs_fertilised": 17,
+                "ours": measured(quadrants=1, fertilised=0),
+                "theirs": measured(quadrants=3, fertilised=17),
+            }
+        )
+    ]
+    played = result({"v54": 0.3}).model_copy(update={"states": {"v54": days}})
+
+    chosen = prompt.selected(
+        store(tmp_path, ("quadrants", 1, 0.99), ("fertilised", 1, 0.95)), played.states
+    )
+
+    assert {claim.form.quantity for _, _, claim in chosen} == {
+        "quadrants",
+        "fertilised",
+    }
 
 
 def test_a_claim_a_day_table_cannot_carry_is_kept_and_not_shown(

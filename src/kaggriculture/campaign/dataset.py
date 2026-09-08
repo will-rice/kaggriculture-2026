@@ -76,13 +76,13 @@ BARE = ("EMPTY", "WEED", "TILLED")
 # half as much. They are different claims and the corpus answers them
 # differently.
 TALLIED = (
-    ("sell", "SELL"),
-    ("buy", "BUY_PRODUCT"),
-    ("seed", "BUY_SEED"),
-    ("animal", "BUY_ANIMAL"),
+    ("sell_orders", "sold_units", "SELL"),
+    ("buy_orders", "bought_units", "BUY_PRODUCT"),
+    ("seed_orders", "seed_units", "BUY_SEED"),
+    ("animal_orders", "animal_units", "BUY_ANIMAL"),
 )
 # Counted but never summed: neither carries a quantity in the tape.
-COUNTED = (("hire", "HIRE"), ("land", "BUY_LAND"))
+COUNTED = (("hire_orders", "HIRE"), ("land_orders", "BUY_LAND"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS episodes (
@@ -184,6 +184,15 @@ CREATE INDEX IF NOT EXISTS orders_day ON orders (episode, seat, day);
 CREATE INDEX IF NOT EXISTS moves_day ON moves (episode, seat, day);
 CREATE INDEX IF NOT EXISTS prices_day ON prices (episode, day);
 """
+# The day row's own columns, in declaration order and without its keys. Read
+# off the schema so a column added there is measured, stored and asked about
+# with nothing to remember.
+COLUMNS = tuple(
+    line.split()[0]
+    for line in SCHEMA[SCHEMA.index("days (") : SCHEMA.index("holdings (")].splitlines()
+    if line.startswith("    ")
+)[4:]
+
 TABLES = ("episodes", "days", "holdings", "orders", "moves", "prices")
 # Written by `rate` after the load, from what the load produced.
 DERIVED = ("teams",)
@@ -290,16 +299,13 @@ def _insert(
         for seat in (0, 1):
             observation = step[seat]["observation"]
             connection.execute(
-                "INSERT INTO days VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                "?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO days VALUES (" + ",".join("?" * (4 + len(COLUMNS))) + ")",
                 (
                     key,
                     seat,
                     day,
                     teams[seat],
-                    *_day(observation, seat, day),
-                    *running[seat][day],
+                    *_row(observation, seat, day, running[seat][day]),
                 ),
             )
             connection.executemany(
@@ -316,26 +322,25 @@ def _insert(
         )
 
 
-def _running(submitted: list[tuple]) -> dict[int, list[tuple[int, ...]]]:
+def _running(submitted: list[tuple]) -> dict[int, list[dict[str, list[int]]]]:
     """Each side's market activity as a running total through every day.
 
-    Cumulative rather than per-day, because every claim about trading is
-    about the season so far -- "has sold more by day twenty" -- and a per-day
-    figure would make one quiet day look like a different strategy.
+    Cumulative rather than per-day, because every claim about trading is about
+    the season so far -- "has sold more by day twenty" -- and a per-day figure
+    would make one quiet day look like a different strategy.
 
     Args:
         submitted: The rows `_orders` produced for one game.
 
     Returns:
-        ``{seat: [totals for day 0, day 1, ...]}``, each a tuple ordered as
-        the day row's trailing columns.
+        ``{seat: [{verb: [orders, units]} for each day]}``.
     """
     counts: dict[int, dict[int, dict[str, list[int]]]] = {0: {}, 1: {}}
     for _, seat, day, _, verb, _, quantity in submitted:
         tally = counts[seat].setdefault(day, {}).setdefault(verb, [0, 0])
         tally[0] += 1
         tally[1] += int(quantity or 0)
-    out: dict[int, list[tuple[int, ...]]] = {}
+    out: dict[int, list[dict[str, list[int]]]] = {}
     for seat in (0, 1):
         total: dict[str, list[int]] = {}
         rows = []
@@ -344,12 +349,7 @@ def _running(submitted: list[tuple]) -> dict[int, list[tuple[int, ...]]]:
                 running = total.setdefault(verb, [0, 0])
                 running[0] += tally[0]
                 running[1] += tally[1]
-            row: list[int] = []
-            for _, verb in TALLIED:
-                row += total.get(verb, [0, 0])
-            for _, verb in COUNTED:
-                row.append(total.get(verb, [0, 0])[0])
-            rows.append(tuple(row))
+            rows.append({verb: list(pair) for verb, pair in total.items()})
         out[seat] = rows
     return out
 
@@ -359,42 +359,88 @@ def _tiles(farm: dict[str, Any]) -> list[dict[str, Any]]:
     return [tile for row in farm["tiles"] for tile in row if isinstance(tile, dict)]
 
 
-def _day(observation: dict[str, Any], seat: int, day: int) -> tuple:
-    """One side's whole state at one day's close, tiles included.
+def measures(
+    farm: dict[str, Any],
+    private: dict[str, Any],
+    town: dict[str, Any],
+    day: int,
+    traded: dict[str, list[int]],
+) -> dict[str, float]:
+    """Every quantity one side can be compared on, at one day's close.
 
-    The tile columns are the half of the game the counts miss. A side holding
-    forty growing tiles of which six were watered today is playing a different
-    game from one holding forty of which forty were, and until now both read
-    as "planted 40".
+    The single definition of each. The extraction reads it off a recorded tape
+    and the harness reads it off a live engine, and both hand it the same
+    shapes -- the engine's `render` is the function that produced the tape in
+    the first place. Written twice they would drift, and a claim measured on
+    the corpus definition and selected on the harness definition would be two
+    quantities wearing one name: a comparison that agrees with itself and is
+    wrong.
+
+    Args:
+        farm: One side's public farm, as an observation renders it.
+        private: That side's ``seeds`` and ``shed``. Private in play, and
+            shown to a program's author afterwards.
+        town: The shared town, for the shops unlocked.
+        day: The day being closed, which the fertilizer and age terms need.
+        traded: Cumulative market activity as ``{verb: [orders, units]}``.
+            Empty where nobody counted, which is how the extraction reads a
+            state without replaying the orders that reached it.
+
+    Returns:
+        One value per name in `COLUMNS`.
     """
-    farm = observation["farms"][seat]
-    private = observation.get("private") or {}
-    tiles = _tiles(farm)
+    tiles = [tile for row in farm["tiles"] for tile in row if isinstance(tile, dict)]
     crops = [tile for tile in tiles if tile.get("crop")]
     pens = [tile for tile in tiles if tile.get("animal")]
-    ages = [day - tile.get("planted_day", day) for tile in crops]
-    return (
-        float(farm["money"]),
-        len(crops),
-        sum(1 for tile in tiles if tile.get("yield_units", 0) > 0),
-        sum(int(tile.get("yield_units", 0)) for tile in tiles),
-        len(pens),
-        sum(1 for tile in tiles if tile.get("kind") == "WEED"),
-        sum(1 for tile in tiles if tile.get("kind") in BARE),
-        len(farm.get("unlocked_quadrants") or []),
-        len(farm.get("hands") or []),
-        int(farm.get("hires_today") or 0),
-        sum((private.get("seeds") or {}).values()),
-        sum((private.get("shed") or {}).values()),
-        len((observation.get("town") or {}).get("unlocked_shops") or []),
-        sum(1 for tile in crops if tile.get("watered_today")),
-        max((int(tile.get("consecutive_unwatered", 0)) for tile in crops), default=0),
-        sum(1 for tile in crops if int(tile.get("fertilized_until_day", -1)) > day),
-        sum(1 for tile in pens if tile.get("fed_today")),
-        max((int(tile.get("consecutive_unfed", 0)) for tile in pens), default=0),
-        sum(1 for tile in pens if tile.get("cared_today")),
-        sum(ages) / len(ages) if ages else 0.0,
+    ages = [day - int(tile.get("planted_day", day)) for tile in crops]
+    out: dict[str, float] = {
+        "bank": float(farm["money"]),
+        "planted": float(len(crops)),
+        "ripe": float(sum(1 for tile in tiles if tile.get("yield_units", 0) > 0)),
+        "yield_held": float(sum(int(tile.get("yield_units", 0)) for tile in tiles)),
+        "pens": float(len(pens)),
+        "weeds": float(sum(1 for tile in tiles if tile.get("kind") == "WEED")),
+        "bare": float(sum(1 for tile in tiles if tile.get("kind") in BARE)),
+        "quadrants": float(len(farm.get("unlocked_quadrants") or [])),
+        "hands": float(len(farm.get("hands") or [])),
+        "hires": float(farm.get("hires_today") or 0),
+        "seeds": float(sum((private.get("seeds") or {}).values())),
+        "shed": float(sum((private.get("shed") or {}).values())),
+        "shops": float(len((town or {}).get("unlocked_shops") or [])),
+        "watered": float(sum(1 for tile in crops if tile.get("watered_today"))),
+        "dry_worst": float(
+            max(
+                (int(tile.get("consecutive_unwatered", 0)) for tile in crops),
+                default=0,
+            )
+        ),
+        "fertilised": float(
+            sum(1 for tile in crops if int(tile.get("fertilized_until_day", -1)) > day)
+        ),
+        "fed": float(sum(1 for tile in pens if tile.get("fed_today"))),
+        "hungry_worst": float(
+            max((int(tile.get("consecutive_unfed", 0)) for tile in pens), default=0)
+        ),
+        "cared": float(sum(1 for tile in pens if tile.get("cared_today"))),
+        "plant_age": sum(ages) / len(ages) if ages else 0.0,
+    }
+    for orders, units, verb in TALLIED:
+        out[orders], out[units] = (float(n) for n in traded.get(verb, [0, 0]))
+    for orders, verb in COUNTED:
+        out[orders] = float(traded.get(verb, [0, 0])[0])
+    return out
+
+
+def _row(observation: dict[str, Any], seat: int, day: int, traded: dict) -> tuple:
+    """One side's row, ordered as the `days` table declares its columns."""
+    found = measures(
+        observation["farms"][seat],
+        observation.get("private") or {},
+        observation.get("town") or {},
+        day,
+        traded,
     )
+    return tuple(found[name] for name in COLUMNS)
 
 
 def _holdings(observation: dict[str, Any], seat: int) -> Iterator[tuple]:
