@@ -120,13 +120,17 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
     )
 
 
-def test_the_message_carries_the_winners_pace() -> None:
+def test_the_message_carries_the_build_order() -> None:
     """A round is shown its own day-by-day play and nothing to read it against.
 
     The agents at the top of the leaderboard publish no kernels, so their
     recorded games are the only view of them there is -- and the pool, built
-    from published work, cannot supply it. The table is measured by
-    `winning-pace` over the replay archive and travels whole.
+    from published work, cannot supply it. The table is averaged over the
+    top of a rating by `build-order` and travels whole.
+
+    Over the top of a *rating*, not the winning side of each game: about half
+    of a ladder's winners are the weaker agent having a good day, and eleven
+    quantities measured that way came back between 45% and 60%.
     """
     text = prompt.compose(
         "champion_1",
@@ -137,12 +141,60 @@ def test_the_message_carries_the_winners_pace() -> None:
         table("champion_1", {"v54": 0.0}),
     )
 
-    assert "How the ladder's winners play" in text
-    assert "| day | median bank | top decile | planted tiles" in text
-    # Thirty days of it, and the pace to beat beside the pace to match.
-    assert prompt.WINNING_PACE.read_text(encoding="utf-8").rstrip() in text
+    assert "How the strongest agents build" in text
+    assert "| quadrants |" in text and "| fertilised |" in text
+    # It travels whole: a table cut in half is a table nobody can read down.
+    assert prompt.BUILD_ORDER.read_text(encoding="utf-8").rstrip() in text
     # Aggregate only: no opponent is named and no path of theirs appears.
     assert "/data" not in text
+
+
+def test_a_round_can_see_the_two_columns_the_corpus_decides_on(tmp_path: Path) -> None:
+    """Quadrants and fertilizer, for both sides, on every row.
+
+    These are the sharpest separations in 16,292 recorded games -- fertilised
+    tiles on day five at 100% of 313 paired games, quadrants on day three at
+    99% -- and until now a round was shown its banks, its tiles and its shed
+    and could see neither. A build-order table stating a number the day table
+    does not carry is a target nobody can read their own position against.
+    """
+    del tmp_path
+    rates = {"v54": 0.3}
+    days = [
+        harness.Day(
+            day=n,
+            ours_bank=100.0,
+            theirs_bank=200.0,
+            ours_plants={"WHEAT": 4},
+            theirs_plants={"MELON": 2},
+            ours_animals={},
+            theirs_animals={"COW": 1},
+            ours_weeds=0,
+            theirs_weeds=3,
+            ours_seeds={"WHEAT": 5},
+            ours_shed={"WHEAT": 12},
+            theirs_shed={"EGG": 3},
+            ours_hands=2,
+            theirs_hands=1,
+            ours_quadrants=1,
+            theirs_quadrants=3,
+            ours_fertilised=0,
+            theirs_fertilised=17,
+            prices={"WHEAT": 25},
+        )
+        for n in range(2)
+    ]
+    measured = result(rates)
+    scored = measured.model_copy(update={"states": {"v54": days}})
+
+    text = prompt.compose(
+        "champion_1", scored, [], [], IMPROVE, table("champion_1", rates)
+    )
+
+    assert "our quads | their quads | our fert | their fert" in text
+    # One quadrant against three, no fertilizer against seventeen: the gap the
+    # build order is about, legible on the row.
+    assert text.count("| 1 | 3 | 0 | 17 |") == 2
 
 
 def test_the_templates_own_note_is_not_sent_to_the_model() -> None:
@@ -307,7 +359,7 @@ def test_a_shown_game_carries_every_column_of_every_day() -> None:
     assert "cannot see the opponent's shed" in text
     # The production side of every row: what each farm was growing while the
     # banks moved, ours with the seed it had not planted yet.
-    assert text.count("| WHEAT 4 / - / - | MELON 2 / COW 1 / 3 | WHEAT 5 |") == 30
+    assert text.count("| WHEAT 4 / - / - | MELON 2 / COW 1 / 3 | 0 | 0 |") == 30
 
 
 def test_the_message_names_opponents_and_never_a_path() -> None:

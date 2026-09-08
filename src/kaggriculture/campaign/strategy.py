@@ -1,6 +1,6 @@
 """Claims about how the ladder's strongest agents play, and the evidence.
 
-The tables in ``winning_pace.md`` are a snapshot: true when they were measured
+The tables in ``build_order.md`` are a snapshot: true when they were measured
 and unattached to any statement about why. A claim is the other thing -- a
 statement that could be wrong, with a form that says how to find out.
 
@@ -60,7 +60,7 @@ QUANTITIES: frozenset[str] = frozenset(
 DAYS = dataset.DAYS
 # The store the round prompt reads, beside the corpus it is measured from.
 #
-# Not inside the package, though it started there next to ``winning_pace.md``.
+# Not inside the package, though it started there next to ``build_order.md``.
 # That works for a file committed once and read by whoever has the checkout,
 # and breaks the moment it is rebuilt daily: the job runs from its own
 # worktree with its own copy of the package, so it would rewrite a store in

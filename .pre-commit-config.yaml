@@ -11,6 +11,11 @@ repos:
     rev: v1.0.7
     hooks:
       - id: prettier-format
+        # Generated nightly by `build-order` from the corpus. Prettier pads
+        # markdown table cells to align them, so leaving it in means the
+        # generator and the hook rewrite the same file forever, and every
+        # rebuild lands as a diff nobody made.
+        exclude: ^src/kaggriculture/campaign/build_order\.md$
   - repo: local
     hooks:
       - id: ruff-format

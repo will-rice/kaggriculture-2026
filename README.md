@@ -82,25 +82,36 @@ nowhere in the pool and only in the public replay archive. Two commands mine
 it, and both write files the round prompt reads:
 
 ```bash
-uv run winning-pace 400   # campaign/winning_pace.md: what winners held each day
-uv run strategies         # campaign/strategies.jsonl: what winners did differently
+uv run extract-corpus     # /data/.../corpus.sqlite: every game as a table
+uv run build-order        # campaign/build_order.md: what the strongest hold, by day
+uv run strategies         # strategies.jsonl: what separates the strong from the rest
 ```
 
-`winning-pace` is a median over winning sides: a reference to read a program's
-own day tables against. `strategies` is paired — it compares the two players
-_inside_ one game, where the map, the prices and the opponent are shared, so
-what is left when they differ is what the two players did. Each claim names a
-quantity, a day and which side leads, and the corpus confirms or refutes it by
-the count. A round is then shown only the confirmed claims its own games put it
-on the wrong side of, so the section is short, specific to that program, and
-empty for a program already doing all of it.
+`extract-corpus` parses every recorded game once into SQLite — one row per
+game, per game-day, per market order and per command — so a question about the
+corpus costs a query rather than a twenty-minute walk of the archives. It also
+fits a Bradley-Terry rating over all of them, and that rating is what the other
+two are grouped by.
 
-`strategies` reads every game there is, in parallel over the daily archives,
-rather than a sample: measured over sixty games eight of the first eleven
-claims cleared the bar, and over four hundred only six did. Selecting a claim
-for scoring highly on a sample is the same winner's curse the promotion gate
-was rebuilt to avoid. Re-run both as archives land — the log keeps every
-measurement, so a claim confirmed early and refuted later keeps both records.
+The grouping is the whole point. Read by _who won each game_, eleven quantities
+over thirteen thousand games all came back between 45% and 60%: about half of a
+ladder's winners are the weaker agent having a good day, and that noise swamps
+everything. Read by _who is actually strong_, the same games separate at
+90-100% — and reverse the sign of one of them.
+
+`build-order` writes the table the round prompt carries whole: what the top
+twenty-five rated agents hold on each day. `strategies` puts every quantity
+crossed with every day to the corpus as a paired within-game comparison between
+the stronger and the weaker agent, and keeps whatever settles; a round is shown
+only the settled claims its own games put it on the wrong side of.
+
+`scripts/daily_corpus.sh` runs the first and third nightly from its own
+worktree. Run `build-order` when the ladder has moved. Everything reads every
+game there is rather than a sample: measured over sixty games eight of the
+first eleven claims cleared the bar, over four hundred six did, and over all
+sixteen thousand one did. Selecting a claim for scoring highly on a sample is
+the same winner's curse the promotion gate was rebuilt to avoid, and the log
+keeps every measurement so a claim settled early and undone later keeps both.
 
 `dry-run` swaps the codex call for one that copies the parent with a visible
 edit, so it exercises validation, evaluation, insertion and the promotion gate

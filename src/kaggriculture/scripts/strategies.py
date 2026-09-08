@@ -1,6 +1,6 @@
 """Ask the corpus every question in the grammar, and keep what it answers.
 
-``winning-pace`` says what the ladder's winners held on each day. It cannot
+``build-order`` says what the strongest agents hold on each day. It cannot
 say what the strong agents do *differently*, because it never compares two
 sides of one game -- and a median over winners describes the whole corpus,
 since "hires every day" is true of the side that lost as well.

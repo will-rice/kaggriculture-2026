@@ -25,8 +25,9 @@ Placeholders, all filled on every round:
   {siblings}     other programs written from this one, or empty
   {failures}     the lineage's recent rejected attempts, or empty
   {instruction}  what to do, and under stagnation why the start moved
-  {pace}         how the ladder's winners play, day by day, from the
-                 recorded replay archive -- rebuilt by `winning-pace`
+  {pace}         what the strongest agents hold on each day, averaged
+                 over the top of a rating fitted across every recorded
+                 game -- rebuilt by `build-order`
 
 A section that would be empty is rendered as nothing at all, heading
 included: a heading over an empty list is noise in a message read every

@@ -46,14 +46,18 @@ TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
 # be read end to end -- what a round is told, and in what order -- without
 # reconstructing it from `compose`.
 ROUND_PROMPT = Path(__file__).with_name("round_prompt.md")
-# How the ladder's winners actually play, day by day, measured over the
-# public replay archive by `winning-pace`. It is here because the message
-# already gives a round its own banks and tiles each day and gives it
-# nothing to read them against -- and because the agents at the top of the
-# leaderboard publish no kernels, so their games are the only view of them
-# there is. A snapshot of how the field played, not a constant of the game:
-# rebuild it when the ladder has moved.
-WINNING_PACE = Path(__file__).with_name("winning_pace.md")
+# What the strongest agents hold on each day, written by `build-order` over
+# the extracted corpus. It is here because the message already gives a round
+# its own banks and tiles each day and gives it nothing to read them against
+# -- and because the agents at the top of the leaderboard publish no kernels,
+# so their games are the only view of them there is.
+#
+# It replaced `winning_pace.md`, which took medians over the winning side of
+# every game. That is the wrong half of the corpus: about half of a ladder's
+# winners are the weaker agent having a good day, and eleven quantities
+# measured that way came back between 45% and 60%. A snapshot of a moving
+# field either way -- rebuilt nightly, because the ladder turns over.
+BUILD_ORDER = Path(__file__).with_name("build_order.md")
 
 # How many claims a round is shown. The store is meant to grow -- every day's
 # archives can propose more -- and the message is not, so what bounds it is
@@ -327,7 +331,10 @@ def _states_lines(
         "`crops / animals / weeds`, counted in tiles, and `-` where there are "
         "none. Tiles are public, so the opponent's farm is here on the same "
         "terms as yours; its seed and carried inventory are private and are "
-        "not.",
+        "not. `quads` is unlocked quadrants of four and `fert` is growing "
+        "tiles still under fertilizer -- the two the corpus separates the "
+        "strongest agents from the rest on, and the two the build-order table "
+        "above states.",
     ]
     for opponent in lost:
         mark = (
@@ -339,15 +346,18 @@ def _states_lines(
             "",
             f"### `{opponent}`, won {result.rates[opponent]:.3f}{mark}",
             "",
-            "| day | our bank | their bank | our farm | their farm | our seed | "
-            "our shed | their shed | our hands | their hands | prices |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| day | our bank | their bank | our farm | their farm | our quads | "
+            "their quads | our fert | their fert | our seed | our shed | "
+            "their shed | our hands | their hands | prices |",
+            "| --- |" + " --- |" * 14,
         ]
         for day in result.states[opponent]:
             lines.append(
                 f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
                 f"{_farm(day.ours_plants, day.ours_animals, day.ours_weeds)} | "
                 f"{_farm(day.theirs_plants, day.theirs_animals, day.theirs_weeds)} | "
+                f"{day.ours_quadrants} | {day.theirs_quadrants} | "
+                f"{day.ours_fertilised} | {day.theirs_fertilised} | "
                 f"{_items(day.ours_seeds)} | "
                 f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
                 f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
@@ -634,7 +644,7 @@ def compose(
     # template puts each on its own line, so an empty one leaves no gap.
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
-        pace=WINNING_PACE.read_text(encoding="utf-8").rstrip("\n"),
+        pace=BUILD_ORDER.read_text(encoding="utf-8").rstrip("\n"),
         name=name,
         imports=IMPORTS,
         seeds=len(result.seeds),

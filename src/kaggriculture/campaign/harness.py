@@ -99,7 +99,21 @@ class Day(BaseModel):
         theirs_shed: The opponent's shed, zero counts dropped.
         ours_hands: Hands the candidate holds, the farmer aside.
         theirs_hands: Hands the opponent holds, the farmer aside.
+        ours_quadrants: Quadrants the candidate has unlocked, of four.
+        theirs_quadrants: The opponent's, on the same terms.
+        ours_fertilised: Growing tiles of the candidate's still under
+            fertilizer on this day.
+        theirs_fertilised: The opponent's, on the same terms.
         prices: The shared market's price per product.
+
+    Quadrants and fertilizer are here because the corpus says they are where
+    the game is decided and nothing showed them. Measured over 16,292 recorded
+    ladder games grouped by fitted rating, the sharpest separations in the
+    whole field are `fertilised` on day five (100% of 313 paired games) and
+    quadrants on day three (99% of 208) -- the strong open their second and
+    third quadrant two to three days ahead and keep fertilizer on the ground
+    rather than selling it. A round was shown its banks, its tiles and its
+    shed, and could not see either.
     """
 
     day: int
@@ -116,6 +130,11 @@ class Day(BaseModel):
     theirs_shed: dict[str, int]
     ours_hands: int
     theirs_hands: int
+    # Defaulted, so a result stored before these existed still loads.
+    ours_quadrants: int = 0
+    theirs_quadrants: int = 0
+    ours_fertilised: int = 0
+    theirs_fertilised: int = 0
     prices: dict[str, int]
 
 
@@ -338,6 +357,22 @@ def _failed(work: Work, player: int, error: Exception, worst: float) -> Game:
     )
 
 
+def _fertilised(tiles: list, day: int) -> int:
+    """Growing tiles still under fertilizer on ``day``.
+
+    A tile carries the day its fertilizer runs out, so "fertilised" is a
+    question about now rather than about what was ever applied.
+    """
+    return sum(
+        1
+        for row in tiles
+        for tile in row
+        if isinstance(tile, dict)
+        and tile.get("crop")
+        and int(tile.get("fertilized_until_day", -1)) > day
+    )
+
+
 def _worked(tiles: list) -> tuple[dict[str, int], dict[str, int], int]:
     """What a board is growing: crops by kind, animals by species, weeds.
 
@@ -382,8 +417,10 @@ def _day(engine: Engine, seat: int, day: int) -> Day:
     """
     ours = engine.observation(seat)
     theirs = render_private(engine.state.farms[1 - seat])["shed"]
-    ours_plants, ours_animals, ours_weeds = _worked(ours["farms"][seat]["tiles"])
-    their_plants, their_animals, their_weeds = _worked(ours["farms"][1 - seat]["tiles"])
+    mine = ours["farms"][seat]
+    yours = ours["farms"][1 - seat]
+    ours_plants, ours_animals, ours_weeds = _worked(mine["tiles"])
+    their_plants, their_animals, their_weeds = _worked(yours["tiles"])
     return Day(
         day=day,
         ours_bank=engine.bank(seat),
@@ -394,6 +431,10 @@ def _day(engine: Engine, seat: int, day: int) -> Day:
         theirs_animals=their_animals,
         ours_weeds=ours_weeds,
         theirs_weeds=their_weeds,
+        ours_quadrants=len(mine.get("unlocked_quadrants") or []),
+        theirs_quadrants=len(yours.get("unlocked_quadrants") or []),
+        ours_fertilised=_fertilised(mine["tiles"], day),
+        theirs_fertilised=_fertilised(yours["tiles"], day),
         ours_seeds={crop: n for crop, n in ours["private"]["seeds"].items() if n},
         ours_shed={item: n for item, n in ours["private"]["shed"].items() if n},
         theirs_shed={item: n for item, n in theirs.items() if n},

@@ -16,7 +16,7 @@ commands, which are the policy itself; and every tile's husbandry -- whether
 it was watered today, how many days it has gone without, whether the animals
 were fed and cared for.
 
-Aggregate only, like `winning-pace`: this reads public replays and writes
+Aggregate only: this reads public replays and writes
 counts. No opponent's source is read, and nothing here is a path.
 
 Shape, with rough row counts over the twenty archives now on disk:
@@ -610,6 +610,73 @@ def ladder(database: Path = DATABASE) -> list[tuple]:
         ).fetchall()
     finally:
         connection.close()
+
+
+# The quantities a build order is stated in, and the only ones a round can act
+# on: each is a column of the day table a round is already shown, so it can
+# read its own number straight off the row beside it. `land_orders` is absent
+# for that reason and quadrants stand in for it -- land is bought to unlock a
+# quadrant, so the two move together and only one of them is visible in a game.
+TARGETS = (
+    "bank",
+    "quadrants",
+    "planted",
+    "fertilised",
+    "pens",
+    "hands",
+    "seeds",
+    "shed",
+    "weeds",
+)
+# How many rated agents the build order is read from, and the days it is
+# stated on. Twenty-five is enough that no single agent's habits carry a
+# column, and few enough that it is the top of the ladder rather than the
+# middle of it.
+BEST = 25
+MARKS = (0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 17, 20, 23, 25, 27, 29)
+
+
+def build_order(database: Path = DATABASE, best: int = BEST) -> dict[str, list[float]]:
+    """What the strongest agents hold on each day, averaged over their games.
+
+    The `winning_pace` tables this replaces were medians over the winning side
+    of every game, which is the wrong half of the corpus: about half of a
+    ladder's winners are the weaker agent having a good day, and eleven
+    quantities measured that way came back between 45% and 60%. Averaged over
+    the top of a rating instead, the same games say something a round can act
+    on -- and say it sharply, since the strongest separations in the whole
+    corpus are quadrants and fertilizer in the first week.
+
+    Args:
+        database: The dataset, already built and rated.
+        best: How many rated agents to read from, strongest first.
+
+    Returns:
+        ``{quantity: [value on each of MARKS]}``, and ``"day"`` itself.
+
+    Raises:
+        ValueError: Nothing is rated yet, so there is no top to read from.
+    """
+    top = [team for team, *_ in ladder(database)[:best]]
+    if not top:
+        raise ValueError(f"no rated teams in {database}; run `rate` first")
+    marks = ",".join("?" * len(top))
+    columns = ", ".join(f"avg({name})" for name in TARGETS)
+    connection = sqlite3.connect(database)
+    try:
+        rows = [
+            connection.execute(
+                f"SELECT {columns} FROM days WHERE day = ? AND team IN ({marks})",  # noqa: S608 - column names are this module's own constants
+                (day, *top),
+            ).fetchone()
+            for day in MARKS
+        ]
+    finally:
+        connection.close()
+    out: dict[str, list[float]] = {"day": [float(day) for day in MARKS]}
+    for index, name in enumerate(TARGETS):
+        out[name] = [float(row[index] or 0.0) for row in rows]
+    return out
 
 
 def leaderboard(database: Path = DATABASE, least: int = 30) -> list[tuple]:
