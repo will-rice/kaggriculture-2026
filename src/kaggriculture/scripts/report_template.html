@@ -276,13 +276,17 @@
     </p>
     <h1>What the strong farms<br />do differently</h1>
     <p class="lede measure">
-      Every recorded ladder game, read by rating rather than by who happened to
-      win. The agents at the top of the leaderboard publish no kernels — their
-      games are the only view of them there is.
+      The last $window days of ladder games, read by rating rather than by who
+      happened to win. The window is the point: the field turns over completely
+      inside a fortnight, so a fit over the whole corpus rates two disjoint
+      fields at once and calls having played early a strength. The agents at the
+      top of the leaderboard publish no kernels — their games are the only view
+      of them there is.
     </p>
     <div class="census">
-      <span><b>$games</b> games</span>
+      <span><b>$rated_games</b> games rated, since $since</span>
       <span><b>$teams</b> rated agents</span>
+      <span><b>$games</b> games extracted</span>
       <span><b>$days_rows</b> day records</span>
       <span><b>$orders</b> market orders</span>
       <span><b>$moves</b> commands</span>
@@ -543,8 +547,10 @@
   <footer>
     <p>
       Corpus: $games clean engine-1.32.7 episodes, $first to $last, extracted
-      from the public replay archive. Ratings: Bradley-Terry MM fit over all of
-      them, agents with forty games or more. Rebuilt $generated.
+      from the public replay archive. Ratings: Bradley-Terry MM fit over the
+      $rated_games of them played since $since — the last $window days — for
+      agents with forty games or more. Every per-agent figure on this page reads
+      that same window. Rebuilt $generated.
     </p>
     <p>Aggregate only — no opponent source was read, and no agent is named.</p>
   </footer>

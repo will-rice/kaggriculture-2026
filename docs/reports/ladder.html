@@ -276,13 +276,17 @@
     </p>
     <h1>What the strong farms<br />do differently</h1>
     <p class="lede measure">
-      Every recorded ladder game, read by rating rather than by who happened to
-      win. The agents at the top of the leaderboard publish no kernels — their
-      games are the only view of them there is.
+      The last 10 days of ladder games, read by rating rather than by who
+      happened to win. The window is the point: the field turns over completely
+      inside a fortnight, so a fit over the whole corpus rates two disjoint
+      fields at once and calls having played early a strength. The agents at the
+      top of the leaderboard publish no kernels — their games are the only view
+      of them there is.
     </p>
     <div class="census">
-      <span><b>16,292</b> games</span>
-      <span><b>185</b> rated agents</span>
+      <span><b>6,646</b> games rated, since 2026-08-29</span>
+      <span><b>82</b> rated agents</span>
+      <span><b>16,292</b> games extracted</span>
       <span><b>977,520</b> day records</span>
       <span><b>27.2M</b> market orders</span>
       <span><b>211.8M</b> commands</span>
@@ -294,7 +298,7 @@
       <p class="eyebrow">How these are grouped</p>
       <p>
         Every comparison below is the
-        <strong>top 25 rated agents against the bottom 80</strong>, by a
+        <strong>top 12 rated agents against the bottom 33</strong>, by a
         Bradley-Terry fit over the whole corpus — never the winner against the
         loser of a given game. That distinction is not pedantry. Grouped by game
         outcome, eleven quantities measured over thirteen thousand games all
@@ -327,15 +331,15 @@
         </p>
       </div>
       <div class="finding">
-        <span class="num">10.4%</span>
-        <h3>Top 25 bank premium</h3>
+        <span class="num">10.1%</span>
+        <h3>Top 12 bank premium</h3>
         <p>
-          95,647 against 86,627. The strongest agents finish ahead by less than
+          97,383 against 88,416. The strongest agents finish ahead by less than
           a tenth.
         </p>
       </div>
       <div class="finding">
-        <span class="num">6.6</span>
+        <span class="num">6.0</span>
         <h3>Rating spread, log-odds</h3>
         <p>End to end across every agent with forty games or more.</p>
       </div>
@@ -381,14 +385,14 @@
             stroke="var(--rest)"
             stroke-width="2"
             stroke-linejoin="round"
-            points="34,108 63,108 82,107 91,66 110,65 129,53 167,18 224,18 272,18 310,18"
+            points="34,108 63,108 82,107 91,65 110,65 129,63 167,23 224,23 272,23 310,23"
           ></polyline>
           <polyline
             fill="none"
             stroke="var(--strong)"
             stroke-width="2.5"
             stroke-linejoin="round"
-            points="34,108 63,105 82,91 91,65 110,49 129,42 167,23 224,22 272,22 310,22"
+            points="34,108 63,101 82,94 91,65 110,51 129,44 167,23 224,23 272,23 310,23"
           ></polyline>
         </svg>
         <figcaption>
@@ -427,70 +431,70 @@
             fill="var(--quiet)"
             text-anchor="end"
           >
-            2,859
+            2,037
           </text>
           <g>
             <rect
               x="36"
-              y="108"
+              y="106"
               width="18"
-              height="2"
+              height="4"
               fill="var(--strong)"
             ></rect>
             <rect
               x="94"
-              y="101"
+              y="100"
               width="18"
-              height="9"
+              height="10"
               fill="var(--strong)"
             ></rect>
             <rect
               x="152"
-              y="91"
+              y="93"
               width="18"
-              height="19"
+              height="17"
               fill="var(--strong)"
             ></rect>
             <rect
               x="210"
-              y="91"
+              y="88"
               width="18"
-              height="19"
+              height="22"
               fill="var(--strong)"
             ></rect>
             <rect
               x="268"
-              y="89"
+              y="81"
               width="18"
-              height="21"
+              height="29"
               fill="var(--strong)"
             ></rect>
             <rect
               x="56"
-              y="109"
+              y="106"
               width="18"
-              height="1"
+              height="4"
               fill="var(--rest)"
             ></rect>
             <rect
               x="114"
-              y="101"
+              y="95"
               width="18"
-              height="9"
+              height="15"
               fill="var(--rest)"
             ></rect>
             <rect
               x="172"
-              y="88"
+              y="81"
               width="18"
-              height="22"
+              height="29"
               fill="var(--rest)"
             ></rect>
             <rect
               x="230"
-              y="66"
+              y="60"
               width="18"
-              height="44"
+              height="50"
               fill="var(--rest)"
             ></rect>
             <rect
@@ -511,11 +515,11 @@
 
     <div class="key">
       <span
-        ><i class="swatch" style="background: var(--strong)"></i> top 25
+        ><i class="swatch" style="background: var(--strong)"></i> top 12
         rated</span
       >
       <span
-        ><i class="swatch" style="background: var(--rest)"></i> bottom 80
+        ><i class="swatch" style="background: var(--rest)"></i> bottom 33
         rated</span
       >
     </div>
@@ -546,39 +550,39 @@
           <tr class="gap">
             <td rowspan="2">Bank</td>
             <td class="who t">top</td>
-            <td class="">51</td>
-            <td class="lead">242</td>
-            <td class="lead">306</td>
-            <td class="">447</td>
-            <td class="">769</td>
-            <td class="">11,295</td>
-            <td class="lead">19,875</td>
-            <td class="">53,030</td>
-            <td class="">73,559</td>
-            <td class="">95,647</td>
+            <td class="">39</td>
+            <td class="">221</td>
+            <td class="">402</td>
+            <td class="">538</td>
+            <td class="">1,004</td>
+            <td class="">11,665</td>
+            <td class="">20,915</td>
+            <td class="">54,738</td>
+            <td class="">75,726</td>
+            <td class="">97,383</td>
           </tr>
           <tr>
             <td class="who r">rest</td>
-            <td>64</td>
-            <td>187</td>
-            <td>253</td>
-            <td>1,380</td>
-            <td>839</td>
-            <td>12,371</td>
-            <td>16,508</td>
-            <td>45,440</td>
-            <td>68,894</td>
-            <td>86,627</td>
+            <td>35</td>
+            <td>210</td>
+            <td>384</td>
+            <td>545</td>
+            <td>969</td>
+            <td>14,953</td>
+            <td>22,615</td>
+            <td>51,169</td>
+            <td>70,278</td>
+            <td>88,416</td>
           </tr>
           <tr class="gap">
             <td rowspan="2">Quadrants</td>
             <td class="who t">top</td>
             <td class="">1.0</td>
-            <td class="">1.1</td>
-            <td class="lead">1.4</td>
+            <td class="">1.2</td>
+            <td class="lead">1.3</td>
             <td class="">2.0</td>
-            <td class="">2.4</td>
-            <td class="">2.5</td>
+            <td class="">2.3</td>
+            <td class="lead">2.5</td>
             <td class="">3.0</td>
             <td class="">3.0</td>
             <td class="">3.0</td>
@@ -591,52 +595,52 @@
             <td>1.0</td>
             <td>2.0</td>
             <td>2.0</td>
-            <td>2.3</td>
-            <td>3.1</td>
-            <td>3.1</td>
-            <td>3.1</td>
-            <td>3.1</td>
+            <td>2.1</td>
+            <td>3.0</td>
+            <td>3.0</td>
+            <td>3.0</td>
+            <td>3.0</td>
           </tr>
           <tr class="gap">
             <td rowspan="2">Planted tiles</td>
             <td class="who t">top</td>
-            <td class="">16.3</td>
-            <td class="">19.3</td>
-            <td class="">20.5</td>
-            <td class="lead">31.0</td>
-            <td class="">40.1</td>
-            <td class="lead">43.5</td>
-            <td class="">57.9</td>
+            <td class="">18.0</td>
+            <td class="">19.1</td>
+            <td class="">19.5</td>
+            <td class="">31.6</td>
+            <td class="">39.4</td>
+            <td class="lead">42.1</td>
+            <td class="">57.6</td>
             <td class="">57.5</td>
-            <td class="">55.6</td>
-            <td class="">4.2</td>
+            <td class="">55.4</td>
+            <td class="lead">3.9</td>
           </tr>
           <tr>
             <td class="who r">rest</td>
-            <td>16.6</td>
-            <td>18.0</td>
+            <td>18.8</td>
             <td>18.9</td>
-            <td>22.4</td>
-            <td>35.1</td>
-            <td>33.0</td>
-            <td>57.3</td>
-            <td>57.5</td>
-            <td>55.5</td>
-            <td>4.6</td>
+            <td>19.1</td>
+            <td>29.7</td>
+            <td>36.5</td>
+            <td>32.9</td>
+            <td>59.5</td>
+            <td>59.4</td>
+            <td>59.2</td>
+            <td>1.5</td>
           </tr>
           <tr class="gap">
             <td rowspan="2">Fertilised</td>
             <td class="who t">top</td>
             <td class="">0.0</td>
             <td class="">0.0</td>
-            <td class="lead">0.2</td>
-            <td class="lead">1.1</td>
-            <td class="lead">0.5</td>
-            <td class="lead">0.2</td>
-            <td class="lead">8.1</td>
-            <td class="">18.0</td>
-            <td class="lead">13.4</td>
-            <td class="lead">1.0</td>
+            <td class="lead">0.0</td>
+            <td class="">0.0</td>
+            <td class="lead">0.0</td>
+            <td class="lead">0.1</td>
+            <td class="lead">7.4</td>
+            <td class="">18.8</td>
+            <td class="lead">15.5</td>
+            <td class="lead">0.9</td>
           </tr>
           <tr>
             <td class="who r">rest</td>
@@ -646,91 +650,91 @@
             <td>0.0</td>
             <td>0.0</td>
             <td>0.0</td>
-            <td>3.9</td>
-            <td>19.7</td>
-            <td>8.0</td>
-            <td>0.6</td>
+            <td>4.1</td>
+            <td>18.6</td>
+            <td>9.4</td>
+            <td>0.0</td>
           </tr>
           <tr class="gap">
             <td rowspan="2">Animals</td>
             <td class="who t">top</td>
-            <td class="">4.4</td>
-            <td class="">5.0</td>
-            <td class="">5.9</td>
-            <td class="lead">7.9</td>
-            <td class="">11.3</td>
-            <td class="">13.1</td>
-            <td class="">14.9</td>
-            <td class="">15.0</td>
-            <td class="">14.7</td>
-            <td class="">12.1</td>
+            <td class="">4.5</td>
+            <td class="">5.2</td>
+            <td class="">6.4</td>
+            <td class="">8.1</td>
+            <td class="">11.5</td>
+            <td class="">13.6</td>
+            <td class="">15.3</td>
+            <td class="">14.6</td>
+            <td class="">13.7</td>
+            <td class="">11.6</td>
           </tr>
           <tr>
             <td class="who r">rest</td>
-            <td>4.1</td>
-            <td>4.8</td>
-            <td>5.8</td>
-            <td>6.3</td>
-            <td>10.6</td>
-            <td>12.6</td>
+            <td>4.0</td>
+            <td>4.9</td>
+            <td>5.9</td>
+            <td>7.8</td>
+            <td>11.9</td>
+            <td>13.2</td>
+            <td>14.0</td>
             <td>14.2</td>
-            <td>14.4</td>
-            <td>14.4</td>
-            <td>13.9</td>
+            <td>14.1</td>
+            <td>13.8</td>
           </tr>
           <tr class="gap">
             <td rowspan="2">Hands hired</td>
             <td class="who t">top</td>
-            <td class="">4.7</td>
-            <td class="">4.7</td>
             <td class="">5.3</td>
-            <td class="lead">7.8</td>
-            <td class="">9.0</td>
+            <td class="">5.2</td>
+            <td class="">5.2</td>
+            <td class="">7.9</td>
+            <td class="">9.4</td>
             <td class="">11.0</td>
-            <td class="lead">11.0</td>
-            <td class="">11.7</td>
-            <td class="">11.5</td>
-            <td class="lead">10.9</td>
+            <td class="">10.9</td>
+            <td class="">11.6</td>
+            <td class="">11.4</td>
+            <td class="">10.1</td>
           </tr>
           <tr>
             <td class="who r">rest</td>
-            <td>4.3</td>
-            <td>4.5</td>
-            <td>4.6</td>
-            <td>4.9</td>
-            <td>9.5</td>
+            <td>5.0</td>
+            <td>5.0</td>
+            <td>4.7</td>
+            <td>7.9</td>
+            <td>9.8</td>
             <td>11.1</td>
-            <td>9.0</td>
-            <td>12.1</td>
-            <td>11.0</td>
-            <td>8.5</td>
+            <td>10.1</td>
+            <td>11.9</td>
+            <td>11.1</td>
+            <td>10.8</td>
           </tr>
           <tr class="gap">
             <td rowspan="2">Seed in store</td>
             <td class="who t">top</td>
             <td class="lead">0.3</td>
-            <td class="lead">0.9</td>
-            <td class="">5.2</td>
-            <td class="">5.9</td>
-            <td class="">7.8</td>
-            <td class="">8.8</td>
-            <td class="">8.1</td>
-            <td class="">10.9</td>
-            <td class="">8.5</td>
+            <td class="">1.3</td>
             <td class="">5.6</td>
+            <td class="">4.2</td>
+            <td class="">6.8</td>
+            <td class="">8.1</td>
+            <td class="">7.7</td>
+            <td class="">10.0</td>
+            <td class="">7.4</td>
+            <td class="">5.1</td>
           </tr>
           <tr>
             <td class="who r">rest</td>
-            <td>0.0</td>
-            <td>0.6</td>
-            <td>6.3</td>
-            <td>12.3</td>
-            <td>10.5</td>
-            <td>12.4</td>
-            <td>10.4</td>
-            <td>15.3</td>
-            <td>11.3</td>
-            <td>9.4</td>
+            <td>0.1</td>
+            <td>1.9</td>
+            <td>10.9</td>
+            <td>7.7</td>
+            <td>9.6</td>
+            <td>9.7</td>
+            <td>15.1</td>
+            <td>24.4</td>
+            <td>18.9</td>
+            <td>7.7</td>
           </tr>
         </tbody>
       </table>
@@ -749,7 +753,7 @@
       After hiring, the top agents' busiest market activity is
       <em>buying</em> wheat. The weak field's is dumping fertilizer — the input
       the top are applying to their own fields. Across the season the top move
-      <strong>1,965</strong> units against the field's <strong>4,999</strong>,
+      <strong>1,643</strong> units against the field's <strong>4,001</strong>,
       and finish richer. Selling is not the constraint. Capacity is.
     </p>
   </section>
@@ -761,7 +765,7 @@
       Independently of the tables above, every quantity was crossed with every
       day and put to the corpus as a paired within-game comparison between the
       stronger and weaker agent — 870 questions, of which
-      <strong>158 settled</strong> on enough games to count. The widest
+      <strong>170 settled</strong> on enough games to count. The widest
       separations are all the same finding.
     </p>
     <div class="scroll">
@@ -777,66 +781,66 @@
         </thead>
         <tbody>
           <tr>
-            <td>fertilised</td>
-            <td>5</td>
-            <td>more</td>
-            <td>313</td>
-            <td class="lead">100%</td>
-          </tr>
-          <tr>
             <td>land_orders</td>
             <td>3</td>
             <td>more</td>
-            <td>221</td>
+            <td>216</td>
             <td class="lead">99%</td>
           </tr>
           <tr>
             <td>quadrants</td>
             <td>3</td>
             <td>more</td>
-            <td>208</td>
+            <td>202</td>
             <td class="lead">99%</td>
           </tr>
           <tr>
             <td>land_orders</td>
             <td>8</td>
             <td>more</td>
-            <td>1,310</td>
+            <td>460</td>
             <td class="lead">98%</td>
           </tr>
           <tr>
-            <td>fertilised</td>
-            <td>6</td>
+            <td>animal_units</td>
+            <td>1</td>
             <td>more</td>
-            <td>1,190</td>
-            <td class="lead">98%</td>
-          </tr>
-          <tr>
-            <td>fertilised</td>
-            <td>7</td>
-            <td>more</td>
-            <td>1,246</td>
-            <td class="lead">98%</td>
-          </tr>
-          <tr>
-            <td>fertilised</td>
-            <td>8</td>
-            <td>more</td>
-            <td>809</td>
-            <td class="lead">97%</td>
-          </tr>
-          <tr>
-            <td>quadrants</td>
-            <td>8</td>
-            <td>more</td>
-            <td>1,313</td>
+            <td>600</td>
             <td class="lead">97%</td>
           </tr>
           <tr>
             <td>land_orders</td>
-            <td>5</td>
+            <td>4</td>
             <td>more</td>
-            <td>1,373</td>
+            <td>224</td>
+            <td class="lead">97%</td>
+          </tr>
+          <tr>
+            <td>animal_units</td>
+            <td>0</td>
+            <td>more</td>
+            <td>601</td>
+            <td class="lead">97%</td>
+          </tr>
+          <tr>
+            <td>pens</td>
+            <td>1</td>
+            <td>more</td>
+            <td>601</td>
+            <td class="lead">97%</td>
+          </tr>
+          <tr>
+            <td>pens</td>
+            <td>0</td>
+            <td>more</td>
+            <td>547</td>
+            <td class="lead">96%</td>
+          </tr>
+          <tr>
+            <td>quadrants</td>
+            <td>4</td>
+            <td>more</td>
+            <td>210</td>
             <td class="lead">96%</td>
           </tr>
         </tbody>
@@ -863,7 +867,7 @@
     <p class="measure">
       Two honest limits. This is observational — strong agents differ in many
       ways at once, so “sells less” may be a consequence of a production
-      strategy rather than a cause of winning. And the top 25 are a moving
+      strategy rather than a cause of winning. And the top 12 are a moving
       target: the ladder turns over, which is why this page is rebuilt from the
       corpus rather than written once.
     </p>
@@ -873,8 +877,9 @@
     <p>
       Corpus: 16,292 clean engine-1.32.7 episodes, 2026-08-15 to 2026-09-07,
       extracted from the public replay archive. Ratings: Bradley-Terry MM fit
-      over all of them, agents with forty games or more. Rebuilt 08 September
-      2026.
+      over the 6,646 of them played since 2026-08-29 — the last 10 days — for
+      agents with forty games or more. Every per-agent figure on this page reads
+      that same window. Rebuilt 08 September 2026.
     </p>
     <p>Aggregate only — no opponent source was read, and no agent is named.</p>
   </footer>

@@ -70,9 +70,13 @@ def measure(
     connection = sqlite3.connect(database)
     out: dict[str, tuple[int, float]] = {}
     try:
+        # The same window the ratings were fitted over. A claim measured across
+        # the whole corpus is measured over two disjoint fields: split in half,
+        # the two top tens share not one name.
+        first = dataset.recent(connection)
         for day, claims in sorted(wanted.items()):
             quantities = sorted({claim.form.quantity for claim in claims})
-            counted = _day(connection, day, quantities)
+            counted = _day(connection, day, quantities, first)
             for claim in claims:
                 ahead, seen = counted[claim.form.quantity]
                 if not seen:
@@ -86,7 +90,7 @@ def measure(
 
 
 def _day(
-    connection: sqlite3.Connection, day: int, quantities: list[str]
+    connection: sqlite3.Connection, day: int, quantities: list[str], first: str
 ) -> dict[str, tuple[int, int]]:
     """For one day, how often the stronger side had more of each quantity.
 
@@ -94,6 +98,8 @@ def _day(
         connection: The dataset.
         day: The day both sides are read at.
         quantities: Day-row columns to compare.
+        first: The earliest archive day to read, so a claim is settled on the
+            field as it now plays rather than on one that has turned over.
 
     Returns:
         ``{quantity: (ahead, differing)}`` -- games where the stronger side
@@ -111,11 +117,12 @@ def _day(
         SELECT {columns}
         FROM days s
         JOIN days w ON w.episode = s.episode AND w.seat <> s.seat AND w.day = s.day
+        JOIN episodes e ON e.episode = s.episode
         JOIN teams ts ON ts.team = s.team
         JOIN teams tw ON tw.team = w.team
-        WHERE s.day = ? AND ts.rating - tw.rating >= ?
+        WHERE s.day = ? AND ts.rating - tw.rating >= ? AND e.played >= ?
         """,  # noqa: S608 - column names are the dataset's own schema
-        (day, MARGIN),
+        (day, MARGIN, first),
     ).fetchone()
     return {
         name: (int(row[2 * index + 1] or 0), int(row[2 * index] or 0))

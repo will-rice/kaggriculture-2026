@@ -57,6 +57,21 @@ WORKERS = 8
 # twice and won both is not the strongest agent on the ladder, and a rating
 # fitted from two games is the prior wearing a number.
 LEAST = 40
+# How many days back a rating and a build order read. The ladder is not a
+# fixed field: it moves under everyone, every day.
+#
+# Measured 2026-09-08. A byte-identical agent scored 2386.8 on 2026-09-03 and
+# 1418.0 five days later. Splitting the corpus in half and fitting each half
+# on its own, the two top tens share not one name -- complete turnover in
+# twelve days -- and teams whose games fall mostly in the early half rate 1.1
+# log-odds lower in a pooled fit purely for having played then.
+#
+# Bradley-Terry has no notion of time, so fitted over everything it reads
+# "played against a weaker field" as "strong" and a build order averaged over
+# it describes a blend of fields, most of which no longer exists. Ten days is
+# the window whose fit matches today's public leaderboard, and it still leaves
+# some seven thousand games -- enough that a claim can clear `SUPPORT`.
+WINDOW = 10
 # A season, and the hours in a day. A day's row is that day at its last hour,
 # which is what both players saw before their final decision in it.
 DAYS = 30
@@ -554,7 +569,7 @@ def summarise(database: Path = DATABASE) -> str:
     return "\n".join(lines)
 
 
-def rate(database: Path = DATABASE, least: int = LEAST) -> int:
+def rate(database: Path = DATABASE, least: int = LEAST, window: int = WINDOW) -> int:
     """Fit one Bradley-Terry strength per team and store it in ``teams``.
 
     A win rate says who won and takes no view on who they played; over a
@@ -570,6 +585,8 @@ def rate(database: Path = DATABASE, least: int = LEAST) -> int:
     Args:
         database: The dataset, already built.
         least: The fewest games a team must have played to be rated.
+        window: Days back to read. The field turns over inside a fortnight,
+            so a rating over everything rates two disjoint fields at once.
 
     Returns:
         How many teams were rated.
@@ -580,7 +597,9 @@ def rate(database: Path = DATABASE, least: int = LEAST) -> int:
         # have written before this table existed.
         connection.executescript(SCHEMA)
         played = connection.execute(
-            "SELECT team_0, team_1, winner FROM episodes WHERE winner IS NOT NULL"
+            "SELECT team_0, team_1, winner FROM episodes "
+            "WHERE winner IS NOT NULL AND played >= ?",
+            (recent(connection, window),),
         ).fetchall()
         rows = _rate(played, least)
         connection.execute("DELETE FROM teams")
@@ -589,6 +608,23 @@ def rate(database: Path = DATABASE, least: int = LEAST) -> int:
         return len(rows)
     finally:
         connection.close()
+
+
+def recent(connection: sqlite3.Connection, window: int = WINDOW) -> str:
+    """The first archive day inside the window, counted back from the newest.
+
+    Off the data rather than off the clock. The fetch can be days behind --
+    it was four days behind this morning -- and a window measured from today
+    would then be half empty or wholly so, which is a rating over nothing
+    rather than a rating over the recent field.
+    """
+    days = [
+        row[0]
+        for row in connection.execute(
+            "SELECT DISTINCT played FROM episodes ORDER BY played DESC"
+        )
+    ]
+    return days[min(window, len(days)) - 1] if days else ""
 
 
 def _rate(played: list[tuple], least: int) -> list[tuple]:
@@ -677,14 +713,19 @@ TARGETS = (
     "weeds",
 )
 # How many rated agents the build order is read from, and the days it is
-# stated on. Twenty-five is enough that no single agent's habits carry a
-# column, and few enough that it is the top of the ladder rather than the
-# middle of it.
-BEST = 25
+# stated on. Enough that no single agent's habits carry a column, and few
+# enough that it is the top of the ladder rather than the middle of it -- so
+# it is a share of the field rather than a count. Twenty-five was an eighth of
+# the 185 teams a whole-corpus fit rated; the same eighth of the 82 a ten-day
+# window rates is twelve, and taking twenty-five of those would be describing
+# the top third.
+BEST = 12
 MARKS = (0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 17, 20, 23, 25, 27, 29)
 
 
-def build_order(database: Path = DATABASE, best: int = BEST) -> dict[str, list[float]]:
+def build_order(
+    database: Path = DATABASE, best: int = BEST, window: int = WINDOW
+) -> dict[str, list[float]]:
     """What the strongest agents hold on each day, averaged over their games.
 
     The `winning_pace` tables this replaces were medians over the winning side
@@ -698,6 +739,9 @@ def build_order(database: Path = DATABASE, best: int = BEST) -> dict[str, list[f
     Args:
         database: The dataset, already built and rated.
         best: How many rated agents to read from, strongest first.
+        window: Days back to average over, matching the rating's own window.
+            Averaged over everything, the table blends fields that no longer
+            play each other.
 
     Returns:
         ``{quantity: [value on each of MARKS]}``, and ``"day"`` itself.
@@ -712,10 +756,13 @@ def build_order(database: Path = DATABASE, best: int = BEST) -> dict[str, list[f
     columns = ", ".join(f"avg({name})" for name in TARGETS)
     connection = sqlite3.connect(database)
     try:
+        first = recent(connection, window)
         rows = [
             connection.execute(
-                f"SELECT {columns} FROM days WHERE day = ? AND team IN ({marks})",  # noqa: S608 - column names are this module's own constants
-                (day, *top),
+                f"SELECT {columns} FROM days d "  # noqa: S608 - column names are this module's own constants
+                f"JOIN episodes e ON e.episode = d.episode "
+                f"WHERE d.day = ? AND d.team IN ({marks}) AND e.played >= ?",
+                (day, *top, first),
             ).fetchone()
             for day in MARKS
         ]

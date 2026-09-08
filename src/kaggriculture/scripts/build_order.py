@@ -26,9 +26,10 @@ It rewrites ``campaign/build_order.md``, which the round prompt includes whole.
 
 import argparse
 import logging
+import sqlite3
 from pathlib import Path
 
-from kaggriculture.campaign import dataset
+from kaggriculture.campaign import dataset, strategy
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,10 +51,13 @@ HEADINGS = {
 
 PREAMBLE = """## How the strongest agents build
 
-Averaged over the {games:,} recorded games of the public ladder, across the {best}
-agents a Bradley-Terry fit over the whole field rates highest. None of them
-publishes a kernel, so their games are the only view of them there is, and none
-of them is in the pool you are being scored against.
+Averaged over the {games:,} games the public ladder played in the last {window}
+days, across the {best} agents a Bradley-Terry fit over that stretch rates
+highest. The window is not a sample: the field turns over completely inside a
+fortnight, so a table averaged over the whole corpus describes a blend of
+fields, most of which no longer plays. None of these agents publishes a kernel,
+so their games are the only view of them there is, and none of them is in the
+pool you are being scored against.
 
 Read down a column and you have what the top of the ladder holds on that day.
 Every row here is also a column of your own day tables below, so you can put
@@ -66,27 +70,20 @@ place to look.
 
 """
 
-CLOSING = """
-The shape of it, which the numbers above make hard to see all at once:
-
-- **Capacity first, and early.** Land and quadrants by day five, animals from
-  day zero, hands hired ahead of need. The strongest agents open their second
-  and third quadrant two to three days before the rest of the field.
-- **Poor on purpose until day twelve.** Their bank trails the field through the
-  first ten days -- 447 against 1,380 on day six -- because it is in the
-  ground. It crosses over around day twelve and finishes ahead, 95,647 against
-  86,627.
-- **Fertilizer is applied, not sold.** The weaker half of the field sells 1,787
-  units of it a game; the strong sell 258 and buy more on top. On day five they
-  hold fertilised tiles where the rest hold none, which is the single sharpest
-  separation in the corpus: 100% of 313 paired games.
-- **Seed goes in the ground.** From day six the strong carry about half the
-  unplanted seed the rest do. They buy it and plant it rather than stockpiling.
-- **They are net buyers.** After hiring, their busiest market activity is
-  *buying* wheat. Over a season they move 1,965 units against the field's
-  4,998, and finish richer -- the weak field sells 2,859 units in the last six
-  days alone.
+# The closing summary is generated from what the corpus currently settles, not
+# written down. Written down, it went stale in a day: it asserted that
+# fertilizer on the ground by day five was the sharpest separation in the
+# corpus at 100% of 313 games, and once the rating was fitted over a ten-day
+# window instead of twenty-four days that finding was not in the top eight --
+# the field had turned over and the top agents no longer fertilise before day
+# twelve. A page whose numbers are live and whose prose is fixed is a page
+# that lies slowly.
+CLOSING_HEAD = """
+What the same games say when the two sides of each are compared directly --
+every quantity crossed with every day, and these are the ones that separate
+the stronger agent from the weaker most sharply:
 """
+SHOWN_CLAIMS = 8
 
 
 def main() -> None:
@@ -108,21 +105,48 @@ def main() -> None:
     arguments = parser.parse_args()
 
     order = dataset.build_order(arguments.database, arguments.best)
-    games = dataset.counts(arguments.database)["episodes"]
-    TABLE.write_text(render(order, games, arguments.best), encoding="utf-8")
+    connection = sqlite3.connect(arguments.database)
+    try:
+        # The games the table actually averages, not the whole corpus: the
+        # preamble names this number and it has to be the windowed one.
+        games = connection.execute(
+            "SELECT count(*) FROM episodes WHERE played >= ?",
+            (dataset.recent(connection),),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    settled = strategy.Strategies(strategy.STORE).settled()
+    TABLE.write_text(render(order, games, arguments.best, settled), encoding="utf-8")
     LOGGER.info("wrote %s over %d games", TABLE, games)
 
 
-def render(order: dict[str, list[float]], games: int, best: int) -> str:
+def render(
+    order: dict[str, list[float]],
+    games: int,
+    best: int,
+    settled: list[strategy.Claim],
+) -> str:
     """The table as the round prompt includes it, days across and rows down."""
     days = [int(day) for day in order["day"]]
-    lines = [PREAMBLE.format(games=games, best=best).rstrip("\n"), ""]
+    lines = [
+        PREAMBLE.format(games=games, best=best, window=dataset.WINDOW).rstrip("\n"),
+        "",
+    ]
     lines.append("| day | " + " | ".join(f"d{day}" for day in days) + " |")
     lines.append("| --- |" + " --- |" * len(days))
     for name in dataset.TARGETS:
         cells = " | ".join(f"{value:,.{PLACES.get(name, 1)}f}" for value in order[name])
         lines.append(f"| {HEADINGS[name]} | {cells} |")
-    lines.append(CLOSING.rstrip("\n"))
+    lines.append(CLOSING_HEAD.rstrip("\n"))
+    lines.append("")
+    for claim in settled[:SHOWN_CLAIMS]:
+        share = claim.agreement if claim.status == "leads" else 1 - claim.agreement
+        side = "more" if claim.status == "leads" else "less"
+        lines.append(
+            f"- **{claim.form.quantity}**, day {claim.form.day}: the stronger "
+            f"side holds {side}, in {share:.0%} of {claim.support:,} games "
+            f"where the two differed."
+        )
     return "\n".join(lines) + "\n"
 
 

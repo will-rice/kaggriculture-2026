@@ -34,11 +34,15 @@ from kaggriculture.campaign import dataset, strategy
 LOGGER = logging.getLogger(__name__)
 
 PAGE = Path(__file__).resolve().parents[3] / "docs" / "reports" / "ladder.html"
-# The two ends of the ladder the page compares. Twenty-five is the same top the
-# build order is read from; eighty is a tail wide enough that no one agent's
-# habits carry a column.
-TOP = 25
-TAIL = 80
+# The two ends of the ladder the page compares, as shares of the rated field
+# rather than counts of agents. Counts were 25 and 80, sized when a fit over
+# the whole corpus rated 185 teams; once the rating took a ten-day window it
+# rated 82, and the two ends silently overlapped by 23 agents -- the page went
+# on comparing the strong against the weak with a third of each group being
+# the same agents. Shares cannot drift that way, and `_ends` refuses outright
+# rather than returning an overlap.
+TOP_SHARE = 0.15
+TAIL_SHARE = 0.40
 DAYS = (0, 3, 5, 6, 8, 10, 14, 20, 25, 29)
 # Rows of the build-order table, as (column, label, decimal places).
 SHOWN = (
@@ -72,8 +76,7 @@ def measure(database: Path) -> dict[str, str]:
     """Every number the page states, queried once."""
     rows = dataset.counts(database)
     ladder = dataset.ladder(database)
-    top = [team for team, *_ in ladder[:TOP]]
-    tail = [team for team, *_ in ladder[-TAIL:]]
+    top, tail = _ends(ladder)
     connection = sqlite3.connect(database)
     try:
         first, last = connection.execute(
@@ -92,18 +95,32 @@ def measure(database: Path) -> dict[str, str]:
         low, high = connection.execute(
             "SELECT min(rating), max(rating) FROM teams"
         ).fetchone()
+        # Every per-team figure below reads the same window the ladder above
+        # it was fitted over. Read over the whole corpus instead, a team that
+        # carried across the turnover brings its games against a vanished
+        # field into a row headed by its current rank.
+        first_rated = dataset.recent(connection)
+        rated = connection.execute(
+            "SELECT count(*) FROM episodes WHERE played >= ?", (first_rated,)
+        ).fetchone()[0]
         build = {
-            name: (_by_day(connection, name, top), _by_day(connection, name, tail))
+            name: (
+                _by_day(connection, name, top, first_rated),
+                _by_day(connection, name, tail, first_rated),
+            )
             for name, _, _ in SHOWN
         }
-        sold = (_sold(connection, top), _sold(connection, tail))
+        sold = (
+            _sold(connection, top, first_rated),
+            _sold(connection, tail, first_rated),
+        )
         quads = (
-            _by_day(connection, "quadrants", top),
-            _by_day(connection, "quadrants", tail),
+            _by_day(connection, "quadrants", top, first_rated),
+            _by_day(connection, "quadrants", tail, first_rated),
         )
         finals = (
-            _final(connection, top),
-            _final(connection, tail),
+            _final(connection, top, first_rated),
+            _final(connection, tail, first_rated),
         )
     finally:
         connection.close()
@@ -112,6 +129,9 @@ def measure(database: Path) -> dict[str, str]:
     settled = store.settled()
     return {
         "games": f"{rows['episodes']:,}",
+        "rated_games": f"{rated:,}",
+        "window": f"{dataset.WINDOW}",
+        "since": first_rated,
         "teams": f"{len(ladder):,}",
         "days_rows": f"{rows['days']:,}",
         "orders": f"{rows['orders'] / 1e6:.1f}M",
@@ -128,8 +148,8 @@ def measure(database: Path) -> dict[str, str]:
         "tail_final": f"{finals[1]:,.0f}",
         "premium": f"{100 * (finals[0] / finals[1] - 1):.1f}%",
         "spread": f"{high - low:.1f}",
-        "top": str(TOP),
-        "tail": str(TAIL),
+        "top": str(len(top)),
+        "tail": str(len(tail)),
         "day_heads": "".join(f"<th>d{day}</th>" for day in DAYS),
         "build_rows": _build_rows(build),
         "quad_top": _points(quads[0]),
@@ -145,16 +165,36 @@ def measure(database: Path) -> dict[str, str]:
     }
 
 
+def _ends(ladder: list[tuple]) -> tuple[list[str], list[str]]:
+    """The two ends of the rated field, as disjoint lists of team names.
+
+    Raises:
+        ValueError: If the shares would overlap. A page that compares a group
+            against itself reads as a page that found no difference, which is
+            the one failure that looks like a result.
+    """
+    names = [team for team, *_ in ladder]
+    strong, weak = round(len(names) * TOP_SHARE), round(len(names) * TAIL_SHARE)
+    if strong + weak > len(names):
+        raise ValueError(
+            f"{strong} strongest and {weak} weakest overlap in a field of "
+            f"{len(names)}: the ends of the ladder are not disjoint"
+        )
+    return names[:strong], names[-weak:]
+
+
 def _by_day(
-    connection: sqlite3.Connection, column: str, teams: list[str]
+    connection: sqlite3.Connection, column: str, teams: list[str], first: str
 ) -> list[float]:
     """One column's mean on each shown day, over those teams."""
     marks = ",".join("?" * len(teams))
     return [
         float(
             connection.execute(
-                f"SELECT avg({column}) FROM days WHERE day=? AND team IN ({marks})",  # noqa: S608 - column names are this module's own constants
-                (day, *teams),
+                f"SELECT avg(d.{column}) FROM days d "  # noqa: S608 - column names are this module's own constants
+                f"JOIN episodes e ON e.episode=d.episode "
+                f"WHERE d.day=? AND d.team IN ({marks}) AND e.played>=?",
+                (day, *teams, first),
             ).fetchone()[0]
             or 0.0
         )
@@ -162,19 +202,21 @@ def _by_day(
     ]
 
 
-def _final(connection: sqlite3.Connection, teams: list[str]) -> float:
+def _final(connection: sqlite3.Connection, teams: list[str], first: str) -> float:
     """Mean final bank over those teams' games."""
     marks = ",".join("?" * len(teams))
     return float(
         connection.execute(
-            f"SELECT avg(bank) FROM days WHERE day=29 AND team IN ({marks})",  # noqa: S608
-            teams,
+            f"SELECT avg(d.bank) FROM days d "  # noqa: S608
+            f"JOIN episodes e ON e.episode=d.episode "
+            f"WHERE d.day=29 AND d.team IN ({marks}) AND e.played>=?",
+            (*teams, first),
         ).fetchone()[0]
         or 0.0
     )
 
 
-def _sold(connection: sqlite3.Connection, teams: list[str]) -> list[float]:
+def _sold(connection: sqlite3.Connection, teams: list[str], first: str) -> list[float]:
     """Units sold per side, in six-day bands."""
     marks = ",".join("?" * len(teams))
     found = dict(
@@ -183,8 +225,10 @@ def _sold(connection: sqlite3.Connection, teams: list[str]) -> list[float]:
                        sum(o.quantity)*1.0/count(DISTINCT o.episode||o.seat)
                 FROM orders o JOIN days d
                   ON d.episode=o.episode AND d.seat=o.seat AND d.day=0
-                WHERE o.verb='SELL' AND d.team IN ({marks}) GROUP BY 1""",  # noqa: S608
-            teams,
+                JOIN episodes e ON e.episode=o.episode
+                WHERE o.verb='SELL' AND d.team IN ({marks})
+                  AND e.played>=? GROUP BY 1""",  # noqa: S608
+            (*teams, first),
         ).fetchall()
     )
     return [float(found.get(band, 0.0)) for band in range(BANDS)]

@@ -336,3 +336,77 @@ def test_a_rating_needs_both_enough_games_and_a_path_to_the_field(
     assert "Cameo" not in rated
     # One island or the other, never both: they share no game.
     assert rated in ({"Ada", "Cyd"}, {"Far", "Off"})
+
+
+def dated(tmp_path: Path, days: dict[str, list[tapes.Episode]]) -> Path:
+    """Extract several days of archives at once, keyed by the date each bears."""
+    database = tmp_path / "windowed.sqlite"
+    dataset.build(
+        [
+            archive(tmp_path / f"kaggriculture-episodes-{day}.zip", episodes)
+            for day, episodes in days.items()
+        ],
+        database,
+        workers=1,
+    )
+    return database
+
+
+def test_a_rating_reads_a_window_and_not_the_whole_history(tmp_path: Path) -> None:
+    """Teams that stopped playing before the window are not rated at all.
+
+    The ladder's field turns over inside a fortnight, and Bradley-Terry has no
+    notion of time: fitted over everything it reads "played against the field
+    of three weeks ago" as a strength, and the order it produces stops matching
+    the one the ladder is currently producing. So a rating names a window, and
+    a team outside it is absent rather than stale.
+    """
+    # One team spans both eras. Without it the two days would be disconnected
+    # islands and the fit would drop one of them for that reason instead of
+    # for its date, which is a different rule being tested by accident.
+    database = dated(
+        tmp_path,
+        {
+            "2026-08-01": [game(1, (100.0, 50.0), ["retired", "carried_over"])],
+            "2026-08-30": [game(2, (100.0, 50.0), ["carried_over", "arrived"])],
+        },
+    )
+
+    assert dataset.rate(database, least=1, window=1) == 2
+    assert {row[0] for row in dataset.ladder(database)} == {"carried_over", "arrived"}
+
+    assert dataset.rate(database, least=1, window=99) == 3
+    assert {row[0] for row in dataset.ladder(database)} == {
+        "retired",
+        "carried_over",
+        "arrived",
+    }
+
+
+def test_the_window_counts_back_from_the_newest_archive_not_from_today(
+    tmp_path: Path,
+) -> None:
+    """The first day of the window is read off the data, not off the clock.
+
+    The fetch runs behind the ladder -- four days behind, the morning this was
+    written -- so a window measured from today's date would begin after the
+    last archive ends and select nothing. Counted back from the newest day
+    present, a late fetch narrows the corpus rather than emptying it.
+    """
+    database = dated(
+        tmp_path,
+        {
+            "2026-08-01": [game(1, (100.0, 50.0), ["a", "b"])],
+            "2026-08-02": [game(2, (100.0, 50.0), ["c", "d"])],
+            "2026-08-03": [game(3, (100.0, 50.0), ["e", "f"])],
+        },
+    )
+    connection = sqlite3.connect(database)
+    try:
+        assert dataset.recent(connection, window=1) == "2026-08-03"
+        assert dataset.recent(connection, window=2) == "2026-08-02"
+        # More window than corpus is the whole corpus, not an error: the
+        # window bounds how far back to look, it does not demand days.
+        assert dataset.recent(connection, window=99) == "2026-08-01"
+    finally:
+        connection.close()
