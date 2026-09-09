@@ -13,7 +13,35 @@ import dataclasses
 import os
 from pathlib import Path
 
-from kaggle_environments.envs.kaggriculture.kaggriculture import (
+# One BLAS thread per process, set before anything can import numpy.
+#
+# Measured 2026-09-09: a bare interpreter holds one thread and `import numpy`
+# alone takes it to sixty-four, one per core, because OpenBLAS sizes its pool
+# to the machine. Every evaluation worker imports numpy -- the agents do, if
+# nothing else -- so forty workers were carrying about two thousand five
+# hundred threads across sixty-four cores. `vmstat` showed sixty thousand
+# context switches a second and a run queue of 134, and each worker process was
+# drawing 1.4 cores on average and as much as 3.3, which is why a budget
+# counting *processes* could not keep the box from being oversubscribed.
+#
+# Nothing here wants BLAS parallelism. A game is one sequential simulation and
+# the parallelism that matters is across games, which the process pool already
+# provides; threads inside a worker only contend with the other workers. This
+# is set in `config` because every campaign module imports it first, and it
+# must land before numpy is imported rather than after, since OpenBLAS reads
+# the environment once at import and never again. Workers are spawned fresh
+# with `max_tasks_per_child=1`, so they inherit this and read it on their own
+# import.
+for _pool in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_pool, "1")
+
+from kaggle_environments.envs.kaggriculture.kaggriculture import (  # noqa: E402 - the thread pins above must land before anything imports numpy
     ANIMALS,
     PRODUCTS,
     SHOPS,

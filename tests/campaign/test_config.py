@@ -184,3 +184,36 @@ def test_each_champion_keeps_its_own_file_apart_from_the_floor() -> None:
     """A pool of N champions must be able to hold N different programs."""
     assert config.LIVE.champions != config.LIVE.floor
     assert config.LIVE.floor not in config.LIVE.champions.parents
+
+
+def test_importing_config_pins_the_blas_pool_to_one_thread() -> None:
+    """A worker must not carry a thread pool sized to the whole machine.
+
+    Measured 2026-09-09: a bare interpreter holds one thread and `import numpy`
+    alone takes it to sixty-four, because OpenBLAS sizes its pool to the box.
+    Every evaluation worker imports numpy, so forty of them carried some two
+    and a half thousand threads across sixty-four cores -- a run queue of 134
+    and sixty thousand context switches a second, with each worker drawing 1.4
+    cores where the budget had counted it as one.
+
+    Run in a subprocess because the pin has to land before numpy is imported,
+    and by the time this test runs the suite has long since imported it.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import pathlib\n"
+        "from kaggriculture.campaign import config\n"
+        "import numpy\n"
+        "print([l for l in pathlib.Path('/proc/self/status').read_text()"
+        ".splitlines() if l.startswith('Threads:')][0].split()[1])\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+
+    assert out.stdout.strip() == "1", (
+        f"a worker importing numpy spawned {out.stdout.strip()} threads; the "
+        "pool pin in config is not landing before numpy is imported"
+    )
