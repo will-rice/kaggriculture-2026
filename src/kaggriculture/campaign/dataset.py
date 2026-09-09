@@ -223,20 +223,30 @@ def build(corpus: list[Path], database: Path = DATABASE, workers: int = WORKERS)
     Args:
         corpus: The archives to read, from `tapes.archives`.
         database: Where to write. Replaced, not appended to -- a half-built
-            dataset that looks complete is worse than no dataset.
+            dataset that looks complete is worse than no dataset. Built beside
+            it and renamed over it on success, so the existing corpus survives
+            a failed rebuild.
         workers: Processes to divide the archives over.
 
     Returns:
         How many episodes were read.
     """
-    database.unlink(missing_ok=True)
+    # Built beside the live corpus and renamed over it only once it is whole.
+    # This used to unlink first, and on 2026-09-09 a single unreadable market
+    # order in one archive of twenty-five ended a fifty-five minute extraction
+    # with no corpus at all -- not a stale one, none. The rename is atomic, so
+    # the guarantee that mattered (never a half-built dataset that looks
+    # complete) is kept without the window where there is nothing.
     with tempfile.TemporaryDirectory(dir=database.parent) as scratch:
         shards = [Path(scratch) / f"{archive.stem}.sqlite" for archive in corpus]
+        building = Path(scratch) / "corpus.sqlite"
         with ProcessPoolExecutor(max_workers=min(workers, len(corpus))) as pool:
             done = pool.map(_shard, corpus, shards)
             counts = list(tqdm(done, total=len(corpus), desc="archives"))
         LOGGER.info("read %d episodes; merging %d shards", sum(counts), len(shards))
-        return _merge(shards, database)
+        total = _merge(shards, building)
+        building.replace(database)
+        return total
 
 
 def _shard(archive: Path, out: Path) -> int:

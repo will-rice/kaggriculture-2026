@@ -10,6 +10,8 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import dataset, tapes
 
 HOURS = dataset.HOURS
@@ -126,6 +128,34 @@ def built(tmp_path: Path, episodes: list[tapes.Episode]) -> sqlite3.Connection:
     database = tmp_path / "corpus.sqlite"
     dataset.build([written], database, workers=1)
     return sqlite3.connect(database)
+
+
+def test_a_failed_rebuild_leaves_the_corpus_it_was_replacing(tmp_path: Path) -> None:
+    """A rebuild that raises must not take the working corpus with it.
+
+    On 2026-09-09 one unreadable market order, in one archive of twenty-five,
+    ended a fifty-five minute extraction with no corpus at all -- because the
+    target was unlinked before the first archive was read. Everything
+    downstream reads that file, so a parser surprise in a single episode became
+    an outage: no ratings, no build order, no report.
+    """
+    database = tmp_path / "corpus.sqlite"
+    good = archive(
+        tmp_path / "kaggriculture-episodes-2026-09-01.zip",
+        [game(1, (100.0, 50.0), ["a", "b"])],
+    )
+    dataset.build([good], database, workers=1)
+    before = database.read_bytes()
+
+    # Not a zip at all, so reading it raises rather than yielding no episodes.
+    broken = tmp_path / "kaggriculture-episodes-2026-09-02.zip"
+    broken.write_text("this is not an archive", encoding="utf-8")
+
+    with pytest.raises(Exception):  # noqa: B017 - the pool re-raises the worker's own
+        dataset.build([good, broken], database, workers=1)
+
+    assert database.exists(), "the rebuild destroyed the corpus it was replacing"
+    assert database.read_bytes() == before
 
 
 def test_an_episode_records_who_played_it(tmp_path: Path) -> None:
