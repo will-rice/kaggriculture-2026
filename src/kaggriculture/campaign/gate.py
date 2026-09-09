@@ -200,7 +200,11 @@ def standing(
 
 
 def promotion(
-    standings: dict[str, float], name: str, champion: str | None = None
+    standings: dict[str, float],
+    name: str,
+    champion: str | None = None,
+    *,
+    decisive: int,
 ) -> tuple[bool, str]:
     """Whether the candidate tops the field *and* clears the floor by the margin.
 
@@ -236,6 +240,13 @@ def promotion(
         name: The candidate's name in those standings.
         champion: The floor to beat, or None before there is one, when
             leading the field is the bar.
+        decisive: Games against that floor that ended with a winner. A
+            candidate that drew nearly every game against the agent it is
+            replacing is that agent, whatever the fit says. Required and
+            keyword-only: a default would have to be either zero, which
+            silently blocks every promotion, or large, which silently allows
+            them -- and this gate has already spent seven hours blocked by a
+            condition nobody could see.
 
     Returns:
         Whether to promote, and a reason either way.
@@ -254,6 +265,18 @@ def promotion(
         return True, f"top of {len(ranked)} at {mine:+.3f}, with no floor yet"
     floor = standings[champion]
     gap = mine - floor
+    # Before the margin is read, the games behind it have to exist. The gap is
+    # a rating difference and a rating is fitted over every pairing on the
+    # record, so a candidate can out-rate the floor on its wins against
+    # *ancestors* -- which its parent also beat -- while drawing the floor
+    # itself. That is not an improvement over the floor; it is a re-measurement
+    # of what the floor already had.
+    if decisive < config.DECISIVE_GAMES:
+        return False, (
+            f"top of {len(ranked)} at {mine:+.3f}, {gap:+.3f} above {champion}, "
+            f"but only {decisive} of its games against {champion} were decided "
+            f"and the bar is {config.DECISIVE_GAMES}: the two play the same game"
+        )
     if gap >= config.PROMOTION_MARGIN:
         return True, (
             f"top of {len(ranked)} at {mine:+.3f}, "

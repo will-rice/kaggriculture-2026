@@ -137,13 +137,19 @@ def test_a_candidate_must_out_rate_the_floor_by_the_margin() -> None:
     margin = config.PROMOTION_MARGIN
 
     clear, why = gate.promotion(
-        {"mine": 1.0, "floor": 1.0 - margin, "other": 0.0}, "mine", "floor"
+        {"mine": 1.0, "floor": 1.0 - margin, "other": 0.0},
+        "mine",
+        "floor",
+        decisive=config.DECISIVE_GAMES,
     )
     assert clear and "above floor" in why
 
     # Ahead of the floor, and by less than the bar.
     close, why = gate.promotion(
-        {"mine": 1.0, "floor": 1.0 - margin / 2, "other": 0.0}, "mine", "floor"
+        {"mine": 1.0, "floor": 1.0 - margin / 2, "other": 0.0},
+        "mine",
+        "floor",
+        decisive=config.DECISIVE_GAMES,
     )
     assert not close and "the bar is" in why
 
@@ -157,7 +163,7 @@ def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
     """
     ranked = {"mine": 2.0, "floor": 2.0 - config.PROMOTION_MARGIN / 3, "third": 0.0}
 
-    clear, _ = gate.promotion(ranked, "mine", "floor")
+    clear, _ = gate.promotion(ranked, "mine", "floor", decisive=config.DECISIVE_GAMES)
 
     assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
     assert not clear
@@ -177,7 +183,7 @@ def test_clearing_the_floor_is_not_enough_without_topping_the_field() -> None:
         "floor": 2.0 - 2 * config.PROMOTION_MARGIN,
     }
 
-    clear, why = gate.promotion(ranked, "mine", "floor")
+    clear, why = gate.promotion(ranked, "mine", "floor", decisive=config.DECISIVE_GAMES)
 
     # Comfortably past the floor, and third of four.
     assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
@@ -187,15 +193,21 @@ def test_clearing_the_floor_is_not_enough_without_topping_the_field() -> None:
 
 def test_before_there_is_a_floor_the_field_is_the_bar() -> None:
     """The first promotion of a run has nothing to be a margin above."""
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None)[0]
-    assert not gate.promotion({"mine": 0.4, "a": 0.5}, "mine", None)[0]
+    enough = config.DECISIVE_GAMES
+    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None, decisive=enough)[0]
+    assert not gate.promotion({"mine": 0.4, "a": 0.5}, "mine", None, decisive=enough)[0]
     # And a floor the fit has never heard of is no floor either.
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", "gone")[0]
+    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", "gone", decisive=enough)[0]
+    # No floor means nothing to be indistinguishable from, so the decisive
+    # bar has nothing to say and a fresh run is not blocked by it.
+    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None, decisive=0)[0]
 
 
 def test_second_place_is_not_promoted_however_close() -> None:
     """A floor that rose on anything but the best would not be the best."""
-    ok, why = gate.promotion({"a": 0.9001, "c": 0.9000, "b": -0.5}, "c")
+    ok, why = gate.promotion(
+        {"a": 0.9001, "c": 0.9000, "b": -0.5}, "c", decisive=config.DECISIVE_GAMES
+    )
 
     assert not ok
     assert "2 of 3" in why and "below a" in why
@@ -208,7 +220,11 @@ def test_the_reason_says_where_it_placed_not_who_it_failed_to_beat() -> None:
     beat, which for a program that beat none of them was the whole pool and
     told it nothing about which to attack first.
     """
-    ok, why = gate.promotion({"a": 2.0, "b": 1.0, "c": 0.0, "mine": -1.0}, "mine")
+    ok, why = gate.promotion(
+        {"a": 2.0, "b": 1.0, "c": 0.0, "mine": -1.0},
+        "mine",
+        decisive=config.DECISIVE_GAMES,
+    )
 
     assert not ok
     assert why.startswith("4 of 4")
@@ -225,7 +241,9 @@ def test_one_bad_matchup_does_not_sink_a_top_rating() -> None:
     # `mine` is rated top despite the standings being the only thing the gate
     # reads -- the rate that would have failed an absolute rule is inside the
     # fit, not beside it.
-    assert gate.promotion({"mine": 1.5, "a": 1.0, "b": 0.2}, "mine")[0]
+    assert gate.promotion(
+        {"mine": 1.5, "a": 1.0, "b": 0.2}, "mine", decisive=config.DECISIVE_GAMES
+    )[0]
 
 
 def test_the_standings_are_over_the_pool_and_nothing_else() -> None:
@@ -237,7 +255,9 @@ def test_the_standings_are_over_the_pool_and_nothing_else() -> None:
     """
     candidate = result("c", 0.8, {"a": 0.9, "b": 0.8})
 
-    assert gate.promotion({"c": 1.0, "a": 0.1, "b": -0.4}, "c")[0]
+    assert gate.promotion(
+        {"c": 1.0, "a": 0.1, "b": -0.4}, "c", decisive=config.DECISIVE_GAMES
+    )[0]
     assert set(candidate.rates) == {"a", "b"}
 
 
@@ -497,3 +517,39 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     )
     gate.enroll(gate.record(champion, paths), reloaded, paths)
     assert champion.name == "champion_2"
+
+
+def test_a_candidate_that_draws_the_floor_is_the_floor() -> None:
+    """Out-rating the champion is not the same as beating it.
+
+    The numbers are champion_55's, measured 2026-09-08. It was promoted over
+    champion_54 on a rating gap the bar reads as "about a 54% head-to-head".
+    Their thirty-two games were two wins by five units and thirty exact draws:
+    the same program, plus a rounding error. A rating is fitted over every
+    pairing on the record, so the gap came from beating *ancestors* -- which
+    champion_54 also beat -- while the pairing that decides whether anything
+    improved was drawn.
+    """
+    ranked = {"mine": 2.0, "floor": 2.0 - 2 * config.PROMOTION_MARGIN, "old": 0.0}
+
+    stuck, why = gate.promotion(ranked, "mine", "floor", decisive=2)
+
+    # Top of the field and comfortably past the margin -- the old bar, cleared.
+    assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
+    assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
+    assert not stuck
+    assert "the two play the same game" in why
+
+
+def test_the_decisive_bar_is_read_on_games_not_on_the_rate() -> None:
+    """Only one of the two shapes behind a rate of 0.53125 is evidence.
+
+    Thirty draws and two wins score exactly as seventeen wins and fifteen
+    losses do. So the bar counts games that ended with a winner. The same candidate, the
+    same rating gap, and the only thing that differs is whether the pairing
+    was ever decided.
+    """
+    ranked = {"mine": 2.0, "floor": 2.0 - 2 * config.PROMOTION_MARGIN, "old": 0.0}
+
+    assert not gate.promotion(ranked, "mine", "floor", decisive=2)[0]
+    assert gate.promotion(ranked, "mine", "floor", decisive=32)[0]

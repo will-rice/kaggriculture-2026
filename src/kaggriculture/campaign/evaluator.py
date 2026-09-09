@@ -61,8 +61,12 @@ class Result(BaseModel):
             has trimmed the last of them away.
         rates: Win rate per pool opponent, ties as half.
         margins: Bank margin per pool opponent.
-        intervals: Wilson interval per pool opponent, so a rate is read with
-            the width of the thing behind it.
+        intervals: Wilson interval per pool opponent, over the decisive games
+            alone, so a rate is read with the width of the evidence actually
+            behind it rather than of the games played.
+        decisive: Games against each opponent that were not draws. The
+            denominator any claim about a difference has to use, and the one
+            thing that separates a candidate from a copy of its parent.
         games: Games played against each opponent: ``2 * GATE_SEEDS``.
         seeds: The seeds drawn for this call. Fresh every time, which is what
             makes every measurement a held-out one.
@@ -83,6 +87,7 @@ class Result(BaseModel):
     rates: dict[str, float]
     margins: dict[str, harness.Margin]
     intervals: dict[str, tuple[float, float]] = {}
+    decisive: dict[str, int] = {}
     games: int = 0
     seeds: list[int]
     hardest: str
@@ -103,6 +108,29 @@ def _rates(games: list[harness.Game], names: list[str]) -> dict[str, float]:
             1.0 if g.ours > g.theirs else 0.5 if g.ours == g.theirs else 0.0
             for g in mine
         ) / len(mine)
+    return out
+
+
+def _contested(
+    games: list[harness.Game], names: list[str]
+) -> dict[str, tuple[int, int]]:
+    """Wins and decisive games against each opponent; draws count in neither.
+
+    A draw says the two sides played the same game, not that they were evenly
+    matched, and counting it as half a win makes thirty draws and two wins
+    read exactly like seventeen wins and fifteen losses -- 0.53125 either way.
+    The first is one agent measured against a copy of itself; the second is
+    two agents that genuinely trade games. Everything downstream that asks
+    "is this different from what we have" needs to tell them apart, and this
+    is the only number that does.
+    """
+    out = {}
+    for name in names:
+        decided = [
+            game for game in games if game.opponent == name and game.ours != game.theirs
+        ]
+        won = sum(1 for game in decided if game.ours > game.theirs)
+        out[name] = (won, len(decided))
     return out
 
 
@@ -195,6 +223,7 @@ def score(
     seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
     games = harness.play(agent, names, seeds, workers, days=True, pool=pool_file)
     rates = _rates(games, names)
+    contested = _contested(games, names)
     # Ties on the rate are broken by the margin, because before the first win
     # every rate is 0.0 and `min` would otherwise always name the first pool
     # key -- so every session would be shown the same opponent rather than the
@@ -219,8 +248,16 @@ def score(
         rates=rates,
         margins=margins,
         intervals={
-            name: wilson_interval(rate * played, played) for name, rate in rates.items()
+            # Over the decisive games, not over every game played. The guard
+            # this width exists to provide was computed on `played`, which
+            # claimed thirty-two games of confidence for a pairing that
+            # decided two. `wilson_interval` returns the whole unit interval
+            # at zero games, which is the right answer for a pairing that
+            # drew every time: no evidence either way.
+            name: wilson_interval(won, decided)
+            for name, (won, decided) in contested.items()
         },
+        decisive={name: decided for name, (_, decided) in contested.items()},
         games=played,
         seeds=seeds,
         hardest=hardest,

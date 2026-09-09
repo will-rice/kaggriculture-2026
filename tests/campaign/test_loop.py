@@ -245,6 +245,10 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             rates=dict.fromkeys(names, rate),
             margins=dict.fromkeys(names, harness.Margin(mean=0.0, worst=0.0, best=0.0)),
             intervals=dict.fromkeys(names, (0.0, 1.0)),
+            # Every game decided. A stub that left this empty would be a
+            # candidate indistinguishable from the floor, which the gate
+            # refuses -- correctly, and not what any of these tests is about.
+            decisive=dict.fromkeys(names, config.DECISIVE_GAMES),
             games=2,
             seeds=[1],
             hardest=names[0],
@@ -1017,6 +1021,7 @@ def _gate_result(
         intervals={
             n: (max(0.0, r - 0.05), min(1.0, r + 0.05)) for n, r in rates.items()
         },
+        decisive=dict.fromkeys(rates, config.DECISIVE_GAMES),
         games=4,
         seeds=[1],
         hardest=min(rates, default=""),

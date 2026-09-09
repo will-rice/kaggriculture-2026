@@ -469,6 +469,15 @@ class Campaign:
             message = prompt.compose(
                 name, result, failures, siblings, instruction, standings
             )
+            # The floor as it stands *before* the round, because that is the
+            # one the round's result is measured against. Read after instead
+            # and a round that promoted is asked whether it beats itself: the
+            # gate inside `round` has already enrolled it, so `floor()` names
+            # this very program, `result` has no games against it, and the
+            # question is incoherent. It went unnoticed while the answer was
+            # accidentally right -- the freshly enrolled champion had no
+            # pairings, so the fit gave it a rating this program cleared.
+            floor = self.floor()
             outcome = await self.round(source, name, result, message, drawn)
             rounds += 1
             if outcome is None:
@@ -477,7 +486,8 @@ class Campaign:
             cleared, why = gate.promotion(
                 gate.standing(name, result.rates, 2 * config.GATE_SEEDS, self.paths),
                 name,
-                self.floor(),
+                floor,
+                decisive=result.decisive.get(floor or "", 0),
             )
             if cleared:
                 LOGGER.info("%s %s: the session is done", name, why)
@@ -672,7 +682,9 @@ class Campaign:
                     }
                 )
                 return
-            verdict, why = gate.promotion(table, program_id, self.floor())
+            verdict, why = gate.promotion(
+                table, program_id, floor, decisive=result.decisive.get(floor or "", 0)
+            )
             if verdict:
                 LOGGER.info("%s %s", program_id, why)
                 # The file work in a thread; the pool it joins on the loop,
@@ -867,6 +879,13 @@ class Campaign:
                 result.program_id
             ),
             "gate/pool": len(result.rates),
+            # How much of this candidate's verdict against the floor rests on
+            # games that were actually decided. A run whose candidates keep
+            # drawing the floor is a run that has stopped producing new
+            # programs, and until this was recorded there was no way to see
+            # that from the outside -- the win rates looked like 0.53 either
+            # way.
+            "gate/decisive": result.decisive.get(baseline.name if baseline else "", 0),
             **{f"gate/rate/{name}": rate for name, rate in result.rates.items()},
             **{f"gate/margin/{n}": m.mean for n, m in result.margins.items()},
         }

@@ -268,7 +268,7 @@ def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:
 
     text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
 
-    assert f"It {gate.promotion(standings, 'champion_1')[1]}." in text
+    assert f"It {gate.promotion(standings, 'champion_1', decisive=0)[1]}." in text
     # Last of three, and told which agent is above it rather than merely that
     # it lost: a place is something the next round can aim to improve.
     assert "3 of 3" in text
@@ -290,7 +290,7 @@ def test_a_program_that_clears_the_bar_is_told_by_how_much() -> None:
 
     text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
 
-    assert f"It {gate.promotion(standings, 'champion_1')[1]}." in text
+    assert f"It {gate.promotion(standings, 'champion_1', decisive=0)[1]}." in text
     # No floor in these standings, so leading the field is the bar.
     assert "with no floor yet" in text
     # Topping it *is* the promotion now; there is no second block to clear,

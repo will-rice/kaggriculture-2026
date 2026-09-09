@@ -157,6 +157,23 @@ GATE_CONTENDERS = 6
 # the guard: 78 of 471 programs once topped a noisy gate and none of them
 # survived a deeper measurement.
 PROMOTION_MARGIN = 0.15
+# The fewest games a candidate must actually decide against the floor before
+# the margin above means anything.
+#
+# Measured 2026-09-08. champion_55 was promoted over champion_54 on a rating
+# gap that the bar above reads as "about a 54% head-to-head". Their thirty-two
+# games were two wins by five units and thirty exact draws: the two programs
+# play the same game. A draw scores as half a win, so thirty draws and two
+# wins come to 0.53125 -- the same number as seventeen wins and fifteen
+# losses, which is two agents genuinely trading games rather than one agent
+# and a copy of itself. Bradley-Terry cannot tell those apart, and the Wilson
+# guard beside it was claiming thirty-two games of confidence for a pairing
+# that decided two.
+#
+# Eight of thirty-two is a quarter. Below that the two programs are the same
+# program and there is nothing to promote; above it the margin above is being
+# read on games that happened.
+DECISIVE_GAMES = 8
 # How many of the database's best a session may start from, and how sharply
 # the draw favours the better ones: weight `PARENT_DECAY ** rank`, so the best
 # is taken about half the time, the second a quarter, and the tenth almost

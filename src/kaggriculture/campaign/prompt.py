@@ -640,7 +640,12 @@ def compose(
         The whole message, for codex's standard input.
     """
     rival = _rival(name, standings, result.states)
-    cleared, why = gate.promotion(standings, name)
+    # No floor is passed, so this asks only whether the program tops the
+    # field -- which is the half of the verdict worth putting in front of a
+    # model. The decisive bar guards the other half, replacing the agent that
+    # stands, and with no floor named there is nothing to be indistinguishable
+    # from; zero is the right value and the branch above never reads it.
+    cleared, why = gate.promotion(standings, name, decisive=0)
     # Opened here rather than at import, so a store the daily measurement
     # has rewritten reaches a campaign that is already running.
     claims = selected(strategy.Strategies(strategy.STORE), result.states)

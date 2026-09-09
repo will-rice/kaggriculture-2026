@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, evaluator, pool
+from kaggriculture.campaign import config, evaluator, harness, pool
 
 # Fits the smallest box the suite runs on: CORE_BUDGET clamps to 1 on a
 # 4-core CI runner.
@@ -176,3 +176,49 @@ def test_a_pool_of_champions_has_no_field_and_that_is_not_fatal() -> None:
     assert evaluator.vendored_field({"champion_1": 0.5, "champion_2": 0.9}) is None
     # And it is still the mean while any of them remain.
     assert evaluator.vendored_field({"champion_1": 0.5, "v54": 0.8}) == 0.8
+
+
+def played(opponent: str, banks: list[tuple[float, float]]) -> list[harness.Game]:
+    """Games against one opponent, as (ours, theirs) final banks."""
+    return [
+        harness.Game(
+            opponent=opponent,
+            seed=seed,
+            seat=seed % 2,
+            ours=ours,
+            theirs=t,
+            worst_step_seconds=0.0,
+        )
+        for seed, (ours, t) in enumerate(banks)
+    ]
+
+
+def test_a_draw_is_not_half_a_win_when_the_question_is_whether_anything_differs() -> (
+    None
+):
+    """The two shapes that share a rate of 0.53125, told apart.
+
+    Champion_55 against champion_54, measured 2026-09-08: two wins by five
+    units and thirty exact draws. It scores the same as seventeen wins and
+    fifteen losses, and only the second is two agents trading games. The rate
+    cannot separate them, so the count of games that ended with a winner has
+    to.
+    """
+    twin = played("t", [(5.0, 0.0)] * 2 + [(7.0, 7.0)] * 30)
+    rival = played("r", [(5.0, 0.0)] * 17 + [(0.0, 5.0)] * 15)
+
+    assert evaluator._rates(twin, ["t"])["t"] == evaluator._rates(rival, ["r"])["r"]
+
+    assert evaluator._contested(twin, ["t"]) == {"t": (2, 2)}
+    assert evaluator._contested(rival, ["r"]) == {"r": (17, 32)}
+
+
+def test_a_pairing_that_drew_every_game_has_no_evidence_either_way() -> None:
+    """Not a narrow interval around a half -- the whole unit interval.
+
+    Thirty-two draws say the two programs played the same game, which is no
+    evidence about which is stronger. The width has to say so, or the guard
+    built on it reports certainty exactly where there is none.
+    """
+    assert evaluator._contested(played("t", [(7.0, 7.0)] * 32), ["t"]) == {"t": (0, 0)}
+    assert evaluator.wilson_interval(0, 0) == (0.0, 1.0)
