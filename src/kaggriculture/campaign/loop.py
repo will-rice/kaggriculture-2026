@@ -36,6 +36,7 @@ the ``campaign loop`` entry point and pytest all do.
 import argparse
 import asyncio
 import logging
+import math
 import random
 import shutil
 import signal
@@ -812,6 +813,8 @@ class Campaign:
         draw below -- which is why that draw has to be a selection and not a
         shuffle.
         """
+        if self.rng.random() < config.SCRATCH_CHANCE:
+            return self.scratch()
         champion = self.state.champion
         if champion is not None and not stagnant:
             return Path(champion.path), champion.name
@@ -820,6 +823,40 @@ class Campaign:
         weights = [config.PARENT_DECAY**rank for rank in range(len(candidates))]
         program = self.rng.choices(candidates, weights=weights)[0]
         return Path(program.source_path), program.id
+
+    def scratch(self) -> tuple[Path, str]:
+        """A session that begins outside the champion's ancestry.
+
+        Every champion descends from `config.SEED`, a harvested public agent,
+        so every round edits one program's sixty-fifth-generation descendant
+        and no instruction reaches outside that basin. This is the only
+        starting point the campaign has that does not.
+
+        The scratch lineage is parented from its own best rather than from the
+        database's, and that is what makes it more than a lottery ticket. A
+        program that begins from nothing rates far below a champion, and
+        `Database.top` ranks on rating -- so without this it would be scored
+        once, never drawn again, and the lineage would die in a single session
+        however promising it was. Parented from itself it gets a ratchet of its
+        own, and joins the global draw when its rating earns a place there
+        rather than being asked to earn one immediately.
+
+        Returns:
+            The program to start from and the name it goes by: the best
+            scratch-descended program, or the blank slate when there is none.
+        """
+        grown = self.database.descendants(config.SCRATCH_ID)
+        if grown:
+            best = max(
+                grown,
+                key=lambda program: (
+                    program.rating if program.rating is not None else -math.inf,
+                    archive.mean_margin(program),
+                ),
+            )
+            return Path(best.source_path), best.id
+        blank = self.database.store(config.SCRATCH_AGENT, config.SCRATCH_ID)
+        return blank, config.SCRATCH_ID
 
     def fail(self, started_from: str, instruction: str, reason: str) -> None:
         """Record an attempt that produced no program, and say why."""

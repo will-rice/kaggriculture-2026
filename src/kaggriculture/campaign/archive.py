@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from kaggriculture.campaign.harness import Margin
 
 
-def _mean_margin(program: "Program") -> float:
+def mean_margin(program: "Program") -> float:
     """Mean bank margin across the opponents a program was measured on.
 
     The tie-break behind `Database.top`. A program with no margins scores
@@ -196,7 +196,7 @@ class Database:
             self._programs.values(),
             key=lambda p: (
                 p.rating if p.rating is not None else -math.inf,
-                _mean_margin(p),
+                mean_margin(p),
             ),
             reverse=True,
         )[:k]
@@ -211,9 +211,30 @@ class Database:
         """
         return sorted(
             (p for p in self._programs.values() if p.started_from == program_id),
-            key=lambda p: (p.fitness, _mean_margin(p)),
+            key=lambda p: (p.fitness, mean_margin(p)),
             reverse=True,
         )
+
+    def descendants(self, root: str) -> list[Program]:
+        """Every program grown from ``root``, however many generations down.
+
+        One forward pass is enough because programs are added in the order
+        they were written and a child is always added after its parent, so a
+        parent is already in the family by the time its children are read.
+
+        Args:
+            root: The id or name the lineage starts from.
+
+        Returns:
+            The lineage, oldest first, excluding ``root`` itself.
+        """
+        family = {root}
+        out = []
+        for program in self._programs.values():
+            if program.started_from in family:
+                family.add(program.id)
+                out.append(program)
+        return out
 
     def get(self, program_id: str) -> Program:
         """Return the program `program_id`.

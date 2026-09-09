@@ -250,6 +250,47 @@ DECISIVE_GAMES = 8
 PARENT_POOL = 10
 PARENT_DECAY = 0.5
 
+# How often a session begins from nothing instead of from the champion.
+#
+# Every champion this campaign has produced is an edit of an edit of `SEED`,
+# which is a harvested public agent -- one program's descendants, sixty-five
+# generations deep. That is the monoculture at its root, and no instruction
+# escapes it, because a round is handed the champion and asked to improve it.
+#
+# The case is structural, not empirical, and it is worth being exact about
+# which. It is tempting to point at champion_1 scoring 2086.8 and champion_48
+# scoring 1963.3 and say sixty-five generations bought nothing -- but those are
+# different days, and the same bytes have scored 2386.8 and 1555.8 five days
+# apart, so that comparison measures the field moving rather than the lineage
+# standing still. Even the same-day pair, champion_47 at 2005.9 and
+# champion_48 at 1963.3, sits inside a noise floor where identical agents have
+# landed 455 and 512 apart.
+#
+# What is established is narrower and does not need the leaderboard: every
+# champion is an edit of an edit of one harvested public agent, and neither
+# signal we have can currently tell us whether that is working. The ladder
+# score moves with the field; the gate's own rating over-claims by about five
+# points of win rate against exactly the opponents that predict the ladder,
+# because most of its evidence is the lineage measuring itself. Diversity here
+# is a hedge against being stuck without being able to see it, which is a
+# weaker claim than "the lineage is stuck" and the one the evidence supports.
+#
+# One session in eight. It is a real cost -- an eighth of the quota, on
+# programs that begin unable to play -- so it is written here as a number to
+# turn down rather than buried in the loop.
+SCRATCH_CHANCE = 0.125
+# The name the blank slate goes by, and the root every scratch lineage is
+# traced back to.
+SCRATCH_ID = "scratch"
+# The blank slate itself: a policy that passes every turn. Not an empty file,
+# which nothing downstream can score, and not `SEED`, which is the ancestry
+# being escaped. It loses every game it plays, which is the point -- what it
+# has that a champion does not is no commitments.
+SCRATCH_AGENT = (
+    "def agent(observation, configuration=None):\n"
+    "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+)
+
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40

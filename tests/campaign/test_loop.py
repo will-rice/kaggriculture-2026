@@ -1594,6 +1594,91 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     assert len(set(drawn)) >= 3
 
 
+def test_a_scratch_session_is_parented_from_the_scratch_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The niche is what makes a blank start more than a lottery ticket.
+
+    A program that begins from nothing rates far below a champion, and
+    `Database.top` ranks on rating -- so parented from the database's best, a
+    scratch session would start from the champion's lineage every time after
+    the first and the blank start would never compound. Parented from its own
+    best it gets a ratchet of its own.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path, paths)
+    stub_evaluator(monkeypatch)
+    monkeypatch.setattr(config, "SCRATCH_CHANCE", 1.0)
+    database = archive.Database(paths.archive, paths.programs)
+    # The champion's lineage, rated far above anything a blank start reaches.
+    for name, parent, standing in (
+        ("champ", "seed", 5.0),
+        ("sprout", config.SCRATCH_ID, -4.0),
+        ("sapling", "sprout", -3.0),
+    ):
+        source = database.store(f"{PASS}# {name}\n", name)
+        database.add(
+            archive.Program(
+                id=name,
+                source_path=str(source),
+                started_from=parent,
+                instruction="tune",
+                model="m",
+                fitness=0.5,
+                field=0.5,
+                rating=standing,
+                created=1.0,
+            )
+        )
+    campaign = loop.Campaign(
+        loop.State(),
+        database,
+        pass_pool(tmp_path, paths),
+        mutate.FakeMutator(edit=lambda source: source),
+        WORKERS,
+        random.Random(3),
+        log,
+        paths,
+    )
+
+    _, name = campaign.start(stagnant=False)
+
+    # The best of the scratch lineage, two generations down -- never `champ`,
+    # which out-rates every one of them by nine log-odds.
+    assert name == "sapling"
+
+
+def test_the_first_scratch_session_begins_from_the_blank_slate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """With no scratch lineage yet, there is nothing to parent from.
+
+    The blank is a policy that passes every turn rather than an empty file:
+    nothing downstream can score an empty file, and `SEED` is the ancestry
+    being escaped, so it cannot be the fallback either.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path, paths)
+    stub_evaluator(monkeypatch)
+    monkeypatch.setattr(config, "SCRATCH_CHANCE", 1.0)
+    campaign = loop.Campaign(
+        loop.State(),
+        archive.Database(paths.archive, paths.programs),
+        pass_pool(tmp_path, paths),
+        mutate.FakeMutator(edit=lambda source: source),
+        WORKERS,
+        random.Random(5),
+        log,
+        paths,
+    )
+
+    source, name = campaign.start(stagnant=False)
+
+    assert name == config.SCRATCH_ID
+    assert source.read_text(encoding="utf-8") == config.SCRATCH_AGENT
+    assert "PASS" in config.SCRATCH_AGENT
+
+
 def _record_campaign(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> loop.Campaign:
