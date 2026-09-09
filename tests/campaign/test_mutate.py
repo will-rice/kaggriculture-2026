@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import mutate
+from kaggriculture.campaign import config, mutate
 
 # A codex that says nothing but a well-formed transcript, so the no-output
 # path can be read without spending a call.
@@ -312,3 +312,39 @@ def test_real_codex_writes_a_child(tmp_path: Path) -> None:
     assert result.child is not None
     assert "def agent" in (box / "child.py").read_text()
     assert result.input_tokens > 0 and result.output_tokens > 0
+
+
+def test_the_reasoning_effort_is_passed_on_every_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A constant nothing passes is a setting that does not exist.
+
+    The effort was never passed at all: codex took it from
+    ``~/.codex/config.toml``, which belongs to the host and is edited for the
+    host's own interactive use. So the loop's reasoning depth was whatever
+    somebody last set for themselves, and a campaign could change behaviour
+    between restarts with nothing in its own tree changing.
+
+    Exercised through a real ``codex`` on PATH rather than a substituted
+    COMMAND, because the flags are only appended when the command *is* codex
+    -- which is exactly the branch a substituted COMMAND skips.
+    """
+    box = workspace(tmp_path)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    shim = binaries / "codex"
+    shim.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\ncat > /dev/null\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    argv = tmp_path / "argv.txt"
+    monkeypatch.setenv("PATH", f"{binaries}:{os.environ['PATH']}")
+    monkeypatch.setenv("ARGV_OUT", str(argv))
+
+    asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p12"))
+
+    passed = argv.read_text(encoding="utf-8").splitlines()
+    assert f"model_reasoning_effort={config.CODEX_REASONING}" in passed
+    # Beside the model, so a call names both rather than inheriting either.
+    assert config.CODEX_MODEL in passed

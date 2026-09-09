@@ -335,6 +335,20 @@ CODEX_MODEL = "gpt-6-astra"
 # all -- and which matters more now that astra is the primary rather than the
 # thing being fallen back from.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
+# How hard the model is asked to think, passed on every call.
+#
+# Astra offers low, medium, high, xhigh, max and ultra, and defaults to medium.
+# The campaign was not running at medium, though, and not at anything it chose:
+# `~/.codex/config.toml` sets `model_reasoning_effort = "high"` for the host's
+# own interactive use, and every campaign call inherited it. That is the same
+# shape of coupling as a round inheriting the host's skills -- the loop's
+# behaviour changing because a file it does not own changed -- and it is worth
+# closing whatever the value is.
+#
+# `max` is "maximum reasoning depth for the hardest problems". Above it sits
+# `ultra`, which adds automatic task delegation; that is a different execution
+# shape rather than more thinking, and a round already has a shape.
+CODEX_REASONING = "max"
 SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The database id of the program a cold start seeds itself from. The copy the
 # cold start writes under a run's `programs` is the campaign's lineage: every

@@ -241,6 +241,10 @@ class CodexMutator:
         command = [*self.COMMAND]
         if command[0] == "codex":
             command += ["-m", model, "-C", str(workspace)]
+            # Passed per call rather than left to `~/.codex/config.toml`, so
+            # the campaign's effort is the campaign's decision and does not
+            # move when the host edits its own codex settings.
+            command += ["-c", f"model_reasoning_effort={config.CODEX_REASONING}"]
         log = workspace / "codex.jsonl"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
