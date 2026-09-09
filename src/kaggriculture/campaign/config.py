@@ -259,29 +259,40 @@ STAGNATION_SESSIONS = 40
 # model or a provider outage, looking busy and producing nothing. Eight is
 # one per worker: a single bad call is noise, eight is the machine.
 NO_VERDICT_LIMIT = 8
-# The cheap model, on purpose. `gpt-6-astra` is the strongest this login has
-# and is not used: the first campaign spent nearly all of a quota on it, and
-# quota is the constraint that binds here rather than capability. `terra` was
-# tried briefly and reverted for the same reason.
+# The strongest model this login has, on trial from 2026-09-09.
 #
-# The 381-program block that ran on this model is not evidence against it. A
-# session drew its starting program uniformly from the best ten for the whole
-# of it, which is barely selection, and 95% of every rate measured was
-# saturated at nought or one. That search ran on a broken hill, so "setup or
-# model?" is still open -- and it is the search that is being fixed first,
-# because a stronger model climbing the same broken hill would only cost more
-# to learn the same thing.
+# It was held back deliberately and the reason still stands: the first campaign
+# spent nearly all of a quota on it, and quota binds here rather than
+# capability. `terra` was tried briefly and reverted for the same reason. The
+# condition set on revisiting it was that the search be fixed first, because a
+# stronger model climbing a broken hill only costs more to learn the same
+# thing.
+#
+# That condition is now largely met. The gate no longer promotes a candidate
+# that merely draws the champion, so a generation of behavioural twins cannot
+# ratchet the floor; every vendored opponent is played every gate, so a
+# candidate is measured against the field rather than against its own lineage;
+# and the ratings are fitted over a ten-day window, so "played early" is no
+# longer read as "strong". The hill the model climbs is a different shape than
+# the one the 381-program block ran on.
+#
+# So this is an experiment with a cost, not a default. What it is being judged
+# on is promotions per session and the gate score of what it writes -- not the
+# gate rate, which is bounded by the arena rather than by the model. Revert to
+# `gpt-5.6-luna` when the quota matters more than the answer; the fallback
+# below is unchanged and still cheap.
 #
 # `mutate.validate_model` checks this against the login's own catalog at
 # startup, because a typo here is hundreds of failed sessions discovered one
 # at a time -- not hypothetical: this login accepts `gpt-6-astra` but refuses
 # `gpt-5.6-astra` (probed 2026-09-05 on codex 0.153).
-CODEX_MODEL = "gpt-5.6-luna"
+CODEX_MODEL = "gpt-6-astra"
 # The model retried once, in the same directory, when the first model's call
 # fails without a verdict -- a provider refusal or a codex crash -- so the
-# round still gets a child. Astra answered "Selected model is at capacity"
-# some of the time (two calls in the first live hour), which is why this
-# exists at all.
+# round still gets a child. Astra answered "Selected model is at capacity" some
+# of the time (two calls in the first live hour), which is why this exists at
+# all -- and which matters more now that astra is the primary rather than the
+# thing being fallen back from.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The database id of the program a cold start seeds itself from. The copy the

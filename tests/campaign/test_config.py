@@ -118,7 +118,7 @@ def test_constants_match_the_spec_table() -> None:
     # A bar with units in it. A rank had none, and promoted on a hair.
     assert config.PROMOTION_MARGIN > 0
     assert config.STAGNATION_SESSIONS == 40
-    assert config.CODEX_MODEL == "gpt-5.6-luna"
+    assert config.CODEX_MODEL == "gpt-6-astra"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
 
 
