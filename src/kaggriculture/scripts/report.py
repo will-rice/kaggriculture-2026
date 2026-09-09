@@ -61,6 +61,17 @@ SHOWN = (
 )
 BANDS = 5
 BAND = 6
+# Our own team name in the replay archive. Our ladder games land in the public
+# corpus like everyone else's, so the campaign's agents can be rated in the
+# same Bradley-Terry fit, over the same window, against the same opponents --
+# which is the one measurement of our own progress that does not move when the
+# field does. A ladder score cannot do that: the same bytes scored 2386.8 and
+# 1555.8 five days apart, and identical agents have landed 455 and 512 apart on
+# the same day.
+#
+# Kept here rather than in `config` because only this page reads it, and
+# `config` is imported by every worker of a running loop.
+TEAM = "kaggricodex"
 
 
 def main() -> None:
@@ -128,6 +139,7 @@ def measure(database: Path) -> dict[str, str]:
             _final(connection, tail, first_rated),
         )
         trailing, crossover = _crossing(connection, top, tail, first_rated)
+        ours = _ours(connection, first_rated, ladder)
     finally:
         connection.close()
 
@@ -137,6 +149,7 @@ def measure(database: Path) -> dict[str, str]:
         "games": f"{rows['episodes']:,}",
         "rated_games": f"{rated:,}",
         "window": f"{dataset.WINDOW}",
+        **ours,
         "since": first_rated,
         "bank_story": _bank_story(trailing, crossover),
         "thin_until": "no point" if crossover is None else f"day {crossover}",
@@ -189,6 +202,65 @@ def _ends(ladder: list[tuple]) -> tuple[list[str], list[str]]:
             f"{len(names)}: the ends of the ladder are not disjoint"
         )
     return names[:strong], names[-weak:]
+
+
+def _ours(
+    connection: sqlite3.Connection, first: str, ladder: list[tuple]
+) -> dict[str, str]:
+    """Our own team's standing in the window, rated or not yet.
+
+    Shown below the threshold as well as above it, because the interesting
+    part is watching it fill: `dataset.LEAST` games is two or three days of
+    ladder play, and until then the campaign has no era-controlled measurement
+    of itself at all.
+
+    Args:
+        connection: The dataset.
+        first: The first day of the rating window.
+        ladder: The rated field, best first, to place ourselves against.
+
+    Returns:
+        The facts the page states about us, already formatted.
+    """
+    played, won = connection.execute(
+        "SELECT count(*), sum(CASE WHEN (team_0 = ? AND winner = 0) "
+        "OR (team_1 = ? AND winner = 1) THEN 1 ELSE 0 END) "
+        "FROM episodes WHERE (team_0 = ? OR team_1 = ?) AND played >= ?",
+        (TEAM, TEAM, TEAM, TEAM, first),
+    ).fetchone()
+    played, won = int(played or 0), int(won or 0)
+    rated = {team: value for team, value, *_ in ladder}
+    days = connection.execute(
+        "SELECT played, count(*), sum(CASE WHEN (team_0 = ? AND winner = 0) "
+        "OR (team_1 = ? AND winner = 1) THEN 1 ELSE 0 END) "
+        "FROM episodes WHERE (team_0 = ? OR team_1 = ?) AND played >= ? "
+        "GROUP BY played ORDER BY played",
+        (TEAM, TEAM, TEAM, TEAM, first),
+    ).fetchall()
+    if TEAM in rated:
+        place = 1 + sorted(rated.values(), reverse=True).index(rated[TEAM])
+        standing = (
+            f"<strong>{rated[TEAM]:+.3f}</strong> log-odds, "
+            f"{173.7 * rated[TEAM]:+,.0f} Elo — {place} of {len(rated)}"
+        )
+    else:
+        short = max(0, dataset.LEAST - played)
+        standing = (
+            f"not yet rated: {played} games of the {dataset.LEAST} a rating "
+            f"needs, {short} short"
+        )
+    return {
+        "ours_team": TEAM,
+        "ours_standing": standing,
+        "ours_games": f"{played:,}",
+        "ours_rate": "—" if not played else f"{won / played:.1%}",
+        "ours_days": "".join(
+            f"<tr><td>{day}</td><td>{count:,}</td><td>{wins:,}</td>"
+            f"<td>{wins / count:.1%}</td></tr>"
+            for day, count, wins in days
+        )
+        or '<tr><td colspan="4">no games in the window yet</td></tr>',
+    }
 
 
 def _crossing(
