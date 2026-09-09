@@ -92,6 +92,15 @@ class Pool(BaseModel):
         What it plays has to be chosen rather than drawn flat, because the
         three things a gate needs are different things:
 
+        - **Every vendored opponent**, always. They are the only agents in
+          the pool this campaign did not write, so they are the only evidence
+          about the field we are actually scored against -- and drawing them
+          by chance starved them. Measured 2026-09-09: the two that happen to
+          be anchors held 33 and 31 pairings, while four harvested on 09-06
+          held one between them and `tetsutani_shape0905` had never been
+          played at all. There are about a dozen and the set does not grow
+          with promotions, so playing all of them is affordable in a way that
+          playing the whole pool is not.
         - **Anchors**, every time. `config.GATE_ANCHORS` spans the strength
           range and never changes, so every candidate has direct edges to
           fixed points at every level. Without them a champion is rated
@@ -122,7 +131,12 @@ class Pool(BaseModel):
             Opponent names, at most `config.GATE_OPPONENTS` of them.
         """
         available = [name for name in self.opponents if name != exclude]
-        wanted = [*config.GATE_ANCHORS, *always]
+        # `always` leads, and the order is load-bearing rather than tidy: the
+        # list is truncated to `config.GATE_OPPONENTS` at the end, and the
+        # floor is the one opponent a promotion cannot be measured without.
+        # Anything dropped by that truncation has to be a contender or a
+        # vendored opponent, never the floor or the leader.
+        wanted = [*always, *config.GATE_ANCHORS, *roster.TRAINING]
         drawn: list[str] = []
         for name in wanted:
             if name in available and name not in drawn:

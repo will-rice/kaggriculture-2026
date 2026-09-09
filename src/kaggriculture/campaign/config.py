@@ -124,8 +124,20 @@ GATE_SEED_RANGE = range(1, 1_000_000)
 # it cost us: champion_1 was trimmed out long ago, and champion_37 -- thirty
 # promotions later, rated five log-odds above it -- beats it only 0.729 of the
 # time. A field this non-transitive keeps its counters or walks past them.
-GATE_OPPONENTS = 16
-# How the sixteen are chosen. Anchors are played every single gate: they span
+#
+# Twenty-four rather than sixteen, because the draw now includes every vendored
+# opponent: about a dozen of those, plus the leader and floor, plus the four
+# anchors that are not themselves vendored, plus `GATE_CONTENDERS`. Sixteen
+# would have truncated exactly the agents the change exists to include.
+#
+# The cost is real and was weighed against playing the pool entire. That is
+# roughly 75 opponents today, 2,400 games a candidate against 512, and it grows
+# with every promotion -- while buying no extra *share* of cross-population
+# evidence, since the pool is itself 84% champions. Drawing all the vendored
+# agents and sampling the rest lifts that share from about a sixth to about a
+# half for half the added cost, and does not grow.
+GATE_OPPONENTS = 24
+# How the twenty-four are chosen. Anchors are played every single gate: they span
 # the strength range and they are what keeps the graph connected, so a new
 # champion is never rated through a chain of thirty overlapping pool eras.
 # Measured 2026-09-07, that chain predicted champion_37 would beat champion_1
@@ -144,7 +156,11 @@ GATE_ANCHORS = (
     "thomastschinkel_router",
     "router_v1",
 )
-GATE_CONTENDERS = 6
+# Highest-rated agents drawn beyond the anchors and the vendored set. Four
+# rather than six because the leader is already drawn through `always` and the
+# vendored opponents now take a dozen slots: the contenders were competing for
+# room with the only cross-population evidence the gate gets.
+GATE_CONTENDERS = 4
 # How far above the champion's rating a candidate must sit to replace it, in
 # log-odds. Promotion used to mean topping a tournament of eight, which is a
 # rank and so has no margin in it at all: a candidate a hair above the

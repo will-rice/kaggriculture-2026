@@ -7,7 +7,7 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
     SHOPS,
 )
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, roster
 
 
 def test_item_order_matches_the_engine_port_enum() -> None:
@@ -80,18 +80,28 @@ def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
     assert config.ROUNDS_PER_SESSION == 5
-    # Sixteen seeds over sixteen opponents, which is the same 512 games the
-    # gate cost at thirty-two seeds over eight. The budget went into
-    # opponents because a rating's precision comes from the whole graph: one
-    # more opponent is a whole new comparison, one more seed a slightly
-    # tighter old one.
+    # Sixteen seeds over twenty-four opponents: 768 games a candidate, up from
+    # the 512 that sixteen opponents cost. The budget goes into opponents
+    # because a rating's precision comes from the whole graph -- one more
+    # opponent is a whole new comparison, one more seed a slightly tighter old
+    # one -- and the eight added slots are what let every vendored agent be
+    # played every gate rather than drawn by luck.
     assert config.GATE_SEEDS == 16
-    assert config.GATE_OPPONENTS == 16
-    assert 2 * config.GATE_SEEDS * config.GATE_OPPONENTS == 512
-    # Every anchor is played by every gate, so they cannot fill the draw --
-    # there has to be room for the contenders and the random remainder that
-    # finds a counter.
-    assert len(config.GATE_ANCHORS) + config.GATE_CONTENDERS < config.GATE_OPPONENTS
+    assert config.GATE_OPPONENTS == 24
+    assert 2 * config.GATE_SEEDS * config.GATE_OPPONENTS == 768
+    # The draw has to hold every vendored opponent, the anchors that are not
+    # themselves vendored, the leader and floor, and the contenders -- with
+    # room left over for the random remainder that finds a counter. This is
+    # the arithmetic that decides `GATE_OPPONENTS`, so it is asserted rather
+    # than left to be rediscovered when the roster next grows.
+    vendored = len(roster.TRAINING)
+    fixed = vendored + len({*config.GATE_ANCHORS} - {*roster.TRAINING}) + 2
+    assert fixed + config.GATE_CONTENDERS < config.GATE_OPPONENTS, (
+        f"{vendored} vendored + anchors + leader/floor + "
+        f"{config.GATE_CONTENDERS} contenders does not fit in "
+        f"{config.GATE_OPPONENTS}: the draw would truncate the vendored set, "
+        "which is the only cross-population evidence the gate gets"
+    )
     # A bar with units in it. A rank had none, and promoted on a hair.
     assert config.PROMOTION_MARGIN > 0
     assert config.STAGNATION_SESSIONS == 40
