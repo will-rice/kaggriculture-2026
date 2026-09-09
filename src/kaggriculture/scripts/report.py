@@ -2,9 +2,14 @@
 
 Every number in the page is queried at render time, so the report is a view of
 the dataset rather than a document that was true once. The prose around them is
-fixed, and is a reading of a direction rather than of a value -- "the bank
-trails until day twelve" survives the bank changing, and if that direction ever
-reverses the numbers beside it will say so plainly.
+fixed where it reads a direction rather than a value. That was argued to be
+safe -- "the bank trails until day twelve" survives the bank changing, and a
+reversal would be visible in the numbers beside it -- and on 2026-09-09 the
+direction reversed and the sentence did not. The top were ahead on cash from
+day zero to day eight, behind only at day ten and day fourteen, and the page
+went on claiming they ran poor for the first ten days and crossed over at
+twelve. A reader takes the prose at its word and reads the table *through* it.
+So the claims that name days are now generated from the days.
 
 Grouped by fitted rating throughout, never by who won a given game: about half
 of a ladder's winners are the weaker agent having a good day, and eleven
@@ -122,6 +127,7 @@ def measure(database: Path) -> dict[str, str]:
             _final(connection, top, first_rated),
             _final(connection, tail, first_rated),
         )
+        trailing, crossover = _crossing(connection, top, tail, first_rated)
     finally:
         connection.close()
 
@@ -132,6 +138,8 @@ def measure(database: Path) -> dict[str, str]:
         "rated_games": f"{rated:,}",
         "window": f"{dataset.WINDOW}",
         "since": first_rated,
+        "bank_story": _bank_story(trailing, crossover),
+        "thin_until": "no point" if crossover is None else f"day {crossover}",
         "teams": f"{len(ladder):,}",
         "days_rows": f"{rows['days']:,}",
         "orders": f"{rows['orders'] / 1e6:.1f}M",
@@ -181,6 +189,61 @@ def _ends(ladder: list[tuple]) -> tuple[list[str], list[str]]:
             f"{len(names)}: the ends of the ladder are not disjoint"
         )
     return names[:strong], names[-weak:]
+
+
+def _crossing(
+    connection: sqlite3.Connection, top: list[str], tail: list[str], first: str
+) -> tuple[list[int], int | None]:
+    """The days the top hold less cash than the field, and the last crossover.
+
+    Read over every day of the season rather than the ten the table shows.
+    The crossover is a day, and the table's marks are six days apart where it
+    falls -- "between day fourteen and day twenty" is the best a reading off
+    the marks could manage, and it is not what the sentence claims.
+
+    Returns:
+        The days the top trail on mean bank, and the last of them, after which
+        they lead for the rest of the season. ``None`` when they never trail.
+    """
+    series = {}
+    for side, names in (("top", top), ("tail", tail)):
+        marks = ",".join("?" * len(names))
+        series[side] = dict(
+            connection.execute(
+                f"SELECT d.day, avg(d.bank) FROM days d "  # noqa: S608 - column names are this module's own constants
+                f"JOIN episodes e ON e.episode = d.episode "
+                f"WHERE d.team IN ({marks}) AND e.played >= ? GROUP BY d.day",
+                (*names, first),
+            ).fetchall()
+        )
+    trailing = [
+        day
+        for day in sorted(series["top"])
+        if series["top"][day] < series["tail"].get(day, 0.0)
+    ]
+    return trailing, trailing[-1] if trailing else None
+
+
+def _bank_story(trailing: list[int], crossover: int | None) -> str:
+    """The lede for finding one, in whatever shape the days actually make."""
+    if crossover is None:
+        return (
+            "The strong agents are never behind on cash. They buy capacity "
+            "early and stay ahead while they do it."
+        )
+    if len(trailing) == 1:
+        when = f"On day {trailing[0]} alone"
+    elif trailing == list(range(trailing[0], trailing[-1] + 1)):
+        when = f"From day {trailing[0]} to day {trailing[-1]}"
+    else:
+        days = ", ".join(str(day) for day in trailing[:-1])
+        when = f"On days {days} and {trailing[-1]}"
+    return (
+        f"{when} the strong agents hold <em>less</em> cash than the field. "
+        "They are spending it — on land, on quadrants, on animals, on "
+        f"hands. The bank crosses over after day {crossover} and never comes "
+        "back."
+    )
 
 
 def _by_day(
