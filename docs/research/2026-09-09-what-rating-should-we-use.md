@@ -88,24 +88,48 @@ statement. If that is wrong, this recommendation changes.
 
 ## What is actually broken
 
-The pool has grown by one champion per promotion and by no public agents at
-all:
+Public opponents _are_ harvested — twelve sit in `roster.TRAINING`, four of
+them added on 2026-09-06 and one on 09-07. The defect is not that outsiders
+never arrive. It is that the gate almost never plays the ones that do:
 
-|        | Agents | Pairings inside the measurable band                   |
-| ------ | ------ | ----------------------------------------------------- |
-| Ours   | 55     | 405 champion vs champion (86%)                        |
-| Public | 12     | 52 champion vs public (11%), 14 public vs public (3%) |
+| Public opponent                            | Pairings on record |
+| ------------------------------------------ | ------------------ |
+| `thomastschinkel_router` — **gate anchor** | 33                 |
+| `router_v1` — **gate anchor**              | 31                 |
+| `pilkwang_economic`, `shopforge`, `v56`    | 10–12              |
+| `router2929`, `v54`                        | 9                  |
+| `boatlee_v29` (harvested 09-06)            | **2**              |
+| `avioon_apex_v7`, `indarkarhana` (09-06)   | **1**              |
+| `lynnsakurai_threeday` (09-06)             | **1**              |
+| `tetsutani_shape0905` (09-06)              | **0**              |
 
-Two further facts make the twelve thinner than they look. `champion_1` and
+Overall that is 405 champion-vs-champion pairings against 52 champion-vs-public
+and 14 public-vs-public — 86% of the evidence is the lineage measuring itself.
+
+`pool.sample` is the mechanism, and it is a feedback loop rather than an
+oversight. Sixteen slots are filled three ways: six fixed `GATE_ANCHORS`, six
+**contenders drawn as the highest rated**, the leader and floor, and whatever
+random remainder is left — three slots or so, drawn from a pool of 67 in which
+12 are public.
+
+Each part is individually well-argued. The anchors exist because rating a
+champion through a chain of overlapping pool eras is measurably wrong; the
+docstring cites champion_37 rated 0.994 against champion_1 and beaten 0.729 in
+the games. The contenders exist because topping the field means beating the
+best of it.
+
+Together they close a loop. Champions' ratings are inflated by the lineage
+effect above, so champions _are_ the highest rated, so champions take all six
+contender slots, so the next gate is another six intra-lineage pairings, which
+inflates the ratings further. Publics reach a candidate only through the two
+public anchors and the random remainder.
+
+And the two public anchors are one agent. `champion_1` and
 `thomastschinkel_router` return identical rates _and_ identical margins to
-every decimal across all four statistics — one agent under two names, and two
-of the six gate anchors. And every public here was harvested weeks ago, from a
-field that the corpus measurement on 2026-09-08 showed turns over completely
-in about twelve days: split the corpus in half and the two top tens share not
-one name.
-
-So the fit is dominated by a lineage measuring itself, and its only tie to the
-outside world is eleven distinct agents from a vanished field.
+every decimal across all four statistics. So the fit's tie to the outside world
+runs through a single program, harvested weeks ago from a field the corpus
+shows turns over completely in about twelve days — while five opponents
+harvested on 09-06 and 09-07 sit in the roster with five pairings between them.
 
 The consequence is the +4.8 / −4.6 split. Long chains of near-identical
 champions stretch the internal rating scale — each generation beats its
@@ -135,11 +159,13 @@ numbers are printed as bare log-odds.
 **3. Fix the population. This is the finding.** In rough order of value per
 unit of work:
 
-- **Harvest public opponents continuously.** The public share of the pool only
-  falls, because promotions add champions and nothing adds outsiders. This is
-  the single highest-value change and it needs no new theory.
+- **Anchor on the freshest publics, not a hardcoded list.** Harvesting already
+  works; the sampler is the bottleneck. `GATE_ANCHORS` guarantees games to two
+  stale opponents and leaves five recent ones to chance, which is why four of
+  them have one pairing or none. Anchoring on the most recently harvested
+  publics would fix the evidence shortage without harvesting anything new.
 - **Treat `champion_1` and `thomastschinkel_router` as one agent.** Two of six
-  anchors are currently the same program.
+  anchors are the same program, so the anchor set is really five.
 - **Steer on the cross-population number.** `Result.field` — the win rate over
   vendored opponents alone — is already computed and its docstring already
   says it is "the one number that means the same thing on the first session and
