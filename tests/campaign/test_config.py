@@ -70,10 +70,23 @@ def test_unit_ops_match_the_port_enum_order() -> None:
 
 
 def test_core_budget_leaves_headroom() -> None:
-    """Eight cores stay free for codex sessions, the loop, and the box's tenants."""
+    """Enough cores stay free for codex, the loop, and the box's other tenants.
+
+    Sized against a measurement rather than a guess. On 2026-09-09 the loop drew
+    60 cores against a budget of 56 while other tenants took 13.3, and `vmstat`
+    reported 89 to 151 runnable on 64 cores with zero blocked and zero iowait --
+    oversubscribed by half again, at sixty thousand context switches a second.
+    The reservation has to cover the tenants and the codex sessions, and eight
+    did not.
+    """
     import os
 
-    assert 1 <= config.CORE_BUDGET <= max(1, (os.cpu_count() or 1) - 8)
+    cores = os.cpu_count() or 1
+    assert 1 <= config.CORE_BUDGET
+    assert config.CORE_BUDGET <= max(1, cores - 24), (
+        "the arena's budget has to leave room for the box's other tenants and "
+        "the codex sessions, or the shortfall is paid as contention instead"
+    )
 
 
 def test_constants_match_the_spec_table() -> None:

@@ -29,9 +29,22 @@ AGENTS = Path("/data/kaggriculture/agents")
 EPISODES = Path("/data/kaggriculture/episodes")
 ENGINE_LIBRARY = Path(__file__).parent / "engine" / "kaggriculture_engine.so"
 
-# Cores the arena and the engine may use between them. Eight are left for
-# codex sessions, the loop, and the box's own tenants.
-CORE_BUDGET = max(1, (os.cpu_count() or 1) - 8)
+# Cores the arena and the engine may use between them.
+#
+# Twenty-four are left over, not eight. Measured 2026-09-09 on the 64-core box:
+# the loop was drawing 60 cores against a budget of 56 while the box's other
+# tenants took 13.3 and 945 processes of their own. `vmstat` showed 89 to 151
+# runnable against 64 cores, zero blocked, zero iowait, and around sixty
+# thousand context switches a second -- entirely CPU-bound and oversubscribed
+# by half again, so a large share of the machine was spent scheduling rather
+# than playing games.
+#
+# The old reservation was not wrong when it was written, it was sized for a box
+# we had to ourselves. Eight cores cannot cover thirteen of other people's work
+# plus eight codex sessions, and the shortfall comes out of the arena either
+# way -- as contention rather than as a smaller pool, which is the same cost
+# paid less efficiently.
+CORE_BUDGET = max(1, (os.cpu_count() or 1) - 24)
 
 # Item order is sim.hpp's `Item` enum: the nine products, then the animals.
 ITEMS: list[str] = list(PRODUCTS) + list(ANIMALS)
