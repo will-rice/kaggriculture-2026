@@ -300,34 +300,33 @@ STAGNATION_SESSIONS = 40
 # model or a provider outage, looking busy and producing nothing. Eight is
 # one per worker: a single bad call is noise, eight is the machine.
 NO_VERDICT_LIMIT = 8
-# The strongest model this login has, on trial from 2026-09-09.
+# The cheap model, and the campaign is back on it.
 #
-# It was held back deliberately and the reason still stands: the first campaign
-# spent nearly all of a quota on it, and quota binds here rather than
-# capability. `terra` was tried briefly and reverted for the same reason. The
-# condition set on revisiting it was that the search be fixed first, because a
-# stronger model climbing a broken hill only costs more to learn the same
-# thing.
+# `gpt-6-astra` ran here for three hours on 2026-09-09 and the trial is recorded
+# rather than left implied. It produced one promotion -- champion_65, decisive
+# over champion_64 on 28 of 32 games -- about fifty minutes in. That is not
+# evidence it beats this model: the vendored-opponent draw landed in the same
+# restart, so the promotion has two candidate causes, and the gate rate cannot
+# separate them because it is bounded by the arena rather than by the model.
 #
-# That condition is now largely met. The gate no longer promotes a candidate
-# that merely draws the champion, so a generation of behavioural twins cannot
-# ratchet the floor; every vendored opponent is played every gate, so a
-# candidate is measured against the field rather than against its own lineage;
-# and the ratings are fitted over a ten-day window, so "played early" is no
-# longer read as "strong". The hill the model climbs is a different shape than
-# the one the 381-program block ran on.
+# Quota is why it was held back originally and why it is put down again. The
+# first campaign spent nearly all of one on astra, `terra` was tried and
+# reverted for the same reason, and three hours bought no result that argues for
+# the cost. The comparison it was meant to inform had model, reasoning depth,
+# sampler, gate rule and rating window all moving at once; removing the most
+# expensive variable costs the least.
 #
-# So this is an experiment with a cost, not a default. What it is being judged
-# on is promotions per session and the gate score of what it writes -- not the
-# gate rate, which is bounded by the arena rather than by the model. Revert to
-# `gpt-5.6-luna` when the quota matters more than the answer; the fallback
-# below is unchanged and still cheap.
+# The condition on trying it again is unchanged and is closer to met: fix the
+# search first, because a stronger model climbing a broken hill only costs more
+# to learn the same thing. What would justify a second trial is a measurement
+# that can attribute -- promotions per session against a luna baseline on the
+# same code, rather than against a memory of one.
 #
 # `mutate.validate_model` checks this against the login's own catalog at
 # startup, because a typo here is hundreds of failed sessions discovered one
 # at a time -- not hypothetical: this login accepts `gpt-6-astra` but refuses
 # `gpt-5.6-astra` (probed 2026-09-05 on codex 0.153).
-CODEX_MODEL = "gpt-6-astra"
+CODEX_MODEL = "gpt-5.6-luna"
 # The model retried once, in the same directory, when the first model's call
 # fails without a verdict -- a provider refusal or a codex crash -- so the
 # round still gets a child. Astra answered "Selected model is at capacity" some
