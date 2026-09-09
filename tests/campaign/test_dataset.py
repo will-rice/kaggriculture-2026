@@ -239,6 +239,39 @@ def test_an_order_keeps_its_item_and_quantity(tmp_path: Path) -> None:
     assert row == (0, 4, "SELL", "WHEAT", 48)
 
 
+def test_an_empty_market_slot_is_no_order_rather_than_a_broken_one(
+    tmp_path: Path,
+) -> None:
+    """A side may submit several market slots and leave some of them unused.
+
+    The action below is copied from the archive: episode 411 of
+    2026-09-08, step 122, seat 1. Two slots, one used. The engine's own
+    MARKET_OPS calls an empty one NONE, and `_moves` already drops PASS for
+    exactly this reason -- counting them would inflate every order tally with
+    actions nobody took.
+
+    Unhandled, this one record ended a fifty-five minute extraction and, since
+    the target was unlinked first, left no corpus at all.
+    """
+    episode = game(1006, (900.0, 300.0), ["Ada", "Grace"])
+    for seat in (0, 1):
+        episode.steps[9][seat]["action"] = {
+            "farmer": ["EAST"],
+            "hands": [["PICKUP", "WHEAT", 2], ["PASS"], ["NORTH"]],
+            "market": [["HIRE"], []],
+        }
+
+    connection = built(tmp_path, [episode])
+
+    orders = connection.execute(
+        "SELECT verb, item, quantity FROM orders "
+        "WHERE seat = 0 AND day = 0 AND hour = 8"
+    ).fetchall()
+
+    # The HIRE is kept whole; the empty slot contributes no row at all.
+    assert orders == [("HIRE", None, None)]
+
+
 def test_the_farmer_and_the_hands_are_recorded_and_passes_are_not(
     tmp_path: Path,
 ) -> None:

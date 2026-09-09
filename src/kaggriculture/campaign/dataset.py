@@ -508,6 +508,17 @@ def _orders(episode: tapes.Episode, key: str) -> Iterator[tuple]:
             action = episode.steps[index][seat].get("action") or {}
             for order in action.get("market") or ():
                 parts = order if isinstance(order, list) else [order]
+                # An empty order is the absence of one, not a broken record: a
+                # side may submit several market slots and leave some unused,
+                # as in `"market": [["HIRE"], []]`. The engine's own MARKET_OPS
+                # calls that NONE. `_moves` drops PASS for the same reason, and
+                # counting these would inflate every order tally with actions
+                # nobody took.
+                #
+                # Left unhandled this ended a fifty-five minute extraction on
+                # 2026-09-09, on one order in one episode of one archive.
+                if not parts:
+                    continue
                 yield (
                     key,
                     seat,
