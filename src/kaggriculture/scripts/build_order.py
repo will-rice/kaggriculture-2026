@@ -52,12 +52,27 @@ HEADINGS = {
 PREAMBLE = """## How the strongest agents build
 
 Averaged over the {games:,} games the public ladder played in the last {window}
-days, across the {best} agents a Bradley-Terry fit over that stretch rates
-highest. The window is not a sample: the field turns over completely inside a
-fortnight, so a table averaged over the whole corpus describes a blend of
-fields, most of which no longer plays. None of these agents publishes a kernel,
-so their games are the only view of them there is, and none of them is in the
-pool you are being scored against.
+days, across the {teams} agents that share the strongest opening on it:
+**{opening}**, mean rating {rating:+.2f}.
+
+Those agents rather than the top of the table, because a mean across the top of
+the table is a mean across agents doing different things. Measured 2026-09-09:
+the top twelve hold 1.16 quadrants on day three, which is 84% of them holding
+one and 16% holding two. No agent holds 1.16 quadrants. Averaged, the group
+that takes land on day three -- the three best agents on the ladder, 0.9
+log-odds clear of fourth -- is blended with the group that waits until day six,
+and the number that separates first place from fourth is deleted.
+
+The opening is a property of the agent and not of the game: within one agent the
+day it takes its second quadrant varies by a tenth of a day, while between
+agents it ranges from three to six. So this is a strategy, and it is followable
+in a way the mean was not.
+
+The window is not a sample either: the field turns over completely inside a
+fortnight, so a table over the whole corpus describes a blend of fields, most of
+which no longer plays. None of these agents publishes a kernel, so their games
+are the only view of them there is, and none is in the pool you are scored
+against.
 
 Read down a column and you have what the top of the ladder holds on that day.
 Every row here is also a column of your own day tables below, so you can put
@@ -104,7 +119,8 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
-    order = dataset.build_order(arguments.database, arguments.best)
+    best = dataset.openings(arguments.database, arguments.best)[0]
+    order = dataset.build_order(arguments.database, teams=best.teams)
     connection = sqlite3.connect(arguments.database)
     try:
         # The games the table actually averages, not the whole corpus: the
@@ -116,20 +132,26 @@ def main() -> None:
     finally:
         connection.close()
     settled = strategy.Strategies(strategy.STORE).settled()
-    TABLE.write_text(render(order, games, arguments.best, settled), encoding="utf-8")
+    TABLE.write_text(render(order, games, best, settled), encoding="utf-8")
     LOGGER.info("wrote %s over %d games", TABLE, games)
 
 
 def render(
     order: dict[str, list[float]],
     games: int,
-    best: int,
+    best: dataset.Opening,
     settled: list[strategy.Claim],
 ) -> str:
     """The table as the round prompt includes it, days across and rows down."""
     days = [int(day) for day in order["day"]]
     lines = [
-        PREAMBLE.format(games=games, best=best, window=dataset.WINDOW).rstrip("\n"),
+        PREAMBLE.format(
+            games=games,
+            teams=len(best.teams),
+            opening=best.describe(),
+            rating=best.rating,
+            window=dataset.WINDOW,
+        ).rstrip("\n"),
         "",
     ]
     lines.append("| day | " + " | ".join(f"d{day}" for day in days) + " |")

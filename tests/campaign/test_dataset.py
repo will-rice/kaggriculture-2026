@@ -47,13 +47,13 @@ def pen(fed: bool, hungry: int) -> dict:
     }
 
 
-def farm(money: float, tiles: list[dict], hands: int = 0) -> dict:
+def farm(money: float, tiles: list[dict], hands: int = 0, quadrants: int = 1) -> dict:
     """One side's public farm."""
     return {
         "money": money,
         "tiles": [tiles],
         "hands": [{} for _ in range(hands)],
-        "unlocked_quadrants": ["NW"],
+        "unlocked_quadrants": ["NW", "NE", "SW", "SE"][:quadrants],
         "hires_today": 0,
         "farmer": [0, 0],
     }
@@ -473,3 +473,176 @@ def test_the_window_counts_back_from_the_newest_archive_not_from_today(
         assert dataset.recent(connection, window=99) == "2026-08-01"
     finally:
         connection.close()
+
+
+def opener(
+    episode_id: int,
+    teams: list[str],
+    takes: tuple[int, int],
+    theirs: tuple[int, int],
+    ours_wins: bool = True,
+) -> tapes.Episode:
+    """A season where each seat takes its quadrants on its own schedule.
+
+    Both seats, because a team plays both across a corpus and its signature is
+    a median over all of them. Give the opening to seat 0 alone and every
+    seat-1 game reads as never reaching a second quadrant, which drags the
+    median to fifty-two -- as it did, the first time this was written.
+
+    Everything else is held still. What is being tested is the grouping, and a
+    fixture that also varied the farms would not say which of the two it keyed
+    on.
+    """
+    tiles = [crop(0, watered=True, dry=0, ripe=2)]
+    steps = []
+    for index in range(STEPS):
+        day = index // HOURS
+        mine = 1 + (day >= takes[0]) + (day >= takes[1])
+        yours = 1 + (day >= theirs[0]) + (day >= theirs[1])
+        # Who wins is given rather than derived, so a test can build any
+        # rating structure it needs -- including one where the single best
+        # agent sits in a group whose mean is low.
+        rich, poor = (900.0, 300.0) if ours_wins else (300.0, 900.0)
+        farms = [
+            farm(rich + index, tiles, quadrants=mine),
+            farm(poor + index, tiles, quadrants=yours),
+        ]
+        observation = {
+            "farms": farms,
+            "private": {"seeds": {"WHEAT": 4}, "shed": {"WHEAT": 7}},
+            "market": {"prices": {"WHEAT": 40}, "inventory": {"WHEAT": 9000}},
+            "town": {"unlocked_shops": ["MARKET"]},
+        }
+        steps.append(
+            [
+                {"observation": observation, "action": {}, "status": "DONE"}
+                for _ in (0, 1)
+            ]
+        )
+    return tapes.Episode(
+        seed=7,
+        engine_version=tapes.ENGINE,
+        info={"seed": 7, "EpisodeId": episode_id, "TeamNames": teams},
+        steps=steps,
+    )
+
+
+def test_agents_that_open_alike_are_grouped_and_the_strongest_group_leads(
+    tmp_path: Path,
+) -> None:
+    """A mean across the top of a ladder is a mean across different strategies.
+
+    Measured 2026-09-09: the top twelve hold 1.16 quadrants on day three, which
+    is 84% of them holding one and 16% holding two. No agent holds 1.16. The
+    three that take land on day three are the three best on the ladder and sit
+    0.9 log-odds clear of fourth, and averaging deletes exactly that.
+    """
+    games = []
+    # Two rushers and two plodders, each playing enough to be rated. The
+    # rushers win their games, so the fit puts them above.
+    for number in range(24):
+        # Every rusher meets every plodder, so the fit sees one connected
+        # field. Paired `number % 2` against `number % 2` they are two disjoint
+        # islands and the rating keeps only one of them.
+        rusher = f"rush_{number % 2}"
+        plodder = f"plod_{(number // 2) % 2}"
+        # The plodders' game is written first, so insertion order puts the
+        # weaker opening first and the assertion below tests the sort rather
+        # than the order the groups happened to be built in.
+        games.append(
+            opener(
+                100 + number,
+                [plodder, rusher],
+                takes=(6, 11),
+                theirs=(3, 8),
+                ours_wins=False,
+            )
+        )
+        games.append(opener(number, [rusher, plodder], takes=(3, 8), theirs=(6, 11)))
+    database = dated(tmp_path, {"2026-09-01": games})
+    dataset.rate(database, least=1, window=99)
+
+    groups = dataset.openings(database, best=4, window=99)
+
+    assert len(groups) == 2, "two openings, so two groups"
+    assert groups[0].signature == (3, 8), "the rushers rate above and come first"
+    assert sorted(groups[0].teams) == ["rush_0", "rush_1"]
+    assert groups[1].signature == (6, 11)
+    assert groups[0].rating > groups[1].rating
+
+
+def test_the_build_order_can_be_read_from_one_group_alone(tmp_path: Path) -> None:
+    """Restricted to agents that open alike, the table is followable.
+
+    Blended, the quadrant row asked for 1.2 on day three and 2.3 on day eight --
+    fractions of a thing that comes in whole numbers, and a target no agent can
+    hit. Within one opening it is 1, 1, 1, 2, and a policy can execute it.
+    """
+    games = []
+    for number in range(24):
+        games.append(
+            opener(number, [f"rush_{number % 2}", "plod"], takes=(3, 8), theirs=(6, 11))
+        )
+        games.append(
+            opener(
+                100 + number,
+                ["plod", f"rush_{number % 2}"],
+                takes=(6, 11),
+                theirs=(3, 8),
+            )
+        )
+    database = dated(tmp_path, {"2026-09-01": games})
+    dataset.rate(database, least=1, window=99)
+
+    order = dataset.build_order(database, window=99, teams=["rush_0", "rush_1"])
+    quadrants = dict(zip(dataset.MARKS, order["quadrants"], strict=False))
+
+    # Whole numbers throughout: one group, one behaviour.
+    assert quadrants[0] == 1.0
+    assert quadrants[3] == 2.0, "the rushers hold two on day three"
+    assert quadrants[2] == 1.0, "and one the day before"
+
+
+def test_a_group_is_ranked_by_its_own_strength_not_by_its_best_member(
+    tmp_path: Path,
+) -> None:
+    """The ladder is read strongest-first, so the groups arrive in that order.
+
+    Which makes the ordering easy to get wrong and easy to test wrongly: while
+    the best agent also sits in the best group, a sort by group mean and no
+    sort at all give the same answer. Here the best agent shares its opening
+    with the worst, so the two disagree.
+
+    Ranking by mean is the useful reading. An opening is worth copying if the
+    agents using it are strong on the whole -- one outlier inside it says more
+    about that agent than about the opening.
+    """
+    rush, plod = (3, 8), (6, 11)
+    games = []
+    for number in range(16):
+        # `star` beats everyone and `stray` loses to everyone, and they share
+        # an opening: that group's mean is middling however good its best is.
+        games.append(opener(number, ["star", "stray"], rush, rush))
+        games.append(opener(100 + number, ["star", "mid_0"], rush, plod))
+        games.append(opener(200 + number, ["star", "mid_1"], rush, plod))
+        # The middling pair beat the stray, so their group's mean sits above.
+        games.append(opener(300 + number, ["mid_0", "stray"], plod, rush))
+        games.append(opener(400 + number, ["mid_1", "stray"], plod, rush))
+        games.append(
+            opener(
+                500 + number, ["mid_0", "mid_1"], plod, plod, ours_wins=number % 2 == 0
+            )
+        )
+    database = dated(tmp_path, {"2026-09-01": games})
+    dataset.rate(database, least=1, window=99)
+
+    groups = dataset.openings(database, best=4, window=99)
+
+    strongest = {team for team, _, _, rating, _ in dataset.ladder(database)}
+    assert "star" in strongest
+    # The best agent is a rusher, so a list left in ladder order leads with the
+    # rushers. Ranked by group mean, the middling pair lead instead.
+    assert groups[0].signature == plod, "ranked by the group, not by its best member"
+    assert set(groups[0].teams) == {"mid_0", "mid_1"}
+    assert groups[0].rating > groups[1].rating
+    assert "star" in groups[1].teams

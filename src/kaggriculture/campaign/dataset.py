@@ -34,11 +34,12 @@ counts answer.
 
 import logging
 import sqlite3
+import statistics
 import tempfile
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from tqdm import tqdm
 
@@ -57,6 +58,9 @@ WORKERS = 8
 # twice and won both is not the strongest agent on the ladder, and a rating
 # fitted from two games is the prior wearing a number.
 LEAST = 40
+# The day a team never reached a quadrant at all, standing in for infinity so a
+# signature is always a pair of days and sorts.
+NEVER = 99
 # How many days back a rating and a build order read. The ladder is not a
 # fixed field: it moves under everyone, every day.
 #
@@ -744,8 +748,111 @@ BEST = 12
 MARKS = (0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 17, 20, 23, 25, 27, 29)
 
 
-def build_order(
+class Opening(NamedTuple):
+    """One group of top agents that open the same way, and how strong they are.
+
+    Attributes:
+        signature: The day the group takes its second quadrant, and its third.
+            Discrete, and consistent to a tenth of a day inside a team.
+        teams: The agents that open this way, strongest first.
+        rating: Their mean Bradley-Terry rating.
+    """
+
+    signature: tuple[int, int]
+    teams: list[str]
+    rating: float
+
+    def describe(self) -> str:
+        """The opening in words, for a table caption."""
+        second, third = self.signature
+        return (
+            f"second quadrant day {second}, third day {third}"
+            if third < NEVER
+            else f"second quadrant day {second}, no third"
+        )
+
+
+def openings(
     database: Path = DATABASE, best: int = BEST, window: int = WINDOW
+) -> list[Opening]:
+    """The strongest agents grouped by how they open, best group first.
+
+    Averaging across the top of the ladder destroys the variable that separates
+    it. Measured 2026-09-09: the top twelve hold a mean 1.16 quadrants on day
+    three, which is 84% of them holding one and 16% holding two -- a mixture,
+    and not a number any agent has. The three best agents on the ladder take
+    their second quadrant on day three and nobody else does, and they sit 0.9
+    log-odds clear of fourth. The mean deletes exactly that.
+
+    Grouping is safe because the opening belongs to the team rather than to the
+    game: within a team the day of the second quadrant varies by a tenth of a
+    day, while between teams it ranges from three to six.
+
+    Args:
+        database: The dataset, already built and rated.
+        best: How many rated agents to group, strongest first.
+        window: Days back to read, matching the rating's own window.
+
+    Returns:
+        One `Opening` per distinct signature, by mean rating, strongest first.
+
+    Raises:
+        ValueError: Nothing is rated yet, so there is no top to group.
+    """
+    # `ladder` rows are (team, games, wins, rating, place); the rating is the
+    # fourth, and taking the second silently groups by game count instead.
+    rated = [(team, rating) for team, _, _, rating, _ in ladder(database)[:best]]
+    if not rated:
+        raise ValueError(f"no rated teams in {database}; run `rate` first")
+    connection = sqlite3.connect(database)
+    try:
+        first = recent(connection, window)
+        signatures = {team: _signature(connection, team, first) for team, _ in rated}
+    finally:
+        connection.close()
+    grouped: dict[tuple[int, int], list[tuple[str, float]]] = {}
+    for team, value in rated:
+        grouped.setdefault(signatures[team], []).append((team, value))
+    out = [
+        Opening(
+            signature=signature,
+            teams=[team for team, _ in sorted(members, key=lambda m: -m[1])],
+            rating=sum(value for _, value in members) / len(members),
+        )
+        for signature, members in grouped.items()
+    ]
+    return sorted(out, key=lambda opening: -opening.rating)
+
+
+def _signature(
+    connection: sqlite3.Connection, team: str, first: str
+) -> tuple[int, int]:
+    """The median day this team reaches its second and third quadrant.
+
+    The median rather than the mean, because the quantity is a day and a team
+    that never reaches a third quadrant in one game should not drag its
+    signature halfway to never.
+    """
+    rows = connection.execute(
+        "SELECT min(CASE WHEN d.quadrants >= 2 THEN d.day END), "
+        "min(CASE WHEN d.quadrants >= 3 THEN d.day END) "
+        "FROM days d JOIN episodes e ON e.episode = d.episode "
+        "WHERE d.team = ? AND e.played >= ? GROUP BY d.episode, d.seat",
+        (team, first),
+    ).fetchall()
+    if not rows:
+        return (NEVER, NEVER)
+    return (
+        int(statistics.median([NEVER if r[0] is None else r[0] for r in rows])),
+        int(statistics.median([NEVER if r[1] is None else r[1] for r in rows])),
+    )
+
+
+def build_order(
+    database: Path = DATABASE,
+    best: int = BEST,
+    window: int = WINDOW,
+    teams: list[str] | None = None,
 ) -> dict[str, list[float]]:
     """What the strongest agents hold on each day, averaged over their games.
 
@@ -759,10 +866,15 @@ def build_order(
 
     Args:
         database: The dataset, already built and rated.
-        best: How many rated agents to read from, strongest first.
+        best: How many rated agents to read from, strongest first. Ignored
+            when ``teams`` is given.
         window: Days back to average over, matching the rating's own window.
             Averaged over everything, the table blends fields that no longer
             play each other.
+        teams: Read from exactly these agents instead of the top ``best``.
+            What `openings` is for: a mean over agents that open differently
+            describes none of them, and the mixture is measured -- 84% of the
+            top twelve hold one quadrant on day three and 16% hold two.
 
     Returns:
         ``{quantity: [value on each of MARKS]}``, and ``"day"`` itself.
@@ -770,7 +882,7 @@ def build_order(
     Raises:
         ValueError: Nothing is rated yet, so there is no top to read from.
     """
-    top = [team for team, *_ in ladder(database)[:best]]
+    top = teams or [team for team, *_ in ladder(database)[:best]]
     if not top:
         raise ValueError(f"no rated teams in {database}; run `rate` first")
     marks = ",".join("?" * len(top))

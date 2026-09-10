@@ -1,12 +1,27 @@
 ## How the strongest agents build
 
 Averaged over the 6,642 games the public ladder played in the last 10
-days, across the 12 agents a Bradley-Terry fit over that stretch rates
-highest. The window is not a sample: the field turns over completely inside a
-fortnight, so a table averaged over the whole corpus describes a blend of
-fields, most of which no longer plays. None of these agents publishes a kernel,
-so their games are the only view of them there is, and none of them is in the
-pool you are being scored against.
+days, across the 3 agents that share the strongest opening on it:
+**second quadrant day 3, third day 8**, mean rating +2.19.
+
+Those agents rather than the top of the table, because a mean across the top of
+the table is a mean across agents doing different things. Measured 2026-09-09:
+the top twelve hold 1.16 quadrants on day three, which is 84% of them holding
+one and 16% holding two. No agent holds 1.16 quadrants. Averaged, the group
+that takes land on day three -- the three best agents on the ladder, 0.9
+log-odds clear of fourth -- is blended with the group that waits until day six,
+and the number that separates first place from fourth is deleted.
+
+The opening is a property of the agent and not of the game: within one agent the
+day it takes its second quadrant varies by a tenth of a day, while between
+agents it ranges from three to six. So this is a strategy, and it is followable
+in a way the mean was not.
+
+The window is not a sample either: the field turns over completely inside a
+fortnight, so a table over the whole corpus describes a blend of fields, most of
+which no longer plays. None of these agents publishes a kernel, so their games
+are the only view of them there is, and none is in the pool you are scored
+against.
 
 Read down a column and you have what the top of the ladder holds on that day.
 Every row here is also a column of your own day tables below, so you can put
@@ -17,17 +32,17 @@ strongest quarter of a 185-agent field happens to do, and any of it can be
 beaten -- but where you differ from it sharply and lose, this is the first
 place to look.
 
-| day           | d0   | d1   | d2   | d3   | d4   | d5   | d6   | d8   | d10    | d12    | d14    | d17    | d20    | d23    | d25    | d27    | d29    |
-| ------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ |
-| bank          | 46   | 202  | 298  | 220  | 418  | 391  | 570  | 977  | 11,195 | 14,930 | 20,743 | 36,927 | 54,866 | 69,036 | 76,394 | 84,745 | 98,359 |
-| quadrants     | 1.0  | 1.0  | 1.0  | 1.2  | 1.2  | 1.3  | 2.0  | 2.3  | 2.5    | 3.0    | 3.0    | 3.0    | 3.0    | 3.0    | 3.0    | 3.0    | 3.0    |
-| planted tiles | 17.8 | 18.4 | 18.6 | 18.8 | 16.6 | 19.1 | 31.4 | 39.7 | 42.7   | 58.2   | 57.2   | 57.3   | 56.7   | 55.2   | 54.5   | 50.3   | 4.1    |
-| fertilised    | 0.0  | 0.0  | 0.0  | 0.0  | 0.0  | 0.0  | 0.0  | 0.1  | 0.1    | 2.3    | 8.4    | 12.0   | 19.1   | 11.8   | 16.6   | 10.4   | 1.0    |
-| animals       | 4.5  | 4.5  | 5.0  | 5.2  | 5.8  | 6.4  | 8.0  | 11.5 | 13.8   | 15.3   | 15.5   | 15.5   | 15.1   | 14.5   | 14.1   | 13.7   | 11.6   |
-| hands         | 5.3  | 3.7  | 4.7  | 5.2  | 4.8  | 5.3  | 7.8  | 9.4  | 11.0   | 10.1   | 10.7   | 11.3   | 11.6   | 11.6   | 11.3   | 11.1   | 10.0   |
-| seed in store | 0.5  | 0.2  | 1.2  | 1.4  | 4.5  | 5.6  | 4.3  | 6.6  | 7.8    | 6.7    | 6.3    | 6.6    | 7.3    | 6.7    | 5.7    | 4.5    | 4.2    |
-| shed          | 3.5  | 4.4  | 2.0  | 2.9  | 8.4  | 5.6  | 8.4  | 8.0  | 34.3   | 14.8   | 10.2   | 8.7    | 10.1   | 7.4    | 6.5    | 6.5    | 1.1    |
-| weeds         | 0.0  | 0.0  | 0.0  | 0.0  | 0.0  | 0.1  | 0.0  | 0.0  | 0.0    | 0.0    | 0.0    | 0.1    | 0.2    | 1.4    | 1.9    | 2.0    | 7.7    |
+| day           | d0   | d1   | d2   | d3   | d4  | d5   | d6   | d8    | d10   | d12   | d14    | d17    | d20    | d23    | d25    | d27    | d29     |
+| ------------- | ---- | ---- | ---- | ---- | --- | ---- | ---- | ----- | ----- | ----- | ------ | ------ | ------ | ------ | ------ | ------ | ------- |
+| bank          | 40   | 626  | 996  | 317  | 757 | 572  | 778  | 1,502 | 3,721 | 9,296 | 15,519 | 35,002 | 56,226 | 71,990 | 80,730 | 90,031 | 106,246 |
+| quadrants     | 1.0  | 1.0  | 1.0  | 2.0  | 2.0 | 2.0  | 2.0  | 2.9   | 3.0   | 3.0   | 3.0    | 3.0    | 3.0    | 3.0    | 3.0    | 3.0    | 3.0     |
+| planted tiles | 19.0 | 19.0 | 19.0 | 20.1 | 7.6 | 17.1 | 33.5 | 43.5  | 58.7  | 59.4  | 57.6   | 57.6   | 56.9   | 55.6   | 53.3   | 53.7   | 4.2     |
+| fertilised    | 0.0  | 0.0  | 0.0  | 0.0  | 0.0 | 0.0  | 0.0  | 0.0   | 0.0   | 0.3   | 5.6    | 11.3   | 20.6   | 17.8   | 15.2   | 15.4   | 1.5     |
+| animals       | 6.0  | 6.0  | 6.0  | 6.0  | 6.1 | 8.7  | 9.1  | 10.8  | 14.1  | 14.5  | 15.3   | 15.9   | 16.3   | 16.4   | 16.4   | 16.3   | 13.4    |
+| hands         | 7.0  | 4.3  | 7.0  | 7.0  | 7.0 | 7.0  | 7.3  | 9.2   | 12.0  | 12.0  | 12.0   | 12.0   | 12.0   | 12.0   | 12.0   | 12.0   | 12.0    |
+| seed in store | 0.0  | 0.0  | 0.0  | 0.6  | 0.8 | 0.4  | 0.8  | 8.5   | 0.7   | 0.5   | 0.5    | 0.4    | 0.6    | 0.8    | 1.1    | 0.8    | 0.8     |
+| shed          | 6.0  | 0.0  | 2.2  | 0.3  | 0.3 | 2.4  | 1.4  | 3.2   | 11.1  | 14.2  | 19.3   | 9.2    | 5.4    | 6.5    | 2.9    | 3.6    | 0.2     |
+| weeds         | 0.0  | 0.0  | 0.0  | 0.0  | 0.1 | 0.3  | 0.1  | 0.0   | 0.0   | 0.0   | 0.0    | 0.0    | 0.0    | 0.2    | 0.3    | 0.3    | 1.0     |
 
 What the same games say when the two sides of each are compared directly --
 every quantity crossed with every day, and these are the ones that separate
