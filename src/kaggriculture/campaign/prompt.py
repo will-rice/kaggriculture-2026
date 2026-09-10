@@ -648,13 +648,11 @@ def compose(
     cleared, why = gate.promotion(standings, name, decisive=0)
     # Opened here rather than at import, so a store the daily measurement
     # has rewritten reaches a campaign that is already running.
-    claims = selected(strategy.Strategies(strategy.STORE), result.states)
     # A lineage with nothing against it gets no section at all: a heading over
     # an empty list is noise in a message the model reads every round. The
     # template puts each on its own line, so an empty one leaves no gap.
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
-        pace=BUILD_ORDER.read_text(encoding="utf-8").rstrip("\n"),
         name=name,
         imports=IMPORTS,
         seeds=len(result.seeds),
@@ -663,17 +661,15 @@ def compose(
         placing=PLACED_TOP if cleared else PLACED_BELOW,
         standings=_standing_rows(name, standings),
         states="\n".join(_states_lines(result, rival, standings)) + "\n",
-        claims="\n".join(_claim_lines(claims)) + "\n" if claims else "",
         siblings="\n".join(_sibling_lines(name, siblings)) + "\n" if siblings else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         instruction=instruction,
     )
     LOGGER.info(
-        "composed a round on %s (rival: %s, %d prior, %d failures, %d claims)",
+        "composed a round on %s (rival: %s, %d prior, %d failures)",
         name,
         rival,
         len(siblings),
         len(failures),
-        len(claims),
     )
     return message

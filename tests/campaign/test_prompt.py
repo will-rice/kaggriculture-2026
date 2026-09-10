@@ -133,17 +133,25 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
     )
 
 
-def test_the_message_carries_the_build_order() -> None:
-    """A round is shown its own day-by-day play and nothing to read it against.
+def test_the_message_carries_no_corpus_derived_target() -> None:
+    """A round is shown the rules and its own play, and nothing read off others.
 
-    The agents at the top of the leaderboard publish no kernels, so their
-    recorded games are the only view of them there is -- and the pool, built
-    from published work, cannot supply it. The table is averaged over the
-    top of a rating by `build-order` and travels whole.
+    The prompt used to carry two things mined from the public replay corpus:
+    the build order, and the settled claims about what the ladder's winners
+    hold. Both were true about the corpus, neither was ever shown to help a
+    program, and the last version of the first measurably hurt.
 
-    Over the top of a *rating*, not the winning side of each game: about half
-    of a ladder's winners are the weaker agent having a good day, and eleven
-    quantities measured that way came back between 45% and 60%.
+    Measured 2026-09-10. With the build order clustered to one opening the
+    median candidate scored 0.275 over 68 gates and promotions ran about one an
+    hour. With the opening added as the orders those agents send, the median
+    fell to 0.026 over 156 gates and nothing promoted in ten hours. The ceiling
+    hardly moved -- 0.940 to 0.914 -- so good programs did not get worse, most
+    programs became broken.
+
+    What the model did with a build order is what three measured experiments
+    did before it: bolt another strategy's orders onto this one and break the
+    economy underneath. Handing a round a build order is an invitation to
+    graft, and grafting is the thing that fails.
     """
     text = prompt.compose(
         "champion_1",
@@ -154,14 +162,14 @@ def test_the_message_carries_the_build_order() -> None:
         table("champion_1", {"v54": 0.0}),
     )
 
-    assert "How the strongest agents build" in text
-    # Matched loosely: the table is generated and then formatted, and prettier
-    # pads markdown cells to align them.
-    assert re.search(r"\|\s*quadrants\s*\|", text)
-    assert re.search(r"\|\s*fertilised\s*\|", text)
-    # It travels whole: a table cut in half is a table nobody can read down.
-    assert prompt.BUILD_ORDER.read_text(encoding="utf-8").rstrip() in text
-    # Aggregate only: no opponent is named and no path of theirs appears.
+    assert "How the strongest agents build" not in text
+    assert "The opening, as orders" not in text
+    # Not asserted on the market verbs themselves: BUY_LAND is a rule of the
+    # game and the task prompt documents it, mined opening or no.
+    # Its own play stays: the rates, the day tables, and the rules.
+    assert "child.py" in text
+    assert re.search(r"\|\s*our quads\s*\|", text)
+    # Aggregate only, still: no opponent is named and no path of theirs appears.
     assert "/data" not in text
 
 

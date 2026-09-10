@@ -18,16 +18,18 @@ Placeholders, all filled on every round:
   {placing}      one line on what that place means, promotion or progress
   {standings}    the tournament table, this program marked
   {states}       one day-by-day game against each opponent that took a game
-  {claims}       what the ladder's winners do that this program does not --
-                 confirmed over the recorded corpus and selected against this
-                 program's own games, so it is empty for a program already
-                 doing all of it
   {siblings}     other programs written from this one, or empty
   {failures}     the lineage's recent rejected attempts, or empty
   {instruction}  what to do, and under stagnation why the start moved
-  {pace}         what the strongest agents hold on each day, averaged
-                 over the top of a rating fitted across every recorded
-                 game -- rebuilt by `build-order`
+
+The corpus-derived sections are gone. `pace`, the build order, and
+`claims`, the settled statements about the ladder's winners, were both
+true about the corpus and neither earned its place: with the build order
+clustered the median candidate scored 0.275 and promotions ran about one
+an hour; with the opening added as orders the median fell to 0.026 over
+156 gates and nothing was promoted in ten hours. What the model did with
+them is what three separate experiments did -- bolt another strategy's
+orders onto this one, and break the economy underneath.
 
 A section that would be empty is rendered as nothing at all, heading
 included: a heading over an empty list is noise in a message read every
@@ -35,8 +37,6 @@ round.
 -->
 
 {task}
-
-{pace}
 
 ## The program
 
@@ -110,7 +110,6 @@ you must finish above. {placing}
 {standings}
 
 {states}
-{claims}
 {siblings}
 {failures}
 
