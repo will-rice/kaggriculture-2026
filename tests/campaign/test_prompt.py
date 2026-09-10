@@ -461,11 +461,18 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
     The three that survived were within 0.06 of each other.
     """
     assert "child.py" in prompt.INSTRUCTION
-    assert "top of the standings" in prompt.INSTRUCTION
-    # It must not prescribe one route to the top: naming a method is
-    # what the five did, and three of them named the same one.
-    for route in ("tune", "restructure", "replace"):
-        assert route in prompt.INSTRUCTION
+    # The bar is now the margin in the games rather than the place in the
+    # table. Fourteen of the champion's twenty-four opponents are saturated and
+    # every one of them is ours, so a rank is a step function over a table with
+    # no gradient left; a program can always win by more. Promotion still runs
+    # on a fit that is blind to margin, so this shapes the search without
+    # deciding it.
+    assert "larger bank" in prompt.INSTRUCTION
+    assert "top of the standings" not in prompt.INSTRUCTION
+    # It must still not prescribe one route: naming a method is what the five
+    # did, and three of them named the same one. More than one is offered.
+    assert "Small, local changes" in prompt.INSTRUCTION
+    assert "replacing" in prompt.INSTRUCTION
 
 
 def failure(reason: str) -> archive.Failure:

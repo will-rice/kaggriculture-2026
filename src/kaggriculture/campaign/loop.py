@@ -885,6 +885,14 @@ class Campaign:
             }
         )
 
+    def _lines(self, program_id: str) -> int:
+        """How many lines the program is, so its growth is on the record."""
+        try:
+            source = Path(self.database.get(program_id).source_path)
+            return len(source.read_text(encoding="utf-8").splitlines())
+        except (KeyError, OSError):
+            return 0
+
     def promotion_record(
         self,
         result: Result,
@@ -916,6 +924,13 @@ class Campaign:
                 result.program_id
             ),
             "gate/pool": len(result.rates),
+            # Nothing has been watching this. The seed is 619 lines and
+            # `config.SEED` says why that matters -- a round is handed the
+            # whole program, and a big one spends the call being read rather
+            # than improved. champion_69 is 3,220 lines, five times its own
+            # ancestor, and the growth arrived a few hundred lines at a time
+            # with no measurement to show it.
+            "gate/lines": self._lines(result.program_id),
             # How much of this candidate's verdict against the floor rests on
             # games that were actually decided. A run whose candidates keep
             # drawing the floor is a run that has stopped producing new

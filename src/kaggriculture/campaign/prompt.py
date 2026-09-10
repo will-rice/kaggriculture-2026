@@ -82,9 +82,13 @@ IMPORTS = ", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS))
 # so only this is chosen here; the rest is in the template.
 PLACED_TOP = (
     "Top of it, so this program is the champion and every later candidate has "
-    "to beat it."
+    "to beat it. That is the bar, and it is not the job: win the games below "
+    "by more."
 )
-PLACED_BELOW = "Every place gained is progress, whoever it comes against."
+PLACED_BELOW = (
+    "Every place gained is progress, whoever it comes against -- but the way "
+    "to gain one is to play the seasons below better, not to target an agent."
+)
 
 # How many of a lineage's failures are sent, and how much of each. The last
 # few are what a next attempt can act on; an older one is about a program two
@@ -143,15 +147,32 @@ CHANGE_CHARS = 160
 # siblings section says has already been tried from it. That was always the
 # real source of spread; the draw was noise on top of it.
 INSTRUCTION = (
-    "Change `child.py` so that it finishes top of the standings above. Every "
-    "agent listed there is one you have to place above, and the one directly "
-    "above you is the nearest of them -- but the bar is the whole table, not "
-    "that one agent. How you get there is yours to choose: tune what is there, "
-    "restructure it, or replace whatever part of it is losing you games."
+    "Change `child.py` so that it finishes each game above with a larger bank "
+    "than it did. Not a better place in the table -- a bigger margin in the "
+    "games themselves, and most of all in the ones it already wins narrowly. "
+    "Every table above is one season played out day by day; find where this "
+    "program left money on the field and take it. Small, local changes are "
+    "welcome, and so is replacing whatever part of it is playing badly."
 )
-# Recorded on every program, so the database keeps saying what a round was
-# asked for even though there is now only one answer.
-INSTRUCTION_NAME = "beat"
+# Margin rather than rank, and the reason is a measurement rather than a
+# preference.
+#
+# The gate has stopped separating anything. Fourteen of champion_69's
+# twenty-four opponents are saturated and every one of them is ours -- a
+# candidate beats the whole lineage almost always -- so "finish top of the
+# standings" is a step function over a table with no gradient left in it. Every
+# one of those saturated games is still a season of 719 decisions, and some of
+# them are bad ones; summarising the season to a win throws that away.
+#
+# Margin is dense where rank is sparse. A program can always win by more, and
+# the day tables it is shown are seasons rather than verdicts.
+#
+# The competition does not score margin -- it is relative bank, and the size of
+# the win never counts -- which is exactly why this is the *instruction* and
+# not the bar. Promotion still runs on a Bradley-Terry fit that is blind to
+# margin by design, so a program that wins bigger and no more often gains
+# nothing at the gate. The shaping steers the search; it does not decide it.
+INSTRUCTION_NAME = "margin"
 
 
 class Message:
