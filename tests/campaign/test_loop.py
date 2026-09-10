@@ -23,10 +23,12 @@ can beat (``strong_champion``) rather than arranging for the gate to fail:
 the promotion rule is then the real one, deciding on the numbers it is given.
 """
 
+import asyncio
 import os
 import random
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -1838,3 +1840,41 @@ def test_no_metric_is_frozen_at_a_score_nothing_can_earn(
     record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
 
     assert not any("top_field" in key for key in record)
+
+
+def test_a_cancelled_round_does_not_leave_its_workspace_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A round the pacer cancels used to leak the directory it was working in.
+
+    Cleanup sat below the two awaits, so it ran only when a round reached a
+    verdict; a cancellation unwinds straight past it. The pacer cancels
+    routinely, and 548 workspaces had collected in /tmp before anyone looked.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+
+    async def cancelled(
+        workspace: Path, message: str, program_id: str
+    ) -> mutate.Mutation:
+        """A call killed mid-flight, which is what the pacer does to a slow one."""
+        assert workspace.exists(), "the round never made a workspace to leak"
+        raise asyncio.CancelledError
+
+    campaign.mutator = cancelled
+    # Workspaces come from `tempfile.mkdtemp`, so pointing the module at
+    # `tmp_path` keeps this test's leak out of the machine's own /tmp and
+    # clear of any already sitting there.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            campaign.round(
+                _write(tmp_path / "parent.py", PASS),
+                "champion_1",
+                _gate_result("p1", {"v54": 0.5}),
+                "improve it",
+                "margin",
+            )
+        )
+
+    assert not list(tmp_path.glob("campaign-round-*"))

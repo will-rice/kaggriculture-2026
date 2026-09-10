@@ -521,15 +521,24 @@ class Campaign:
         """
         program_id = f"p{uuid.uuid4().hex[:12]}"
         box = Path(tempfile.mkdtemp(prefix="campaign-round-"))
-        child = box / "child.py"
-        shutil.copy(source, child)
-        # The gate writes a champion read-only so nothing can edit the file
-        # the pool plays, and `shutil.copy` carries that mode across. This
-        # copy is the one file the call must be able to write.
-        child.chmod(0o644)
-        mutation = await self.mutator(box, message, program_id)
-        kept = await self.keep(mutation, name, drawn, program_id)
-        await asyncio.to_thread(shutil.rmtree, box, ignore_errors=True)
+        try:
+            child = box / "child.py"
+            shutil.copy(source, child)
+            # The gate writes a champion read-only so nothing can edit the file
+            # the pool plays, and `shutil.copy` carries that mode across. This
+            # copy is the one file the call must be able to write.
+            child.chmod(0o644)
+            mutation = await self.mutator(box, message, program_id)
+            kept = await self.keep(mutation, name, drawn, program_id)
+        finally:
+            # The pacer cancels codex calls routinely, and a cancellation
+            # unwinds through these awaits: cleanup written below them is
+            # simply never reached. Five hundred and forty-eight workspaces
+            # had collected in /tmp before anything noticed. Removing the
+            # tree here is synchronous on purpose -- `await` in a finally
+            # during cancellation is how a cleanup gets cancelled too, and
+            # these directories are a hundred kilobytes each.
+            shutil.rmtree(box, ignore_errors=True)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.
         record: dict[str, float | str] = {
