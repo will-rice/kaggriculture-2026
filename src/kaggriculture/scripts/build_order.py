@@ -49,6 +49,21 @@ HEADINGS = {
     "weeds": "weeds",
 }
 
+OPENING = """### The opening, as orders
+
+What those agents send to the market on each of the first days -- the orders
+themselves, not what the orders accumulate to. Counts are medians over their
+games, so every line is a whole order that was really sent; a mean would give
+fractions of an order, which is how the old table came to ask for 1.2
+quadrants.
+"""
+HOLDINGS = """### What that accumulates to
+
+The same agents' holdings at the end of each day. This is a description of
+where the opening above arrives, not a second set of targets: hit the orders
+and the holdings follow, while chasing the holdings directly is what could not
+be done.
+"""
 PREAMBLE = """## How the strongest agents build
 
 Averaged over the {games:,} games the public ladder played in the last {window}
@@ -121,6 +136,7 @@ def main() -> None:
 
     best = dataset.openings(arguments.database, arguments.best)[0]
     order = dataset.build_order(arguments.database, teams=best.teams)
+    sent = dataset.opening_orders(arguments.database, teams=best.teams)
     connection = sqlite3.connect(arguments.database)
     try:
         # The games the table actually averages, not the whole corpus: the
@@ -132,12 +148,13 @@ def main() -> None:
     finally:
         connection.close()
     settled = strategy.Strategies(strategy.STORE).settled()
-    TABLE.write_text(render(order, games, best, settled), encoding="utf-8")
+    TABLE.write_text(render(order, sent, games, best, settled), encoding="utf-8")
     LOGGER.info("wrote %s over %d games", TABLE, games)
 
 
 def render(
     order: dict[str, list[float]],
+    sent: list[dataset.Order],
     games: int,
     best: dataset.Opening,
     settled: list[strategy.Claim],
@@ -153,7 +170,15 @@ def render(
             window=dataset.WINDOW,
         ).rstrip("\n"),
         "",
+        OPENING.rstrip("\n"),
+        "",
     ]
+    for day in sorted({order.day for order in sent}):
+        lines.append(f"**Day {day}**")
+        lines += [f"- {order.describe()}" for order in sent if order.day == day]
+        lines.append("")
+    lines.append(HOLDINGS.rstrip("\n"))
+    lines.append("")
     lines.append("| day | " + " | ".join(f"d{day}" for day in days) + " |")
     lines.append("| --- |" + " --- |" * len(days))
     for name in dataset.TARGETS:

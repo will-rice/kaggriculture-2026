@@ -646,3 +646,94 @@ def test_a_group_is_ranked_by_its_own_strength_not_by_its_best_member(
     assert set(groups[0].teams) == {"mid_0", "mid_1"}
     assert groups[0].rating > groups[1].rating
     assert "star" in groups[1].teams
+
+
+def trader(episode_id: int, teams: list[str], orders: list[list]) -> tapes.Episode:
+    """A season where seat 0 sends the same market orders on day zero."""
+    tiles = [crop(0, watered=True, dry=0, ripe=2)]
+    steps = []
+    for index in range(STEPS):
+        observation = {
+            "farms": [farm(900.0 + index, tiles), farm(300.0 + index, tiles)],
+            "private": {"seeds": {"WHEAT": 4}, "shed": {"WHEAT": 7}},
+            "market": {"prices": {"WHEAT": 40}, "inventory": {"WHEAT": 9000}},
+            "town": {"unlocked_shops": ["MARKET"]},
+        }
+        steps.append(
+            [
+                {
+                    "observation": observation,
+                    "action": {"market": orders if index == 1 and seat == 0 else []},
+                    "status": "DONE",
+                }
+                for seat in (0, 1)
+            ]
+        )
+    return tapes.Episode(
+        seed=7,
+        engine_version=tapes.ENGINE,
+        info={"seed": 7, "EpisodeId": episode_id, "TeamNames": teams},
+        steps=steps,
+    )
+
+
+def test_an_opening_is_read_as_whole_orders_that_were_really_sent(
+    tmp_path: Path,
+) -> None:
+    """A count of orders is a count, and a mean over it is a fraction of one.
+
+    Every artifact built from this corpus reduced a game to per-day holdings
+    and then averaged those, which is how the table came to ask for 1.2
+    quadrants -- 84% of a group holding one and 16% holding two, and no way to
+    buy a fifth of a quadrant. Nothing in the corpus is impossible; the summary
+    was. So the orders are read as sent, and counted with a median.
+    """
+    games = [
+        trader(
+            number,
+            ["rush", "plod"],
+            [["HIRE"], ["HIRE"], ["BUY_LAND"], ["BUY_PRODUCT", "WHEAT", 2]],
+        )
+        for number in range(1, 9)
+    ]
+    database = dated(tmp_path, {"2026-09-01": games})
+
+    sent = dataset.opening_orders(database, teams=["rush"], days=1, window=99)
+
+    by_verb = {(order.verb, order.item): order for order in sent}
+    assert by_verb[("HIRE", "")].count == 2, "two hires, not an average of them"
+    assert by_verb[("BUY_LAND", "")].count == 1
+    assert by_verb[("BUY_PRODUCT", "WHEAT")].quantity == 2
+    # Every game sent them, so no share qualifier belongs on the line.
+    assert by_verb[("HIRE", "")].share == 1.0
+    assert "in " not in by_verb[("HIRE", "")].describe()
+    assert by_verb[("HIRE", "")].describe() == "2 x `HIRE`"
+
+
+def test_an_order_only_some_games_send_says_so(tmp_path: Path) -> None:
+    """A line that reads like a rule when it is a coin flip is worse than none.
+
+    The count is a median over the games that send the order at all, so an
+    order sent by a fifth of them still reads "1 x" -- true of those games, and
+    misleading about the opening unless the share travels with it.
+    """
+    always = [["HIRE"]]
+    games = [
+        trader(
+            number, ["rush", "plod"], always + ([["BUY_LAND"]] if number < 3 else [])
+        )
+        for number in range(1, 9)
+    ]
+    database = dated(tmp_path, {"2026-09-01": games})
+
+    sent = dataset.opening_orders(database, teams=["rush"], days=1, window=99)
+
+    land = next(order for order in sent if order.verb == "BUY_LAND")
+    assert land.share == 0.25
+    # One each, in the quarter of games that send it at all. Counted over
+    # every game instead this rounds to nought and the order vanishes from a
+    # build order that a quarter of the strongest games actually send.
+    assert land.count == 1
+    assert "1 x `BUY_LAND`, in 25% of games" == land.describe()
+    hire = next(order for order in sent if order.verb == "HIRE")
+    assert "in " not in hire.describe(), "sent by all of them, so no qualifier"

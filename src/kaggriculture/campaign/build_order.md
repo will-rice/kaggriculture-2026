@@ -1,8 +1,8 @@
 ## How the strongest agents build
 
-Averaged over the 6,642 games the public ladder played in the last 10
+Averaged over the 6,640 games the public ladder played in the last 10
 days, across the 3 agents that share the strongest opening on it:
-**second quadrant day 3, third day 8**, mean rating +2.19.
+**second quadrant day 3, third day 8**, mean rating +2.05.
 
 Those agents rather than the top of the table, because a mean across the top of
 the table is a mean across agents doing different things. Measured 2026-09-09:
@@ -32,6 +32,55 @@ strongest quarter of a 185-agent field happens to do, and any of it can be
 beaten -- but where you differ from it sharply and lose, this is the first
 place to look.
 
+### The opening, as orders
+
+What those agents send to the market on each of the first days -- the orders
+themselves, not what the orders accumulate to. Counts are medians over their
+games, so every line is a whole order that was really sent; a mean would give
+fractions of an order, which is how the old table came to ask for 1.2
+quadrants.
+
+**Day 0**
+
+- 7 x `HIRE`
+- 3 x `BUY_PRODUCT WHEAT` x2
+- 1 x `BUY_ANIMAL COW` x5
+- 1 x `BUY_ANIMAL SHEEP` x1
+
+**Day 1**
+
+- 4 x `HIRE`
+- 4 x `SELL FERTILIZER` x2
+- 1 x `BUY_PRODUCT WHEAT` x1, in 20% of games
+- 1 x `SELL WHEAT` x1, in 20% of games
+
+**Day 2**
+
+- 7 x `HIRE`
+- 3 x `SELL FERTILIZER` x2
+- 1 x `BUY_PRODUCT WHEAT` x6
+
+**Day 3**
+
+- 7 x `HIRE`
+- 3 x `SELL FERTILIZER` x2
+- 1 x `BUY_PRODUCT WHEAT` x4
+- 1 x `BUY_LAND`
+
+**Day 4**
+
+- 7 x `HIRE`
+- 3 x `SELL WHEAT` x6, in 96% of games
+- 3 x `SELL FERTILIZER` x2
+- 2 x `BUY_SEED MELON` x1, in 81% of games
+
+### What that accumulates to
+
+The same agents' holdings at the end of each day. This is a description of
+where the opening above arrives, not a second set of targets: hit the orders
+and the holdings follow, while chasing the holdings directly is what could not
+be done.
+
 | day           | d0   | d1   | d2   | d3   | d4  | d5   | d6   | d8    | d10   | d12   | d14    | d17    | d20    | d23    | d25    | d27    | d29     |
 | ------------- | ---- | ---- | ---- | ---- | --- | ---- | ---- | ----- | ----- | ----- | ------ | ------ | ------ | ------ | ------ | ------ | ------- |
 | bank          | 40   | 626  | 996  | 317  | 757 | 572  | 778  | 1,502 | 3,721 | 9,296 | 15,519 | 35,002 | 56,226 | 71,990 | 80,730 | 90,031 | 106,246 |
@@ -48,11 +97,11 @@ What the same games say when the two sides of each are compared directly --
 every quantity crossed with every day, and these are the ones that separate
 the stronger agent from the weaker most sharply:
 
-- **fertilised**, day 6: the stronger side holds more, in 93% of 268 games where the two differed.
-- **fertilised**, day 7: the stronger side holds more, in 93% of 275 games where the two differed.
-- **fertilised**, day 8: the stronger side holds more, in 91% of 235 games where the two differed.
-- **land_orders**, day 8: the stronger side holds more, in 89% of 620 games where the two differed.
-- **hungry_worst**, day 2: the stronger side holds more, in 88% of 275 games where the two differed.
-- **quadrants**, day 3: the stronger side holds more, in 88% of 292 games where the two differed.
-- **quadrants**, day 8: the stronger side holds more, in 88% of 577 games where the two differed.
-- **land_orders**, day 5: the stronger side holds more, in 87% of 639 games where the two differed.
+- **fertilised**, day 7: the stronger side holds more, in 91% of 245 games where the two differed.
+- **fertilised**, day 6: the stronger side holds more, in 91% of 231 games where the two differed.
+- **land_orders**, day 5: the stronger side holds more, in 90% of 688 games where the two differed.
+- **fertilised**, day 8: the stronger side holds more, in 90% of 229 games where the two differed.
+- **hungry_worst**, day 2: the stronger side holds more, in 89% of 300 games where the two differed.
+- **dry_worst**, day 1: the stronger side holds more, in 89% of 595 games where the two differed.
+- **plant_age**, day 1: the stronger side holds less, in 89% of 597 games where the two differed.
+- **land_orders**, day 8: the stronger side holds more, in 88% of 664 games where the two differed.

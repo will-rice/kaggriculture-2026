@@ -61,6 +61,12 @@ LEAST = 40
 # The day a team never reached a quadrant at all, standing in for infinity so a
 # signature is always a pair of days and sorts.
 NEVER = 99
+# How much of the opening to read as orders, and how many distinct orders to
+# keep from each day. Five days because every settled claim about the opening
+# falls inside the first week, and four orders because past that a day's list
+# is the long tail of one-offs rather than the shape of the opening.
+OPENING_DAYS = 5
+OPENING_ORDERS = 4
 # How many days back a rating and a build order read. The ladder is not a
 # fixed field: it moves under everyone, every day.
 #
@@ -289,7 +295,12 @@ def _insert(
 ) -> None:
     """Write every row one recorded game produces."""
     identity = episode.info
-    key = str(identity.get("EpisodeId") or episode.seed)
+    # `is None` rather than `or`: an EpisodeId of 0 is an episode id, and
+    # `or` sends it to the seed instead, where it collides with whichever
+    # episode really has that seed. Two games then share a key and the row
+    # counts every query makes are quietly short.
+    identifier = identity.get("EpisodeId")
+    key = str(episode.seed if identifier is None else identifier)
     final = episode.steps[-1][0]["observation"]["farms"]
     banks = [float(farm["money"]) for farm in final]
     teams = list(identity.get("TeamNames") or ["", ""])
@@ -846,6 +857,111 @@ def _signature(
         int(statistics.median([NEVER if r[0] is None else r[0] for r in rows])),
         int(statistics.median([NEVER if r[1] is None else r[1] for r in rows])),
     )
+
+
+class Order(NamedTuple):
+    """One order the strongest opening sends on one day.
+
+    Attributes:
+        day: The day it is sent.
+        verb: The market op, as the engine names it.
+        item: What it acts on, or "" for `HIRE` and `BUY_LAND`, which take
+            none.
+        share: Fraction of that opening's seat-games that send it at all.
+        count: How many go out on that day, when any do. A median, because a
+            mean over a count of orders is a fraction of an order and nobody
+            can send 3.3 of them.
+        quantity: Units per order, likewise a median, or 0 where the order
+            takes no quantity.
+    """
+
+    day: int
+    verb: str
+    item: str
+    share: float
+    count: int
+    quantity: int
+
+    def describe(self) -> str:
+        """The order as a line a reader can act on."""
+        amount = f" x{self.quantity}" if self.quantity else ""
+        what = f" {self.item}" if self.item else ""
+        every = "" if self.share > 0.98 else f", in {self.share:.0%} of games"
+        return f"{self.count} x `{self.verb}{what}`{amount}{every}"
+
+
+def opening_orders(
+    database: Path = DATABASE,
+    teams: list[str] | None = None,
+    days: int = OPENING_DAYS,
+    window: int = WINDOW,
+    shown: int = OPENING_ORDERS,
+) -> list[Order]:
+    """The orders one opening actually sends, day by day.
+
+    Every artifact built from this corpus reduces a game to per-day holdings
+    and throws the sequence away, and the holdings are then averaged into
+    something unplayable: 1.2 quadrants on day three is 84% of the group
+    holding one and 16% holding two, and nobody can buy a fifth of a quadrant.
+
+    Nothing in the corpus is impossible, though. Every order in it was sent by
+    a real agent in a real game, and the table is 29.5M of them. So this reads
+    the orders rather than their accumulated effect, and reports a median count
+    rather than a mean, because a mean over orders is a fraction of an order.
+
+    Aggregate over a group and naming no agent, which is the footing the build
+    order and the report already stand on.
+
+    Args:
+        database: The dataset, already built and rated.
+        teams: Read from these agents; the strongest opening when None.
+        days: How many days of the opening to read.
+        window: Days back to read, matching the rating's own window.
+        shown: How many distinct orders to keep per day, most sent first.
+
+    Returns:
+        Every kept order, by day and then by how often it is sent.
+    """
+    group = teams or openings(database, window=window)[0].teams
+    marks = ",".join("?" * len(group))
+    connection = sqlite3.connect(database)
+    out: list[Order] = []
+    try:
+        first = recent(connection, window)
+        seats = connection.execute(
+            f"SELECT count(DISTINCT o.episode || o.seat) FROM orders o "  # noqa: S608 - names are this module's own
+            f"JOIN days d ON d.episode = o.episode AND d.seat = o.seat "
+            f"AND d.day = 0 JOIN episodes e ON e.episode = o.episode "
+            f"WHERE d.team IN ({marks}) AND e.played >= ?",
+            (*group, first),
+        ).fetchone()[0]
+        if not seats:
+            return out
+        for day in range(days):
+            rows = connection.execute(
+                f"SELECT o.verb, coalesce(o.item, ''), "  # noqa: S608
+                f"count(DISTINCT o.episode || o.seat), count(*), "
+                f"coalesce(avg(o.quantity), 0) FROM orders o "
+                f"JOIN days d ON d.episode = o.episode AND d.seat = o.seat "
+                f"AND d.day = 0 JOIN episodes e ON e.episode = o.episode "
+                f"WHERE d.team IN ({marks}) AND e.played >= ? AND o.day = ? "
+                f"GROUP BY o.verb, o.item ORDER BY count(*) DESC LIMIT ?",
+                (*group, first, day, shown),
+            ).fetchall()
+            for verb, item, sending, total, quantity in rows:
+                out.append(
+                    Order(
+                        day=day,
+                        verb=verb,
+                        item=item,
+                        share=sending / seats,
+                        count=round(total / max(sending, 1)),
+                        quantity=round(quantity),
+                    )
+                )
+    finally:
+        connection.close()
+    return out
 
 
 def build_order(
