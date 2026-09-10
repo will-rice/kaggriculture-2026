@@ -120,6 +120,8 @@ def library() -> ctypes.CDLL:
     lib.kag_new.restype = ctypes.c_void_p
     lib.kag_new.argtypes = [ctypes.c_uint64, ctypes.c_int32]
     lib.kag_free.argtypes = [ctypes.c_void_p]
+    lib.kag_clone.restype = ctypes.c_void_p
+    lib.kag_clone.argtypes = [ctypes.c_void_p]
     lib.kag_step.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(PackedAction),
@@ -334,6 +336,21 @@ class Engine:
     def bank(self, player: int) -> float:
         """Return ``player``'s money, the quantity the competition scores."""
         return float(self.state.farms[player].money)
+
+    def fork(self) -> "Engine":
+        """Return an independent episode at this exact position.
+
+        A plan search tries many continuations from one position, and
+        replaying from step 0 for each of them is the search's whole cost.
+        The two engines share nothing after this returns: stepping one leaves
+        the other where it was.
+        """
+        twin = Engine.__new__(Engine)
+        twin.library = self.library
+        twin.sim = self.library.kag_clone(self.sim)
+        twin.state = PackedState()
+        twin.export()
+        return twin
 
     @property
     def done(self) -> bool:

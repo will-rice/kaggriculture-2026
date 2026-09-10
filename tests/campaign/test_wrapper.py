@@ -104,3 +104,40 @@ def test_bank_is_the_money_the_reference_engine_reports() -> None:
         engine.step(PASS, PASS)
     assert engine.bank(0) == 3000.0 and engine.bank(1) == 3000.0
     assert engine.step_index == EPISODE_STEPS - 1
+
+
+def test_a_fork_plays_on_identically_and_independently() -> None:
+    """A forked position continues exactly as the one it came from, alone.
+
+    This is the primitive a plan search runs on: trying a continuation must
+    not cost a replay from step 0, and must not disturb the position it
+    branched from. Both halves are checked -- the fork reaches the bank the
+    original would have reached, and stepping the fork leaves the original
+    where it was.
+    """
+    buy = {"farmer": ["PASS"], "hands": [], "market": [["BUY_SEED", "WHEAT", 5]]}
+    engine = Engine(seed=4242, episode_steps=EPISODE_STEPS)
+    for _ in range(48):
+        engine.step(PASS, PASS)
+
+    twin = engine.fork()
+    assert twin.step_index == engine.step_index
+    assert twin.observation(0) == engine.observation(0)
+
+    # The fork spends; the original must not notice.
+    before = engine.bank(0)
+    twin.step(buy, PASS)
+    assert twin.bank(0) < before, "the fork never spent anything to notice"
+    assert engine.bank(0) == before
+    assert engine.step_index == 48
+
+    # And a fork taken later plays on identically, so it inherited the
+    # episode's randomness rather than starting a new one of its own.
+    for _ in range(24):
+        engine.step(PASS, PASS)
+    second = engine.fork()
+    for _ in range(48):
+        engine.step(PASS, PASS)
+        second.step(PASS, PASS)
+    assert second.bank(0) == engine.bank(0)
+    assert second.observation(0) == engine.observation(0)
