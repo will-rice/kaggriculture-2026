@@ -81,7 +81,14 @@ def measure(database: Path) -> dict[str, str]:
     """Every number the page states, queried once."""
     rows = dataset.counts(database)
     ladder = dataset.ladder(database)
-    top, tail = _ends(ladder)
+    # The strong side is one opening rather than the top of the table. A mean
+    # across the top of the table is a mean across agents doing different
+    # things: it put 1.2 quadrants on day three, which is 84% of them holding
+    # one and 16% holding two, and no agent holds a fifth of a quadrant. The
+    # weak side stays the bottom of the ladder, which is a blend and is fine
+    # as one -- it is context for the strong side, never a target.
+    best = dataset.openings(database)[0]
+    top, tail = best.teams, _ends(ladder)[1]
     connection = sqlite3.connect(database)
     try:
         first, last = connection.execute(
@@ -158,6 +165,8 @@ def measure(database: Path) -> dict[str, str]:
         "spread": f"{high - low:.1f}",
         "top": str(len(top)),
         "tail": str(len(tail)),
+        "opening": best.describe(),
+        "opening_rating": f"{best.rating:+.2f}",
         "day_heads": "".join(f"<th>d{day}</th>" for day in DAYS),
         "build_rows": _build_rows(build),
         "quad_top": _points(quads[0]),
@@ -175,6 +184,10 @@ def measure(database: Path) -> dict[str, str]:
 
 def _ends(ladder: list[tuple]) -> tuple[list[str], list[str]]:
     """The two ends of the rated field, as disjoint lists of team names.
+
+    Only the weak end is read from this now; the strong side is one opening,
+    for which see `measure`. Kept whole because the disjointness check below is
+    what guarantees the two sides do not overlap as the field shrinks.
 
     Raises:
         ValueError: If the shares would overlap. A page that compares a group

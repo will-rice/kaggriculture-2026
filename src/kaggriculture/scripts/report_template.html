@@ -297,15 +297,24 @@
     <div class="note">
       <p class="eyebrow">How these are grouped</p>
       <p>
-        Every comparison below is the
-        <strong>top $top rated agents against the bottom $tail</strong>, by a
-        Bradley-Terry fit over the whole corpus — never the winner against the
-        loser of a given game. That distinction is not pedantry. Grouped by game
-        outcome, eleven quantities measured over thirteen thousand games all
-        came back between <strong>45% and 60%</strong>: noise. About half of
-        every ladder's winners are the weaker agent having a good day, and that
-        swamps the signal. Regrouped by rating, the same corpus separates
-        cleanly — and reverses the sign of one of them.
+        The strong side of every comparison below is the
+        <strong>$top agents that share the ladder's strongest opening</strong> —
+        $opening, mean rating $opening_rating — set against the
+        <strong>bottom $tail</strong> of the same Bradley-Terry fit.
+      </p>
+      <p>
+        One opening rather than the top of the table, because a mean across the
+        top of the table is a mean across agents doing different things: it
+        asked for <strong>1.2 quadrants on day three</strong>, which is 84% of
+        them holding one and 16% holding two. No agent holds a fifth of a
+        quadrant, and an agent built to follow that number could not buy
+        anything at all.
+      </p>
+      <p>
+        Grouped by rating rather than by who won, too. By game outcome, eleven
+        quantities measured over thirteen thousand games all came back between
+        <strong>45% and 60%</strong>: noise, because about half of every
+        ladder's winners are the weaker agent having a good day.
       </p>
     </div>
   </section>
@@ -440,8 +449,8 @@
 
     <div class="key">
       <span
-        ><i class="swatch" style="background: var(--strong)"></i> top $top
-        rated</span
+        ><i class="swatch" style="background: var(--strong)"></i> $top on the
+        strongest opening</span
       >
       <span
         ><i class="swatch" style="background: var(--rest)"></i> bottom $tail
