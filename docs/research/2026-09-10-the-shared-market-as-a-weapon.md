@@ -159,3 +159,88 @@ seats -- which is why sixteen seeds settle it there.
   reads `/data/kaggriculture/opponents` and `/data/kaggriculture/agents`, and
   the seed is named by `config.SEED`, so nothing under `experiments/` is
   reachable by the optimizer.
+
+## Chasing champion_65
+
+The bar for a submission is not the seed, it is the agent a submission would
+displace. Kaggle scores the latest two, so anything sent up bumps champion_64
+or champion_65 out of a scored slot.
+
+The portfolio agent, which beat its own parent by +2,800, loses to champion_65
+by **-22,918** over 24 games, winning 2. Beating a parent measures whether a
+change helped. It says nothing about whether an agent is worth a slot, and
+reading one as the other is how the tape lineage saturated against itself.
+
+### The gap is farming, not fighting
+
+|             | alone   | facing each other |
+| ----------- | ------- | ----------------- |
+| portfolio   | 143,026 | 75,299            |
+| champion_65 | 166,017 | 92,128            |
+
+Contact costs both sides about 45% of their bank -- the shared market again --
+but it costs _us_ 6,163 less than it costs them. The whole deficit is farming
+in isolation: 22,992 with the board to ourselves.
+
+### And it is not for want of inputs
+
+Averaged over six episodes, each alone:
+
+|                        | day 5 | day 15 | day 25   | day 29  |
+| ---------------------- | ----- | ------ | -------- | ------- |
+| hands, portfolio       | 7.0   | 13.0   | 13.0     | 12.0    |
+| hands, champion_65     | 5.0   | 11.0   | 11.0     | 8.5     |
+| plants, portfolio      | 21.0  | 61.8   | **37.3** | 16.3    |
+| plants, champion_65    | 19.0  | 57.7   | **56.0** | 15.0    |
+| quadrants, portfolio   | 1.0   | 4.0    | 4.0      | 4.0     |
+| quadrants, champion_65 | 1.0   | 3.0    | 3.0      | 3.0     |
+| money, portfolio       | 157   | 22,388 | 98,396   | 131,978 |
+| money, champion_65     | 95    | 33,894 | 128,524  | 162,362 |
+
+More labour and more land, fewer plants and less money. The farm empties out
+after day 15 while theirs stays full.
+
+### Twenty-two tiles, bare, with the seed for them in the shed
+
+From day 15 to the end, 22 to 25 unlocked tiles sit empty, and `_crop_choices`
+would take a crop on every one of them -- 45 of them by day 25. Meanwhile the
+seed counts stand frozen at `{WHEAT: 12, STRAWBERRY: 10, MELON: 2}` for ten
+days: nothing planted, nothing bought. Planting falls from 2.19% of worker
+actions in the first half to 0.91% in the second, while 11% of actions are
+workers passing.
+
+Three things were tested against that, and only one of them was the cause.
+
+**Planting priority.** Tasks are ranked by value and planting sits at 65,
+under watering at 110, placing an animal at 120 and fertilizing at 135. Raising
+it to 115 made the agent _worse_: -2,887 against the seed. Watering earns its
+place, and stealing workers from it costs more than the planting gains.
+
+**The seed cap.** `n = min(12, n) - seeds.get(c, 0)` holds at most twelve seeds
+of a crop however many plots want it -- 45 plots asking for wheat against 12
+wheat seeds -- and seeds cost no shed space, so the cap buys nothing. Removing
+it changed nothing measurable: +5,603 against +5,968, inside the error bar.
+Seeds were not the constraint either.
+
+**The fourth quadrant.** This was. It costs 4,000 on a farm that already cannot
+work the land it has, and champion_65 never buys it. Pricing it out of reach:
+
+|                 | vs the seed, 32 games           | vs champion_65, 24 games |
+| --------------- | ------------------------------- | ------------------------ |
+| portfolio       | +2,800 +/- 583, score 0.781     | -22,918, score 0.083     |
+| three quadrants | **+5,968 +/- 722, score 0.938** | **-15,038, score 0.208** |
+
+A third of the gap to champion_65, closed by not buying something.
+
+### Where this leaves it
+
+Still losing to champion_65, and the remaining 15,000 is the same idle land
+seen from the other side: the farm cannot work three quadrants either. Worker
+routing is the constraint -- not priority, not seeds, not land. Workers are
+assigned plant tasks and walk toward them, and the seed counts never fall,
+so they are being re-targeted before they arrive.
+
+That is the next thing to measure: how often a worker's target changes before
+it reaches it. `_TARGETS` carries the previous assignment across turns, and if
+that persistence is weaker than the re-ranking, the farm spends its labour
+walking. Movement is 49% of all worker actions after day 15.
