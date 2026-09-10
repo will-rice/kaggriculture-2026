@@ -263,12 +263,25 @@ def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
         table("champion_1", {"v54": 0.5}),
     )
 
+    # The program is named, because a round that does not know which file it
+    # is editing edits nothing.
     assert "`child.py` in your working directory is `champion_1`" in text
-    assert "Edit it in place and stop" in text
-    assert "the campaign plays" in text
-    # Whitespace-normalised: the paragraph is wrapped, so the sentence this
-    # is about spans a line break in the source.
-    assert "no time limit on this call" in " ".join(text.split())
+    # The rest is structural rather than quoted: the working rules are
+    # editorial and a test that pins their wording breaks on every rewrite
+    # while catching nothing. What has to hold is that every line of the
+    # section reaches the round whole -- a truncated rule is a different rule
+    # -- and that the instruction comes after them.
+    rules = prompt.ROUND_PROMPT.read_text(encoding="utf-8")
+    section = rules.split("## The program", 1)[1].split("\n## ", 1)[0]
+    # Lines carrying a placeholder are compared after substitution elsewhere;
+    # these are the ones that travel verbatim.
+    literal = [
+        line for line in section.splitlines() if line.strip() and "{" not in line
+    ]
+    assert len(literal) > 20, "the section stopped being the working rules"
+    for line in literal:
+        assert line in text, f"the round never sees: {line!r}"
+    assert text.index(literal[-1]) < text.index(IMPROVE)
 
 
 def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:
@@ -606,10 +619,15 @@ def test_the_message_says_what_has_already_been_made_of_the_program(
         table("champion_1", {"v54": 0.5}),
     )
 
-    assert "What has already been made of `champion_1`" in text
+    heading = "What has already been made of `champion_1`"
+    assert heading in text
     # Best first, so the row that says what to beat is the one read first.
-    assert text.index("better") < text.index("worse")
-    assert "Held wheat for the glut to lift." in text
+    # Scoped to the section: these ids are ordinary English words, and looking
+    # for them in the whole message found "worse" in the working rules instead
+    # and read the table as mis-sorted.
+    section = text.split(heading, 1)[1].split("\n## ", 1)[0]
+    assert section.index("better") < section.index("worse")
+    assert "Held wheat for the glut to lift." in section
     assert "Sold wheat on sight. Worse." in text
     assert "0.400" in text and "0.100" in text
     # Another program's children are not this program's.

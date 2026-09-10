@@ -43,10 +43,33 @@ round.
 `child.py` in your working directory is `{name}`, and it is the only file
 there. It is the program to improve.
 
-Edit it in place and stop. Do not run anything and do not report anything back
-in your reply: whatever `child.py` holds when you finish is what the campaign
-plays, against every opponent below, and the result comes back to you as
-another message like this one asking you to improve it again.
+Edit it in place. Do not report anything back in your reply: whatever
+`child.py` holds when you finish is what the campaign plays, against every
+opponent below, and the result comes back to you as another message like this
+one asking you to improve it again.
+
+Check your work before you finish. The directory is yours and it is thrown
+away after this call, so write whatever scratch files help -- a test, a probe,
+a script that plays a few turns -- and leave them there; only `child.py` is
+read. Two things are worth doing every round:
+
+    ruff format child.py
+    ruff check --select C,E,F,I,W,D,N,B,PTH,ANN --ignore D107 child.py
+
+Both are on your path. The flags are spelled out because there is no config
+file in this directory. Fix what `check` reports rather than silencing it: a
+round is handed this whole program as text, so how readable it is decides how
+much of the next call goes into reading it rather than improving it. `C901`
+is the one that matters most and the one the program is worst at -- `agent`
+arrived at 111 branches against a limit of 10. Splitting it up is welcome work
+in its own right.
+
+Then test what you changed. Write a small test beside `child.py`, run it with
+`pytest`, and make it fail before you make it pass -- a test that passes
+against the bug it was written for is worse than none, because it reports the
+bug as fixed. Import `child` and call `agent` with an observation you build
+yourself. A change that has never been executed is a guess, and a round that
+ships a crash scores nothing at all: the program forfeits every game.
 
 `child.py` must stay one self-contained file whose last top-level callable is
 `agent(observation, configuration)` -- that is what Kaggle loads. Say in a

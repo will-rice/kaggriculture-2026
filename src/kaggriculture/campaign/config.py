@@ -454,25 +454,28 @@ POOL = OPPONENTS.parent / "campaign" / "pool.json"
 # this is the only place the live one is named -- a dry run and a test each
 # construct their own and nothing has to be swapped out from under anyone.
 LIVE = Run(root=RUN, pool=POOL)
-# The published agent a cold start begins from, and the one number that says
-# why it rather than another: fit over `FIELD` on 2026-09-06 it rated +1.78
-# against +0.64 for the next opponent and -2.67 for the last, so it is the
-# top of the field by a clear point of rating.
+# `pb75e380571fc`, the best program the campaign's own rule-based lineage ever
+# wrote: 491 lines that decide the season turn by turn from the observation --
+# analytic market prices, crop and livestock forecasts on actual production
+# dates, workers assigned by value. No recorded actions anywhere in it.
 #
-# The campaign spent 381 programs evolving upward from a thirty-line skeleton
-# and never once topped the tournament -- 95% of every rate it measured was a
-# shutout, because a program that loses every game to eleven of twelve
-# opponents has no gradient to climb. Starting from the strongest published
-# agent starts the search where the gradient is: every opponent is within
-# reach of it, so an edit that helps shows up as a rate that moves.
+# It replaces `thomastschinkel_router`, which was adopted on 2026-09-07 on the
+# reading that the rule-based search had no gradient: 95% of every rate it
+# measured was a shutout. That reading was of the wrong number. Win rate was
+# flat because a young lineage beats nobody, while the mean bank margin
+# underneath it ran from -179,647 to -8,444 -- 171,000 coins of clean,
+# well-ordered signal, already recorded on every program, already the
+# tie-break `Database.top` sorts on. The record over that run went -119,258,
+# then -10,446, then -8,444, the last of them 585 seconds before the run was
+# stopped. It was accelerating when we read it as dead.
 #
-# What makes this legitimate is the competition's own sharing rule -- this
-# agent is published, and published code is the field's to build on -- and
-# what makes it worth anything is the gate, which is unchanged: a candidate
-# is promoted only when it tops the tournament, and this agent is *in* that
-# tournament. Tying the seed does not promote. Only beating it does.
+# What we adopted instead turned out to be a 720-step recording with a repair
+# layer around it: 86.5% of champion_69's actions came out of the table
+# verbatim, the table was byte-identical from the seed through 69 promotions,
+# and emptying it dropped the agent to 3,000 -- what passing every turn banks.
+# The search never touched the policy because it never could; 29,820
+# characters of base64 do not fit in a prompt.
 #
-# It is 619 lines in one file, which matters: a round hands the model the
-# whole program, and the 3,778-line `shopforge` or the 316KB tuned kernels
-# would spend a call being read rather than improved.
-SEED = OPPONENTS / "thomastschinkel_router" / "main.py"
+# So the lineage starts from a program that plays, and `ALLOWED_IMPORTS` no
+# longer admits `base64` or `zlib`, which is what a recording needs to travel.
+SEED = ROOT / "src" / "kaggriculture" / "seed" / "main.py"

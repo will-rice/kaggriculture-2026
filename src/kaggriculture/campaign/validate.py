@@ -46,13 +46,18 @@ from kaggriculture.campaign import copycheck, harness
 # a candidate importing either would validate here and die on the ladder --
 # the one failure this system cannot afford.
 #
-# `base64` and `zlib` are here because one file must carry everything: an
-# agent with a learned table -- and the seed the campaign starts from is one
-# -- has nowhere to put it but a compressed literal in its own source. Both
-# are pure computation over bytes: neither opens a file, reaches the network,
-# or loads a module. Nor can what they return become code, because
-# `_forbidden_call` blocks `eval`, `exec` and `compile` outright, so a
-# decoded blob stays data no matter what it decodes to.
+# `base64` and `zlib` were admitted on 2026-09-07 so a seed carrying a learned
+# table could bring it along, one file having nowhere else to put one. They
+# are refused now because of what that table turned out to be: 86.5% of
+# champion_69's actions came verbatim out of a 720-step recording, the
+# recording was byte-identical from the seed through all 69 promotions, and
+# emptying it dropped the agent to 3,000 -- what passing every turn banks.
+#
+# Neither module is dangerous, and that was never the question. They are the
+# way a recording travels, and a recording cannot be improved by a search that
+# is handed the program as text: 29,820 characters of base64 reach a round as
+# one opaque literal, so 521 sessions edited the repair layer around a policy
+# they could not read. This campaign is looking for an agent that plays.
 ALLOWED_IMPORTS: frozenset[str] = frozenset(
     {
         "math",
@@ -69,8 +74,6 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
         "enum",
         "copy",
         "json",
-        "base64",
-        "zlib",
         "pathlib",
         "time",
         "kaggle_environments",
