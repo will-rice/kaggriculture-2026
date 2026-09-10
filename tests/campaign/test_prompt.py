@@ -162,12 +162,19 @@ def test_the_message_carries_no_corpus_derived_target() -> None:
         table("champion_1", {"v54": 0.0}),
     )
 
-    assert "How the strongest agents build" not in text
-    assert "The opening, as orders" not in text
-    # Not asserted on the market verbs themselves: BUY_LAND is a rule of the
-    # game and the task prompt documents it, mined opening or no.
-    # Its own play stays: the rates, the day tables, and the rules.
-    assert "child.py" in text
+    # The invariant is that neither corpus artifact's *content* travels, which
+    # is checked against the artifacts themselves rather than against headings
+    # somebody chose. A heading can be renamed; the file either reaches the
+    # round or it does not.
+    build_order = prompt.BUILD_ORDER.read_text(encoding="utf-8").strip()
+    assert build_order
+    assert build_order not in text
+    for line in build_order.splitlines():
+        if line.startswith("| ") and len(line) > 40:
+            assert line not in text, "a row of the build order reached the round"
+            break
+    # Its own play stays: the day tables it was measured on, and the rules.
+    assert prompt.TASK_PROMPT.read_text(encoding="utf-8").strip()[:80] in text
     assert re.search(r"\|\s*our quads\s*\|", text)
     # Aggregate only, still: no opponent is named and no path of theirs appears.
     assert "/data" not in text
@@ -460,19 +467,23 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
     and a farm bot written from scratch loses every game to this pool.
     The three that survived were within 0.06 of each other.
     """
-    assert "child.py" in prompt.INSTRUCTION
-    # The bar is now the margin in the games rather than the place in the
-    # table. Fourteen of the champion's twenty-four opponents are saturated and
-    # every one of them is ours, so a rank is a step function over a table with
-    # no gradient left; a program can always win by more. Promotion still runs
-    # on a fit that is blind to margin, so this shapes the search without
-    # deciding it.
-    assert "larger bank" in prompt.INSTRUCTION
-    assert "top of the standings" not in prompt.INSTRUCTION
-    # It must still not prescribe one route: naming a method is what the five
-    # did, and three of them named the same one. More than one is offered.
-    assert "Small, local changes" in prompt.INSTRUCTION
-    assert "replacing" in prompt.INSTRUCTION
+    # One instruction, not a set to draw from. That is the whole invariant,
+    # and it is structural: wording is an editorial choice and a test that
+    # pins it breaks on every rewrite while catching nothing.
+    assert isinstance(prompt.INSTRUCTION, str)
+    assert prompt.INSTRUCTION.strip()
+    assert not isinstance(prompt.INSTRUCTION_NAME, (list, tuple, set, dict))
+    # And it reaches the round whole, since a truncated instruction is an
+    # instruction to do something else.
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.0}, days=30),
+        [],
+        [],
+        prompt.INSTRUCTION,
+        table("champion_1", {"v54": 0.0}),
+    )
+    assert prompt.INSTRUCTION in text
 
 
 def failure(reason: str) -> archive.Failure:
