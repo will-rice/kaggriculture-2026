@@ -53,6 +53,11 @@ exclude = [".venv"]
 # is for. The round asks for it; this line is what stops it blocking the
 # commit in the meantime.
 "src/kaggriculture/seed/main.py" = ["C901"]
+# The experiments are variants of that same seed, each differing from it in one
+# place, so they inherit its four complex functions unchanged. Fixing the
+# complexity here would mean they no longer differ in one place, and the
+# head-to-head against the seed would stop meaning anything.
+"experiments/*/main.py" = ["C901"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
