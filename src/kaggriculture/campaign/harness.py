@@ -440,6 +440,16 @@ def _tally(traded: dict[int, dict[str, list[int]]], actions: Sequence[Any]) -> N
         orders = action.get("market") if isinstance(action, dict) else None
         for order in orders or ():
             parts = list(order) if isinstance(order, list | tuple) else [order]
+            # An empty order has no verb to count. The engine drops one
+            # silently, so a program can emit it and play a perfectly good
+            # game -- `ahmedberatozer_notebook07b5f4563e` submits
+            # `[['HIRE'], []]` on step 121 and four harvested opponents did
+            # the same. This used to read `parts[0]` regardless, so the
+            # bookkeeping raised `IndexError` where the game itself had no
+            # complaint, and an opponent doing something legal took the whole
+            # campaign down on the next gate.
+            if not parts:
+                continue
             running = traded[player].setdefault(str(parts[0]), [0, 0])
             running[0] += 1
             running[1] += int(parts[2]) if len(parts) > 2 else 0

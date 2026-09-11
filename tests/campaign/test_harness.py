@@ -504,3 +504,28 @@ def test_a_day_row_counts_what_each_farm_was_growing(
         # Neglected ground goes to weeds, which is a tile lost and worth
         # seeing: this agent waters one tile and leaves the rest.
         assert max(row.ours_weeds for row in game.days) > 0
+
+
+def test_an_empty_market_order_does_not_take_the_campaign_down() -> None:
+    """A program may submit an order with nothing in it, and the engine shrugs.
+
+    `ahmedberatozer_notebook07b5f4563e` submits `[['HIRE'], []]` on step 121,
+    and four harvested opponents did the same. The engine drops the empty one
+    and plays on; this bookkeeping read its first element regardless and raised
+    `IndexError`, which is not a failure the game had. A legal opponent
+    therefore took down every gate that drew it -- five of twenty-seven in the
+    pool on the day it was found, and the campaign died on its first round.
+    """
+    traded: dict[int, dict[str, list[int]]] = {0: {}, 1: {}}
+
+    harness._tally(
+        traded,
+        [
+            {"market": [["HIRE"], [], ["SELL", "WHEAT", 3]]},
+            {"market": []},
+        ],
+    )
+
+    # The empty one carries no verb to count; the real ones are counted.
+    assert traded[0] == {"HIRE": [1, 0], "SELL": [1, 3]}
+    assert traded[1] == {}
