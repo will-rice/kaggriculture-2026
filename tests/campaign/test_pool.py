@@ -213,3 +213,43 @@ def test_the_floor_survives_a_draw_too_small_to_hold_everyone(
 
     assert "d" in drawn
     assert len(drawn) == 2
+
+
+def test_our_champions_are_trimmed_and_harvested_agents_are_not() -> None:
+    """Two kinds of opponent, kept on two different terms.
+
+    A published agent is evidence about the field we are scored against and
+    the campaign cannot make another one, so it stays. A champion is a rung on
+    a ladder we built, and the tenth-best rung says nothing the best one does
+    not. Keeping every champion is what put sixty-nine of them in the pool,
+    holding ten of a gate's twenty-four slots.
+    """
+    opponents = {f"champion_{i}": f"/champions/{i}.py" for i in range(1, 10)}
+    opponents.update({"router_v1": "/public/a.py", "shopforge": "/public/b.py"})
+    subject = pool.Pool(opponents=dict(opponents))
+    # The newest champion rates worst, and is kept regardless: it has just won
+    # the gate, which a rating fitted before it joined knows nothing about.
+    standings = {f"champion_{i}": float(i) for i in range(1, 10)}
+    standings["champion_10"] = -99.0
+
+    subject.add_champion("champion_10", "/champions/10.py", standings)
+
+    ours = sorted(n for n in subject.opponents if n.startswith("champion_"))
+    assert len(ours) == config.POOL_CHAMPIONS
+    assert "champion_10" in ours
+    # The best of the old ones stay; the weakest are retired.
+    assert "champion_9" in ours
+    assert "champion_1" not in ours
+    # Nothing published leaves, whatever it rates.
+    assert {"router_v1", "shopforge"} <= set(subject.opponents)
+
+
+def test_without_standings_no_champion_is_dropped() -> None:
+    """Dropping in an order nobody measured is worse than keeping them all."""
+    subject = pool.Pool(
+        opponents={f"champion_{i}": f"/champions/{i}.py" for i in range(1, 20)}
+    )
+
+    subject.add_champion("champion_20", "/champions/20.py")
+
+    assert len(subject.opponents) == 20

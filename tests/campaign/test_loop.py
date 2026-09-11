@@ -633,10 +633,15 @@ def test_the_pool_is_changed_on_the_loop_thread(
     threads: list[str] = []
     add_champion = pool.Pool.add_champion
 
-    def watched(self: pool.Pool, name: str, path: str) -> None:
+    def watched(
+        self: pool.Pool,
+        name: str,
+        path: str,
+        standings: dict[str, float] | None = None,
+    ) -> None:
         """The real pool change, with a note of the thread that made it."""
         threads.append(threading.current_thread().name)
-        add_champion(self, name, path)
+        add_champion(self, name, path, standings)
 
     monkeypatch.setattr(pool.Pool, "add_champion", watched)
 

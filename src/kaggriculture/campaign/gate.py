@@ -400,9 +400,22 @@ def enroll(champion: Champion, pool: Pool, paths: config.Run) -> None:
         pool: The opponent pool, updated and saved in place.
         paths: The run whose pool file it is saved to.
     """
-    pool.add_champion(champion.name, champion.path)
+    before = set(pool.opponents)
+    # Fitted over every pairing on the record, which is what decides who stays:
+    # a champion's rating here is its standing against the whole field, not
+    # against whoever it happened to draw.
+    placed = rating.standings(rating.Field.load(paths.field).everything())
+    pool.add_champion(champion.name, champion.path, placed)
     pool.save(paths.pool)
-    LOGGER.info("%s joined the pool", champion.name)
+    retired = before - set(pool.opponents)
+    if retired:
+        LOGGER.info(
+            "%s joined the pool; %s retired from it",
+            champion.name,
+            ", ".join(sorted(retired)),
+        )
+    else:
+        LOGGER.info("%s joined the pool", champion.name)
 
 
 def record(champion: Champion, paths: config.Run) -> Champion:

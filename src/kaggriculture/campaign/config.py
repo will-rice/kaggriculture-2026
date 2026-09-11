@@ -218,6 +218,18 @@ GATE_ANCHORS = (
 # vendored opponents now take a dozen slots: the contenders were competing for
 # room with the only cross-population evidence the gate gets.
 GATE_CONTENDERS = 4
+# How many of our own champions stay in the pool. Harvested agents are never
+# trimmed and these are, because the two are different kinds of evidence: a
+# published agent says something about the field we are scored against and
+# the campaign cannot produce another one, while the tenth-best rung of our
+# own ladder says nothing the best rung does not.
+#
+# Eight, because that is roughly a third of a gate's draw -- enough that a
+# candidate must beat its recent ancestry rather than only the current
+# champion, and few enough that the other two thirds stay outside agents.
+# Unbounded is what produced the monoculture: sixty-nine champions holding ten
+# of twenty-four slots, so nearly half of every gate replayed our own lineage.
+POOL_CHAMPIONS = 8
 # There is no promotion margin any more, and this note is here so nobody adds
 # one back.
 #
