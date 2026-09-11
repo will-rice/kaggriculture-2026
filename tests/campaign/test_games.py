@@ -204,3 +204,60 @@ def test_the_days_table_is_ordered_for_the_questions_asked_of_it() -> None:
     # And a day's identity is the ordering key, which is what makes a
     # re-recorded program collapse rather than duplicate.
     assert "ReplacingMergeTree(version)" in sql
+
+
+@live
+def test_a_database_built_before_a_column_existed_gains_it(scratch: str) -> None:
+    """`CREATE TABLE IF NOT EXISTS` is silent about a table already there.
+
+    So a column added to the schema never reaches a database built before it,
+    and the first sign is an insert failing -- in the loop, on a real
+    evaluation, which is exactly how it was found: the run died on `No such
+    column source in table games.candidate` having passed every test, because
+    a test builds a fresh database and a fresh database matches by
+    construction. Only the long-lived one was behind.
+    """
+    # A database as it was before `source` was added to `candidate`.
+    games.query(f"DROP TABLE {scratch}.candidate")
+    games.query(
+        f"CREATE TABLE {scratch}.candidate (episode String, seat UInt8, "
+        "team LowCardinality(String), matchup UInt16, season UInt16) "
+        "ENGINE = MergeTree ORDER BY episode"
+    )
+    before = games.query(
+        f"SELECT count() FROM system.columns WHERE database = '{scratch}' "
+        "AND table = 'candidate' AND name = 'source'"
+    )
+    assert before == "0", "the fixture did not reproduce the old shape"
+
+    games.create(scratch)
+
+    # And the write that used to fail now lands.
+    assert (
+        games.record("probe", [(1, 1, "probe", game([day(0, 5.0, 3.0)]))], scratch) == 1
+    )
+    assert (
+        games.query(f"SELECT source FROM {scratch}.candidate FORMAT TabSeparated")
+        == "campaign"
+    )
+
+
+@live
+def test_every_table_the_writers_use_matches_the_schema(scratch: str) -> None:
+    """The reconciliation is only worth having if it covers every table.
+
+    A column added to `days` and not reaching it is the same failure as the
+    one that killed the run, with a hundred times the rows behind it.
+    """
+    for table in games.COLUMNS:
+        live = set(
+            games.query(
+                f"SELECT name FROM system.columns WHERE database = '{scratch}' "
+                f"AND table = '{table}' FORMAT TabSeparated"
+            ).split()
+        )
+        declared = {name for name, _ in games._declared(table)}
+        assert declared <= live, f"{table} is missing {declared - live}"
+        # And every column the writer names is one the table has.
+        for column in games.COLUMNS[table].replace(" ", "").split(","):
+            assert column in live, f"{table} has no {column}"

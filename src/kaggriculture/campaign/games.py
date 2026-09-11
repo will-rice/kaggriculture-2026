@@ -339,11 +339,58 @@ def query(sql: str, body: bytes | None = None) -> str:
 
 
 def create(database: str = DATABASE) -> None:
-    """Make every table, if it is not already there."""
+    """Make every table, and bring an existing one up to the schema.
+
+    `CREATE TABLE IF NOT EXISTS` is silent about a table that already exists,
+    so a column added here would never reach a database built before it. The
+    first sign of that is an insert failing on a real evaluation -- which is
+    how it was found, the loop dying on `No such column source in table
+    games.candidate` -- because every test builds a fresh database and a fresh
+    database matches by construction.
+
+    So the columns are reconciled afterwards: anything the schema names and
+    the table lacks is added. ClickHouse adds a column to a MergeTree as
+    metadata, so this is cheap however large the table.
+    """
     query(f"CREATE DATABASE IF NOT EXISTS {database}")
     for statement in schema(database).split(";"):
         if statement.strip():
             query(statement)
+    _reconcile(database)
+
+
+def _reconcile(database: str) -> None:
+    """Add every column the schema names that the live table does not have."""
+    for table in COLUMNS:
+        live = set(
+            query(
+                f"SELECT name FROM system.columns WHERE database = '{database}' "
+                f"AND table = '{table}' FORMAT TabSeparated"
+            ).split()
+        )
+        if not live:
+            continue
+        for column, kind in _declared(table):
+            if column not in live:
+                LOGGER.warning("%s.%s lacks %s; adding it", database, table, column)
+                query(f"ALTER TABLE {database}.{table} ADD COLUMN {column} {kind}")
+
+
+def _declared(table: str) -> list[tuple[str, str]]:
+    """The columns the schema declares for one table, as (name, type)."""
+    body = schema("x").split(f"CREATE TABLE IF NOT EXISTS x.{table} (", 1)[-1]
+    # Split on the table's own terminator, not the first bracket: a type
+    # like `LowCardinality(String)` carries one of its own.
+    body = body.split("\n) ENGINE", 1)[0]
+    declared = []
+    for line in body.splitlines():
+        stripped = line.strip().rstrip(",")
+        if not stripped or stripped.startswith("--"):
+            continue
+        name, _, kind = stripped.partition(" ")
+        if kind.strip():
+            declared.append((name, kind.strip()))
+    return declared
 
 
 def ordered(result: "evaluator.Result") -> list[str]:
