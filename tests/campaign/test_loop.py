@@ -235,6 +235,7 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         program_id: str,
         opponents: pool.Pool,
         rng: random.Random,
+        seeds: Sequence[int],
         workers: int,
         pool_file: Path | None = None,
         standings: dict[str, float] | None = None,
@@ -1382,13 +1383,14 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         program_id: str,
         opponents: pool.Pool,
         rng: random.Random,
+        seeds: Sequence[int],
         workers: int,
         pool_file: Path | None = None,
         standings: dict[str, float] | None = None,
         always: Sequence[str] = (),
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
-        result = measure(agent, program_id, opponents, rng, workers, pool_file)
+        result = measure(agent, program_id, opponents, rng, seeds, workers, pool_file)
         result.rates.pop("joiner", None)
         return result
 
@@ -1999,6 +2001,37 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER
+
+
+def test_candidates_share_a_block_of_seasons_and_it_rotates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Two things at once, pulling opposite ways.
+
+    Sharing is what makes two candidates comparable. The seeds used to be
+    drawn per call, so no two programs were ever ranked on the same seasons --
+    and a season is most of what the rating measures: one unchanged agent
+    through the gate five times, opponents held fixed and only the seeds
+    moving, gave fitted ratings from -3.466 to -2.226, a standard deviation of
+    0.491 against a promotion bar that used to be 0.15. Varying the opponents
+    instead moved it 0.070.
+
+    Rotating is what stops a block becoming a set the search is selected
+    against, which is what the reserved held-out seeds existed to prevent.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "SEED_ROTATION", 3)
+
+    blocks = [campaign.seasons() for _ in range(7)]
+
+    # Three candidates share a block, then a fresh one is drawn.
+    assert blocks[0] == blocks[1] == blocks[2]
+    assert blocks[3] == blocks[4] == blocks[5]
+    assert blocks[0] != blocks[3]
+    assert blocks[6] != blocks[3]
+    # And a block is a full gate's worth of seasons, every time.
+    assert all(len(block) == config.GATE_SEEDS for block in blocks)
+    assert all(len(set(block)) == len(block) for block in blocks)
 
 
 async def _one_harvest(campaign: loop.Campaign) -> None:

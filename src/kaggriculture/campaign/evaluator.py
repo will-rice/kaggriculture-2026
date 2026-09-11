@@ -29,7 +29,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, harness, roster
+from kaggriculture.campaign import harness, roster
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
 
@@ -170,17 +170,30 @@ def score(
     program_id: str,
     pool: Pool,
     rng: random.Random,
+    seeds: Sequence[int],
     workers: int,
     pool_file: Path | None = None,
     standings: dict[str, float] | None = None,
     always: Sequence[str] = (),
 ) -> Result:
-    """Mean win rate over ``GATE_SEEDS`` fresh seeds, both seats.
+    """Mean win rate over ``GATE_SEEDS`` seasons, both seats.
 
-    The seeds are drawn per call from the whole range, so no two programs are
-    ranked on the same maps and none is ever measured on maps it or its
-    ancestors were selected on. That is what a held-out set is for, and it is
-    why there is no longer one: redrawing every call gives it continuously.
+    The seeds come from the caller so that every candidate in one round plays
+    the same seasons, and are redrawn between rounds. Both halves matter and
+    they pull in opposite directions.
+
+    Redrawing is what a held-out set was for: no program is ever measured on
+    maps it or its ancestors were selected on, and getting that continuously
+    is why there is no reserved block any more.
+
+    Sharing is what makes two candidates comparable. Drawn per call, they were
+    never ranked on the same seasons, and a season is most of what a rating
+    measures: one unchanged agent put through this five times, opponents held
+    fixed and only the seeds moving, produced fitted ratings from -3.466 to
+    -2.226 -- a standard deviation of 0.491 against a promotion bar that used
+    to be 0.15. Holding the seeds and varying the *opponents* instead moved it
+    0.070. The maps are seven times the draw, which was the opposite of what
+    this looked like before it was measured.
 
     Every game is played with its day table recorded, because one of them is
     what the loop shows a model of how its program played. Which one is not
@@ -193,7 +206,8 @@ def score(
         agent: The candidate's ``main.py``.
         program_id: The program being scored, so it is not among them.
         pool: The opponents to measure against.
-        rng: The generator the seeds are drawn from.
+        rng: The generator the opponent draw comes from.
+        seeds: The seasons to play, shared by every candidate in this round.
         workers: Processes to fan the games over.
         pool_file: Where a champion's name resolves from, since the
             roster only knows the vendored opponents.
@@ -220,8 +234,7 @@ def score(
     # the record, so a candidate adds sixteen edges and is placed against the
     # rest through them.
     names = measured.sample(standings or {}, rng, program_id, always)
-    seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
-    games = harness.play(agent, names, seeds, workers, days=True, pool=pool_file)
+    games = harness.play(agent, names, list(seeds), workers, days=True, pool=pool_file)
     rates = _rates(games, names)
     contested = _contested(games, names)
     # Ties on the rate are broken by the margin, because before the first win

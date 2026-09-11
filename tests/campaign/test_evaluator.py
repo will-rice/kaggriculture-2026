@@ -29,29 +29,44 @@ CRASHER = (
 
 
 @pytest.mark.local_data
-def test_score_draws_fresh_seeds_and_averages_the_pool(
+def test_score_plays_the_block_and_averages_the_pool(
     tmp_path: Path,
 ) -> None:
-    """Seeds are drawn per call, and every opponent counts the same."""
+    """It plays the seasons it is given, and every opponent counts the same."""
     agent = tmp_path / "main.py"
     agent.write_text(PASS, encoding="utf-8")
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
-    result = evaluator.score(agent, "prog", p, random.Random(1), workers=WORKERS)
+    result = evaluator.score(
+        agent, "prog", p, random.Random(1), [5, 6], workers=WORKERS
+    )
     assert len(result.seeds) == config.GATE_SEEDS
     assert result.rates == {"v54": 0.0} and result.fitness == 0.0
 
 
 @pytest.mark.local_data
-def test_two_calls_draw_different_seeds(tmp_path: Path) -> None:
-    """Ranking must not reuse one seed block, or drift becomes overfitting."""
+def test_a_call_plays_the_seasons_it_is_handed(tmp_path: Path) -> None:
+    """The caller owns the seasons, so two candidates can share a block.
+
+    They used to be drawn per call, which meant no two programs were ever
+    ranked on the same seasons -- and a season is most of what the rating
+    measures. One unchanged agent through the gate five times, opponents held
+    fixed and only the seeds moving, gave fitted ratings from -3.466 to -2.226:
+    a standard deviation of 0.491, where varying the opponents instead moved it
+    0.070.
+
+    The drift the old draw protected against is now `loop.Campaign.seasons`,
+    which rotates the block; it is not this function's to decide.
+    """
     agent = tmp_path / "main.py"
     agent.write_text(PASS, encoding="utf-8")
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
-    rng = random.Random(2)
-    assert (
-        evaluator.score(agent, "prog", p, rng, workers=WORKERS).seeds
-        != evaluator.score(agent, "prog", p, rng, workers=WORKERS).seeds
-    )
+    block = [7, 8]
+
+    first = evaluator.score(agent, "prog", p, random.Random(2), block, workers=WORKERS)
+    again = evaluator.score(agent, "prog", p, random.Random(3), block, workers=WORKERS)
+
+    assert sorted(first.seeds) == sorted(block)
+    assert first.seeds == again.seeds
 
 
 def test_a_program_in_the_pool_is_never_played_against_itself(
@@ -80,7 +95,7 @@ def test_a_program_in_the_pool_is_never_played_against_itself(
     p.save(registry)
 
     ranked = evaluator.score(
-        champion, "champion_1", p, random.Random(4), WORKERS, registry
+        champion, "champion_1", p, random.Random(4), [5, 6], WORKERS, registry
     )
 
     assert set(ranked.rates) == {"other"} and set(ranked.intervals) == {"other"}
@@ -113,7 +128,7 @@ def test_score_diverts_what_a_candidate_writes_away_from_the_caller(
     monkeypatch.setattr(config, "GATE_SEEDS", 1)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
-    evaluator.score(agent, "prog", p, random_module.Random(3), workers=WORKERS)
+    evaluator.score(agent, "prog", p, random_module.Random(3), [5, 6], workers=WORKERS)
 
     assert list(workspace.iterdir()) == []
     assert Path.cwd() == workspace
@@ -134,7 +149,7 @@ def test_score_reports_an_interval_beside_every_rate(
     monkeypatch.setattr(config, "GATE_SEEDS", 2)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
-    result = evaluator.score(agent, "prog", p, random.Random(1), WORKERS)
+    result = evaluator.score(agent, "prog", p, random.Random(1), [5, 6], WORKERS)
 
     assert result.program_id == "prog" and result.games == 4
     assert result.rates["v54"] == 0.0
@@ -155,7 +170,7 @@ def test_score_lets_a_crash_propagate_and_still_restores_the_cwd(
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
     with pytest.raises(RuntimeError):
-        evaluator.score(agent, "prog", p, random.Random(1), WORKERS)
+        evaluator.score(agent, "prog", p, random.Random(1), [5, 6], WORKERS)
 
     assert Path.cwd() == workspace
 

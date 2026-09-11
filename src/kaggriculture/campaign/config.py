@@ -154,6 +154,22 @@ GATE_SEEDS = 16
 # its ancestors were selected on. The reserved block was a held-out set for a
 # search that is always, structurally, held out.
 GATE_SEED_RANGE = range(1, 1_000_000)
+# Candidates that share one block of seasons before a fresh block is drawn.
+#
+# Sharing is what makes two candidates comparable at all. The seeds used to be
+# drawn per call, so no two programs were ever ranked on the same seasons --
+# and a season is most of what the rating measures. One unchanged agent
+# through the gate five times, opponents held fixed and only the seeds moving,
+# gave fitted ratings from -3.466 to -2.226: a standard deviation of 0.491,
+# against a promotion bar that used to be 0.15. Holding the seeds and varying
+# the opponents instead moved it 0.070, so the maps are seven times the draw.
+#
+# Rotating is what keeps the note above this constant true -- a block that
+# never moved would be one the search gets selected against, which is exactly
+# what the reserved held-out set existed to prevent. Sixty-four is a few
+# generations of eight concurrent sessions: long enough that the candidates
+# being compared share a block, short enough that no lineage lives in one.
+SEED_ROTATION = 64
 # Opponents drawn for one gate. The pool itself is now everything the campaign
 # has ever produced or harvested and nothing leaves it, so this is a sample
 # and not the pool: a rating is fitted over every pairing anyone has ever

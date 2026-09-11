@@ -285,7 +285,15 @@ def run(
             LOGGER.info("field: %d anchor pairing(s) for %s", len(measured), anchor)
     database = archive.Database(paths.archive, paths.programs)
     if not database.programs:
-        seed = evaluator.score(seed_agent, SEED_ID, pool, rng, workers, paths.pool)
+        seed = evaluator.score(
+            seed_agent,
+            SEED_ID,
+            pool,
+            rng,
+            rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+            workers,
+            paths.pool,
+        )
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
         database.add(_program(SEED_ID, stored, "", "seed", "", seed))
         LOGGER.info("seeded from %s at fast fitness %.3f", seed_agent, seed.fitness)
@@ -355,6 +363,12 @@ class Campaign:
         # module-level path and no test has to swap one out from under it.
         self.paths = paths
         self.remaining = 0
+        # The seasons every candidate in the current block is measured on, and
+        # how many have been measured since it was drawn. Both live here
+        # rather than in a session, because the eight run at once and a block
+        # only makes candidates comparable if they share it.
+        self.block: list[int] = []
+        self.measured = 0
         # Calls in a row that ran to no verdict. A call that never reached the
         # model is nobody's failure, so it writes nothing and the worker
         # simply starts another -- which, when the cause is the login, the
@@ -849,11 +863,41 @@ class Campaign:
             program_id,
             self.snapshot(),
             random.Random(self.rng.random()),
+            self.seasons(),
             self.workers,
             self.paths.pool,
             table,
             self.must_play(table),
         )
+
+    def seasons(self) -> list[int]:
+        """The seeds every candidate measured in this block plays.
+
+        Shared, because a season is most of what a rating measures and two
+        candidates ranked on different ones are barely being compared. One
+        unchanged agent through the gate five times, opponents held fixed and
+        only the seeds moving, gave fitted ratings from -3.466 to -2.226 -- a
+        standard deviation of 0.491, where varying the *opponents* instead
+        moved it 0.070. The maps are seven times the draw.
+
+        Rotated, because a set that never moves is one the search can be
+        selected against. `config.SEED_ROTATION` candidates share a block and
+        then it is redrawn from the whole range, so no program is measured for
+        long on maps its ancestors were selected on -- which is what the
+        reserved held-out block used to be for, and why there is no longer
+        one.
+
+        Called on the loop thread, where the counter is nobody else's.
+        """
+        if self.measured % config.SEED_ROTATION == 0:
+            self.block = self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
+            LOGGER.info(
+                "seasons: a fresh block of %d after %d candidates",
+                config.GATE_SEEDS,
+                self.measured,
+            )
+        self.measured += 1
+        return self.block
 
     def must_play(self, standings: dict[str, float]) -> list[str]:
         """The opponents every candidate is drawn against: the leader and the floor.
