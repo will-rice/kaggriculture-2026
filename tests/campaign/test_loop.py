@@ -24,6 +24,7 @@ the promotion rule is then the real one, deciding on the numbers it is given.
 """
 
 import asyncio
+import inspect
 import os
 import random
 import signal
@@ -230,23 +231,31 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         """A stand-in fitness: longer source, higher score, never a full 1.0."""
         return min(0.99, len(agent.read_text(encoding="utf-8")) / 1000)
 
-    def measure(
-        agent: Path,
-        program_id: str,
-        opponents: pool.Pool,
-        rng: random.Random,
-        seeds: Sequence[int],
-        workers: int,
-        pool_file: Path | None = None,
-        standings: dict[str, float] | None = None,
-        always: Sequence[str] = (),
-    ) -> evaluator.Result:
+    real = inspect.signature(evaluator.score)
+
+    def measure(*args: object, **given: object) -> evaluator.Result:
         """The evaluation's shape, without its games.
 
         No day table: a scheduling test asserts on what the loop did with a
         number, never on the states behind it, and the only game that could
         produce one is the game this stands in for.
+
+        Bound against the real signature rather than redeclaring it. A stub
+        that names its own parameters drifts the moment the function it stands
+        in for gains one, and does it silently: adding `seeds` between `rng`
+        and `workers` shifted every later argument by one here, so the pool
+        file arrived as the standings and nineteen tests failed a long way
+        from the change. Binding makes that a `TypeError` naming the
+        parameter, and usually makes it nothing at all.
         """
+        bound = real.bind(*args, **given)
+        bound.apply_defaults()
+        agent = bound.arguments["agent"]
+        program_id = bound.arguments["program_id"]
+        opponents = bound.arguments["pool"]
+        rng = bound.arguments["rng"]
+        standings = bound.arguments["standings"]
+        always = bound.arguments["always"]
         scored.append(program_id)
         if crashes:
             raise RuntimeError("the candidate raised in its own seat")
