@@ -40,23 +40,18 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import dataset
+from kaggriculture.campaign import config, dataset
 
 # What a claim may be about: every column of a day row that is a number, which
 # is every quantity the extraction measures for both sides. A claim naming
 # anything else cannot be checked and is refused rather than stored
 # unverifiable.
 #
-# Read off the schema rather than listed here, so a column added to the
-# dataset is a claim that can be made about it, and there is no second list to
-# keep in step.
-QUANTITIES: frozenset[str] = frozenset(
-    line.split()[0]
-    for line in dataset.SCHEMA[
-        dataset.SCHEMA.index("days (") : dataset.SCHEMA.index("holdings (")
-    ].splitlines()
-    if line.startswith("    ")
-) - {"episode", "seat", "day", "team"}
+# Taken from `dataset.COLUMNS` rather than listed here, so a quantity added to
+# what the campaign measures is a claim that can be made about it, and there is
+# no second list to keep in step. It used to be parsed out of a CREATE TABLE,
+# which is what there was to read before the measures had a list of their own.
+QUANTITIES: frozenset[str] = frozenset(dataset.COLUMNS)
 DAYS = dataset.DAYS
 # The store the round prompt reads, beside the corpus it is measured from.
 #
@@ -66,7 +61,7 @@ DAYS = dataset.DAYS
 # worktree with its own copy of the package, so it would rewrite a store in
 # one checkout while the campaign read a stale one from another. A measurement
 # of the public ladder belongs with the ladder's other measurements.
-STORE = dataset.DATABASE.with_name("strategies.jsonl")
+STORE = config.EPISODES.parent / "strategies.jsonl"
 # Share of differing games at which a claim is settled one way or the other.
 # Between them it says nothing: 60% over twenty games is not evidence, and
 # saying so is the point of keeping the count.

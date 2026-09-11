@@ -11,10 +11,11 @@ it, an index of the seasons it just played, and the instruction. One function
 composes it and every round is composed by it, the first included, so the
 model never sees a round shaped differently from the others.
 
-The seasons are not in the message. They are written beside `child.py` as a
-CSV of every game the evaluation scored, at a width no message could carry,
-and what travels here is the index: which matchup is which, how many seasons
-each holds, and how they went.
+The seasons are not in the message and they are not a file either. Every game
+the campaign has played and every game it recorded off the competition are rows
+in one database, and a round queries it. What travels here is the index of its
+own last evaluation -- which matchup is which, how many seasons each holds, and
+how they went -- and a pointer to the rest.
 
 Nothing mined from the public replay corpus reaches a round any more. The
 build order and the settled claims about the ladder's winners were both true
@@ -31,8 +32,9 @@ from pathlib import Path
 
 from kaggriculture.campaign import (
     archive,
-    browse,
+    config,
     evaluator,
+    games,
     validate,
 )
 
@@ -71,21 +73,11 @@ IMPORTS = ", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS))
 RECENT_FAILURES = 3
 REASON_CHARS = 200
 
-# The name of the file the seasons are written to, in the same directory as
-# `child.py`. They used to be rendered into the message: six games at 30 rows
-# of fifteen columns, 74% of a message that is otherwise the rules, the
-# program and what to do. Bounding the message therefore meant dropping games,
-# which is bounding the evidence -- and the evaluation had already thrown away
-# thirty-one of every thirty-two games before the message was even composed.
-#
-# A file bounds neither. Every game the campaign scored is in it, at full
-# width: all 29 measures `dataset.measures` defines, for both sides, where the
-# table had room for nine. The message carries an index instead -- one line per
-# matchup -- so a round that wants day twelve of the season it nearly won can
-# read day twelve, or ask which day the banks diverged across every game it
-# played, and a round with a different question pays nothing for the answer to
-# this one.
-SEASONS = "seasons.db"
+# How a round reaches the games. One database holds every game this campaign
+# has played and every game recorded off the competition, and a round asks it
+# questions rather than being handed a copy: the size of the evidence stops
+# being the message's problem, which is the only property that scales.
+GAMES = config.GAMES_URL
 
 
 CHANGE_CHARS = 160
@@ -119,10 +111,10 @@ INSTRUCTION = (
     "Change `child.py` so that it finishes every season with a larger bank "
     "than it did. Not a better place in a table -- a bigger margin in the "
     "games themselves, and most of all in the ones it already wins narrowly. "
-    f"Every game it played is in `{SEASONS}`, day by day, and every one of "
-    "them was scored: find where this program left money on the field and "
-    "take it. Small, local changes are welcome, and so is replacing whatever "
-    "part of it is playing badly."
+    "Every game it played is in the games database, day by day, and every "
+    "one of them was scored: find where this program left money on the "
+    "field and take it. Small, local changes are welcome, and so is replacing "
+    "whatever part of it is playing badly."
 )
 # Margin rather than rank, and the reason is a measurement rather than a
 # preference.
@@ -203,64 +195,37 @@ class Message:
 ROUND = Message(ROUND_PROMPT)
 
 
-def seasons(result: evaluator.Result, path: Path, name: str) -> Path:
-    """Write every game of one evaluation to a database beside ``child.py``.
-
-    Two numbers name a game. `matchup` is one opponent, whose name is the
-    whole of what a round is not told about who it played; `season` is one
-    game inside that matchup. Every game the evaluation scored is there,
-    because a round can only improve a game it is shown and the campaign
-    scores all of them.
-
-    Those two keys are what makes a comparison mean something. Within one
-    matchup the opponent is fixed and what changes between seasons is the
-    world -- the map, the prices, the seat -- which is the axis a general
-    program has to hold up across. Across matchups the adversary changes too,
-    so a difference between two of them says nothing about either.
-
-    A database rather than the CSV this used to write, because 768 games of
-    thirty days is nine megabytes and a round cannot ask nine megabytes
-    anything: it has to load the file and write code before it can answer
-    "which day did I lose". `browse` says the rest.
-
-    Args:
-        result: The evaluation, for its games and the rates that order them.
-        path: Where to write it.
-        name: What to record the program being measured as.
-
-    Returns:
-        ``path``, written.
-    """
-    return browse.write(path, browse.games(result, name))
-
-
 def _states_lines(result: evaluator.Result) -> list[str]:
-    """Render the index of the seasons file: one line per matchup.
+    """Render the index of the evaluation just played: one line per matchup.
 
-    Not the games themselves. Every game the evaluation scored is in
-    `SEASONS`, at a width no message could carry, and what belongs here is
-    the part a round cannot work out for itself: how many seasons each matchup
-    holds, how they went, and which one is worth opening first.
+    Not the games themselves, and no longer a file either. Every game this
+    campaign has played and every game recorded off the competition are rows
+    in one database, and what belongs in the message is the part a round
+    cannot work out for itself: which matchups these were, how many seasons
+    each holds, and how they went.
     """
-    ordered = browse.ordered(result)
+    ordered = games.ordered(result)
     if not ordered:
         return []
     lines = [
         "## The seasons it just played",
         "",
-        f"Every game it played is in `{SEASONS}` beside `child.py`, a SQLite "
-        "database: one row per side per day, every quantity the campaign "
-        "measures. Ask it rather than read it, and use the `query-games` "
-        "skill -- it has the schema and the queries worth running.",
+        "Every game it played is in the games database, along with every game "
+        "the competition has recorded. Ask it rather than read it:",
         "",
-        f'    sqlite3 {SEASONS} "select * from swings order by moved limit 5"',
+        f"    curl -s {GAMES} --data-binary " + '"select count() from games.days"',
+        "",
+        "The `query-games` skill has the schema and the queries worth "
+        "running. Its own games are the ones below; the rest of the database "
+        "is other agents' recorded games, there if a question wants them and "
+        "ignorable if not.",
         "",
         "Every game below was scored, so every one of them is a game to "
-        "improve. The opponents are not named and it does not matter which "
-        "they were: they are drawn from a field that turns over, and the "
-        "agent across the table in a scored game will be one this program has "
-        "never seen. A change that wins these seasons because it recognised "
-        "who it was playing wins nothing that counts.",
+        "improve. The opponents in them are not named and it does not matter "
+        "which they were: they are drawn from a field that turns over, and "
+        "the agent across the table in a scored game will be one this program "
+        "has never seen. A change that wins these seasons because it "
+        "recognised who it was playing wins nothing that counts.",
         "",
         "| matchup | seasons | won | mean finish | worst | best |",
         "| --- | --- | --- | --- | --- | --- |",

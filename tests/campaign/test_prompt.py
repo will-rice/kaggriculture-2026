@@ -1,7 +1,6 @@
 """What the composed message says, and what it must never say."""
 
 import re
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -198,7 +197,7 @@ def test_the_message_carries_no_corpus_derived_target() -> None:
     # Its own play stays: the index of the seasons it was measured on, and
     # the rules.
     assert prompt.TASK_PROMPT.read_text(encoding="utf-8").strip()[:80] in text
-    assert f"`{prompt.SEASONS}`" in text
+    assert prompt.GAMES in text
     assert "| matchup | seasons | won | mean finish | worst | best |" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
     assert "/data" not in text
@@ -454,79 +453,6 @@ def test_the_templates_own_note_never_reaches_the_model() -> None:
     assert "the parts the campaign" not in text
 
 
-def test_every_season_reaches_the_file_at_full_width(tmp_path: Path) -> None:
-    """The file is the evidence; the message is the index of it.
-
-    A markdown table can be read at about fifteen columns, and a `Day` carries
-    sixty-odd. So the rendered version had to choose, and what it chose cost
-    the campaign real evidence: quadrants and fertilizer -- the two sharpest
-    separations in 16,292 recorded games, at 99% and 100% of their paired
-    samples -- were measured, stored, and shown to nobody for want of room.
-    Written to a file there is no room to run out of.
-    """
-    rates = {"v54": 0.3, "shopforge": 0.5}
-    path = prompt.seasons(
-        result(rates, days=30, seasons=16), tmp_path / "full.db", "champion_1"
-    )
-    db = sqlite3.connect(path)
-
-    # Both matchups, every season, every day, both sides of each.
-    assert db.execute("select count(*) from days").fetchone() == (2 * 16 * 30 * 2,)
-    columns = [row[1] for row in db.execute("PRAGMA table_info(days)")]
-    for measure in dataset.COLUMNS:
-        assert measure in columns
-    for column in ("quadrants", "fertilised", "sell_orders"):
-        assert column in columns
-    # The breakdowns behind the totals, and the shared market.
-    kinds = {row[0] for row in db.execute("select distinct kind from holdings")}
-    assert {"plants", "animals", "seeds", "shed"} <= kinds
-    assert db.execute("select count(*) from prices").fetchone()[0] > 0
-
-
-def test_a_matchup_is_one_opponent_and_every_season_against_them(
-    tmp_path: Path,
-) -> None:
-    """The grouping is what makes two seasons comparable.
-
-    Within a matchup the opponent is fixed, so what changes between seasons is
-    the world -- the map, the prices, the seat -- which is the variation a
-    general program has to hold up across. Across matchups the adversary
-    changes too, so a difference between two of them says nothing about
-    either, and the only reading that survives is "that opponent does this",
-    which is the fitting this message exists not to encourage.
-
-    The file used to hold one game per opponent, which is the confounded
-    version: twelve seasons that differ in both things at once.
-    """
-    rates = {"close": 0.5, "beaten": 0.1}
-    played = result(rates, days=4).model_copy(
-        update={
-            "states": {
-                "beaten": games([1000.0, 2000.0], days=4),
-                "close": games([2900.0, 2950.0, 3100.0], days=4),
-            }
-        }
-    )
-
-    db = sqlite3.connect(prompt.seasons(played, tmp_path / "grouped.db", "champion_1"))
-
-    # Matchup 1 is `beaten`, its two seasons; matchup 2 is `close`, its three.
-    assert db.execute(
-        "select matchup, count(*) from candidate group by matchup"
-    ).fetchall() == [(1, 2), (2, 3)]
-    assert db.execute(
-        "select season from candidate where matchup = 1 order by season"
-    ).fetchall() == [(1,), (2,)]
-    # Worst-beaten opponent first, so a round reading matchup 1 is reading the
-    # one with the most left to learn from.
-    assert db.execute(
-        "select bank from gaps where matchup = 1 and season = 1 and day = 3"
-    ).fetchone() == (1000.0 - 3000.0,)
-    assert db.execute(
-        "select bank from gaps where matchup = 2 and season = 1 and day = 3"
-    ).fetchone() == (2900.0 - 3000.0,)
-
-
 def test_the_index_says_how_many_seasons_each_matchup_holds_and_how_they_went() -> None:
     """What a round cannot work out for itself is which matchup is which."""
     rates = {"close": 0.5, "beaten": 0.1}
@@ -541,58 +467,44 @@ def test_the_index_says_how_many_seasons_each_matchup_holds_and_how_they_went() 
 
     text = prompt.compose("champion_1", played, [], [], IMPROVE, table("c", rates))
 
-    assert f"`{prompt.SEASONS}`" in text
+    assert prompt.GAMES in text
     # Two seasons, neither won, finishing -2,000 and -1,000 against 3,000.
     assert "| 1 | 2 | 0 | -1,500 | -2,000 | -1,000 |" in text
     # Three, one of them won: -100, -50, +100.
     assert "| 2 | 3 | 1 | -17 | -100 | +100 |" in text
 
 
-def test_the_message_does_not_grow_with_the_games_played(tmp_path: Path) -> None:
-    """Twelve opponents cost twelve lines, not twelve tables.
+def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
+    """The index travels; the games do not, and neither does a copy of them.
 
-    This is the whole reason the games moved out of the message. Rendered, a
-    game was 30 rows of fifteen columns, and six of them were 74% of a message
-    that is otherwise the rules, the program and what to do -- so the size was
-    capped by dropping games, which is capping the evidence. A round can only
-    improve a game it is shown, and the campaign scores every one of them, so
-    dropping any of them was the wrong trade. The index is one line per
-    matchup, and the games are all in the file however many there are.
+    There is one store, and a round queries it. What the message owes it is
+    the part it cannot work out: which matchups its last evaluation was
+    against, how many seasons each holds, and how they went.
     """
-    one = {"v54": 0.3}
-    many = {f"other_{index}": 0.3 for index in range(12)}
-
-    small = prompt.compose(
-        "champion_1", result(one, days=30, seasons=32), [], [], IMPROVE, table("c", one)
-    )
-    large = prompt.compose(
-        "champion_1",
-        result(many, days=30, seasons=32),
-        [],
-        [],
-        IMPROVE,
-        table("c", many),
-    )
-
-    assert len(large) - len(small) < 500
-    # And every scored game is still there: twelve matchups, thirty-two
-    # seasons each, thirty days each, both sides of every day.
-    path = prompt.seasons(
-        result(many, days=30, seasons=32), tmp_path / "many.db", "champion_1"
-    )
-    db = sqlite3.connect(path)
-    assert db.execute("select count(*) from days").fetchone() == (12 * 32 * 30 * 2,)
-    assert db.execute("select count(*) from candidate").fetchone() == (12 * 32,)
-
-
-def test_a_program_that_played_nothing_gets_no_seasons_section(tmp_path: Path) -> None:
-    """A heading over an empty index is noise in a message read every round."""
-    empty = result({"v54": 0.3}).model_copy(update={"states": {}})
-
+    rates = {"close": 0.5, "beaten": 0.1}
     text = prompt.compose(
-        "champion_1", empty, [], [], IMPROVE, table("c", {"v54": 0.3})
+        "champion_1", result(rates, days=4), [], [], IMPROVE, table("c", rates)
     )
 
-    assert "## The seasons" not in text
-    path = prompt.seasons(empty, tmp_path / "empty.db", "champion_1")
-    assert sqlite3.connect(path).execute("select count(*) from days").fetchone() == (0,)
+    assert prompt.GAMES in text, "the round is not told where to ask"
+    assert "query-games" in text, "the skill that has the schema is not named"
+    assert "| matchup | seasons | won | mean finish | worst | best |" in text
+    # The day tables themselves stay out: they are rows, not message text.
+    assert "ours_bank" not in text
+    assert "ours_quadrants" not in text
+
+
+def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
+    """Its own games and the recorded ones are the same rows in one store.
+
+    It is not made to look at the recorded games and it is not stopped from
+    it: a round with a question about the field can ask, and a round changing
+    one thing and measuring it never opens the database at all.
+    """
+    rates = {"close": 0.5}
+    text = prompt.compose(
+        "champion_1", result(rates, days=4), [], [], IMPROVE, table("c", rates)
+    )
+
+    assert "recorded games" in text
+    assert "ignorable if not" in text

@@ -60,9 +60,10 @@ OPPONENTS = Path("/data/kaggriculture/opponents")
 # the repository's `docker-compose.yml`: the recorded ladder and every game the
 # campaign plays, in one store, because the questions worth asking span both.
 GAMES_URL = os.environ.get("KAGGRICULTURE_GAMES_URL", "http://127.0.0.1:8123")
-# The SQLite the corpus was extracted into before that, kept as what the
-# migration reads and as nothing else.
-GAMES_SQLITE = Path("/data/kaggriculture/games.sqlite")
+# The database inside that server. Here rather than in `games` because
+# `dataset` names it too, and the two modules importing each other to agree
+# on a string is how they come to disagree on one.
+GAMES_DB = "games"
 # Skills copied into every round's workspace. They live in the repository, beside
 # the code whose schema they describe, rather than in the host's codex
 # configuration: a skill that documents `browse`'s tables and is kept somewhere

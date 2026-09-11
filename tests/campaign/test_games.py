@@ -14,7 +14,7 @@ import pytest
 
 from kaggriculture.campaign import dataset, games
 
-from .test_browse import day, game
+from .fixtures import day, game
 
 
 def running() -> bool:
@@ -63,7 +63,9 @@ def test_the_column_types_come_from_what_the_measures_actually_hold() -> None:
     # Every measure has a type, and the casts line up with them one for one.
     assert len(games._CAST) == len(dataset.COLUMNS)
     for cast, measure in zip(games._CAST, dataset.COLUMNS, strict=True):
-        assert cast is (float if games.column_type(measure) == "Float32" else int)
+        assert cast is (
+            games.real if games.column_type(measure) == "Float32" else games.number
+        )
 
 
 def test_a_measure_arrives_as_a_float_and_lands_in_an_integer_column() -> None:
@@ -184,7 +186,7 @@ def test_the_schema_names_every_measure_the_corpus_defines() -> None:
 
     for measure in dataset.COLUMNS:
         assert f"{measure} {games.column_type(measure)}" in sql
-    for table in (*dataset.TABLES, "candidate"):
+    for table in games.COLUMNS:
         assert f"games.{table}" in sql
 
 

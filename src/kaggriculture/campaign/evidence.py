@@ -24,9 +24,8 @@ of at least one of them.
 
 import logging
 import sqlite3
-from pathlib import Path
 
-from kaggriculture.campaign import dataset, strategy
+from kaggriculture.campaign import config, dataset, strategy
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,7 +41,7 @@ MARGIN = 0.5
 
 
 def measure(
-    store: strategy.Strategies, database: Path = dataset.DATABASE
+    store: strategy.Strategies, database: str = config.GAMES_DB
 ) -> dict[str, tuple[int, float]]:
     """Measure every claim in ``store`` against the corpus and record it.
 
@@ -73,7 +72,7 @@ def measure(
         # The same window the ratings were fitted over. A claim measured across
         # the whole corpus is measured over two disjoint fields: split in half,
         # the two top tens share not one name.
-        first = dataset.recent(connection)
+        first = dataset.recent(database)
         for day, claims in sorted(wanted.items()):
             quantities = sorted({claim.form.quantity for claim in claims})
             counted = _day(connection, day, quantities, first)

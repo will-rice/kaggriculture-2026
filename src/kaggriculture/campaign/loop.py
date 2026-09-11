@@ -54,7 +54,6 @@ from pydantic import BaseModel
 # body cannot see this module -- hence `Champion` imported by name below.
 from kaggriculture.campaign import (
     archive,
-    browse,
     config,
     evaluator,
     games,
@@ -617,11 +616,6 @@ class Campaign:
             # opponents this never sees, and nothing a round reports is read.
             shutil.copy(source, box / "parent.py")
             shutil.copy(Path(measure.__file__), box / "measure.py")
-            # Every game behind the verdict, as a database rather than as
-            # message text. A round asks it questions; the message carries
-            # only the index, so what a round can look at stops being bounded
-            # by what will fit in front of it.
-            prompt.seasons(result, box / prompt.SEASONS, name)
             # And how to ask it, as a skill rather than as more message. Codex
             # discovers `.codex/skills` under its working directory, so a
             # round that wants the schema and the queries worth running opens
@@ -897,7 +891,7 @@ class Campaign:
         # is about 11 GB a day at eight sessions -- affordable against the
         # competition's remaining weeks, and off the loop thread either way.
         await asyncio.to_thread(
-            games.record, program_id, browse.games(result, program_id)
+            games.record, program_id, games.played(result, program_id)
         )
         return result
 

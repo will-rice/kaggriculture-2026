@@ -30,7 +30,7 @@ undone over a bigger one, and the log keeps both readings.
 import argparse
 import logging
 
-from kaggriculture.campaign import dataset, evidence, strategy
+from kaggriculture.campaign import config, evidence, strategy
 
 LOGGER = logging.getLogger(__name__)
 # How many settled claims to print, strongest separation first.
@@ -43,7 +43,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--database",
-        default=dataset.DATABASE,
+        default=config.GAMES_DB,
         help="the extracted corpus (default: %(default)s)",
     )
     arguments = parser.parse_args()

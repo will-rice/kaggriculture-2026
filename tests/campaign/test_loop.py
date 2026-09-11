@@ -28,7 +28,6 @@ import inspect
 import os
 import random
 import signal
-import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -1297,13 +1296,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert handed.held == [
-        ".codex",
-        "child.py",
-        "measure.py",
-        "parent.py",
-        "seasons.db",
-    ]
+    assert handed.held == [".codex", "child.py", "measure.py", "parent.py"]
     assert not handed.where.exists()
 
 
@@ -2066,13 +2059,6 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         seen["skill"] = (
             workspace / ".codex" / "skills" / "query-games" / "SKILL.md"
         ).exists()
-        # Counted here rather than after: the workspace is removed as soon
-        # as this call unwinds, and a path is not evidence once it is gone.
-        seen["seasons"] = (
-            sqlite3.connect(workspace / "seasons.db")
-            .execute("select count(*) from days")
-            .fetchone()[0]
-        )
         raise asyncio.CancelledError
 
     campaign.mutator = inspect
@@ -2090,19 +2076,13 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             )
         )
 
-    assert seen["files"] == [
-        ".codex",
-        "child.py",
-        "measure.py",
-        "parent.py",
-        "seasons.db",
-    ]
+    assert seen["files"] == [".codex", "child.py", "measure.py", "parent.py"]
     # The skills go in where codex looks for them, under its working directory.
     assert seen["skill"], "the round was given no query-games skill"
     # Every game behind the verdict, at a width no message could carry. The
     # message holds the index; this is what the index points at.
-    # One opponent, one season, thirty days, both sides of each.
-    assert seen["seasons"] == 30 * 2, "the round was handed an empty database"
+    # No games file: there is one database and the round queries it.
+    assert "seasons.db" not in str(seen["files"])
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER
