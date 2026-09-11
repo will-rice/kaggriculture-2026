@@ -29,12 +29,19 @@ live = pytest.mark.skipif(not running(), reason="no ClickHouse on GAMES_URL")
 
 
 @pytest.fixture
-def table(request: pytest.FixtureRequest) -> str:
-    """A database of this test's own, dropped when it finishes."""
-    name = f"test_{request.node.name.replace('[', '_').replace(']', '')}"[:60]
+def scratch(request: pytest.FixtureRequest) -> str:
+    """A database of this test's own, with the real schema, dropped after.
+
+    Every live test takes this rather than writing into the campaign's own.
+    They used not to, and tidied up afterwards instead -- which means tidying
+    the tables somebody remembered: a write goes to five of them, the teardown
+    cleared one, and ten probe episodes were sitting in the real store before
+    anything noticed.
+    """
+    name = f"test_{abs(hash(request.node.name)):x}"[:40]
     games.query(f"DROP DATABASE IF EXISTS {name}")
-    games.query(f"CREATE DATABASE {name}")
     request.addfinalizer(lambda: games.query(f"DROP DATABASE IF EXISTS {name}"))
+    games.create(name)
     return name
 
 
@@ -81,7 +88,7 @@ def test_a_measure_arrives_as_a_float_and_lands_in_an_integer_column() -> None:
 
 
 @live
-def test_the_rebuild_drops_the_ladder_and_keeps_the_campaign(table: str) -> None:
+def test_the_rebuild_drops_the_ladder_and_keeps_the_campaign(scratch: str) -> None:
     """One store, two writers, and only one of them may delete.
 
     The nightly extraction replaces every recorded game. The campaign's own
@@ -91,24 +98,25 @@ def test_the_rebuild_drops_the_ladder_and_keeps_the_campaign(table: str) -> None
     clause somebody has to keep right.
     """
     games.query(
-        f"CREATE TABLE {table}.days (episode String, source LowCardinality(String)) "
+        f"CREATE TABLE {scratch}.probe (episode String, source LowCardinality(String)) "
         "ENGINE = MergeTree PARTITION BY source ORDER BY (source, episode)"
     )
     games.query(
-        f"INSERT INTO {table}.days VALUES ('old', 'ladder'), ('ours', 'campaign')"
+        f"INSERT INTO {scratch}.probe VALUES ('old', 'ladder'), ('ours', 'campaign')"
     )
 
-    games.query(f"ALTER TABLE {table}.days DROP PARTITION 'ladder'")
-    games.query(f"INSERT INTO {table}.days VALUES ('new', 'ladder')")
+    games.query(f"ALTER TABLE {scratch}.probe DROP PARTITION 'ladder'")
+    games.query(f"INSERT INTO {scratch}.probe VALUES ('new', 'ladder')")
 
     kept = games.query(
-        f"SELECT episode, source FROM {table}.days ORDER BY episode FORMAT TabSeparated"
+        f"SELECT episode, source FROM {scratch}.probe ORDER BY episode "
+        "FORMAT TabSeparated"
     )
     assert kept.split("\n") == ["new\tladder", "ours\tcampaign"]
 
 
 @live
-def test_eight_sessions_record_at_once_without_taking_turns() -> None:
+def test_eight_sessions_record_at_once_without_taking_turns(scratch: str) -> None:
     """The property the store was chosen for, read off real concurrent writes.
 
     SQLite admits one writer: eight sessions would queue, and a busy timeout
@@ -117,58 +125,44 @@ def test_eight_sessions_record_at_once_without_taking_turns() -> None:
     session lands -- a store that dropped writes under contention would look
     fast and be wrong.
     """
-    name = "concurrency_probe"
-    games.create()
-    games.query(
-        f"ALTER TABLE games.days DELETE WHERE team = '{name}' SETTINGS mutations_sync=1"
-    )
     played = [
-        (1, season, name, game([day(n, 1.0, 2.0) for n in range(4)], seat=season % 2))
+        (
+            1,
+            season,
+            "probe",
+            game([day(n, 1.0, 2.0) for n in range(4)], seat=season % 2),
+        )
         for season in range(1, 5)
     ]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        counts = list(pool.map(lambda _: games.record(name, played), range(8)))
+        counts = list(
+            pool.map(lambda name: games.record(name, played, scratch), "abcdefgh")
+        )
 
     assert counts == [len(played)] * 8
-    # One program, so the engine collapses the eight identical writes to one
-    # set of rows: four seasons, four days, both sides.
-    games.query("OPTIMIZE TABLE games.days FINAL")
-    landed = games.query(
-        f"SELECT count() FROM games.days WHERE team = '{name}' OR "
-        f"episode LIKE '{name}%'"
-    )
-    assert int(landed) == len(played) * 4 * 2
-    games.query(
-        f"ALTER TABLE games.days DELETE WHERE episode LIKE '{name}%' "
-        "SETTINGS mutations_sync=1"
-    )
+    # Eight programs, four seasons each, four days, both sides of every day.
+    landed = games.query(f"SELECT count() FROM {scratch}.days")
+    assert int(landed) == 8 * len(played) * 4 * 2
 
 
 @live
-def test_a_program_recorded_twice_is_one_program() -> None:
+def test_a_program_recorded_twice_is_one_program(scratch: str) -> None:
     """A champion re-scored is the same program, not a second one.
 
     There is no cheap delete here and there does not need to be: the ordering
     key is a row's identity, so re-recording inserts and the engine collapses
     the older row. `FINAL` asks for that to have happened.
     """
-    name = "rerecord_probe"
-    games.create()
     for bank in (5.0, 9.0):
-        games.record(name, [(1, 1, name, game([day(0, bank, 3.0)], seat=0))])
+        games.record("probe", [(1, 1, "probe", game([day(0, bank, 3.0)]))], scratch)
 
-    games.query("OPTIMIZE TABLE games.days FINAL")
     rows = games.query(
-        f"SELECT bank FROM games.days FINAL WHERE episode = '{name}m1s1' AND seat = 0 "
-        "FORMAT TabSeparated"
+        f"SELECT bank FROM {scratch}.days FINAL WHERE episode = 'probem1s1' "
+        "AND seat = 0 FORMAT TabSeparated"
     )
 
     assert rows == "9", "the re-record did not replace the first"
-    games.query(
-        f"ALTER TABLE games.days DELETE WHERE episode LIKE '{name}%' "
-        "SETTINGS mutations_sync=1"
-    )
 
 
 def test_a_name_carrying_a_tab_cannot_shift_the_columns() -> None:

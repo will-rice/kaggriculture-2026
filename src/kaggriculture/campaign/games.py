@@ -41,6 +41,12 @@ from kaggriculture.campaign import config, dataset, harness
 
 LOGGER = logging.getLogger(__name__)
 
+# The database inside the server. A parameter everywhere rather than baked
+# into the SQL, so a test points at one of its own instead of writing into
+# the campaign's and tidying up afterwards -- which it did, and which left
+# ten probe episodes in the real store before anything noticed.
+DATABASE = "games"
+
 # Counts that are cumulative over a season and can run large; `sold_units`
 # reaches fifteen million in the corpus. The rest are tiles, pens and hands on
 # one day and stay inside sixteen bits.
@@ -69,7 +75,7 @@ def column_type(measure: str) -> str:
     return "UInt32" if measure in WIDE else "UInt16"
 
 
-def schema() -> str:
+def schema(database: str = DATABASE) -> str:
     """Every table, written from `dataset.COLUMNS` so it cannot drift from it.
 
     `days` is ordered by source, day, episode and seat, which is the order the
@@ -86,7 +92,7 @@ def schema() -> str:
         f"{measure} {column_type(measure)}" for measure in dataset.COLUMNS
     )
     return f"""
-CREATE TABLE IF NOT EXISTS games.episodes (
+CREATE TABLE IF NOT EXISTS {database}.episodes (
     episode    String,
     kaggle_id  Int64,
     seed       Int64,
@@ -102,7 +108,7 @@ CREATE TABLE IF NOT EXISTS games.episodes (
 ) ENGINE = ReplacingMergeTree(version)
 ORDER BY (source, episode);
 
-CREATE TABLE IF NOT EXISTS games.days (
+CREATE TABLE IF NOT EXISTS {database}.days (
     episode    String,
     seat       UInt8,
     day        UInt16,
@@ -114,7 +120,7 @@ CREATE TABLE IF NOT EXISTS games.days (
 PARTITION BY source
 ORDER BY (source, day, episode, seat);
 
-CREATE TABLE IF NOT EXISTS games.holdings (
+CREATE TABLE IF NOT EXISTS {database}.holdings (
     episode    String,
     seat       UInt8,
     day        UInt16,
@@ -127,7 +133,7 @@ CREATE TABLE IF NOT EXISTS games.holdings (
 PARTITION BY source
 ORDER BY (source, episode, seat, day, kind, item);
 
-CREATE TABLE IF NOT EXISTS games.prices (
+CREATE TABLE IF NOT EXISTS {database}.prices (
     episode    String,
     day        UInt16,
     item       LowCardinality(String),
@@ -139,7 +145,7 @@ CREATE TABLE IF NOT EXISTS games.prices (
 PARTITION BY source
 ORDER BY (source, episode, day, item);
 
-CREATE TABLE IF NOT EXISTS games.orders (
+CREATE TABLE IF NOT EXISTS {database}.orders (
     episode    String,
     seat       UInt8,
     day        UInt16,
@@ -152,7 +158,7 @@ CREATE TABLE IF NOT EXISTS games.orders (
 PARTITION BY source
 ORDER BY (source, episode, seat, day, hour);
 
-CREATE TABLE IF NOT EXISTS games.moves (
+CREATE TABLE IF NOT EXISTS {database}.moves (
     episode    String,
     seat       UInt8,
     day        UInt16,
@@ -166,7 +172,7 @@ CREATE TABLE IF NOT EXISTS games.moves (
 PARTITION BY source
 ORDER BY (source, episode, seat, day, hour);
 
-CREATE TABLE IF NOT EXISTS games.candidate (
+CREATE TABLE IF NOT EXISTS {database}.candidate (
     episode    String,
     seat       UInt8,
     team       LowCardinality(String),
@@ -178,7 +184,10 @@ ORDER BY episode;
 """
 
 
-def load(sqlite: str = "/var/lib/clickhouse/user_files/games.sqlite") -> dict[str, int]:
+def load(
+    sqlite: str = "/var/lib/clickhouse/user_files/games.sqlite",
+    database: str = DATABASE,
+) -> dict[str, int]:
     """Replace the recorded ladder from the SQLite the extraction builds.
 
     The extraction still writes SQLite: it parses twenty-five archives across
@@ -196,11 +205,13 @@ def load(sqlite: str = "/var/lib/clickhouse/user_files/games.sqlite") -> dict[st
 
     Args:
         sqlite: The merged extraction, as the server sees it.
+        database: Which database to load into. A parameter so a test can
+            point at one of its own rather than tidy up after itself here.
 
     Returns:
         Rows now in each table.
     """
-    create()
+    create(database)
     measures = ", ".join(dataset.COLUMNS)
     plans = {
         "episodes": (
@@ -238,16 +249,16 @@ def load(sqlite: str = "/var/lib/clickhouse/user_files/games.sqlite") -> dict[st
         # starts with source, so a delete is cheap and exact.
         if table == "episodes":
             query(
-                f"ALTER TABLE games.{table} DELETE WHERE source = 'ladder' "
+                f"ALTER TABLE {database}.{table} DELETE WHERE source = 'ladder' "
                 "SETTINGS mutations_sync = 1"
             )
         else:
-            query(f"ALTER TABLE games.{table} DROP PARTITION 'ladder'")
+            query(f"ALTER TABLE {database}.{table} DROP PARTITION 'ladder'")
         query(
-            f"INSERT INTO games.{table} ({columns}) SELECT {select} "
+            f"INSERT INTO {database}.{table} ({columns}) SELECT {select} "
             f"FROM sqlite('{sqlite}', '{table}')"
         )
-        landed[table] = int(query(f"SELECT count() FROM games.{table}"))
+        landed[table] = int(query(f"SELECT count() FROM {database}.{table}"))
         LOGGER.info("%s: %d rows", table, landed[table])
     return landed
 
@@ -280,9 +291,10 @@ def query(sql: str, body: bytes | None = None) -> str:
         raise RuntimeError(f"{sql.splitlines()[0][:80]}: {detail}") from error
 
 
-def create() -> None:
+def create(database: str = DATABASE) -> None:
     """Make every table, if it is not already there."""
-    for statement in schema().split(";"):
+    query(f"CREATE DATABASE IF NOT EXISTS {database}")
+    for statement in schema(database).split(";"):
         if statement.strip():
             query(statement)
 
@@ -297,7 +309,11 @@ _CAST = tuple(
 )
 
 
-def record(name: str, played: Sequence[tuple[int, int, str, harness.Game]]) -> int:
+def record(
+    name: str,
+    played: Sequence[tuple[int, int, str, harness.Game]],
+    database: str = DATABASE,
+) -> int:
     """Write one program's games, in parallel with whatever else is writing.
 
     No lock and no delete. Two sessions recording at once are two POSTs, and a
@@ -307,6 +323,8 @@ def record(name: str, played: Sequence[tuple[int, int, str, harness.Game]]) -> i
     Args:
         name: The program these games belong to; prefixes their episode keys.
         played: One entry per game, as `browse.games` returns them.
+        database: Which database to write to. A parameter so a test can
+            point at one of its own rather than tidy up after itself here.
 
     Returns:
         How many games were written.
@@ -368,10 +386,10 @@ def record(name: str, played: Sequence[tuple[int, int, str, harness.Game]]) -> i
                 _row([episode, day.day, item, price, 0, "campaign"])
                 for item, price in day.prices.items()
             )
-    _insert("episodes", _EPISODE_COLUMNS, episodes)
-    _insert("days", _DAY_COLUMNS, rows)
-    _insert("holdings", _HOLDING_COLUMNS, holdings)
-    _insert("prices", _PRICE_COLUMNS, prices)
+    _insert("episodes", _EPISODE_COLUMNS, episodes, database)
+    _insert("days", _DAY_COLUMNS, rows, database)
+    _insert("holdings", _HOLDING_COLUMNS, holdings, database)
+    _insert("prices", _PRICE_COLUMNS, prices, database)
     _insert(
         "candidate",
         "episode, seat, team, matchup, season",
@@ -379,6 +397,7 @@ def record(name: str, played: Sequence[tuple[int, int, str, harness.Game]]) -> i
             _row([f"{name}m{matchup}s{season}", game.seat, mine, matchup, season])
             for matchup, season, mine, game in played
         ],
+        database,
     )
     return len(played)
 
@@ -392,11 +411,11 @@ _HOLDING_COLUMNS = "episode, seat, day, kind, item, count, source"
 _PRICE_COLUMNS = "episode, day, item, price, stock, source"
 
 
-def _insert(table: str, columns: str, rows: Sequence[str]) -> None:
+def _insert(table: str, columns: str, rows: Sequence[str], database: str) -> None:
     """POST rows into one table as tab-separated values."""
     if rows:
         query(
-            f"INSERT INTO games.{table} ({columns}) FORMAT TabSeparated",
+            f"INSERT INTO {database}.{table} ({columns}) FORMAT TabSeparated",
             ("\n".join(rows) + "\n").encode(),
         )
 
