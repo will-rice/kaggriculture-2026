@@ -205,6 +205,7 @@ def promotion(
     champion: str | None = None,
     *,
     decisive: int,
+    over_champion: harness.Margin | None = None,
 ) -> tuple[bool, str]:
     """Whether the candidate tops the field *and* clears the floor by the margin.
 
@@ -225,7 +226,7 @@ def promotion(
 
     So the bar is both, and they answer different questions. Topping the field
     says this is the best agent there is; clearing the floor by
-    `config.PROMOTION_MARGIN` says it is measurably better than the one it
+    a paired margin over the floor beyond twice its own error says it is
     replaces, rather than a hair ahead on noise.
 
     Neither alone is enough. A rank has no margin in it, and over a sampled
@@ -247,6 +248,11 @@ def promotion(
             silently blocks every promotion, or large, which silently allows
             them -- and this gate has already spent seven hours blocked by a
             condition nobody could see.
+        over_champion: The candidate's bank margin over that floor, across the
+            gate's games against it -- the same seasons in both seats, so a
+            paired comparison whose error is small enough to read. None or an
+            unmeasured error blocks the promotion, because the second half of
+            the bar is that beating the champion was *shown*, and nothing was.
 
     Returns:
         Whether to promote, and a reason either way.
@@ -277,15 +283,45 @@ def promotion(
             f"but only {decisive} of its games against {champion} were decided "
             f"and the bar is {config.DECISIVE_GAMES}: the two play the same game"
         )
-    if gap >= config.PROMOTION_MARGIN:
+    # The second half is whether beating the champion was demonstrated, not
+    # whether it was demonstrated by some fixed amount.
+    #
+    # It used to be `gap >= PROMOTION_MARGIN`, a constant 0.15 of rating --
+    # about 26 Elo. That was there to stop the winner's curse, since selecting
+    # the maximum of a noisy estimator is biased upward by construction, and
+    # it could not: measured 2026-09-11, one unchanged agent's fitted rating
+    # moves with a standard deviation of 0.745 across draws, so a 0.15 bar
+    # sits a fifth of a standard deviation out and filters almost nothing. It
+    # did reliably block one thing, which is a real improvement too small to
+    # clear a constant nobody had measured against the noise.
+    #
+    # A fixed size is the wrong shape of answer to a varying quantity. What
+    # the margin was reaching for is significance, and that has an answer
+    # here: the gate already plays this candidate against the champion over
+    # every gate seed in both seats, which is a paired comparison on the same
+    # seasons, so the episode's own swing lands on both sides and cancels.
+    # Twice the standard error tightens when the measurement is good and
+    # refuses when it is not, which is what a constant cannot do.
+    #
+    # Bank rather than win rate because it is the denser of the two on the
+    # same games: over 32, a modest real edge reads 2.1 standard deviations by
+    # margin and 1.5 by rate, and only one of those clears. The competition
+    # scores wins, and topping the field above is where that is answered.
+    if over_champion is None or not over_champion.error:
+        return False, (
+            f"top of {len(ranked)} at {mine:+.3f}, {gap:+.3f} above "
+            f"{champion}, but its margin over {champion} was not measured"
+        )
+    bar = 2 * over_champion.error
+    if over_champion.mean > bar:
         return True, (
-            f"top of {len(ranked)} at {mine:+.3f}, "
-            f"{gap:+.3f} above {champion} at {floor:+.3f}"
+            f"top of {len(ranked)} at {mine:+.3f}, and {over_champion.mean:+,.0f} "
+            f"over {champion} against an error of {over_champion.error:,.0f}"
         )
     return False, (
-        f"top of {len(ranked)} at {mine:+.3f} but only {gap:+.3f} above "
-        f"{champion} at {floor:+.3f}, and the bar is "
-        f"{config.PROMOTION_MARGIN:+.3f}"
+        f"top of {len(ranked)} at {mine:+.3f}, but {over_champion.mean:+,.0f} "
+        f"over {champion} is inside twice its error of {bar:,.0f}: "
+        f"not shown to be better"
     )
 
 

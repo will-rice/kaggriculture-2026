@@ -218,18 +218,26 @@ GATE_ANCHORS = (
 # vendored opponents now take a dozen slots: the contenders were competing for
 # room with the only cross-population evidence the gate gets.
 GATE_CONTENDERS = 4
-# How far above the champion's rating a candidate must sit to replace it, in
-# log-odds. Promotion used to mean topping a tournament of eight, which is a
-# rank and so has no margin in it at all: a candidate a hair above the
-# champion promoted, and the hair was usually noise.
+# There is no promotion margin any more, and this note is here so nobody adds
+# one back.
 #
-# A rating has units, so the bar can be stated. 0.15 log-odds is about a 54%
-# head-to-head, and at sixteen seeds a pairing the standard error on a
-# candidate's rating is well inside that -- which is the point. Selecting the
-# maximum of a noisy estimator is biased upward by construction, and this is
-# the guard: 78 of 471 programs once topped a noisy gate and none of them
-# survived a deeper measurement.
-PROMOTION_MARGIN = 0.15
+# It was `PROMOTION_MARGIN = 0.15` of rating, about 26 Elo, and its job was to
+# stop the winner's curse: selecting the maximum of a noisy estimator is
+# biased upward by construction, and 78 of 471 programs once topped a noisy
+# gate with none surviving a deeper look. The reasoning was right and the
+# instrument was never checked against it. Measured 2026-09-11: one unchanged
+# agent's fitted rating moves with a standard deviation of 0.745 across draws
+# -- 129 Elo -- so the bar sat a fifth of a standard deviation out and
+# filtered almost none of the noise it was aimed at. What it did filter
+# reliably was a real improvement too small to clear it.
+#
+# A fixed size cannot be the answer to a quantity that varies with the draw,
+# the candidate's strength and how many games were decided. `gate.promotion`
+# asks for significance instead: the gate already plays the candidate against
+# the champion over every gate seed in both seats, which is one set of seasons
+# played twice and therefore paired, and a margin larger than twice its own
+# error is a demonstration. That bar tightens when the measurement is good and
+# refuses when it is not, which is the whole of what the constant was for.
 # The fewest games a candidate must actually decide against the floor before
 # the margin above means anything.
 #

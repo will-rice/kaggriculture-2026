@@ -115,8 +115,10 @@ def test_constants_match_the_spec_table() -> None:
         f"{config.GATE_OPPONENTS}: the draw would truncate the vendored set, "
         "which is the only cross-population evidence the gate gets"
     )
-    # A bar with units in it. A rank had none, and promoted on a hair.
-    assert config.PROMOTION_MARGIN > 0
+    # There is deliberately no promotion margin: a fixed bar could not
+    # answer a noise level that varies, and `gate.promotion` asks for a
+    # margin beyond twice its own error instead.
+    assert not hasattr(config, "PROMOTION_MARGIN")
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"

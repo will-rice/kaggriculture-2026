@@ -93,7 +93,7 @@ SEED_ID = config.SEED_ID
 # What the wandb run records as its configuration: spec section 8's table.
 HYPERPARAMETERS = (
     "SESSIONS ROUNDS_PER_SESSION GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
-    "PROMOTION_MARGIN STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
+    "STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
 ).split()
 
 # Prepended to the instruction under stagnation, so the message says that this
@@ -535,6 +535,7 @@ class Campaign:
                 name,
                 floor,
                 decisive=result.decisive.get(floor or "", 0),
+                over_champion=result.margins.get(floor or ""),
             )
             if cleared:
                 LOGGER.info("%s %s: the session is done", name, why)
@@ -749,7 +750,11 @@ class Campaign:
                 )
                 return
             verdict, why = gate.promotion(
-                table, program_id, floor, decisive=result.decisive.get(floor or "", 0)
+                table,
+                program_id,
+                floor,
+                decisive=result.decisive.get(floor or "", 0),
+                over_champion=result.margins.get(floor or ""),
             )
             if verdict:
                 LOGGER.info("%s %s", program_id, why)
@@ -811,7 +816,7 @@ class Campaign:
     def floor(self) -> str | None:
         """The champion's name, or None before there is one.
 
-        The bar a candidate has to clear by `config.PROMOTION_MARGIN`. Read
+        The bar a candidate has to beat by a margin it can show. Read
         from state rather than passed down, because eight workers reach the
         gate concurrently and the floor may have moved since a round began --
         which is the correct behaviour: a candidate is judged against the

@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import shutil
+import statistics
 import sys
 import tarfile
 import tempfile
@@ -158,11 +159,19 @@ class Margin(BaseModel):
         mean: Mean of ``ours - theirs`` over those games.
         worst: The lowest such difference.
         best: The highest.
+        error: The standard error on ``mean``, so it can be read as a
+            measurement rather than a number. Promotion turns on this: a
+            candidate replaces the champion when its margin over it is larger
+            than twice this, which is a question with a statistical answer
+            rather than a constant somebody chose. Defaulted, so a result
+            stored before it existed still loads -- and zero there means
+            "unknown", which no comparison can clear.
     """
 
     mean: float
     worst: float
     best: float
+    error: float = 0.0
 
 
 class Game(BaseModel):
@@ -350,7 +359,19 @@ def margins(games: list[Game], names: list[str]) -> dict[str, Margin]:
     out = {}
     for name in names:
         gaps = [game.ours - game.theirs for game in games if game.opponent == name]
-        out[name] = Margin(mean=sum(gaps) / len(gaps), worst=min(gaps), best=max(gaps))
+        mean = sum(gaps) / len(gaps)
+        # The games against one opponent are the same seasons played in both
+        # seats, so this is a paired comparison and the error is small: the
+        # episode's own swing lands on both sides and cancels. Measured
+        # 2026-09-10: a plan's bank varies by 19.5% across seasons, and the
+        # gap between two plans on the same seasons by a quarter of that.
+        spread = statistics.stdev(gaps) if len(gaps) > 1 else 0.0
+        out[name] = Margin(
+            mean=mean,
+            worst=min(gaps),
+            best=max(gaps),
+            error=spread / len(gaps) ** 0.5,
+        )
     return out
 
 

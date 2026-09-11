@@ -259,7 +259,13 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             fitness=rate,
             field=0.5,
             rates=dict.fromkeys(names, rate),
-            margins=dict.fromkeys(names, harness.Margin(mean=0.0, worst=0.0, best=0.0)),
+            # A measured margin, because promotion now asks whether beating
+            # the champion was shown rather than by how much: a mean inside
+            # its own error refuses, and a zero error reads as unmeasured.
+            margins=dict.fromkeys(
+                names,
+                harness.Margin(mean=5000.0, worst=0.0, best=9000.0, error=500.0),
+            ),
             intervals=dict.fromkeys(names, (0.0, 1.0)),
             # Every game decided. A stub that left this empty would be a
             # candidate indistinguishable from the floor, which the gate

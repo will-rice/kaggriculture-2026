@@ -195,8 +195,15 @@ def test_margins_are_the_bank_gap_over_the_games_against_each_opponent() -> None
 
     margins = harness.margins(games, ["near", "far"])
 
-    assert margins["near"] == harness.Margin(mean=0.0, worst=-10.0, best=10.0)
-    assert margins["far"] == harness.Margin(mean=-890.0, worst=-890.0, best=-890.0)
+    assert margins["near"] == harness.Margin(
+        mean=0.0, worst=-10.0, best=10.0, error=10.0
+    )
+    # One game, so the spread -- and the error on it -- is not defined by any
+    # sample: reported as zero, which promotion reads as "not measured" and
+    # refuses rather than mistaking for certainty.
+    assert margins["far"] == harness.Margin(
+        mean=-890.0, worst=-890.0, best=-890.0, error=0.0
+    )
 
 
 @pytest.mark.local_data

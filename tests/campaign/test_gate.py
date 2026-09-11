@@ -126,32 +126,55 @@ def test_edges_already_on_the_record_are_not_played_again(
 
 
 def test_a_candidate_must_out_rate_the_floor_by_the_margin() -> None:
-    """The bar is a rating gap, not a rank.
+    """Beating the champion has to be shown, not merely scored higher.
 
-    A rank has no margin in it -- a candidate a hair above the champion topped
-    the table and promoted, and at these sample sizes the hair is usually
-    noise. And a rank over a *sample* is not a rank at all: a candidate draws
-    sixteen opponents out of dozens, so "top of the table" would mean top of
-    whichever sixteen it happened to draw, and an easy draw would promote.
+    The bar was a rating gap of a fixed 0.15, there to stop the winner's
+    curse: selecting the maximum of a noisy estimator is biased upward by
+    construction. It could not do that. One unchanged agent's fitted rating
+    moves with a standard deviation of 0.745 across draws, measured
+    2026-09-11, so a 0.15 bar sat a fifth of a standard deviation out and
+    filtered almost nothing -- while reliably blocking real improvements too
+    small to clear a constant nobody had checked against the noise.
+
+    A fixed size is the wrong shape of answer to a quantity that varies. The
+    gate already plays the candidate against the champion over every gate seed
+    in both seats, which is the same seasons twice and so a paired comparison,
+    and twice its standard error is a bar that tightens when the measurement
+    is good and refuses when it is not.
     """
-    margin = config.PROMOTION_MARGIN
+    standings = {"mine": 1.0, "floor": 0.999, "other": 0.0}
 
+    # Barely ahead on rating, but the margin over the floor is eight times its
+    # own error: shown, and promoted. The old rule refused this outright.
     clear, why = gate.promotion(
-        {"mine": 1.0, "floor": 1.0 - margin, "other": 0.0},
+        standings,
         "mine",
         "floor",
         decisive=config.DECISIVE_GAMES,
+        over_champion=harness.Margin(
+            mean=5968.0, worst=-400.0, best=9000.0, error=722.0
+        ),
     )
-    assert clear and "above floor" in why
+    assert clear and "over floor" in why
 
-    # Ahead of the floor, and by less than the bar.
+    # A bigger rating gap, and a margin inside its own error: not shown, so
+    # not promoted however far ahead the fit puts it.
     close, why = gate.promotion(
-        {"mine": 1.0, "floor": 1.0 - margin / 2, "other": 0.0},
+        {"mine": 1.0, "floor": 0.0, "other": -1.0},
         "mine",
         "floor",
         decisive=config.DECISIVE_GAMES,
+        over_champion=harness.Margin(
+            mean=700.0, worst=-9000.0, best=9000.0, error=722.0
+        ),
     )
-    assert not close and "the bar is" in why
+    assert not close and "inside twice its error" in why
+
+    # And a margin nobody measured is not a promotion either.
+    unmeasured, why = gate.promotion(
+        standings, "mine", "floor", decisive=config.DECISIVE_GAMES
+    )
+    assert not unmeasured and "not measured" in why
 
 
 def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
@@ -161,9 +184,17 @@ def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
     estimated through the fit rather than measured. It is exactly the case the
     margin exists for.
     """
-    ranked = {"mine": 2.0, "floor": 2.0 - config.PROMOTION_MARGIN / 3, "third": 0.0}
+    ranked = {"mine": 2.0, "floor": 1.95, "third": 0.0}
 
-    clear, _ = gate.promotion(ranked, "mine", "floor", decisive=config.DECISIVE_GAMES)
+    clear, _ = gate.promotion(
+        ranked,
+        "mine",
+        "floor",
+        decisive=config.DECISIVE_GAMES,
+        over_champion=harness.Margin(
+            mean=700.0, worst=-9000.0, best=9000.0, error=722.0
+        ),
+    )
 
     assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
     assert not clear
@@ -180,13 +211,21 @@ def test_clearing_the_floor_is_not_enough_without_topping_the_field() -> None:
         "leader": 3.0,
         "runner_up": 2.5,
         "mine": 2.0,
-        "floor": 2.0 - 2 * config.PROMOTION_MARGIN,
+        "floor": 1.0,
     }
 
-    clear, why = gate.promotion(ranked, "mine", "floor", decisive=config.DECISIVE_GAMES)
+    clear, why = gate.promotion(
+        ranked,
+        "mine",
+        "floor",
+        decisive=config.DECISIVE_GAMES,
+        over_champion=harness.Margin(
+            mean=5968.0, worst=-400.0, best=9000.0, error=722.0
+        ),
+    )
 
-    # Comfortably past the floor, and third of four.
-    assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
+    # Comfortably past the floor and shown to be, and third of four.
+    assert ranked["mine"] > ranked["floor"]
     assert not clear
     assert "3 of 4" in why and "below leader" in why
 
@@ -530,13 +569,22 @@ def test_a_candidate_that_draws_the_floor_is_the_floor() -> None:
     champion_54 also beat -- while the pairing that decides whether anything
     improved was drawn.
     """
-    ranked = {"mine": 2.0, "floor": 2.0 - 2 * config.PROMOTION_MARGIN, "old": 0.0}
+    ranked = {"mine": 2.0, "floor": 1.0, "old": 0.0}
 
-    stuck, why = gate.promotion(ranked, "mine", "floor", decisive=2)
+    stuck, why = gate.promotion(
+        ranked,
+        "mine",
+        "floor",
+        decisive=2,
+        over_champion=harness.Margin(
+            mean=5968.0, worst=-400.0, best=9000.0, error=722.0
+        ),
+    )
 
-    # Top of the field and comfortably past the margin -- the old bar, cleared.
+    # Top of the field, and its margin over the floor well past its own error:
+    # everything else the bar asks for, cleared.
     assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
-    assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
+    assert ranked["mine"] > ranked["floor"]
     assert not stuck
     assert "the two play the same game" in why
 
@@ -549,7 +597,10 @@ def test_the_decisive_bar_is_read_on_games_not_on_the_rate() -> None:
     same rating gap, and the only thing that differs is whether the pairing
     was ever decided.
     """
-    ranked = {"mine": 2.0, "floor": 2.0 - 2 * config.PROMOTION_MARGIN, "old": 0.0}
+    ranked = {"mine": 2.0, "floor": 1.0, "old": 0.0}
+    shown = harness.Margin(mean=5968.0, worst=-400.0, best=9000.0, error=722.0)
 
-    assert not gate.promotion(ranked, "mine", "floor", decisive=2)[0]
-    assert gate.promotion(ranked, "mine", "floor", decisive=32)[0]
+    assert not gate.promotion(ranked, "mine", "floor", decisive=2, over_champion=shown)[
+        0
+    ]
+    assert gate.promotion(ranked, "mine", "floor", decisive=32, over_champion=shown)[0]
