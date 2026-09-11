@@ -6,10 +6,8 @@ a harness error rather than a quietly wrong fitness.
 """
 
 import argparse
-import atexit
 import hashlib
 import logging
-import os
 import random
 import shutil
 import statistics
@@ -52,33 +50,6 @@ OVERAGE_SECONDS = 60
 Work = tuple[str, str, str, int, int, bool]
 # The last hour label of a day; the step taken on it runs the day-end refresh.
 LAST_HOUR = 23
-
-
-def isolated() -> None:
-    """Give this worker a directory of its own, once, before it runs anything.
-
-    Passed as every process pool's ``initializer``. Playing a program executes
-    it and an evolved or harvested program may write files, so it must not be
-    able to write where the caller lives -- and the only lever Python offers
-    for that, short of launching each agent as its own subprocess, is the
-    working directory.
-
-    Once per process, at birth, rather than around each task. Every pool that
-    uses this caps tasks per child, so a worker exists to do one thing and
-    there is nothing to restore afterwards: the process ends and takes its
-    directory with it.
-
-    The distinction that matters is *whose* process. `os.chdir` moves the
-    whole interpreter, and a spawned child inherits the cwd of whoever spawned
-    it -- so a chdir on the loop's own process silently relocates every game
-    it starts next. That is not hypothetical: the campaign died on
-    `FileNotFoundError: /tmp/campaign-check-56ludna7` on 2026-09-11, an hour
-    after a check was given a scratch directory the honest-looking way, in the
-    caller.
-    """
-    scratch = tempfile.mkdtemp(prefix="campaign-worker-")
-    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
-    os.chdir(scratch)
 
 
 class OpponentCrash(RuntimeError):  # noqa: N818 - a crash, not our error

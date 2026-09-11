@@ -4,6 +4,8 @@ import ast
 import os
 from pathlib import Path
 
+import pytest
+
 from kaggriculture.campaign import config, pools
 
 # Where a process pool may be constructed, and why each is allowed.
@@ -14,10 +16,10 @@ from kaggriculture.campaign import config, pools
 # task per child, which would cost it a process per archive.
 #
 # Anything else appearing here is the question this file exists to ask: does
-# it run a program? If it does, it belongs in `pools.workers`, because the
-# initializer that gives a worker its own directory is exactly the argument a
-# new call site forgets, and forgetting it produces a failure that appears
-# only when two things run at once.
+# it run a program? If it does, it belongs in `pools.workers`, which wraps
+# every task in a directory of its own. Isolation is exactly the thing a new
+# call site forgets, and forgetting it produces a failure that appears only
+# when two things run at once.
 ALLOWED = {"pools.py", "dataset.py"}
 
 
@@ -53,17 +55,54 @@ def test_only_the_factory_starts_a_worker_process() -> None:
     )
 
 
-def test_a_worker_is_given_a_directory_of_its_own() -> None:
-    """The initializer moves this process, and only this one."""
-    origin = Path.cwd()
-    try:
-        pools.isolated()
-        moved = Path.cwd()
-    finally:
-        os.chdir(origin)
+def test_a_task_runs_in_a_directory_that_is_gone_when_it_returns() -> None:
+    """The scratch tree's life is the task's, and the cwd comes back with it.
 
-    assert moved != origin
-    assert moved.name.startswith("campaign-worker-")
+    It used to be `mkdtemp` plus an `atexit` hook at process birth. Both
+    remove the tree; only one of them says when. A worker killed mid-game --
+    routine here, because the pacer cancels codex calls and the loop tears its
+    pools down with them -- never reaches its `atexit`, and 164 scratch
+    directories from the same shape were sitting in /tmp when this was
+    written.
+    """
+    origin = Path.cwd()
+    seen: list[Path] = []
+
+    def note_where() -> str:
+        """A task that writes a file and reports where it stood to do it."""
+        seen.append(Path.cwd())
+        Path("scribble.txt").write_text("x", encoding="utf-8")
+        return "done"
+
+    assert pools.sandboxed(note_where) == "done"
+
+    assert seen[0] != origin
+    assert seen[0].name.startswith("campaign-worker-")
+    assert not seen[0].exists(), "the directory outlived the task"
+    assert Path.cwd() == origin, "the task left the process somewhere else"
+    assert not (origin / "scribble.txt").exists()
+
+
+def test_a_task_that_raises_still_gives_its_directory_back() -> None:
+    """The exception path is the one a `finally` is written for.
+
+    A candidate raising mid-game is an ordinary outcome here -- the harness
+    reports it as a failed evaluation -- so the path that matters most is the
+    one where the task does not return normally.
+    """
+    origin = Path.cwd()
+    seen: list[Path] = []
+
+    def explode() -> None:
+        """A task that fails the way a broken candidate does."""
+        seen.append(Path.cwd())
+        raise ValueError("this candidate is broken")
+
+    with pytest.raises(ValueError, match="broken"):
+        pools.sandboxed(explode)
+
+    assert Path.cwd() == origin
+    assert not seen[0].exists(), "a failed task kept its directory"
 
 
 def where_and_who(_: int) -> tuple[str, int]:

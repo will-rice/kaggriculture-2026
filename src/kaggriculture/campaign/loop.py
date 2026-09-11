@@ -581,8 +581,24 @@ class Campaign:
             the session ends there.
         """
         program_id = f"p{uuid.uuid4().hex[:12]}"
-        box = Path(tempfile.mkdtemp(prefix="campaign-round-"))
-        try:
+        # The directory owns its own removal. Written as `mkdtemp` and a
+        # `finally`, the cleanup was a line somebody had to remember to put in
+        # the right place, and twice it was not: first below the awaits, where
+        # a cancelled codex call unwound straight past it and five hundred and
+        # forty-eight workspaces collected in /tmp, and again as a `finally`
+        # that had to be argued about -- synchronous, because an `await` in a
+        # finally during cancellation is how a cleanup gets cancelled too.
+        # `__exit__` runs on every one of those paths without being asked, so
+        # the question stops being one anybody can get wrong.
+        #
+        # `ignore_cleanup_errors` keeps what `rmtree(ignore_errors=True)` gave
+        # us: a call is free to leave a read-only file or a directory it
+        # cannot remove behind, and a workspace that will not delete is not a
+        # reason to lose the round that ran in it.
+        with tempfile.TemporaryDirectory(
+            prefix="campaign-round-", ignore_cleanup_errors=True
+        ) as scratch:
+            box = Path(scratch)
             child = box / "child.py"
             shutil.copy(source, child)
             # The gate writes a champion read-only so nothing can edit the file
@@ -607,15 +623,6 @@ class Campaign:
             (box / prompt.SEASONS).write_text(prompt.seasons(result), encoding="utf-8")
             mutation = await self.mutator(box, message, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
-        finally:
-            # The pacer cancels codex calls routinely, and a cancellation
-            # unwinds through these awaits: cleanup written below them is
-            # simply never reached. Five hundred and forty-eight workspaces
-            # had collected in /tmp before anything noticed. Removing the
-            # tree here is synchronous on purpose -- `await` in a finally
-            # during cancellation is how a cleanup gets cancelled too, and
-            # these directories are a hundred kilobytes each.
-            shutil.rmtree(box, ignore_errors=True)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.
         record: dict[str, float | str] = {
