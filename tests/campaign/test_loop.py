@@ -44,6 +44,7 @@ from kaggriculture.campaign import (
     archive,
     config,
     copycheck,
+    dataset,
     evaluator,
     gate,
     harness,
@@ -1000,6 +1001,14 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     id and whose source path are two fields of the same record, so the
     doctrine binds this branch exactly as it binds the champion's -- and
     testing only the champion's left the branch that runs first uncovered.
+
+    It used to assert the id reached the round as well as the path not
+    reaching it. The id no longer travels either -- a round is not told what
+    the program it is editing is called, because a name is a handle for
+    fitting -- and that half is asserted in `test_prompt`, against the
+    composed message, where "seed" is not also a word in the game's rules.
+    What is left here is the branch: this session drew from the database, and
+    nothing openable reached the call.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -1011,7 +1020,6 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
 
     assert state.champion is None
     handed = mutator.seen[0]
-    assert "`seed`" in handed.message
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture" not in handed.message
     # The doctrine lives in `round_prompt.md` now, so this asserts on what
@@ -1045,9 +1053,18 @@ def _write(path: Path, source: str) -> Path:
 
 
 def _gate_result(
-    program_id: str, rates: dict[str, float], score: float | None = None
+    program_id: str,
+    rates: dict[str, float],
+    score: float | None = None,
+    days: int = 0,
 ) -> evaluator.Result:
-    """A hand-built result standing in for one the gate measured."""
+    """A hand-built result standing in for one the gate measured.
+
+    ``days`` records that many days of one game against each opponent, which
+    is what the round writes to ``seasons.csv``. Zero by default: most of
+    these tests are about what the loop does with a verdict, not about the
+    games behind it.
+    """
     point = sum(rates.values()) / len(rates) if score is None else score
     return evaluator.Result(
         program_id=program_id,
@@ -1062,7 +1079,31 @@ def _gate_result(
         games=4,
         seeds=[1],
         hardest=min(rates, default=""),
-        states={},
+        states={
+            name: [
+                harness.Day(
+                    day=n,
+                    ours_bank=100.0 + n,
+                    theirs_bank=200.0,
+                    ours_plants={"WHEAT": 4},
+                    theirs_plants={"MELON": 2},
+                    ours_animals={},
+                    theirs_animals={"COW": 1},
+                    ours_weeds=0,
+                    theirs_weeds=3,
+                    ours_seeds={"WHEAT": 5},
+                    ours_shed={"WHEAT": 12},
+                    theirs_shed={"EGG": 3},
+                    ours_hands=2,
+                    theirs_hands=1,
+                    ours=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 100.0 + n},
+                    theirs=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 200.0},
+                    prices={"WHEAT": 25},
+                )
+                for n in range(days)
+            ]
+            for name in rates
+        },
     )
 
 
@@ -1229,7 +1270,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert handed.held == ["child.py", "measure.py", "parent.py"]
+    assert handed.held == ["child.py", "measure.py", "parent.py", "seasons.csv"]
     assert not handed.where.exists()
 
 
@@ -1989,6 +2030,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         """A call that only reports what it was handed."""
         seen["files"] = sorted(path.name for path in workspace.iterdir())
         seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
+        seen["seasons"] = (workspace / "seasons.csv").read_text(encoding="utf-8")
         raise asyncio.CancelledError
 
     campaign.mutator = inspect
@@ -2000,13 +2042,21 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             campaign.round(
                 source,
                 "champion_1",
-                _gate_result("p1", {"v54": 0.5}),
+                _gate_result("p1", {"v54": 0.5}, days=30),
                 "improve it",
                 "margin",
             )
         )
 
-    assert seen["files"] == ["child.py", "measure.py", "parent.py"]
+    assert seen["files"] == [
+        "child.py",
+        "measure.py",
+        "parent.py",
+        "seasons.csv",
+    ]
+    # Every game behind the verdict, at a width no message could carry. The
+    # message holds the index; this is what the index points at.
+    assert str(seen["seasons"]).startswith("season,day,ours_bank,")
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER

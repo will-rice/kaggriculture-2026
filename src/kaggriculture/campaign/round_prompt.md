@@ -1,35 +1,42 @@
 <!--
 The whole message a round is given, in order, with the parts the campaign
-measures left as placeholders. `prompt.compose` reads this file, renders the
-tables, and fills them in; nothing else composes a message, so what a codex
-call sees is this file plus numbers.
+measures left as placeholders. `prompt.compose` reads this file and fills them
+in; nothing else composes a message, so what a codex call sees is this file
+plus numbers, and one file beside `child.py` that this message points at.
 
 Placeholders, all filled on every round:
 
   {task}         the game's rules, from `task_prompt.md`
-  {name}         the program's name -- a pool name or a database id, never a
-                 path, and interpolated raw
   {imports}      the allowed-import list, rendered from the gate's own
                  whitelist so a round is never told a different set from the
                  one that rejects it
-  {seeds}        how many seeds the verdict was measured over
-  {rates}        one row per pool opponent: rate, mean margin, worst, best
-  {verdict}      the gate's own sentence about where this program placed
-  {placing}      one line on what that place means, promotion or progress
-  {standings}    the tournament table, this program marked
-  {states}       one day-by-day game against each opponent that took a game
-  {siblings}     other programs written from this one, or empty
+  {seeds}        how many seasons it was measured over
+  {margin}       how far behind it finished on average, across all of them
+  {states}       the index of `seasons.csv`: one line per season it played
   {failures}     the lineage's recent rejected attempts, or empty
-  {instruction}  what to do, and under stagnation why the start moved
+  {instruction}  what to do
 
-The corpus-derived sections are gone. `pace`, the build order, and
-`claims`, the settled statements about the ladder's winners, were both
-true about the corpus and neither earned its place: with the build order
-clustered the median candidate scored 0.275 and promotions ran about one
-an hour; with the opening added as orders the median fell to 0.026 over
-156 gates and nothing was promoted in ten hours. What the model did with
-them is what three separate experiments did -- bolt another strategy's
-orders onto this one, and break the economy underneath.
+What is *not* here is the point of the shape. A round used to be told its own
+name, its rank in a tournament of the pool, the gate's verdict on where it
+placed, a row per opponent with a win rate against each, and what sibling
+rounds had already tried. All of that framed the task as climbing a named
+ladder, and the campaign optimised exactly that: the previous lineage evolved
+opponent fingerprinting, recognising specific agents by their sheep and cow
+counts, which is the right answer to "beat this pool" and worth nothing on a
+ladder where the agent across the table has never been seen before.
+
+The objective is a program that beats *any* opponent. The pool is a sample of
+the field used to estimate that, never a set of targets, so no opponent is
+named anywhere in this message and neither is the program itself.
+
+The seasons themselves are a file, not a section. Rendered into the message
+they were 74% of it, at 30 rows of fifteen columns per game, and the fifteen
+were all a markdown table can be read at -- so cutting the message meant
+cutting to one game, and cutting the evidence with it. Written to
+`seasons.csv` instead, every game is there at full width: all 29 quantities
+`dataset.measures` defines, for both sides, plus the per-crop breakdowns and
+the market. The message carries the index, because which season is which is
+the one part a round cannot work out for itself.
 
 A section that would be empty is rendered as nothing at all, heading
 included: a heading over an empty list is noise in a message read every
@@ -40,13 +47,12 @@ round.
 
 ## The program
 
-`child.py` in your working directory is `{name}`, and it is the only file
-there. It is the program to improve.
+`child.py` in your working directory is the program to improve.
 
 Edit it in place. Do not report anything back in your reply: whatever
-`child.py` holds when you finish is what the campaign plays, against every
-opponent below, and the result comes back to you as another message like this
-one asking you to improve it again.
+`child.py` holds when you finish is what the campaign plays, against
+opponents you never see, and the result comes back to you as another message
+like this one asking you to improve it again.
 
 ## Measure your edit, do not guess at it
 
@@ -137,35 +143,18 @@ far you like -- rewrite any part of it, or all of it.
 
 Every other opponent is closed. Never read one's source, never ask for it,
 never reconstruct it: the gate rejects code that resembles any opponent your
-lineage did not start from. You are given their names and what your program
-scored against them, and that is the whole of what you may know about them.
+lineage did not start from. You are not told who they are, and nothing in this
+message names one. You are writing a program that has to beat an opponent it
+has never seen, so recognising a particular one would be worth nothing even if
+you could.
 
-## The verdict on `{name}`
+## How this program played
 
-Played over {seeds} seeds, both seats, against every opponent in the pool. The
-margin is your bank minus theirs at the final state.
-
-| opponent | win rate | mean margin | worst | best |
-| -------- | -------- | ----------- | ----- | ---- |
-
-{rates}
-
-It {verdict}.
-
-The bar is a Bradley-Terry tournament, which is how the competition itself
-ranks the field: every agent plays every other, one strength per agent is
-fitted from all of it at once, and the ranking is what counts. Beating a
-strong opponent is worth more than beating a weak one, and one bad matchup is
-absorbed rather than fatal -- there is no opponent you must beat, only a field
-you must finish above. {placing}
-
-| rank | agent | rating |
-| ---- | ----- | ------ |
-
-{standings}
+It played {seeds} seasons in both seats against opponents drawn from the
+field, and finished {margin} behind on average. Every one of those seasons is
+in your directory, day by day.
 
 {states}
-{siblings}
 {failures}
 
 ## Your instruction

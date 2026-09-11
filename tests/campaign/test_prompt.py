@@ -1,5 +1,6 @@
 """What the composed message says, and what it must never say."""
 
+import csv
 import re
 from pathlib import Path
 
@@ -10,7 +11,6 @@ from kaggriculture.campaign import (
     config,
     dataset,
     evaluator,
-    gate,
     harness,
     prompt,
     strategy,
@@ -173,248 +173,22 @@ def test_the_message_carries_no_corpus_derived_target() -> None:
         if line.startswith("| ") and len(line) > 40:
             assert line not in text, "a row of the build order reached the round"
             break
-    # Its own play stays: the day tables it was measured on, and the rules.
+    # Its own play stays: the index of the seasons it was measured on, and
+    # the rules.
     assert prompt.TASK_PROMPT.read_text(encoding="utf-8").strip()[:80] in text
-    assert re.search(r"\|\s*our quads\s*\|", text)
+    assert f"`{prompt.SEASONS}`" in text
+    assert "| season | finished |" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
     assert "/data" not in text
 
 
-def test_a_round_can_see_the_two_columns_the_corpus_decides_on(tmp_path: Path) -> None:
-    """Quadrants and fertilizer, for both sides, on every row.
-
-    These are the sharpest separations in 16,292 recorded games -- fertilised
-    tiles on day five at 100% of 313 paired games, quadrants on day three at
-    99% -- and until now a round was shown its banks, its tiles and its shed
-    and could see neither. A build-order table stating a number the day table
-    does not carry is a target nobody can read their own position against.
-    """
-    del tmp_path
-    rates = {"v54": 0.3}
-    days = [
-        harness.Day(
-            day=n,
-            ours_bank=100.0,
-            theirs_bank=200.0,
-            ours_plants={"WHEAT": 4},
-            theirs_plants={"MELON": 2},
-            ours_animals={},
-            theirs_animals={"COW": 1},
-            ours_weeds=0,
-            theirs_weeds=3,
-            ours_seeds={"WHEAT": 5},
-            ours_shed={"WHEAT": 12},
-            theirs_shed={"EGG": 3},
-            ours_hands=2,
-            theirs_hands=1,
-            ours_quadrants=1,
-            theirs_quadrants=3,
-            ours_fertilised=0,
-            theirs_fertilised=17,
-            prices={"WHEAT": 25},
-        )
-        for n in range(2)
-    ]
-    played = result(rates)
-    scored = played.model_copy(update={"states": {"v54": days}})
-
-    text = prompt.compose(
-        "champion_1", scored, [], [], IMPROVE, table("champion_1", rates)
-    )
-
-    assert "our quads | their quads | our fert | their fert" in text
-    # One quadrant against three, no fertilizer against seventeen: the gap the
-    # build order is about, legible on the row.
-    assert text.count("| 1 | 3 | 0 | 17 |") == 2
-
-
-def test_the_templates_own_note_is_not_sent_to_the_model() -> None:
-    """The file explains itself at the top, and that note is not the prompt.
-
-    It is also a trap rather than merely noise: the note names the
-    placeholders it documents, so `str.format` substitutes them and every
-    section of the message is rendered twice -- silently, in a message nobody
-    reads end to end. Found exactly that way.
-    """
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.0}, days=30),
-        [],
-        [],
-        IMPROVE,
-        table("champion_1", {"v54": 0.0}),
-    )
-
-    assert prompt.ROUND_PROMPT.read_text(encoding="utf-8").startswith("<!--")
-    assert "<!--" not in text
-    assert "the parts the campaign" not in text
-    # One opponent, one table, thirty days: rendered once.
-    assert text.count("### `v54`") == 1
-
-
-def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
-    """The model edits child.py and stops; the campaign plays it."""
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.3}),
-        [],
-        [],
-        IMPROVE,
-        table("champion_1", {"v54": 0.5}),
-    )
-
-    # The program is named, because a round that does not know which file it
-    # is editing edits nothing.
-    assert "`child.py` in your working directory is `champion_1`" in text
-    # The rest is structural rather than quoted: the working rules are
-    # editorial and a test that pins their wording breaks on every rewrite
-    # while catching nothing. What has to hold is that every line of the
-    # section reaches the round whole -- a truncated rule is a different rule
-    # -- and that the instruction comes after them.
-    rules = prompt.ROUND_PROMPT.read_text(encoding="utf-8")
-    # Everything from the program to the import list: what the round is told
-    # about how to work, however many headings that is split across.
-    rules_start = rules.split("## The program", 1)[1]
-    section = rules_start.split("## What your program may import", 1)[0]
-    # Lines carrying a placeholder are compared after substitution elsewhere;
-    # these are the ones that travel verbatim.
-    literal = [
-        line for line in section.splitlines() if line.strip() and "{" not in line
-    ]
-    assert len(literal) > 20, "the section stopped being the working rules"
-    for line in literal:
-        assert line in text, f"the round never sees: {line!r}"
-    assert text.index(literal[-1]) < text.index(IMPROVE)
-
-
-def test_the_verdict_is_the_gates_own_reading_of_a_win() -> None:
-    """One implementation of "did it win", so a model cannot believe otherwise.
-
-    The sentence naming what the program does not beat is the gate's own,
-    word for word, which is what stops a model concluding it has cleared a
-    bar the gate then refuses it on.
-    """
-    rates = {"v54": 0.3, "v56": 0.9}
-    standings = table("champion_1", rates)
-
-    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
-
-    assert f"It {gate.promotion(standings, 'champion_1', decisive=0)[1]}." in text
-    # Last of three, and told which agent is above it rather than merely that
-    # it lost: a place is something the next round can aim to improve.
-    assert "3 of 3" in text
-    # The per-opponent rates are still there, because a place says where the
-    # program stands and these say against whom.
-    assert "| v54 | 0.300 | -100 | -300 | +50 |" in text
-    assert "| v56 | 0.900 |" in text
-
-
-def test_a_program_that_clears_the_bar_is_told_by_how_much() -> None:
-    """The verdict is a rating gap now, not a place.
-
-    A place had no margin in it and, over a sampled draw, was not even a
-    place -- it was top of whichever sixteen opponents the candidate happened
-    to draw. The gap says how far above the floor it sits, on one scale.
-    """
-    rates = {"v54": 0.9, "v56": 0.8}
-    standings = table("champion_1", rates, place="top")
-
-    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
-
-    assert f"It {gate.promotion(standings, 'champion_1', decisive=0)[1]}." in text
-    # No floor in these standings, so leading the field is the bar.
-    assert "with no floor yet" in text
-    # Topping it *is* the promotion now; there is no second block to clear,
-    # and telling a round otherwise would describe a gate that no longer runs.
-    assert "this program is the champion" in text
-    assert "sealed" not in text
-    # The whole table, so a round can see who it has yet to pass.
-    assert "| rank | agent | rating |" in text
-    assert "| 1 | **champion_1** |" in text
-
-
-def test_every_opponent_that_took_a_game_is_shown_day_by_day() -> None:
-    """The losses, because that is where there is something to learn.
-
-    A loss is a game lost, not a matchup lost. The cut used to be a rate at or
-    below 0.5, which was right while the lineage lost nearly everything and
-    inverted the moment the campaign was seeded from a strong agent: a program
-    winning 0.875 against eight opponents was told "nothing to show", so the
-    better it got the less it was shown. Only an opponent beaten every single
-    time has nothing left to teach.
-    """
-    rates = {"v54": 0.0, "v56": 0.9, "shopforge": 1.0}
-    text = prompt.compose(
-        "champion_1",
-        result(rates, days=30),
-        [],
-        [],
-        IMPROVE,
-        table("champion_1", rates),
-    )
-
-    assert "The matches it lost, day by day" in text
-    # Never beaten, so first; and 0.9 still drops a game in ten, so it is here
-    # too -- that is the one this used to hide.
-    assert "### `v54`, won 0.000" in text
-    assert "### `v56`, won 0.900" in text
-    assert text.index("`v54`") < text.index("`v56`")
-    # Beaten every time: nothing left to learn from it.
-    assert "### `shopforge`" not in text
-
-
-def test_a_program_that_wins_everything_is_told_so_rather_than_shown_nothing() -> None:
-    """The empty case has to mean what it says, because it reads as an all-clear."""
-    rates = {"v54": 1.0, "v56": 1.0}
-    text = prompt.compose(
-        "champion_1", result(rates), [], [], IMPROVE, table("champion_1", rates)
-    )
-
-    assert "won every game against every opponent" in text
-
-
-def test_the_tables_shown_are_bounded() -> None:
-    """A whole pool of day tables is most of the message and most of it noise."""
-    rates = {f"agent_{n}": 0.5 for n in range(12)}
-    text = prompt.compose(
-        "champion_1",
-        result(rates, days=30),
-        [],
-        [],
-        IMPROVE,
-        table("champion_1", rates),
-    )
-
-    assert text.count("### `agent_") == prompt.MOST_TABLES
-    assert text.count("| WHEAT 12 | EGG 3 |") == 30 * prompt.MOST_TABLES
-
-
-def test_a_shown_game_carries_every_column_of_every_day() -> None:
-    """One table is the whole game: thirty days, both farms, both sheds."""
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.0}, days=30),
-        [],
-        [],
-        IMPROVE,
-        table("champion_1", {"v54": 0.0}),
-    )
-
-    assert text.count("| WHEAT 12 | EGG 3 |") == 30
-    assert "| 29 | 2971 | 3029 |" in text
-    # The shed is hidden from a player at runtime; the author is not a player.
-    assert "cannot see the opponent's shed" in text
-    # The production side of every row: what each farm was growing while the
-    # banks moved, ours with the seed it had not planted yet.
-    assert text.count("| WHEAT 4 / - / - | MELON 2 / COW 1 / 3 | 0 | 0 |") == 30
-
-
-def test_the_message_names_opponents_and_never_a_path() -> None:
+def test_the_message_carries_no_path_at_all() -> None:
     """The doctrine: nothing the loop composes carries an opponent's path.
 
     Everything a model is given is this string, so this is the whole of the
-    campaign's exposure. Opponent names travel; nothing that could be opened
-    does.
+    campaign's exposure. Names no longer travel either -- see
+    `test_no_opponent_is_named_anywhere_in_the_message` -- so what is left to
+    check here is that nothing which could be opened reaches a round.
     """
     text = prompt.compose(
         "champion_1",
@@ -428,7 +202,6 @@ def test_the_message_names_opponents_and_never_a_path() -> None:
     assert "/data/kaggriculture" not in text
     assert not re.search(r"/(?:home|data|Users|tmp)/\S*", text)
     assert str(config.ROOT) not in text
-    assert "router_v1" in text and "v54" in text
 
 
 def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
@@ -595,76 +368,6 @@ def stored(
     return program
 
 
-def test_the_message_says_what_has_already_been_made_of_the_program(
-    tmp_path: Path,
-) -> None:
-    """Sessions all start from the same program and must not repeat each other.
-
-    A round is told what earlier rounds made of exactly the program it holds,
-    and what those scored. Without it the only feedback crossing between
-    attempts is a failure that produced no program at all, so a direction that
-    was tried and measured as bad is indistinguishable from one never tried,
-    and the campaign re-explores it for as long as it runs. AlphaEvolve and
-    FAMOU both feed prior candidates' measured performance into the next
-    prompt.
-    """
-    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
-    stored(db, "worse", "champion_1", 0.1, "Sold wheat on sight. Worse.")
-    stored(db, "better", "champion_1", 0.4, "Held wheat for the glut to lift.")
-    stored(db, "elsewhere", "champion_2", 0.9, "Another lineage entirely.")
-
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.5}),
-        [],
-        db.children("champion_1"),
-        IMPROVE,
-        table("champion_1", {"v54": 0.5}),
-    )
-
-    heading = "What has already been made of `champion_1`"
-    assert heading in text
-    # Best first, so the row that says what to beat is the one read first.
-    # Scoped to the section: these ids are ordinary English words, and looking
-    # for them in the whole message found "worse" in the working rules instead
-    # and read the table as mis-sorted.
-    section = text.split(heading, 1)[1].split("\n## ", 1)[0]
-    assert section.index("better") < section.index("worse")
-    assert "Held wheat for the glut to lift." in section
-    assert "Sold wheat on sight. Worse." in text
-    assert "0.400" in text and "0.100" in text
-    # Another program's children are not this program's.
-    assert "elsewhere" not in text and "Another lineage entirely" not in text
-
-
-def test_only_the_best_few_siblings_are_shown_and_the_rest_are_counted(
-    tmp_path: Path,
-) -> None:
-    """A champion accumulates children for as long as it stands.
-
-    All of them would be most of the message and most of it noise, so the
-    count is stated and the best `SIBLINGS` are shown -- the ones that say
-    what the ceiling from here is.
-    """
-    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
-    for n in range(prompt.SIBLINGS + 5):
-        stored(db, f"p{n}", "champion_1", n / 100, f"Attempt {n}.")
-
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.5}),
-        [],
-        db.children("champion_1"),
-        IMPROVE,
-        table("champion_1", {"v54": 0.5}),
-    )
-
-    assert f"{prompt.SIBLINGS + 5} program(s) have been written" in text
-    assert f"the best {prompt.SIBLINGS} of them" in text
-    assert "Attempt 12." in text  # the best
-    assert "Attempt 0." not in text  # the worst, cut
-
-
 def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> None:
     """A heading over an empty table is noise in a message read every round."""
     db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
@@ -679,64 +382,6 @@ def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> N
     )
 
     assert "already been made" not in text
-
-
-def test_a_sibling_with_no_docstring_is_still_shown_for_its_score(
-    tmp_path: Path,
-) -> None:
-    """The number is the point; the program's own account of itself is a bonus.
-
-    A round is asked for a docstring saying what it changed, and mostly writes
-    one. Dropping the row when it did not would hide a measured result over a
-    missing comment.
-    """
-    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
-    bare = archive.Program(
-        id="bare",
-        source_path=str(db.store("def agent(o, c=None):\n    return {}\n", "bare")),
-        started_from="champion_1",
-        instruction="tune",
-        model="gpt-5.6-luna",
-        fitness=0.25,
-        field=0.25,
-        created=0.0,
-    )
-    db.add(bare)
-
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.5}),
-        [],
-        db.children("champion_1"),
-        IMPROVE,
-        table("champion_1", {"v54": 0.5}),
-    )
-
-    assert "| bare | tune | 0.250 | - |" in text
-
-
-def test_the_game_shown_is_against_the_agent_directly_above() -> None:
-    """The next place, not the furthest one.
-
-    Under the absolute gate the worst matchup was the binding constraint, so
-    that was the game to study. Under a tournament it is usually just the
-    strongest agent in the pool, and a program at the bottom loses to it
-    sixteen games to nothing -- a different league, not a next step. Measured
-    on the live campaign, a round was being shown `router2929` at 0.000 while
-    the agent it had to overtake was `indarkarhana`, which it already took a
-    quarter of its games from.
-    """
-    rates = {"unreachable": 0.0, "rival": 0.25, "below": 1.0}
-    standings = {"unreachable": 3.0, "rival": 1.0, "champion_1": 0.0, "below": -2.0}
-
-    text = prompt.compose("champion_1", result(rates), [], [], IMPROVE, standings)
-
-    # Both losses are shown, worst first, so the agent it never beats leads.
-    assert text.index("### `unreachable`") < text.index("### `rival`")
-    # And the one it has to pass is marked, because that is the next place.
-    assert "### `rival`, won 0.250 -- directly above you" in text
-    # Beaten every single time, so nothing left to teach.
-    assert "### `below`" not in text
 
 
 def store(tmp_path: Path, *claims: tuple[str, int, float]) -> strategy.Strategies:
@@ -911,3 +556,168 @@ def test_the_claim_section_disappears_when_there_is_nothing_to_say() -> None:
         assert text.count("| what the corpus says |") == 1
     else:
         assert "what the corpus says" not in text
+
+
+def test_no_opponent_is_named_anywhere_in_the_message() -> None:
+    """The round is writing a program to beat any opponent, not these ones.
+
+    "Beat this pool" is a fitting objective and "beat any opponent" is a
+    generalising one, and the campaign spent weeks optimising the first while
+    measuring the second. Left to it, the previous lineage evolved opponent
+    fingerprinting -- recognising specific agents by their sheep and cow counts
+    -- which is the correct solution to the objective it was actually given,
+    and worth nothing on a ladder where the agent across the table is one it
+    has never seen.
+
+    A name is all it takes to start fitting, so no name travels. The pool is a
+    sample of the field, and the sections that used to rank it, place this
+    program in it, and label each day table with who was across the table are
+    gone.
+    """
+    rates = {"v54": 0.3, "shopforge": 0.5, "router_v1": 0.9}
+    text = prompt.compose(
+        "champion_1",
+        result(rates, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("champion_1", rates),
+    )
+
+    for opponent in rates:
+        assert opponent not in text, f"{opponent} reached the round by name"
+    # Nor the program's own name, which is a pool name in the same namespace.
+    assert "champion_1" not in text
+
+
+def test_the_templates_own_note_never_reaches_the_model() -> None:
+    """The header explains the file to a reader and would render twice."""
+    text = prompt.compose(
+        "champion_1",
+        result({"v54": 0.5}, days=30),
+        [],
+        [],
+        IMPROVE,
+        table("c", {"v54": 0.5}),
+    )
+
+    assert prompt.ROUND_PROMPT.read_text(encoding="utf-8").startswith("<!--")
+    assert "<!--" not in text
+    assert "the parts the campaign" not in text
+
+
+def test_every_season_reaches_the_file_at_full_width() -> None:
+    """The file is the evidence; the message is the index of it.
+
+    A markdown table can be read at about fifteen columns, and a `Day` carries
+    sixty-odd. So the rendered version had to choose, and what it chose cost
+    the campaign real evidence: quadrants and fertilizer -- the two sharpest
+    separations in 16,292 recorded games, at 99% and 100% of their paired
+    samples -- were measured, stored, and shown to nobody for want of room.
+    Written to a file there is no room to run out of.
+    """
+    rates = {"v54": 0.3, "shopforge": 0.5}
+    rendered = prompt.seasons(result(rates, days=30))
+    header, *rows = rendered.splitlines()
+    columns = header.split(",")
+
+    assert len(rows) == 60, "both seasons, every day of each"
+    for column in ("ours_quadrants", "theirs_fertilised", "ours_sell_orders"):
+        assert column in columns
+    # Both sides of every quantity the campaign measures, not a chosen few.
+    for measure in dataset.COLUMNS:
+        assert f"ours_{measure}" in columns
+        assert f"theirs_{measure}" in columns
+    # The breakdowns behind the totals, and the shared market.
+    assert "ours_plants_WHEAT" in columns
+    assert "theirs_animals_COW" in columns
+    assert "price_WHEAT" in columns
+
+
+def test_season_one_is_the_game_with_the_most_left_to_learn_from() -> None:
+    """The number a round is given instead of a name still has to mean something.
+
+    Worst-beaten opponent first, because a loss is a game lost and not a
+    matchup lost: an opponent beaten 0.875 took one game in eight and those
+    are the games that decide whether the program finishes top. A round
+    reading only season 1 is reading the one where the change is reachable, so
+    the order is load-bearing rather than presentational.
+    """
+    rates = {"swept": 1.0, "close": 0.5, "beaten": 0.1}
+    banks = {"swept": 9000.0, "close": 5000.0, "beaten": 1000.0}
+    played = result(rates, days=4).model_copy(
+        update={
+            "states": {
+                name: [day(n, bank, 3000.0) for n in range(4)]
+                for name, bank in banks.items()
+            }
+        }
+    )
+
+    reader = list(csv.DictReader(prompt.seasons(played).splitlines()))
+
+    assert [row["season"] for row in reader] == ["1"] * 4 + ["2"] * 4 + ["3"] * 4
+    assert [row["day"] for row in reader[:4]] == ["0", "1", "2", "3"]
+    # Rate ascending: the one it hardly ever beats, then the split, then the
+    # one it swept -- which is in the file too, at the bottom.
+    assert [reader[index]["ours_bank"] for index in (0, 4, 8)] == [
+        "1000.0",
+        "5000.0",
+        "9000.0",
+    ]
+
+
+def test_the_index_names_a_season_by_how_it_finished() -> None:
+    """What a round cannot work out for itself is which season is which."""
+    rates = {"close": 0.5, "beaten": 0.1}
+    banks = {"close": 2900.0, "beaten": 1000.0}
+    played = result(rates, days=4).model_copy(
+        update={
+            "states": {
+                name: [day(n, bank, 3000.0) for n in range(4)]
+                for name, bank in banks.items()
+            }
+        }
+    )
+
+    text = prompt.compose("champion_1", played, [], [], IMPROVE, table("c", rates))
+
+    assert f"`{prompt.SEASONS}`" in text
+    assert "| 1 | -2,000 |" in text
+    assert "| 2 | -100 |" in text
+
+
+def test_the_message_does_not_grow_with_the_seasons_played() -> None:
+    """Twelve opponents cost twelve lines, not twelve tables.
+
+    This is the whole reason the games moved out of the message. Rendered, a
+    game was 30 rows of fifteen columns, and six of them were 74% of a message
+    that is otherwise the rules, the program and what to do -- so the size was
+    capped by dropping games, which is capping the evidence. The index is one
+    line each, so nothing has to be dropped to keep the message small.
+    """
+    one = {"v54": 0.3}
+    many = {f"other_{index}": 0.3 for index in range(12)}
+
+    small = prompt.compose(
+        "champion_1", result(one, days=30), [], [], IMPROVE, table("c", one)
+    )
+    large = prompt.compose(
+        "champion_1", result(many, days=30), [], [], IMPROVE, table("c", many)
+    )
+
+    assert len(large) - len(small) < 200
+    # And the games are all still there, in the file.
+    assert len(prompt.seasons(result(many, days=30)).splitlines()) == 1 + 12 * 30
+
+
+def test_a_program_that_played_nothing_gets_no_seasons_section() -> None:
+    """A heading over an empty index is noise in a message read every round."""
+    empty = result({"v54": 0.3}).model_copy(update={"states": {}})
+
+    text = prompt.compose(
+        "champion_1", empty, [], [], IMPROVE, table("c", {"v54": 0.3})
+    )
+
+    assert "## The seasons" not in text
+    assert prompt.seasons(empty) == ""

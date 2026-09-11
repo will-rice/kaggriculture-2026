@@ -25,6 +25,8 @@ reach it.
 """
 
 import ast
+import csv
+import io
 import logging
 import re
 from pathlib import Path
@@ -33,7 +35,6 @@ from typing import NamedTuple
 from kaggriculture.campaign import (
     archive,
     evaluator,
-    gate,
     harness,
     strategy,
     validate,
@@ -77,18 +78,6 @@ MOSTLY = 0.5
 # the program's whole dependency surface.
 IMPORTS = ", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS))
 
-# The one line that differs between a program that topped the tournament and
-# one that did not. Everything else in that paragraph is the same either way,
-# so only this is chosen here; the rest is in the template.
-PLACED_TOP = (
-    "Top of it, so this program is the champion and every later candidate has "
-    "to beat it. That is the bar, and it is not the job: win the games below "
-    "by more."
-)
-PLACED_BELOW = (
-    "Every place gained is progress, whoever it comes against -- but the way "
-    "to gain one is to play the seasons below better, not to target an agent."
-)
 
 # How many of a lineage's failures are sent, and how much of each. The last
 # few are what a next attempt can act on; an older one is about a program two
@@ -98,27 +87,26 @@ PLACED_BELOW = (
 RECENT_FAILURES = 3
 REASON_CHARS = 200
 
-# Day tables shown, at 30 rows each. Every opponent the program did not beat
-# outright earns one, worst first, and this bounds a message that is otherwise
-# a whole pool's worth of games -- twelve of them is 360 rows of eleven
-# columns, most of it about opponents the program is already close to.
+# The name of the file the seasons are written to, in the same directory as
+# `child.py`. They used to be rendered into the message: six games at 30 rows
+# of fifteen columns, 74% of a message that is otherwise the rules, the
+# program and what to do. Cutting it to one game cut the size and cut the
+# evidence with it.
 #
-# The cut used to be a rate at or below 0.5, which was right for a lineage
-# losing nearly everything and inverted the moment the campaign was seeded
-# from a strong agent: a program winning 0.875 against eight opponents was
-# told "nothing to show", so the better a program got the less it was shown of
-# how it played. The games it loses one in eight of are exactly the ones it
-# has to win to top the standings.
-MOST_TABLES = 6
+# A file does neither. Every game the evaluation played is in it, at full
+# width -- all 29 measures `dataset.measures` defines, for both sides, where
+# the table had room for nine -- and the message carries an index instead: one
+# line per season saying how it finished. A round that wants day twelve of the
+# season it nearly won can read day twelve, or load the whole file and ask
+# which day the banks diverged, and a round with a different question pays
+# nothing for the answer to this one.
+SEASONS = "seasons.csv"
 
-# How many already-scored siblings are shown, and how much of each one's own
-# account of itself. Best first, so the list is both the ceiling reached from
-# here and the directions already measured. Without it eight workers start
-# every session from the same program knowing nothing of each other, and the
-# same dead end is re-explored in parallel for as long as the campaign runs;
-# AlphaEvolve and FAMOU both feed prior candidates' measured performance into
-# the next prompt, and this is that.
-SIBLINGS = 8
+# The columns that are not a measure: the per-crop breakdowns the measures
+# total up, and the shared prices. Rendered as one column per key, so a round
+# can ask about WHEAT rather than about "crops".
+SPREADS = ("plants", "animals", "seeds", "shed")
+
 CHANGE_CHARS = 160
 
 # The instruction, and there is one. It says the bar the gate actually applies
@@ -147,12 +135,13 @@ CHANGE_CHARS = 160
 # siblings section says has already been tried from it. That was always the
 # real source of spread; the draw was noise on top of it.
 INSTRUCTION = (
-    "Change `child.py` so that it finishes each game above with a larger bank "
-    "than it did. Not a better place in the table -- a bigger margin in the "
-    "games themselves, and most of all in the ones it already wins narrowly. "
-    "Every table above is one season played out day by day; find where this "
-    "program left money on the field and take it. Small, local changes are "
-    "welcome, and so is replacing whatever part of it is playing badly."
+    "Change `child.py` so that it finishes each season above with a larger "
+    "bank than it did. Not a better place in a table -- a bigger margin in "
+    "the games themselves, and most of all in the ones it already wins "
+    f"narrowly. Every season is in `{SEASONS}`, played out day by day; find "
+    "where this program left money on the field and take it. Small, local "
+    "changes are welcome, and so is replacing whatever part of it is playing "
+    "badly."
 )
 # Margin rather than rank, and the reason is a measurement rather than a
 # preference.
@@ -247,144 +236,122 @@ def _rate_rows(result: evaluator.Result) -> str:
     )
 
 
-def _standing_rows(name: str, standings: dict[str, float]) -> str:
-    """The tournament table, best first, with this program marked.
+def seasons(result: evaluator.Result) -> str:
+    """Every recorded game of one evaluation as a single CSV, day by day.
 
-    It goes in whole. A place says more than a yes or a no, and every place
-    gained is progress the next round can aim at.
+    One row per day per game, keyed by a season number that stands in for the
+    opponent -- which is the whole of what a round is told about who it
+    played. The games are ordered as the index in the message orders them,
+    narrowest loss first, so season 1 is the one a small change would have
+    turned.
+
+    The width is the point of the file existing. A markdown table has room for
+    about fifteen columns before it stops being readable, and `Day` carries
+    sixty-odd: the 29 quantities `dataset.measures` defines for each side, the
+    per-crop breakdowns behind four of those totals, and the market's prices.
+    Written out, every one of them is a column a round can group by, diff
+    across days, or ignore -- and the two sharpest separations in the whole
+    corpus, quadrants on day three and fertilizer on day five, were quantities
+    the table had no room for.
+
+    Args:
+        result: The evaluation, for its day tables and the rates that order
+            them.
+
+    Returns:
+        The whole CSV, header first. Empty when nothing was recorded.
     """
-    return "\n".join(
-        f"| {place} | {'**' + agent + '**' if agent == name else agent} "
-        f"| {value:+.3f} |"
-        for place, (agent, value) in enumerate(
-            sorted(standings.items(), key=lambda pair: -pair[1]), start=1
-        )
+    rows: list[dict[str, object]] = []
+    for season, opponent in enumerate(_ordered(result), start=1):
+        for day in result.states[opponent]:
+            row: dict[str, object] = {"season": season, "day": day.day}
+            for side in ("ours", "theirs"):
+                for measure, value in getattr(day, side).items():
+                    row[f"{side}_{measure}"] = value
+                for spread in SPREADS:
+                    counts = getattr(day, f"{side}_{spread}", None)
+                    for item, count in (counts or {}).items():
+                        row[f"{side}_{spread}_{item}"] = count
+            for item, price in day.prices.items():
+                row[f"price_{item}"] = price
+            rows.append(row)
+    if not rows:
+        return ""
+    # The union, because a crop nobody planted on day one has no key on day
+    # one. Ordered by first appearance so the reading order is the writing
+    # order rather than the alphabet, and blank where a row has no value --
+    # which is a count of zero, and says so in the message.
+    columns: dict[str, None] = {}
+    for row in rows:
+        columns.update(dict.fromkeys(row))
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=list(columns), restval="")
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue()
+
+
+def _ordered(result: evaluator.Result) -> list[str]:
+    """The recorded games, worst-beaten opponent first.
+
+    A loss is a game lost, not a matchup lost: an opponent beaten 0.875 took
+    one game in eight, and those are the games that decide whether the program
+    finishes top. So the order is by rate and then by margin, which puts the
+    seasons with the most to learn from at the top of the index, and the games
+    it swept at the bottom rather than out of the file.
+    """
+    return sorted(
+        (name for name in result.rates if result.states.get(name)),
+        key=lambda name: (result.rates[name], result.margins[name].mean),
     )
 
 
-def _rival(
-    name: str, standings: dict[str, float], states: dict[str, list[harness.Day]]
-) -> str:
-    """The opponent directly above ``name``, whose game is worth studying.
+def _states_lines(result: evaluator.Result) -> list[str]:
+    """Render the index of the seasons file: one line per game, how it closed.
 
-    The gate is a tournament, so the next place is taken from whoever is one
-    rung up -- not from the agent the program does worst against, which under
-    an absolute gate was the binding constraint and under this one is usually
-    just the strongest agent in the pool. A program at the bottom of the table
-    loses to that agent sixteen games to nothing; the one above it is a game
-    it sometimes wins.
-
-    Args:
-        name: The program's own name in the standings.
-        standings: Every agent's rating from the tournament it is part of.
-        states: The day tables available, one per opponent played.
-
-    Returns:
-        An opponent name with a day table, above ``name`` if there is one.
+    Not the games themselves. They are in `SEASONS` beside `child.py`, at a
+    width no message could carry, and what belongs here is the part a round
+    cannot work out for itself -- which season is which, and which one is
+    worth opening first.
     """
-    ranked = [
-        agent
-        for agent in sorted(standings, key=lambda other: -standings[other])
-        if agent == name or agent in states
-    ]
-    place = ranked.index(name)
-    # Top of the table has nobody above it; then the nearest challenger below
-    # is what it has to stay ahead of.
-    above = ranked[place - 1] if place else ranked[1]
-    return above
-
-
-def _states_lines(
-    result: evaluator.Result, rival: str, standings: dict[str, float]
-) -> list[str]:
-    """Render one game against every opponent that took a game off the program.
-
-    The losses, because that is where there is something to learn -- and a
-    loss is a game lost, not a matchup lost. An opponent beaten 0.875 has
-    taken one game in eight, and those are precisely the games that decide
-    whether the program finishes top; only an opponent it has beaten every
-    single time has nothing left to teach. Worst first, capped at
-    ``MOST_TABLES``, so the agents it has never taken a game from come before
-    the ones it splits with.
-
-    One game each, and the closest one played -- the game a small change would
-    have flipped, rather than the widest loss, which shows the failure at its
-    starkest and least reachable.
-
-    Args:
-        result: The evaluation, for its rates and its day tables.
-        rival: The agent directly above in the standings, marked because
-            passing it is the next place available.
-        standings: Every agent's rating, to order what is shown.
-
-    Returns:
-        Lines of a markdown section: one table per opponent not beaten.
-    """
-    lost = sorted(
-        (
-            name
-            for name, rate in result.rates.items()
-            if rate < 1.0 and name in result.states
-        ),
-        key=lambda name: (result.rates[name], result.margins[name].mean),
-    )[:MOST_TABLES]
-    if not lost:
-        return [
-            "## Every match, day by day",
-            "",
-            "Nothing to show: this program won every game against every "
-            "opponent in the pool.",
-        ]
+    ordered = _ordered(result)
+    if not ordered:
+        return []
     lines = [
-        "## The matches it lost, day by day",
+        "## The seasons it just played",
         "",
-        f"One game against each of the {len(lost)} opponents that took a game "
-        "off it, worst first. A rate below 1.000 is a game lost, and those are "
-        "the games that decide where it finishes: the ones at the top it has "
-        "never beaten at all, and the ones lower down it beats most of the "
-        "time and still drops points to. Each table is the closest game played "
-        "against that opponent -- the one a small change would have flipped, "
-        "rather than the widest loss, which shows the failure at its starkest "
-        "and least reachable.",
+        f"Every one of them is in `{SEASONS}`, beside `child.py`: one row per "
+        "day per season, keyed by the `season` column below. Read it however "
+        "suits the question -- the whole file, one season, one day, one "
+        "column across all of them.",
         "",
-        "Each row is how that day closed. You are shown both sides because you "
-        "are the program's author; the program itself cannot see the "
-        "opponent's shed or seed while it plays. A farm column reads "
-        "`crops / animals / weeds`, counted in tiles, and `-` where there are "
-        "none. Tiles are public, so the opponent's farm is here on the same "
-        "terms as yours; its seed and carried inventory are private and are "
-        "not. `quads` is unlocked quadrants of four and `fert` is growing "
-        "tiles still under fertilizer -- the two the corpus separates the "
-        "strongest agents from the rest on, and the two the build-order table "
-        "above states.",
+        "The opponents are not named and it does not matter which they were. "
+        "They are drawn from the field this program will meet, and the field "
+        "turns over: the agent across the table in a scored game will be one "
+        "this program has never seen. So these are samples of how a season "
+        "can go against a competent opponent, not a list of agents to beat. A "
+        "change that wins these seasons because it recognised who it was "
+        "playing wins nothing that counts.",
+        "",
+        "| season | finished |",
+        "| --- | --- |",
     ]
-    for opponent in lost:
-        mark = (
-            " -- directly above you, and the next place you can take"
-            if opponent == rival
-            else ""
-        )
-        lines += [
-            "",
-            f"### `{opponent}`, won {result.rates[opponent]:.3f}{mark}",
-            "",
-            "| day | our bank | their bank | our farm | their farm | our quads | "
-            "their quads | our fert | their fert | our seed | our shed | "
-            "their shed | our hands | their hands | prices |",
-            "| --- |" + " --- |" * 14,
-        ]
-        for day in result.states[opponent]:
-            lines.append(
-                f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
-                f"{_farm(day.ours_plants, day.ours_animals, day.ours_weeds)} | "
-                f"{_farm(day.theirs_plants, day.theirs_animals, day.theirs_weeds)} | "
-                f"{day.ours_quadrants} | {day.theirs_quadrants} | "
-                f"{day.ours_fertilised} | {day.theirs_fertilised} | "
-                f"{_items(day.ours_seeds)} | "
-                f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
-                f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
-            )
-    del standings
+    for season, opponent in enumerate(ordered, start=1):
+        final = result.states[opponent][-1]
+        lines.append(f"| {season} | {final.ours_bank - final.theirs_bank:+,.0f} |")
+    lines += [
+        "",
+        "Each row of the file is a day as it closed, at hour 23. Both sides "
+        "are in it, the opponent's shed included: that is what the author of "
+        "a program is shown afterwards, never what the program may read while "
+        "it plays. `ours_*` and `theirs_*` carry every quantity the campaign "
+        "measures -- banks, planted and ripe tiles, pens, weeds, bare tiles, "
+        "unlocked quadrants, hands, seed and shed totals, shops, watering and "
+        "feeding, fertilizer, plant age, and the running counts of every kind "
+        "of market order -- with the per-crop breakdowns behind the totals as "
+        "`ours_plants_WHEAT` and the like, and the shared market as `price_*`. "
+        "An empty cell is a count of zero.",
+    ]
     return lines
 
 
@@ -562,38 +529,6 @@ def _summary(program: archive.Program) -> str:
     return " ".join((docstring or "").split())[:CHANGE_CHARS]
 
 
-def _sibling_lines(name: str, siblings: list[archive.Program]) -> list[str]:
-    """Render what earlier rounds made of this same program, and what it scored.
-
-    Args:
-        name: The program they were all written from, by name.
-        siblings: Its children, best first.
-
-    Returns:
-        Lines of a markdown section: one row per attempt.
-    """
-    shown = siblings[:SIBLINGS]
-    lines = [
-        f"## What has already been made of `{name}`",
-        "",
-        f"{len(siblings)} program(s) have been written from `{name}` and scored, "
-        f"the best {len(shown)} of them below. These are results, not mistakes: "
-        "each one ran and was played against the same pool on the same terms as "
-        "the table above. A direction here has been measured, so repeating it "
-        "spends a round to learn what this table already says; the rate to beat "
-        "from where you stand is the best of them.",
-        "",
-        "| attempt | instruction | win rate | what it changed |",
-        "| --- | --- | --- | --- |",
-    ]
-    for program in shown:
-        lines.append(
-            f"| {program.id} | {program.instruction} | {program.fitness:.3f} | "
-            f"{_summary(program) or '-'} |"
-        )
-    return lines
-
-
 def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     """Render the most recent rounds on this lineage that produced no program.
 
@@ -622,14 +557,17 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     return lines
 
 
-def _items(counts: dict[str, int]) -> str:
-    """Render a shed or a price list as ``WHEAT 12, EGG 3``; "-" when empty."""
-    return ", ".join(f"{item} {n}" for item, n in counts.items()) or "-"
+def _behind(result: evaluator.Result) -> float:
+    """Mean bank margin across every game, which is what the instruction moves.
 
-
-def _farm(plants: dict[str, int], animals: dict[str, int], weeds: int) -> str:
-    """Render one side's worked tiles as ``crops / animals / weeds``."""
-    return f"{_items(plants)} / {_items(animals)} / {weeds or '-'}"
+    One number rather than a row per opponent. A rate against a named agent
+    affords one action -- target that agent -- and that is the fitting this
+    message exists not to encourage. This is the scale the instruction asks
+    the program to move, and the season below is where it can be read.
+    """
+    if not result.margins:
+        return 0.0
+    return sum(margin.mean for margin in result.margins.values()) / len(result.margins)
 
 
 def compose(
@@ -660,36 +598,33 @@ def compose(
     Returns:
         The whole message, for codex's standard input.
     """
-    rival = _rival(name, standings, result.states)
-    # No floor is passed, so this asks only whether the program tops the
-    # field -- which is the half of the verdict worth putting in front of a
-    # model. The decisive bar guards the other half, replacing the agent that
-    # stands, and with no floor named there is nothing to be indistinguishable
-    # from; zero is the right value and the branch above never reads it.
-    cleared, why = gate.promotion(standings, name, decisive=0)
-    # Opened here rather than at import, so a store the daily measurement
-    # has rewritten reaches a campaign that is already running.
+    # The standings still choose which game is worth showing -- the agent
+    # directly above is the one whose game was closest -- but they are no
+    # longer shown. A place is not something a round can act on: it cannot
+    # choose its opponents or its rank, and everything it can act on is in the
+    # per-opponent table. Worse, the ratings are mostly noise at this sample
+    # size -- one unchanged agent's fitted rating moves with a standard
+    # deviation of 0.745 across draws, where the whole table spans about five
+    # -- so printing them to three decimals invited a round to reason about
+    # differences a re-run would reshuffle. And the top of that table was this
+    # lineage's own ancestry, which is the target the campaign spent a day
+    # removing from the pool.
     # A lineage with nothing against it gets no section at all: a heading over
     # an empty list is noise in a message the model reads every round. The
     # template puts each on its own line, so an empty one leaves no gap.
+    index = _states_lines(result)
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
-        name=name,
         imports=IMPORTS,
         seeds=len(result.seeds),
-        rates=_rate_rows(result),
-        verdict=why,
-        placing=PLACED_TOP if cleared else PLACED_BELOW,
-        standings=_standing_rows(name, standings),
-        states="\n".join(_states_lines(result, rival, standings)) + "\n",
-        siblings="\n".join(_sibling_lines(name, siblings)) + "\n" if siblings else "",
+        margin=f"{_behind(result):+,.0f}",
+        states="\n".join(index) + "\n" if index else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         instruction=instruction,
     )
     LOGGER.info(
-        "composed a round on %s (rival: %s, %d prior, %d failures)",
+        "composed a round on %s (%d prior, %d failures)",
         name,
-        rival,
         len(siblings),
         len(failures),
     )
