@@ -12,7 +12,7 @@ Placeholders, all filled on every round:
                  one that rejects it
   {seeds}        how many seasons it was measured over
   {margin}       how far behind it finished on average, across all of them
-  {states}       the index of `seasons.csv`: one line per season it played
+  {states}       the index of `seasons.csv`: one line per matchup it played
   {failures}     the lineage's recent rejected attempts, or empty
   {instruction}  what to do
 
@@ -32,11 +32,21 @@ named anywhere in this message and neither is the program itself.
 The seasons themselves are a file, not a section. Rendered into the message
 they were 74% of it, at 30 rows of fifteen columns per game, and the fifteen
 were all a markdown table can be read at -- so cutting the message meant
-cutting to one game, and cutting the evidence with it. Written to
-`seasons.csv` instead, every game is there at full width: all 29 quantities
-`dataset.measures` defines, for both sides, plus the per-crop breakdowns and
-the market. The message carries the index, because which season is which is
-the one part a round cannot work out for itself.
+cutting to one game, and cutting the evidence with it. Worse, the evaluation
+had already dropped thirty-one of every thirty-two games before the message
+was composed: a round was asked to improve a program on one game in
+thirty-two of what it would be scored on.
+
+Written to `seasons.csv` instead, every scored game is there at full width:
+all 29 quantities `dataset.measures` defines, for both sides, plus the
+per-crop breakdowns and the market. Two keys order it. A `matchup` is one
+opponent and every season played against them -- fixed opponent, so what
+varies between its seasons is the map, the prices and the seat, which is the
+variation a general program has to hold up across. Between matchups the
+adversary varies too, so a difference there says nothing about either.
+
+The message carries the index of that, because how many seasons a matchup
+holds and how they went is the part a round cannot work out for itself.
 
 A section that would be empty is rendered as nothing at all, heading
 included: a heading over an empty list is noise in a message read every
@@ -150,9 +160,9 @@ you could.
 
 ## How this program played
 
-It played {seeds} seasons in both seats against opponents drawn from the
-field, and finished {margin} behind on average. Every one of those seasons is
-in your directory, day by day.
+It played {seeds} seasons in both seats against each opponent drawn from the
+field, and finished {margin} behind on average. Every one of those games is in
+your directory, day by day.
 
 {states}
 {failures}

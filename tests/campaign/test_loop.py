@@ -1057,13 +1057,14 @@ def _gate_result(
     rates: dict[str, float],
     score: float | None = None,
     days: int = 0,
+    seasons: int = 1,
 ) -> evaluator.Result:
     """A hand-built result standing in for one the gate measured.
 
-    ``days`` records that many days of one game against each opponent, which
-    is what the round writes to ``seasons.csv``. Zero by default: most of
-    these tests are about what the loop does with a verdict, not about the
-    games behind it.
+    ``days`` and ``seasons`` record that many seasons against each opponent,
+    which is what the round writes to ``seasons.csv``. No days by default:
+    most of these tests are about what the loop does with a verdict, not about
+    the games behind it.
     """
     point = sum(rates.values()) / len(rates) if score is None else score
     return evaluator.Result(
@@ -1081,26 +1082,29 @@ def _gate_result(
         hardest=min(rates, default=""),
         states={
             name: [
-                harness.Day(
-                    day=n,
-                    ours_bank=100.0 + n,
-                    theirs_bank=200.0,
-                    ours_plants={"WHEAT": 4},
-                    theirs_plants={"MELON": 2},
-                    ours_animals={},
-                    theirs_animals={"COW": 1},
-                    ours_weeds=0,
-                    theirs_weeds=3,
-                    ours_seeds={"WHEAT": 5},
-                    ours_shed={"WHEAT": 12},
-                    theirs_shed={"EGG": 3},
-                    ours_hands=2,
-                    theirs_hands=1,
-                    ours=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 100.0 + n},
-                    theirs=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 200.0},
-                    prices={"WHEAT": 25},
-                )
-                for n in range(days)
+                [
+                    harness.Day(
+                        day=n,
+                        ours_bank=100.0 + n,
+                        theirs_bank=200.0,
+                        ours_plants={"WHEAT": 4},
+                        theirs_plants={"MELON": 2},
+                        ours_animals={},
+                        theirs_animals={"COW": 1},
+                        ours_weeds=0,
+                        theirs_weeds=3,
+                        ours_seeds={"WHEAT": 5},
+                        ours_shed={"WHEAT": 12},
+                        theirs_shed={"EGG": 3},
+                        ours_hands=2,
+                        theirs_hands=1,
+                        ours=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 100.0 + n},
+                        theirs=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 200.0},
+                        prices={"WHEAT": 25},
+                    )
+                    for n in range(days)
+                ]
+                for _ in range(seasons)
             ]
             for name in rates
         },
@@ -2056,7 +2060,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     ]
     # Every game behind the verdict, at a width no message could carry. The
     # message holds the index; this is what the index points at.
-    assert str(seen["seasons"]).startswith("season,day,ours_bank,")
+    assert str(seen["seasons"]).startswith("matchup,season,day,ours_bank,")
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER

@@ -74,11 +74,25 @@ class Result(BaseModel):
             what a round is *shown* is chosen from the standings instead,
             because the gate is a tournament and the agent to study is the one
             directly above, not the one furthest away.
-        states: One game against each opponent, day by day: the narrowest
-            loss, or the narrowest win where it lost none. Every opponent,
-            because which one is worth showing depends on the standings and
-            those are not fitted until after this returns -- and the games are
-            played either way, so keeping their tables costs nothing.
+        states: Every game played, day by day, grouped by the opponent it was
+            played against and narrowest first within each group.
+
+            All of them, because a round can only improve a game it is shown
+            and the campaign scores every one of them. It used to keep the
+            single narrowest game against each opponent and drop the other
+            thirty-one, which quietly decided on a round's behalf that the
+            other thirty-one held nothing -- and the games are played either
+            way, with their days already rendered, so keeping them costs
+            nothing but the write.
+
+            Grouped, because the grouping is what makes two seasons
+            comparable. Within one group the opponent is fixed and what varies
+            between seasons is the world: the map, the prices, the seat. That
+            is the axis a general program has to hold up across. Across groups
+            the adversary varies too, so a difference between two of them says
+            nothing about either -- and the only reading that survives is
+            "that opponent does this", which is the fitting the message exists
+            not to encourage.
     """
 
     program_id: str
@@ -91,7 +105,7 @@ class Result(BaseModel):
     games: int = 0
     seeds: list[int]
     hardest: str
-    states: dict[str, list[harness.Day]]
+    states: dict[str, list[list[harness.Day]]]
 
 
 def _mean(rates: dict[str, float]) -> float:
@@ -243,14 +257,20 @@ def score(
     # one it came closest to beating.
     margins = harness.margins(games, names)
     hardest = min(rates, key=lambda name: (rates[name], margins[name].mean))
-    # The narrowest game against each: the one a small change would have
-    # flipped, which is what a round can act on. Taking the widest loss
-    # instead showed the failure at its starkest and the least reachable.
+    # Every game, grouped by opponent, narrowest first within each group. The
+    # narrowest is the one a small change would have flipped, so it leads; the
+    # widest shows the failure at its starkest and the least reachable, so it
+    # does not. This used to keep the narrowest alone and drop the other
+    # thirty-one against each opponent, which is a round being told about one
+    # thirty-second of what it is scored on.
     states = {
-        name: min(
-            (game for game in games if game.opponent == name),
-            key=lambda game: abs(game.ours - game.theirs),
-        ).days
+        name: [
+            game.days
+            for game in sorted(
+                (game for game in games if game.opponent == name),
+                key=lambda game: abs(game.ours - game.theirs),
+            )
+        ]
         for name in names
     }
     played = 2 * len(seeds)

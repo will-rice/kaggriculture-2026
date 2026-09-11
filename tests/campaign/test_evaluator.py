@@ -237,3 +237,34 @@ def test_a_pairing_that_drew_every_game_has_no_evidence_either_way() -> None:
     """
     assert evaluator._contested(played("t", [(7.0, 7.0)] * 32), ["t"]) == {"t": (0, 0)}
     assert evaluator.wilson_interval(0, 0) == (0.0, 1.0)
+
+
+@pytest.mark.local_data
+def test_every_game_it_scores_is_a_game_the_round_can_improve(tmp_path: Path) -> None:
+    """Every game, grouped by opponent, narrowest first.
+
+    This used to keep the single narrowest game against each opponent and drop
+    the rest, so a round was asked to improve a program on one game in
+    thirty-two of what it was about to be scored on -- and the thirty-one it
+    could not see were decided by the same policy for the same reasons. The
+    days are already rendered by the time this runs, so keeping them costs the
+    write and nothing else.
+
+    Narrowest first because that is the game a small change would have turned;
+    the widest shows the failure at its starkest and the least reachable, so it
+    goes last rather than first.
+    """
+    agent = tmp_path / "main.py"
+    agent.write_text(PASS, encoding="utf-8")
+    p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
+
+    result = evaluator.score(
+        agent, "prog", p, random.Random(4), [11, 12], workers=WORKERS
+    )
+
+    seasons = result.states["v54"]
+    assert len(seasons) == result.games, "one recorded season per game scored"
+    assert all(len(days) == len(seasons[0]) for days in seasons)
+    assert len(seasons[0]) > 1, "a season is its days, not one terminal row"
+    gaps = [abs(days[-1].ours_bank - days[-1].theirs_bank) for days in seasons]
+    assert gaps == sorted(gaps), "narrowest first, so season 1 is the reachable one"

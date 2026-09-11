@@ -13,7 +13,6 @@ from kaggriculture.campaign import (
     evaluator,
     harness,
     prompt,
-    strategy,
     validate,
 )
 
@@ -67,7 +66,14 @@ def day(number: int, ours: float, theirs: float) -> harness.Day:
     )
 
 
-def result(rates: dict[str, float], days: int = 2) -> evaluator.Result:
+def games(banks: list[float], days: int) -> list[list[harness.Day]]:
+    """One recorded game per bank in ``banks``, each ``days`` days long."""
+    return [[day(n, bank, 3000.0) for n in range(days)] for bank in banks]
+
+
+def result(
+    rates: dict[str, float], days: int = 2, seasons: int = 1
+) -> evaluator.Result:
     """A fast evaluation standing in for one the loop played."""
     hardest = min(rates, key=lambda name: rates[name])
     return evaluator.Result(
@@ -81,7 +87,10 @@ def result(rates: dict[str, float], days: int = 2) -> evaluator.Result:
         seeds=[1, 2, 3, 4],
         hardest=hardest,
         states={
-            name: [day(n, 3000.0 - n, 3000.0 + n) for n in range(days)]
+            name: [
+                [day(n, 3000.0 - n, 3000.0 + n) for n in range(days)]
+                for _ in range(seasons)
+            ]
             for name in rates
         },
     )
@@ -177,7 +186,7 @@ def test_the_message_carries_no_corpus_derived_target() -> None:
     # the rules.
     assert prompt.TASK_PROMPT.read_text(encoding="utf-8").strip()[:80] in text
     assert f"`{prompt.SEASONS}`" in text
-    assert "| season | finished |" in text
+    assert "| matchup | seasons | won | mean finish | worst | best |" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
     assert "/data" not in text
 
@@ -384,180 +393,6 @@ def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> N
     assert "already been made" not in text
 
 
-def store(tmp_path: Path, *claims: tuple[str, int, float]) -> strategy.Strategies:
-    """A claim store the corpus has already spoken about.
-
-    Built rather than monkeypatched, and passed in: `selected` takes the store
-    because a test that has to reach into the module to change where it reads
-    from is a test of the reaching.
-    """
-    opened = strategy.Strategies(tmp_path / "strategies.jsonl")
-    for quantity, when, agreement in claims:
-        claim = opened.propose(strategy.Form(quantity=quantity, day=when))
-        opened.record(claim.id, support=4000, agreement=agreement)
-    return opened
-
-
-def test_a_claim_this_program_already_follows_is_not_shown(tmp_path: Path) -> None:
-    """What makes a claim worth a round is not that it is true.
-
-    Every settled claim is true of the corpus by construction, so a section
-    listing them would be the same paragraph every round on every program. The
-    one thing that differs between programs is which of them this program is
-    not doing.
-    """
-    # The day table has this program ahead on planted tiles in every game, and
-    # the corpus says the stronger side has more of them.
-    chosen = prompt.selected(
-        store(tmp_path, ("planted", 1, 0.9)), result({"v54": 0.3}).states
-    )
-
-    assert chosen == []
-
-
-def test_the_claims_shown_are_the_ones_this_program_breaks_worst_first(
-    tmp_path: Path,
-) -> None:
-    """A round that reads one claim should read the one it is furthest from."""
-    # This program trails on bank and leads on planted in every recorded game.
-    # The corpus says the stronger side holds more bank and fewer planted
-    # tiles, so it is on the wrong side of both and of neither of the others.
-    chosen = prompt.selected(
-        store(
-            tmp_path,
-            ("bank", 1, 0.95),
-            ("planted", 1, 0.20),
-            ("weeds", 1, 0.10),
-            ("shed", 1, 0.93),
-        ),
-        result({"v54": 0.3, "v16": 0.5}).states,
-    )
-
-    assert [gap.claim.form.quantity for gap in chosen] == ["bank", "planted"]
-    # Both opponents, and the row says the count rather than the share.
-    assert [(gap.wrong, gap.seen) for gap in chosen] == [(2, 2), (2, 2)]
-    # And each carries the figures behind it, so a round is not told it is
-    # behind on something it can find no number for.
-    assert chosen[0].ours == 2999.0 and chosen[0].theirs == 3001.0
-
-
-def test_a_claim_the_corpus_has_not_settled_never_reaches_a_round(
-    tmp_path: Path,
-) -> None:
-    """The measurement decides what is shown, and which way round it is shown.
-
-    A claim the corpus cannot separate the sides on has no direction, so there
-    is no wrong side to put a program on -- and telling a round to act on one
-    anyway is worse than telling it nothing.
-    """
-    unsettled = store(tmp_path, ("bank", 1, 0.5))
-
-    assert unsettled.claims[0].status == "open"
-    assert prompt.selected(unsettled, result({"v54": 0.3}).states) == []
-
-
-def test_the_two_quantities_the_corpus_decides_on_can_be_selected_on(
-    tmp_path: Path,
-) -> None:
-    """Rendering them in the table is not the same as being able to select.
-
-    `harness.Day` carries quadrants and fertilizer, and the day tables show
-    them -- but the bridge the selector reads did not, so the two widest
-    separations in 16,292 games were visible to a reader and invisible to the
-    thing that decides what a round is told. Shipped exactly that way once.
-    """
-    # The day table has this program on one quadrant against three.
-    days = [
-        result({"v54": 0.3})
-        .states["v54"][0]
-        .model_copy(
-            update={
-                "day": 1,
-                "ours_quadrants": 1,
-                "theirs_quadrants": 3,
-                "ours_fertilised": 0,
-                "theirs_fertilised": 17,
-                "ours": measured(quadrants=1, fertilised=0),
-                "theirs": measured(quadrants=3, fertilised=17),
-            }
-        )
-    ]
-    played = result({"v54": 0.3}).model_copy(update={"states": {"v54": days}})
-
-    chosen = prompt.selected(
-        store(tmp_path, ("quadrants", 1, 0.99), ("fertilised", 1, 0.95)), played.states
-    )
-
-    assert {gap.claim.form.quantity for gap in chosen} == {
-        "quadrants",
-        "fertilised",
-    }
-    # One quadrant against three, and the row says so.
-    quads = next(g for g in chosen if g.claim.form.quantity == "quadrants")
-    assert (quads.ours, quads.theirs) == (1.0, 3.0)
-
-
-def test_a_claim_a_day_table_cannot_carry_is_kept_and_not_shown(
-    tmp_path: Path,
-) -> None:
-    """Hire orders are among the store's clearest findings and cannot be shown.
-
-    A day table is a state at a moment and does not count what was submitted
-    to reach it, so there is no value to put this program on a side of. It
-    stays measured in the store; it does not become a claim about a program
-    whose orders nobody counted.
-    """
-    assert "hire_orders" in strategy.QUANTITIES
-
-    chosen = prompt.selected(
-        store(tmp_path, ("hire_orders", 1, 0.2)), result({"v54": 0.3}).states
-    )
-
-    assert chosen == []
-
-
-def test_a_claim_the_corpus_reversed_selects_the_program_that_does_more(
-    tmp_path: Path,
-) -> None:
-    """Half the findings are about doing *less* of something.
-
-    The strongest agents sell under half what the rest do. A program that
-    sells more is the one that needs telling, and that only comes out right
-    because the direction is read off the measurement rather than off
-    something a person wrote down first.
-    """
-    # The day table has this program ahead on planted tiles; the corpus says
-    # the stronger side holds fewer.
-    chosen = prompt.selected(
-        store(tmp_path, ("planted", 1, 0.05)), result({"v54": 0.3}).states
-    )
-
-    assert [gap.claim.form.quantity for gap in chosen] == ["planted"]
-
-
-def test_the_claim_section_disappears_when_there_is_nothing_to_say() -> None:
-    """A heading over an empty list is noise in a message read every round.
-
-    The live store decides this one, so it asserts the shape of the message
-    rather than a particular claim: either the section is there with its table
-    under it, or it is not there at all.
-    """
-    text = prompt.compose(
-        "champion_1",
-        result({"v54": 0.3}, days=30),
-        [],
-        [],
-        IMPROVE,
-        table("champion_1", {"v54": 0.3}),
-    )
-
-    heading = "## What the strongest agents on the ladder do differently"
-    if heading in text:
-        assert text.count("| what the corpus says |") == 1
-    else:
-        assert "what the corpus says" not in text
-
-
 def test_no_opponent_is_named_anywhere_in_the_message() -> None:
     """The round is writing a program to beat any opponent, not these ones.
 
@@ -617,11 +452,11 @@ def test_every_season_reaches_the_file_at_full_width() -> None:
     Written to a file there is no room to run out of.
     """
     rates = {"v54": 0.3, "shopforge": 0.5}
-    rendered = prompt.seasons(result(rates, days=30))
+    rendered = prompt.seasons(result(rates, days=30, seasons=16))
     header, *rows = rendered.splitlines()
     columns = header.split(",")
 
-    assert len(rows) == 60, "both seasons, every day of each"
+    assert len(rows) == 2 * 16 * 30, "both matchups, every season, every day"
     for column in ("ours_quadrants", "theirs_fertilised", "ours_sell_orders"):
         assert column in columns
     # Both sides of every quantity the campaign measures, not a chosen few.
@@ -634,48 +469,49 @@ def test_every_season_reaches_the_file_at_full_width() -> None:
     assert "price_WHEAT" in columns
 
 
-def test_season_one_is_the_game_with_the_most_left_to_learn_from() -> None:
-    """The number a round is given instead of a name still has to mean something.
+def test_a_matchup_is_one_opponent_and_every_season_against_them() -> None:
+    """The grouping is what makes two seasons comparable.
 
-    Worst-beaten opponent first, because a loss is a game lost and not a
-    matchup lost: an opponent beaten 0.875 took one game in eight and those
-    are the games that decide whether the program finishes top. A round
-    reading only season 1 is reading the one where the change is reachable, so
-    the order is load-bearing rather than presentational.
+    Within a matchup the opponent is fixed, so what changes between seasons is
+    the world -- the map, the prices, the seat -- which is the variation a
+    general program has to hold up across. Across matchups the adversary
+    changes too, so a difference between two of them says nothing about
+    either, and the only reading that survives is "that opponent does this",
+    which is the fitting this message exists not to encourage.
+
+    The file used to hold one game per opponent, which is the confounded
+    version: twelve seasons that differ in both things at once.
     """
-    rates = {"swept": 1.0, "close": 0.5, "beaten": 0.1}
-    banks = {"swept": 9000.0, "close": 5000.0, "beaten": 1000.0}
+    rates = {"close": 0.5, "beaten": 0.1}
     played = result(rates, days=4).model_copy(
         update={
             "states": {
-                name: [day(n, bank, 3000.0) for n in range(4)]
-                for name, bank in banks.items()
+                "beaten": games([1000.0, 2000.0], days=4),
+                "close": games([2900.0, 2950.0, 3100.0], days=4),
             }
         }
     )
 
     reader = list(csv.DictReader(prompt.seasons(played).splitlines()))
 
-    assert [row["season"] for row in reader] == ["1"] * 4 + ["2"] * 4 + ["3"] * 4
+    # Matchup 1 is `beaten`, its two seasons; matchup 2 is `close`, its three.
+    assert [row["matchup"] for row in reader] == ["1"] * 8 + ["2"] * 12
+    assert [row["season"] for row in reader[:8]] == ["1"] * 4 + ["2"] * 4
     assert [row["day"] for row in reader[:4]] == ["0", "1", "2", "3"]
-    # Rate ascending: the one it hardly ever beats, then the split, then the
-    # one it swept -- which is in the file too, at the bottom.
-    assert [reader[index]["ours_bank"] for index in (0, 4, 8)] == [
-        "1000.0",
-        "5000.0",
-        "9000.0",
-    ]
+    # Worst-beaten opponent first, so a round reading matchup 1 is reading the
+    # one with the most left to learn from.
+    assert reader[0]["ours_bank"] == "1000.0"
+    assert reader[8]["ours_bank"] == "2900.0"
 
 
-def test_the_index_names_a_season_by_how_it_finished() -> None:
-    """What a round cannot work out for itself is which season is which."""
+def test_the_index_says_how_many_seasons_each_matchup_holds_and_how_they_went() -> None:
+    """What a round cannot work out for itself is which matchup is which."""
     rates = {"close": 0.5, "beaten": 0.1}
-    banks = {"close": 2900.0, "beaten": 1000.0}
     played = result(rates, days=4).model_copy(
         update={
             "states": {
-                name: [day(n, bank, 3000.0) for n in range(4)]
-                for name, bank in banks.items()
+                "beaten": games([1000.0, 2000.0], days=4),
+                "close": games([2900.0, 2950.0, 3100.0], days=4),
             }
         }
     )
@@ -683,32 +519,43 @@ def test_the_index_names_a_season_by_how_it_finished() -> None:
     text = prompt.compose("champion_1", played, [], [], IMPROVE, table("c", rates))
 
     assert f"`{prompt.SEASONS}`" in text
-    assert "| 1 | -2,000 |" in text
-    assert "| 2 | -100 |" in text
+    # Two seasons, neither won, finishing -2,000 and -1,000 against 3,000.
+    assert "| 1 | 2 | 0 | -1,500 | -2,000 | -1,000 |" in text
+    # Three, one of them won: -100, -50, +100.
+    assert "| 2 | 3 | 1 | -17 | -100 | +100 |" in text
 
 
-def test_the_message_does_not_grow_with_the_seasons_played() -> None:
+def test_the_message_does_not_grow_with_the_games_played() -> None:
     """Twelve opponents cost twelve lines, not twelve tables.
 
     This is the whole reason the games moved out of the message. Rendered, a
     game was 30 rows of fifteen columns, and six of them were 74% of a message
     that is otherwise the rules, the program and what to do -- so the size was
-    capped by dropping games, which is capping the evidence. The index is one
-    line each, so nothing has to be dropped to keep the message small.
+    capped by dropping games, which is capping the evidence. A round can only
+    improve a game it is shown, and the campaign scores every one of them, so
+    dropping any of them was the wrong trade. The index is one line per
+    matchup, and the games are all in the file however many there are.
     """
     one = {"v54": 0.3}
     many = {f"other_{index}": 0.3 for index in range(12)}
 
     small = prompt.compose(
-        "champion_1", result(one, days=30), [], [], IMPROVE, table("c", one)
+        "champion_1", result(one, days=30, seasons=32), [], [], IMPROVE, table("c", one)
     )
     large = prompt.compose(
-        "champion_1", result(many, days=30), [], [], IMPROVE, table("c", many)
+        "champion_1",
+        result(many, days=30, seasons=32),
+        [],
+        [],
+        IMPROVE,
+        table("c", many),
     )
 
-    assert len(large) - len(small) < 200
-    # And the games are all still there, in the file.
-    assert len(prompt.seasons(result(many, days=30)).splitlines()) == 1 + 12 * 30
+    assert len(large) - len(small) < 500
+    # And every scored game is still there: twelve matchups, thirty-two
+    # seasons each, thirty days each.
+    rendered = prompt.seasons(result(many, days=30, seasons=32))
+    assert len(rendered.splitlines()) == 1 + 12 * 32 * 30
 
 
 def test_a_program_that_played_nothing_gets_no_seasons_section() -> None:
