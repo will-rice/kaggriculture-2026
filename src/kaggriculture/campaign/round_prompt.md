@@ -48,10 +48,42 @@ Edit it in place. Do not report anything back in your reply: whatever
 opponent below, and the result comes back to you as another message like this
 one asking you to improve it again.
 
-Check your work before you finish. The directory is yours and it is thrown
-away after this call, so write whatever scratch files help -- a test, a probe,
-a script that plays a few turns -- and leave them there; only `child.py` is
-read. Two things are worth doing every round:
+## Measure your edit, do not guess at it
+
+`parent.py` beside it is the same program before you touched it, and
+`measure.py` plays one against the other:
+
+    python measure.py
+
+Thirty-two games, sixteen seasons played twice with the seats swapped, about
+twenty seconds. It prints the mean difference in final bank and the error on
+it, and says whether to keep the change or revert it.
+
+The pairing is what makes that worth reading. A fixed plan's bank swings about
+19.5% from season to season, so two programs played on different seasons are
+mostly being compared on their luck -- telling apart a five-thousand-coin
+difference that way takes about 114 games. Played on the same seasons in both
+seats, the luck lands on both sides and cancels, and the same difference shows
+up in about four. You are measuring more sharply here than the gate that will
+judge you does.
+
+So work the way that number lets you: change one thing, measure it, keep it or
+put it back. Try several ideas and ship the one that measured best. An idea
+that comes out inside the error bar has told you nothing -- play more seeds
+with `--seeds`, or make a bigger change. Most ideas are worse than what is
+already there, and finding that out here costs twenty seconds instead of a
+whole round.
+
+What it prints is not the verdict. The campaign plays every scored game itself,
+against opponents you never see, and that is what promotes a program. This is
+for deciding whether an edit is worth submitting to it.
+
+## Check your work
+
+The directory is yours and it is thrown away after this call, so write whatever
+scratch files help -- a test, a probe, a script that plays a few turns -- and
+leave them there; only `child.py` is read. Two things are worth doing every
+round:
 
     ruff format child.py
     ruff check --select C,E,F,I,W,D,N,B,PTH,ANN --ignore D107 child.py

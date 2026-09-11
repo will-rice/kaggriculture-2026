@@ -534,6 +534,16 @@ def _one(work: Work) -> Game:
         os.chdir(scratch)
         try:
             return _play_one(resolved)
+        except Exception as error:
+            # A process pool sends the exception back without the frames that
+            # raised it, so a failure here reaches the loop as a bare
+            # `IndexError` or `FileNotFoundError` with nothing to chase. Three
+            # separate crashes on 2026-09-11 each cost a reproduction to find
+            # out which opponent and which line, so the game says so itself.
+            raise RuntimeError(
+                f"{type(error).__name__} playing {opponent_name} "
+                f"on seed {seed} from seat {seat}: {error}"
+            ) from error
         finally:
             os.chdir(origin)
 
@@ -727,6 +737,18 @@ def _reference(work: tuple[str, str, int]) -> tuple[int, int]:
 def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     """Load as Kaggle does and play ``steps`` turns against itself on the reference.
 
+    Runs in a scratch directory, because loading a program runs its top-level
+    code and playing it runs the rest. `_one` and `_reference` have both moved
+    the working directory for this reason all along; this did not, and it is
+    the path the *least* trusted code in the system takes -- `harvest` calls it
+    on a kernel downloaded from the competition minutes earlier, before that
+    kernel is anything but a file we fetched.
+
+    Found on 2026-09-11, after a harvested agent overwrote the repository's own
+    `main.py` with a 158KB replay agent and left a `teacher_bootstrap.tar.gz`
+    beside it. Nothing was lost -- `main.py` is three tracked lines -- and the
+    same write against an untracked file would not have been noticed at all.
+
     Args:
         agent: The candidate's ``main.py``.
         steps: How many turns to play before stopping.
@@ -734,6 +756,18 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     Returns:
         What happened: whether it loaded, its bank, its worst call, any failure.
     """
+    resolved = Path(agent).resolve()
+    origin = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="campaign-check-") as scratch:
+        os.chdir(scratch)
+        try:
+            return _check(resolved, steps)
+        finally:
+            os.chdir(origin)
+
+
+def _check(agent: Path, steps: int) -> CheckReport:
+    """The check itself; the caller has moved to a scratch cwd."""
     try:
         policy = load_agent(agent)
     except Exception as error:  # noqa: BLE001 - the report is the point

@@ -272,7 +272,10 @@ def test_the_message_names_the_program_and_asks_for_one_edit() -> None:
     # section reaches the round whole -- a truncated rule is a different rule
     # -- and that the instruction comes after them.
     rules = prompt.ROUND_PROMPT.read_text(encoding="utf-8")
-    section = rules.split("## The program", 1)[1].split("\n## ", 1)[0]
+    # Everything from the program to the import list: what the round is told
+    # about how to work, however many headings that is split across.
+    rules_start = rules.split("## The program", 1)[1]
+    section = rules_start.split("## What your program may import", 1)[0]
     # Lines carrying a placeholder are compared after substitution elsewhere;
     # these are the ones that travel verbatim.
     literal = [

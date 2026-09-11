@@ -58,6 +58,7 @@ from kaggriculture.campaign import (
     evaluator,
     gate,
     harvest,
+    measure,
     prompt,
     rating,
     validate,
@@ -573,6 +574,16 @@ class Campaign:
             # the pool plays, and `shutil.copy` carries that mode across. This
             # copy is the one file the call must be able to write.
             child.chmod(0o644)
+            # The same program again, and the script that plays one against
+            # the other. The spec had the model run nothing -- "the loop
+            # plays; the model never does" -- which made every round an edit
+            # shipped blind and waited on. A round can now change one thing
+            # and measure it before spending a gate on it, which is what every
+            # improvement found by hand on 2026-09-10 came from. The verdict
+            # is still the loop's: it plays every scored game itself, against
+            # opponents this never sees, and nothing a round reports is read.
+            shutil.copy(source, box / "parent.py")
+            shutil.copy(Path(measure.__file__), box / "measure.py")
             mutation = await self.mutator(box, message, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         finally:

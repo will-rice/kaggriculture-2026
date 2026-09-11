@@ -42,6 +42,7 @@ from git import Actor, Repo
 from kaggriculture.campaign import (
     archive,
     config,
+    copycheck,
     evaluator,
     gate,
     harness,
@@ -152,6 +153,19 @@ def tiny_run(
     monkeypatch.setattr(config, "ROUNDS_PER_SESSION", rounds)
     monkeypatch.setattr(config, "GATE_SEEDS", 1)
     monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
+    # The copy check reads every opponent the machine holds, and the campaign
+    # now harvests new ones every hour -- so a test that leaves this alone is
+    # measured against a corpus that changes underneath it. These fixtures are
+    # a few lines each, and a small program's shingle set is small enough that
+    # Jaccard against anything at all runs high: on 2026-09-11 `SELLER` came
+    # out 0.071 similar to a kernel harvested that morning, against a 0.03
+    # bar, and four tests that had passed for weeks began failing on a corpus
+    # nobody had touched them with. Pointed at an empty directory, they test
+    # the pipeline rather than today's ladder.
+    corpus = tmp_path / "no-opponents"
+    corpus.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(copycheck, "CORPUS_ROOTS", (corpus,))
+    copycheck._corpus.cache_clear()
     root = tmp_path / "run"
     return config.Run(root=root, pool=root / "pool.json")
 
@@ -1176,11 +1190,14 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
 def test_a_round_is_given_one_file_and_the_directory_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """One file, `child.py`, and nothing else a path could leak through.
+    """The program, the program before the edit, and a way to compare them.
 
     The engine copy, the standing rules and the feedback file were all things
     a session read off disk; nothing reads them now, so nothing is written.
-    The directory goes once its program is in the database.
+    What is written is what a round needs to measure its own edit rather than
+    ship it blind, and nothing else -- no path to an opponent, no corpus, no
+    channel a name could leak through. The directory goes once its program is
+    in the database.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -1191,7 +1208,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert handed.held == ["child.py"]
+    assert handed.held == ["child.py", "measure.py", "parent.py"]
     assert not handed.where.exists()
 
 
@@ -1926,6 +1943,51 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
     asyncio.run(_one_harvest(campaign))
 
     assert campaign.pool.opponents == before
+
+
+def test_a_round_is_given_its_parent_and_a_way_to_play(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A round can measure an edit instead of shipping it blind.
+
+    The spec had the model run nothing -- "the loop plays; the model never
+    does" -- so a round wrote a program and waited for a gate whose own
+    estimator could not separate its best candidate from its fourth. Every
+    improvement found by hand on 2026-09-10 came from measuring instead, and
+    two of four ideas were measured as worse and dropped before costing
+    anything. The round gets the same instrument: the program it started from,
+    and the script that plays one against the other.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    seen: dict[str, object] = {}
+
+    async def inspect(
+        workspace: Path, message: str, program_id: str
+    ) -> mutate.Mutation:
+        """A call that only reports what it was handed."""
+        seen["files"] = sorted(path.name for path in workspace.iterdir())
+        seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
+        raise asyncio.CancelledError
+
+    campaign.mutator = inspect
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    source = _write(tmp_path / "parent-source.py", SELLER)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            campaign.round(
+                source,
+                "champion_1",
+                _gate_result("p1", {"v54": 0.5}),
+                "improve it",
+                "margin",
+            )
+        )
+
+    assert seen["files"] == ["child.py", "measure.py", "parent.py"]
+    # The parent is the program as it was, not the edited copy: a comparison
+    # against the thing being edited measures nothing.
+    assert seen["parent"] == SELLER
 
 
 async def _one_harvest(campaign: loop.Campaign) -> None:

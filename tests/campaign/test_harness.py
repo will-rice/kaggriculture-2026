@@ -506,6 +506,41 @@ def test_a_day_row_counts_what_each_farm_was_growing(
         assert max(row.ours_weeds for row in game.days) > 0
 
 
+def test_checking_an_agent_cannot_write_where_it_was_checked_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loading a program runs it, and `check` runs the least trusted code there is.
+
+    `harvest` puts a kernel downloaded from the competition minutes earlier
+    through this, before it is anything but a file we fetched. On 2026-09-11
+    one of them overwrote the repository's own `main.py` with a 158KB replay
+    agent and dropped a `teacher_bootstrap.tar.gz` beside it. `_one` and
+    `_reference` had both moved the working directory for exactly this reason;
+    this path never did.
+    """
+    litter = (
+        "import pathlib\n"
+        "pathlib.Path('escaped.txt').write_text('written at import')\n"
+        "\n"
+        "def agent(observation, configuration=None):\n"
+        "    pathlib.Path('escaped-playing.txt').write_text('written while playing')\n"
+        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+    )
+    agent = tmp_path / "litterer.py"
+    agent.write_text(litter, encoding="utf-8")
+    here = tmp_path / "where-it-is-run-from"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    report = harness.check(agent, steps=3)
+
+    assert report.loaded and report.error is None
+    # It wrote both files somewhere; nowhere this can see.
+    assert sorted(path.name for path in here.iterdir()) == []
+    assert not (tmp_path / "escaped.txt").exists()
+    assert not (tmp_path / "escaped-playing.txt").exists()
+
+
 def test_an_empty_market_order_does_not_take_the_campaign_down() -> None:
     """A program may submit an order with nothing in it, and the engine shrugs.
 

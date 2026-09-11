@@ -130,9 +130,25 @@ def vendor(entry: Path, name: str) -> Path:
         The vendored ``main.py``.
     """
     target = config.OPPONENTS / name
+    # Built beside the target and renamed onto it, never written in place.
+    # `config.OPPONENTS` is read continuously while this runs: every game
+    # resolves an opponent's path under it, and `copycheck` walks the whole
+    # tree reading every file. A `rmtree` followed by a `copytree` leaves that
+    # tree half-built for the length of the copy, and a reader landing inside
+    # the gap gets `FileNotFoundError` -- which is what killed the run at
+    # 02:37 on 2026-09-11, on the first harvest that ever ran while games
+    # were playing. `Pool.save` has renamed for this reason all along; this
+    # did not, because nothing used to harvest and evaluate at the same time.
+    staging = config.OPPONENTS / f".incoming-{name}"
+    retired = config.OPPONENTS / f".retired-{name}"
+    for scratch in (staging, retired):
+        if scratch.exists():
+            shutil.rmtree(scratch)
+    shutil.copytree(entry.parent, staging)
     if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(entry.parent, target)
+        target.rename(retired)
+    staging.rename(target)
+    shutil.rmtree(retired, ignore_errors=True)
     return target / entry.name
 
 
