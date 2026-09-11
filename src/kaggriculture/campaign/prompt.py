@@ -25,8 +25,6 @@ separate experiments did: bolt another strategy's orders onto this one and
 break the economy underneath.
 """
 
-import csv
-import io
 import logging
 import re
 from pathlib import Path
@@ -89,10 +87,6 @@ REASON_CHARS = 200
 # this one.
 SEASONS = "seasons.csv"
 
-# The columns that are not a measure: the per-crop breakdowns the measures
-# total up, and the shared prices. Rendered as one column per key, so a round
-# can ask about WHEAT rather than about "crops".
-SPREADS = ("plants", "animals", "seeds", "shed")
 
 CHANGE_CHARS = 160
 
@@ -240,48 +234,13 @@ def seasons(result: evaluator.Result) -> str:
     Returns:
         The whole CSV, header first. Empty when nothing was recorded.
     """
-    rows = [
-        _row(matchup, season, day)
-        for matchup, opponent in enumerate(_ordered(result), start=1)
-        for season, days in enumerate(result.states[opponent], start=1)
-        for day in days
-    ]
-    if not rows:
-        return ""
-    # The union, because a crop nobody planted on day one has no key on day
-    # one. Ordered by first appearance so the reading order is the writing
-    # order rather than the alphabet, and blank where a row has no value --
-    # which is a count of zero, and says so in the message.
-    columns: dict[str, None] = {}
-    for row in rows:
-        columns.update(dict.fromkeys(row))
-    out = io.StringIO()
-    writer = csv.DictWriter(out, fieldnames=list(columns), restval="")
-    writer.writeheader()
-    writer.writerows(rows)
-    return out.getvalue()
-
-
-def _row(matchup: int, season: int, day: harness.Day) -> dict[str, object]:
-    """One day of one game, flattened to a row: the two keys and every column.
-
-    Every quantity `dataset.measures` defines for each side, then the per-crop
-    breakdowns behind four of those totals, then the shared market. A dict per
-    row rather than a fixed column list because the breakdowns are keyed by
-    crop, so which columns exist depends on what was planted -- and a fixed
-    list is how a quantity comes to be measured, stored, and shown to nobody.
-    """
-    row: dict[str, object] = {"matchup": matchup, "season": season, "day": day.day}
-    for side in ("ours", "theirs"):
-        for measure, value in getattr(day, side).items():
-            row[f"{side}_{measure}"] = value
-        for spread in SPREADS:
-            counts = getattr(day, f"{side}_{spread}", None)
-            for item, count in (counts or {}).items():
-                row[f"{side}_{spread}_{item}"] = count
-    for item, price in day.prices.items():
-        row[f"price_{item}"] = price
-    return row
+    return harness.day_csv(
+        [
+            ({"matchup": matchup, "season": season}, days)
+            for matchup, opponent in enumerate(_ordered(result), start=1)
+            for season, days in enumerate(result.states[opponent], start=1)
+        ]
+    )
 
 
 def _ordered(result: evaluator.Result) -> list[str]:

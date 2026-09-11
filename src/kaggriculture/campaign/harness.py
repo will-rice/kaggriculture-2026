@@ -6,7 +6,9 @@ a harness error rather than a quietly wrong fitness.
 """
 
 import argparse
+import csv
 import hashlib
+import io
 import logging
 import random
 import shutil
@@ -526,6 +528,75 @@ def _day(
     )
 
 
+# The columns that are not a measure: the per-crop breakdowns the measures
+# total up, and the shared prices. One column per key, so a reader can ask
+# about WHEAT rather than about "crops".
+SPREADS = ("plants", "animals", "seeds", "shed")
+
+
+def day_csv(games: Sequence[tuple[dict[str, int], Sequence[Day]]]) -> str:
+    """Every day of every game as one CSV, each game named by its own keys.
+
+    The keys lead each row and say which game it belongs to -- the campaign
+    names a game by matchup and season, a round replaying one names it by seed
+    and seat -- and the columns after them are the same either way. That is the
+    point of this living in one place: a round reads the campaign's seasons,
+    replays one itself, and lays the two side by side, which only works while
+    both are written by the same function.
+
+    The width is why it is a file and not a table. A markdown table has room
+    for about fifteen columns before it stops being readable and a `Day`
+    carries sixty-odd: the quantities `dataset.measures` defines for each
+    side, the per-crop breakdowns behind four of those totals, and the
+    market's prices. Quadrants on day three and fertilizer on day five
+    separate the stronger side from the weaker in 99% and 100% of their paired
+    samples, and both were measured, stored and shown to nobody for want of
+    room in a table.
+
+    Args:
+        games: One entry per game: the keys naming it, and its days in order.
+
+    Returns:
+        The whole CSV, header first. Empty when there are no days.
+    """
+    rows = [_row(keys, day) for keys, days in games for day in days]
+    if not rows:
+        return ""
+    # The union, because a crop nobody planted on day one has no key on day
+    # one. Ordered by first appearance so the reading order is the writing
+    # order rather than the alphabet, and blank where a row has no value --
+    # which is a count of zero.
+    columns: dict[str, None] = {}
+    for row in rows:
+        columns.update(dict.fromkeys(row))
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=list(columns), restval="")
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue()
+
+
+def _row(keys: dict[str, int], day: Day) -> dict[str, object]:
+    """One day of one game, flattened: the keys that name it, then every column.
+
+    A dict per row rather than a fixed column list because the breakdowns are
+    keyed by crop, so which columns exist depends on what was planted -- and a
+    fixed list is how a quantity comes to be measured, stored, and shown to
+    nobody.
+    """
+    row: dict[str, object] = {**keys, "day": day.day}
+    for side in ("ours", "theirs"):
+        for measure, value in getattr(day, side).items():
+            row[f"{side}_{measure}"] = value
+        for spread in SPREADS:
+            counts = getattr(day, f"{side}_{spread}", None)
+            for item, count in (counts or {}).items():
+                row[f"{side}_{spread}_{item}"] = count
+    for item, price in day.prices.items():
+        row[f"price_{item}"] = price
+    return row
+
+
 def _one(work: Work) -> Game:
     """Play one game on the engine port. Runs in a fresh process per game.
 
@@ -560,6 +631,42 @@ def _one(work: Work) -> Game:
             f"{type(error).__name__} playing {opponent_name} "
             f"on seed {seed} from seat {seat}: {error}"
         ) from error
+
+
+def game(
+    agent: Path,
+    opponent: Path,
+    seed: int,
+    seat: int,
+    days: bool = False,
+    name: str = "opponent",
+) -> Game:
+    """Play one game between two files, here in the calling process.
+
+    The public door onto a single game, for a caller that holds two paths
+    rather than a pool: `measure.py`, which a round runs to compare its edit
+    against the program it started from.
+
+    It exists so that there is one play loop. `measure` used to carry its own
+    -- load both, read the observation, step the engine -- which is the shape
+    where a measurement and the thing it measures share a mistake and agree
+    with each other about it, and where a change to how a game is played
+    reaches the campaign's games and not the round's. A round is now measuring
+    with the same function the gate scores with.
+
+    Args:
+        agent: The program being measured, which holds ``seat``.
+        opponent: The program it plays.
+        seed: The episode seed.
+        seat: The seat ``agent`` holds, 0 or 1.
+        days: Record the day table, for a caller that wants to read the season
+            rather than only its result.
+        name: What to call the opponent if the game raises.
+
+    Returns:
+        The `Game`, from ``agent``'s point of view.
+    """
+    return _one((str(agent), name, str(opponent), seed, seat, days))
 
 
 def _play_one(work: Work) -> Game:

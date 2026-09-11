@@ -64,35 +64,55 @@ Edit it in place. Do not report anything back in your reply: whatever
 opponents you never see, and the result comes back to you as another message
 like this one asking you to improve it again.
 
-## Measure your edit, do not guess at it
+## Work one season at a time
 
 `parent.py` beside it is the same program before you touched it, and
-`measure.py` plays one against the other:
+`measure.py` plays one against the other. Do not work from the totals. A total
+tells you whether an edit helped and never where, and a program is improved by
+finding one thing it does badly on one day and fixing that. So take one season,
+work it until it is better, and then take the next:
 
-    python measure.py
+**1. Pick the season.** `python measure.py` plays all sixteen in both seats,
+prints a line for each, and names the one this program does worst on. The
+seasons the campaign scored are in `seasons.csv`, hardest matchup first.
 
-Thirty-two games, sixteen seasons played twice with the seats swapped, about
-twenty seconds. It prints the mean difference in final bank and the error on
-it, and says whether to keep the change or revert it.
+**2. Read it day by day.** `python measure.py --replay 103` writes
+`replay-103.csv` -- one row per day, the same columns as `seasons.csv` -- and
+says which day the gap moved most against you. Open that day and the few
+before it. What did the other side hold that you did not? Bare tiles, seed
+sitting unplanted, a quadrant never bought, animals never fed: the columns are
+there for both sides.
 
-The pairing is what makes that worth reading. A fixed plan's bank swings about
-19.5% from season to season, so two programs played on different seasons are
-mostly being compared on their luck -- telling apart a five-thousand-coin
-difference that way takes about 114 games. Played on the same seasons in both
-seats, the luck lands on both sides and cancels, and the same difference shows
-up in about four. You are measuring more sharply here than the gate that will
-judge you does.
+**3. Change one thing.** The one thing that day pointed at.
 
-So work the way that number lets you: change one thing, measure it, keep it or
-put it back. Try several ideas and ship the one that measured best. An idea
-that comes out inside the error bar has told you nothing -- play more seeds
-with `--seeds`, or make a bigger change. Most ideas are worse than what is
-already there, and finding that out here costs twenty seconds instead of a
-whole round.
+**4. Replay the same season.** `python measure.py --replay 103` again. The seed
+is fixed, so it is the same map, the same prices and the same opponent, and
+what moved is your edit and nothing else. Did the day you were aiming at get
+better?
+
+**5. Check it cost nothing elsewhere.** `python measure.py` over all sixteen.
+Keep the edit if it is ahead by more than twice its error, put it back if it is
+behind. Inside the error it has told you nothing -- play more seeds with
+`--seeds`, or make a bigger change. An edit that wins one season by twenty
+thousand and loses three by six is luck on one map, not an improvement; the
+per-season lines are printed so you can see which you have.
+
+Then go back to 1 with the next season. Several small changes, each measured on
+the season that motivated it, beat one large change measured once.
+
+The pairing is what makes these numbers worth reading. A fixed plan's bank
+swings about 19.5% from season to season, so two programs played on different
+seasons are mostly being compared on their luck -- telling apart a
+five-thousand-coin difference that way takes about 114 games. Played on the
+same seasons in both seats, the luck lands on both sides and cancels, and the
+same difference shows up in about four. You are measuring more sharply here
+than the gate that will judge you does.
 
 What it prints is not the verdict. The campaign plays every scored game itself,
 against opponents you never see, and that is what promotes a program. This is
-for deciding whether an edit is worth submitting to it.
+for deciding whether an edit is worth submitting to it. Most ideas are worse
+than what is already there, and finding that out here costs a few seconds
+instead of a whole round.
 
 ## Check your work
 
