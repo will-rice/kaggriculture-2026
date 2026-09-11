@@ -450,6 +450,23 @@ WANDB_PROJECT = "kaggriculture-2026"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of anything a codex call is given.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"
+# How often the campaign takes newly published kernels into its pool, and how
+# many refs it considers each time.
+#
+# `harvest` was written as the other half of the ratchet -- champions join on
+# every promotion and nothing else does, so left alone the pool becomes the
+# campaign playing itself. It ran on 2026-09-01 and 2026-09-06 and then
+# nothing ran it, which is the whole of why the pool reached 69 champions
+# against 12 published agents, all of them frozen at the older of those dates.
+# A field that turns over in days was being gated against a five-day-old
+# snapshot of itself.
+#
+# So the loop harvests rather than a person remembering to. Hourly because
+# that is the rate the competition publishes at and a kernel costs one
+# 720-step game to check; forty refs because that is roughly five days of
+# publications, so a restart after an outage catches up in one pass.
+HARVEST_INTERVAL_SECONDS = 3600
+HARVEST_LIMIT = 40
 # The campaign this checkout runs. Everything that writes takes a `Run`, so
 # this is the only place the live one is named -- a dry run and a test each
 # construct their own and nothing has to be swapped out from under anyone.

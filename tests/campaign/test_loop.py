@@ -1878,3 +1878,65 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
         )
 
     assert not list(tmp_path.glob("campaign-round-*"))
+
+
+def test_the_campaign_harvests_while_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """New opponents reach the pool without anyone stopping the campaign.
+
+    The harvest is the other half of the ratchet: promotions add champions and
+    nothing else adds anything, so a pool left alone becomes the campaign
+    playing itself. It ran twice by hand and then nothing ran it, which is how
+    the pool reached 69 champions against 12 published agents frozen five days
+    back.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(
+        loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
+    )
+
+    asyncio.run(_one_harvest(campaign))
+
+    assert campaign.pool.opponents["fresh"] == "/vendored/main.py"
+    # And it is on disk, because the pool file is what resolves an opponent's
+    # path when the harness goes to play it.
+    assert "fresh" in pool.Pool.load(campaign.paths.pool).opponents
+
+
+def test_a_harvest_that_fails_does_not_end_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The competition's API is somebody else's uptime.
+
+    A run that has been evaluating for hours must not end because a listing
+    timed out, so the harvester logs and waits for the next turn.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+
+    def refuses(limit: int, known: set) -> dict:
+        """A listing that fails, the way a rate-limited one does."""
+        raise RuntimeError("kaggle said no")
+
+    monkeypatch.setattr(loop.harvest, "vendored", refuses)
+    before = dict(campaign.pool.opponents)
+
+    asyncio.run(_one_harvest(campaign))
+
+    assert campaign.pool.opponents == before
+
+
+async def _one_harvest(campaign: loop.Campaign) -> None:
+    """Run the harvester long enough for exactly one pass, then stop it."""
+    task = asyncio.ensure_future(campaign.harvesting())
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if task.done():
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

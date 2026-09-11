@@ -6,6 +6,7 @@ a harness error rather than a quietly wrong fitness.
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import random
@@ -205,12 +206,21 @@ class CheckReport(BaseModel):
         bank: Seat zero's money when the run stopped.
         worst_step_seconds: The slowest single call to the agent.
         error: The failure, or None if the run finished.
+        fingerprint: Seat zero's whole action sequence, hashed. Two agents
+            that play this identically are one agent under two names, which
+            the published field produces constantly -- the same work reposted,
+            a notebook and its fork, a Python agent and its C++ build. Free
+            here because the check already emits every action to play the
+            game, and worth having because a duplicate opponent costs a gate
+            real time and tells it nothing new. Empty when the run failed,
+            since a crash is not an identity.
     """
 
     loaded: bool
     bank: float
     worst_step_seconds: float
     error: str | None
+    fingerprint: str = ""
 
 
 def main() -> None:
@@ -727,6 +737,9 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     environment = make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS})
     environment.reset()
     worst = 0.0
+    # Seat zero's actions as they are emitted, so the identity below costs
+    # nothing beyond the game this already plays.
+    played = hashlib.sha256()
     try:
         for _ in range(steps):
             if environment.done:
@@ -740,6 +753,7 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
                 started = perf_counter()
                 actions.append(policy(*arguments))
                 worst = max(worst, perf_counter() - started)
+            played.update(repr(actions[0]).encode())
             environment.step(actions)
     except Exception as error:  # noqa: BLE001
         return CheckReport(
@@ -753,6 +767,7 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
         bank=float(environment.state[0].observation["farms"][0]["money"]),
         worst_step_seconds=worst,
         error=None,
+        fingerprint=played.hexdigest()[:16],
     )
 
 

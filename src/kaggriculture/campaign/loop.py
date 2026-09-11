@@ -57,6 +57,7 @@ from kaggriculture.campaign import (
     config,
     evaluator,
     gate,
+    harvest,
     prompt,
     rating,
     validate,
@@ -393,6 +394,10 @@ class Campaign:
             )
         )
         work = asyncio.ensure_future(self.work())
+        # Beside the work rather than inside its task group, so that it ends
+        # when the sessions do: a group waits for every task it holds, and a
+        # harvester that sleeps for an hour would hold a finished run open.
+        harvesting = asyncio.ensure_future(self.harvesting())
         for number in (signal.SIGINT, signal.SIGTERM):
             running.add_signal_handler(number, work.cancel)
         try:
@@ -400,8 +405,48 @@ class Campaign:
         except asyncio.CancelledError:
             LOGGER.warning("stopped on a signal at %d sessions", self.state.sessions)
         finally:
+            harvesting.cancel()
             for number in (signal.SIGINT, signal.SIGTERM):
                 running.remove_signal_handler(number)
+
+    async def harvesting(self) -> None:
+        """Take newly published kernels into the pool, for as long as the run lasts.
+
+        The other half of the ratchet. Promotions add champions and nothing
+        else adds anything, so a pool left alone becomes this campaign's own
+        lineage playing itself -- which it did: 69 champions against 12
+        published agents, and those frozen on the day someone last ran the
+        harvest by hand.
+
+        Discovery, the download, the build and the 720-step check all go to a
+        thread, because each is slow and none of them is the pool's. The pool
+        is changed here, on the loop, where `gate.promote` also changes it and
+        nothing runs at the same time. A load-modify-save from that thread
+        would quietly drop any champion promoted while it was downloading.
+
+        A failed harvest is not a failed campaign: the competition's API is
+        somebody else's uptime, and a run that has been evaluating for hours
+        must not end because a listing timed out.
+        """
+        while True:
+            await asyncio.sleep(config.HARVEST_INTERVAL_SECONDS)
+            try:
+                found = await asyncio.to_thread(
+                    harvest.vendored, config.HARVEST_LIMIT, set(self.pool.opponents)
+                )
+            except Exception:
+                LOGGER.exception("harvest failed; the campaign continues")
+                continue
+            if not found:
+                continue
+            self.pool.opponents.update(found)
+            self.pool.save(self.paths.pool)
+            LOGGER.info(
+                "harvest: %d new opponent(s) (%s), pool now %d",
+                len(found),
+                ", ".join(sorted(found)),
+                len(self.pool.opponents),
+            )
 
     async def work(self) -> None:
         """``config.SESSIONS`` workers in one task group, and every gate they fire."""
