@@ -548,6 +548,34 @@ def test_checking_an_agent_cannot_write_where_it_was_checked_from(
     assert not (tmp_path / "escaped-playing.txt").exists()
 
 
+def test_checking_an_agent_does_not_move_the_callers_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller stays where it was, and so does anything it spawns next.
+
+    Isolating by moving the *caller's* directory was briefly correct and then
+    catastrophic. A spawned worker inherits the cwd of whoever spawned it, so
+    every game the loop started while a harvest was checking a kernel began
+    inside that check's scratch tree; when the check finished and removed it,
+    those workers stood in a directory that no longer existed. The campaign
+    died on `FileNotFoundError: /tmp/campaign-check-...` within the hour.
+    """
+    agent = tmp_path / "litterer.py"
+    agent.write_text(WRITING_AGENT, encoding="utf-8")
+    here = tmp_path / "where-it-is-run-from"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    report = harness.check(agent, steps=3)
+
+    assert report.loaded and report.error is None
+    # The caller never moved, so a process spawned after this starts somewhere
+    # that still exists.
+    assert Path.cwd() == here.resolve()
+    # And the agent's scribble landed in the child's scratch, not here.
+    assert sorted(path.name for path in here.iterdir()) == []
+
+
 def test_an_empty_market_order_does_not_take_the_campaign_down() -> None:
     """A program may submit an order with nothing in it, and the engine shrugs.
 

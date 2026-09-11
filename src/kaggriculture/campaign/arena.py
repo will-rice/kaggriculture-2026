@@ -6,11 +6,11 @@ is measured here.
 """
 
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from time import perf_counter
 
 from kaggle_environments import make
 
+from kaggriculture.campaign import pools
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
 
@@ -66,7 +66,7 @@ def play(
     seat_zero: str, seat_one: str, seeds: Sequence[int], workers: int
 ) -> list[tuple[int, int]]:
     """Play every seed with the given seating, fanned over a process pool."""
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
+    with pools.workers(workers) as pool:
         return list(pool.map(_one, [(seat_zero, seat_one, seed) for seed in seeds]))
 
 
@@ -102,7 +102,7 @@ def outcomes(
         for seed in seeds
         for seat, seating in ((0, (candidate, opponent)), (1, (opponent, candidate)))
     ]
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
+    with pools.workers(workers) as pool:
         results = list(pool.map(_one_outcome, work))
     scores = OutcomeScores()
     for name, _seed, seat, banks, failure in results:

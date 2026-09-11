@@ -6,6 +6,7 @@ a harness error rather than a quietly wrong fitness.
 """
 
 import argparse
+import atexit
 import hashlib
 import logging
 import os
@@ -16,7 +17,6 @@ import sys
 import tarfile
 import tempfile
 from collections.abc import Callable, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -27,7 +27,7 @@ from kaggle_environments.core import Environment
 from kaggle_environments.utils import Struct, structify
 from pydantic import BaseModel
 
-from kaggriculture.campaign import arena, config, dataset, roster
+from kaggriculture.campaign import arena, config, dataset, pools, roster
 from kaggriculture.campaign.engine.wrapper import Engine, render_private
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
@@ -52,6 +52,33 @@ OVERAGE_SECONDS = 60
 Work = tuple[str, str, str, int, int, bool]
 # The last hour label of a day; the step taken on it runs the day-end refresh.
 LAST_HOUR = 23
+
+
+def isolated() -> None:
+    """Give this worker a directory of its own, once, before it runs anything.
+
+    Passed as every process pool's ``initializer``. Playing a program executes
+    it and an evolved or harvested program may write files, so it must not be
+    able to write where the caller lives -- and the only lever Python offers
+    for that, short of launching each agent as its own subprocess, is the
+    working directory.
+
+    Once per process, at birth, rather than around each task. Every pool that
+    uses this caps tasks per child, so a worker exists to do one thing and
+    there is nothing to restore afterwards: the process ends and takes its
+    directory with it.
+
+    The distinction that matters is *whose* process. `os.chdir` moves the
+    whole interpreter, and a spawned child inherits the cwd of whoever spawned
+    it -- so a chdir on the loop's own process silently relocates every game
+    it starts next. That is not hypothetical: the campaign died on
+    `FileNotFoundError: /tmp/campaign-check-56ludna7` on 2026-09-11, an hour
+    after a check was given a scratch directory the honest-looking way, in the
+    caller.
+    """
+    scratch = tempfile.mkdtemp(prefix="campaign-worker-")
+    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+    os.chdir(scratch)
 
 
 class OpponentCrash(RuntimeError):  # noqa: N818 - a crash, not our error
@@ -550,23 +577,18 @@ def _one(work: Work) -> Game:
         seat,
         days,
     )
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="campaign-game-") as scratch:
-        os.chdir(scratch)
-        try:
-            return _play_one(resolved)
-        except Exception as error:
-            # A process pool sends the exception back without the frames that
-            # raised it, so a failure here reaches the loop as a bare
-            # `IndexError` or `FileNotFoundError` with nothing to chase. Three
-            # separate crashes on 2026-09-11 each cost a reproduction to find
-            # out which opponent and which line, so the game says so itself.
-            raise RuntimeError(
-                f"{type(error).__name__} playing {opponent_name} "
-                f"on seed {seed} from seat {seat}: {error}"
-            ) from error
-        finally:
-            os.chdir(origin)
+    try:
+        return _play_one(resolved)
+    except Exception as error:
+        # A process pool sends the exception back without the frames that
+        # raised it, so a failure here reaches the loop as a bare `IndexError`
+        # or `FileNotFoundError` with nothing to chase. Three separate crashes
+        # on 2026-09-11 each cost a reproduction to find out which opponent
+        # and which line, so the game says so itself.
+        raise RuntimeError(
+            f"{type(error).__name__} playing {opponent_name} "
+            f"on seed {seed} from seat {seat}: {error}"
+        ) from error
 
 
 def _play_one(work: Work) -> Game:
@@ -672,7 +694,7 @@ def play(
     ]
     # Named `executor` rather than `pool`, which is what this was: the
     # opponent pool arrived as a parameter and quietly shadowed it.
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
+    with pools.workers(workers) as executor:
         games = list(executor.map(_one, work))
     # A crash is a failure, never a score: an agent that raised banked its
     # untouched opening money and would otherwise read as an ordinary loss,
@@ -738,7 +760,7 @@ def _replay(seat_zero: str, seat_one: str, seed: int) -> tuple[int, int]:
     Returns:
         Both seats' final banks, seat zero first.
     """
-    with ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as pool:
+    with pools.workers(1) as pool:
         return pool.submit(_reference, (seat_zero, seat_one, seed)).result()
 
 
@@ -746,13 +768,7 @@ def _reference(work: tuple[str, str, int]) -> tuple[int, int]:
     """Run one reference-engine game in a scratch directory. Runs in a child."""
     seat_zero, seat_one, seed = work
     sources = (str(Path(seat_zero).resolve()), str(Path(seat_one).resolve()))
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="campaign-reference-") as scratch:
-        os.chdir(scratch)
-        try:
-            return arena.run_banks(*sources, seed)
-        finally:
-            os.chdir(origin)
+    return arena.run_banks(*sources, seed)
 
 
 def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
@@ -777,14 +793,27 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     Returns:
         What happened: whether it loaded, its bank, its worst call, any failure.
     """
-    resolved = Path(agent).resolve()
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="campaign-check-") as scratch:
-        os.chdir(scratch)
-        try:
-            return _check(resolved, steps)
-        finally:
-            os.chdir(origin)
+    with pools.workers(1) as executor:
+        return executor.submit(_checked, str(Path(agent).resolve()), steps).result()
+
+
+def _checked(agent: str, steps: int) -> CheckReport:
+    """Move to a scratch directory and check there. Runs in a child.
+
+    A child, because `os.chdir` is the whole process's and this one is its
+    own. The first version of this moved the *caller's* directory, which was
+    briefly correct and then catastrophic: a spawned worker inherits the cwd
+    of whoever spawned it, so every game the loop started while a harvest was
+    checking a kernel began life inside that check's scratch tree -- and when
+    the check finished and removed it, those workers were standing in a
+    directory that no longer existed. The campaign died on
+    `FileNotFoundError: /tmp/campaign-check-56ludna7` an hour after the
+    isolation was added to stop a harvested agent writing into the repository.
+
+    `_one` and `_reference` chdir freely because each already has a process to
+    itself. This is the same trick paid for honestly.
+    """
+    return _check(Path(agent), steps)
 
 
 def _check(agent: Path, steps: int) -> CheckReport:

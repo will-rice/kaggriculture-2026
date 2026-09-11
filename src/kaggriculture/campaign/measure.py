@@ -38,11 +38,10 @@ import argparse
 import os
 import pathlib
 import statistics
-from concurrent.futures import ProcessPoolExecutor
 
 from kaggle_environments.utils import structify
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, pools
 from kaggriculture.campaign.engine.wrapper import Engine
 from kaggriculture.campaign.harness import (
     OVERAGE_SECONDS,
@@ -77,7 +76,7 @@ def main() -> None:
         for seed in SEEDS[: args.seeds]
         for seat in (0, 1)
     ]
-    with ProcessPoolExecutor(max_workers=min(len(work), _spare_cores())) as pool:
+    with pools.workers(min(len(work), _spare_cores())) as pool:
         gaps = list(pool.map(_gap, work))
     wins = sum(gap > 0 for gap in gaps)
     draws = sum(gap == 0 for gap in gaps)

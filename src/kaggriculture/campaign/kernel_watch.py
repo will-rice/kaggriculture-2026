@@ -39,11 +39,21 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from kaggriculture.campaign import config
+
 LOGGER = logging.getLogger(__name__)
 
 COMPETITION = "kaggriculture"
-SEEN = Path("run/kernel-watch/seen.json")
-WORK = Path("run/kernel-watch/kernels")
+# Absolute, anchored to the repository rather than to wherever the process
+# happens to stand. These were `Path("run/kernel-watch/...")`, which is right
+# for as long as nothing ever moves the working directory -- and things do:
+# every worker that runs a program is given a directory of its own, and the
+# harvest runs in the same process as the loop that starts them. A relative
+# constant then resolves somewhere else, silently, and the harvest writes its
+# memory of which kernels it has seen into a scratch tree about to be deleted.
+# Nothing raises; it simply forgets, and re-checks every kernel forever.
+SEEN = config.ROOT / "run" / "kernel-watch" / "seen.json"
+WORK = config.ROOT / "run" / "kernel-watch" / "kernels"
 
 # What marks a cell as holding the agent: a def the engine can call, or a
 # module-level binding of one, which is how a factory-built policy is
