@@ -72,7 +72,9 @@ def main() -> None:
     args = parser.parse_args()
 
     work = [
-        (str(args.child), str(args.parent), seed, seat)
+        # Absolute, because a worker is given a directory of its own and a
+        # relative path stops meaning anything the moment it moves there.
+        (str(args.child.resolve()), str(args.parent.resolve()), seed, seat)
         for seed in SEEDS[: args.seeds]
         for seat in (0, 1)
     ]
