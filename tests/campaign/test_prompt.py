@@ -1,7 +1,7 @@
 """What the composed message says, and what it must never say."""
 
-import csv
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -66,9 +66,22 @@ def day(number: int, ours: float, theirs: float) -> harness.Day:
     )
 
 
-def games(banks: list[float], days: int) -> list[list[harness.Day]]:
+def played(days: list[harness.Day], seat: int = 0) -> harness.Game:
+    """One game carrying those days, finishing where its last day left off."""
+    return harness.Game(
+        opponent="v54",
+        seed=101,
+        seat=seat,
+        ours=days[-1].ours_bank,
+        theirs=days[-1].theirs_bank,
+        worst_step_seconds=0.0,
+        days=days,
+    )
+
+
+def games(banks: list[float], days: int) -> list[harness.Game]:
     """One recorded game per bank in ``banks``, each ``days`` days long."""
-    return [[day(n, bank, 3000.0) for n in range(days)] for bank in banks]
+    return [played([day(n, bank, 3000.0) for n in range(days)]) for bank in banks]
 
 
 def result(
@@ -88,7 +101,7 @@ def result(
         hardest=hardest,
         states={
             name: [
-                [day(n, 3000.0 - n, 3000.0 + n) for n in range(days)]
+                played([day(n, 3000.0 - n, 3000.0 + n) for n in range(days)])
                 for _ in range(seasons)
             ]
             for name in rates
@@ -441,7 +454,7 @@ def test_the_templates_own_note_never_reaches_the_model() -> None:
     assert "the parts the campaign" not in text
 
 
-def test_every_season_reaches_the_file_at_full_width() -> None:
+def test_every_season_reaches_the_file_at_full_width(tmp_path: Path) -> None:
     """The file is the evidence; the message is the index of it.
 
     A markdown table can be read at about fifteen columns, and a `Day` carries
@@ -452,24 +465,27 @@ def test_every_season_reaches_the_file_at_full_width() -> None:
     Written to a file there is no room to run out of.
     """
     rates = {"v54": 0.3, "shopforge": 0.5}
-    rendered = prompt.seasons(result(rates, days=30, seasons=16))
-    header, *rows = rendered.splitlines()
-    columns = header.split(",")
+    path = prompt.seasons(
+        result(rates, days=30, seasons=16), tmp_path / "full.db", "champion_1"
+    )
+    db = sqlite3.connect(path)
 
-    assert len(rows) == 2 * 16 * 30, "both matchups, every season, every day"
-    for column in ("ours_quadrants", "theirs_fertilised", "ours_sell_orders"):
-        assert column in columns
-    # Both sides of every quantity the campaign measures, not a chosen few.
+    # Both matchups, every season, every day, both sides of each.
+    assert db.execute("select count(*) from days").fetchone() == (2 * 16 * 30 * 2,)
+    columns = [row[1] for row in db.execute("PRAGMA table_info(days)")]
     for measure in dataset.COLUMNS:
-        assert f"ours_{measure}" in columns
-        assert f"theirs_{measure}" in columns
+        assert measure in columns
+    for column in ("quadrants", "fertilised", "sell_orders"):
+        assert column in columns
     # The breakdowns behind the totals, and the shared market.
-    assert "ours_plants_WHEAT" in columns
-    assert "theirs_animals_COW" in columns
-    assert "price_WHEAT" in columns
+    kinds = {row[0] for row in db.execute("select distinct kind from holdings")}
+    assert {"plants", "animals", "seeds", "shed"} <= kinds
+    assert db.execute("select count(*) from prices").fetchone()[0] > 0
 
 
-def test_a_matchup_is_one_opponent_and_every_season_against_them() -> None:
+def test_a_matchup_is_one_opponent_and_every_season_against_them(
+    tmp_path: Path,
+) -> None:
     """The grouping is what makes two seasons comparable.
 
     Within a matchup the opponent is fixed, so what changes between seasons is
@@ -492,16 +508,23 @@ def test_a_matchup_is_one_opponent_and_every_season_against_them() -> None:
         }
     )
 
-    reader = list(csv.DictReader(prompt.seasons(played).splitlines()))
+    db = sqlite3.connect(prompt.seasons(played, tmp_path / "grouped.db", "champion_1"))
 
     # Matchup 1 is `beaten`, its two seasons; matchup 2 is `close`, its three.
-    assert [row["matchup"] for row in reader] == ["1"] * 8 + ["2"] * 12
-    assert [row["season"] for row in reader[:8]] == ["1"] * 4 + ["2"] * 4
-    assert [row["day"] for row in reader[:4]] == ["0", "1", "2", "3"]
+    assert db.execute(
+        "select matchup, count(*) from candidate group by matchup"
+    ).fetchall() == [(1, 2), (2, 3)]
+    assert db.execute(
+        "select season from candidate where matchup = 1 order by season"
+    ).fetchall() == [(1,), (2,)]
     # Worst-beaten opponent first, so a round reading matchup 1 is reading the
     # one with the most left to learn from.
-    assert reader[0]["ours_bank"] == "1000.0"
-    assert reader[8]["ours_bank"] == "2900.0"
+    assert db.execute(
+        "select bank from gaps where matchup = 1 and season = 1 and day = 3"
+    ).fetchone() == (1000.0 - 3000.0,)
+    assert db.execute(
+        "select bank from gaps where matchup = 2 and season = 1 and day = 3"
+    ).fetchone() == (2900.0 - 3000.0,)
 
 
 def test_the_index_says_how_many_seasons_each_matchup_holds_and_how_they_went() -> None:
@@ -525,7 +548,7 @@ def test_the_index_says_how_many_seasons_each_matchup_holds_and_how_they_went() 
     assert "| 2 | 3 | 1 | -17 | -100 | +100 |" in text
 
 
-def test_the_message_does_not_grow_with_the_games_played() -> None:
+def test_the_message_does_not_grow_with_the_games_played(tmp_path: Path) -> None:
     """Twelve opponents cost twelve lines, not twelve tables.
 
     This is the whole reason the games moved out of the message. Rendered, a
@@ -553,12 +576,16 @@ def test_the_message_does_not_grow_with_the_games_played() -> None:
 
     assert len(large) - len(small) < 500
     # And every scored game is still there: twelve matchups, thirty-two
-    # seasons each, thirty days each.
-    rendered = prompt.seasons(result(many, days=30, seasons=32))
-    assert len(rendered.splitlines()) == 1 + 12 * 32 * 30
+    # seasons each, thirty days each, both sides of every day.
+    path = prompt.seasons(
+        result(many, days=30, seasons=32), tmp_path / "many.db", "champion_1"
+    )
+    db = sqlite3.connect(path)
+    assert db.execute("select count(*) from days").fetchone() == (12 * 32 * 30 * 2,)
+    assert db.execute("select count(*) from candidate").fetchone() == (12 * 32,)
 
 
-def test_a_program_that_played_nothing_gets_no_seasons_section() -> None:
+def test_a_program_that_played_nothing_gets_no_seasons_section(tmp_path: Path) -> None:
     """A heading over an empty index is noise in a message read every round."""
     empty = result({"v54": 0.3}).model_copy(update={"states": {}})
 
@@ -567,4 +594,5 @@ def test_a_program_that_played_nothing_gets_no_seasons_section() -> None:
     )
 
     assert "## The seasons" not in text
-    assert prompt.seasons(empty) == ""
+    path = prompt.seasons(empty, tmp_path / "empty.db", "champion_1")
+    assert sqlite3.connect(path).execute("select count(*) from days").fetchone() == (0,)

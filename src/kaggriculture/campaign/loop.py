@@ -615,12 +615,11 @@ class Campaign:
             # opponents this never sees, and nothing a round reports is read.
             shutil.copy(source, box / "parent.py")
             shutil.copy(Path(measure.__file__), box / "measure.py")
-            # Every game behind the verdict, at a width the message cannot
-            # carry: sixty-odd columns a day against the fifteen a markdown
-            # table can be read at. The message holds the index -- which
-            # season is which and how each finished -- and a round reads as
-            # much of the rest as its question needs, or none of it.
-            (box / prompt.SEASONS).write_text(prompt.seasons(result), encoding="utf-8")
+            # Every game behind the verdict, as a database rather than as
+            # message text. A round asks it questions; the message carries
+            # only the index, so what a round can look at stops being bounded
+            # by what will fit in front of it.
+            prompt.seasons(result, box / prompt.SEASONS, name)
             mutation = await self.mutator(box, message, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1

@@ -28,6 +28,7 @@ import inspect
 import os
 import random
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -1082,32 +1083,54 @@ def _gate_result(
         hardest=min(rates, default=""),
         states={
             name: [
-                [
-                    harness.Day(
-                        day=n,
-                        ours_bank=100.0 + n,
-                        theirs_bank=200.0,
-                        ours_plants={"WHEAT": 4},
-                        theirs_plants={"MELON": 2},
-                        ours_animals={},
-                        theirs_animals={"COW": 1},
-                        ours_weeds=0,
-                        theirs_weeds=3,
-                        ours_seeds={"WHEAT": 5},
-                        ours_shed={"WHEAT": 12},
-                        theirs_shed={"EGG": 3},
-                        ours_hands=2,
-                        theirs_hands=1,
-                        ours=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 100.0 + n},
-                        theirs=dict.fromkeys(dataset.COLUMNS, 0.0) | {"bank": 200.0},
-                        prices={"WHEAT": 25},
-                    )
-                    for n in range(days)
-                ]
+                _played(
+                    [
+                        harness.Day(
+                            day=n,
+                            ours_bank=100.0 + n,
+                            theirs_bank=200.0,
+                            ours_plants={"WHEAT": 4},
+                            theirs_plants={"MELON": 2},
+                            ours_animals={},
+                            theirs_animals={"COW": 1},
+                            ours_weeds=0,
+                            theirs_weeds=3,
+                            ours_seeds={"WHEAT": 5},
+                            ours_shed={"WHEAT": 12},
+                            theirs_shed={"EGG": 3},
+                            ours_hands=2,
+                            theirs_hands=1,
+                            ours=dict.fromkeys(dataset.COLUMNS, 0.0)
+                            | {"bank": 100.0 + n},
+                            theirs=dict.fromkeys(dataset.COLUMNS, 0.0)
+                            | {"bank": 200.0},
+                            prices={"WHEAT": 25},
+                        )
+                        for n in range(days)
+                    ]
+                )
                 for _ in range(seasons)
             ]
             for name in rates
         },
+    )
+
+
+def _played(days: list[harness.Day]) -> harness.Game:
+    """One game carrying those days, as the evaluator now records them.
+
+    `Result.states` holds whole games rather than day tables alone: a `Game`
+    knows the seat it was played from, and the seat is what lets the days be
+    written out the way the public corpus writes them.
+    """
+    return harness.Game(
+        opponent="v54",
+        seed=101,
+        seat=0,
+        ours=days[-1].ours_bank if days else 0.0,
+        theirs=days[-1].theirs_bank if days else 0.0,
+        worst_step_seconds=0.0,
+        days=days,
     )
 
 
@@ -1274,7 +1297,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert handed.held == ["child.py", "measure.py", "parent.py", "seasons.csv"]
+    assert handed.held == ["child.py", "measure.py", "parent.py", "seasons.db"]
     assert not handed.where.exists()
 
 
@@ -2034,7 +2057,13 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         """A call that only reports what it was handed."""
         seen["files"] = sorted(path.name for path in workspace.iterdir())
         seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
-        seen["seasons"] = (workspace / "seasons.csv").read_text(encoding="utf-8")
+        # Counted here rather than after: the workspace is removed as soon
+        # as this call unwinds, and a path is not evidence once it is gone.
+        seen["seasons"] = (
+            sqlite3.connect(workspace / "seasons.db")
+            .execute("select count(*) from days")
+            .fetchone()[0]
+        )
         raise asyncio.CancelledError
 
     campaign.mutator = inspect
@@ -2056,11 +2085,12 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         "child.py",
         "measure.py",
         "parent.py",
-        "seasons.csv",
+        "seasons.db",
     ]
     # Every game behind the verdict, at a width no message could carry. The
     # message holds the index; this is what the index points at.
-    assert str(seen["seasons"]).startswith("matchup,season,day,ours_bank,")
+    # One opponent, one season, thirty days, both sides of each.
+    assert seen["seasons"] == 30 * 2, "the round was handed an empty database"
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER

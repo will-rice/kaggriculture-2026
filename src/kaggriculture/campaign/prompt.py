@@ -31,8 +31,8 @@ from pathlib import Path
 
 from kaggriculture.campaign import (
     archive,
+    browse,
     evaluator,
-    harness,
     validate,
 )
 
@@ -85,7 +85,7 @@ REASON_CHARS = 200
 # read day twelve, or ask which day the banks diverged across every game it
 # played, and a round with a different question pays nothing for the answer to
 # this one.
-SEASONS = "seasons.csv"
+SEASONS = "seasons.db"
 
 
 CHANGE_CHARS = 160
@@ -203,43 +203,41 @@ class Message:
 ROUND = Message(ROUND_PROMPT)
 
 
-def seasons(result: evaluator.Result) -> str:
-    """Every game of one evaluation as a single CSV, day by day.
+def seasons(result: evaluator.Result, path: Path, name: str) -> Path:
+    """Write every game of one evaluation to a database beside ``child.py``.
 
-    One row per day, keyed by two numbers. `matchup` is one opponent, whose
-    name is the whole of what a round is not told about who it played;
-    `season` is one game inside that matchup. Every game the evaluation
-    scored is here, because a round can only improve a game it is shown, and
-    the campaign scores all of them.
+    Two numbers name a game. `matchup` is one opponent, whose name is the
+    whole of what a round is not told about who it played; `season` is one
+    game inside that matchup. Every game the evaluation scored is there,
+    because a round can only improve a game it is shown and the campaign
+    scores all of them.
 
-    The two keys are what makes a comparison mean something. Within one
+    Those two keys are what makes a comparison mean something. Within one
     matchup the opponent is fixed and what changes between seasons is the
     world -- the map, the prices, the seat -- which is the axis a general
     program has to hold up across. Across matchups the adversary changes too,
     so a difference between two of them says nothing about either.
 
-    The width is the point of the file existing. A markdown table has room for
-    about fifteen columns before it stops being readable, and `Day` carries
-    sixty-odd: the 29 quantities `dataset.measures` defines for each side, the
-    per-crop breakdowns behind four of those totals, and the market's prices.
-    Written out, every one of them is a column a round can group by, diff
-    across days, or ignore -- and the two sharpest separations in the whole
-    corpus, quadrants on day three and fertilizer on day five, were quantities
-    the table had no room for.
+    A database rather than the CSV this used to write, because 768 games of
+    thirty days is nine megabytes and a round cannot ask nine megabytes
+    anything: it has to load the file and write code before it can answer
+    "which day did I lose". `browse` says the rest.
 
     Args:
-        result: The evaluation, for its day tables and the rates that order
-            them.
+        result: The evaluation, for its games and the rates that order them.
+        path: Where to write it.
+        name: What to record the program being measured as.
 
     Returns:
-        The whole CSV, header first. Empty when nothing was recorded.
+        ``path``, written.
     """
-    return harness.day_csv(
+    return browse.write(
+        path,
         [
-            ({"matchup": matchup, "season": season}, days)
+            (matchup, season, name, game)
             for matchup, opponent in enumerate(_ordered(result), start=1)
-            for season, days in enumerate(result.states[opponent], start=1)
-        ]
+            for season, game in enumerate(result.states[opponent], start=1)
+        ],
     )
 
 
@@ -272,17 +270,19 @@ def _states_lines(result: evaluator.Result) -> list[str]:
     lines = [
         "## The seasons it just played",
         "",
-        f"Every game it played is in `{SEASONS}`, beside `child.py`: one row "
-        "per day, keyed by `matchup` and `season`. A matchup is one opponent "
-        "and every season it played against them; within it the opponent is "
+        f"Every game it played is in `{SEASONS}` beside `child.py`, a SQLite "
+        "database. Ask it rather than read it:",
+        "",
+        f'    sqlite3 {SEASONS} ".schema"',
+        f'    sqlite3 {SEASONS} "select * from swings order by moved limit 5"',
+        "",
+        "A game is named by `matchup` and `season`. A matchup is one opponent "
+        "and every season played against them; within it the opponent is "
         "fixed, so what changes from season to season is the world -- the "
         "map, the prices, the seat -- which is the variation a program has to "
         "hold up across. Between matchups the opponent changes too, so a "
-        "difference there says nothing about either.",
-        "",
-        "Read it however suits the question: one season, one matchup, one day "
-        "across every game, one column across all of them. Every game below "
-        "was scored, so every one of them is a game to improve.",
+        "difference there says nothing about either. Every game below was "
+        "scored, so every one of them is a game to improve.",
         "",
         "The opponents are not named and it does not matter which they were. "
         "They are drawn from the field this program will meet, and the field "
@@ -296,10 +296,10 @@ def _states_lines(result: evaluator.Result) -> list[str]:
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for matchup, opponent in enumerate(ordered, start=1):
-        finals = [
-            days[-1].ours_bank - days[-1].theirs_bank
-            for days in result.states[opponent]
-        ]
+        # The game's own final banks, not the last day's. They are the same
+        # number when a game ran to the end and only the game's is right when
+        # it did not -- a forfeit has no last day to read.
+        finals = [game.ours - game.theirs for game in result.states[opponent]]
         lines.append(
             f"| {matchup} | {len(finals)} | "
             f"{sum(1 for final in finals if final > 0)} | "
@@ -312,16 +312,29 @@ def _states_lines(result: evaluator.Result) -> list[str]:
         "1 is the game a small change would have turned and the last is the "
         "one furthest out of reach.",
         "",
-        "Each row of the file is a day as it closed, at hour 23. Both sides "
-        "are in it, the opponent's shed included: that is what the author of "
-        "a program is shown afterwards, never what the program may read while "
-        "it plays. `ours_*` and `theirs_*` carry every quantity the campaign "
-        "measures -- banks, planted and ripe tiles, pens, weeds, bare tiles, "
-        "unlocked quadrants, hands, seed and shed totals, shops, watering and "
-        "feeding, fertilizer, plant age, and the running counts of every kind "
-        "of market order -- with the per-crop breakdowns behind the totals as "
-        "`ours_plants_WHEAT` and the like, and the shared market as `price_*`. "
-        "An empty cell is a count of zero.",
+        "",
+        "`.schema` is the authority; this is the shape of it. `days` is one "
+        "row per side per day as it "
+        "closed, at hour 23, carrying every quantity the campaign measures: "
+        "banks, planted and ripe tiles, pens, weeds, bare tiles, unlocked "
+        "quadrants, hands, seed and shed totals, shops, watering and feeding, "
+        "fertilizer, plant age, and the running counts of every kind of "
+        "market order. `holdings` has the per-crop breakdowns behind four of "
+        "those totals, `prices` the shared market, `episodes` how each game "
+        "finished. `orders`, `moves` and `teams` are there and empty: the "
+        "schema is the public corpus's own, so that these games and recorded "
+        "ones are the same kind of row, and those three are what a recorded "
+        "game carries and a played one does not.",
+        "",
+        "The two views are the questions worth asking. `gaps` is every one of "
+        "those quantities as yours minus theirs, one row per day, so negative "
+        "is behind. `swings` adds `moved`, the day-on-day change in the bank "
+        "gap -- so the day this program lost the most, across every game it "
+        "played, is one query.",
+        "",
+        "Both sides are in it, the opponent's shed included: that is what the "
+        "author of a program is shown afterwards, never what the program may "
+        "read while it plays.",
     ]
     return lines
 

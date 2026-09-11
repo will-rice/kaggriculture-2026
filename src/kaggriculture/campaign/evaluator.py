@@ -74,8 +74,16 @@ class Result(BaseModel):
             what a round is *shown* is chosen from the standings instead,
             because the gate is a tournament and the agent to study is the one
             directly above, not the one furthest away.
-        states: Every game played, day by day, grouped by the opponent it was
-            played against and narrowest first within each group.
+        states: Every game played, grouped by the opponent it was played
+            against and narrowest first within each group.
+
+            Whole games rather than their day tables alone. A `Game` carries
+            the seed it was played on and the seat the candidate held, and
+            those are what let the days be written out as the public corpus
+            writes them -- which records an absolute seat, having no notion of
+            "ours". Keeping only the days meant inventing a seat at the point
+            of writing, and an invented seat is a row that looks like a corpus
+            row and is not one.
 
             All of them, because a round can only improve a game it is shown
             and the campaign scores every one of them. It used to keep the
@@ -105,7 +113,7 @@ class Result(BaseModel):
     games: int = 0
     seeds: list[int]
     hardest: str
-    states: dict[str, list[list[harness.Day]]]
+    states: dict[str, list[harness.Game]]
 
 
 def _mean(rates: dict[str, float]) -> float:
@@ -264,13 +272,10 @@ def score(
     # thirty-one against each opponent, which is a round being told about one
     # thirty-second of what it is scored on.
     states = {
-        name: [
-            game.days
-            for game in sorted(
-                (game for game in games if game.opponent == name),
-                key=lambda game: abs(game.ours - game.theirs),
-            )
-        ]
+        name: sorted(
+            (game for game in games if game.opponent == name),
+            key=lambda game: abs(game.ours - game.theirs),
+        )
         for name in names
     }
     played = 2 * len(seeds)

@@ -264,7 +264,11 @@ def test_every_game_it_scores_is_a_game_the_round_can_improve(tmp_path: Path) ->
 
     seasons = result.states["v54"]
     assert len(seasons) == result.games, "one recorded season per game scored"
-    assert all(len(days) == len(seasons[0]) for days in seasons)
-    assert len(seasons[0]) > 1, "a season is its days, not one terminal row"
-    gaps = [abs(days[-1].ours_bank - days[-1].theirs_bank) for days in seasons]
+    assert all(len(game.days) == len(seasons[0].days) for game in seasons)
+    assert len(seasons[0].days) > 1, "a season is its days, not one terminal row"
+    # Whole games, because the seat is what lets the days be written out the
+    # way the corpus writes them, and days alone do not carry it.
+    assert {game.seat for game in seasons} == {0, 1}
+    assert {game.seed for game in seasons} == {11, 12}
+    gaps = [abs(game.ours - game.theirs) for game in seasons]
     assert gaps == sorted(gaps), "narrowest first, so season 1 is the reachable one"
