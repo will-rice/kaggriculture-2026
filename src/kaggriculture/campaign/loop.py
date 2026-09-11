@@ -54,8 +54,10 @@ from pydantic import BaseModel
 # body cannot see this module -- hence `Champion` imported by name below.
 from kaggriculture.campaign import (
     archive,
+    browse,
     config,
     evaluator,
+    games,
     gate,
     harvest,
     measure,
@@ -875,7 +877,7 @@ class Campaign:
         anything it did.
         """
         table = rating.standings(rating.Field.load(self.paths.field).everything())
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             evaluator.score,
             source,
             program_id,
@@ -887,6 +889,17 @@ class Campaign:
             table,
             self.must_play(table),
         )
+        # Every game of it, into the one database the nightly extraction also
+        # writes to. Every candidate, not only the ones that survive: what
+        # separates a program that promoted from one that did not is a
+        # question about the ones that did not, and it cannot be asked of
+        # games nobody kept. Measured at 9.6 MB and 1.3s an evaluation, which
+        # is about 11 GB a day at eight sessions -- affordable against the
+        # competition's remaining weeks, and off the loop thread either way.
+        await asyncio.to_thread(
+            games.record, program_id, browse.games(result, program_id)
+        )
+        return result
 
     def seasons(self) -> list[int]:
         """The seeds every candidate measured in this block plays.

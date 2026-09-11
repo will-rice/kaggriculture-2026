@@ -49,7 +49,11 @@ LOGGER = logging.getLogger(__name__)
 
 # Beside the archives it is built from, because it is the same data in another
 # shape and it is far too big for the repository.
-DATABASE = config.EPISODES.parent / "corpus.sqlite"
+# The one database, which this module is no longer the only writer of. It was
+# `corpus.sqlite` and held the recorded ladder alone; the campaign's own games
+# are in it now, under `episodes.source = 'campaign'`, and a rebuild carries
+# them across rather than replacing them along with everything else.
+DATABASE = config.GAMES_SQLITE
 # Processes to divide the archives over. The same reasoning as
 # the loop is usually running while this is, and the loop is what must not
 # slow down.
@@ -120,7 +124,13 @@ CREATE TABLE IF NOT EXISTS episodes (
     team_1     TEXT,
     bank_0     REAL,
     bank_1     REAL,
-    winner     INTEGER
+    winner     INTEGER,
+    -- Which writer put this episode here: `ladder` for a game recorded off
+    -- the competition, `campaign` for one this lineage played. One file holds
+    -- both, and a nightly rebuild replaces every `ladder` row and must not
+    -- touch a `campaign` one -- so the column is what makes "the rebuild only
+    -- deletes what it owns" a fact rather than a convention.
+    source     TEXT
 );
 CREATE TABLE IF NOT EXISTS days (
     episode    TEXT,
@@ -305,8 +315,14 @@ def _insert(
     banks = [float(farm["money"]) for farm in final]
     teams = list(identity.get("TeamNames") or ["", ""])
     winner = None if banks[0] == banks[1] else int(banks[1] > banks[0])
+    # Columns named rather than positional: this table gained `source` when
+    # the campaign's own games moved into the same file, and a positional
+    # insert is the kind that keeps working right up until the counts happen
+    # to match and it writes every value one column to the left.
     connection.execute(
-        "INSERT OR REPLACE INTO episodes VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO episodes (episode, kaggle_id, seed, engine, "
+        "played, team_0, team_1, bank_0, bank_1, winner, source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,'ladder')",
         (
             key,
             identity.get("EpisodeId"),

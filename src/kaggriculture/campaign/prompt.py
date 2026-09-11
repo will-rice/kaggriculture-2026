@@ -231,29 +231,7 @@ def seasons(result: evaluator.Result, path: Path, name: str) -> Path:
     Returns:
         ``path``, written.
     """
-    return browse.write(
-        path,
-        [
-            (matchup, season, name, game)
-            for matchup, opponent in enumerate(_ordered(result), start=1)
-            for season, game in enumerate(result.states[opponent], start=1)
-        ],
-    )
-
-
-def _ordered(result: evaluator.Result) -> list[str]:
-    """The matchups, worst-beaten opponent first.
-
-    A loss is a game lost, not a matchup lost: an opponent beaten 0.875 took
-    one game in eight, and those are the games that decide whether the program
-    finishes top. So the order is by rate and then by margin, which puts the
-    matchups with the most to learn from at the top of the index, and the ones
-    it swept at the bottom rather than out of the file.
-    """
-    return sorted(
-        (name for name in result.rates if result.states.get(name)),
-        key=lambda name: (result.rates[name], result.margins[name].mean),
-    )
+    return browse.write(path, browse.games(result, name))
 
 
 def _states_lines(result: evaluator.Result) -> list[str]:
@@ -264,7 +242,7 @@ def _states_lines(result: evaluator.Result) -> list[str]:
     the part a round cannot work out for itself: how many seasons each matchup
     holds, how they went, and which one is worth opening first.
     """
-    ordered = _ordered(result)
+    ordered = browse.ordered(result)
     if not ordered:
         return []
     lines = [

@@ -50,6 +50,19 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (  # noqa: E402
 ROOT = Path(__file__).resolve().parents[3]
 RUN = ROOT / "run" / "campaign"
 OPPONENTS = Path("/data/kaggriculture/opponents")
+# The one database. The nightly extraction writes the recorded ladder into it
+# and the loop writes every game it plays into it, because the questions worth
+# asking span both -- is this lineage converging on what the field does, or
+# somewhere else -- and that is only askable while both are rows in one table.
+# `episodes.source` says which writer owns a row, so the rebuild replaces the
+# ladder and never touches a game the campaign played.
+# Where the one games database answers. ClickHouse on localhost, started by
+# the repository's `docker-compose.yml`: the recorded ladder and every game the
+# campaign plays, in one store, because the questions worth asking span both.
+GAMES_URL = os.environ.get("KAGGRICULTURE_GAMES_URL", "http://127.0.0.1:8123")
+# The SQLite the corpus was extracted into before that, kept as what the
+# migration reads and as nothing else.
+GAMES_SQLITE = Path("/data/kaggriculture/games.sqlite")
 # Skills copied into every round's workspace. They live in the repository, beside
 # the code whose schema they describe, rather than in the host's codex
 # configuration: a skill that documents `browse`'s tables and is kept somewhere

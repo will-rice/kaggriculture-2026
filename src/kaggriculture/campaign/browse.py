@@ -40,7 +40,7 @@ import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
-from kaggriculture.campaign import dataset, harness
+from kaggriculture.campaign import dataset, evaluator, harness
 
 # Ours, beyond the corpus's own tables. `candidate` names the seat the program
 # being measured held, which is the one thing the corpus cannot have. The views
@@ -69,16 +69,47 @@ SELECT * FROM (
 """
 
 
-def write(path: Path, games: Sequence[tuple[int, int, str, harness.Game]]) -> Path:
+def ordered(result: evaluator.Result) -> list[str]:
+    """The matchups of one evaluation, worst-beaten opponent first.
+
+    A loss is a game lost, not a matchup lost: an opponent beaten 0.875 took
+    one game in eight, and those are the games that decide whether a program
+    finishes top. So the order is by rate and then by margin, which puts the
+    matchups with the most to learn from first.
+
+    It lives here because the numbering is what a matchup *is* -- an opponent's
+    name never travels, so `matchup = 1` is the only handle there is on which
+    games those were. The message and the database have to agree about it, and
+    two orderings that agree today are two orderings.
+    """
+    return sorted(
+        (name for name in result.rates if result.states.get(name)),
+        key=lambda name: (result.rates[name], result.margins[name].mean),
+    )
+
+
+def games(
+    result: evaluator.Result, name: str
+) -> list[tuple[int, int, str, harness.Game]]:
+    """One evaluation's games, keyed the way both writers key them."""
+    return [
+        (matchup, season, name, game)
+        for matchup, opponent in enumerate(ordered(result), start=1)
+        for season, game in enumerate(result.states[opponent], start=1)
+    ]
+
+
+def write(path: Path, played: Sequence[tuple[int, int, str, harness.Game]]) -> Path:
     """Write every day of every game to a fresh database at ``path``.
 
-    Replaced rather than appended to: a half-written database that looks whole
-    is worse than none, and the caller always holds every game it means to
-    store.
+    For the extract a round is handed: replaced rather than appended to,
+    because a half-written database that looks whole is worse than none and
+    the caller always holds every game it means to store. `record` is the one
+    that adds to the database of record.
 
     Args:
         path: Where to write. Removed first if it exists.
-        games: One entry per game: its matchup, its season within that
+        played: One entry per game: its matchup, its season within that
             matchup, the name to record for the program being measured, and
             the played `Game` with its days recorded.
 
@@ -88,18 +119,37 @@ def write(path: Path, games: Sequence[tuple[int, int, str, harness.Game]]) -> Pa
     path.unlink(missing_ok=True)
     connection = sqlite3.connect(path)
     with connection:
-        connection.executescript(dataset.SCHEMA)
-        connection.executescript(
-            OURS.format(
-                differences=",\n       ".join(
-                    f"o.{column} - t.{column} AS {column}" for column in dataset.COLUMNS
-                )
-            )
-        )
-        for matchup, season, mine, game in games:
+        _prepare(connection)
+        for matchup, season, mine, game in played:
             _game(connection, matchup, season, mine, game)
     connection.close()
     return path
+
+
+def _prepare(connection: sqlite3.Connection) -> None:
+    """The corpus's own schema, plus what only our side of it needs.
+
+    Write-ahead logging so that reading this file never blocks writing it. The
+    database is worth querying while a campaign is running -- that is most of
+    why there is one -- and under the default journal a long analytical read
+    would stall the loop's next record behind it.
+
+    No busy timeout, deliberately. A timeout does not remove `database is
+    locked`, it schedules it: the writer waits, and then raises anyway, on the
+    loop thread, having spent the wait. The contention it would paper over is
+    not allowed to happen instead -- `Campaign.recording` admits one writer at
+    a time, and the nightly rebuild writes to a file beside this one and
+    renames, so it never holds a write lock here at all.
+    """
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.executescript(dataset.SCHEMA)
+    connection.executescript(
+        OURS.format(
+            differences=",\n       ".join(
+                f"o.{column} - t.{column} AS {column}" for column in dataset.COLUMNS
+            )
+        )
+    )
 
 
 def _game(
@@ -108,6 +158,7 @@ def _game(
     season: int,
     mine: str,
     game: harness.Game,
+    prefix: str = "",
 ) -> None:
     """Insert one game into the corpus's own tables, plus who was on our side.
 
@@ -120,12 +171,13 @@ def _game(
     # The episode id has to be unique inside this database and mean nothing
     # outside it. The opponent is not in it: a name here would be a name in a
     # file the round can read, and no opponent is named anywhere it can see.
-    episode = f"m{matchup}s{season}"
+    episode = f"{prefix}m{matchup}s{season}" if prefix else f"m{matchup}s{season}"
     theirs = 1 - game.seat
     final = game.days[-1] if game.days else None
     connection.execute(
         "INSERT INTO episodes (episode, seed, engine, team_0, team_1, "
-        "bank_0, bank_1, winner) VALUES (?, ?, 'port', ?, ?, ?, ?, ?)",
+        "bank_0, bank_1, winner, source) "
+        "VALUES (?, ?, 'port', ?, ?, ?, ?, ?, 'campaign')",
         (
             episode,
             game.seed,
