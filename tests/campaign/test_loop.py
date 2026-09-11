@@ -1297,7 +1297,13 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert handed.held == ["child.py", "measure.py", "parent.py", "seasons.db"]
+    assert handed.held == [
+        ".codex",
+        "child.py",
+        "measure.py",
+        "parent.py",
+        "seasons.db",
+    ]
     assert not handed.where.exists()
 
 
@@ -2057,6 +2063,9 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         """A call that only reports what it was handed."""
         seen["files"] = sorted(path.name for path in workspace.iterdir())
         seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
+        seen["skill"] = (
+            workspace / ".codex" / "skills" / "query-games" / "SKILL.md"
+        ).exists()
         # Counted here rather than after: the workspace is removed as soon
         # as this call unwinds, and a path is not evidence once it is gone.
         seen["seasons"] = (
@@ -2082,11 +2091,14 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         )
 
     assert seen["files"] == [
+        ".codex",
         "child.py",
         "measure.py",
         "parent.py",
         "seasons.db",
     ]
+    # The skills go in where codex looks for them, under its working directory.
+    assert seen["skill"], "the round was given no query-games skill"
     # Every game behind the verdict, at a width no message could carry. The
     # message holds the index; this is what the index points at.
     # One opponent, one season, thirty days, both sides of each.

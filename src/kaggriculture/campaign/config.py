@@ -50,6 +50,12 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (  # noqa: E402
 ROOT = Path(__file__).resolve().parents[3]
 RUN = ROOT / "run" / "campaign"
 OPPONENTS = Path("/data/kaggriculture/opponents")
+# Skills copied into every round's workspace. They live in the repository, beside
+# the code whose schema they describe, rather than in the host's codex
+# configuration: a skill that documents `browse`'s tables and is kept somewhere
+# the tests cannot reach is a skill that goes stale the first time a column is
+# renamed, and goes stale silently.
+SKILLS = ROOT / ".agents" / "skills"
 # Where an opponent whose source predates the vendored drop still lives; the
 # roster names one. Both roots are stated here so no other module spells out
 # a path under /data.

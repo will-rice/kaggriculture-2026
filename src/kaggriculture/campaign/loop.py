@@ -620,6 +620,12 @@ class Campaign:
             # only the index, so what a round can look at stops being bounded
             # by what will fit in front of it.
             prompt.seasons(result, box / prompt.SEASONS, name)
+            # And how to ask it, as a skill rather than as more message. Codex
+            # discovers `.codex/skills` under its working directory, so a
+            # round that wants the schema and the queries worth running opens
+            # them, and a round with a different question pays nothing for
+            # them. The message is read every round; this is read on demand.
+            shutil.copytree(config.SKILLS, box / ".codex" / "skills")
             mutation = await self.mutator(box, message, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1

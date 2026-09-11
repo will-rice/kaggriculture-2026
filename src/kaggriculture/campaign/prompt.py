@@ -271,26 +271,18 @@ def _states_lines(result: evaluator.Result) -> list[str]:
         "## The seasons it just played",
         "",
         f"Every game it played is in `{SEASONS}` beside `child.py`, a SQLite "
-        "database. Ask it rather than read it:",
+        "database: one row per side per day, every quantity the campaign "
+        "measures. Ask it rather than read it, and use the `query-games` "
+        "skill -- it has the schema and the queries worth running.",
         "",
-        f'    sqlite3 {SEASONS} ".schema"',
         f'    sqlite3 {SEASONS} "select * from swings order by moved limit 5"',
         "",
-        "A game is named by `matchup` and `season`. A matchup is one opponent "
-        "and every season played against them; within it the opponent is "
-        "fixed, so what changes from season to season is the world -- the "
-        "map, the prices, the seat -- which is the variation a program has to "
-        "hold up across. Between matchups the opponent changes too, so a "
-        "difference there says nothing about either. Every game below was "
-        "scored, so every one of them is a game to improve.",
-        "",
-        "The opponents are not named and it does not matter which they were. "
-        "They are drawn from the field this program will meet, and the field "
-        "turns over: the agent across the table in a scored game will be one "
-        "this program has never seen. So these are samples of how a season "
-        "can go against a competent opponent, not a list of agents to beat. A "
-        "change that wins these seasons because it recognised who it was "
-        "playing wins nothing that counts.",
+        "Every game below was scored, so every one of them is a game to "
+        "improve. The opponents are not named and it does not matter which "
+        "they were: they are drawn from a field that turns over, and the "
+        "agent across the table in a scored game will be one this program has "
+        "never seen. A change that wins these seasons because it recognised "
+        "who it was playing wins nothing that counts.",
         "",
         "| matchup | seasons | won | mean finish | worst | best |",
         "| --- | --- | --- | --- | --- | --- |",
@@ -310,31 +302,9 @@ def _states_lines(result: evaluator.Result) -> list[str]:
         "",
         "Seasons are numbered narrowest first inside each matchup, so season "
         "1 is the game a small change would have turned and the last is the "
-        "one furthest out of reach.",
-        "",
-        "",
-        "`.schema` is the authority; this is the shape of it. `days` is one "
-        "row per side per day as it "
-        "closed, at hour 23, carrying every quantity the campaign measures: "
-        "banks, planted and ripe tiles, pens, weeds, bare tiles, unlocked "
-        "quadrants, hands, seed and shed totals, shops, watering and feeding, "
-        "fertilizer, plant age, and the running counts of every kind of "
-        "market order. `holdings` has the per-crop breakdowns behind four of "
-        "those totals, `prices` the shared market, `episodes` how each game "
-        "finished. `orders`, `moves` and `teams` are there and empty: the "
-        "schema is the public corpus's own, so that these games and recorded "
-        "ones are the same kind of row, and those three are what a recorded "
-        "game carries and a played one does not.",
-        "",
-        "The two views are the questions worth asking. `gaps` is every one of "
-        "those quantities as yours minus theirs, one row per day, so negative "
-        "is behind. `swings` adds `moved`, the day-on-day change in the bank "
-        "gap -- so the day this program lost the most, across every game it "
-        "played, is one query.",
-        "",
-        "Both sides are in it, the opponent's shed included: that is what the "
-        "author of a program is shown afterwards, never what the program may "
-        "read while it plays.",
+        "one furthest out of reach. Both sides are in the database, the "
+        "opponent's shed included: that is what the author of a program is "
+        "shown afterwards, never what the program may read while it plays.",
     ]
     return lines
 
