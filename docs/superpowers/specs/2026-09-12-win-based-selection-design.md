@@ -195,6 +195,47 @@ promotion bar, so a round's local tool and the gate compute the same statistic.
 `--seeds` trades time for tightness. Playing the whole pool is nine minutes and is
 the campaign's job.
 
+## Where a program runs
+
+Playing a program executes it, and a candidate or a harvested kernel may write
+files -- relative ones, so the working directory decides where. `validate` bans
+`open`, `eval`, `exec` and `__import__`, but `pathlib` is an allowed import and
+`Path.write_text` walks through; harvested opponents are not validated at all.
+The sandbox is the only thing between a stranger's kernel and the repository, and
+one has already overwritten our own `main.py` with a 158KB replay agent.
+
+`Sandbox.submit` wraps every task, so the sandbox is the pool's property and not
+something a task function has to remember. The wrapper is the whole of it:
+
+```python
+def _sandboxed(call, *args, **kwargs):
+    """Runs in the child, once. `Sandbox.submit` is the only caller."""
+    with tempfile.TemporaryDirectory(prefix="campaign-worker-") as scratch:
+        os.chdir(scratch)
+        return call(*args, **kwargs)
+```
+
+Three properties, each of which was a failure:
+
+- **In the child, never the parent.** A spawned child inherits the cwd of
+  whoever spawned it, so a parent that chdirs relocates every game it starts
+  next, and deleting the tree afterwards leaves them standing nowhere. That
+  killed the campaign on 2026-09-11 and again on 2026-09-12.
+- **No `Path.cwd()`.** Reading the cwd to restore it later is what raised
+  `FileNotFoundError: [Errno 2]` with no filename -- the crash that reads like
+  nothing at all -- when the directory was already gone.
+- **No restore.** `max_tasks_per_child=1`, so the process takes one task and
+  exits; there is nothing after it to put a directory back for.
+
+`TemporaryDirectory` rather than `mkdtemp` and an `atexit` hook: both remove the
+tree, only one says when, and a worker killed mid-game -- routine, since the
+pacer cancels codex calls and the loop tears its pools down with them -- never
+reaches an `atexit`. 164 scratch directories from that shape were in /tmp when it
+was last changed.
+
+`os.chdir` appears in that function and nowhere else in the package, enforced by
+a test that reads the source.
+
 ## No lineage
 
 Nothing records or consults what came from what. A round edits whatever the round
