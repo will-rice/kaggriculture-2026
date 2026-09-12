@@ -9,8 +9,9 @@ Date: 2026-09-12. Replaces sections 5.1, 5.2 and the prompt half of section 4 of
 champion = seed                        # a file on disk, and a row
 
 8 sessions in parallel, forever:
+    program = champion
     for 12 rounds:
-        game    = one of the champion's recorded games, a different one each round
+        game    = one of `program`'s own recorded games, a different one each round
         message = the game's rules
                 + that game's episode key and the query that reads it
                 + the chain: what each earlier round of this session changed,
@@ -23,6 +24,7 @@ champion = seed                        # a file on disk, and a row
 
         games   = play(file, publics + champion, 16 seeds, both seats)
         record(games); row(id, change, rate)
+        program = file                             # the next round edits this
 
         if wilson_low(rate vs champion) > 0.5 and decisive vs champion >= 8:
             champion = file
@@ -106,9 +108,16 @@ time, and the only escape is a round choosing to rewrite.
 
 ## What a round is given
 
-One game: its episode key and the query that reads it out of the games database,
-day by day, both sides. Not the game itself -- one season is 8,888 characters
-across 68 columns, and the database already holds it.
+One game played by the program this round is editing: its episode key and the
+query that reads it out of the games database, day by day, both sides. Not the
+game itself -- one season is 8,888 characters across 68 columns, and the database
+already holds it.
+
+The program it is editing, not the champion. Round 1 edits the champion, so those
+are the champion's games; round 7 edits round 6's output, and a champion game
+there would be a game played by a program six edits away from the one in front of
+it. Every round's program is scored over the whole pool, so its own games are
+always recorded.
 
 A different game each round, so a session's 12 rounds see twelve maps and no
 change gets twelve consecutive attempts at entrenching on one.
@@ -261,6 +270,8 @@ Each verified by mutation, not assumed:
 - Every candidate plays every pool opponent; none is sampled out.
 - The round message names one game and carries the chain.
 - Twelve rounds of a session get twelve different games.
+- The game a round is shown was played by the program that round is editing, not
+  by the champion, once they differ.
 - `measure.py`'s printed rate matches what the gate computes on the same games.
 - A program and a rejected round are both rows in `games.programs`, and the
   champion is the most recent promoted one.
