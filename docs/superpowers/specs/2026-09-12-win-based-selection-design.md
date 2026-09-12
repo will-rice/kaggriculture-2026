@@ -129,6 +129,42 @@ promotion bar -- so a round's local tool and the gate compute the same statistic
 `--seeds` trades time for tightness. Playing the whole pool is nine minutes and
 is the campaign's job.
 
+## Module structure
+
+The loop's transitive imports, measured 2026-09-12: 22 modules, 8,773 lines.
+
+| group           | modules                                                                                                                          | lines |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| core mechanism  | loop, harness, config, games, mutate, gate, validate, evaluator, prompt, archive, pool, copycheck, measure, arena, pools, roster | 6,427 |
+| harvest         | kernel_watch, harvest, field_gate                                                                                                | 980   |
+| corpus analysis | dataset, rating, tapes                                                                                                           | 1,166 |
+| dead            | evidence                                                                                                                         | 149   |
+
+Four changes fall out of that:
+
+**Break the `dataset` coupling.** `harness` uses `dataset.measures`; `games` uses
+`dataset.measures` and `dataset.COLUMNS`. Those two names pull `dataset` ->
+`tapes` -> `rating` -- 1,166 lines of corpus analysis -- into the loop's import
+graph. Move the measure definitions to where the campaign uses them, and the
+corpus becomes corpus-only.
+
+**`rating` then leaves the campaign by itself.** `gate` uses `rating.Field` and
+`rating.standings`, both deleted here. With the `dataset` coupling broken, the
+only importer left is `dataset`, which is where it belongs.
+
+**Delete `evidence.py`.** 149 lines, imported by nothing. (`strategy.py` stays:
+the `strategies` script uses it.)
+
+**Split `loop.py`.** 1,208 lines holding the CLI, the wandb run, resumable
+state, the campaign object, sessions, rounds, `keep`, `consider`, promotion
+logging and the harvester coroutine. This design already rewrites much of it, so
+the split happens while it is open rather than after.
+
+Out of scope, recorded because it is the next boundary worth questioning: harvest
+is 980 lines -- a Kaggle client, notebook parsing, base64 and zlib extraction,
+compiled-kernel builds, a gate of its own -- reached from the loop through one
+hourly coroutine, and nothing to do with producing programs.
+
 ## Deleted
 
 | deleted                                                              | why                                                |
@@ -145,6 +181,7 @@ is the campaign's job.
 | `Program.started_from`, `Database.children`, `Database.descendants`  | ancestry does not bear on winning                  |
 | `SCRATCH_CHANCE`, `SCRATCH_ID`, `SCRATCH_AGENT`, the stagnation note | lineage machinery                                  |
 | `parent.py` in the round directory                                   | `measure.py` measures the champion                 |
+| `evidence.py`                                                        | imported by nothing                                |
 | `PARENT_POOL`, `PARENT_DECAY`, the weighted draw, `Database.top(k)`  | a session starts from the champion                 |
 | the no-champion branches in `start`, `floor` and `consider`          | the seed is champion zero                          |
 
@@ -195,3 +232,4 @@ Each verified by mutation, not assumed:
 - `measure.py`'s printed rate matches what the gate computes on the same games.
 - Nothing in the campaign reads `started_from`.
 - No module outside `dataset.py` imports `rating`.
+- Importing `loop` does not import `dataset`, `tapes` or `rating`.
