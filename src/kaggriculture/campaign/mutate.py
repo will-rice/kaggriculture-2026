@@ -35,6 +35,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Protocol
 
+from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from kaggriculture.campaign import config
@@ -57,6 +58,48 @@ def known_models() -> set[str]:
         MODEL_CATALOG_COMMAND, capture_output=True, check=True, text=True
     ).stdout
     return {model["slug"] for model in json.loads(output)["models"]}
+
+
+# The file the model is read from, absolute on purpose. `load_dotenv` with no
+# path searches relative to something -- the caller's module, or the working
+# directory -- and the campaign moves its working directory: every worker that
+# runs a program is given a scratch one. A relative search would find a
+# different file depending on who asked.
+ENV = config.ROOT / ".env"
+
+
+def model() -> str:
+    """The model to ask for, read fresh at every call.
+
+    Read here rather than captured at startup so that it can change without
+    stopping the campaign. `.env` is reloaded first, which is what makes that
+    true: a process's environment is fixed when it is spawned, so exporting a
+    variable in a shell cannot reach a loop that is already running, and the
+    file is the part of the environment a running process can re-read.
+
+    So: edit `CAMPAIGN_CODEX_MODEL` in `.env` and the next round uses it. The
+    wandb run keeps the name it started with, because that is what it started
+    with; `calls/model` is logged per call and is the truth about any one of
+    them.
+
+    Returns:
+        The slug from the environment, or `config.CODEX_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_CODEX_MODEL") or config.CODEX_MODEL
+
+
+def fallback() -> str:
+    """The model retried once when the first fails without a verdict.
+
+    Read at the call for the same reason, and "" to never retry.
+
+    Returns:
+        The slug from the environment, or `config.CODEX_FALLBACK_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    value = os.environ.get("CAMPAIGN_CODEX_FALLBACK_MODEL")
+    return config.CODEX_FALLBACK_MODEL if value is None else value
 
 
 def validate_model(model: str) -> None:
@@ -165,18 +208,18 @@ class CodexMutator:
         "-",
     ]
 
-    def __init__(
-        self,
-        model: str = config.CODEX_MODEL,
-        fallback: str = config.CODEX_FALLBACK_MODEL,
-    ) -> None:
+    def __init__(self, model: str = "", fallback: str | None = None) -> None:
         """Initializes the mutator.
 
+        Both are normally left unset and read from the environment at every
+        call, so the campaign's model can change without stopping it. A test
+        pins them instead.
+
         Args:
-            model: The codex model to request.
+            model: The codex model to request, or "" to read it per call.
             fallback: The model to retry on, once, when a call on ``model``
                 fails without a verdict (the provider refused or codex
-                crashed); "" to never retry.
+                crashed). "" never retries; None reads it per call.
         """
         self.model = model
         self.fallback = fallback
@@ -200,19 +243,23 @@ class CodexMutator:
             A `Mutation` describing what happened, on whichever model
             produced it.
         """
-        mutation = await self.call(workspace, message, program_id, self.model)
-        if mutation.status != "exec_error" or not self.fallback:
+        # Read here, not at startup: the model is allowed to change under a
+        # running campaign, and a round asks for whatever it is now.
+        asked = self.model or model()
+        retry = fallback() if self.fallback is None else self.fallback
+        mutation = await self.call(workspace, message, program_id, asked)
+        if mutation.status != "exec_error" or not retry:
             return mutation
         LOGGER.warning(
             "codex call for %s failed on %s (%s); retrying on %s",
             program_id,
-            self.model,
+            asked,
             mutation.reason[:120],
-            self.fallback,
+            retry,
         )
         log = workspace / "codex.jsonl"
-        log.replace(log.with_name(f"codex.{self.model}.failed.jsonl"))
-        retried = await self.call(workspace, message, program_id, self.fallback)
+        log.replace(log.with_name(f"codex.{asked}.failed.jsonl"))
+        retried = await self.call(workspace, message, program_id, retry)
         return retried.model_copy(
             update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
         )
