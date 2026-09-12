@@ -887,8 +887,16 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
     ``main``, and it never runs with ``--dry-run``: a dirty-``src`` check or
     a live wandb run would otherwise have to be arranged just to reach the
     check this test is about.
+
+    The typo goes in an ``.env`` of this test's own, because that file is
+    where the slug is chosen: `mutate.model` reloads it with ``override=True``
+    on every read, so a slug set any other way -- a patched constant, an
+    exported variable -- is overwritten by the host's real file before
+    ``main`` ever sees it.
     """
-    monkeypatch.setattr(config, "CODEX_MODEL", "gpt-5.6-astra")
+    env = tmp_path / ".env"
+    env.write_text("CAMPAIGN_CODEX_MODEL=gpt-5.6-astra\n", encoding="utf-8")
+    monkeypatch.setattr(mutate, "ENV", env)
     monkeypatch.setattr(
         mutate,
         "MODEL_CATALOG_COMMAND",
@@ -902,10 +910,16 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
 def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The run id is the model and the revision, so a restart lands on the same run."""
+    """The run id is the revision alone, so a restart lands on the same run.
+
+    The model was in the name until it became a thing `.env` chooses at the
+    call. A wandb id is fixed for the life of the run, so a name carrying a
+    value that can move without a restart is wrong from the first round that
+    moves it, and there is no correcting it afterwards.
+    """
     repo = _repository(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "ROOT", tmp_path)
-    expected = f"{config.CODEX_MODEL}-{repo.head.commit.hexsha[:7]}"
+    expected = repo.head.commit.hexsha[:7]
 
     first = loop._open_run(dry_run=True)
     first.finish()
@@ -914,6 +928,7 @@ def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
 
     assert first.name == expected and first.id == expected
     assert second.id == first.id
+    assert config.CODEX_MODEL not in first.id
 
 
 def test_a_restart_resumes_state_json_and_champion_json(

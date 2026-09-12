@@ -72,6 +72,8 @@ from kaggriculture.campaign.mutate import (
     FakeMutator,
     Mutation,
     Mutator,
+    fallback,
+    model,
     validate_model,
 )
 from kaggriculture.campaign.pool import Pool
@@ -92,9 +94,12 @@ THREADS = config.SESSIONS + 1
 SEED_ID = config.SEED_ID
 
 # What the wandb run records as its configuration: spec section 8's table.
+# The two model slugs are not here: they are chosen in `.env` at the call, so
+# the constant beside them is a default rather than a fact about this run.
+# `_open_run` reads them through the accessors instead.
 HYPERPARAMETERS = (
     "SESSIONS ROUNDS_PER_SESSION GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
-    "STAGNATION_SESSIONS CODEX_MODEL CODEX_FALLBACK_MODEL"
+    "STAGNATION_SESSIONS"
 ).split()
 
 # Prepended to the instruction under stagnation, so the message says that this
@@ -125,10 +130,12 @@ def main(argv: list[str] | None = None) -> None:
     else:
         # A typo'd model is hundreds of failed sessions discovered one at a
         # time; caught here, before the run opens or a call is ever made.
-        validate_model(config.CODEX_MODEL)
-        if config.CODEX_FALLBACK_MODEL:
-            validate_model(config.CODEX_FALLBACK_MODEL)
-    # 1. wandb, named for the model and the code that produced the run.
+        # Through the accessors, because `.env` is where the slug is chosen
+        # now: validating the constant would pass a run that never uses it.
+        validate_model(model())
+        if fallback():
+            validate_model(fallback())
+    # 1. wandb, named for the revision of the code that produced the run.
     log = _open_run(dry_run=args.dry_run)
     mutator: Mutator = (
         FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
@@ -177,12 +184,20 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _open_run(dry_run: bool) -> wandb.Run:
-    """Open the run this campaign logs to, named for the model and the revision.
+    """Open the run this campaign logs to, named for the revision that made it.
 
     Two axes, because a session is many rounds now: everything a round
     produces is stepped by ``calls`` and everything a session or a gate
     produces by ``sessions``. One axis for both would file five rounds under
     one session number and keep the last.
+
+    The revision alone. The model used to be in the name too, from when it
+    was a constant compiled into the run; it is chosen in `.env` at the call
+    now and can change without a restart, so a name carrying it would be
+    wrong from the first round that moved it -- and a wandb id is fixed for
+    the life of the run, so there is no renaming it afterwards. The model
+    this run opened on is recorded in the run config, and `calls/model` is
+    logged per call and is the truth about any one of them.
 
     Exits on uncommitted changes under ``src/``: a run named by a hash has to
     be that hash.
@@ -193,7 +208,8 @@ def _open_run(dry_run: bool) -> wandb.Run:
     dirty = Git(config.ROOT).status("--porcelain", "--", "src")
     if dirty:
         raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
-    name = f"{config.CODEX_MODEL}-{Repo(config.ROOT).head.commit.hexsha[:7]}"
+    started_on = model()
+    name = Repo(config.ROOT).head.commit.hexsha[:7]
     log = wandb.init(
         entity=config.WANDB_ENTITY,
         project=config.WANDB_PROJECT,
@@ -201,7 +217,11 @@ def _open_run(dry_run: bool) -> wandb.Run:
         name=name,
         resume="allow",
         mode="disabled" if dry_run else "online",
-        config={key: getattr(config, key) for key in HYPERPARAMETERS},
+        config={
+            **{key: getattr(config, key) for key in HYPERPARAMETERS},
+            "CODEX_MODEL": started_on,
+            "CODEX_FALLBACK_MODEL": fallback(),
+        },
     )
     log.define_metric("sessions")
     log.define_metric("calls")

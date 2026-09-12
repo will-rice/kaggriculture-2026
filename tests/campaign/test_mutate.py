@@ -328,7 +328,20 @@ def test_the_reasoning_effort_is_passed_on_every_call(
     Exercised through a real ``codex`` on PATH rather than a substituted
     COMMAND, because the flags are only appended when the command *is* codex
     -- which is exactly the branch a substituted COMMAND skips.
+
+    `.env` is pointed at an empty file of this test's own and the variable is
+    removed from the environment, so `mutate.model` falls through to the
+    constant and the assertion below is about the flag being passed rather
+    than about whichever slug the host happens to be running today. Both
+    halves are needed: `load_dotenv` only ever adds to `os.environ`, so any
+    earlier read of the real `.env` -- this process makes one per call --
+    leaves the host's slug set for the life of the interpreter, and moving
+    `ENV` afterwards cannot take it back out.
     """
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("CAMPAIGN_CODEX_FALLBACK_MODEL", raising=False)
     box = workspace(tmp_path)
     binaries = tmp_path / "bin"
     binaries.mkdir()
