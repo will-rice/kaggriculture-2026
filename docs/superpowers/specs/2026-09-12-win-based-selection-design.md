@@ -14,8 +14,9 @@ Date: 2026-09-12. Replaces sections 5.1 and 5.2 of
 - With no promotion, nothing is retained and the search re-converges. Five of 14
   programs in that day's run came from a parent at 0.206 and landed at
   0.180-0.203.
-- `Database.top` ranked on the rating, which tied the best program (0.331) with
-  one at 0.206, so the rank-weighted draw took the worse one half the time.
+- The session's starting program came from a weighted draw ranked on the rating,
+  which tied the best program (0.331) with one at 0.206, so the draw took the
+  worse one half the time.
 - Refusals were logged only when they were not refusals.
 - All 79 programs hold 5,777-6,236 on day 10 against opponents averaging 16,219.
 
@@ -58,27 +59,37 @@ One condition: the Wilson lower bound of `result.rates[champion]` above 0.5, ove
 at least `DECISIVE_GAMES` decisive games. At 32 decisive games that is 22 wins,
 0.688.
 
-The champion is in the pool, so this is directly measured: 16 seeds in both
-seats, both programs in the same games, so the map is shared and the seat swap
-cancels position.
+The champion is in the pool -- the seed is champion zero, so there is always
+one -- and this is therefore directly measured from the first round: 16 seeds in
+both seats, both programs in the same games, so the map is shared and the seat
+swap cancels position.
 
 `DECISIVE_GAMES = 8` blocks 4 to 7 decisive games -- a candidate drawing 78% to
 88% of its games with the champion. Below 4 the interval refuses on its own
 (3/3 is 0.438).
 
-**Cold start.** No champion: the bar is a higher pool win rate than the best
-program in the database.
-
 **Known risk.** Promotion is a ratchet, not a proof of progress, so a chain of
 head-to-head wins can walk around a cycle. Each champion's pool win rate is
 recorded, so drift reads as bars passing while that rate falls.
 
-## Selection
+## Where a session starts
 
-A session starts from a program drawn from `Database.top(DRAW_POOL)`, ranked on
-the pool win rate with the mean bank margin as tie-break, weighted
-`DRAW_DECAY ** rank`. `PARENT_POOL` and `PARENT_DECAY` are renamed: there are no
-parents.
+The champion. Always, and nothing else.
+
+At a cold start the seed is champion zero: scored, written as the champion, and
+in the pool like any other. So there is no pre-champion regime -- every session
+starts from a champion and every candidate plays one.
+
+That deletes the weighted draw over the database's best, which was only ever
+reached before the first promotion and never again once a champion existed. Its
+case was that a search starting from one program "explores with one hand", and
+the other hand was five instructions drawn per session; there is one instruction
+now, and eight concurrent sessions from the same champion are already eight
+independent attempts at it.
+
+The whole search therefore sits on one program at a time, which was already true
+whenever a champion existed. The only escape is a round choosing to rewrite,
+which is what the instruction asks for.
 
 ## What a round is given
 
@@ -134,6 +145,8 @@ is the campaign's job.
 | `Program.started_from`, `Database.children`, `Database.descendants`  | ancestry does not bear on winning                  |
 | `SCRATCH_CHANCE`, `SCRATCH_ID`, `SCRATCH_AGENT`, the stagnation note | lineage machinery                                  |
 | `parent.py` in the round directory                                   | `measure.py` measures the champion                 |
+| `PARENT_POOL`, `PARENT_DECAY`, the weighted draw, `Database.top(k)`  | a session starts from the champion                 |
+| the no-champion branches in `start`, `floor` and `consider`          | the seed is champion zero                          |
 
 `rating.py` itself stays, for `dataset.py`.
 
@@ -160,7 +173,9 @@ and it is cheap because it runs only on a promotion.
 Green and uncommitted:
 
 - `evaluator.score` plays the whole pool.
-- `Database.top` ranks on the win rate.
+- `Database.top` ranks on the win rate rather than the rating. Superseded: the
+  draw it fed is deleted, so `top` goes with it. The rank-0 tie it fixed stops
+  mattering once a session starts from the champion.
 - `Kept` carries the evaluation, standings and gate verdict out of `keep`, so a
   round makes one Bradley-Terry fit where it made three.
 - `consider` logs its reason whether it promotes or refuses.
@@ -172,9 +187,9 @@ Each verified by mutation, not assumed:
 - A decisive head-to-head win over the champion promotes.
 - A candidate drawing nearly every game against the champion does not, however
   its rate reads.
-- With no champion, the first candidate beating the database's best promotes.
-- `Database.top` prefers the program that won more games over one with a higher
-  stored rating.
+- At a cold start the seed is the champion, is in the pool, and is played
+  head-to-head by the first candidate.
+- A session starts from the champion, whatever else the database holds.
 - The round message names one game and carries the chain.
 - Twelve rounds of a session get twelve different games.
 - `measure.py`'s printed rate matches what the gate computes on the same games.
