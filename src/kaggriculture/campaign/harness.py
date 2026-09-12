@@ -608,11 +608,10 @@ def _one(work: Work) -> Game:
     """Play one game on the engine port. Runs in a fresh process per game.
 
     Playing a candidate executes it, and a candidate is evolved source that may
-    write files, so the game runs inside a directory of its own. This is the one
-    place every execution path -- fast, deep, and a sandbox's own
-    ``campaign play`` -- passes through, so sandboxing here sandboxes all of
-    them. Both sources are resolved to absolute paths first, because a relative
-    one stops resolving the moment the directory changes.
+    write files, so the game runs inside a directory of its own -- given by the
+    pool that submitted it, not taken here. Both sources are resolved to
+    absolute paths first, because a relative one stops resolving the moment
+    that directory changes.
     """
     agent_path, opponent_name, opponent_path, seed, seat, days = work
     resolved = (
@@ -624,7 +623,7 @@ def _one(work: Work) -> Game:
         days,
     )
     try:
-        return pools.sandboxed(lambda: _play_one(resolved))
+        return _play_one(resolved)
     except Exception as error:
         # A process pool sends the exception back without the frames that
         # raised it, so a failure here reaches the loop as a bare `IndexError`
@@ -847,7 +846,7 @@ def _replay(seat_zero: str, seat_one: str, seed: int) -> tuple[int, int]:
 
 
 def _reference(work: tuple[str, str, int]) -> tuple[int, int]:
-    """Run one reference-engine game in a scratch directory. Runs in a child."""
+    """Run one reference-engine game. Runs in a child, in its own directory."""
     seat_zero, seat_one, seed = work
     sources = (str(Path(seat_zero).resolve()), str(Path(seat_one).resolve()))
     return arena.run_banks(*sources, seed)
@@ -875,12 +874,11 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     Returns:
         What happened: whether it loaded, its bank, its worst call, any failure.
     """
-    with pools.workers(1) as executor:
-        return executor.submit(_checked, str(Path(agent).resolve()), steps).result()
+    return pools.isolated(_check_in_child, str(Path(agent).resolve()), steps)
 
 
-def _checked(agent: str, steps: int) -> CheckReport:
-    """Check the agent in a directory of its own. Runs in a child.
+def _check_in_child(agent: str, steps: int) -> CheckReport:
+    """`check`'s body, as `isolated` runs it: in a child, in its own directory.
 
     A child, because the sandbox is a working directory and a working
     directory is the whole process's. The first version moved the *caller's*,
@@ -890,8 +888,10 @@ def _checked(agent: str, steps: int) -> CheckReport:
     and the check then removed it from under them. The campaign died on
     `FileNotFoundError: /tmp/campaign-check-56ludna7` an hour after the
     isolation was added to stop a harvested agent writing into the repository.
+
+    A path as a string and a plain int, because both cross to the child.
     """
-    return pools.sandboxed(lambda: _check(Path(agent), steps))
+    return _check(Path(agent), steps)
 
 
 def _check(agent: Path, steps: int) -> CheckReport:

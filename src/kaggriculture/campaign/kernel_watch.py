@@ -442,7 +442,7 @@ def inline_written(source: str, written: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def resolve_in_sandbox(source: str) -> object:
+def resolve_in_sandbox(source: str) -> str:
     """Run the engine's loader over untrusted source from a scratch directory.
 
     Resolving means EXECUTING it, so a stranger's code gets two things it must
@@ -467,14 +467,31 @@ def resolve_in_sandbox(source: str) -> object:
         source: Candidate agent source.
 
     Returns:
-        The callable the loader selects.
+        The name of the callable the loader selects.
+    """
+    return pools.isolated(entrypoint_name, source)
+
+
+def entrypoint_name(source: str) -> str:
+    """The name of the callable the loader selects. Runs in `isolated`'s child.
+
+    A name rather than the callable, because this crosses a process boundary
+    and a freshly-imported function does not pickle. Both callers only ever
+    wanted the name or the fact that one resolved at all.
+
+    Args:
+        source: Candidate agent source.
+
+    Returns:
+        The selected callable's name.
     """
     from kaggle_environments.agent import get_last_callable
 
     try:
-        return pools.sandboxed(lambda: get_last_callable(source, path="main.py"))
+        selected = get_last_callable(source, path="main.py")
     except SystemExit as exit_call:
         raise RuntimeError(f"source called sys.exit({exit_call.code})") from None
+    return getattr(selected, "__name__", repr(selected))
 
 
 def loadable(source: str) -> bool:
@@ -594,8 +611,7 @@ def resolved_entrypoint(path: Path) -> str:
         The selected callable's name. These artifacts shadow ``agent``, so the
         surviving definition is often not the one that plays.
     """
-    selected = resolve_in_sandbox(path.read_text(encoding="utf-8"))
-    return getattr(selected, "__name__", repr(selected))
+    return resolve_in_sandbox(path.read_text(encoding="utf-8"))
 
 
 def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float, int]:
@@ -630,8 +646,8 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     # directories included -- stops resolving the moment the sandbox does.
     absolute = path.resolve()
     seeds = tuple(range(700_000, 700_000 + gate_seeds))
-    rates, _ = pools.sandboxed(
-        lambda: score_field(absolute, seeds, workers, list(roster.TRAINING))
+    rates, _ = pools.isolated(
+        score_field, absolute, seeds, workers, list(roster.TRAINING)
     )
     games = len(rates) * len(seeds) * 2
     equal = sum(rates.values()) / len(rates)
