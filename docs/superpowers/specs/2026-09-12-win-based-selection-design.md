@@ -9,27 +9,37 @@ Date: 2026-09-12. Replaces sections 5.1, 5.2 and the prompt half of section 4 of
 champion = seed                        # a file on disk, and a row
 
 8 sessions in parallel, forever:
-    program = champion
+    current = champion                 # the program being edited
     for 12 rounds:
-        game    = one of `program`'s own recorded games, a different one each round
-        message = the game's rules
-                + that game's episode key and the query that reads it
-                + the chain: what each earlier round of this session changed,
-                  and the win rate that came back
-                + "Write a program that beats the opponent."
 
-        file    = codex(message)                   # writes one file, stops
-        if not valid(file):
+        # one season `current` played, a different one each round
+        episode   = next(episodes_of(current))
+
+        message   = RULES_OF_KAGGRICULTURE
+                  + episode.key + the query that reads it out of the database
+                  + the chain: what each earlier round of this session changed,
+                    and the win rate that came back
+                  + "Write a program that beats the opponent."
+
+        candidate = codex(message)                 # writes one file, stops
+        if not valid(candidate):
             row(reason); continue                  # the next round is told
 
-        games   = play(file, publics + champion, 16 seeds, both seats)
-        record(games); row(id, change, rate)
-        program = file                             # the next round edits this
+        seasons   = play(candidate, publics + champion, 16 seeds, both seats)
+        rate      = wins(seasons) / len(seasons)
+        record(seasons); row(candidate.id, change, rate)
+
+        current   = candidate                      # the next round edits this
 
         if wilson_low(rate vs champion) > 0.5 and decisive vs champion >= 8:
-            champion = file
+            champion = candidate
             break
 ```
+
+`episode` is one recorded season, `current` is the file being edited, `candidate`
+is what the round wrote. "The opponent" in the instruction is whoever is across
+the table in a scored game, never the opponent in `episode`: the round is not
+being pointed at that agent, and nothing in the message names one.
 
 Everything below is that in detail. Nothing else is in scope.
 
