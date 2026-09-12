@@ -143,42 +143,82 @@ session see twelve maps.
 Variety rather than depth, and the division of labour is the reason. The
 campaign's job is to stop the search entrenching on one map: a change that helps
 only the map that motivated it gets no second round to build on. Verification is
-already the round's own -- `measure.py` sits in its directory and plays all
-sixteen seeds in both seats, paired, whenever it wants -- so holding a seed for
-twelve rounds would have given the campaign's scarce feedback to depth the round
-can get for itself, and left variety to whether it went looking.
+the round's own, with `measure.py` in its directory.
 
 This makes the chain load-bearing rather than a nicety. Twelve rounds on twelve
 maps are twelve independent attempts unless something ties them together, and the
 only thing that does is what each round changed and the win rate it got. So: for
-each earlier round on this lineage, what it changed and the win rate that came
-back. It needs:
+each round before it in this session, what it changed and the win rate that came
+back.
 
-- `Program.change`, a short description, taken from the docstring at the top of
-  the file the round wrote.
-- The round prompt asking for that docstring again. It asked once and the line
-  was cut on 2026-09-12 while trimming instructions about how to work; this is a
-  record of what was done, which is different.
+The chain is the session's own record, held in the session, not a query over a
+lineage graph. It needs a short description of what each round changed, taken
+from the docstring at the top of the file that round wrote -- which means the
+round prompt asks for that docstring again. It asked once and the line was cut
+earlier on 2026-09-12 while trimming instructions about _how to work_; a record
+of what was done is a different thing.
 
-`compose` already receives `siblings` and only counts them for a log line.
+### No lineage
+
+Nothing records or consults what came from what. `Program.started_from`,
+`Database.children`, `Database.descendants`, the scratch lineage
+(`SCRATCH_CHANCE`, `SCRATCH_ID`, `SCRATCH_AGENT`) and the stagnation note are all
+deleted. A program's ancestry has no bearing on whether it wins, which is the
+only thing being selected on.
+
+A round still edits a file, and that file is whatever the round before it in the
+session produced -- but that is the session's local state, not a recorded
+relation, and nothing downstream can ask about it.
+
+What goes with the scratch lineage is the campaign's only mechanism for starting
+outside the seed's basin, and that basin is where all 79 programs sat in a
+460-coin band. The replacement is the instruction: "Write a program that beats the
+opponent" permits a rewrite where "finish every season with a larger bank" asked
+for an edit. The escape belongs in what a round is asked for, not in a special
+category of program.
+
+### What `measure.py` measures
+
+The champion, on `GATE_SEEDS` seeds in both seats: 32 games, about twenty
+seconds at five workers. Before there is a champion, the best program in the
+database.
+
+It compared the round's program against `parent.py`, a copy of whatever the round
+was handed. That is gone with the rest of the lineage, and what replaces it is
+better: the head-to-head rate against the champion, with its Wilson interval, is
+_exactly_ promotion condition 2. The round's local tool and the gate's bar become
+the same statistic, computable in twenty seconds, so a round can check the real
+thing instead of a proxy for it.
+
+`--seeds` trades time for tightness. Playing the whole pool is 1,088 games and
+nine minutes, which is too slow to iterate against and is the campaign's job
+anyway.
 
 ### Selection
 
-Parents are drawn from `Database.top(PARENT_POOL)` ranked on the pool win rate,
-weighted `PARENT_DECAY ** rank`. The rank-0 tie is what this fixes.
+A session starts from a program drawn from `Database.top(DRAW_POOL)`, ranked on
+the pool win rate, weighted `DRAW_DECAY ** rank`. The rank-0 tie is what this
+fixes.
+
+`PARENT_POOL` and `PARENT_DECAY` are renamed: with no lineage there are no
+parents, only the best programs there are and how sharply the draw favours
+them.
 
 ## What is deleted
 
-| deleted | why |
-| --- | --- |
-| `rating` from the campaign path | the design is balanced; the win rate is sufficient |
-| `field.json`, `rating.Field` | stored pairings existed only to connect the fit |
-| `gate.refresh`, the startup anchor pairings | nothing needs a connected graph now |
-| `GATE_ANCHORS` as a rating origin, `_anchored` | no additive constant left to pin |
-| `GATE_OPPONENTS`, `GATE_CONTENDERS`, `must_play`, `Pool.sample` | everyone is played |
-| `Program.rating`, `Program.place` | nothing selects or promotes on them |
-| the `place == 1` gate and its paired-margin test | replaced by the two conditions above |
-| the frozen `field` win rate as a selection signal | ignores 22 of 34 opponents |
+| deleted                                                              | why                                                   |
+| -------------------------------------------------------------------- | ----------------------------------------------------- |
+| `rating` from the campaign path                                      | the design is balanced; the win rate is sufficient    |
+| `field.json`, `rating.Field`                                         | stored pairings existed only to connect the fit       |
+| `gate.refresh`, the startup anchor pairings                          | nothing needs a connected graph now                   |
+| `GATE_ANCHORS` as a rating origin, `_anchored`                       | no additive constant left to pin                      |
+| `GATE_OPPONENTS`, `GATE_CONTENDERS`, `must_play`, `Pool.sample`      | everyone is played                                    |
+| `Program.rating`, `Program.place`                                    | nothing selects or promotes on them                   |
+| `Program.started_from`, `Database.children`, `Database.descendants`  | ancestry does not bear on winning                     |
+| `SCRATCH_CHANCE`, `SCRATCH_ID`, `SCRATCH_AGENT`, the stagnation note | lineage machinery; the instruction carries the escape |
+| `parent.py` in the round directory                                   | `measure.py` measures the champion now                |
+| the `place == 1` gate and its paired-margin test                     | replaced by the two conditions above                  |
+| the frozen `field` win rate as a selection signal                    | ignores 22 of 34 opponents                            |
 
 `rating.py` itself stays, for `dataset.py`.
 
@@ -216,6 +256,11 @@ by mutation rather than assumed:
   what each changed and scored.
 - Twelve rounds of a session are given twelve different games, so a seed held
   across rounds fails the test.
+- `measure.py` reports the head-to-head rate against the champion, and the
+  number it prints matches what the gate computes for condition 2 on the same
+  games.
+- Nothing in the campaign reads `started_from`, and a program can be scored,
+  ranked and promoted without it.
 - No module outside `dataset.py` imports `rating`.
 
 ## Seed robustness, and what carries it
@@ -236,7 +281,7 @@ of them is obviously the one doing the work.
 - **Feedback rounds are different maps.** Twelve rounds, twelve seeds, so
   nothing gets twelve consecutive attempts at entrenching on one.
 
-What is deliberately *not* here: a confirmation pass on a fresh block before
+What is deliberately _not_ here: a confirmation pass on a fresh block before
 promoting. It is the textbook winner's-curse guard and a two-stage gate was
 deleted once already, because its cheap stage was 8 seeds and 78 of 471 programs
 topped it with none surviving the deep look. The four mechanisms above are the
