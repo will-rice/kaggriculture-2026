@@ -77,9 +77,22 @@ ten to twenty-five. The rating cost an additive constant that is undefined
 `field.json` and the three unplayable champions), and 0.745 of fit noise on an
 unchanged agent -- to save 320 games.
 
-This makes the pool's size a cost multiplier where it used to be free: 60
-opponents is 16 minutes an evaluation and 100 is 27. The cap on the pool is
-load-bearing from here.
+The gate's opponents are every public agent there is, and that is not negotiable
+against cost. A subset is what created the need for a rating, and capping the
+public half of the pool would be the same subset chosen once instead of per
+candidate -- with the cap deciding which opponents a program is never measured
+against, which is the choice the rating existed to paper over.
+
+So the pool's size becomes a linear cost on every evaluation where it used to be
+free: 34 opponents is 9.1 minutes, 60 is 16, 100 is 27, and harvest added 9 in a
+day. That cost is absorbed on the other axes -- `GATE_SEEDS`, `SESSIONS`, the
+worker split -- or by accepting longer evaluations, which are still short against
+a codex call. It is not absorbed by playing fewer opponents.
+
+The trade to watch is seeds against opponents at a fixed time budget: seeds buy
+resolution on the head-to-head bar that decides promotions, opponents buy breadth
+on the win rate that decides selection. Both are real; the second is fixed by the
+field and only the first is ours to set.
 
 Bradley-Terry stays in `dataset.py`, fitted over the ladder corpus, where the
 48,337 recorded games were paired by Kaggle rather than by us and the graph
