@@ -66,31 +66,38 @@ def test_a_program_with_no_model_is_a_bug_not_a_legacy_case() -> None:
         )
 
 
-def test_top_ranks_by_rating(tmp_path: Path) -> None:
-    """`top` is the best programs by the measure the gate promotes on.
+def test_top_ranks_by_games_won(tmp_path: Path) -> None:
+    """`top` is the programs that won the most, which is the objective.
 
-    It picks who the exam block is spent on and what a session starts from,
-    and both want the same answer as the gate. Ranking on the mean win rate
-    instead had the search climbing a different hill: over 184 rated programs
-    the campaign peaked around the fiftieth and wandered after.
+    It decides what a session starts from. It ranked on the Bradley-Terry
+    rating until 2026-09-12, when every candidate began playing the whole pool
+    on the same seeds in both seats -- which makes the rate comparable directly
+    and leaves the rating estimating something already measured.
+
+    The rating also stopped separating the top. Measured that day: the best
+    program the campaign had produced tied on rating with one winning 12.5
+    points fewer games, so the rank-weighted draw took the worse one half the
+    time; the second and third best by games won sat at rating ranks 14 and 10,
+    outside the parent pool.
     """
     db = make(tmp_path)
-    # Fitness and rating deliberately disagree: `b` wins more games, `c` wins
-    # them against stronger opponents, and a rating is what says so.
+    # Deliberately disagreeing: `c` has the rating, `b` won the games.
     program(db, "a", 0.1, rating=-2.0)
     program(db, "b", 0.7, rating=0.1)
     program(db, "c", 0.4, rating=1.5)
 
-    assert [p.id for p in db.top(2)] == ["c", "b"]
+    assert [p.id for p in db.top(2)] == ["b", "c"]
 
 
-def test_a_program_with_no_rating_sorts_below_every_rated_one(
+def test_an_unrated_program_is_ranked_on_what_it_won(
     tmp_path: Path,
 ) -> None:
-    """The seed has none: it is scored before any pool is loaded.
+    """A missing rating is no longer a reason to sort last.
 
-    Sorting it above the rated ones would make every session start from the
-    program nothing has been measured about.
+    The seed has no rating -- it is scored before any pool is loaded -- and
+    while `top` ranked on the rating that put it below every rated program
+    however many games it won. It ranks on games won now, so the seed competes
+    on the same terms as everything else and an absent rating decides nothing.
     """
     db = make(tmp_path)
     program(db, "rated_badly", 0.0, rating=-9.0)
@@ -106,7 +113,7 @@ def test_a_program_with_no_rating_sorts_below_every_rated_one(
     )
     db.add(unrated)
 
-    assert [p.id for p in db.top(2)] == ["rated_badly", "seed"]
+    assert [p.id for p in db.top(2)] == ["seed", "rated_badly"]
 
 
 def test_the_log_survives_a_restart(tmp_path: Path) -> None:

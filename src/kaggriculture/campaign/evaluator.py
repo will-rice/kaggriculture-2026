@@ -249,13 +249,28 @@ def score(
             failed evaluation, never a zero score, so this propagates.
     """
     measured = opponents(pool, program_id, agent)
-    # A sample, not the pool. Nothing leaves the pool any more, so it is
-    # everything the campaign has produced or harvested and a candidate cannot
-    # play all of it -- sixty opponents is nearly four thousand games for one
-    # verdict. A rating does not need it to: the fit spans every pairing on
-    # the record, so a candidate adds sixteen edges and is placed against the
-    # rest through them.
-    names = measured.sample(standings or {}, rng, program_id, always)
+    # The whole pool, not a sample of it, and that is what lets a win rate be
+    # the answer on its own.
+    #
+    # It was a draw of `GATE_OPPONENTS` from the pool, and the draw is the only
+    # reason this ever needed a Bradley-Terry fit: two candidates measured
+    # against different samples have win rates that are not comparable, so a
+    # rating was fitted across every pairing on the record to place them
+    # against each other through opponents neither had played. That bought a
+    # rating whose additive constant is undefined, a dependence on other
+    # agents' stored pairings, and 0.745 of fit noise on an unchanged agent --
+    # to avoid 320 games.
+    #
+    # Measured 2026-09-12: 24 of 34 opponents is 768 games and 6.4 minutes at
+    # five workers; all 34 is 1,088 games and 9.1 minutes, against a codex call
+    # that takes ten to twenty-five. Played by everyone on the same seeds in
+    # both seats, the design is complete and balanced, and the win rate is then
+    # the whole of what a rating was estimating.
+    #
+    # This does make the pool's size a cost multiplier where it used to be
+    # free: sixty opponents is sixteen minutes an evaluation and a hundred is
+    # twenty-seven, so the cap on the pool is load-bearing now.
+    names = measured.names()
     games = harness.play(agent, names, list(seeds), workers, days=True, pool=pool_file)
     rates = _rates(games, names)
     contested = _contested(games, names)

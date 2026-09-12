@@ -45,6 +45,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 import wandb
 from git import Git, Repo
@@ -235,6 +236,30 @@ def _open_run(dry_run: bool) -> wandb.Run:
 def state_file(paths: config.Run) -> Path:
     """Where the state a restart resumes from lives, beside the database."""
     return paths.state
+
+
+class Kept(NamedTuple):
+    """What a round produced, once it has been scored and put to the gate.
+
+    One object rather than a widening tuple, because every field of it is
+    something a caller was recomputing. `table` in particular is a whole
+    Bradley-Terry fit: `round` made one for its metrics, `keep` made one for
+    the program record, and `session` made a third to ask the gate a question
+    `keep` had already answered.
+
+    Attributes:
+        source: The stored program, on disk.
+        name: Its database id.
+        result: What the loop's evaluation of it said.
+        table: The standings that evaluation was fitted into, itself included.
+        cleared: Whether the gate promoted it.
+    """
+
+    source: Path
+    name: str
+    result: Result
+    table: dict[str, float]
+    cleared: bool
 
 
 class State(BaseModel):
@@ -542,68 +567,44 @@ class Campaign:
             note = STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
             instruction = note + instruction
         rounds = 0
-        # The seed this session works on, held for all of its rounds so the
-        # proposer gets several attempts at the same game rather than one look
-        # at each of many. It is re-played by every round's program, so what a
-        # round is shown is its own edit on the map the last round saw.
+        # A different game every round, so a session's rounds see as many maps as
+        # it has rounds and no change gets twelve consecutive attempts at
+        # entrenching on one. The campaign's feedback buys variety; verification
+        # is the round's own, with `measure.py` in its directory.
         #
-        # Held by seed rather than by its index in the list: `games.ordered`
-        # sorts matchups by win rate every evaluation, so the nth entry is a
-        # different opponent from one round to the next, while a seed is the
-        # same map and the same prices every time it is played.
-        # None until the first evaluation has been drawn from.
-        seed: int | None = None
-        for _ in range(config.ROUNDS_PER_SESSION):
+        # The seed was held across a session for a while, which gave the scarce
+        # channel to depth the round can get for itself.
+        for turn in range(config.ROUNDS_PER_SESSION):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
-            # `games.played` keys them the way the database does, name
-            # included; `compose` already has the name and takes the rest.
+            # One game played by the program this round is editing -- not the
+            # champion's, once they differ. `games.played` keys them the way the
+            # database does, name included; `compose` has the name already.
             scored = [
                 (matchup, season, game)
                 for matchup, season, _, game in games.played(result, name)
             ]
-            if seed is None and scored:
-                seed = scored[0][2].seed
-            # The held seed as this program has just played it. A seed block
-            # rotates every `SEED_ROTATION` candidates, so a session can outlive
-            # its seed; when that happens the next game in order stands in and
-            # becomes the one the rest of the session works on.
-            playing = next(
-                (one for one in scored if one[2].seed == seed),
-                scored[0] if scored else None,
-            )
-            if playing is not None:
-                seed = playing[2].seed
+            playing = scored[turn % len(scored)] if scored else None
             message = prompt.compose(name, playing, failures, siblings, instruction)
-            # The floor as it stands *before* the round, because that is the
-            # one the round's result is measured against. Read after instead
-            # and a round that promoted is asked whether it beats itself: the
-            # gate inside `round` has already enrolled it, so `floor()` names
-            # this very program, `result` has no games against it, and the
-            # question is incoherent. It went unnoticed while the answer was
-            # accidentally right -- the freshly enrolled champion had no
-            # pairings, so the fit gave it a rating this program cleared.
-            floor = self.floor()
             outcome = await self.round(source, name, result, message, drawn)
             rounds += 1
             if outcome is None:
                 break
-            source, name, result = outcome
-            cleared, why = gate.promotion(
-                gate.standing(name, result.rates, 2 * config.GATE_SEEDS, self.paths),
-                name,
-                floor,
-                decisive=result.decisive.get(floor or "", 0),
-                over_champion=result.margins.get(floor or ""),
-            )
+            source, name, result, cleared = outcome
+            # The gate already ran, inside the round, under the promotions
+            # lock, and said so. This used to re-ask it here: a second
+            # `gate.standing` -- a whole Bradley-Terry fit -- and a second
+            # `gate.promotion` against a `floor` read at a different moment,
+            # which is two sources of truth for one question and three fits a
+            # round between them.
             if cleared:
-                LOGGER.info("%s %s: the session is done", name, why)
+                LOGGER.info("%s promoted: the session is done", name)
                 break
         self.finish(rounds)
 
     async def round(
         self, source: Path, name: str, result: Result, message: str, drawn: str
-    ) -> tuple[Path, str, Result] | None:
+    ) -> tuple[Path, str, Result, bool] | None:
         """One round: one codex call on one file, and the loop's verdict on it.
 
         The call is given a directory holding ``child.py`` and nothing else --
@@ -620,10 +621,10 @@ class Campaign:
             drawn: The name of the drawn instruction, recorded on the program.
 
         Returns:
-            The program the next round continues from, its id and its verdict.
-            That is what this round wrote, or what it started from when the
-            round was rejected. None when the call never ran to a verdict, and
-            the session ends there.
+            The program the next round continues from, its id, its verdict, and
+            whether the gate promoted it. That is what this round wrote, or what
+            it started from when the round was rejected. None when the call
+            never ran to a verdict, and the session ends there.
         """
         program_id = f"p{uuid.uuid4().hex[:12]}"
         # The directory owns its own removal. Written as `mkdtemp` and a
@@ -685,14 +686,14 @@ class Campaign:
         if rated:
             record["database/top_rating"] = max(rated)
         if kept is not None:
-            source, program_id, result = kept
-            del source
+            result = kept.result
             record["calls/fitness"] = result.fitness
             if result.field is not None:
                 record["calls/field"] = result.field
-            table = gate.standing(
-                program_id, result.rates, 2 * config.GATE_SEEDS, self.paths
-            )
+            # The fit `keep` already made. Computing another here was the third
+            # Bradley-Terry fit of the same round.
+            table = kept.table
+            program_id = kept.name
             record["calls/rating"] = table[program_id]
             record["calls/place"] = 1 + sorted(
                 table, key=lambda name: -table[name]
@@ -707,11 +708,13 @@ class Campaign:
         # A rejected round continues from what it started from. Its reason is
         # in the ledger and the next message carries it back, which is worth
         # more than throwing away the rounds that remain.
-        return kept if kept is not None else (source, name, result)
+        if kept is None:
+            return source, name, result, False
+        return kept.source, kept.name, kept.result, kept.cleared
 
     async def keep(
         self, mutation: Mutation, started_from: str, drawn: str, program_id: str
-    ) -> tuple[Path, str, Result] | None:
+    ) -> Kept | None:
         """Validate what a call wrote, score it, insert it, and gate the top K.
 
         A call that never ran to a verdict -- the provider refused, or codex
@@ -726,7 +729,7 @@ class Campaign:
             program_id: The child program id.
 
         Returns:
-            The stored program, its id and its verdict, or None.
+            What the round produced and what the gate said about it, or None.
         """
         if mutation.status == "exec_error":
             LOGGER.warning("%s: no verdict (%s)", program_id, mutation.reason[:200])
@@ -767,12 +770,12 @@ class Campaign:
             )
         )
         LOGGER.info("%s %s gate %.3f", program_id, drawn, result.fitness)
-        await self.consider(program_id, result, table)
-        return stored, program_id, result
+        cleared = await self.consider(program_id, result, table)
+        return Kept(stored, program_id, result, table, cleared)
 
     async def consider(
         self, program_id: str, result: Result, table: dict[str, float]
-    ) -> None:
+    ) -> bool:
         """Promote ``program_id`` if it topped the tournament it was just in.
 
         This is the whole gate. There was a second one -- the best three
@@ -820,7 +823,7 @@ class Campaign:
                         "gate/stale": 1,
                     }
                 )
-                return
+                return False
             verdict, why = gate.promotion(
                 table,
                 program_id,
@@ -828,8 +831,14 @@ class Campaign:
                 decisive=result.decisive.get(floor or "", 0),
                 over_champion=result.margins.get(floor or ""),
             )
+            # Logged either way. `why` is the only account of what the gate
+            # decided and it used to be written only when the answer was yes:
+            # 79 programs were turned away with a precise reason -- "25 of 28
+            # at -1.983, below <agent> at +1.634" -- and every copy of it was
+            # discarded, so the absence of a champion had no explanation
+            # anywhere in the log or in wandb.
+            LOGGER.info("%s %s", program_id, why)
             if verdict:
-                LOGGER.info("%s %s", program_id, why)
                 # The file work in a thread; the pool it joins on the loop,
                 # where the other seven workers are reading it.
                 program = self.database.get(program_id)
@@ -884,6 +893,7 @@ class Campaign:
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
             self.log.log(self.promotion_record(result, verdict, baseline, table))
+            return verdict
 
     def floor(self) -> str | None:
         """The champion's name, or None before there is one.
