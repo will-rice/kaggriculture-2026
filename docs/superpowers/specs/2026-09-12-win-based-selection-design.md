@@ -242,58 +242,75 @@ Nothing records or consults what came from what. A round edits whatever the roun
 before it produced, but that is the session's local state and nothing downstream
 can ask about it.
 
-## Module structure
+## The rebuild
 
-The loop's transitive imports today: 22 modules, 8,773 lines.
+`src/kaggriculture/campaign/` is replaced in place. Nothing is carried over as
+code; what is carried over is the list of behaviours below, each of which is a
+failure that already happened.
 
-| group           | lines | modules                                                                                                                          |
-| --------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------- |
-| core mechanism  | 6,427 | loop, harness, config, games, mutate, gate, validate, evaluator, prompt, archive, pool, copycheck, measure, arena, pools, roster |
-| harvest         | 980   | kernel_watch, harvest, field_gate                                                                                                |
-| corpus analysis | 1,166 | dataset, rating, tapes                                                                                                           |
-| dead            | 149   | evidence                                                                                                                         |
+The case for rebuilding rather than refactoring is the ratio: the mechanism above
+is 25 lines, the package is 9,135 across 25 modules, and the tests are 8,422 --
+of which 4,161 describe ratings, opponent sampling, lineage, stagnation, the
+scratch lineage, the draw and a two-condition gate, all deleted here. Those tests
+do not shrink, they vanish with what they were describing. `test_loop.py` alone is
+2,148 lines, a quarter of the suite, for one file holding nine responsibilities.
 
-- **Break the `dataset` coupling.** `harness` uses `dataset.measures`; `games`
-  uses that and `dataset.COLUMNS`. Those two names pull dataset -> tapes ->
-  rating into the loop's graph. Move the measure definitions to the campaign.
-- **`rating` then leaves by itself.** `gate` uses `rating.Field` and
-  `rating.standings`, both deleted; `dataset` becomes its only importer.
-- **Delete `evidence.py`** -- imported by nothing. `strategy.py` stays; the
-  `strategies` script uses it.
-- **Split `loop.py`.** 1,208 lines holding the CLI, the wandb run, resumable
-  state, the campaign object, sessions, rounds, `keep`, `consider`, promotion
-  logging and the harvester. This design rewrites much of it, so the split
-  happens while it is open.
-- `pool` loses `sample` and becomes a name-to-path map. `gate` keeps the bar and
-  the champion's files. `evaluator` keeps per-opponent rates and the head-to-head
-  interval; `margins` fed a deleted tie-break, `hardest` chose a game the round
-  now gets by rotation, `field` is deleted.
+One job per module:
 
-Out of scope, recorded as the next boundary worth questioning: harvest is 980
-lines -- a Kaggle client, notebook parsing, base64 and zlib extraction,
-compiled-kernel builds, a gate of its own -- reached through one hourly coroutine,
-with nothing to do with producing programs.
+| module       | lines | does                                                                                                               |
+| ------------ | ----- | ------------------------------------------------------------------------------------------------------------------ |
+| `pool.py`    | ~60   | the opponent list: name to path, load, save                                                                        |
+| `sandbox.py` | ~50   | the worker pool, one task per child, tempdir and chdir in the child                                                |
+| `play.py`    | ~250  | one game between two files on a seed, both seats; extract the day table                                            |
+| `score.py`   | ~120  | play a candidate against the pool, count wins, the Wilson bar                                                      |
+| `codex.py`   | ~100  | spawn in a process group, pipe the message, kill the group, verify the file changed, recover the reason, fall back |
+| `check.py`   | ~200  | syntax, entrypoint, imports, copy, and a timed play                                                                |
+| `store.py`   | ~200  | the ClickHouse tables: games, days, programs                                                                       |
+| `message.py` | ~120  | compose the round message                                                                                          |
+| `loop.py`    | ~250  | the controller: sessions, rounds, promotion                                                                        |
+| `config.py`  | ~120  | the constants                                                                                                      |
 
-## Deleted
+About 1,550 lines against 6,427 of core today.
 
-| deleted                                                              | why                                               |
-| -------------------------------------------------------------------- | ------------------------------------------------- |
-| `rating` from the campaign path                                      | balanced design; the win rate is sufficient       |
-| `field.json`, `rating.Field`                                         | stored pairings existed only to connect the fit   |
-| `gate.refresh`, the startup anchor pairings                          | nothing needs a connected graph                   |
-| `GATE_ANCHORS` as a rating origin, `_anchored`                       | no additive constant left to pin                  |
-| `GATE_OPPONENTS`, `GATE_CONTENDERS`, `must_play`, `Pool.sample`      | everyone is played                                |
-| `Program.rating`, `place`, `field`, `vendored_field`                 | nothing selects or promotes on them               |
-| `POOL_CHAMPIONS`                                                     | there is one champion                             |
-| the `place == 1` gate and its paired-margin test                     | replaced by the bar above                         |
-| `Program.started_from`, `Database.children`, `Database.descendants`  | ancestry does not bear on winning                 |
-| `PARENT_POOL`, `PARENT_DECAY`, the weighted draw, `Database.top`     | a session starts from the champion                |
-| `SCRATCH_CHANCE`, `SCRATCH_ID`, `SCRATCH_AGENT`, the stagnation note | lineage machinery                                 |
-| `archive.py`, `archive.jsonl`, `champion.json`, `state.json`         | the games database holds programs                 |
-| `Result.margins`, `Result.hardest`                                   | fed a deleted tie-break and a deleted choice      |
-| `parent.py` in the round directory                                   | `measure.py` measures the champion                |
-| `evidence.py`                                                        | imported by nothing                               |
-| the five-step work loop, the aggregate margin, the matchup table     | told a round how to work, or summarised 768 games |
+### What must survive
+
+The tests target these rather than the modules. Every one is a bug that has
+already cost this campaign a run or a measurement:
+
+- Kill the process group, not the process. `codex` spawns children, and a killed
+  call otherwise leaves them burning quota.
+- Verify `child.py` actually changed. A call can exit 0 having written nothing,
+  and the loop then scores the previous program as if it were new.
+- Recover the failure reason from the transcript. Without it a failed round is
+  recorded with no cause.
+- Retry the fallback model once on a capacity refusal.
+- `chdir` only in the child, only inside a `TemporaryDirectory`, and never read
+  `Path.cwd()`.
+- Reject a program that calls `sys.exit` on load, that has its entrypoint
+  shadowed by a later callable, that imports outside the whitelist, or that
+  resembles an opponent it did not start from.
+- A program never plays itself.
+- Play every opponent, never a sample.
+- Log the gate's reason on refusal as well as on success.
+- Every test mutation-verified: break the code, watch it go red.
+
+### The one thing that cannot be verified by reading
+
+`play.py` drives the engine, and a wrong game silently poisons every measurement
+above it. So the old `harness.py` stays on disk until the new `play.py`
+reproduces its banks and day tables over a set of seeds, and only then is it
+deleted.
+
+That is a differential check against an oracle that shares its assumptions, so it
+cannot catch a misreading both versions make. It catches transcription, and that
+is what a rewrite risks.
+
+### Kept as-is
+
+Nothing in `campaign/`. Outside it: the Rust engine and its bindings, `report.py`
+for the Wilson interval, `constants.py`, the `served/` skeleton, and `dataset.py`
+with `rating.py` and `tapes.py` for the ladder corpus, which is a separate
+concern that the loop must not import.
 
 ## Seed robustness
 
@@ -348,12 +365,17 @@ Each verified by mutation, not assumed:
 - No module outside `dataset.py` imports `rating`, and importing `loop` does not
   import `dataset`, `tapes` or `rating`.
 
-## Already implemented
+## Work already done, and its fate
 
-Green and uncommitted:
+Four changes were made to the old package on 2026-09-12 and are green. The
+rebuild discards all four as code; three of them are design decisions that carry
+over, and the fourth was already superseded.
 
-- `evaluator.score` plays the whole pool.
-- `Kept` carries the evaluation and the gate's verdict out of `keep`, so a round
-  makes one Bradley-Terry fit where it made three.
-- `consider` logs its reason whether it promotes or refuses.
-- `Database.top` ranks on the win rate. Superseded: the draw it fed is deleted.
+- `evaluator.score` plays the whole pool -- carried over, as `score.py`.
+- `consider` logs its reason on refusal -- carried over, in the behaviour list.
+- `Kept` collapses three Bradley-Terry fits per round into one -- moot, there are
+  no fits.
+- `Database.top` ranks on the win rate -- moot, the draw it fed is deleted.
+
+The prompt rewritten earlier that day (one game per round, the instruction, no
+work loop) carries over into `message.py` and is already committed as `4824ed7`.
