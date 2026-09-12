@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from kaggriculture.campaign import config, dataset, harness
 
@@ -50,176 +50,7 @@ LOGGER = logging.getLogger(__name__)
 # store before anything noticed.
 DATABASE = config.GAMES_DB
 
-# Counts that are cumulative over a season and can run large; `sold_units`
-# reaches fifteen million in the corpus. The rest are tiles, pens and hands on
-# one day and stay inside sixteen bits.
-WIDE = (
-    "sell_orders",
-    "sold_units",
-    "buy_orders",
-    "bought_units",
-    "seed_orders",
-    "seed_units",
-    "animal_orders",
-    "animal_units",
-    "hire_orders",
-    "land_orders",
-)
-# The only measures that are not whole numbers. `bank` is money and the engine
-# carries it as a float, so it is stored as one even though the corpus happens
-# to hold no fractional bank.
-REAL = ("bank", "plant_age")
 
-
-# The columns each table is written with, named rather than positional. A
-# positional insert keeps working right up until two column counts happen to
-# match and every value lands one to the left.
-COLUMNS = {
-    "episodes": (
-        "episode, kaggle_id, seed, engine, played, team_0, team_1, "
-        "bank_0, bank_1, winner, source"
-    ),
-    "days": "episode, seat, day, team, " + ", ".join(dataset.COLUMNS) + ", source",
-    "holdings": "episode, seat, day, kind, item, count, source",
-    "prices": "episode, day, item, price, stock, source",
-    "orders": "episode, seat, day, hour, verb, item, quantity, source",
-    "moves": "episode, seat, day, hour, actor, verb, argument, source",
-    "candidate": "episode, seat, team, matchup, season, source",
-}
-
-
-def column_type(measure: str) -> str:
-    """The narrowest type that holds every value this measure takes."""
-    if measure in REAL:
-        return "Float32"
-    return "UInt32" if measure in WIDE else "UInt16"
-
-
-def schema(database: str = DATABASE) -> str:
-    """Every table, written from `dataset.COLUMNS` so it cannot drift from it.
-
-    `days` is ordered by source, day, episode and seat, which is the order the
-    questions arrive in: almost everything filters or groups by day, across one
-    source or both. ClickHouse's primary index is that ordering, so a query for
-    one day reads one granule range rather than the table.
-
-    `ReplacingMergeTree` because a champion re-scored is the same program, not a
-    second one. There is no cheap `DELETE` here and there does not need to be:
-    re-recording inserts, and the engine collapses the older row on merge. The
-    ordering key is the identity of a row -- one episode, one seat, one day.
-    """
-    measures = ",\n    ".join(
-        f"{measure} {column_type(measure)}" for measure in dataset.COLUMNS
-    )
-    return f"""
-CREATE TABLE IF NOT EXISTS {database}.episodes (
-    episode    String,
-    kaggle_id  Int64,
-    seed       Int64,
-    engine     LowCardinality(String),
-    played     LowCardinality(String),
-    team_0     LowCardinality(String),
-    team_1     LowCardinality(String),
-    bank_0     Float32,
-    bank_1     Float32,
-    winner     Int8,
-    source     LowCardinality(String),
-    version    UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
-) ENGINE = ReplacingMergeTree(version)
-PARTITION BY source
-ORDER BY (source, episode);
-
-CREATE TABLE IF NOT EXISTS {database}.days (
-    episode    String,
-    seat       UInt8,
-    day        UInt16,
-    team       LowCardinality(String),
-    source     LowCardinality(String),
-    {measures},
-    version    UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
-) ENGINE = ReplacingMergeTree(version)
-PARTITION BY source
-ORDER BY (source, day, episode, seat);
-
-CREATE TABLE IF NOT EXISTS {database}.holdings (
-    episode    String,
-    seat       UInt8,
-    day        UInt16,
-    kind       LowCardinality(String),
-    item       LowCardinality(String),
-    count      Int32,
-    source     LowCardinality(String),
-    version    UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
-) ENGINE = ReplacingMergeTree(version)
-PARTITION BY source
-ORDER BY (source, episode, seat, day, kind, item);
-
-CREATE TABLE IF NOT EXISTS {database}.prices (
-    episode    String,
-    day        UInt16,
-    item       LowCardinality(String),
-    price      Int32,
-    stock      Int32,
-    source     LowCardinality(String),
-    version    UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
-) ENGINE = ReplacingMergeTree(version)
-PARTITION BY source
-ORDER BY (source, episode, day, item);
-
-CREATE TABLE IF NOT EXISTS {database}.orders (
-    episode    String,
-    seat       UInt8,
-    day        UInt16,
-    hour       UInt8,
-    verb       LowCardinality(String),
-    item       LowCardinality(String),
-    quantity   Int32,
-    source     LowCardinality(String)
-) ENGINE = MergeTree
-PARTITION BY source
-ORDER BY (source, episode, seat, day, hour);
-
-CREATE TABLE IF NOT EXISTS {database}.moves (
-    episode    String,
-    seat       UInt8,
-    day        UInt16,
-    hour       UInt8,
-    -- The farmer is -1 and the hands are 0 upward, so this is signed.
-    actor      Int8,
-    verb       LowCardinality(String),
-    argument   LowCardinality(String),
-    source     LowCardinality(String)
-) ENGINE = MergeTree
-PARTITION BY source
-ORDER BY (source, episode, seat, day, hour);
-
-CREATE TABLE IF NOT EXISTS {database}.teams (
-    team       String,
-    games      UInt32,
-    wins       UInt32,
-    rating     Float64,
-    place      UInt32
-) ENGINE = ReplacingMergeTree
-ORDER BY team;
-
-CREATE TABLE IF NOT EXISTS {database}.candidate (
-    episode    String,
-    seat       UInt8,
-    team       LowCardinality(String),
-    matchup    UInt16,
-    season     UInt16,
-    source     LowCardinality(String),
-    version    UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
-) ENGINE = ReplacingMergeTree(version)
-ORDER BY episode;
-"""
-
-
-# How each measure is written, decided by the same function that decided its
-# column type. `dataset.measures` returns every quantity as a float -- a tile
-# count arrives as `4.0` -- and TabSeparated will not parse "4.0" into a
-# `UInt16`. Reading the cast off `column_type` rather than off a second list
-# means the value written and the column it is written into cannot disagree.
 def text(value: object) -> str:
     """A string column's value; a missing one is empty, never the word None."""
     return "" if value is None else str(value)
@@ -240,31 +71,256 @@ def real(value: object) -> float:
     return 0.0 if value is None else float(str(value))
 
 
-_CAST: tuple[Callable[[object], object], ...] = tuple(
-    real if column_type(measure) == "Float32" else number for measure in dataset.COLUMNS
+class Column(NamedTuple):
+    """One column: how the server stores it, and how a value is written to it.
+
+    The pair is the point. They were two lists before -- a `CREATE TABLE` in
+    one place and a tuple of casts in another -- and they disagreed the first
+    time a column was added, because nothing made them agree. A column that
+    cannot be declared without saying how it is written cannot drift from how
+    it is written.
+
+    Attributes:
+        kind: The ClickHouse type.
+        cast: What a Python value becomes on the wire. `dataset.measures`
+            returns every quantity as a float, so a tile count arrives as
+            `4.0` and TabSeparated will not parse that into a `UInt16`.
+        written: Whether a writer supplies it. `version` is filled by the
+            server and is declared but never sent.
+    """
+
+    kind: str
+    cast: Callable[[object], object] = text
+    written: bool = True
+
+
+# Filled by the server on every insert, so that a re-recorded program's rows
+# replace its earlier ones rather than joining them.
+VERSION = Column("UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))", written=False)
+# Which source a row came from: `ladder` for a recorded game, `campaign` for
+# one this lineage played. Every table carries it and every table is
+# partitioned on it, so a rebuild replaces what it owns and nothing else.
+SOURCE = Column("LowCardinality(String)")
+
+# Counts that are cumulative over a season and can run large; `sold_units`
+# reaches fifteen million in the corpus. The rest are tiles, pens and hands on
+# one day and stay inside sixteen bits.
+WIDE = frozenset(
+    {
+        "sell_orders",
+        "sold_units",
+        "buy_orders",
+        "bought_units",
+        "seed_orders",
+        "seed_units",
+        "animal_orders",
+        "animal_units",
+        "hire_orders",
+        "land_orders",
+    }
 )
+# The only measures that are not whole numbers. `bank` is money and the engine
+# carries it as a float, so it is stored as one even though the corpus happens
+# to hold no fractional bank.
+REAL = frozenset({"bank", "plant_age"})
 
 
-# What each column is written as, for the tables whose values do not already
-# arrive in the right type. `dataset.measures` returns every quantity as a
-# float -- a tile count arrives as `4.0` -- and TabSeparated will not parse
-# "4.0" into a `UInt16`, so the insert fails rather than the field.
+def measure_column(measure: str) -> Column:
+    """The narrowest column that holds every value this measure takes.
+
+    Read off the corpus rather than guessed from the name. Over 1,057,020
+    recorded days nothing is ever negative, `plant_age` is the only measure
+    ever fractional, and `sold_units` reaches 15,002,111 where every other
+    count stays inside sixteen bits.
+    """
+    if measure in REAL:
+        return Column("Float32", real)
+    return Column("UInt32" if measure in WIDE else "UInt16", number)
+
+
+class Table(NamedTuple):
+    """One table: its columns in order, and how the server should keep them.
+
+    Attributes:
+        columns: Name to `Column`, in the order they are declared and written.
+        order: The ordering key, which is ClickHouse's primary index and, for
+            a `ReplacingMergeTree`, the identity of a row.
+        replacing: Whether a later row replaces an earlier one on that key. A
+            champion re-scored is the same program, not a second one.
+        partition: The partition expression, or "" for a table small enough
+            not to want one.
+    """
+
+    columns: dict[str, Column]
+    order: str
+    replacing: bool = True
+    partition: str = "source"
+
+
+# Every table, declared once. The `CREATE TABLE` text, the column list an
+# insert names, the casts a row is written through and the reconciliation of a
+# database built before a column existed are all read from this -- so there is
+# nothing to keep in step, and "the schema and the writer disagree" stops being
+# a thing that can happen rather than a thing a test catches.
 #
-# In `Batch` rather than in either writer, because there are two of them: the
-# loop recording a game it played and the extraction reading one off the
-# ladder. This was a cast in the first, and the second met the same wall the
-# moment it was written.
-CASTS: dict[str, tuple[Callable[[object], object], ...]] = {
-    "days": (text, number, number, text, *_CAST),
-    # A HIRE carries no item and no quantity, and a move may carry no
-    # argument. None reaches TabSeparated as the word "None", which parses
-    # into a String column and fails an integer one -- so the absent ones are
-    # spelled out here rather than discovered a table at a time.
-    "orders": (text, number, number, number, text, text, number),
-    "moves": (text, number, number, number, number, text, text),
-    "prices": (text, number, text, number, number),
-    "holdings": (text, number, number, text, text, number),
+# It was four: a SQL template, a dict of comma-joined column names, a tuple of
+# casts, and a parser that read the types back out of the SQL. They disagreed
+# within the hour and the run died on `No such column source in table
+# games.candidate`.
+TABLES: dict[str, Table] = {
+    "episodes": Table(
+        {
+            "episode": Column("String"),
+            "kaggle_id": Column("Int64", number),
+            "seed": Column("Int64", number),
+            "engine": Column("LowCardinality(String)"),
+            "played": Column("LowCardinality(String)"),
+            "team_0": Column("LowCardinality(String)"),
+            "team_1": Column("LowCardinality(String)"),
+            "bank_0": Column("Float32", real),
+            "bank_1": Column("Float32", real),
+            "winner": Column("Int8", number),
+            "source": SOURCE,
+            "version": VERSION,
+        },
+        order="(source, episode)",
+    ),
+    "days": Table(
+        {
+            "episode": Column("String"),
+            "seat": Column("UInt8", number),
+            "day": Column("UInt16", number),
+            "team": Column("LowCardinality(String)"),
+            **{measure: measure_column(measure) for measure in dataset.COLUMNS},
+            "source": SOURCE,
+            "version": VERSION,
+        },
+        # The order the questions arrive in: almost everything filters or
+        # groups by day, across one source or both, so a query for one day
+        # reads a granule range rather than the table.
+        order="(source, day, episode, seat)",
+    ),
+    "holdings": Table(
+        {
+            "episode": Column("String"),
+            "seat": Column("UInt8", number),
+            "day": Column("UInt16", number),
+            "kind": Column("LowCardinality(String)"),
+            "item": Column("LowCardinality(String)"),
+            "count": Column("Int32", number),
+            "source": SOURCE,
+            "version": VERSION,
+        },
+        order="(source, episode, seat, day, kind, item)",
+    ),
+    "prices": Table(
+        {
+            "episode": Column("String"),
+            "day": Column("UInt16", number),
+            "item": Column("LowCardinality(String)"),
+            "price": Column("Int32", number),
+            "stock": Column("Int32", number),
+            "source": SOURCE,
+            "version": VERSION,
+        },
+        order="(source, episode, day, item)",
+    ),
+    "orders": Table(
+        {
+            "episode": Column("String"),
+            "seat": Column("UInt8", number),
+            "day": Column("UInt16", number),
+            "hour": Column("UInt8", number),
+            "verb": Column("LowCardinality(String)"),
+            # A HIRE carries no item and no quantity, so both are absent
+            # rather than empty, and `text`/`number` say what absent becomes.
+            "item": Column("LowCardinality(String)"),
+            "quantity": Column("Int32", number),
+            "source": SOURCE,
+        },
+        order="(source, episode, seat, day, hour)",
+        replacing=False,
+    ),
+    "moves": Table(
+        {
+            "episode": Column("String"),
+            "seat": Column("UInt8", number),
+            "day": Column("UInt16", number),
+            "hour": Column("UInt8", number),
+            # The farmer is -1 and the hands are 0 upward, so this is signed.
+            "actor": Column("Int8", number),
+            "verb": Column("LowCardinality(String)"),
+            "argument": Column("LowCardinality(String)"),
+            "source": SOURCE,
+        },
+        order="(source, episode, seat, day, hour)",
+        replacing=False,
+    ),
+    "candidate": Table(
+        {
+            "episode": Column("String"),
+            "seat": Column("UInt8", number),
+            "team": Column("LowCardinality(String)"),
+            "matchup": Column("UInt16", number),
+            "season": Column("UInt16", number),
+            "source": SOURCE,
+            "version": VERSION,
+        },
+        # Partitioned like the rest even though every row of it is ours: a
+        # table that carries a source and cannot be swapped a source at a time
+        # is one the rebuild has to special-case, and the special case is the
+        # thing partitioning replaced.
+        order="episode",
+    ),
+    "teams": Table(
+        {
+            "team": Column("String"),
+            "games": Column("UInt32", number),
+            "wins": Column("UInt32", number),
+            "rating": Column("Float64", real),
+            "place": Column("UInt32", number),
+        },
+        order="team",
+        partition="",
+    ),
 }
+
+
+def written(table: str) -> list[str]:
+    """The columns a writer supplies, in order."""
+    return [name for name, column in TABLES[table].columns.items() if column.written]
+
+
+def schema(database: str = DATABASE) -> list[str]:
+    """One `CREATE TABLE` per table, derived from `TABLES`.
+
+    Derived rather than written, so the declaration and everything read off it
+    -- the insert's column list, the casts, the reconciliation -- come from one
+    place and cannot disagree.
+
+    Args:
+        database: The database to declare the tables in.
+
+    Returns:
+        One statement per table, in `TABLES` order.
+    """
+    statements = []
+    for name, table in TABLES.items():
+        columns = ",\n    ".join(
+            f"{column} {spec.kind}" for column, spec in table.columns.items()
+        )
+        engine = "ReplacingMergeTree(version)" if table.replacing else "MergeTree"
+        if table.replacing and "version" not in table.columns:
+            engine = "ReplacingMergeTree"
+        partition = f"PARTITION BY {table.partition}\n" if table.partition else ""
+        statements.append(
+            f"CREATE TABLE IF NOT EXISTS {database}.{name} (\n"
+            f"    {columns}\n"
+            f") ENGINE = {engine}\n"
+            f"{partition}"
+            f"ORDER BY {table.order}"
+        )
+    return statements
 
 
 class Batch:
@@ -287,14 +343,20 @@ class Batch:
         self.rows: dict[str, list[str]] = {}
 
     def add(self, table: str, values: Iterable[object]) -> None:
-        """Hold one row for ``table``, cast to its columns, with the source appended."""
-        casts = CASTS.get(table)
-        cast = (
-            [function(value) for function, value in zip(casts, values, strict=True)]
-            if casts
-            else list(values)
-        )
-        self.rows.setdefault(table, []).append(_row([*cast, self.source]))
+        """Hold one row for ``table``, cast to its own columns.
+
+        The caller supplies every column but `source`, which every table has
+        and every row of one batch shares. `strict` because a row with the
+        wrong number of values is a row every column after the gap lands one
+        to the left of -- which parses, and is wrong.
+        """
+        columns = [
+            spec
+            for name, spec in TABLES[table].columns.items()
+            if spec.written and name != "source"
+        ]
+        row = [spec.cast(value) for spec, value in zip(columns, values, strict=True)]
+        self.rows.setdefault(table, []).append(_row([*row, self.source]))
 
     def send(self, database: str = DATABASE) -> dict[str, int]:
         """Insert everything held, one request per table, and forget it.
@@ -304,7 +366,7 @@ class Batch:
         """
         sent = {}
         for table, rows in self.rows.items():
-            _insert(table, COLUMNS[table], rows, database)
+            _insert(table, ", ".join(written(table)), rows, database)
             sent[table] = len(rows)
         self.rows = {}
         return sent
@@ -353,44 +415,24 @@ def create(database: str = DATABASE) -> None:
     metadata, so this is cheap however large the table.
     """
     query(f"CREATE DATABASE IF NOT EXISTS {database}")
-    for statement in schema(database).split(";"):
-        if statement.strip():
-            query(statement)
+    for statement in schema(database):
+        query(statement)
     _reconcile(database)
 
 
 def _reconcile(database: str) -> None:
-    """Add every column the schema names that the live table does not have."""
-    for table in COLUMNS:
+    """Add every column `TABLES` declares that the live table does not have."""
+    for name, table in TABLES.items():
         live = set(
             query(
                 f"SELECT name FROM system.columns WHERE database = '{database}' "
-                f"AND table = '{table}' FORMAT TabSeparated"
+                f"AND table = '{name}' FORMAT TabSeparated"
             ).split()
         )
-        if not live:
-            continue
-        for column, kind in _declared(table):
-            if column not in live:
-                LOGGER.warning("%s.%s lacks %s; adding it", database, table, column)
-                query(f"ALTER TABLE {database}.{table} ADD COLUMN {column} {kind}")
-
-
-def _declared(table: str) -> list[tuple[str, str]]:
-    """The columns the schema declares for one table, as (name, type)."""
-    body = schema("x").split(f"CREATE TABLE IF NOT EXISTS x.{table} (", 1)[-1]
-    # Split on the table's own terminator, not the first bracket: a type
-    # like `LowCardinality(String)` carries one of its own.
-    body = body.split("\n) ENGINE", 1)[0]
-    declared = []
-    for line in body.splitlines():
-        stripped = line.strip().rstrip(",")
-        if not stripped or stripped.startswith("--"):
-            continue
-        name, _, kind = stripped.partition(" ")
-        if kind.strip():
-            declared.append((name, kind.strip()))
-    return declared
+        for column, spec in table.columns.items():
+            if live and column not in live:
+                LOGGER.warning("%s.%s lacks %s; adding it", database, name, column)
+                query(f"ALTER TABLE {database}.{name} ADD COLUMN {column} {spec.kind}")
 
 
 def ordered(result: "evaluator.Result") -> list[str]:

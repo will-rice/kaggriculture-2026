@@ -191,11 +191,13 @@ def build(
         with ProcessPoolExecutor(max_workers=min(workers, len(corpus))) as pool:
             done = pool.map(_ingest, corpus, [staging] * len(corpus))
             counts = list(tqdm(done, total=len(corpus), desc="archives"))
-        for table in games.COLUMNS:
-            if table != "candidate":
+        # Every partitioned table, with no exceptions to remember: a table
+        # with no ladder rows swaps an empty partition for an empty one.
+        for name, table in games.TABLES.items():
+            if table.partition:
                 games.query(
-                    f"ALTER TABLE {database}.{table} "
-                    f"REPLACE PARTITION 'ladder' FROM {staging}.{table}"
+                    f"ALTER TABLE {database}.{name} "
+                    f"REPLACE PARTITION 'ladder' FROM {staging}.{name}"
                 )
     finally:
         games.query(f"DROP DATABASE IF EXISTS {staging}")
@@ -512,7 +514,7 @@ def counts(database: str = config.GAMES_DB) -> dict[str, int]:
 
     return {
         table: int(games.query(f"SELECT count() FROM {database}.{table}"))
-        for table in games.COLUMNS
+        for table in games.TABLES
     }
 
 

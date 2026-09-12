@@ -52,41 +52,67 @@ def test_the_column_types_come_from_what_the_measures_actually_hold() -> None:
     only measure that is ever fractional, nothing is ever negative, and
     `sold_units` reaches 15,002,111 where every other count stays inside
     sixteen bits. The types are read off that rather than guessed from the
-    names, and the schema and the values written into it are decided by the
-    same function so they cannot disagree.
+    names.
     """
-    assert games.column_type("plant_age") == "Float32"
-    assert games.column_type("bank") == "Float32"
+    assert games.measure_column("plant_age") == games.Column("Float32", games.real)
+    assert games.measure_column("bank") == games.Column("Float32", games.real)
     # Fifteen million does not fit in sixteen bits.
-    assert games.column_type("sold_units") == "UInt32"
-    assert games.column_type("planted") == "UInt16"
-    # Every measure has a type, and the casts line up with them one for one.
-    assert len(games._CAST) == len(dataset.COLUMNS)
-    for cast, measure in zip(games._CAST, dataset.COLUMNS, strict=True):
-        assert cast is (
-            games.real if games.column_type(measure) == "Float32" else games.number
-        )
+    assert games.measure_column("sold_units").kind == "UInt32"
+    assert games.measure_column("planted").kind == "UInt16"
+
+
+def test_how_a_column_is_stored_and_how_it_is_written_are_one_declaration() -> None:
+    """They were two lists, and they disagreed the first time one changed.
+
+    A `CREATE TABLE` in one place and a tuple of casts in another, kept in step
+    by whoever remembered. `Column` carries both, so a column that cannot be
+    declared without saying how it is written cannot drift from how it is
+    written -- and the `TABLES` entry is the only place either is stated.
+    """
+    days = games.TABLES["days"].columns
+
+    # Every measure the campaign defines is a column of `days`, typed and cast
+    # by the same declaration.
+    for measure in dataset.COLUMNS:
+        assert days[measure] == games.measure_column(measure)
+    # An integer column casts through `number`, which is what stops a tile
+    # count arriving as `4.0` and failing the insert.
+    assert days["planted"].cast is games.number
+    assert days["bank"].cast is games.real
+    # `version` is declared and never written: the server fills it.
+    assert not days["version"].written
+    assert "version" not in games.written("days")
 
 
 def test_a_measure_arrives_as_a_float_and_lands_in_an_integer_column() -> None:
     """`dataset.measures` returns every quantity as a float, tile counts too.
 
-    So a row reaches the server as `4.0` for a column declared `UInt16`, which
-    TabSeparated refuses to parse -- the whole insert fails, not the field.
-    Found by eight sessions writing at once, which is the first time a real
-    evaluation's measures went in.
+    So a row would reach the server as `4.0` for a column declared `UInt16`,
+    which TabSeparated refuses to parse -- the whole insert fails, not the
+    field. The batch casts each value through its own column's declaration, so
+    neither writer can forget and neither can disagree with the schema.
     """
-    rows = []
     measures = dict.fromkeys(dataset.COLUMNS, 0.0) | {"planted": 4.0, "bank": 7.5}
-    values = [
-        cast(measures[column])
-        for cast, column in zip(games._CAST, dataset.COLUMNS, strict=True)
-    ]
+    batch = games.Batch("campaign")
 
-    rows.append(games._row(["e", 0, 0, "t", "campaign", *values]))
+    batch.add("days", ["e", 0, 0, "t", *(measures[c] for c in dataset.COLUMNS)])
 
-    assert "\t4\t" in rows[0], "a tile count reached the wire as a float"
-    assert "7.5" in rows[0], "money lost its fraction"
+    row = batch.rows["days"][0]
+    assert "\t4\t" in row, "a tile count reached the wire as a float"
+    assert "7.5" in row, "money lost its fraction"
+    assert row.endswith("\tcampaign"), "the source is not the last column"
+
+
+def test_a_row_with_the_wrong_number_of_values_is_refused() -> None:
+    """A short row lands every column after the gap one to the left.
+
+    Which parses, and is wrong, and is the failure a positional insert exists
+    to produce. `strict` turns it into a raise at the point of the mistake.
+    """
+    batch = games.Batch("campaign")
+
+    with pytest.raises(ValueError, match="argument"):
+        batch.add("holdings", ["e", 0, 0, "plants"])
 
 
 @live
@@ -181,13 +207,13 @@ def test_a_name_carrying_a_tab_cannot_shift_the_columns() -> None:
 
 
 def test_the_schema_names_every_measure_the_corpus_defines() -> None:
-    """The table is written from `dataset.COLUMNS`, so it cannot fall behind it."""
-    sql = games.schema()
+    """The tables are derived from `TABLES`, which is derived from the measures."""
+    sql = "\n".join(games.schema())
 
     for measure in dataset.COLUMNS:
-        assert f"{measure} {games.column_type(measure)}" in sql
-    for table in games.COLUMNS:
-        assert f"games.{table}" in sql
+        assert f"{measure} {games.measure_column(measure).kind}" in sql
+    for table in games.TABLES:
+        assert f"games.{table} (" in sql
 
 
 def test_the_days_table_is_ordered_for_the_questions_asked_of_it() -> None:
@@ -197,13 +223,28 @@ def test_the_days_table_is_ordered_for_the_questions_asked_of_it() -> None:
     Ordered that way a query for one day reads a granule range; ordered by
     episode first it reads the table.
     """
-    sql = games.schema()
+    days = games.TABLES["days"]
 
-    assert "PARTITION BY source" in sql
-    assert "ORDER BY (source, day, episode, seat)" in sql
-    # And a day's identity is the ordering key, which is what makes a
-    # re-recorded program collapse rather than duplicate.
-    assert "ReplacingMergeTree(version)" in sql
+    assert days.partition == "source"
+    assert days.order == "(source, day, episode, seat)"
+    # And a day's identity is that key, which is what makes a re-recorded
+    # program collapse rather than duplicate.
+    assert days.replacing
+    assert "ReplacingMergeTree(version)" in "\n".join(games.schema())
+
+
+def test_every_table_is_partitioned_on_the_column_the_rebuild_swaps() -> None:
+    """`REPLACE PARTITION` is how a rebuild replaces only what it owns.
+
+    A table holding both sources and partitioned on something else cannot be
+    swapped a source at a time, so the rebuild would have to delete by
+    predicate -- which is the convention this partitioning exists to replace.
+    """
+    for name, table in games.TABLES.items():
+        both = "source" in table.columns
+        assert both == bool(table.partition), (
+            f"{name} carries a source and is not partitioned on it, or the reverse"
+        )
 
 
 @live
@@ -249,15 +290,15 @@ def test_every_table_the_writers_use_matches_the_schema(scratch: str) -> None:
     A column added to `days` and not reaching it is the same failure as the
     one that killed the run, with a hundred times the rows behind it.
     """
-    for table in games.COLUMNS:
+    for name, table in games.TABLES.items():
         live = set(
             games.query(
                 f"SELECT name FROM system.columns WHERE database = '{scratch}' "
-                f"AND table = '{table}' FORMAT TabSeparated"
+                f"AND table = '{name}' FORMAT TabSeparated"
             ).split()
         )
-        declared = {name for name, _ in games._declared(table)}
-        assert declared <= live, f"{table} is missing {declared - live}"
-        # And every column the writer names is one the table has.
-        for column in games.COLUMNS[table].replace(" ", "").split(","):
-            assert column in live, f"{table} has no {column}"
+        declared = set(table.columns)
+        assert declared <= live, f"{name} is missing {declared - live}"
+        # And every column a writer names is one the table has.
+        for column in games.written(name):
+            assert column in live, f"{name} has no {column}"

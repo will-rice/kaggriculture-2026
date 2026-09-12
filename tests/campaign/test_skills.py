@@ -148,7 +148,7 @@ def test_the_skill_names_only_columns_the_schema_has() -> None:
     # Everything in backticks that looks like a measure has to be one. The
     # tables, the keys and the two source labels are known and excluded.
     known = {
-        *games.COLUMNS,
+        *games.TABLES,
         "teams",
         "source",
         "campaign",
