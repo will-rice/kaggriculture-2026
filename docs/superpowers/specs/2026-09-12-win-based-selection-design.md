@@ -129,6 +129,45 @@ promotion bar -- so a round's local tool and the gate compute the same statistic
 `--seeds` trades time for tightness. Playing the whole pool is nine minutes and
 is the campaign's job.
 
+## One database
+
+`archive.py` is deleted. Programs live in the games database beside the games,
+as a `programs` table declared in `games.TABLES` like the other eight
+(`episodes`, `days`, `holdings`, `prices`, `orders`, `moves`, `candidate`,
+`teams`).
+
+One table, not two: a round that produced nothing is a row with a reason and no
+rate, so what was `Database.failures` is `where reason != ''`.
+
+| column     | is                                                    |
+| ---------- | ----------------------------------------------------- |
+| `id`       | the program id, which also prefixes its episode keys  |
+| `change`   | what the round said it changed, from its docstring    |
+| `rate`     | its win rate over the pool; zero when it never played |
+| `reason`   | why it was rejected, or empty                         |
+| `model`    | the slug that wrote it                                |
+| `promoted` | whether this became the champion                      |
+| `created`  | when                                                  |
+
+The source itself stays a file on disk under the run's `programs/`, because the
+pool plays files.
+
+This is what makes the log worth keeping. A JSONL the loop replays at startup is
+a structure only the loop can read; the same rows in the games database are
+queryable by the `query-games` skill, so a round can ask what has been tried and
+what it scored with the tool it already uses for its games -- and so can we,
+joined against the games themselves.
+
+**The champion is a query**, not a file of its own: the most recently promoted
+row. `champion.json` and `archive.jsonl` go. `state.json`'s counters are counts
+over the same table.
+
+**The cost.** ClickHouse moves from recording the campaign to being in its
+control flow: with it down, the loop cannot find its champion, where before that
+was a local JSON file. Accepted -- it is the same process's own docker container
+and the loop cannot score anything without it either, since every evaluation
+records its games.
+
 ## Module structure
 
 The loop's transitive imports, measured 2026-09-12: 22 modules, 8,773 lines.
@@ -182,6 +221,8 @@ hourly coroutine, and nothing to do with producing programs.
 | `SCRATCH_CHANCE`, `SCRATCH_ID`, `SCRATCH_AGENT`, the stagnation note | lineage machinery                                  |
 | `parent.py` in the round directory                                   | `measure.py` measures the champion                 |
 | `evidence.py`                                                        | imported by nothing                                |
+| `archive.py`, `archive.jsonl`, `champion.json`, `state.json`         | the games database holds programs too              |
+| `Result.margins`, `Result.hardest`                                   | fed a deleted tie-break and a deleted choice       |
 | `PARENT_POOL`, `PARENT_DECAY`, the weighted draw, `Database.top(k)`  | a session starts from the champion                 |
 | the no-champion branches in `start`, `floor` and `consider`          | the seed is champion zero                          |
 
@@ -233,3 +274,6 @@ Each verified by mutation, not assumed:
 - Nothing in the campaign reads `started_from`.
 - No module outside `dataset.py` imports `rating`.
 - Importing `loop` does not import `dataset`, `tapes` or `rating`.
+- A program and a rejected round are both rows in `games.programs`, and the
+  champion is the most recent promoted one.
+- A round's query for what has already been tried returns the chain.
