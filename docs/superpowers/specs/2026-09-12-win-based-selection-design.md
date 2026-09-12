@@ -104,6 +104,22 @@ the seat swap cancels position.
 of its games with the champion. Below 4 the interval refuses on its own -- 3/3 is
 0.438.
 
+### When the champion moves under a session
+
+Eight sessions run at once and the pool is copied per evaluation, so a promotion
+by one lands while the others are mid-flight and their head-to-head is against a
+champion that has been replaced.
+
+The bar is re-played, not refused: if the champion changed since the evaluation
+started, play the 32 games against the current one -- twenty seconds -- and read
+the bar off those.
+
+So the promotion is always measured against the champion as it stands, and there
+is no snapshot semantics to specify beyond the obvious: the pool copy decides the
+score, the champion at check time decides the promotion. What this replaces threw
+the candidate away and logged `gate/stale`, discarding a nine-minute evaluation
+over a twenty-second measurement.
+
 ## Where a session starts
 
 The champion. Always, and nothing else.
@@ -280,6 +296,8 @@ Each verified by mutation, not assumed:
 - Every candidate plays every pool opponent; none is sampled out.
 - The round message names one game and carries the chain.
 - Twelve rounds of a session get twelve different games.
+- A candidate whose champion was replaced mid-evaluation is measured against the
+  new champion rather than discarded.
 - The game a round is shown was played by the program that round is editing, not
   by the champion, once they differ.
 - `measure.py`'s printed rate matches what the gate computes on the same games.
