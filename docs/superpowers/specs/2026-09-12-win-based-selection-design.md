@@ -137,13 +137,22 @@ season is 8,888 characters across 68 columns, and the database already holds it
 along with every recorded competition game, so a round reads whichever columns
 its own question wants.
 
-The seed is held for all `ROUNDS_PER_SESSION = 12` rounds of a session, and
-re-played by each round's program, so a round sees its own edit on the map the
-last round saw.
+A different game each round, so the `ROUNDS_PER_SESSION = 12` rounds of a
+session see twelve maps.
 
-Plus the chain: for each earlier round on this lineage, what it changed and the
-win rate that came back. This is the part that makes twelve rounds a search with
-memory rather than twelve independent attempts. It needs:
+Variety rather than depth, and the division of labour is the reason. The
+campaign's job is to stop the search entrenching on one map: a change that helps
+only the map that motivated it gets no second round to build on. Verification is
+already the round's own -- `measure.py` sits in its directory and plays all
+sixteen seeds in both seats, paired, whenever it wants -- so holding a seed for
+twelve rounds would have given the campaign's scarce feedback to depth the round
+can get for itself, and left variety to whether it went looking.
+
+This makes the chain load-bearing rather than a nicety. Twelve rounds on twelve
+maps are twelve independent attempts unless something ties them together, and the
+only thing that does is what each round changed and the win rate it got. So: for
+each earlier round on this lineage, what it changed and the win rate that came
+back. It needs:
 
 - `Program.change`, a short description, taken from the docstring at the top of
   the file the round wrote.
@@ -205,4 +214,32 @@ by mutation rather than assumed:
   stored rating.
 - The round message names one game and carries the chain of earlier rounds with
   what each changed and scored.
+- Twelve rounds of a session are given twelve different games, so a seed held
+  across rounds fails the test.
 - No module outside `dataset.py` imports `rating`.
+
+## Seed robustness, and what carries it
+
+Worth stating in one place, because it is spread across four mechanisms and none
+of them is obviously the one doing the work.
+
+- **The score is not one map.** 16 seeds, both seats, the whole pool: 1,088
+  games. A fixed plan's bank swings about 19.5% season to season, so a single
+  season decides nothing here.
+- **Condition 2 is paired.** Candidate and champion on identical seeds in both
+  seats, so the episode's own swing lands on both sides and cancels. Measured:
+  telling apart a five-thousand-coin difference takes about 114 games unpaired
+  and about 4 paired.
+- **The chain reports the global rate, not the map's.** A round that improved
+  only the map it was shown sees the number fail to move, which is the feedback
+  that punishes a map-specific hack.
+- **Feedback rounds are different maps.** Twelve rounds, twelve seeds, so
+  nothing gets twelve consecutive attempts at entrenching on one.
+
+What is deliberately *not* here: a confirmation pass on a fresh block before
+promoting. It is the textbook winner's-curse guard and a two-stage gate was
+deleted once already, because its cheap stage was 8 seeds and 78 of 471 programs
+topped it with none surviving the deep look. The four mechanisms above are the
+bet that one measurement at 16 paired seeds is deep enough to promote on. If
+promotions start arriving and then failing to hold up, a fresh-block confirmation
+is the first thing to add, and it is cheap because it runs only on a promotion.
