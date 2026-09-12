@@ -286,10 +286,16 @@ already cost this campaign a run or a measurement:
 - Retry the fallback model once on a capacity refusal.
 - `chdir` only in the child, only inside a `TemporaryDirectory`, and never read
   `Path.cwd()`.
-- Reject a program that calls `sys.exit` on load, that has its entrypoint
-  shadowed by a later callable, that imports outside the whitelist, or that
+- Reject a program whose entrypoint is shadowed by a later callable, since
+  Kaggle's loader takes the last one; that imports outside the whitelist; or that
   resembles an opponent it did not start from.
-- A program never plays itself.
+- Catch `BaseException` when loading a candidate, not `Exception`. `raise
+SystemExit` needs no import and would otherwise escape.
+- A program never plays itself. This is also what the resemblance check is for: a
+  candidate that copies an agent in the pool scores about 0.5 against it by
+  playing itself, and would promote as an improvement. The check is calibrated,
+  not a guess -- a lifted 110-line block scores 0.231 and stays above the floor
+  under reformatting, where an independent 70-line agent scores 0.0066.
 - Play every opponent, never a sample.
 - Log the gate's reason on refusal as well as on success.
 - Every test mutation-verified: break the code, watch it go red.
@@ -305,12 +311,20 @@ That is a differential check against an oracle that shares its assumptions, so i
 cannot catch a misreading both versions make. It catches transcription, and that
 is what a rewrite risks.
 
-### Kept as-is
+### What the optimizer needs from outside
 
-Nothing in `campaign/`. Outside it: the Rust engine and its bindings, `report.py`
-for the Wilson interval, `constants.py`, the `served/` skeleton, and `dataset.py`
-with `rating.py` and `tapes.py` for the ladder corpus, which is a separate
-concern that the loop must not import.
+The Rust engine and its bindings, `report.py` for the Wilson interval,
+`constants.py`, and the `served/` skeleton. That is all.
+
+`dataset.py`, `rating.py`, `tapes.py` and `strategy.py` -- about 1,465 lines of
+ladder-corpus analysis -- are **not** part of the optimizer and nothing in this
+design consumes them. Their output used to reach a round as the build order and
+the settled claims; both were removed on 2026-09-10 after the first measurably
+hurt. What remains is offline analysis for us, and whether it is worth keeping is
+its own decision, taken separately and not by being carried along.
+
+The only hard requirement is the direction of the dependency: the loop must not
+import them, which a test asserts.
 
 ## Seed robustness
 
