@@ -49,7 +49,8 @@ day-10 problem before any of this was measured by hand.
 ### The pool
 
 Every harvested public agent, plus the most recent champion. One champion,
-replaced on promotion rather than accumulated: `POOL_CHAMPIONS` becomes 1.
+replaced on promotion rather than accumulated, so `POOL_CHAMPIONS` is deleted
+rather than set to 1 -- with exactly one of them the constant states nothing.
 
 The previous campaign accumulated them and became self-play -- 69 champions
 holding 10 of 24 slots, the field frozen on the day someone last ran the
@@ -86,48 +87,47 @@ really is sparse. That is what tells `strategies` which public agent is
 stronger.
 
 The frozen `field` metric -- a win rate over `roster.TRAINING`, 12 vendored
-agents -- is retired as a selection signal. It was comparable across time
-because it ignored the field getting stronger: 22 of the pool's 34 opponents are
-invisible to it, including `thomastschinkel_kaggriculture_93_8_win_r`, the
-strongest agent in the pool. Comparability now comes from the head-to-head
-below, which is measured directly on the same seeds every time.
+agents -- is deleted, along with `vendored_field` and `Program.field`. It was
+comparable across time because it ignored the field getting stronger: 22 of the
+pool's 34 opponents are invisible to it, including
+`thomastschinkel_kaggriculture_93_8_win_r`, the strongest agent in the pool.
+Comparability now comes from the head-to-head below, measured directly on the
+same seeds every time.
 
 ### Promotion
 
-Two conditions, both read off the candidate's own evaluation:
+One condition: the candidate beats the champion head-to-head. The Wilson lower
+bound of `result.rates[champion]` above 0.5, over at least `DECISIVE_GAMES`
+decisive games.
 
-1. a higher pool win rate than the champion's, as recorded when the champion was
-   promoted, and
-2. beats the champion head-to-head: the Wilson lower bound of
-   `result.rates[champion]` above 0.5, over at least `DECISIVE_GAMES` decisive
-   games.
+The champion is in the pool, so this is always directly measured -- 16 seeds in
+both seats, 32 games, the two programs in the same games so the map is shared and
+the seat swap cancels the position. At 32 decisive games it takes 22 wins, 0.688.
 
-Condition 1 compares across blocks, and that is a known weakness rather than an
-oversight: the champion's recorded rate was measured on its own seeds against
-the pool as it then stood, and seed blocks rotate every `SEED_ROTATION`
-candidates while harvest adds opponents. It is a cheap screen, not a proof.
-Condition 2 is the rigorous half -- same block, same seeds, both seats, paired,
-with the interval widening when the evidence is thin -- and it is the one that
-makes a promotion mean something. Re-scoring the champion alongside every
-candidate would put condition 1 on the same footing too, and costs a second full
-evaluation per round; it is not worth that, given condition 2 is required
-anyway.
+Selection and promotion do different jobs and each needs one number. Selection
+ranks on the pool win rate, which is how the search climbs the field; promotion
+is the ratchet, which is beating what we have. An earlier draft required both of
+promotion -- a better pool rate than the champion's _recorded_ rate, plus the
+head-to-head -- and the first half compared across seed blocks, since the
+champion's number came from its own seeds against a smaller pool. A stale
+screen in front of a direct measurement is not worth the weakness it introduces.
 
-The champion is in the pool, so condition 2 is always directly measured, paired
-on the same seeds in both seats. `DECISIVE_GAMES = 8` stays because it caught a
-real case: champion_55 was promoted over champion_54 on two wins and thirty
-exact draws in 32 games -- two programs playing the same game, which a rating
-cannot distinguish from seventeen wins and fifteen losses.
+What that leaves is the chance of sideways drift: a chain of head-to-head wins
+that walks around a cycle rather than up. It is detectable rather than silent,
+because each champion's pool win rate is recorded -- drift appears as
+head-to-heads passing while that rate falls.
 
-Both conditions are required. Condition 1 alone promotes an agent that beats the
-field on average and loses to the specific thing it replaces; condition 2 alone
-promotes an agent that counters the champion and nothing else. The field is
-non-transitive -- shopforge scores 0.979 against the field and 0.6875 against
-v56 -- so neither implies the other.
+`DECISIVE_GAMES = 8` stays, and does less than it looks. The interval alone
+refuses thin evidence: 1/1 is 0.207, 2/2 is 0.342, 3/3 is 0.438, all below the
+bar, so the champion_55 case -- promoted on two wins and thirty exact draws in 32
+games -- is refused by the interval without help. What the minimum uniquely
+blocks is 4 to 7 decisive games, a candidate drawing 78% to 88% of its games with
+the champion, which is close enough to being the same program that the difference
+is not worth promoting on.
 
-**Cold start.** With no champion, condition 2 has nothing to measure and the bar
-is condition 1 against the best program in the database. Reachable from the
-first round: the seed's win rate is what has to be beaten, not rank 1 of 28.
+**Cold start.** With no champion there is nothing to beat head-to-head, and the
+bar is the pool win rate against the best program in the database. Reachable from
+the first round: the seed's rate is what has to be beaten, not rank 1 of 28.
 
 ### What a round is given
 
@@ -186,7 +186,7 @@ database.
 It compared the round's program against `parent.py`, a copy of whatever the round
 was handed. That is gone with the rest of the lineage, and what replaces it is
 better: the head-to-head rate against the champion, with its Wilson interval, is
-_exactly_ promotion condition 2. The round's local tool and the gate's bar become
+_exactly_ the promotion bar. The round's local tool and the gate's bar become
 the same statistic, computable in twenty seconds, so a round can check the real
 thing instead of a proxy for it.
 
@@ -222,12 +222,6 @@ them.
 
 `rating.py` itself stays, for `dataset.py`.
 
-`Program.field` stays as a recorded number and nothing reads it to decide
-anything. It is the only quantity in the existing archive that means the same
-thing across the whole campaign, so the 79 programs already written stay
-comparable to each other; new programs keep getting it for the same reason. Its
-retirement is from selection and promotion, not from the record.
-
 ## Already implemented
 
 Green and uncommitted at the time of writing, from the same day:
@@ -244,8 +238,7 @@ Green and uncommitted at the time of writing, from the same day:
 Each of these is a test that fails before the change and passes after, verified
 by mutation rather than assumed:
 
-- A candidate with a better pool win rate and a decisive head-to-head win over
-  the champion is promoted; one with either condition alone is not.
+- A candidate with a decisive head-to-head win over the champion is promoted.
 - With no champion, the first candidate beating the database's best is
   promoted -- the condition that was unreachable before.
 - A candidate that draws nearly every game against the champion is refused
@@ -257,8 +250,7 @@ by mutation rather than assumed:
 - Twelve rounds of a session are given twelve different games, so a seed held
   across rounds fails the test.
 - `measure.py` reports the head-to-head rate against the champion, and the
-  number it prints matches what the gate computes for condition 2 on the same
-  games.
+  number it prints matches what the gate computes on the same games.
 - Nothing in the campaign reads `started_from`, and a program can be scored,
   ranked and promoted without it.
 - No module outside `dataset.py` imports `rating`.
@@ -271,7 +263,7 @@ of them is obviously the one doing the work.
 - **The score is not one map.** 16 seeds, both seats, the whole pool: 1,088
   games. A fixed plan's bank swings about 19.5% season to season, so a single
   season decides nothing here.
-- **Condition 2 is paired.** Candidate and champion on identical seeds in both
+- **The promotion bar is paired.** Candidate and champion on identical seeds in both
   seats, so the episode's own swing lands on both sides and cancels. Measured:
   telling apart a five-thousand-coin difference takes about 114 games unpaired
   and about 4 paired.
