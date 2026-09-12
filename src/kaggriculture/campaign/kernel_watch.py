@@ -39,7 +39,7 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, pools
 
 LOGGER = logging.getLogger(__name__)
 
@@ -469,20 +469,12 @@ def resolve_in_sandbox(source: str) -> object:
     Returns:
         The callable the loader selects.
     """
-    import os
-    import tempfile
-
     from kaggle_environments.agent import get_last_callable
 
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="kernel-watch-") as sandbox:
-        os.chdir(sandbox)
-        try:
-            return get_last_callable(source, path="main.py")
-        except SystemExit as exit_call:
-            raise RuntimeError(f"source called sys.exit({exit_call.code})") from None
-        finally:
-            os.chdir(origin)
+    try:
+        return pools.sandboxed(lambda: get_last_callable(source, path="main.py"))
+    except SystemExit as exit_call:
+        raise RuntimeError(f"source called sys.exit({exit_call.code})") from None
 
 
 def loadable(source: str) -> bool:
@@ -625,9 +617,6 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     Returns:
         The equal-weighted field rate, its Wilson bounds, and the games played.
     """
-    import os
-    import tempfile
-
     from kaggriculture.campaign import roster
     from kaggriculture.campaign.field_gate import score_field
     from kaggriculture.report import wilson_interval
@@ -641,13 +630,9 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     # directories included -- stops resolving the moment the sandbox does.
     absolute = path.resolve()
     seeds = tuple(range(700_000, 700_000 + gate_seeds))
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="kernel-watch-gate-") as sandbox:
-        os.chdir(sandbox)
-        try:
-            rates, _ = score_field(absolute, seeds, workers, list(roster.TRAINING))
-        finally:
-            os.chdir(origin)
+    rates, _ = pools.sandboxed(
+        lambda: score_field(absolute, seeds, workers, list(roster.TRAINING))
+    )
     games = len(rates) * len(seeds) * 2
     equal = sum(rates.values()) / len(rates)
     low, high = wilson_interval(equal * games, games)

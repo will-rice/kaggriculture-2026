@@ -223,6 +223,12 @@ class CheckReport(BaseModel):
             game, and worth having because a duplicate opponent costs a gate
             real time and tells it nothing new. Empty when the run failed,
             since a crash is not an identity.
+        last: The name of the callable Kaggle would load, which must be
+            `agent`. Reported from here because this is where the module is
+            imported: `validate` used to import it a second time, outside any
+            sandbox, purely to read this one string -- so a candidate's
+            module-level code ran in the validator's own directory for the
+            sake of a name the check already knew.
     """
 
     loaded: bool
@@ -230,6 +236,7 @@ class CheckReport(BaseModel):
     worst_step_seconds: float
     error: str | None
     fingerprint: str = ""
+    last: str = ""
 
 
 def main() -> None:
@@ -600,15 +607,12 @@ def _row(keys: dict[str, int], day: Day) -> dict[str, object]:
 def _one(work: Work) -> Game:
     """Play one game on the engine port. Runs in a fresh process per game.
 
-    Playing a candidate executes it, and a candidate is evolved source that
-    may write files, so the game runs with the working directory moved into a
-    scratch tree that is removed afterwards. This is the one place every
-    execution path -- fast, deep, and a sandbox's own ``campaign play`` --
-    passes through, so isolating here isolates all of them. Both sources are
-    resolved to absolute paths before the move, because a relative one stops
-    resolving the moment it happens, and the cwd is restored before the
-    scratch tree is removed so nothing is left standing in a deleted
-    directory.
+    Playing a candidate executes it, and a candidate is evolved source that may
+    write files, so the game runs inside a directory of its own. This is the one
+    place every execution path -- fast, deep, and a sandbox's own
+    ``campaign play`` -- passes through, so sandboxing here sandboxes all of
+    them. Both sources are resolved to absolute paths first, because a relative
+    one stops resolving the moment the directory changes.
     """
     agent_path, opponent_name, opponent_path, seed, seat, days = work
     resolved = (
@@ -620,7 +624,7 @@ def _one(work: Work) -> Game:
         days,
     )
     try:
-        return _play_one(resolved)
+        return pools.sandboxed(lambda: _play_one(resolved))
     except Exception as error:
         # A process pool sends the exception back without the frames that
         # raised it, so a failure here reaches the loop as a bare `IndexError`
@@ -876,26 +880,22 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
 
 
 def _checked(agent: str, steps: int) -> CheckReport:
-    """Move to a scratch directory and check there. Runs in a child.
+    """Check the agent in a directory of its own. Runs in a child.
 
-    A child, because `os.chdir` is the whole process's and this one is its
-    own. The first version of this moved the *caller's* directory, which was
-    briefly correct and then catastrophic: a spawned worker inherits the cwd
-    of whoever spawned it, so every game the loop started while a harvest was
-    checking a kernel began life inside that check's scratch tree -- and when
-    the check finished and removed it, those workers were standing in a
-    directory that no longer existed. The campaign died on
+    A child, because the sandbox is a working directory and a working
+    directory is the whole process's. The first version moved the *caller's*,
+    which was briefly correct and then catastrophic: a spawned worker inherits
+    the cwd of whoever spawned it, so every game the loop started while a
+    harvest was checking a kernel began life inside that check's scratch tree,
+    and the check then removed it from under them. The campaign died on
     `FileNotFoundError: /tmp/campaign-check-56ludna7` an hour after the
     isolation was added to stop a harvested agent writing into the repository.
-
-    `_one` and `_reference` chdir freely because each already has a process to
-    itself. This is the same trick paid for honestly.
     """
-    return _check(Path(agent), steps)
+    return pools.sandboxed(lambda: _check(Path(agent), steps))
 
 
 def _check(agent: Path, steps: int) -> CheckReport:
-    """The check itself; the caller has moved to a scratch cwd."""
+    """The check itself; the caller has put it in a directory of its own."""
     try:
         policy = load_agent(agent)
     except Exception as error:  # noqa: BLE001 - the report is the point
@@ -905,6 +905,7 @@ def _check(agent: Path, steps: int) -> CheckReport:
             worst_step_seconds=0.0,
             error=f"{type(error).__name__}: {error}",
         )
+    last = getattr(policy, "__name__", "<anonymous>")
     arity = argument_count(policy)
     environment = make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS})
     environment.reset()
@@ -933,6 +934,7 @@ def _check(agent: Path, steps: int) -> CheckReport:
             bank=0.0,
             worst_step_seconds=worst,
             error=f"{type(error).__name__}: {error}",
+            last=last,
         )
     return CheckReport(
         loaded=True,
@@ -940,6 +942,7 @@ def _check(agent: Path, steps: int) -> CheckReport:
         worst_step_seconds=worst,
         error=None,
         fingerprint=played.hexdigest()[:16],
+        last=last,
     )
 
 

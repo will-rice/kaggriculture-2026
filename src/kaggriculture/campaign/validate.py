@@ -18,19 +18,17 @@ a conditional definition can rebind the last name in ways no AST walk
 sees. Only once every one of those clears does a candidate earn ~20s of
 reference-engine time in `harness.check`.
 
-That dynamic half -- the load and the reference-engine run -- happens in a
-child process with a wall-clock cap. Loading a module runs its top-level
-code, so a candidate with an unbounded loop outside any function would
-otherwise wedge the validating thread, and through it the island it was
-mutating, for the life of the run. The child also works from a scratch
-directory, because loading a candidate is running it.
+That dynamic half -- the reference-engine run -- happens in a child process
+with a wall-clock cap. Loading a module runs its top-level code, so a
+candidate with an unbounded loop outside any function would otherwise wedge
+the validating thread, and through it the island it was mutating, for the
+life of the run. The candidate's code runs one layer further in, inside
+`harness.check`'s own sandbox: this module never imports it.
 """
 
 import ast
 import multiprocessing
-import os
 import queue
-import tempfile
 import time
 from multiprocessing.queues import Queue
 from pathlib import Path
@@ -212,12 +210,14 @@ def _shadowed_entrypoint(tree: ast.Module) -> Verdict | None:
 
 
 def _dynamic(agent: Path, steps: int) -> Verdict:
-    """Load the candidate as Kaggle does, then play it on the reference engine.
+    """Play the candidate on the reference engine and read the verdict off it.
 
-    Everything here executes the candidate's own code, which is why the caller
-    runs it in a child process. A load failure is exactly what
-    `harness.check` would report as `crashed` a moment later, so it is
-    reported the same way.
+    Nothing here executes the candidate. It used to: the module was imported
+    here to read the name of its last callable, outside any sandbox, and then
+    imported again inside the check's own. One of those two was a candidate's
+    module-level code running in the validator's directory for the sake of a
+    string the check already had, so the check reports it and this does not
+    load anything.
 
     Args:
         agent: The candidate's `main.py`, already absolute.
@@ -226,17 +226,12 @@ def _dynamic(agent: Path, steps: int) -> Verdict:
     Returns:
         The failing `Verdict`, or `status="ok"`.
     """
-    try:
-        last_callable = harness.load_agent(agent)
-    except Exception as error:  # noqa: BLE001 - a candidate's own failure
-        return Verdict(status="crashed", reason=f"{type(error).__name__}: {error}")
-    loaded_name = getattr(last_callable, "__name__", "<anonymous>")
-    if loaded_name != "agent":
+    report = harness.check(agent, steps=steps)
+    if report.loaded and report.last != "agent":
         return Verdict(
             status="contract",
-            reason=f"agent is shadowed by {loaded_name!r}, the last callable",
+            reason=f"agent is shadowed by {report.last!r}, the last callable",
         )
-    report = harness.check(agent, steps=steps)
     if not report.loaded or report.error is not None:
         return Verdict(
             status="crashed",
@@ -253,19 +248,20 @@ def _dynamic(agent: Path, steps: int) -> Verdict:
 
 
 def _dynamic_child(agent: str, steps: int, results: "Queue[dict]") -> None:
-    """Run `_dynamic` in a scratch directory and put its verdict on ``results``.
+    """Run `_dynamic` and put its verdict on ``results``.
 
-    Module-level so ``spawn`` can import it. The scratch directory is never
-    left, because the process ends with this call.
+    Module-level so ``spawn`` can import it. A child process still, but for the
+    deadline rather than for isolation -- `LOAD_ALLOWANCE` is enforced by
+    joining it, and a candidate that hangs on import has to be killable. The
+    candidate's own code runs inside `harness.check`, in a directory of its
+    own, and no longer here.
 
     Args:
         agent: The candidate's `main.py` as an absolute path string.
         steps: How many turns `harness.check` plays before stopping.
         results: Where the verdict goes, as a plain dict.
     """
-    with tempfile.TemporaryDirectory(prefix="campaign-check-") as scratch:
-        os.chdir(scratch)
-        results.put(_dynamic(Path(agent), steps).model_dump())
+    results.put(_dynamic(Path(agent), steps).model_dump())
 
 
 # Seconds a candidate may take to import before it is called at all. Spawning

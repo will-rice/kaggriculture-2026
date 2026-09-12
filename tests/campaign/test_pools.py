@@ -1,4 +1,4 @@
-"""Nothing starts a process that runs a program except `pools.workers`."""
+"""Where somebody else's program may run, and where it may write."""
 
 import ast
 import os
@@ -11,15 +11,16 @@ from kaggriculture.campaign import config, pools
 # Where a process pool may be constructed, and why each is allowed.
 #
 # `pools` is the factory itself. `dataset` is the one pool in the campaign
-# that runs none of anybody else's code -- it reads episode archives into a
-# sqlite database -- so it neither needs a scratch directory nor wants one
+# that runs none of anybody else's code -- it reads episode archives into the
+# games database -- so it neither needs a scratch directory nor wants one
 # task per child, which would cost it a process per archive.
 #
 # Anything else appearing here is the question this file exists to ask: does
-# it run a program? If it does, it belongs in `pools.workers`, which wraps
-# every task in a directory of its own. Isolation is exactly the thing a new
-# call site forgets, and forgetting it produces a failure that appears only
-# when two things run at once.
+# it run a program? If it does, it belongs in `pools.workers`, whose children
+# take one task each, and its task belongs in `pools.sandboxed`, which gives
+# that task a directory of its own. Isolation is exactly the thing a new call
+# site forgets, and forgetting it produces a failure that appears only when
+# two things run at once.
 ALLOWED = {"pools.py", "dataset.py"}
 
 
@@ -77,7 +78,7 @@ def test_a_task_runs_in_a_directory_that_is_gone_when_it_returns() -> None:
     assert pools.sandboxed(note_where) == "done"
 
     assert seen[0] != origin
-    assert seen[0].name.startswith("campaign-worker-")
+    assert seen[0].name.startswith("campaign-")
     assert not seen[0].exists(), "the directory outlived the task"
     assert Path.cwd() == origin, "the task left the process somewhere else"
     assert not (origin / "scribble.txt").exists()
@@ -106,17 +107,24 @@ def test_a_task_that_raises_still_gives_its_directory_back() -> None:
 
 
 def where_and_who(_: int) -> tuple[str, int]:
-    """This worker's directory and process, for the test below."""
-    return str(Path.cwd()), os.getpid()
+    """A worker task shaped like the real ones: sandboxed, then reporting.
+
+    `harness._one` and `harness._checked` are this, with a game in place of
+    the `Path.cwd()`. The sandbox is the task's own call, not something the
+    pool does to it, because the pool cannot know which of its tasks runs
+    somebody else's program.
+    """
+    return pools.sandboxed(lambda: (str(Path.cwd()), os.getpid()))
 
 
 def test_every_task_gets_a_fresh_process_in_a_directory_of_its_own() -> None:
-    """The two guarantees the factory exists for, read off real workers.
+    """The two guarantees a worker running a program needs, read off real ones.
 
     A policy holds state between turns, so a second game in the same
     interpreter would start from whatever the first left behind -- hence one
-    task per child. And each of those children must land somewhere harmless,
-    because playing a program executes it.
+    task per child, which is what `workers` is for. And each of those children
+    must land somewhere harmless, because playing a program executes it --
+    which is what the task's own `sandboxed` call is for.
     """
     with pools.workers(2) as pool:
         results = list(pool.map(where_and_who, range(4)))
@@ -124,8 +132,8 @@ def test_every_task_gets_a_fresh_process_in_a_directory_of_its_own() -> None:
     directories = [where for where, _ in results]
     processes = [who for _, who in results]
     assert len(set(processes)) == len(results), "a worker was reused"
-    assert len(set(directories)) == len(results), "two workers shared a directory"
-    assert all(Path(where).name.startswith("campaign-worker-") for where in directories)
+    assert len(set(directories)) == len(results), "two tasks shared a directory"
+    assert all(Path(where).name.startswith("campaign-") for where in directories)
     # And none of them is where the test is standing.
     assert str(Path.cwd()) not in directories
 
