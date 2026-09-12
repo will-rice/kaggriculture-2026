@@ -25,10 +25,14 @@ candidate. So a round measuring its own edit this way has a sharper instrument
 than the thing that will judge it.
 
 `--replay` is the other half. The aggregate says whether an edit helped; it
-never says where. A replay writes the season out day by day in the same columns
-as `seasons.csv`, so the game a round just played and the games the campaign
-played can be read side by side, and it names the day the gap moved most
-against the child -- which is where to look first.
+never says where. A replay writes the season out day by day, in the columns
+`harness.day_csv` renders, and names the day the gap moved most against the
+child.
+
+It used to say those were "the same columns as `seasons.csv`", a file the round
+prompt promised and nothing has ever written: the campaign's own games went to
+the games database, and the reference outlived the file. They are in the
+database, day by day and both sides, which is where to read them against this.
 
 A game costs about two and a half seconds -- the engine steps in microseconds,
 and the programs themselves are what take the time -- so the default comparison
@@ -137,9 +141,9 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
 def replay(child: pathlib.Path, parent: pathlib.Path, seed: int) -> None:
     """Write one season day by day, and name the day the gap moved most.
 
-    The same columns `seasons.csv` uses, written by the same function, so the
-    season a round has just played and the seasons the campaign played can be
-    read against each other rather than translated between.
+    Rendered by `harness.day_csv`, the same function the campaign's own day
+    tables go through, so a replay and a game out of the games database line up
+    column for column rather than having to be translated between.
     """
     played = _games(child, parent, (seed,), days=True)
     out = HERE / f"replay-{seed}.csv"

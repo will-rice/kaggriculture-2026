@@ -92,7 +92,10 @@ def test_core_budget_leaves_headroom() -> None:
 def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
-    assert config.ROUNDS_PER_SESSION == 5
+    # Twelve attempts at the one seed a session holds. A round is feedback on
+    # one game, so the rounds of a session are tries at the same map rather
+    # than one look at each of many.
+    assert config.ROUNDS_PER_SESSION == 12
     # Sixteen seeds over twenty-four opponents: 768 games a candidate, up from
     # the 512 that sixteen opponents cost. The budget goes into opponents
     # because a rating's precision comes from the whole graph -- one more

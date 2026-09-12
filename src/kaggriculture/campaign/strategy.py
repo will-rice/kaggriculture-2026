@@ -1,8 +1,9 @@
 """Claims about how the ladder's strongest agents play, and the evidence.
 
-The tables in ``build_order.md`` are a snapshot: true when they were measured
-and unattached to any statement about why. A claim is the other thing -- a
-statement that could be wrong, with a form that says how to find out.
+A table of what the strongest agents hold on each day is a snapshot: true
+when it was measured and unattached to any statement about why. That is what
+this replaced. A claim is the other thing -- a statement that could be wrong,
+with a form that says how to find out.
 
 Two things decide whether such a statement means anything, and the first
 version of this got the second one wrong.
@@ -55,7 +56,7 @@ QUANTITIES: frozenset[str] = frozenset(dataset.COLUMNS)
 DAYS = dataset.DAYS
 # The store the round prompt reads, beside the corpus it is measured from.
 #
-# Not inside the package, though it started there next to ``build_order.md``.
+# Not inside the package, though it started there beside the prompt's files.
 # That works for a file committed once and read by whoever has the checkout,
 # and breaks the moment it is rebuilt daily: the job runs from its own
 # worktree with its own copy of the package, so it would rewrite a store in

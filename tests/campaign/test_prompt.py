@@ -108,6 +108,17 @@ def result(
     )
 
 
+def first_game(scored: evaluator.Result) -> tuple[int, int, harness.Game]:
+    """The first scored game of an evaluation, as `compose` now takes it.
+
+    A round is feedback on one game, so `compose` is given that game rather
+    than the whole evaluation it came out of. Matchup and season are what the
+    loop numbers them, and the database keys its episodes by.
+    """
+    opponent = next(iter(scored.states))
+    return 1, 1, scored.states[opponent][0]
+
+
 def test_a_template_names_its_own_fields(tmp_path: Path) -> None:
     """The file decides what fills it, so there is no second list to keep."""
     path = tmp_path / "t.md"
@@ -146,59 +157,41 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
     # otherwise, so reaching the end of this is the assertion.
     prompt.compose(
         "champion_1",
-        result({"v54": 0.0}),
+        first_game(result({"v54": 0.0})),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.0}),
     )
 
 
-def test_the_message_carries_no_corpus_derived_target() -> None:
-    """A round is shown the rules and its own play, and nothing read off others.
+def test_the_message_carries_the_rules_and_its_own_play() -> None:
+    """A round is shown the rules and its own games, and nothing read off others.
 
-    The prompt used to carry two things mined from the public replay corpus:
-    the build order, and the settled claims about what the ladder's winners
-    hold. Both were true about the corpus, neither was ever shown to help a
-    program, and the last version of the first measurably hurt.
+    The prompt used to carry a build order mined from the public replay corpus:
+    what the top-rated agents hold on each day. Measured 2026-09-10, clustered
+    to one opening the median candidate scored 0.275 over 68 gates and
+    promotions ran about one an hour; supplied as the orders those agents send,
+    the median fell to 0.026 over 156 gates and nothing promoted in ten hours.
+    The ceiling hardly moved, 0.940 to 0.914, so good programs did not get
+    worse -- most programs became broken. What a model does with another
+    strategy's schedule is bolt it on and break the economy underneath.
 
-    Measured 2026-09-10. With the build order clustered to one opening the
-    median candidate scored 0.275 over 68 gates and promotions ran about one an
-    hour. With the opening added as the orders those agents send, the median
-    fell to 0.026 over 156 gates and nothing promoted in ten hours. The ceiling
-    hardly moved -- 0.940 to 0.914 -- so good programs did not get worse, most
-    programs became broken.
-
-    What the model did with a build order is what three measured experiments
-    did before it: bolt another strategy's orders onto this one and break the
-    economy underneath. Handing a round a build order is an invitation to
-    graft, and grafting is the thing that fails.
+    The file and the constant that named it are gone, so there is nothing left
+    to assert the absence of: this checks what the message *does* carry, which
+    is the rules and the program's own play. Everything numeric in it is
+    measured off this program's own games.
     """
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.0}, days=30),
+        first_game(result({"v54": 0.0}, days=30)),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.0}),
     )
 
-    # The invariant is that neither corpus artifact's *content* travels, which
-    # is checked against the artifacts themselves rather than against headings
-    # somebody chose. A heading can be renamed; the file either reaches the
-    # round or it does not.
-    build_order = prompt.BUILD_ORDER.read_text(encoding="utf-8").strip()
-    assert build_order
-    assert build_order not in text
-    for line in build_order.splitlines():
-        if line.startswith("| ") and len(line) > 40:
-            assert line not in text, "a row of the build order reached the round"
-            break
-    # Its own play stays: the index of the seasons it was measured on, and
-    # the rules.
     assert prompt.TASK_PROMPT.read_text(encoding="utf-8").strip()[:80] in text
     assert prompt.GAMES in text
-    assert "| matchup | seasons | won | mean finish | worst | best |" in text
+    assert "Episode `champion_1m1s1`" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
     assert "/data" not in text
 
@@ -213,11 +206,10 @@ def test_the_message_carries_no_path_at_all() -> None:
     """
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.1, "router_v1": 0.0}),
+        first_game(result({"v54": 0.1, "router_v1": 0.0})),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
     )
 
     assert "/data/kaggriculture" not in text
@@ -235,11 +227,10 @@ def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
     """
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}),
+        first_game(result({"v54": 0.5})),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
     )
 
     for name in validate.ALLOWED_IMPORTS:
@@ -252,11 +243,10 @@ def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
     """The game's rules travel; the harness section does not, having nothing to run."""
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}),
+        first_game(result({"v54": 0.5})),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
     )
 
     assert "Kaggriculture policy task" in text
@@ -287,11 +277,10 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
     # instruction to do something else.
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.0}, days=30),
+        first_game(result({"v54": 0.0}, days=30)),
         [],
         [],
         prompt.INSTRUCTION,
-        table("champion_1", {"v54": 0.0}),
     )
     assert prompt.INSTRUCTION in text
 
@@ -324,11 +313,10 @@ def test_the_message_carries_the_lineages_recent_failures() -> None:
 
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}),
+        first_game(result({"v54": 0.5})),
         failures,
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
     )
 
     assert "## Recent attempts on `champion_1` that produced nothing" in text
@@ -344,11 +332,10 @@ def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
     """A heading over an empty list is noise in a message read every round."""
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}),
+        first_game(result({"v54": 0.5})),
         [],
         [],
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
     )
 
     assert "produced nothing" not in text
@@ -358,11 +345,10 @@ def test_the_instruction_reaches_the_message_whole() -> None:
     """It is the last thing said, and it arrives uncut."""
     message = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}),
+        first_game(result({"v54": 0.5})),
         [],
         [],
         prompt.INSTRUCTION,
-        table("champion_1", {"v54": 0.5}),
     )
 
     assert message.rstrip().endswith(prompt.INSTRUCTION)
@@ -395,11 +381,10 @@ def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> N
 
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}),
+        first_game(result({"v54": 0.5})),
         [],
         db.children("champion_1"),
         IMPROVE,
-        table("champion_1", {"v54": 0.5}),
     )
 
     assert "already been made" not in text
@@ -416,62 +401,48 @@ def test_no_opponent_is_named_anywhere_in_the_message() -> None:
     and worth nothing on a ladder where the agent across the table is one it
     has never seen.
 
-    A name is all it takes to start fitting, so no name travels. The pool is a
-    sample of the field, and the sections that used to rank it, place this
+    A name is all it takes to start fitting, so no opponent's travels. The pool
+    is a sample of the field, and the sections that used to rank it, place this
     program in it, and label each day table with who was across the table are
     gone.
+
+    The program's own id does travel now, inside the episode key of the game
+    the round is working on -- `<id>m<matchup>s<season>` is how the games
+    database addresses it, so a round cannot read its own game without it. That
+    is its own id and never an opponent's. It is a real cost only where the two
+    namespaces meet: a champion is also a pool opponent, so a round starting
+    from one is told that champion's pool name. What it learns there is the name
+    of itself.
     """
     rates = {"v54": 0.3, "shopforge": 0.5, "router_v1": 0.9}
     text = prompt.compose(
         "champion_1",
-        result(rates, days=30),
+        first_game(result(rates, days=30)),
         [],
         [],
         IMPROVE,
-        table("champion_1", rates),
     )
 
     for opponent in rates:
         assert opponent not in text, f"{opponent} reached the round by name"
-    # Nor the program's own name, which is a pool name in the same namespace.
-    assert "champion_1" not in text
+    # Its own id appears only inside the episode key, and nowhere else.
+    assert "champion_1m1s1" in text
+    assert "champion_1" not in text.replace("champion_1m1s1", "")
 
 
 def test_the_templates_own_note_never_reaches_the_model() -> None:
     """The header explains the file to a reader and would render twice."""
     text = prompt.compose(
         "champion_1",
-        result({"v54": 0.5}, days=30),
+        first_game(result({"v54": 0.5}, days=30)),
         [],
         [],
         IMPROVE,
-        table("c", {"v54": 0.5}),
     )
 
     assert prompt.ROUND_PROMPT.read_text(encoding="utf-8").startswith("<!--")
     assert "<!--" not in text
     assert "the parts the campaign" not in text
-
-
-def test_the_index_says_how_many_seasons_each_matchup_holds_and_how_they_went() -> None:
-    """What a round cannot work out for itself is which matchup is which."""
-    rates = {"close": 0.5, "beaten": 0.1}
-    played = result(rates, days=4).model_copy(
-        update={
-            "states": {
-                "beaten": games([1000.0, 2000.0], days=4),
-                "close": games([2900.0, 2950.0, 3100.0], days=4),
-            }
-        }
-    )
-
-    text = prompt.compose("champion_1", played, [], [], IMPROVE, table("c", rates))
-
-    assert prompt.GAMES in text
-    # Two seasons, neither won, finishing -2,000 and -1,000 against 3,000.
-    assert "| 1 | 2 | 0 | -1,500 | -2,000 | -1,000 |" in text
-    # Three, one of them won: -100, -50, +100.
-    assert "| 2 | 3 | 1 | -17 | -100 | +100 |" in text
 
 
 def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
@@ -483,12 +454,12 @@ def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
     """
     rates = {"close": 0.5, "beaten": 0.1}
     text = prompt.compose(
-        "champion_1", result(rates, days=4), [], [], IMPROVE, table("c", rates)
+        "champion_1", first_game(result(rates, days=4)), [], [], IMPROVE
     )
 
     assert prompt.GAMES in text, "the round is not told where to ask"
     assert "query-games" in text, "the skill that has the schema is not named"
-    assert "| matchup | seasons | won | mean finish | worst | best |" in text
+    assert "Episode `champion_1m1s1`" in text
     # The day tables themselves stay out: they are rows, not message text.
     assert "ours_bank" not in text
     assert "ours_quadrants" not in text
@@ -497,14 +468,15 @@ def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
 def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
     """Its own games and the recorded ones are the same rows in one store.
 
-    It is not made to look at the recorded games and it is not stopped from
-    it: a round with a question about the field can ask, and a round changing
-    one thing and measuring it never opens the database at all.
+    Stated as a fact and nothing more. The message used to add that the rest
+    was "there if a question wants them and ignorable if not", which is the
+    message telling a round how to work; it says what exists and leaves the
+    use of it alone.
     """
     rates = {"close": 0.5}
     text = prompt.compose(
-        "champion_1", result(rates, days=4), [], [], IMPROVE, table("c", rates)
+        "champion_1", first_game(result(rates, days=4)), [], [], IMPROVE
     )
 
-    assert "recorded games" in text
-    assert "ignorable if not" in text
+    assert "the competition has recorded" in text
+    assert prompt.GAMES in text

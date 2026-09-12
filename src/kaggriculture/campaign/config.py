@@ -137,7 +137,13 @@ SESSIONS = 8
 # bar or failing. There is no clock on a round or on a session: a round runs the
 # skills this login has installed, which take as long as they take, and a cap
 # only ever cut one off before it had written anything.
-ROUNDS_PER_SESSION = 5
+#
+# Twelve, because a session holds one seed and these are the attempts at it. A
+# round is feedback on one game: it is shown that game, it edits, the program is
+# re-scored, and the next round is shown the same seed played by what it wrote.
+# Five was the count from when a round was handed a summary of the whole
+# evaluation, where nothing connected one round to the next except the program.
+ROUNDS_PER_SESSION = 12
 # Seeds a program is scored on: drawn fresh every evaluation and played in
 # both seats against every pool opponent. This is the whole measurement -- one
 # gate, one number, and promotion decided on it.

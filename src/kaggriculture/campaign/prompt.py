@@ -6,24 +6,20 @@ It edits that file and stops. The loop plays every game, so there is nothing
 here about running a harness, no engine to read and no workspace to manage --
 and no file we assemble that an opponent's path could leak through.
 
-The message is four parts: the game's rules, the program and how to work on
-it, an index of the seasons it just played, and the instruction. One function
-composes it and every round is composed by it, the first included, so the
-model never sees a round shaped differently from the others.
+The message is the game's rules, the constraints on the program, one game to
+work on, and the instruction. One function composes it and every round is
+composed by it, the first included, so the model never sees a round shaped
+differently from the others.
 
-The seasons are not in the message and they are not a file either. Every game
+A round is feedback on one game. It is named rather than rendered: every game
 the campaign has played and every game it recorded off the competition are rows
-in one database, and a round queries it. What travels here is the index of its
-own last evaluation -- which matchup is which, how many seasons each holds, and
-how they went -- and a pointer to the rest.
+in one database, so the message carries the episode key and the query, and a
+round reads whichever columns its own question wants. It used to carry a table
+of every matchup in the evaluation instead -- twenty-four rows standing for 768
+games -- which says the program is losing and nothing about a decision it made.
 
-Nothing mined from the public replay corpus reaches a round any more. The
-build order and the settled claims about the ladder's winners were both true
-about the corpus and neither earned its place -- measured 2026-09-10, adding
-the opening as orders took the median candidate from 0.275 to 0.026 and
-stopped promotions for ten hours. What a model did with them is what three
-separate experiments did: bolt another strategy's orders onto this one and
-break the economy underneath.
+Nothing measured off other agents' games reaches a round; see the note on the
+build order below for what happened when it did.
 """
 
 import logging
@@ -33,8 +29,7 @@ from pathlib import Path
 from kaggriculture.campaign import (
     archive,
     config,
-    evaluator,
-    games,
+    harness,
     validate,
 )
 
@@ -46,18 +41,18 @@ TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
 # be read end to end -- what a round is told, and in what order -- without
 # reconstructing it from `compose`.
 ROUND_PROMPT = Path(__file__).with_name("round_prompt.md")
-# What the strongest agents hold on each day, written by `build-order` over
-# the extracted corpus. It is here because the message already gives a round
-# its own banks and tiles each day and gives it nothing to read them against
-# -- and because the agents at the top of the leaderboard publish no kernels,
-# so their games are the only view of them there is.
-#
-# It replaced `winning_pace.md`, which took medians over the winning side of
-# every game. That is the wrong half of the corpus: about half of a ladder's
-# winners are the weaker agent having a good day, and eleven quantities
-# measured that way came back between 45% and 60%. A snapshot of a moving
-# field either way -- rebuilt nightly, because the ladder turns over.
-BUILD_ORDER = Path(__file__).with_name("build_order.md")
+# Nothing measured off other agents' games reaches a round, and the reason is
+# a measurement rather than a preference. A `build_order.md` used to hold what
+# the strongest agents hold on each day and the message carried it whole.
+# Measured 2026-09-10: clustered to one opening the median candidate scored
+# 0.275 over 68 gates with promotions about one an hour; supplied as the orders
+# those agents send, the median fell to 0.026 over 156 gates and nothing
+# promoted in ten hours. The ceiling hardly moved, 0.940 to 0.914, so good
+# programs did not get worse -- most programs became broken. What a model does
+# with another strategy's schedule is bolt it on and break the economy
+# underneath, which is what three separate experiments found. The file and the
+# constant that named it are gone; a round has the games database and can ask
+# it whatever it wants.
 
 # Rendered from the gate's own whitelist, so the model is never told a
 # different set from the one that rejects it. One file ships, so this list is
@@ -82,59 +77,24 @@ GAMES = config.GAMES_URL
 
 CHANGE_CHARS = 160
 
-# The instruction, and there is one. It says the bar the gate actually applies
-# -- finish top of the standings -- rather than naming a way to go about it.
+# One instruction. There were five once -- FAMOU appendix C.2's rewrites, drawn
+# per session -- and two of them, "a completely different algorithm" and "a
+# novel approach inspired by this one", took 54% of every call the campaign
+# made and returned 476 programs of which one scored above nought.
+INSTRUCTION = "Write a program that beats the opponent."
+# The objective, and nothing about how to reach it.
 #
-# There were five, FAMOU appendix C.2's rewrites, drawn one per session on the
-# theory that eight workers starting from one champion would otherwise explore
-# in one direction. Measured over the 476 programs of the first router-seeded
-# run, that is not what they bought:
+# It was "finish every season with a larger bank than it did" until
+# 2026-09-12, chosen as shaping because the gate of the champion_69 era was
+# saturated with the lineage's own ancestors and rank had no gradient left in
+# it. The pool has since inverted -- thirty-two of thirty-four opponents are
+# harvested public agents and the campaign holds no champions -- so winning is
+# the signal with the gradient now.
 #
-#     different      134 programs   mean fitness 0.000   best 0.000
-#     inspired       125            mean 0.013           best 0.911
-#     restructure     84            mean 0.844           best 0.940
-#     improve         70            mean 0.825           best 0.969
-#     tune            62            mean 0.883           best 0.964
-#
-# Every one of the 134 `different` programs scored exactly nought, and
-# `inspired` landed once in 125. Together they are 54% of every call the
-# campaign made. The cause is the seed: "replace it with a completely
-# different algorithm" costs nothing against a thirty-line skeleton and means
-# deleting a rated agent when the program is a published one, and a farm bot
-# written from scratch loses every game to this pool. The three that survived
-# are within 0.06 of each other, which is three ways of saying the same thing.
-#
-# What varies between sessions is the program they start from and what the
-# siblings section says has already been tried from it. That was always the
-# real source of spread; the draw was noise on top of it.
-INSTRUCTION = (
-    "Change `child.py` so that it finishes every season with a larger bank "
-    "than it did. Not a better place in a table -- a bigger margin in the "
-    "games themselves, and most of all in the ones it already wins narrowly. "
-    "Every game it played is in the games database, day by day, and every "
-    "one of them was scored: find where this program left money on the "
-    "field and take it. Small, local changes are welcome, and so is replacing "
-    "whatever part of it is playing badly."
-)
-# Margin rather than rank, and the reason is a measurement rather than a
-# preference.
-#
-# The gate has stopped separating anything. Fourteen of champion_69's
-# twenty-four opponents are saturated and every one of them is ours -- a
-# candidate beats the whole lineage almost always -- so "finish top of the
-# standings" is a step function over a table with no gradient left in it. Every
-# one of those saturated games is still a season of 719 decisions, and some of
-# them are bad ones; summarising the season to a win throws that away.
-#
-# Margin is dense where rank is sparse. A program can always win by more, and
-# the day tables it is shown are seasons rather than verdicts.
-#
-# The competition does not score margin -- it is relative bank, and the size of
-# the win never counts -- which is exactly why this is the *instruction* and
-# not the bar. Promotion still runs on a Bradley-Terry fit that is blind to
-# margin by design, so a program that wins bigger and no more often gains
-# nothing at the gate. The shaping steers the search; it does not decide it.
-INSTRUCTION_NAME = "margin"
+# It also asked for the wrong thing. A round told to improve a margin improves
+# the program it was handed, and seventy-nine rounds did exactly that without
+# once leaving that program's shape.
+INSTRUCTION_NAME = "win"
 
 
 class Message:
@@ -195,61 +155,48 @@ class Message:
 ROUND = Message(ROUND_PROMPT)
 
 
-def _states_lines(result: evaluator.Result) -> list[str]:
-    """Render the index of the evaluation just played: one line per matchup.
+def _game_lines(name: str, played: tuple[int, int, harness.Game] | None) -> list[str]:
+    """Name one game, its result, and the query that reads it back.
 
-    Not the games themselves, and no longer a file either. Every game this
-    campaign has played and every game recorded off the competition are rows
-    in one database, and what belongs in the message is the part a round
-    cannot work out for itself: which matchups these were, how many seasons
-    each holds, and how they went.
+    One game, because a round is feedback on a game. The message used to carry
+    a table of every matchup in the evaluation -- twenty-four rows standing for
+    768 games -- which is a number a round cannot act on: it says the program
+    is losing and nothing about any decision it made.
+
+    The game itself is not rendered here. At full width one season is 8,888
+    characters across 68 columns, and it is already in the games database along
+    with every game the competition has recorded, so what belongs in the
+    message is its name and the query. A round reads whichever columns its own
+    question wants instead of whichever fifteen would fit in a table.
+
+    Args:
+        name: The program's id, which prefixes its episode keys.
+        played: The matchup, the season and the game, or None before there is
+            an evaluation to draw one from.
+
+    Returns:
+        Lines of a markdown section, or nothing at all when there is no game.
     """
-    ordered = games.ordered(result)
-    if not ordered:
+    if played is None:
         return []
-    lines = [
-        "## The seasons it just played",
+    matchup, season, game = played
+    episode = f"{name}m{matchup}s{season}"
+    finish = game.ours - game.theirs
+    return [
+        "## The game",
         "",
-        "Every game it played is in the games database, along with every game "
-        "the competition has recorded. Ask it rather than read it:",
+        f"Episode `{episode}`. It held seat {game.seat} and finished "
+        f"{game.ours:,.0f} against {game.theirs:,.0f}, {finish:+,.0f}.",
         "",
-        f"    curl -s {GAMES} --data-binary " + '"select count() from games.days"',
+        "Every day of it, both sides, is in the games database, along with "
+        "every game the competition has recorded:",
         "",
-        "The `query-games` skill has the schema and the queries worth "
-        "running. Its own games are the ones below; the rest of the database "
-        "is other agents' recorded games, there if a question wants them and "
-        "ignorable if not.",
+        f"    curl -s {GAMES} --data-binary "
+        + f"\"select * from games.days where episode='{episode}'"
+        + ' order by day, seat format Pretty"',
         "",
-        "Every game below was scored, so every one of them is a game to "
-        "improve. The opponents in them are not named and it does not matter "
-        "which they were: they are drawn from a field that turns over, and "
-        "the agent across the table in a scored game will be one this program "
-        "has never seen. A change that wins these seasons because it "
-        "recognised who it was playing wins nothing that counts.",
-        "",
-        "| matchup | seasons | won | mean finish | worst | best |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "The `query-games` skill has the schema.",
     ]
-    for matchup, opponent in enumerate(ordered, start=1):
-        # The game's own final banks, not the last day's. They are the same
-        # number when a game ran to the end and only the game's is right when
-        # it did not -- a forfeit has no last day to read.
-        finals = [game.ours - game.theirs for game in result.states[opponent]]
-        lines.append(
-            f"| {matchup} | {len(finals)} | "
-            f"{sum(1 for final in finals if final > 0)} | "
-            f"{sum(finals) / len(finals):+,.0f} | "
-            f"{min(finals):+,.0f} | {max(finals):+,.0f} |"
-        )
-    lines += [
-        "",
-        "Seasons are numbered narrowest first inside each matchup, so season "
-        "1 is the game a small change would have turned and the last is the "
-        "one furthest out of reach. Both sides are in the database, the "
-        "opponent's shed included: that is what the author of a program is "
-        "shown afterwards, never what the program may read while it plays.",
-    ]
-    return lines
 
 
 def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
@@ -280,68 +227,45 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     return lines
 
 
-def _behind(result: evaluator.Result) -> float:
-    """Mean bank margin across every game, which is what the instruction moves.
-
-    One number rather than a row per opponent. A rate against a named agent
-    affords one action -- target that agent -- and that is the fitting this
-    message exists not to encourage. This is the scale the instruction asks
-    the program to move, and the season below is where it can be read.
-    """
-    if not result.margins:
-        return 0.0
-    return sum(margin.mean for margin in result.margins.values()) / len(result.margins)
-
-
 def compose(
     name: str,
-    result: evaluator.Result,
+    played: tuple[int, int, harness.Game] | None,
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
-    standings: dict[str, float],
 ) -> str:
     """Compose the message for one round.
+
+    A rating used to be passed in and is not any more. It was never rendered --
+    a place is not something a round can act on, it cannot choose its opponents
+    or its rank -- and it cost a Bradley-Terry fit per round to compute an
+    argument nothing read.
 
     Args:
         name: What the program in ``child.py`` is called -- a pool name or a
             database id. It is interpolated raw, so it must never be a path.
-        result: The loop's fast evaluation of that program: the verdict, and
-            the day table of one game behind it.
+        played: The one game this round is feedback on, as its matchup, its
+            season and the game itself. None before there is an evaluation.
         failures: Every failure the ledger holds against that program, oldest
             first. The caller hands over what it has and this cuts it to the
             last few, so a caller cannot forget to.
-        siblings: Programs already written from ``name`` and scored, best
-            first. Cut to ``SIBLINGS`` here for the same reason.
+        siblings: Programs already written from ``name`` and scored. Only
+            counted, for the log line that says how deep this lineage is.
         instruction: ``INSTRUCTION``, with any stagnation note the caller
             prepended.
-        standings: Every agent's rating from the tournament this program's
-            results are part of, itself included.
 
     Returns:
         The whole message, for codex's standard input.
     """
-    # The standings still choose which game is worth showing -- the agent
-    # directly above is the one whose game was closest -- but they are no
-    # longer shown. A place is not something a round can act on: it cannot
-    # choose its opponents or its rank, and everything it can act on is in the
-    # per-opponent table. Worse, the ratings are mostly noise at this sample
-    # size -- one unchanged agent's fitted rating moves with a standard
-    # deviation of 0.745 across draws, where the whole table spans about five
-    # -- so printing them to three decimals invited a round to reason about
-    # differences a re-run would reshuffle. And the top of that table was this
-    # lineage's own ancestry, which is the target the campaign spent a day
-    # removing from the pool.
-    # A lineage with nothing against it gets no section at all: a heading over
-    # an empty list is noise in a message the model reads every round. The
-    # template puts each on its own line, so an empty one leaves no gap.
-    index = _states_lines(result)
+    # A section that would be empty is rendered as nothing at all, heading
+    # included: a heading over an empty list is noise in a message the model
+    # reads every round. The template puts each on its own line, so an empty
+    # one leaves no gap.
+    section = _game_lines(name, played)
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         imports=IMPORTS,
-        seeds=len(result.seeds),
-        margin=f"{_behind(result):+,.0f}",
-        states="\n".join(index) + "\n" if index else "",
+        game="\n".join(section) + "\n" if section else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         instruction=instruction,
     )

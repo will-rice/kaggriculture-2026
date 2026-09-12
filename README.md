@@ -83,7 +83,6 @@ it, and both write files the round prompt reads:
 
 ```bash
 uv run extract-corpus     # /data/.../corpus.sqlite: every game as a table
-uv run build-order        # campaign/build_order.md: what the strongest hold, by day
 uv run strategies         # strategies.jsonl: what separates the strong from the rest
 ```
 
@@ -99,14 +98,18 @@ ladder's winners are the weaker agent having a good day, and that noise swamps
 everything. Read by _who is actually strong_, the same games separate at
 90-100% — and reverse the sign of one of them.
 
-`build-order` writes the table the round prompt carries whole: what the top
-twenty-five rated agents hold on each day. `strategies` puts every quantity
-crossed with every day to the corpus as a paired within-game comparison between
-the stronger and the weaker agent, and keeps whatever settles; a round is shown
-only the settled claims its own games put it on the wrong side of.
+`strategies` puts every quantity crossed with every day to the corpus as a
+paired within-game comparison between the stronger and the weaker agent, and
+keeps whatever settles.
 
-`scripts/daily_corpus.sh` runs the first and third nightly from its own
-worktree. Run `build-order` when the ladder has moved. Everything reads every
+Nothing measured off other agents' games reaches a round. A `build-order`
+command used to write a table of what the top-rated agents hold on each day,
+and the round prompt carried it whole; both were removed on 2026-09-10 after
+measurement, because supplying another strategy's schedule took the median
+candidate from 0.275 to 0.026 and stopped promotions for ten hours.
+
+`scripts/daily_corpus.sh` runs both nightly from its own
+worktree. Everything reads every
 game there is rather than a sample: measured over sixty games eight of the
 first eleven claims cleared the bar, over four hundred six did, and over all
 sixteen thousand one did. Selecting a claim for scoring highly on a sample is

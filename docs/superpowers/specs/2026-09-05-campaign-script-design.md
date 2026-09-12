@@ -206,7 +206,12 @@ cannot poison the next. A fresh call also cannot anchor on its own earlier
 hypothesis: the program embodies its prior work and the verdict says what
 that work achieved.
 
-Bounded by `ROUNDS_PER_SESSION = 5`, and by nothing else. A call runs until it
+Bounded by `ROUNDS_PER_SESSION = 12`, and by nothing else. Twelve because a
+session holds one seed and these are the attempts at it: a round is shown one
+game, it edits, the program is re-scored, and the next round sees the same seed
+played by what it wrote. Five was the count from when a round was handed a
+summary of the whole evaluation, where nothing tied one round to the next except
+the program itself. A call runs until it
 is done and a session runs its rounds. A round inherits the skills the login
 has installed and is meant to -- it brainstorms, plans, writes a test and only
 then edits -- and there is no honest number of seconds for that. The one cap
@@ -279,7 +284,7 @@ with uncommitted changes under `src/`.
 | constant                 | source                      |
 | ------------------------ | --------------------------- |
 | `SESSIONS` 8             | fits the machine            |
-| `ROUNDS_PER_SESSION` 5   | the only bound on a session |
+| `ROUNDS_PER_SESSION` 12  | attempts at the session's seed |
 | `FAST_SEEDS` 8           | 4 was too noisy to rank on  |
 | `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
 | `DEEP_TOP_K` 3           | FAMOU                       |

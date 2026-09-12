@@ -4,7 +4,7 @@ import csv
 import statistics
 from pathlib import Path
 
-from kaggriculture.campaign import harness, measure, prompt
+from kaggriculture.campaign import harness
 
 PASS = (
     "def agent(observation, configuration=None):\n"
@@ -104,24 +104,3 @@ def test_a_replay_names_the_day_the_gap_moved_most(tmp_path: Path) -> None:
     worst, when = min(moves)
     assert 0 < when < len(game.days)
     assert worst == gaps[when] - gaps[when - 1]
-
-
-def test_the_round_is_told_the_commands_that_exist(tmp_path: Path) -> None:
-    """The message prescribes a loop; the loop has to be runnable.
-
-    Every step of `round_prompt.md`'s season loop is a command line, and a
-    prescribed command that the script does not accept is a round spending its
-    call on an error message. The parser is the authority on what exists, so it
-    is what this asks.
-    """
-    del tmp_path
-    template = prompt.ROUND_PROMPT.read_text(encoding="utf-8")
-
-    assert "python measure.py --replay" in template
-    assert "`--seeds`" in template
-    # Both flags reach the script, and `--replay` takes the seed the text says.
-    parser = measure.parser()
-    assert parser.parse_args(["--replay", "103"]).replay == 103
-    assert parser.parse_args(["--seeds", "4"]).seeds == 4
-    # And the seed the prompt uses as its example is one the script will play.
-    assert 103 in measure.SEEDS

@@ -542,15 +542,39 @@ class Campaign:
             note = STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
             instruction = note + instruction
         rounds = 0
+        # The seed this session works on, held for all of its rounds so the
+        # proposer gets several attempts at the same game rather than one look
+        # at each of many. It is re-played by every round's program, so what a
+        # round is shown is its own edit on the map the last round saw.
+        #
+        # Held by seed rather than by its index in the list: `games.ordered`
+        # sorts matchups by win rate every evaluation, so the nth entry is a
+        # different opponent from one round to the next, while a seed is the
+        # same map and the same prices every time it is played.
+        # None until the first evaluation has been drawn from.
+        seed: int | None = None
         for _ in range(config.ROUNDS_PER_SESSION):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
-            standings = gate.standing(
-                name, result.rates, 2 * config.GATE_SEEDS, self.paths
+            # `games.played` keys them the way the database does, name
+            # included; `compose` already has the name and takes the rest.
+            scored = [
+                (matchup, season, game)
+                for matchup, season, _, game in games.played(result, name)
+            ]
+            if seed is None and scored:
+                seed = scored[0][2].seed
+            # The held seed as this program has just played it. A seed block
+            # rotates every `SEED_ROTATION` candidates, so a session can outlive
+            # its seed; when that happens the next game in order stands in and
+            # becomes the one the rest of the session works on.
+            playing = next(
+                (one for one in scored if one[2].seed == seed),
+                scored[0] if scored else None,
             )
-            message = prompt.compose(
-                name, result, failures, siblings, instruction, standings
-            )
+            if playing is not None:
+                seed = playing[2].seed
+            message = prompt.compose(name, playing, failures, siblings, instruction)
             # The floor as it stands *before* the round, because that is the
             # one the round's result is measured against. Read after instead
             # and a round that promoted is asked whether it beats itself: the
