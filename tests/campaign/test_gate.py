@@ -125,90 +125,131 @@ def test_edges_already_on_the_record_are_not_played_again(
     assert again == []
 
 
-def beat(rate: float, decided: int, champion: str = "floor") -> evaluator.Result:
-    """An evaluation in which the candidate took ``rate`` of ``decided`` games.
+def beat(
+    rate: float,
+    decided: int,
+    field: float = 0.30,
+    champion_field: float = 0.20,
+    champion: str = "floor",
+    shared: int = 20,
+) -> tuple[evaluator.Result, gate.Champion]:
+    """A candidate and the champion it is judged against.
 
-    Only the three fields the bar reads are meaningful: who was played, the rate
-    against the champion, and how many of those games ended with a winner.
+    ``field`` and ``champion_field`` are each side's win rate over the opponents
+    they share, so the two conditions can be moved independently: ``rate`` and
+    ``decided`` drive the head-to-head, and the two field figures drive the
+    win-rate comparison.
     """
-    return evaluator.Result(
+    rates = {champion: rate, **{f"public_{i}": field for i in range(shared)}}
+    theirs = {f"public_{i}": champion_field for i in range(shared)}
+    result = evaluator.Result(
         program_id="mine",
         fitness=rate,
-        field=rate,
-        rates={champion: rate, "other": 0.5},
+        field=field,
+        rates=rates,
         margins={
-            name: harness.Margin(mean=0.0, worst=0.0, best=0.0)
-            for name in (champion, "other")
+            name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates
         },
-        decisive={champion: decided, "other": 32},
+        decisive={champion: decided, **{f"public_{i}": 32 for i in range(shared)}},
+        games=32,
         seeds=[1, 2, 3, 4],
         hardest=champion,
         states={},
     )
+    standing = gate.Champion(
+        name=champion,
+        path=f"/champions/{champion}.py",
+        tarball="",
+        result=result.model_copy(update={"program_id": champion, "rates": theirs}),
+    )
+    return result, standing
 
 
-def test_a_decisive_head_to_head_win_promotes() -> None:
-    """The bar is beating the champion, measured in the games against it.
+def test_a_better_rate_and_a_decisive_win_promotes() -> None:
+    """Both conditions, and this is the case that clears them.
 
-    Directly measured and paired: the champion is a pool opponent, so the two
-    programs are in the same games on the same seeds in both seats, and the seat
-    swap cancels position. No rating, no tournament, no stored pairings.
-
-    22 of 32 is 0.688, which is where the Wilson lower bound crosses 0.5.
+    0.30 against the shared opponents where the champion has 0.20 is well past
+    twice the error of the difference, and 22 of 32 against the champion is where
+    the Wilson lower bound crosses 0.5.
     """
-    clear, why = gate.promotion(beat(22 / 32, 32), "floor")
+    clear, why = gate.promotion(*beat(22 / 32, 32))
 
     assert clear, why
-    assert "beat floor" in why and "lower bound" in why
+    assert "against the field" in why and "lower bound" in why
 
 
-def test_a_narrow_head_to_head_win_is_not_shown_to_be_better() -> None:
-    """Above half is not the bar; above half beyond the interval is.
+def test_a_better_rate_without_the_pairing_does_not_promote() -> None:
+    """Beating the field on average is not beating the program it replaces.
 
-    21 of 32 is 0.656 and a real edge on the face of it, and the lower bound is
-    0.483. The interval is what a fixed margin could not be: it tightens when
-    the measurement is good and refuses when it is not.
+    An agent can win more of the field and still lose to the specific one it is
+    taking the slot from, which is not a ratchet.
     """
-    close, why = gate.promotion(beat(21 / 32, 32), "floor")
+    close, why = gate.promotion(*beat(21 / 32, 32))
 
     assert not close
-    assert "not shown to be better" in why
+    assert "not shown to beat it" in why
+
+
+def test_winning_the_pairing_while_losing_the_field_does_not_promote() -> None:
+    """The condition the campaign learned it needed, twice, on 2026-09-13.
+
+    `champion_3` was promoted at a field rate of 0.114 over a champion at 0.155,
+    and `champion_8` at 0.221 over one at 0.244 -- each having beaten the program
+    it replaced decisively. Two of nine promotions handed back field ground,
+    which is a ratchet turning the wrong way.
+    """
+    worse, why = gate.promotion(
+        *beat(28 / 32, 32, field=0.114, champion_field=0.155)
+    )
+
+    assert not worse
+    assert "inside twice its error" in why
+
+
+def test_a_rate_inside_the_noise_does_not_promote() -> None:
+    """A higher number is not a better program.
+
+    At 20 shared opponents and 32 games each the standard error of a rate near
+    0.22 is about 0.014, so the bar is near 0.029. `champion_8` to `champion_9`
+    was +0.0044, a fifth of it. Promoting on any improvement is the winner's
+    curse: 78 of 471 programs once topped a noisy ranking and none survived a
+    deeper look.
+    """
+    noise, why = gate.promotion(
+        *beat(28 / 32, 32, field=0.2253, champion_field=0.2209)
+    )
+
+    assert not noise
+    assert "inside twice its error" in why
 
 
 def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:
     """Two programs that draw are the same program, whatever the rate says.
 
     champion_55 was promoted over champion_54 on two wins and thirty exact draws
-    in 32 games. A rate cannot tell that from seventeen wins and fifteen losses,
-    and 2/2 reads as 1.000.
-
-    `DECISIVE_GAMES` is what covers the band the interval does not: 4 to 7
-    decided out of 32 is a candidate drawing 78% to 88% of its games with the
-    champion. Below 4 the interval refuses on its own, since 3/3 is 0.438.
+    in 32 games; 2/2 reads as 1.000. `DECISIVE_GAMES` covers the band the
+    interval does not -- 4 to 7 decided out of 32 is a candidate drawing 78% to
+    88% of its games with the champion -- and below 4 the interval refuses on its
+    own, since 3/3 is 0.438.
     """
-    drawn, why = gate.promotion(beat(1.0, 2), "floor")
+    drawn, why = gate.promotion(*beat(1.0, 2))
 
     assert not drawn
-    assert "only 2 of its games were decided" in why
-    assert "the same game" in why
+    assert "only 2 of its games" in why and "the same game" in why
 
-    # Seven decided is a perfect record and still refused, because seven of
-    # thirty-two decided is two programs playing the same season.
-    thin, why = gate.promotion(beat(1.0, 7), "floor")
+    thin, why = gate.promotion(*beat(1.0, 7))
     assert not thin and "the bar is 8" in why
 
 
 def test_an_unplayed_champion_is_not_a_measurement() -> None:
-    """A champion that moved under a running evaluation was never played.
-
-    Eight sessions run at once, so a promotion by one lands while the others are
-    mid-flight. Their games are against the champion it replaced, and a bar read
-    off those would replace champion N with something that beat champion N-1.
-    """
-    missing, why = gate.promotion(beat(1.0, 32, champion="someone_else"), "floor")
+    """A champion that moved under a running evaluation was never played."""
+    result, standing = beat(1.0, 32)
+    missing, why = gate.promotion(
+        result, standing.model_copy(update={"name": "someone_else"})
+    )
 
     assert not missing
-    assert "did not play floor" in why
+    assert "did not play someone_else" in why
 
 
 def _paths(tmp_path: Path) -> config.Run:
@@ -475,21 +516,3 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     )
     gate.enroll(gate.record(champion, paths), reloaded, paths)
     assert Path(champion.path).name == "champion_2.py"
-
-
-def test_the_decisive_bar_counts_games_not_the_rate() -> None:
-    """The denominator is games that ended with a winner, not games played.
-
-    champion_55's numbers, measured 2026-09-08: promoted over champion_54 on
-    thirty-two games that were two wins by five units and thirty exact draws. A
-    rate of 1.000 and a rate of 0.531 describe that same record depending on
-    whether the draws are counted, and only one of them says "the same program".
-
-    So a perfect record over two decided games is refused, and a record over
-    thirty-two is read on its merits. The bar is about how much was decided.
-    """
-    perfect, why = gate.promotion(beat(1.0, 2), "floor")
-    assert not perfect and "only 2 of its games were decided" in why
-
-    read, why = gate.promotion(beat(24 / 32, 32), "floor")
-    assert read, why

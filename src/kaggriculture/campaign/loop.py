@@ -307,28 +307,11 @@ def run(
     # A champion's name resolves through the pool file, so the pool on disk
     # must be current before anything plays a game.
     pool.save(paths.pool)
-    # Before anything is judged against this pool, the pool has to have played
-    # itself. `standing` fits over the pairings that exist and plays nothing,
-    # and `Field.results` returns only what it holds, so a tournament run
-    # against a pool with no pairings of its own is fitted from the
-    # candidate's rows alone -- every opponent rated purely by how this one
-    # program did against it, which is not a tournament.
-    #
-    # The anchors are what a rating is calibrated against, and they are played
-    # by every gate, so they have to be connected to each other before the
-    # first one runs. Only their own pairings -- fifteen of them, once -- and
-    # never the pool's, which no longer has a bounded number of pairs.
-    anchors = [name for name in config.GATE_ANCHORS if name in pool.opponents]
-    for anchor in anchors:
-        measured = gate.refresh(
-            anchor,
-            anchors,
-            rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
-            workers,
-            paths,
-        )
-        if measured:
-            LOGGER.info("field: %d anchor pairing(s) for %s", len(measured), anchor)
+    # No anchor pairings are played here. They existed so a Bradley-Terry fit
+    # would have a connected graph before the first gate ran, and no decision is
+    # fitted any more: promotion is a win rate on shared opponents and a
+    # head-to-head, both measured in the candidate's own evaluation. The fifteen
+    # pairings cost about ten minutes of every startup.
     database = archive.Database(paths.archive, paths.programs)
     scored: Result | None = None
     if not database.programs:
@@ -449,8 +432,13 @@ class Campaign:
         # It happened on this campaign's first launch: sixteen sessions in
         # forty-seven seconds over a missing flag.
         self.no_verdict = 0
-        # A promotion renumbers the pool, writes the floor and joins the
-        # champion; eight sessions promoting at once would race on all three.
+        # Which champion file each candidate actually played, taken from the
+        # pool snapshot its evaluation kept. The pool key is fixed, so the key
+        # alone cannot tell the gate that the champion moved mid-evaluation --
+        # the file can.
+        self.champion_played: dict[str, str] = {}
+        # A promotion writes the floor and swaps the champion's pool slot; eight
+        # sessions promoting at once would race on both.
         self.promotions = asyncio.Lock()
         self.group = asyncio.TaskGroup()
 
@@ -847,7 +835,35 @@ class Campaign:
             # "missing" every time -- and it silently blocked every promotion
             # for seven hours, invisibly, because the record below is the only
             # thing that logs a gate and this returned above it.
-            floor = self.floor()
+            # The champion as it stands, not its pool key. The key is fixed at
+            # `config.POOL_CHAMPION` so that a promotion cannot collide with a
+            # harvested name, and that made the staleness check below dead: a
+            # candidate measured against the previous champion still finds the
+            # key present and was credited with beating the current one.
+            # `champion_4` was promoted on 2026-09-13 for beating a program it
+            # never played. The file it played is what identifies it.
+            standing = self.state.champion
+            floor = standing.name if standing is not None else None
+            measured_against = self.champion_played.get(program_id)
+            if (
+                standing is not None
+                and measured_against is not None
+                and measured_against != standing.path
+            ):
+                LOGGER.info(
+                    "%s: measured against %s, and the champion is now %s; "
+                    "not promoted",
+                    program_id,
+                    Path(measured_against).stem,
+                    Path(standing.path).stem,
+                )
+                self.log.log(
+                    {
+                        **self.promotion_record(result, False, baseline, table),
+                        "gate/stale": 1,
+                    }
+                )
+                return False
             if floor is not None and floor not in result.rates:
                 LOGGER.info(
                     "%s: measured before %s became the floor; not promoted",
@@ -866,7 +882,7 @@ class Campaign:
                     }
                 )
                 return False
-            verdict, why = gate.promotion(result, floor)
+            verdict, why = gate.promotion(result, standing)
             # Logged either way. `why` is the only account of what the gate
             # decided and it used to be written only when the answer was yes:
             # 79 programs were turned away with a precise reason -- "25 of 28
@@ -891,44 +907,23 @@ class Campaign:
                 LOGGER.info("pool: %d opponents", len(self.pool.names()))
                 self.state.champion = gate.record(champion, self.paths)
                 self.state.sessions_since_promotion = 0
-                # Last, and after the record, because it is the only slow step
-                # here: the champion joined the pool with no pairings of its
-                # own and `standing` plays nothing, so these have to be played
-                # -- and a first promotion is a whole pool's worth of them.
-                # Until they exist the champion sits in every tournament on one
-                # edge, the row of whichever candidate is being judged against
-                # it, and beating it drops its rating far enough to make
-                # topping the standings easy; each promotion would buy the next
-                # one cheaply.
+                # No field refresh. It played the new champion's pairings so a
+                # Bradley-Terry fit would have edges for it, and nothing reads
+                # that fit any more: the bar is a win rate and a head-to-head,
+                # both measured in the candidate's own evaluation.
                 #
-                # Interrupting this is now harmless. `field.missing` is what
-                # decides what to play, so a refresh that never finished leaves
-                # pairings absent and the next promotion plays them. Ordered
-                # the other way round -- and it was -- a kill in the middle
-                # left the pool holding a champion that `champion.json` had
-                # never heard of, which is exactly what happened the first time
-                # this ever promoted.
-                #
-                # Its edges to the agents it will be compared against, which
-                # is the sample any later candidate would draw -- not every
-                # missing pair in the pool, which now grows with its square.
-                measured = await asyncio.to_thread(
-                    gate.refresh,
-                    champion.name,
-                    self.snapshot().sample(table, self.rng, exclude=champion.name),
-                    self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
-                    self.workers,
-                    self.paths,
-                )
-                LOGGER.info(
-                    "field: %d new pairing(s) for %s", len(measured), champion.name
-                )
+                # It cost 8.5 minutes of this lock per promotion, measured
+                # 2026-09-13 -- 24 pairings at 768 games -- and every other
+                # session's gate queued behind it. Three candidates were waiting
+                # when the first promotion of that run finished, one of them a
+                # better program than the one that had just promoted.
                 artifact = wandb.Artifact(
                     champion.name, "champion", metadata=result.model_dump()
                 )
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
             self.log.log(self.promotion_record(result, verdict, baseline, table))
+            self.champion_played.pop(program_id, None)
             return verdict
 
     def floor(self) -> str | None:
@@ -961,11 +956,15 @@ class Campaign:
         anything it did.
         """
         table = rating.standings(rating.Field.load(self.paths.field).everything())
+        pool = self.snapshot()
+        # Recorded before a game is played, so the gate can tell afterwards
+        # whether the champion it is being compared against is the one it met.
+        self.champion_played[program_id] = pool.opponents.get(config.POOL_CHAMPION, "")
         result = await asyncio.to_thread(
             evaluator.score,
             source,
             program_id,
-            self.snapshot(),
+            pool,
             random.Random(self.rng.random()),
             self.seasons(),
             self.workers,

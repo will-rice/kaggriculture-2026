@@ -47,6 +47,7 @@ a tree the next launch refuses to start on.
 """
 
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -206,66 +207,89 @@ def standing(
 
 def promotion(
     result: Result,
-    champion: str | None,
+    champion: "Champion | None",
     *,
     decisive_bar: int = config.DECISIVE_GAMES,
 ) -> tuple[bool, str]:
-    """Whether the candidate beat the champion, decisively enough to say so.
+    """Whether the candidate is better than the champion, on both counts.
 
-    One condition, read off the candidate's own evaluation: the Wilson lower
-    bound of its win rate against the champion, above 0.5, over at least
-    ``decisive_bar`` games that ended with a winner. At 32 decisive games that
-    is 22 wins, 0.688.
+    Two conditions, and both are required:
 
-    The champion is a pool opponent, so this is directly measured -- 16 seeds in
-    both seats, both programs in the same games, so the map is shared and the
-    seat swap cancels position -- and it needs no rating, no tournament and no
-    stored pairings.
+    1. **A higher win rate**, over the opponents both were measured against,
+       beyond twice the error of the difference.
+    2. **Beating the champion head-to-head**: the Wilson lower bound of its rate
+       against the champion above 0.5, over at least ``decisive_bar`` decided
+       games.
 
-    What it replaces required `place == 1` of a Bradley-Terry fit in both of its
-    regimes, including the branch labelled as the first promotion of a run. The
-    best program this campaign produced placed 25 of 28, and four of the five
-    above it were champions of the tape lineage; three of those are not in the
-    pool and cannot be played, so the bar could not be cleared by playing well.
-    Seventy-nine programs were refused against it and none of the refusals were
-    logged.
+    Neither implies the other, and the campaign has now produced both failures.
+    Condition 2 alone promoted `champion_3` at a field rate of 0.114 over a
+    champion at 0.155, and `champion_8` at 0.221 over one at 0.244: two of nine
+    promotions handing back field ground while winning the pairing decisively.
+    Condition 1 alone would promote an agent that beats the field on average and
+    loses to the specific program it replaces, which is not a ratchet.
 
-    The interval does the work a fixed margin could not: it widens when few
-    games were decided, so a thin record refuses itself. ``decisive_bar`` covers
-    what it cannot -- 4 to 7 decisive games out of 32 is a candidate drawing 78%
-    to 88% of them with the champion, close enough to being the same program
-    that the difference is not worth promoting on. Below 4 the interval already
-    refuses: 3/3 is 0.438.
+    The rate is compared on common opponents because the two were measured in
+    different seed blocks against a pool that harvest grows, so their own
+    `fitness` figures are not the same question. Restricting to the opponents
+    both played is the same discipline that turns a 0.331-against-24 and a
+    0.221-against-33 into a comparable 0.283 and 0.214.
+
+    It is still not paired -- different blocks means different maps, and the
+    difference carries both measurements' noise. Twice the error of the
+    difference is what stands in for that: at 41 opponents and 32 games each the
+    standard error of a rate near 0.22 is 0.011, so the bar is about 0.023, and
+    it tightens or loosens with the evidence rather than being a constant nobody
+    checked against the noise.
 
     Args:
         result: The candidate's evaluation, which played the champion.
-        champion: The champion's pool name, or None when there is none.
-        decisive_bar: Decided games required before the rate is read.
+        champion: The champion it must beat, or None when there is none.
+        decisive_bar: Decided games required before the pairing is read.
 
     Returns:
         Whether to promote, and a reason either way.
     """
     if champion is None:
         return False, "no champion to beat"
-    if champion not in result.rates:
-        return False, f"did not play {champion}"
-    decided = result.decisive.get(champion, 0)
-    rate = result.rates[champion]
+    name = champion.name
+    if name not in result.rates:
+        return False, f"did not play {name}"
+
+    common = sorted((set(result.rates) & set(champion.result.rates)) - {name})
+    if not common:
+        return False, f"no opponent in common with {name}"
+    mine = sum(result.rates[one] for one in common) / len(common)
+    theirs = sum(champion.result.rates[one] for one in common) / len(common)
+    played = max(1, len(common) * max(1, result.games))
+    error = math.sqrt(
+        mine * (1 - mine) / played + theirs * (1 - theirs) / played
+    )
+    bar = 2 * error
+    if mine - theirs <= bar:
+        return False, (
+            f"{mine:.3f} against the field where {name} has {theirs:.3f} over "
+            f"{len(common)} shared opponents: {mine - theirs:+.3f} is inside "
+            f"twice its error of {bar:.3f}"
+        )
+
+    decided = result.decisive.get(name, 0)
+    rate = result.rates[name]
     if decided < decisive_bar:
         return False, (
-            f"{rate:.3f} against {champion} but only {decided} of its games "
-            f"were decided and the bar is {decisive_bar}: the two play the "
-            f"same game"
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f}, but only "
+            f"{decided} of its games against {name} were decided and the bar is "
+            f"{decisive_bar}: the two play the same game"
         )
     low, _ = wilson_interval(rate * decided, decided)
     if low > 0.5:
         return True, (
-            f"beat {champion} at {rate:.3f} over {decided} decided, "
-            f"lower bound {low:.3f}"
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f}, and beat "
+            f"{name} at {rate:.3f} over {decided} decided, lower bound {low:.3f}"
         )
     return False, (
-        f"{rate:.3f} against {champion} over {decided} decided, lower bound "
-        f"{low:.3f}: not shown to be better"
+        f"{mine:.3f} against the field over {name}'s {theirs:.3f}, but "
+        f"{rate:.3f} against {name} over {decided} decided has lower bound "
+        f"{low:.3f}: not shown to beat it"
     )
 
 
