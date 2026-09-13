@@ -158,6 +158,7 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
     prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.0})),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -184,6 +185,7 @@ def test_the_message_carries_the_rules_and_its_own_play() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.0}, days=30)),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -207,6 +209,7 @@ def test_the_message_carries_no_path_at_all() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.1, "router_v1": 0.0})),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -228,6 +231,7 @@ def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -244,6 +248,7 @@ def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -278,6 +283,7 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.0}, days=30)),
+        0.316,
         [],
         [],
         prompt.INSTRUCTION,
@@ -314,6 +320,7 @@ def test_the_message_carries_the_lineages_recent_failures() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
+        0.316,
         failures,
         [],
         IMPROVE,
@@ -333,6 +340,7 @@ def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -346,6 +354,7 @@ def test_the_instruction_reaches_the_message_whole() -> None:
     message = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
+        0.316,
         [],
         [],
         prompt.INSTRUCTION,
@@ -376,18 +385,83 @@ def stored(
 
 
 def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> None:
-    """A heading over an empty table is noise in a message read every round."""
+    """A heading over an empty table is noise in a message read every round.
+
+    The string this asserted on until 2026-09-13 was "already been made",
+    which no version of the section has ever rendered, so it held whatever the
+    code did. It asserts on the heading `_tried_lines` actually writes now.
+    """
     db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
 
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
+        0.316,
         [],
         db.children("champion_1"),
         IMPROVE,
     )
 
-    assert "already been made" not in text
+    assert "Edits already tried" not in text
+    assert "tried_1.py" not in text
+
+
+def test_the_edits_already_tried_are_named_and_scored(tmp_path: Path) -> None:
+    """A round is told which way its predecessors moved, and by how much.
+
+    A codex call remembers nothing of the ones before it, so a session's twelve
+    consecutive attempts on one opponent were twelve independent guesses. On
+    2026-09-13 that cost four of a run's thirteen rounds: one session wrote a
+    program scoring 0.000 and spent three more rounds editing that, because
+    nothing ever told a round what its last change did.
+
+    The score is in the message and the program itself is a file, so the round
+    can diff whichever one its own question is about.
+    """
+    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+    stored(db, "p_better", "champion_1", 0.340, "nudged the opening")
+    stored(db, "p_worse", "champion_1", 0.130, "rewrote the planner")
+
+    text = prompt.compose(
+        "champion_1",
+        first_game(result({"v54": 0.5})),
+        0.316,
+        [],
+        db.children("champion_1"),
+        IMPROVE,
+    )
+
+    assert "## Edits already tried on `champion_1`" in text
+    assert "`child.py` wins 0.316 of its games" in text
+    # Best first, which is `children`'s own order, and each delta is against
+    # the program in `child.py` rather than against the one above it.
+    assert "- `tried_1.py` scored 0.340 (+0.024)" in text
+    assert "- `tried_2.py` scored 0.130 (-0.186)" in text
+
+
+def test_only_the_first_few_edits_are_sent(tmp_path: Path) -> None:
+    """Eight sessions edit one champion, so the list needs a cut.
+
+    Every program written from the champion by any session is a sibling, and
+    `RECENT_ATTEMPTS` of them reach the message -- the best, since that is the
+    order `children` returns and the direction that came closest is what a
+    round can act on.
+    """
+    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
+    for number in range(prompt.RECENT_ATTEMPTS + 2):
+        stored(db, f"p{number}", "champion_1", 0.30 - number / 100, f"try {number}")
+
+    text = prompt.compose(
+        "champion_1",
+        first_game(result({"v54": 0.5})),
+        0.316,
+        [],
+        db.children("champion_1"),
+        IMPROVE,
+    )
+
+    assert f"`tried_{prompt.RECENT_ATTEMPTS}.py`" in text
+    assert f"`tried_{prompt.RECENT_ATTEMPTS + 1}.py`" not in text
 
 
 def test_no_opponent_is_named_anywhere_in_the_message() -> None:
@@ -418,6 +492,7 @@ def test_no_opponent_is_named_anywhere_in_the_message() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result(rates, days=30)),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -435,6 +510,7 @@ def test_the_templates_own_note_never_reaches_the_model() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5}, days=30)),
+        0.316,
         [],
         [],
         IMPROVE,
@@ -454,7 +530,7 @@ def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
     """
     rates = {"close": 0.5, "beaten": 0.1}
     text = prompt.compose(
-        "champion_1", first_game(result(rates, days=4)), [], [], IMPROVE
+        "champion_1", first_game(result(rates, days=4)), 0.316, [], [], IMPROVE
     )
 
     assert prompt.GAMES in text, "the round is not told where to ask"
@@ -475,7 +551,7 @@ def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
     """
     rates = {"close": 0.5}
     text = prompt.compose(
-        "champion_1", first_game(result(rates, days=4)), [], [], IMPROVE
+        "champion_1", first_game(result(rates, days=4)), 0.316, [], [], IMPROVE
     )
 
     assert "the competition has recorded" in text

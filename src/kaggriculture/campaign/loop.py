@@ -615,8 +615,10 @@ class Campaign:
                     one for one in scored if one[0] == matchups[block % len(matchups)]
                 ]
                 playing = against[attempt % len(against)]
-            message = prompt.compose(name, playing, failures, siblings, instruction)
-            outcome = await self.round(source, name, result, message, drawn)
+            message = prompt.compose(
+                name, playing, result.fitness, failures, siblings, instruction
+            )
+            outcome = await self.round(source, name, result, message, siblings, drawn)
             rounds += 1
             if outcome is None:
                 break
@@ -633,7 +635,13 @@ class Campaign:
         self.finish(rounds)
 
     async def round(
-        self, source: Path, name: str, result: Result, message: str, drawn: str
+        self,
+        source: Path,
+        name: str,
+        result: Result,
+        message: str,
+        siblings: list[archive.Program],
+        drawn: str,
     ) -> tuple[Path, str, Result, bool] | None:
         """One round: one codex call on one file, and the loop's verdict on it.
 
@@ -648,13 +656,16 @@ class Campaign:
             result: The loop's verdict on that program, carried through so a
                 rejected round hands the same program to the next one.
             message: The composed prompt for this round.
+            siblings: Programs already written from ``source``, best first. The
+                message names the first few as ``tried_1.py`` and so on; this
+                is what puts those files in the directory.
             drawn: The name of the drawn instruction, recorded on the program.
 
         Returns:
             The program the next round continues from, its id, its verdict, and
             whether the gate promoted it. That is what this round wrote, or what
-            it started from when the round was rejected. None when the call
-            never ran to a verdict, and the session ends there.
+            it started from when the round was rejected or lost ground. None
+            when the call never ran to a verdict, and the session ends there.
         """
         program_id = f"p{uuid.uuid4().hex[:12]}"
         # The directory owns its own removal. Written as `mkdtemp` and a
@@ -691,6 +702,14 @@ class Campaign:
             # opponents this never sees, and nothing a round reports is read.
             shutil.copy(source, box / "parent.py")
             shutil.copy(Path(measure.__file__), box / "measure.py")
+            # And the edits already made to this program, which the message
+            # names and scores. A score says a direction lost ground; the file
+            # is what says which direction it was, and `measure.py` will play
+            # one of them against `child.py` if the round wants that too.
+            for number, program in enumerate(
+                siblings[: prompt.RECENT_ATTEMPTS], start=1
+            ):
+                shutil.copy(program.source_path, box / f"tried_{number}.py")
             # And how to ask it, as a skill rather than as more message. Codex
             # discovers `.codex/skills` under its working directory, so a
             # round that wants the schema and the queries worth running opens
@@ -716,10 +735,13 @@ class Campaign:
         if rated:
             record["database/top_rating"] = max(rated)
         if kept is not None:
-            result = kept.result
-            record["calls/fitness"] = result.fitness
-            if result.field is not None:
-                record["calls/field"] = result.field
+            # Named apart from `result`, which is the program this round was
+            # given and is what the comparison below is against. Rebinding it
+            # here made that comparison the child against itself.
+            scored = kept.result
+            record["calls/fitness"] = scored.fitness
+            if scored.field is not None:
+                record["calls/field"] = scored.field
             # The fit `keep` already made. Computing another here was the third
             # Bradley-Terry fit of the same round.
             table = kept.table
@@ -728,7 +750,7 @@ class Campaign:
             record["calls/place"] = 1 + sorted(
                 table, key=lambda name: -table[name]
             ).index(program_id)
-            record["calls/pool"] = len(result.rates)
+            record["calls/pool"] = len(scored.rates)
         self.log.log(record)
         if mutation.status == "exec_error":
             # No verdict, and no failure on the lineage either: there is
@@ -739,6 +761,26 @@ class Campaign:
         # in the ledger and the next message carries it back, which is worth
         # more than throwing away the rounds that remain.
         if kept is None:
+            return source, name, result, False
+        # Neither does a round that made the program worse. A session used to
+        # continue from whatever its last round wrote, which makes a sequence
+        # of rounds a random walk rather than a climb: on 2026-09-13 one
+        # session wrote a program scoring 0.000, then spent three more rounds
+        # editing that, four of the run's thirteen rounds spent below 0.14
+        # while the program they started from scored 0.316.
+        #
+        # A promotion is taken whatever the comparison says. The gate is a
+        # higher bar than this one and it has already run.
+        if not kept.cleared and not kept.result.beats(result):
+            LOGGER.info(
+                "%s scored %.3f where %s scored %.3f: the next round starts "
+                "from %s again",
+                kept.name,
+                kept.result.fitness,
+                name,
+                result.fitness,
+                name,
+            )
             return source, name, result, False
         return kept.source, kept.name, kept.result, kept.cleared
 
@@ -851,8 +893,7 @@ class Campaign:
                 and measured_against != standing.path
             ):
                 LOGGER.info(
-                    "%s: measured against %s, and the champion is now %s; "
-                    "not promoted",
+                    "%s: measured against %s, and the champion is now %s; not promoted",
                     program_id,
                     Path(measured_against).stem,
                     Path(standing.path).stem,

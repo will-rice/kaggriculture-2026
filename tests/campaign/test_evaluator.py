@@ -272,3 +272,56 @@ def test_every_game_it_scores_is_a_game_the_round_can_improve(tmp_path: Path) ->
     assert {game.seed for game in seasons} == {11, 12}
     gaps = [abs(game.ours - game.theirs) for game in seasons]
     assert gaps == sorted(gaps), "narrowest first, so season 1 is the reachable one"
+
+
+def rated(program_id: str, rates: dict[str, float]) -> evaluator.Result:
+    """A result carrying nothing but the rates a comparison reads."""
+    return evaluator.Result(
+        program_id=program_id,
+        fitness=sum(rates.values()) / len(rates),
+        field=None,
+        rates=rates,
+        margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
+        games=2,
+        seeds=[1],
+        hardest=next(iter(rates)),
+        states={},
+    )
+
+
+def test_a_result_is_compared_over_the_opponents_both_programs_played() -> None:
+    """A pool that grew between two evaluations must not decide the comparison.
+
+    Harvest enrolled an opponent at 14:01 on 2026-09-13, mid-session, and a mean
+    over a pool that gained an agent is not the same number as a mean over the
+    pool before it. Here the child faces one extra opponent it beats outright:
+    on `fitness` it looks ahead, and over what both actually played it is behind.
+    """
+    parent = rated("parent", {"a": 0.40, "b": 0.40})
+    child = rated("child", {"a": 0.30, "b": 0.30, "harvested": 1.0})
+
+    assert child.fitness > parent.fitness, "the whole-pool mean favours the child"
+    assert not child.beats(parent), "over the shared two it is 0.30 against 0.40"
+    assert parent.beats(child)
+
+
+def test_a_tie_is_not_an_improvement() -> None:
+    """Two programs that draw every game are the same program.
+
+    Equality keeps the incumbent, so a round that changed nothing measurable
+    does not become what the next round builds on.
+    """
+    held = rated("parent", {"a": 0.5, "b": 0.5})
+    same = rated("child", {"a": 0.5, "b": 0.5})
+
+    assert not same.beats(held)
+    assert not held.beats(same)
+
+
+def test_two_results_with_no_opponent_in_common_are_not_a_comparison() -> None:
+    """No shared opponent is no evidence, and no evidence keeps the incumbent."""
+    parent = rated("parent", {"a": 0.1})
+    child = rated("child", {"b": 0.9})
+
+    assert not child.beats(parent)
+    assert not parent.beats(child)

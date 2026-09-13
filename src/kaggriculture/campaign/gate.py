@@ -261,9 +261,7 @@ def promotion(
     mine = sum(result.rates[one] for one in common) / len(common)
     theirs = sum(champion.result.rates[one] for one in common) / len(common)
     played = max(1, len(common) * max(1, result.games))
-    error = math.sqrt(
-        mine * (1 - mine) / played + theirs * (1 - theirs) / played
-    )
+    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
     bar = 2 * error
     if mine - theirs <= bar:
         return False, (
@@ -317,9 +315,14 @@ def promote(
         program: The archive entry being promoted.
         result: Its measurement.
         paths: The run the champion is written into.
+        package: Whether to build the submission tarball. Champion zero passes
+            False: it is the seed being enthroned at startup rather than
+            something a round won, so there is nothing to submit yet, and
+            packaging it fails on the skeleton's `LICENSE`.
 
     Returns:
-        The champion record, for ``enroll`` and ``record`` to act on.
+        The champion record, for ``enroll`` and ``record`` to act on. Its
+        ``tarball`` is empty when ``package`` is False.
 
     Raises:
         FileExistsError: The champions directory already holds this name.

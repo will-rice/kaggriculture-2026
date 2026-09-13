@@ -68,14 +68,18 @@ IMPORTS = ", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS))
 RECENT_FAILURES = 3
 REASON_CHARS = 200
 
+# How many of the edits already made to this program are sent. Best first,
+# which is `Database.children`'s own order: what a round can act on is the
+# direction that came closest and the ones that lost ground, and with eight
+# sessions editing the same champion the list is long enough to need a cut.
+RECENT_ATTEMPTS = 3
+
 # How a round reaches the games. One database holds every game this campaign
 # has played and every game recorded off the competition, and a round asks it
 # questions rather than being handed a copy: the size of the evidence stops
 # being the message's problem, which is the only property that scales.
 GAMES = config.GAMES_URL
 
-
-CHANGE_CHARS = 160
 
 # One instruction. There were five once -- FAMOU appendix C.2's rewrites, drawn
 # per session -- and two of them, "a completely different algorithm" and "a
@@ -227,9 +231,73 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     return lines
 
 
+def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> list[str]:
+    """Render the edits already made to this program and what they scored.
+
+    A round is a fresh call that remembers nothing of the ones before it, so
+    without this a session's twelve consecutive attempts on one opponent are
+    twelve independent guesses rather than twelve steps of a search. Early on
+    guessing works, because when a program is bad most changes help; at 0.316
+    against the field most changes hurt, and a search that cannot tell which
+    way it moved stops climbing. Measured 2026-09-13: thirteen rounds, eight of
+    them above the program they started from by +0.005 to +0.024, and nothing
+    carried between them.
+
+    `Database.children` has held this list all along -- "what the next round is
+    told has already been tried from where it stands" -- and `compose` counted
+    it for a log line. It was always empty, because a session advanced onto
+    whatever its last round wrote, so the program being composed against was
+    new and had no children yet. It fills up now that a round that lost ground
+    hands the next one the program it started from.
+
+    The edits are files rather than diffs in the message, the way the game is
+    an episode key rather than a table: a round diffs whichever of them its own
+    question is about, and one that does not care pays nothing for them.
+
+    The deltas are whole-pool means differenced, not `Result.beats`'s comparison
+    over the opponents both sides played. A sibling and the program it was
+    edited from are measured minutes apart and almost always against the same
+    pool, so the two agree; across a harvest the delta is off by about a
+    forty-eighth of a rate difference. This is a direction for a round to read
+    and not the comparison anything is decided on, which is why it is the cheap
+    one.
+
+    Args:
+        name: The program in ``child.py``, by name.
+        rate: Its mean win rate over the opponents it was measured on, so the
+            deltas below have something to be deltas from.
+        siblings: Programs written from it, best first, already copied into the
+            round's directory as ``tried_1.py`` and so on.
+
+    Returns:
+        Lines of a markdown section, one bullet per edit.
+    """
+    lines = [
+        f"## Edits already tried on `{name}`",
+        "",
+        f"`child.py` wins {rate:.3f} of its games against the pool. These "
+        "programs were written from it and played, best first, and each one is "
+        "in your directory:",
+        "",
+    ]
+    for number, program in enumerate(siblings[:RECENT_ATTEMPTS], start=1):
+        lines.append(
+            f"- `tried_{number}.py` scored {program.fitness:.3f} "
+            f"({program.fitness - rate:+.3f})"
+        )
+    lines += [
+        "",
+        "Diff them against `child.py` to see what each one changed. A better "
+        "score is a direction to go further in; a worse one is a direction "
+        "already measured and lost.",
+    ]
+    return lines
+
+
 def compose(
     name: str,
     played: tuple[int, int, harness.Game] | None,
+    rate: float,
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
@@ -246,11 +314,14 @@ def compose(
             database id. It is interpolated raw, so it must never be a path.
         played: The one game this round is feedback on, as its matchup, its
             season and the game itself. None before there is an evaluation.
+        rate: The program's mean win rate over the opponents it was measured
+            on, which is the number the edits below are deltas from.
         failures: Every failure the ledger holds against that program, oldest
             first. The caller hands over what it has and this cuts it to the
             last few, so a caller cannot forget to.
-        siblings: Programs already written from ``name`` and scored. Only
-            counted, for the log line that says how deep this lineage is.
+        siblings: Programs already written from ``name`` and scored, best
+            first. The caller hands over what it has and this cuts it to the
+            first few, and `round` copies the same ones into the directory.
         instruction: ``INSTRUCTION``, with any stagnation note the caller
             prepended.
 
@@ -262,10 +333,12 @@ def compose(
     # reads every round. The template puts each on its own line, so an empty
     # one leaves no gap.
     section = _game_lines(name, played)
+    tried = _tried_lines(name, rate, siblings) if siblings else []
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         imports=IMPORTS,
         game="\n".join(section) + "\n" if section else "",
+        tried="\n".join(tried) + "\n" if tried else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         instruction=instruction,
     )

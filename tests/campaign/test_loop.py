@@ -1172,6 +1172,11 @@ def test_a_session_is_rounds_and_each_continues_from_the_last(
     difference between a round and a session, which starts again from the
     champion -- and every round's program is scored and inserted, so three
     rounds leave three programs in the database beside the seed.
+
+    Each edit here lengthens the source and the stub scores on length, so every
+    round genuinely improves on the one before it. That is the condition:
+    `test_a_round_that_lost_ground_is_not_what_the_next_one_builds_on` is the
+    same session when it does not hold.
     """
     paths = tiny_run(tmp_path, monkeypatch, rounds=3)
     pass_pool(tmp_path, paths)
@@ -1189,6 +1194,47 @@ def test_a_session_is_rounds_and_each_continues_from_the_last(
     assert all(program.rates for program in written)
     assert len(calls_of(records)) == 3
     assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
+
+
+def test_a_round_that_lost_ground_is_not_what_the_next_one_builds_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A session climbs from its best program, not from its latest one.
+
+    Measured 2026-09-13: one session wrote a program scoring 0.000, then spent
+    three more rounds editing that, while the program it had started from
+    scored 0.316. Four of the run's thirteen rounds went on a lineage already
+    known to be broken, because a session continued from whatever its last
+    round happened to write. That is a random walk; taking the better of the
+    two is a climb.
+
+    The second round here shortens the source, which the stub scores lower, so
+    the third round is handed the first round's program again -- and is told
+    that the discarded one exists and what it cost.
+    """
+    paths = tiny_run(tmp_path, monkeypatch, rounds=3)
+    pass_pool(tmp_path, paths)
+    stub_evaluator(monkeypatch)
+    seed = _write(tmp_path / "seed.py", PASS)
+    better = PASS + "# a longer program\n"
+    written = iter([better, PASS, better + "# and further\n"])
+    mutator = Recorder(edit=lambda _: next(written))
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+
+    first, second, third = mutator.seen
+    assert first.child == PASS
+    assert second.child == better
+    # Not `PASS`, which is what the second round wrote and scored worse for.
+    assert third.child == better
+    # The regression is still in the database -- it was played, and what it
+    # cost is worth telling the next round -- and it reaches that round as a
+    # file it can diff rather than as prose.
+    assert "## Edits already tried on" in third.message
+    assert "`tried_1.py` scored" in third.message
+    assert "tried_1.py" in third.held
+    database = archive.Database(paths.archive, paths.programs)
+    assert len([p for p in database.programs if p.id != config.SEED_ID]) == 3
 
 
 def test_the_database_records_which_model_wrote_each_program(
@@ -2012,6 +2058,7 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
                 "champion_1",
                 _gate_result("p1", {"v54": 0.5}),
                 "improve it",
+                [],
                 "margin",
             )
         )
@@ -2105,6 +2152,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
                 "champion_1",
                 _gate_result("p1", {"v54": 0.5}, days=30),
                 "improve it",
+                [],
                 "margin",
             )
         )

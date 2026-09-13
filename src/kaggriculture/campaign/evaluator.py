@@ -115,6 +115,35 @@ class Result(BaseModel):
     hardest: str
     states: dict[str, list[harness.Game]]
 
+    def beats(self, other: "Result") -> bool:
+        """Whether this scored better than ``other`` over what both played.
+
+        The shared opponents rather than `fitness`, because the pool grows
+        while a session runs -- harvest enrolled one at 14:01 on 2026-09-13,
+        mid-session -- and a mean over a pool that gained an agent is not the
+        same number as a mean over the pool before it. The shift is about a
+        forty-seventh of a rate difference, which is the size of the
+        improvements this comparison exists to tell apart.
+
+        Ties go to ``other``. Two programs that draw every game are the same
+        program however their sources differ, and there is no reason to move
+        onto one of them.
+
+        Args:
+            other: The result to compare against, usually the program this one
+                was edited from.
+
+        Returns:
+            True when this result is the better of the two. False when they
+            share no opponent, which is not a comparison.
+        """
+        common = sorted(set(self.rates) & set(other.rates))
+        if not common:
+            return False
+        mine = sum(self.rates[one] for one in common) / len(common)
+        theirs = sum(other.rates[one] for one in common) / len(common)
+        return mine > theirs
+
 
 def _mean(rates: dict[str, float]) -> float:
     """The mean of ``rates``; every opponent counts the same."""

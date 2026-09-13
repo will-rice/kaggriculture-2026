@@ -33,7 +33,7 @@ for how it was built.
 | `src/kaggriculture/campaign/copycheck.py`                             | token-shingle similarity against opponent sources                                                                                                               |
 | `src/kaggriculture/campaign/validate.py`                              | `validate(agent) -> Verdict`: syntax, contract, imports, copy check, a full game; no latency check                                                              |
 | `src/kaggriculture/campaign/archive.py`                               | the shared database: every program with its scores, its deep result and every failure, as an append-only log                                                    |
-| `src/kaggriculture/campaign/prompt.py`                                | composes the message a call is given: the game, the program, its verdict, the day states, one instruction                                                       |
+| `src/kaggriculture/campaign/prompt.py`                                | composes the message a call is given: the rules, one game, the edits already tried on this program and what they scored, one instruction                        |
 | `src/kaggriculture/campaign/mutate.py`                                | one `codex exec` call: a directory holding `child.py`, the message on stdin, a fallback model on a provider refusal                                             |
 | `src/kaggriculture/campaign/evaluator.py`                             | `fast` on fresh seeds and `deep` on the sealed block; a program never plays itself                                                                              |
 | `src/kaggriculture/campaign/pool.py`                                  | the opponents, counting equally; champions join, the crushed retire at `POOL_CAP`                                                                               |
@@ -58,16 +58,24 @@ database, one pool and one champion. A worker takes the champion and runs a
 session on it: each round composes a message, hands codex a directory holding
 one file, `child.py`, and the message on standard input, then validates what
 codex wrote, plays it against every pool opponent, inserts it, and sends the
-result back for another round. A round continues from its own previous
-program; a new session starts again from the champion. A session ends when a
-round beats every opponent, or at whichever of `ROUNDS_PER_SESSION` and
-`SESSION_LIMIT_SECONDS` comes first.
+result back for another round. A round continues from the best program its
+session has produced, not the latest one: a round that lost ground hands the
+next one the program it started from, and that program's rejected children
+reach the next round as `tried_1.py` and so on beside their scores. A new
+session starts again from the champion. A session runs
+`ROUNDS_PER_OPPONENT` consecutive rounds on each pool opponent in turn and
+ends when a round clears the promotion gate.
 
 The model is a mutation operator: it plays nothing and measures nothing, so
 every game goes through the one pool that knows how many cores there are, and
 the verdict it is sent is the same rule the promotion gate applies. There is
-one measurement, over `GATE_SEEDS` fresh seeds, and a program that finishes top
-of the Bradley-Terry standings on it becomes the champion and joins the pool.
+one measurement, over `GATE_SEEDS` fresh seeds, and a program becomes the
+champion by clearing two bars on it: a higher mean win rate than the standing
+champion over the opponents both played, by more than twice the error of the
+difference, and a win against that champion itself whose Wilson lower bound is
+above a half over at least `DECISIVE_GAMES` decided games. Either alone let the
+chain move sideways — `champion_3` replaced a champion 0.041 better than it on
+the field, and `champion_8` one 0.023 better — so both are required.
 There were two — a cheap ranking to shortlist on and a sealed block to confirm
 — and the cheap one selected the luckiest program rather than the best: 78 of
 471 topped it and none survived the block. Re-measuring cannot fix that, so

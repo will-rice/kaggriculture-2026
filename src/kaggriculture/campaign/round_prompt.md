@@ -10,6 +10,8 @@ Placeholders, all filled on every round:
                  whitelist so a round is never told a different set from the
                  one that rejects it
   {game}         the one game this round is feedback on
+  {tried}        the edits already made to this program and what they scored,
+                 or empty before any has been
   {failures}     the lineage's recent rejected attempts, or empty
   {instruction}  what to do
 -->
@@ -48,6 +50,7 @@ source, ask for it, or reconstruct it -- the gate rejects code resembling any
 opponent your lineage did not start from.
 
 {game}
+{tried}
 {failures}
 
 ## Your instruction
