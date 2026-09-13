@@ -281,17 +281,17 @@ with uncommitted changes under `src/`.
 
 ## 8. Constants
 
-| constant                 | source                      |
-| ------------------------ | --------------------------- |
-| `SESSIONS` 8             | fits the machine            |
+| constant                 | source                         |
+| ------------------------ | ------------------------------ |
+| `SESSIONS` 8             | fits the machine               |
 | `ROUNDS_PER_SESSION` 12  | attempts at the session's seed |
-| `FAST_SEEDS` 8           | 4 was too noisy to rank on  |
-| `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent     |
-| `DEEP_TOP_K` 3           | FAMOU                       |
-| `DEEP_CONCURRENCY` 2     |                             |
-| `POOL_SIZE` 8            | the pool is the top of it   |
-| `STAGNATION_SESSIONS` 40 |                             |
-| `CORE_BUDGET` cores - 8  |                             |
+| `FAST_SEEDS` 8           | 4 was too noisy to rank on     |
+| `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent        |
+| `DEEP_TOP_K` 3           | FAMOU                          |
+| `DEEP_CONCURRENCY` 2     |                                |
+| `POOL_SIZE` 8            | the pool is the top of it      |
+| `STAGNATION_SESSIONS` 40 |                                |
+| `CORE_BUDGET` cores - 8  |                                |
 
 ## 9. Deliberately not built
 

@@ -147,9 +147,7 @@ def beat(
         fitness=rate,
         field=field,
         rates=rates,
-        margins={
-            name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates
-        },
+        margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
         decisive={champion: decided, **{f"public_{i}": 32 for i in range(shared)}},
         games=32,
         seeds=[1, 2, 3, 4],
@@ -198,9 +196,7 @@ def test_winning_the_pairing_while_losing_the_field_does_not_promote() -> None:
     it replaced decisively. Two of nine promotions handed back field ground,
     which is a ratchet turning the wrong way.
     """
-    worse, why = gate.promotion(
-        *beat(28 / 32, 32, field=0.114, champion_field=0.155)
-    )
+    worse, why = gate.promotion(*beat(28 / 32, 32, field=0.114, champion_field=0.155))
 
     assert not worse
     assert "inside twice its error" in why
@@ -215,9 +211,7 @@ def test_a_rate_inside_the_noise_does_not_promote() -> None:
     curse: 78 of 471 programs once topped a noisy ranking and none survived a
     deeper look.
     """
-    noise, why = gate.promotion(
-        *beat(28 / 32, 32, field=0.2253, champion_field=0.2209)
-    )
+    noise, why = gate.promotion(*beat(28 / 32, 32, field=0.2253, champion_field=0.2209))
 
     assert not noise
     assert "inside twice its error" in why
