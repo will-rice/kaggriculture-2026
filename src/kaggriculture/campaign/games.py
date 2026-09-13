@@ -488,12 +488,16 @@ def record(
     agree on what matchup 7 means, which makes "do we still lose to the agent
     that beat champion_10" unanswerable.
 
-    The fingerprinting risk is real and is now carried deliberately: a lineage
-    here has evolved opponent recognition before, off sheep and cow counts,
-    because it is the correct answer to a gate rather than to the competition.
-    The gate scores the whole field and the field turns over daily, so a
-    program that wins by recognising one agent should not promote -- but that
-    is a bar doing the work, not a missing column.
+    A round can tell its opponents apart now, and the objection to that does
+    not survive the pool. Measured 2026-09-13: the 51 opponents hold 36
+    distinct behavioural signatures, and the duplicates are forks across
+    authors -- five agents from five accounts finishing on bank 108,113 having
+    sold 89,793, to the unit. `harvest` dedupes only an exact fingerprint, so
+    every near-variant enrolled separately. So a strategy the pool holds five
+    times is the one most people copied, which makes it the one most likely
+    across the table on the ladder: learning to beat it generalises by
+    construction, because its variants play identically. What promotes is a
+    lift over the whole field either way.
 
     Args:
         name: The program these games belong to; prefixes their episode keys.
