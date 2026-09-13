@@ -482,19 +482,22 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     loop._open_run(dry_run=True).finish()
 
 
-def test_the_seed_is_never_promoted(
+def test_the_seed_is_champion_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """The gate judges programs sessions wrote, not the one the campaign began on.
+    """The seed is enthroned at startup, so there is no pre-champion regime.
 
-    The seed can be the best program in the database -- on a cold start with a
-    child that ranks below it, it is -- and there is no champion for it to
-    beat, so anything that put it through the gate would promote it. That
-    would make `champion_1` an opponent every candidate already beats: a
-    constant added to every score that separates none of them.
+    It was forbidden until 2026-09-12, on the grounds that `champion_1` would be
+    "an opponent every candidate already beats: a constant added to every score
+    that separates none of them". That objection was about the pool win rate,
+    which no longer decides a promotion -- the bar is the head-to-head -- and it
+    is one slot in a pool of forty-one.
 
-    It is structural rather than a rule now. The gate runs at the end of a
-    round, on the program that round produced, and no round produces the seed.
+    What enthroning it buys is the absence of a second regime. Every session
+    starts from a champion and every candidate plays one, so the bar is the same
+    single condition from the first round instead of a branch for having nothing
+    to beat. Each champion after it beats the one before by 22 of 32, which is a
+    ratchet whether the first rung is high or low.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -511,11 +514,15 @@ def test_the_seed_is_never_promoted(
         paths=paths,
     )
 
-    # It is measured -- at the cold start, and again when a session begins
-    # from it -- and never judged: the gate runs on what a round produced.
+    # Measured at the cold start, then enthroned: in the pool, on the floor,
+    # and the thing the first candidate is asked to beat.
     assert config.SEED_ID in scored
-    assert state.champion is None
-    assert not (paths.floor / "main.py").exists()
+    assert state.champion is not None
+    assert state.champion.name == "champion_1"
+    assert (paths.floor / "main.py").exists()
+    # No tarball: nothing would ever submit the seed, and packaging needs the
+    # licence and the served skeleton that a bare run directory has not got.
+    assert state.champion.tarball == ""
 
 
 @pytest.mark.slow
@@ -667,7 +674,10 @@ def test_the_pool_is_changed_on_the_loop_thread(
     )
 
     assert state.champion is not None
-    assert threads == [threading.main_thread().name]
+    # Every change, not one: champion zero enrols at startup and a promotion
+    # enrols again. What matters is that no other thread ever appears.
+    assert threads
+    assert set(threads) == {threading.main_thread().name}
 
 
 def test_a_promotion_logs_the_tarball_a_cut_uploads(
@@ -695,9 +705,12 @@ def test_a_promotion_logs_the_tarball_a_cut_uploads(
         paths=paths,
     )
 
-    assert [artifact.name for artifact in artifacts] == ["champion_1"]
-    assert list(artifacts[0].manifest.entries) == ["champion_1.tar.gz"]
-    assert (paths.champions / "champion_1.tar.gz").exists()
+    # champion_2: the seed is champion zero and took the first name. Only this
+    # one is logged as an artifact, since champion zero is not packaged.
+    assert [artifact.name for artifact in artifacts] == ["champion_2"]
+    assert list(artifacts[0].manifest.entries) == ["champion_2.tar.gz"]
+    # champion_2: champion zero took the first name and is not packaged.
+    assert (paths.champions / "champion_2.tar.gz").exists()
 
 
 def test_a_provider_failure_is_not_the_lineages_failure(
@@ -1033,7 +1046,8 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
 
     state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
-    assert state.champion is None
+    # Champion zero, so a session is handed a champion's name rather than an id.
+    assert state.champion is not None
     handed = mutator.seen[0]
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture" not in handed.message
@@ -1287,7 +1301,9 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     assert "- syntax: " in second.message
     assert second.child == first.child == PASS
     database = archive.Database(paths.archive, paths.programs)
-    assert [p.started_from for p in database.programs] == ["", config.SEED_ID]
+    # The seed came from nothing; the round's program came from champion zero,
+    # which is what a session starts from.
+    assert [p.started_from for p in database.programs] == ["", "champion_1"]
 
 
 def test_a_round_is_given_one_file_and_the_directory_is_removed(
@@ -1566,7 +1582,7 @@ def test_a_dry_run_writes_only_under_the_root_it_was_given(
     assert not paths.archive.exists()
 
 
-def test_stagnation_says_nothing_before_there_is_a_champion(
+def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
     """A campaign that has never promoted has no champion's line to be stuck in.
@@ -1588,10 +1604,14 @@ def test_stagnation_says_nothing_before_there_is_a_champion(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
     state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
-    assert state.champion is None
+    # There is always a champion now, so the note has something true to say from
+    # the first session: the line it names is champion zero's. It used to be
+    # withheld here, because telling a model its lineage was stuck when it had
+    # never had one was a sentence about nothing.
+    assert state.champion is not None
     assert state.sessions_since_promotion >= config.STAGNATION_SESSIONS
     assert len(mutator.seen) == 2
-    assert not any("no promotion" in seen.message for seen in mutator.seen)
+    assert any("no promotion" in seen.message for seen in mutator.seen)
 
 
 def test_a_round_logs_the_win_rate_and_the_place_it_bought(
@@ -1624,7 +1644,8 @@ def test_a_round_logs_the_win_rate_and_the_place_it_bought(
 
     call = calls_of(records)[-1]
     assert 0.0 <= call["calls/fitness"] <= 1.0
-    assert call["calls/pool"] == 1
+    # One public opponent, plus champion zero.
+    assert call["calls/pool"] == 2
     assert isinstance(call["calls/rating"], float)
     assert call["calls/place"] >= 1
     # The best rating so far, so the curve has a ratchet on it and not just

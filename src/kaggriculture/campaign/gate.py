@@ -59,6 +59,7 @@ from kaggriculture.campaign import config, harness, rating, roster
 from kaggriculture.campaign.archive import Program
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.pool import Pool
+from kaggriculture.report import wilson_interval
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,7 +75,11 @@ class Champion(BaseModel):
     Attributes:
         name: The champion's pool name, e.g. "champion_3".
         path: The immutable copy under the runs ``champions`` the pool plays.
-        tarball: The archive a cut uploads, written by this promotion.
+        tarball: The archive a cut uploads, written by this promotion. Empty
+            for champion zero, which is the seed enthroned at startup so that
+            there is no pre-champion regime: nothing would ever submit it, and
+            packaging needs the licence and the served skeleton, which a bare
+            run directory does not have.
         result: The measurement it was promoted on, which is also what a
             session is shown of the program it starts from.
     """
@@ -200,132 +205,77 @@ def standing(
 
 
 def promotion(
-    standings: dict[str, float],
-    name: str,
-    champion: str | None = None,
+    result: Result,
+    champion: str | None,
     *,
-    decisive: int,
-    over_champion: harness.Margin | None = None,
+    decisive_bar: int = config.DECISIVE_GAMES,
 ) -> tuple[bool, str]:
-    """Whether the candidate tops the field *and* clears the floor by the margin.
+    """Whether the candidate beat the champion, decisively enough to say so.
 
-    The bar used to be a rank -- top of a Bradley-Terry tournament over the
-    eight pool opponents. A rank was the right shape while the pool *was* the
-    tournament and every candidate played all of it. It stopped being right
-    for two reasons at once.
+    One condition, read off the candidate's own evaluation: the Wilson lower
+    bound of its win rate against the champion, above 0.5, over at least
+    ``decisive_bar`` games that ended with a winner. At 32 decisive games that
+    is 22 wins, 0.688.
 
-    A rank has no margin in it. A candidate a hair above the champion topped
-    the table and promoted, and at these sample sizes the hair is usually
-    noise; selecting the maximum of a noisy estimator is biased upward by
-    construction, which is how 78 of 471 programs once cleared a gate that
-    none of them survived a deeper look at.
+    The champion is a pool opponent, so this is directly measured -- 16 seeds in
+    both seats, both programs in the same games, so the map is shared and the
+    seat swap cancels position -- and it needs no rating, no tournament and no
+    stored pairings.
 
-    And a rank over a *sample* is not a rank. A candidate now draws sixteen
-    opponents out of dozens, so "top of the table" would mean top of whichever
-    sixteen it happened to draw, and an easy draw would promote.
+    What it replaces required `place == 1` of a Bradley-Terry fit in both of its
+    regimes, including the branch labelled as the first promotion of a run. The
+    best program this campaign produced placed 25 of 28, and four of the five
+    above it were champions of the tape lineage; three of those are not in the
+    pool and cannot be played, so the bar could not be cleared by playing well.
+    Seventy-nine programs were refused against it and none of the refusals were
+    logged.
 
-    So the bar is both, and they answer different questions. Topping the field
-    says this is the best agent there is; clearing the floor by
-    a paired margin over the floor beyond twice its own error says it is
-    replaces, rather than a hair ahead on noise.
-
-    Neither alone is enough. A rank has no margin in it, and over a sampled
-    draw it is estimated through the fit rather than measured. A gap over the
-    floor is directly measured -- the floor is drawn every round -- but says
-    nothing about the rest of the field, and the two came apart within an hour
-    of the pool growing: candidates promoted at third and fourth of 64 for
-    clearing a floor that was no longer the best agent in it.
+    The interval does the work a fixed margin could not: it widens when few
+    games were decided, so a thin record refuses itself. ``decisive_bar`` covers
+    what it cannot -- 4 to 7 decisive games out of 32 is a candidate drawing 78%
+    to 88% of them with the champion, close enough to being the same program
+    that the difference is not worth promoting on. Below 4 the interval already
+    refuses: 3/3 is 0.438.
 
     Args:
-        standings: Every agent's rating, from one fit over the whole record.
-        name: The candidate's name in those standings.
-        champion: The floor to beat, or None before there is one, when
-            leading the field is the bar.
-        decisive: Games against that floor that ended with a winner. A
-            candidate that drew nearly every game against the agent it is
-            replacing is that agent, whatever the fit says. Required and
-            keyword-only: a default would have to be either zero, which
-            silently blocks every promotion, or large, which silently allows
-            them -- and this gate has already spent seven hours blocked by a
-            condition nobody could see.
-        over_champion: The candidate's bank margin over that floor, across the
-            gate's games against it -- the same seasons in both seats, so a
-            paired comparison whose error is small enough to read. None or an
-            unmeasured error blocks the promotion, because the second half of
-            the bar is that beating the champion was *shown*, and nothing was.
+        result: The candidate's evaluation, which played the champion.
+        champion: The champion's pool name, or None when there is none.
+        decisive_bar: Decided games required before the rate is read.
 
     Returns:
         Whether to promote, and a reason either way.
     """
-    ranked = sorted(standings, key=lambda agent: -standings[agent])
-    place = ranked.index(name) + 1
-    mine = standings[name]
-    if place != 1:
-        best = ranked[0]
+    if champion is None:
+        return False, "no champion to beat"
+    if champion not in result.rates:
+        return False, f"did not play {champion}"
+    decided = result.decisive.get(champion, 0)
+    rate = result.rates[champion]
+    if decided < decisive_bar:
         return False, (
-            f"{place} of {len(ranked)} at {mine:+.3f}, "
-            f"below {best} at {standings[best]:+.3f}"
+            f"{rate:.3f} against {champion} but only {decided} of its games "
+            f"were decided and the bar is {decisive_bar}: the two play the "
+            f"same game"
         )
-    if champion is None or champion not in standings:
-        # The first promotion of a run, and it happens once.
-        return True, f"top of {len(ranked)} at {mine:+.3f}, with no floor yet"
-    floor = standings[champion]
-    gap = mine - floor
-    # Before the margin is read, the games behind it have to exist. The gap is
-    # a rating difference and a rating is fitted over every pairing on the
-    # record, so a candidate can out-rate the floor on its wins against
-    # *ancestors* -- which its parent also beat -- while drawing the floor
-    # itself. That is not an improvement over the floor; it is a re-measurement
-    # of what the floor already had.
-    if decisive < config.DECISIVE_GAMES:
-        return False, (
-            f"top of {len(ranked)} at {mine:+.3f}, {gap:+.3f} above {champion}, "
-            f"but only {decisive} of its games against {champion} were decided "
-            f"and the bar is {config.DECISIVE_GAMES}: the two play the same game"
-        )
-    # The second half is whether beating the champion was demonstrated, not
-    # whether it was demonstrated by some fixed amount.
-    #
-    # It used to be `gap >= PROMOTION_MARGIN`, a constant 0.15 of rating --
-    # about 26 Elo. That was there to stop the winner's curse, since selecting
-    # the maximum of a noisy estimator is biased upward by construction, and
-    # it could not: measured 2026-09-11, one unchanged agent's fitted rating
-    # moves with a standard deviation of 0.745 across draws, so a 0.15 bar
-    # sits a fifth of a standard deviation out and filters almost nothing. It
-    # did reliably block one thing, which is a real improvement too small to
-    # clear a constant nobody had measured against the noise.
-    #
-    # A fixed size is the wrong shape of answer to a varying quantity. What
-    # the margin was reaching for is significance, and that has an answer
-    # here: the gate already plays this candidate against the champion over
-    # every gate seed in both seats, which is a paired comparison on the same
-    # seasons, so the episode's own swing lands on both sides and cancels.
-    # Twice the standard error tightens when the measurement is good and
-    # refuses when it is not, which is what a constant cannot do.
-    #
-    # Bank rather than win rate because it is the denser of the two on the
-    # same games: over 32, a modest real edge reads 2.1 standard deviations by
-    # margin and 1.5 by rate, and only one of those clears. The competition
-    # scores wins, and topping the field above is where that is answered.
-    if over_champion is None or not over_champion.error:
-        return False, (
-            f"top of {len(ranked)} at {mine:+.3f}, {gap:+.3f} above "
-            f"{champion}, but its margin over {champion} was not measured"
-        )
-    bar = 2 * over_champion.error
-    if over_champion.mean > bar:
+    low, _ = wilson_interval(rate * decided, decided)
+    if low > 0.5:
         return True, (
-            f"top of {len(ranked)} at {mine:+.3f}, and {over_champion.mean:+,.0f} "
-            f"over {champion} against an error of {over_champion.error:,.0f}"
+            f"beat {champion} at {rate:.3f} over {decided} decided, "
+            f"lower bound {low:.3f}"
         )
     return False, (
-        f"top of {len(ranked)} at {mine:+.3f}, but {over_champion.mean:+,.0f} "
-        f"over {champion} is inside twice its error of {bar:,.0f}: "
-        f"not shown to be better"
+        f"{rate:.3f} against {champion} over {decided} decided, lower bound "
+        f"{low:.3f}: not shown to be better"
     )
 
 
-def promote(program: Program, result: Result, paths: config.Run) -> Champion:
+def promote(
+    program: Program,
+    result: Result,
+    paths: config.Run,
+    *,
+    package: bool = True,
+) -> Champion:
     """The file half of a promotion: the tarball, the champion's copy, the floor.
 
     Every file this writes is one nothing else owns, so it is safe to call
@@ -367,10 +317,11 @@ def promote(program: Program, result: Result, paths: config.Run) -> Champion:
         # The tarball is built in here and moved into place whole. Packaging
         # writes a file at a time and can fail part way through; a half-built
         # archive under `champions/` would be a cut waiting to upload it.
-        built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
         paths.champions.mkdir(parents=True, exist_ok=True)
         tarball = paths.champions / f"{name}.tar.gz"
-        shutil.move(str(built), str(tarball))
+        if package:
+            built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
+            shutil.move(str(built), str(tarball))
 
     code = source.read_text(encoding="utf-8")
     kept.write_text(code, encoding="utf-8")
@@ -384,7 +335,12 @@ def promote(program: Program, result: Result, paths: config.Run) -> Champion:
     floor.chmod(0o444)
 
     LOGGER.info("promoted %s to %s", program.id, name)
-    return Champion(name=name, path=str(kept), tarball=str(tarball), result=result)
+    return Champion(
+        name=name,
+        path=str(kept),
+        tarball=str(tarball) if package else "",
+        result=result,
+    )
 
 
 def enroll(champion: Champion, pool: Pool, paths: config.Run) -> None:

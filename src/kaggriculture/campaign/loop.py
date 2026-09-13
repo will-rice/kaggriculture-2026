@@ -330,8 +330,9 @@ def run(
         if measured:
             LOGGER.info("field: %d anchor pairing(s) for %s", len(measured), anchor)
     database = archive.Database(paths.archive, paths.programs)
+    scored: Result | None = None
     if not database.programs:
-        seed = evaluator.score(
+        scored = evaluator.score(
             seed_agent,
             SEED_ID,
             pool,
@@ -341,8 +342,33 @@ def run(
             paths.pool,
         )
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
-        database.add(_program(SEED_ID, stored, "", "seed", "", seed))
-        LOGGER.info("seeded from %s at fast fitness %.3f", seed_agent, seed.fitness)
+        database.add(_program(SEED_ID, stored, "", "seed", "", scored))
+        LOGGER.info("seeded from %s at %.3f over the pool", seed_agent, scored.fitness)
+    # Champion zero, so there is no pre-champion regime: every session starts
+    # from a champion and every candidate plays one head-to-head, which makes the
+    # promotion bar the same single condition from the first round instead of a
+    # branch for having nothing to beat.
+    if state.champion is None:
+        first = database.top(1)[0]
+        if scored is None or scored.program_id != first.id:
+            # Resuming a run that has programs but no champion: the best of them
+            # has to be measured against the pool as it now stands before it can
+            # be the thing others are asked to beat.
+            scored = evaluator.score(
+                Path(first.source_path),
+                first.id,
+                pool,
+                rng,
+                rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+                workers,
+                paths.pool,
+            )
+        champion = gate.promote(first, scored, paths, package=False)
+        gate.enroll(champion, pool, paths)
+        state.champion = gate.record(champion, paths)
+        LOGGER.info(
+            "champion zero: %s from %s at %.3f", champion.name, first.id, scored.fitness
+        )
     campaign = Campaign(state, database, pool, mutator, workers, rng, log, paths)
     asyncio.run(campaign.drive(sessions))
     return campaign.state
@@ -584,7 +610,19 @@ class Campaign:
                 (matchup, season, game)
                 for matchup, season, _, game in games.played(result, name)
             ]
-            playing = scored[turn % len(scored)] if scored else None
+            # A different opponent each round, not a different map against the
+            # same one. `games.played` is matchup-major -- every season against
+            # opponent one, then every season against opponent two -- so walking
+            # it flat gave a session twelve seeds against whichever agent
+            # `games.ordered` puts first, which is the one it loses to hardest.
+            # Twelve rounds of tuning against a single adversary is "beat this
+            # pool", and the objective is to beat any opponent.
+            matchups = sorted({one[0] for one in scored})
+            playing = None
+            if matchups:
+                wanted = matchups[turn % len(matchups)]
+                against = [one for one in scored if one[0] == wanted]
+                playing = against[(turn // len(matchups)) % len(against)]
             message = prompt.compose(name, playing, failures, siblings, instruction)
             outcome = await self.round(source, name, result, message, drawn)
             rounds += 1
@@ -824,13 +862,7 @@ class Campaign:
                     }
                 )
                 return False
-            verdict, why = gate.promotion(
-                table,
-                program_id,
-                floor,
-                decisive=result.decisive.get(floor or "", 0),
-                over_champion=result.margins.get(floor or ""),
-            )
+            verdict, why = gate.promotion(result, floor)
             # Logged either way. `why` is the only account of what the gate
             # decided and it used to be written only when the answer was yes:
             # 79 programs were turned away with a precise reason -- "25 of 28

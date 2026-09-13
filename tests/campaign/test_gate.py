@@ -125,179 +125,90 @@ def test_edges_already_on_the_record_are_not_played_again(
     assert again == []
 
 
-def test_a_candidate_must_out_rate_the_floor_by_the_margin() -> None:
-    """Beating the champion has to be shown, not merely scored higher.
+def beat(rate: float, decided: int, champion: str = "floor") -> evaluator.Result:
+    """An evaluation in which the candidate took ``rate`` of ``decided`` games.
 
-    The bar was a rating gap of a fixed 0.15, there to stop the winner's
-    curse: selecting the maximum of a noisy estimator is biased upward by
-    construction. It could not do that. One unchanged agent's fitted rating
-    moves with a standard deviation of 0.745 across draws, measured
-    2026-09-11, so a 0.15 bar sat a fifth of a standard deviation out and
-    filtered almost nothing -- while reliably blocking real improvements too
-    small to clear a constant nobody had checked against the noise.
-
-    A fixed size is the wrong shape of answer to a quantity that varies. The
-    gate already plays the candidate against the champion over every gate seed
-    in both seats, which is the same seasons twice and so a paired comparison,
-    and twice its standard error is a bar that tightens when the measurement
-    is good and refuses when it is not.
+    Only the three fields the bar reads are meaningful: who was played, the rate
+    against the champion, and how many of those games ended with a winner.
     """
-    standings = {"mine": 1.0, "floor": 0.999, "other": 0.0}
-
-    # Barely ahead on rating, but the margin over the floor is eight times its
-    # own error: shown, and promoted. The old rule refused this outright.
-    clear, why = gate.promotion(
-        standings,
-        "mine",
-        "floor",
-        decisive=config.DECISIVE_GAMES,
-        over_champion=harness.Margin(
-            mean=5968.0, worst=-400.0, best=9000.0, error=722.0
-        ),
+    return evaluator.Result(
+        program_id="mine",
+        fitness=rate,
+        field=rate,
+        rates={champion: rate, "other": 0.5},
+        margins={
+            name: harness.Margin(mean=0.0, worst=0.0, best=0.0)
+            for name in (champion, "other")
+        },
+        decisive={champion: decided, "other": 32},
+        seeds=[1, 2, 3, 4],
+        hardest=champion,
+        states={},
     )
-    assert clear and "over floor" in why
-
-    # A bigger rating gap, and a margin inside its own error: not shown, so
-    # not promoted however far ahead the fit puts it.
-    close, why = gate.promotion(
-        {"mine": 1.0, "floor": 0.0, "other": -1.0},
-        "mine",
-        "floor",
-        decisive=config.DECISIVE_GAMES,
-        over_champion=harness.Margin(
-            mean=700.0, worst=-9000.0, best=9000.0, error=722.0
-        ),
-    )
-    assert not close and "inside twice its error" in why
-
-    # And a margin nobody measured is not a promotion either.
-    unmeasured, why = gate.promotion(
-        standings, "mine", "floor", decisive=config.DECISIVE_GAMES
-    )
-    assert not unmeasured and "not measured" in why
 
 
-def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
-    """Top of the table and level with the champion promotes nothing.
+def test_a_decisive_head_to_head_win_promotes() -> None:
+    """The bar is beating the champion, measured in the games against it.
 
-    Rank alone has no margin in it, and over a sampled draw a rank is
-    estimated through the fit rather than measured. It is exactly the case the
-    margin exists for.
+    Directly measured and paired: the champion is a pool opponent, so the two
+    programs are in the same games on the same seeds in both seats, and the seat
+    swap cancels position. No rating, no tournament, no stored pairings.
+
+    22 of 32 is 0.688, which is where the Wilson lower bound crosses 0.5.
     """
-    ranked = {"mine": 2.0, "floor": 1.95, "third": 0.0}
+    clear, why = gate.promotion(beat(22 / 32, 32), "floor")
 
-    clear, _ = gate.promotion(
-        ranked,
-        "mine",
-        "floor",
-        decisive=config.DECISIVE_GAMES,
-        over_champion=harness.Margin(
-            mean=700.0, worst=-9000.0, best=9000.0, error=722.0
-        ),
-    )
-
-    assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
-    assert not clear
+    assert clear, why
+    assert "beat floor" in why and "lower bound" in why
 
 
-def test_clearing_the_floor_is_not_enough_without_topping_the_field() -> None:
-    """The two questions came apart within an hour of the pool growing.
+def test_a_narrow_head_to_head_win_is_not_shown_to_be_better() -> None:
+    """Above half is not the bar; above half beyond the interval is.
 
-    Candidates promoted at third and fourth of sixty-four for clearing a floor
-    that was no longer the best agent in the field. Beating the agent you
-    replace says the ratchet turned; being the best says it is worth turning.
+    21 of 32 is 0.656 and a real edge on the face of it, and the lower bound is
+    0.483. The interval is what a fixed margin could not be: it tightens when
+    the measurement is good and refuses when it is not.
     """
-    ranked = {
-        "leader": 3.0,
-        "runner_up": 2.5,
-        "mine": 2.0,
-        "floor": 1.0,
-    }
+    close, why = gate.promotion(beat(21 / 32, 32), "floor")
 
-    clear, why = gate.promotion(
-        ranked,
-        "mine",
-        "floor",
-        decisive=config.DECISIVE_GAMES,
-        over_champion=harness.Margin(
-            mean=5968.0, worst=-400.0, best=9000.0, error=722.0
-        ),
-    )
-
-    # Comfortably past the floor and shown to be, and third of four.
-    assert ranked["mine"] > ranked["floor"]
-    assert not clear
-    assert "3 of 4" in why and "below leader" in why
+    assert not close
+    assert "not shown to be better" in why
 
 
-def test_before_there_is_a_floor_the_field_is_the_bar() -> None:
-    """The first promotion of a run has nothing to be a margin above."""
-    enough = config.DECISIVE_GAMES
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None, decisive=enough)[0]
-    assert not gate.promotion({"mine": 0.4, "a": 0.5}, "mine", None, decisive=enough)[0]
-    # And a floor the fit has never heard of is no floor either.
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", "gone", decisive=enough)[0]
-    # No floor means nothing to be indistinguishable from, so the decisive
-    # bar has nothing to say and a fresh run is not blocked by it.
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None, decisive=0)[0]
+def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:
+    """Two programs that draw are the same program, whatever the rate says.
 
+    champion_55 was promoted over champion_54 on two wins and thirty exact draws
+    in 32 games. A rate cannot tell that from seventeen wins and fifteen losses,
+    and 2/2 reads as 1.000.
 
-def test_second_place_is_not_promoted_however_close() -> None:
-    """A floor that rose on anything but the best would not be the best."""
-    ok, why = gate.promotion(
-        {"a": 0.9001, "c": 0.9000, "b": -0.5}, "c", decisive=config.DECISIVE_GAMES
-    )
-
-    assert not ok
-    assert "2 of 3" in why and "below a" in why
-
-
-def test_the_reason_says_where_it_placed_not_who_it_failed_to_beat() -> None:
-    """A place is something a next round can aim at; a list of losses is not.
-
-    The absolute rule this replaced named every opponent a program did not
-    beat, which for a program that beat none of them was the whole pool and
-    told it nothing about which to attack first.
+    `DECISIVE_GAMES` is what covers the band the interval does not: 4 to 7
+    decided out of 32 is a candidate drawing 78% to 88% of its games with the
+    champion. Below 4 the interval refuses on its own, since 3/3 is 0.438.
     """
-    ok, why = gate.promotion(
-        {"a": 2.0, "b": 1.0, "c": 0.0, "mine": -1.0},
-        "mine",
-        decisive=config.DECISIVE_GAMES,
-    )
+    drawn, why = gate.promotion(beat(1.0, 2), "floor")
 
-    assert not ok
-    assert why.startswith("4 of 4")
-    assert "below a" in why
+    assert not drawn
+    assert "only 2 of its games were decided" in why
+    assert "the same game" in why
+
+    # Seven decided is a perfect record and still refused, because seven of
+    # thirty-two decided is two programs playing the same season.
+    thin, why = gate.promotion(beat(1.0, 7), "floor")
+    assert not thin and "the bar is 8" in why
 
 
-def test_one_bad_matchup_does_not_sink_a_top_rating() -> None:
-    """Where the tournament and the old absolute rule actually disagree.
+def test_an_unplayed_champion_is_not_a_measurement() -> None:
+    """A champion that moved under a running evaluation was never played.
 
-    Measured on the pool of 2026-09-06, the second-strongest published agent
-    wins 78.6% of everything and loses one matchup at 0.062. The rule this
-    replaced turned that agent away; a tournament ranks it where it belongs.
+    Eight sessions run at once, so a promotion by one lands while the others are
+    mid-flight. Their games are against the champion it replaced, and a bar read
+    off those would replace champion N with something that beat champion N-1.
     """
-    # `mine` is rated top despite the standings being the only thing the gate
-    # reads -- the rate that would have failed an absolute rule is inside the
-    # fit, not beside it.
-    assert gate.promotion(
-        {"mine": 1.5, "a": 1.0, "b": 0.2}, "mine", decisive=config.DECISIVE_GAMES
-    )[0]
+    missing, why = gate.promotion(beat(1.0, 32, champion="someone_else"), "floor")
 
-
-def test_the_standings_are_over_the_pool_and_nothing_else() -> None:
-    """The gate is a place in one tournament, not a score against a set.
-
-    There is no held-out set any more and no second measurement: seeds
-    are drawn fresh every evaluation, so every rate here was already
-    measured on maps this program was never selected on.
-    """
-    candidate = result("c", 0.8, {"a": 0.9, "b": 0.8})
-
-    assert gate.promotion(
-        {"c": 1.0, "a": 0.1, "b": -0.4}, "c", decisive=config.DECISIVE_GAMES
-    )[0]
-    assert set(candidate.rates) == {"a", "b"}
+    assert not missing
+    assert "did not play floor" in why
 
 
 def _paths(tmp_path: Path) -> config.Run:
@@ -558,49 +469,19 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     assert champion.name == "champion_2"
 
 
-def test_a_candidate_that_draws_the_floor_is_the_floor() -> None:
-    """Out-rating the champion is not the same as beating it.
+def test_the_decisive_bar_counts_games_not_the_rate() -> None:
+    """The denominator is games that ended with a winner, not games played.
 
-    The numbers are champion_55's, measured 2026-09-08. It was promoted over
-    champion_54 on a rating gap the bar reads as "about a 54% head-to-head".
-    Their thirty-two games were two wins by five units and thirty exact draws:
-    the same program, plus a rounding error. A rating is fitted over every
-    pairing on the record, so the gap came from beating *ancestors* -- which
-    champion_54 also beat -- while the pairing that decides whether anything
-    improved was drawn.
+    champion_55's numbers, measured 2026-09-08: promoted over champion_54 on
+    thirty-two games that were two wins by five units and thirty exact draws. A
+    rate of 1.000 and a rate of 0.531 describe that same record depending on
+    whether the draws are counted, and only one of them says "the same program".
+
+    So a perfect record over two decided games is refused, and a record over
+    thirty-two is read on its merits. The bar is about how much was decided.
     """
-    ranked = {"mine": 2.0, "floor": 1.0, "old": 0.0}
+    perfect, why = gate.promotion(beat(1.0, 2), "floor")
+    assert not perfect and "only 2 of its games were decided" in why
 
-    stuck, why = gate.promotion(
-        ranked,
-        "mine",
-        "floor",
-        decisive=2,
-        over_champion=harness.Margin(
-            mean=5968.0, worst=-400.0, best=9000.0, error=722.0
-        ),
-    )
-
-    # Top of the field, and its margin over the floor well past its own error:
-    # everything else the bar asks for, cleared.
-    assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
-    assert ranked["mine"] > ranked["floor"]
-    assert not stuck
-    assert "the two play the same game" in why
-
-
-def test_the_decisive_bar_is_read_on_games_not_on_the_rate() -> None:
-    """Only one of the two shapes behind a rate of 0.53125 is evidence.
-
-    Thirty draws and two wins score exactly as seventeen wins and fifteen
-    losses do. So the bar counts games that ended with a winner. The same candidate, the
-    same rating gap, and the only thing that differs is whether the pairing
-    was ever decided.
-    """
-    ranked = {"mine": 2.0, "floor": 1.0, "old": 0.0}
-    shown = harness.Margin(mean=5968.0, worst=-400.0, best=9000.0, error=722.0)
-
-    assert not gate.promotion(ranked, "mine", "floor", decisive=2, over_champion=shown)[
-        0
-    ]
-    assert gate.promotion(ranked, "mine", "floor", decisive=32, over_champion=shown)[0]
+    read, why = gate.promotion(beat(24 / 32, 32), "floor")
+    assert read, why
