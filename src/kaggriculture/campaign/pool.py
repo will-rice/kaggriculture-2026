@@ -171,61 +171,22 @@ class Pool(BaseModel):
             drawn += rng.sample(remainder, min(room, len(remainder)))
         return drawn[: config.GATE_OPPONENTS]
 
-    def add_champion(
-        self, name: str, path: str, standings: dict[str, float] | None = None
-    ) -> None:
-        """Put ``name`` in the pool, and keep only our best `config.POOL_CHAMPIONS`.
+    def add_champion(self, path: str) -> None:
+        """Put our champion in the pool, replacing whichever one was there.
 
-        Our own champions are trimmed; harvested agents never are. They are
-        two different kinds of thing. A published agent is evidence about the
-        field we are actually scored against, and there is no substitute for
-        it -- the campaign cannot generate one. A champion of ours is a rung
-        on a ladder we built, and the tenth-best rung teaches a candidate
-        nothing the best rung does not.
+        One key, `config.POOL_CHAMPION`, overwritten every promotion, because
+        there is one champion. Nothing is trimmed and no rating decides anything.
 
-        Nothing used to leave, on the reasoning that champion_1 "counters our
-        current champion at 0.729 where the rating says 0.994" and that a
-        field this non-transitive cannot drop an agent for rating low. Neither
-        half of that survives the measurements since.
-
-        The counterexample was taken inside a lineage where every champion was
-        86.5% one recording: those agents draw thirty games in thirty-two
-        against each other, which is exactly where a rate and a fitted rating
-        come apart for want of decided games. It was noise in an inbred pool,
-        not a counter.
-
-        And the field is not non-transitive. A round-robin of fourteen public
-        implementations over 96 fresh seeds in both seats, published
-        2026-09-03, found no intransitive triple at all, with the newer
-        implementation beating the older in 86 of 91 chronological pairs. It
-        is a ladder. On a ladder, the agent that rates low really is the one
-        worth dropping.
-
-        What the old rule actually bought was the monoculture: sixty-nine
-        champions holding ten of a gate's twenty-four slots, so a candidate
-        spent nearly half its gate replaying its own ancestry.
+        It used to add `champion_N` and trim "our" champions to
+        `POOL_CHAMPIONS = 8` by the `champion_` prefix. That prefix is
+        overloaded -- the pool also holds `champion_1` and `champion_65` from the
+        abandoned tape lineage, which are opponents, not rungs of ours -- so the
+        trim could retire an agent the pool was keeping on purpose, and on
+        2026-09-12 a promotion numbering itself from an empty champions directory
+        picked `champion_1` and overwrote the tape agent of that name outright.
 
         Args:
-            name: The champion's opponent name.
-            path: The champion's own immutable copy.
-            standings: A rating per agent, deciding which champions stay. The
-                new one is always kept -- it just won the gate, and a rating
-                fitted before it joined has little to say about it. Without
-                standings nothing is trimmed, because dropping champions in an
-                order nobody measured is worse than keeping them all.
+            path: The champion's own immutable copy, which the pool plays.
         """
-        self.opponents[name] = path
-        self.history.append({"action": "add_champion", "name": name, "ts": time.time()})
-        if standings is None:
-            return
-        ours = [
-            other
-            for other in self.opponents
-            if other.startswith(CHAMPION_PREFIX) and other != name
-        ]
-        ours.sort(key=lambda other: standings.get(other, float("-inf")), reverse=True)
-        for retired in ours[max(0, config.POOL_CHAMPIONS - 1) :]:
-            del self.opponents[retired]
-            self.history.append(
-                {"action": "retire_champion", "name": retired, "ts": time.time()}
-            )
+        self.opponents[config.POOL_CHAMPION] = path
+        self.history.append({"action": "add_champion", "path": path, "ts": time.time()})

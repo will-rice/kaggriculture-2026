@@ -295,7 +295,11 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
         champion=gate.promote(paths=paths, program=program, result=_result()),
     )
     gate.enroll(champion, p, paths)
-    assert champion.name == "champion_1"
+    # The pool key is fixed -- there is one champion -- and the numbering is on
+    # the file, which is what keeps a history without colliding with the tape
+    # lineage's `champion_1` already in the pool.
+    assert champion.name == config.POOL_CHAMPION
+    assert Path(champion.path).name == "champion_1.py"
     floor = paths.floor / "main.py"
     assert (
         floor.read_text() == source.read_text()
@@ -307,7 +311,7 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
         and (kept.stat().st_mode & 0o777) == 0o444
     )
     saved = pool.Pool.load(paths.pool)
-    assert "champion_1" in saved.names()
+    assert config.POOL_CHAMPION in saved.names()
 
 
 def test_promote_refuses_a_champion_name_the_directory_already_holds(
@@ -355,10 +359,14 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     )
 
     saved = pool.Pool.load(paths.pool)
-    one, two = saved.opponents["champion_1"], saved.opponents["champion_2"]
-    assert one != two
-    assert Path(one).read_text() == Path(first.source_path).read_text()
-    assert Path(two).read_text() == Path(second.source_path).read_text()
+    # One key, so the second promotion replaces the first in the pool. Both files
+    # are still on disk under their own numbers, which is where the history is.
+    held = saved.opponents[config.POOL_CHAMPION]
+    assert Path(held).read_text() == Path(second.source_path).read_text()
+    assert Path(held).name == "champion_2.py"
+    assert (paths.champions / "champion_1.py").read_text() == Path(
+        first.source_path
+    ).read_text()
     floor = paths.floor / "main.py"
     assert floor.read_text() == Path(second.source_path).read_text()
 
@@ -408,7 +416,7 @@ def test_champion_numbering_survives_a_pool_retirement(
     )
     gate.enroll(gate.record(champion, paths), retired, paths)
 
-    assert champion.name == "champion_4"
+    assert Path(champion.path).name == "champion_4.py"
     assert sorted(p.name for p in paths.champions.glob("champion_*.py")) == [
         "champion_1.py",
         "champion_2.py",
@@ -466,7 +474,7 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
         paths=paths, program=program, result=result("p9", 0.8, {"a": 0.9, "b": 0.6})
     )
     gate.enroll(gate.record(champion, paths), reloaded, paths)
-    assert champion.name == "champion_2"
+    assert Path(champion.path).name == "champion_2.py"
 
 
 def test_the_decisive_bar_counts_games_not_the_rate() -> None:

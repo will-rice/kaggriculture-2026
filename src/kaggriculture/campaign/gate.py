@@ -303,9 +303,13 @@ def promote(
     # Numbered off the champions directory, which only ever grows. Counting
     # the pool's `champion_` members instead would renumber after a
     # retirement and hand the sixth promotion a name the fifth already has.
+    # The file is numbered for history; the pool key is not. They were the same
+    # string until 2026-09-12, when numbering from this run's empty champions
+    # directory produced `champion_1` and the pool already had one of those --
+    # the tape lineage's, which `enroll` then overwrote.
     number = 1 + sum(1 for _ in paths.champions.glob("champion_*.py"))
-    name = f"champion_{number}"
-    kept = paths.champions / f"{name}.py"
+    name = config.POOL_CHAMPION
+    kept = paths.champions / f"champion_{number}.py"
     if kept.exists():
         raise FileExistsError(
             f"{kept} already exists: something other than a promotion has "
@@ -318,9 +322,9 @@ def promote(
         # writes a file at a time and can fail part way through; a half-built
         # archive under `champions/` would be a cut waiting to upload it.
         paths.champions.mkdir(parents=True, exist_ok=True)
-        tarball = paths.champions / f"{name}.tar.gz"
+        tarball = paths.champions / f"champion_{number}.tar.gz"
         if package:
-            built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
+            built = harness.package(source, Path(scratch) / f"champion_{number}.tar.gz")
             shutil.move(str(built), str(tarball))
 
     code = source.read_text(encoding="utf-8")
@@ -356,22 +360,17 @@ def enroll(champion: Champion, pool: Pool, paths: config.Run) -> None:
         pool: The opponent pool, updated and saved in place.
         paths: The run whose pool file it is saved to.
     """
-    before = set(pool.opponents)
-    # Fitted over every pairing on the record, which is what decides who stays:
-    # a champion's rating here is its standing against the whole field, not
-    # against whoever it happened to draw.
-    placed = rating.standings(rating.Field.load(paths.field).everything())
-    pool.add_champion(champion.name, champion.path, placed)
+    # No rating is fitted here any more. It decided which of our champions to
+    # retire, and there is one champion now: the key it occupies is overwritten
+    # and nothing else in the pool is touched.
+    pool.add_champion(champion.path)
     pool.save(paths.pool)
-    retired = before - set(pool.opponents)
-    if retired:
-        LOGGER.info(
-            "%s joined the pool; %s retired from it",
-            champion.name,
-            ", ".join(sorted(retired)),
-        )
-    else:
-        LOGGER.info("%s joined the pool", champion.name)
+    LOGGER.info(
+        "%s holds the %s slot; pool is %d",
+        Path(champion.path).stem,
+        champion.name,
+        len(pool.opponents),
+    )
 
 
 def record(champion: Champion, paths: config.Run) -> Champion:

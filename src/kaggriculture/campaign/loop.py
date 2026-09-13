@@ -99,7 +99,7 @@ SEED_ID = config.SEED_ID
 # the constant beside them is a default rather than a fact about this run.
 # `_open_run` reads them through the accessors instead.
 HYPERPARAMETERS = (
-    "SESSIONS ROUNDS_PER_SESSION GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
+    "SESSIONS ROUNDS_PER_OPPONENT GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
     "STAGNATION_SESSIONS"
 ).split()
 
@@ -560,7 +560,8 @@ class Campaign:
         from the champion. Depth within, breadth across.
 
         The session ends when a round clears the bar, when a call never ran to
-        a verdict, or after ``ROUNDS_PER_SESSION`` rounds. A round that was
+        a verdict, or once it has spent ``ROUNDS_PER_OPPONENT`` rounds on every
+        opponent in the pool. A round that was
         rejected is
         not the end of one: the reason goes in the ledger and the next round's
         message carries it back, which is what "your program did not parse" is
@@ -600,7 +601,11 @@ class Campaign:
         #
         # The seed was held across a session for a while, which gave the scarce
         # channel to depth the round can get for itself.
-        for turn in range(config.ROUNDS_PER_SESSION):
+        # Every opponent, `ROUNDS_PER_OPPONENT` consecutive rounds each, so the
+        # session's length is the pool's rather than a constant. A promotion ends
+        # it long before the pool is exhausted in practice.
+        planned = config.ROUNDS_PER_OPPONENT * max(1, len(games.ordered(result)))
+        for turn in range(planned):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
             # One game played by the program this round is editing -- not the
@@ -610,19 +615,18 @@ class Campaign:
                 (matchup, season, game)
                 for matchup, season, _, game in games.played(result, name)
             ]
-            # A different opponent each round, not a different map against the
-            # same one. `games.played` is matchup-major -- every season against
-            # opponent one, then every season against opponent two -- so walking
-            # it flat gave a session twelve seeds against whichever agent
-            # `games.ordered` puts first, which is the one it loses to hardest.
-            # Twelve rounds of tuning against a single adversary is "beat this
-            # pool", and the objective is to beat any opponent.
+            # `config.ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
+            # then the next, with the season advancing inside the block. Four
+            # attempts against one agent on four maps: enough to learn it,
+            # without four attempts at the same game.
             matchups = sorted({one[0] for one in scored})
             playing = None
             if matchups:
-                wanted = matchups[turn % len(matchups)]
-                against = [one for one in scored if one[0] == wanted]
-                playing = against[(turn // len(matchups)) % len(against)]
+                block, attempt = divmod(turn, config.ROUNDS_PER_OPPONENT)
+                against = [
+                    one for one in scored if one[0] == matchups[block % len(matchups)]
+                ]
+                playing = against[attempt % len(against)]
             message = prompt.compose(name, playing, failures, siblings, instruction)
             outcome = await self.round(source, name, result, message, drawn)
             rounds += 1

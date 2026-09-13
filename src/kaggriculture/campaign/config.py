@@ -132,18 +132,23 @@ MARKET_OPS: list[str] = [
 # One codex session per worker; eight fit the machine beside their
 # evaluations. Spec section 8.
 SESSIONS = 8
-# Codex calls in one session, each continuing from the program the last one
-# produced, and the only thing that ends a session besides a round clearing the
-# bar or failing. There is no clock on a round or on a session: a round runs the
-# skills this login has installed, which take as long as they take, and a cap
-# only ever cut one off before it had written anything.
+# Consecutive codex calls against one opponent before the session moves to the
+# next, and a session works through every opponent in the pool. So its length is
+# the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
+# a promotion, a call that ran to no verdict, or the run stopping.
 #
-# Twelve, because a session holds one seed and these are the attempts at it. A
-# round is feedback on one game: it is shown that game, it edits, the program is
-# re-scored, and the next round is shown the same seed played by what it wrote.
-# Five was the count from when a round was handed a summary of the whole
-# evaluation, where nothing connected one round to the next except the program.
-ROUNDS_PER_SESSION = 12
+# There is no fixed cap any more. `ROUNDS_PER_SESSION = 12` was one, and it made
+# the session length arbitrary -- twelve rounds covered one opponent or twelve
+# depending on how the games happened to be walked. Both ways of walking them
+# shipped on 2026-09-12 and both were wrong: the flat list gave twelve seasons
+# against whichever agent `games.ordered` puts first, since it is matchup-major
+# and that is the one the program loses to hardest; striding matchups gave one
+# game against each of twelve, which is twelve first impressions.
+#
+# Twelve attempts is what learning an opponent takes, and the season advances
+# inside the block, so they are twelve maps against the same agent rather than
+# twelve tries at one game.
+ROUNDS_PER_OPPONENT = 12
 # Seeds a program is scored on: drawn fresh every evaluation and played in
 # both seats against every pool opponent. This is the whole measurement -- one
 # gate, one number, and promotion decided on it.
@@ -271,7 +276,20 @@ GATE_CONTENDERS = 4
 # champion, and few enough that the other two thirds stay outside agents.
 # Unbounded is what produced the monoculture: sixty-nine champions holding ten
 # of twenty-four slots, so nearly half of every gate replayed our own lineage.
-POOL_CHAMPIONS = 8
+# The pool key our champion occupies. One key, overwritten on every promotion,
+# because there is one champion.
+#
+# Not `champion_N`. `POOL_CHAMPIONS = 8` used to trim "our" champions by the
+# `champion_` prefix, and that prefix is overloaded: the pool also holds
+# `champion_1` and `champion_65` from the abandoned tape lineage, which are
+# opponents rather than rungs of ours. On 2026-09-12 a promotion numbered itself
+# from this run's empty champions directory, picked `champion_1`, and silently
+# replaced the tape agent of that name -- an agent the pool was keeping
+# specifically because it counters our lineage.
+#
+# A key that cannot be produced by harvesting or by the old lineage ends both
+# problems: nothing to collide with, and nothing to scan a prefix for.
+POOL_CHAMPION = "ours"
 # There is no promotion margin any more, and this note is here so nobody adds
 # one back.
 #

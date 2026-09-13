@@ -145,8 +145,21 @@ there would be a game played by a program six edits away from the one in front o
 it. Every round's program is scored over the whole pool, so its own games are
 always recorded.
 
-A different game each round, so a session's 12 rounds see twelve maps and no
-change gets twelve consecutive attempts at entrenching on one.
+`ROUNDS_PER_OPPONENT = 4` consecutive rounds against one opponent, then the next:
+twelve rounds are three opponents, four attempts each. Learning to beat an agent
+does not happen in one game, and a single game against each of twelve is twelve
+first impressions.
+
+Consecutive attempts, but not on the same map -- the season advances each round
+inside the opponent's block, so the four attempts see the same adversary on four
+maps. Repeated exposure to the agent without fitting one of its games.
+
+The two failures either side of this are worth naming, because both shipped. The
+first was walking the flat list of games, which is matchup-major: twelve rounds
+landed on twelve seasons against whichever opponent `games.ordered` puts first,
+the one the program loses to hardest, so a session tuned against a single
+adversary. Correcting that by striding matchups gave one game per opponent, which
+is the opposite error.
 
 Plus the chain: for each round before it in this session, what it changed and the
 win rate that came back. Twelve rounds on twelve maps are twelve independent

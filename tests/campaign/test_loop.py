@@ -152,7 +152,7 @@ def tiny_run(
     ask for more. It is the only constant here that decides behaviour rather
     than cost, which is why it is a parameter and not a line in the body.
     """
-    monkeypatch.setattr(config, "ROUNDS_PER_SESSION", rounds)
+    monkeypatch.setattr(config, "ROUNDS_PER_OPPONENT", rounds)
     monkeypatch.setattr(config, "GATE_SEEDS", 1)
     monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
     # The copy check reads every opponent the machine holds, and the campaign
@@ -518,7 +518,9 @@ def test_the_seed_is_champion_zero(
     # and the thing the first candidate is asked to beat.
     assert config.SEED_ID in scored
     assert state.champion is not None
-    assert state.champion.name == "champion_1"
+    # The pool key is fixed; the file carries the number.
+    assert state.champion.name == config.POOL_CHAMPION
+    assert Path(state.champion.path).name == "champion_1.py"
     assert (paths.floor / "main.py").exists()
     # No tarball: nothing would ever submit the seed, and packaging needs the
     # licence and the served skeleton that a bare run directory has not got.
@@ -651,15 +653,10 @@ def test_the_pool_is_changed_on_the_loop_thread(
     threads: list[str] = []
     add_champion = pool.Pool.add_champion
 
-    def watched(
-        self: pool.Pool,
-        name: str,
-        path: str,
-        standings: dict[str, float] | None = None,
-    ) -> None:
+    def watched(self: pool.Pool, path: str) -> None:
         """The real pool change, with a note of the thread that made it."""
         threads.append(threading.current_thread().name)
-        add_champion(self, name, path, standings)
+        add_champion(self, path)
 
     monkeypatch.setattr(pool.Pool, "add_champion", watched)
 
@@ -705,9 +702,9 @@ def test_a_promotion_logs_the_tarball_a_cut_uploads(
         paths=paths,
     )
 
-    # champion_2: the seed is champion zero and took the first name. Only this
-    # one is logged as an artifact, since champion zero is not packaged.
-    assert [artifact.name for artifact in artifacts] == ["champion_2"]
+    # One artifact: champion zero is not packaged, so only the promotion that
+    # followed it is logged, under the fixed pool key with the numbered tarball.
+    assert [artifact.name for artifact in artifacts] == [config.POOL_CHAMPION]
     assert list(artifacts[0].manifest.entries) == ["champion_2.tar.gz"]
     # champion_2: champion zero took the first name and is not packaged.
     assert (paths.champions / "champion_2.tar.gz").exists()
@@ -1302,8 +1299,8 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     assert second.child == first.child == PASS
     database = archive.Database(paths.archive, paths.programs)
     # The seed came from nothing; the round's program came from champion zero,
-    # which is what a session starts from.
-    assert [p.started_from for p in database.programs] == ["", "champion_1"]
+    # which is what a session starts from and is named by its pool key.
+    assert [p.started_from for p in database.programs] == ["", config.POOL_CHAMPION]
 
 
 def test_a_round_is_given_one_file_and_the_directory_is_removed(

@@ -30,11 +30,19 @@ def test_a_champion_joins_and_nothing_leaves_with_it() -> None:
     """
     p = five()
 
-    p.add_champion("champ", "/x/champ.py")
+    p.add_champion("/x/champ.py")
 
-    assert p.names() == [*"abcde", "champ"]
-    assert p.opponents["champ"] == "/x/champ.py"
+    # One key, `config.POOL_CHAMPION`, whatever the champion's file is called.
+    # It used to take the name too and add `champion_N`, which collided with the
+    # tape lineage's `champion_1` already in the pool and replaced it.
+    assert p.names() == [*"abcde", config.POOL_CHAMPION]
+    assert p.opponents[config.POOL_CHAMPION] == "/x/champ.py"
     assert p.history[-1]["action"] == "add_champion"
+
+    # And a second promotion overwrites rather than accumulating.
+    p.add_champion("/x/next.py")
+    assert p.names() == [*"abcde", config.POOL_CHAMPION]
+    assert p.opponents[config.POOL_CHAMPION] == "/x/next.py"
 
 
 def test_the_draw_always_contains_every_anchor(
@@ -163,7 +171,7 @@ def test_the_candidate_is_never_drawn_against_itself() -> None:
 def test_round_trips_through_json(tmp_path: Path) -> None:
     """save() then load() reproduces the same pool."""
     p = five()
-    p.add_champion("champ", "/x/champ.py")
+    p.add_champion("/x/champ.py")
 
     p.save(tmp_path / "pool.json")
 
@@ -215,41 +223,37 @@ def test_the_floor_survives_a_draw_too_small_to_hold_everyone(
     assert len(drawn) == 2
 
 
-def test_our_champions_are_trimmed_and_harvested_agents_are_not() -> None:
-    """Two kinds of opponent, kept on two different terms.
+def test_adding_our_champion_touches_nothing_else() -> None:
+    """One slot is overwritten and every other opponent stays exactly as it was.
 
-    A published agent is evidence about the field we are scored against and
-    the campaign cannot make another one, so it stays. A champion is a rung on
-    a ladder we built, and the tenth-best rung says nothing the best one does
-    not. Keeping every champion is what put sixty-nine of them in the pool,
-    holding ten of a gate's twenty-four slots.
+    Champions used to accumulate under `champion_N` and be trimmed to the best
+    `POOL_CHAMPIONS = 8` by a rating, on the reasoning that a published agent is
+    evidence the campaign cannot manufacture while "the tenth-best rung says
+    nothing the best one does not". Keeping all of them is what put sixty-nine in
+    the pool, holding ten of a gate's twenty-four slots.
+
+    Both halves are gone because there is one champion now. The trim is also what
+    made the `champion_` prefix dangerous: the pool holds `champion_1` and
+    `champion_65` from the abandoned tape lineage, which are opponents rather
+    than rungs of ours, and a prefix scan cannot tell them apart. On 2026-09-12 a
+    promotion numbering itself from an empty champions directory took the name
+    `champion_1` and replaced the tape agent outright.
     """
-    opponents = {f"champion_{i}": f"/champions/{i}.py" for i in range(1, 10)}
-    opponents.update({"router_v1": "/public/a.py", "shopforge": "/public/b.py"})
+    opponents = {
+        "champion_1": "/tape/1.py",
+        "champion_65": "/tape/65.py",
+        "router_v1": "/public/a.py",
+        "shopforge": "/public/b.py",
+    }
     subject = pool.Pool(opponents=dict(opponents))
-    # The newest champion rates worst, and is kept regardless: it has just won
-    # the gate, which a rating fitted before it joined knows nothing about.
-    standings = {f"champion_{i}": float(i) for i in range(1, 10)}
-    standings["champion_10"] = -99.0
 
-    subject.add_champion("champion_10", "/champions/10.py", standings)
+    subject.add_champion("/champions/champion_3.py")
 
-    ours = sorted(n for n in subject.opponents if n.startswith("champion_"))
-    assert len(ours) == config.POOL_CHAMPIONS
-    assert "champion_10" in ours
-    # The best of the old ones stay; the weakest are retired.
-    assert "champion_9" in ours
-    assert "champion_1" not in ours
-    # Nothing published leaves, whatever it rates.
-    assert {"router_v1", "shopforge"} <= set(subject.opponents)
+    assert subject.opponents[config.POOL_CHAMPION] == "/champions/champion_3.py"
+    assert {k: v for k, v in subject.opponents.items() if k in opponents} == opponents
+    assert len(subject.opponents) == len(opponents) + 1
 
-
-def test_without_standings_no_champion_is_dropped() -> None:
-    """Dropping in an order nobody measured is worse than keeping them all."""
-    subject = pool.Pool(
-        opponents={f"champion_{i}": f"/champions/{i}.py" for i in range(1, 20)}
-    )
-
-    subject.add_champion("champion_20", "/champions/20.py")
-
-    assert len(subject.opponents) == 20
+    # A second promotion replaces ours and still touches nothing else.
+    subject.add_champion("/champions/champion_4.py")
+    assert subject.opponents[config.POOL_CHAMPION] == "/champions/champion_4.py"
+    assert len(subject.opponents) == len(opponents) + 1
