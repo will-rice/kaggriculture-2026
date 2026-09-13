@@ -193,6 +193,37 @@ def test_a_program_recorded_twice_is_one_program(scratch: str) -> None:
     assert rows == "9", "the re-record did not replace the first"
 
 
+@live
+def test_the_opponent_is_recorded_by_roster_name(scratch: str) -> None:
+    """A matchup index is not an opponent, so the name goes in beside it.
+
+    Both sides were written as the literal "opponent" until 2026-09-13, which
+    cost the whole audit trail: the games were all there and correctly grouped,
+    and nothing said which agent a group was. `candidate` holds the index and no
+    name; the index is not the order the rates are recorded in; and `Pool.names`
+    is insertion order with the scored program removed, so the champion sits
+    mid-pool and every opponent after it shifts by one depending on who is being
+    measured. Two evaluations do not agree on what matchup 7 means.
+
+    Seat 1 here, so the assertions also pin which column is whose: getting that
+    backwards would write our own banks under the opponent's name and read as a
+    program that loses to itself.
+    """
+    games.record("probe", [(7, 1, "probe", game([day(0, 5.0, 3.0)], seat=1))], scratch)
+
+    sides = games.query(
+        f"SELECT team_0, team_1 FROM {scratch}.episodes "
+        "WHERE episode = 'probem7s1' FORMAT TabSeparated"
+    )
+    teams = games.query(
+        f"SELECT seat, team FROM {scratch}.days WHERE episode = 'probem7s1' "
+        "ORDER BY seat FORMAT TabSeparated"
+    )
+
+    assert sides == "v54\tprobe", "seat 1 is ours, so team_0 is the opponent"
+    assert teams == "0\tv54\n1\tprobe"
+
+
 def test_a_name_carrying_a_tab_cannot_shift_the_columns() -> None:
     """TabSeparated's delimiters are the escape's whole reason.
 

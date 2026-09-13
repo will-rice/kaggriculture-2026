@@ -31,10 +31,8 @@ program has to hold up across. Between matchups the opponent changes too.
 Seasons are numbered narrowest first, so `season = 1` is the game a small
 change would have turned.
 
-The opponents in your own games are written as `opponent` and it does not
-matter which they were. You are writing a program that has to beat an agent it
-has never seen; a change that wins because it recognised a particular one wins
-nothing that counts.
+The opponents in your own games are written by roster name, in `episodes` and
+in `days`.
 
 ## Tables
 

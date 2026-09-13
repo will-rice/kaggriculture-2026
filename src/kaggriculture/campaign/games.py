@@ -474,9 +474,26 @@ def record(
     program recorded twice inserts twice and is collapsed by the engine on the
     ordering key, so a re-scored champion is one program rather than two.
 
-    The opponent is written as "opponent". Its roster name stays in the
-    campaign's own memory: a name in a table is a name a round could read, and
-    recognising one opponent is worth nothing against a field that turns over.
+    The opponent is written by roster name, in ``episodes`` and in ``days``.
+    It was the literal "opponent" until 2026-09-13, on the reasoning that a
+    name in a table is a name a round could read and recognising one opponent
+    is worth nothing against a field that turns over. The cost of that was
+    auditability, and it was total: the games are all there and correctly
+    grouped -- 51 matchups whose win rates match the champion's own record
+    exactly -- but nothing said which agent a matchup was. `candidate` carries
+    the index and no name, the index is not the order the rates are recorded
+    in, and `Pool.names` is insertion order with the scored program removed,
+    so the champion sits at position 41 of 53 and every opponent after it
+    shifts by one depending on who is being measured. Two evaluations do not
+    agree on what matchup 7 means, which makes "do we still lose to the agent
+    that beat champion_10" unanswerable.
+
+    The fingerprinting risk is real and is now carried deliberately: a lineage
+    here has evolved opponent recognition before, off sheep and cow counts,
+    because it is the correct answer to a gate rather than to the competition.
+    The gate scores the whole field and the field turns over daily, so a
+    program that wins by recognising one agent should not promote -- but that
+    is a bar doing the work, not a missing column.
 
     Args:
         name: The program these games belong to; prefixes their episode keys.
@@ -501,8 +518,8 @@ def record(
                 game.seed,
                 "port",
                 "",
-                mine if game.seat == 0 else "opponent",
-                mine if game.seat == 1 else "opponent",
+                mine if game.seat == 0 else game.opponent,
+                mine if game.seat == 1 else game.opponent,
                 game.ours if game.seat == 0 else game.theirs,
                 game.ours if game.seat == 1 else game.theirs,
                 game.seat if game.ours > game.theirs else theirs,
@@ -519,7 +536,7 @@ def record(
                         episode,
                         seat,
                         day.day,
-                        mine if side == "ours" else "opponent",
+                        mine if side == "ours" else game.opponent,
                         *(measures.get(column, 0) for column in dataset.COLUMNS),
                     ],
                 )
