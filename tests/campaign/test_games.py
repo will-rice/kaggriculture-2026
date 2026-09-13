@@ -7,6 +7,7 @@ count written as a float lands in an integer column -- and none of that can be
 checked against a stand-in for the thing being relied on.
 """
 
+import logging
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
@@ -311,6 +312,48 @@ def test_a_database_built_before_a_column_existed_gains_it(scratch: str) -> None
     assert (
         games.query(f"SELECT source FROM {scratch}.candidate FORMAT TabSeparated")
         == "campaign"
+    )
+
+
+@live
+def test_a_live_table_that_lost_its_partition_key_says_so(
+    scratch: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partition key cannot be altered, so drift has to be reported.
+
+    `episodes` and `candidate` were both unpartitioned in the long-lived
+    database on 2026-09-13, having been built before `TABLES` gave them a key.
+    `CREATE TABLE IF NOT EXISTS` is silent about them and the columns
+    reconciliation cannot help, because ClickHouse has no `ALTER` for a
+    partition key. So every corpus rebuild from 2026-09-09 on built its staging
+    database, failed `REPLACE PARTITION` with "Wrong number of fields in the
+    partition expression", tore the staging down and left the old rows -- and
+    the corpus sat four days stale with nothing else to show for it.
+
+    `test_every_table_is_partitioned_on_the_column_the_rebuild_swaps` checks the
+    declaration against itself and passed throughout. Only the live table
+    disagreed.
+    """
+    games.query(f"DROP TABLE {scratch}.episodes")
+    games.query(
+        f"CREATE TABLE {scratch}.episodes (episode String, source "
+        "LowCardinality(String), version UInt64) ENGINE = ReplacingMergeTree(version) "
+        "ORDER BY (source, episode)"
+    )
+    assert (
+        games.query(
+            f"SELECT partition_key FROM system.tables WHERE database = '{scratch}' "
+            "AND name = 'episodes' FORMAT TabSeparated"
+        )
+        == ""
+    ), "the fixture did not reproduce an unpartitioned table"
+
+    with caplog.at_level(logging.WARNING):
+        games.create(scratch)
+
+    said = [record.getMessage() for record in caplog.records]
+    assert any("episodes is partitioned by nothing" in line for line in said), (
+        f"no warning named the drift: {said}"
     )
 
 

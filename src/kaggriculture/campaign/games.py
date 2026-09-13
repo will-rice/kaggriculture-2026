@@ -433,6 +433,53 @@ def _reconcile(database: str) -> None:
             if live and column not in live:
                 LOGGER.warning("%s.%s lacks %s; adding it", database, name, column)
                 query(f"ALTER TABLE {database}.{name} ADD COLUMN {column} {spec.kind}")
+    _partitioned(database)
+
+
+def _partitioned(database: str) -> None:
+    """Refuse a live table whose partition key is not the one declared.
+
+    A column can be added to an existing table and is; a partition key cannot
+    be altered at all, so a table built before `TABLES` gave it one stays
+    unpartitioned however many times `create` runs. `dataset.build` swaps a
+    source in with `REPLACE PARTITION`, which needs the partition, and against
+    an unpartitioned table it fails with "Wrong number of fields in the
+    partition expression: 1, must be: 0".
+
+    Found on 2026-09-13: `episodes` and `candidate` had both drifted, so every
+    corpus rebuild since 2026-09-09 built its staging database, failed the
+    swap, tore the staging down and left the old rows in place -- a refresh
+    that reported an error nobody was reading and a corpus that stopped
+    four days back without any other sign.
+
+    Warning rather than repairing, because the repair moves data: the table has
+    to be recreated with the key, the rows copied over and the two exchanged,
+    and most of the rows here are games the campaign played and cannot rebuild.
+    That is a migration to run deliberately, not something to do inside a
+    function every launch calls.
+
+    Warning rather than raising, too. A drifted table serves every read and
+    write the campaign makes and fails only a rebuild, which fails loudly on
+    its own; refusing to start over it would stop the loop for something the
+    loop does not need. And the table cannot always be fixed in place at all:
+    a database older than the `source` column cannot be partitioned by it until
+    the reconciliation above has added it.
+    """
+    for name, table in TABLES.items():
+        live = query(
+            f"SELECT partition_key FROM system.tables WHERE database = "
+            f"'{database}' AND name = '{name}' FORMAT TabSeparated"
+        )
+        if live != table.partition:
+            LOGGER.warning(
+                "%s.%s is partitioned by %s where %s is declared; a rebuild's "
+                "REPLACE PARTITION will fail until it is recreated with the "
+                "key, its rows copied in and the two exchanged",
+                database,
+                name,
+                live or "nothing",
+                table.partition or "nothing",
+            )
 
 
 def ordered(result: "evaluator.Result") -> list[str]:
