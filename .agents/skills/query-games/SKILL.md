@@ -26,8 +26,7 @@ Your own evaluation's games are keyed by `matchup` and `season`, joined
 through `candidate`. A matchup is one opponent and every season played against
 them; within it the opponent is fixed, so what changes from season to season
 is the world -- the map, the prices, the seat -- which is the variation a
-program has to hold up across. Between matchups the opponent changes too, so a
-difference there says nothing about either.
+program has to hold up across. Between matchups the opponent changes too.
 
 Seasons are numbered narrowest first, so `season = 1` is the game a small
 change would have turned.
