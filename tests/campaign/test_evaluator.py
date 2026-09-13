@@ -32,14 +32,23 @@ CRASHER = (
 def test_score_plays_the_block_and_averages_the_pool(
     tmp_path: Path,
 ) -> None:
-    """It plays the seasons it is given, and every opponent counts the same."""
+    """It plays the seasons it is given, and every opponent counts the same.
+
+    The seeds assertion was `len(result.seeds) == config.GATE_SEEDS` until
+    2026-09-13, which contradicted both this docstring and the call right above
+    it: `score` stopped drawing its own block and started taking one from the
+    caller, so a test handing it `[5, 6]` was asserting that two seeds were
+    sixteen. It reports back the block it was given.
+    """
     agent = tmp_path / "main.py"
     agent.write_text(PASS, encoding="utf-8")
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
     result = evaluator.score(
         agent, "prog", p, random.Random(1), [5, 6], workers=WORKERS
     )
-    assert len(result.seeds) == config.GATE_SEEDS
+    assert sorted(result.seeds) == [5, 6]
+    # Both seats of both seasons, which is what makes a rate over them a rate.
+    assert result.games == 4
     assert result.rates == {"v54": 0.0} and result.fitness == 0.0
 
 

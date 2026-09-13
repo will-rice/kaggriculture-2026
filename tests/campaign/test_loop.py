@@ -51,7 +51,7 @@ from kaggriculture.campaign import (
     loop,
     mutate,
     pool,
-    rating,
+    prompt,
 )
 
 PASS = (
@@ -363,43 +363,25 @@ class Recorder:
 
 
 @pytest.mark.slow
-def test_the_pool_plays_itself_before_anything_is_judged_against_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """A tournament needs the pool's own pairings, and only a start builds them.
-
-    `standing` fits over what the field holds and plays nothing, so against a
-    pool that has never played itself every opponent is rated purely by how
-    the one candidate did against it. That is not a tournament, it is a row.
-
-    A promotion used to be the only thing that filled the field in, which
-    worked for exactly as long as something else had built the file first.
-    """
-    paths = tiny_run(tmp_path, monkeypatch)
-    opponents = pool.Pool(
-        opponents={
-            "one": str(_write(tmp_path / "one.py", PASS)),
-            "two": str(_write(tmp_path / "two.py", PASS)),
-        }
-    )
-    opponents.save(paths.pool)
-    monkeypatch.setattr(evaluator, "VENDORED", ["one", "two"])
-    stub_evaluator(monkeypatch)
-    assert not paths.field.exists()
-
-    loop.run(
-        sessions=1,
-        mutator=mutate.FakeMutator(edit=lambda source: source + "\n# edited\n"),
-        workers=WORKERS,
-        seed_agent=_write(tmp_path / "seed.py", PASS),
-        rng=random.Random(0),
-        log=log,
-        paths=paths,
-    )
-
-    field = rating.Field.load(paths.field)
-    assert field.results(["one", "two"]), "the pool never played itself"
-    assert field.games == 2 * config.GATE_SEEDS
+# `test_the_pool_plays_itself_before_anything_is_judged_against_it` stood here
+# until 2026-09-13. It asserted that a launch fills `paths.field` with the
+# pool's own pairings, so that a Bradley-Terry fit over the field is a
+# tournament rather than one candidate's row.
+#
+# The rule it protected is gone. Ratings decided promotion then, and a champion
+# that joined the pool with no pairings was rated almost entirely from the row
+# of whoever was being judged against it -- beat it, and its rating fell far
+# enough that each promotion bought the next one cheaply. Promotion is now a
+# win rate over the field and a head-to-head against the champion, both
+# measured inside the candidate's own evaluation, and neither reads a fit. The
+# refresh that kept the field current was removed with it: it cost 8.5 minutes
+# of the promotions lock per promotion, measured 2026-09-13, with three
+# candidates queued behind the first one of that run.
+#
+# So nothing writes the field and nothing downstream of it decides anything.
+# What remains of that machinery -- `gate.refresh`, `evaluator.score`'s unused
+# `standings` argument, and the fit `measure` makes to feed it -- is dead and
+# wants deleting, which is a change to `src/` rather than to a test.
 
 
 @pytest.mark.slow
@@ -413,8 +395,19 @@ def test_a_better_child_is_promoted(
 
     A seam test: real validation, real games through the real harness, the
     real gate, and only the codex session stood in for.
+
+    Six seeds rather than `tiny_run`'s one, because the gate stopped promoting
+    on a Bradley-Terry rank and started asking for evidence. At one seed a
+    pairing is two games, and neither bar can be met at that depth however much
+    better the child is: the field bar is twice the error of the difference,
+    which at one shared opponent and two games is 0.707 against a maximum
+    possible gap of 0.5, and the head-to-head needs `DECISIVE_GAMES` decided
+    games where two exist. Twelve games a pairing puts the field bar at 0.289
+    and the Wilson lower bound on a clean sweep at 0.676, and leaves room for a
+    draw or two without dropping under the decisive floor.
     """
     paths = tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "GATE_SEEDS", 6)
     pass_pool(tmp_path, paths)
 
     state = loop.run(
@@ -595,8 +588,18 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
 
     A seam test: the champion here is one a real promotion produced, out of
     real games, and the second run reads it back off disk.
+
+    The file is `champion_2.py`, not `champion_1.py`: the seed is enthroned as
+    champion zero at startup and takes the first number, so the first program a
+    round wins with is the second champion. The numbering is the file's and the
+    pool key is fixed, which is why the second run's message names
+    `config.POOL_CHAMPION` -- see `gate.promote`.
+
+    Six seeds for the same reason as `test_a_better_child_is_promoted`: the
+    two-condition gate cannot be satisfied at `tiny_run`'s one.
     """
     paths = tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "GATE_SEEDS", 6)
     pass_pool(tmp_path, paths)
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
@@ -604,35 +607,46 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     assert [handed.child for handed in mutator.seen] == [PASS]
-    assert (paths.champions / "champion_1.py").read_text() == SELLER
+    assert (paths.champions / "champion_2.py").read_text() == SELLER
 
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     assert mutator.seen[1].child == SELLER
-    assert "champion_1" in mutator.seen[1].message
+    assert f"`{config.POOL_CHAMPION}m" in mutator.seen[1].message
 
 
 @pytest.mark.slow
 def test_a_program_is_gated_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """A program the gate has already confirmed is never sent through it again.
+    """A program a round wrote is scored once and never scored again.
 
     Four restarts, so every session's gates have finished before the next
-    session opens and the top three are the same programs each time: a
-    database that forgot which programs carry a deep result would spend the
-    exam block on them over and over.
+    session opens: a database that forgot which programs carry a result would
+    spend the block on them over and over.
+
+    The champion is the exception and is excluded here. Until 2026-09-13 this
+    asserted that *nothing* was scored twice, which was true of the two-stage
+    gate: a program was ranked cheaply, then a shortlist went to a sealed block,
+    and the memo existed so the block was never spent twice. There is one
+    evaluation now, and a session opens by measuring the program it starts from
+    -- that measurement is the baseline the round's edits are compared against
+    and the game the round is shown -- so the champion is measured once per
+    session by design, on whatever seed block is current.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    strong_champion(tmp_path, paths)
+    champion = strong_champion(tmp_path, paths)
     scored = stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
     for session in range(4):
         mutator = mutate.FakeMutator(edit=lambda s, n=session: f"{s}\n# child {n}\n")
         loop.run(1, mutator, WORKERS, seed, random.Random(session), log, paths)
 
-    assert len(scored) > 2
-    assert sorted(scored) == sorted(set(scored))
+    written = [name for name in scored if name not in {champion.name, config.SEED_ID}]
+    assert len(written) > 2
+    assert sorted(written) == sorted(set(written))
+    # And the champion is the only thing measured more than once.
+    assert scored.count(champion.name) == 4
 
 
 def test_the_pool_is_changed_on_the_loop_thread(
@@ -993,21 +1007,32 @@ def test_a_round_is_told_a_name_and_never_a_path(
 ) -> None:
     """What a round starts from is interpolated raw, so it is a name, not a path.
 
-    The champion reaches the message as its pool name, which is also how the
-    verdict tells the round to beat it head to head. A path there would both
-    break that sentence and point at the file it must not read. Everything a
-    model is given is this one string, so this is the whole exposure.
+    The program a round is editing reaches the message as its pool name, in the
+    episode key of the game the round is shown. A path there would point at a
+    file it must not read. Everything a model is given is this one string, so
+    this is the whole exposure.
+
+    The evaluation is the real one rather than the stub, because the stub
+    reports no recorded games and the name is interpolated into the game
+    section: stubbed, this asserted on a message that had no section to put a
+    name in, and held whatever `compose` did.
+
+    It is the name of the program being edited and not of any opponent. The
+    champion is itself a pool opponent, and no opponent is named anywhere in the
+    message -- see `test_no_opponent_is_named_anywhere_in_the_message` for the
+    measurement behind that.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     champion = strong_champion(tmp_path, paths)
-    stub_evaluator(monkeypatch)
     mutator = Recorder(edit=lambda _: SELLER)
     seed = _write(tmp_path / "seed.py", PASS)
 
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert f"`{champion.name}`" in handed.message
+    # The episode key is `<name>m<matchup>s<season>`, so the name is a prefix
+    # inside the quotes rather than the whole of what they hold.
+    assert f"`{champion.name}m" in handed.message
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture" not in handed.message
     # The doctrine lives in `round_prompt.md` now, so this asserts on what
@@ -1380,11 +1405,18 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
 ) -> None:
     """The opening round is composed from a measurement the loop made itself.
 
-    A seam test: the verdict and the thirty rows below it come out of real
-    games the loop played against the pool before the first round, which is
-    what makes the first round no different from the fourth. Nothing in the
-    message could have come from anywhere else -- the model has played
-    nothing at this point.
+    A seam test: the game the round is shown comes out of real games the loop
+    played against the pool before the first round, which is what makes the
+    first round no different from the fourth. Nothing in the message could have
+    come from anywhere else -- the model has played nothing at this point.
+
+    What this asserted until 2026-09-13 was a verdict line, a standings table,
+    a per-opponent day-by-day section and its rows -- all of which the message
+    stopped carrying. A table of every matchup says the program is losing and
+    nothing about a decision it made, and the day tables are rows rather than
+    message text: every game the campaign has played is in the games database,
+    so the message names one and carries the query. The seam is the same, and
+    the episode key is where it now shows.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -1394,18 +1426,16 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     message = mutator.seen[0].message
-    assert f"The verdict on `{config.SEED_ID}`" in message
-    # PASS against PASS is a dead heat, so the seed is not top of a
-    # tournament it shares with the opponent it drew against.
-    assert "It 2 of 2 at " in message and "below pass" in message
-    # And the standings themselves, so a round can see what it has to pass.
-    assert "| rank | agent | rating |" in message
-    # PASS draws with PASS, and a draw is not a win, so the opponent it did
-    # not beat is shown day by day for the round to learn from.
-    assert "The matches it lost, day by day" in message
-    assert "### `pass`, won 0.500" in message
-    assert message.count("\n| 2") + message.count("\n| 1") > 0
-    assert "| 29 |" in message
+    # One game, named by the program that played it -- champion zero, which is
+    # the seed enthroned at startup and goes by the pool key.
+    assert "## The game" in message
+    assert f"Episode `{config.POOL_CHAMPION}m" in message
+    # Its result, which is what a round can act on: PASS against PASS is a dead
+    # heat, so the banks it finished on are equal and the difference is zero.
+    assert "finished" in message and "+0" in message
+    # And where to read the rest of it, rather than the rest of it.
+    assert prompt.GAMES in message
+    assert "| 29 |" not in message and "| rank | agent | rating |" not in message
 
 
 def test_calls_that_never_reach_a_verdict_stop_the_campaign(
