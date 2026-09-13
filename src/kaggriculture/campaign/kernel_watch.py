@@ -39,11 +39,21 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from kaggriculture.campaign import config, pools
+
 LOGGER = logging.getLogger(__name__)
 
 COMPETITION = "kaggriculture"
-SEEN = Path("run/kernel-watch/seen.json")
-WORK = Path("run/kernel-watch/kernels")
+# Absolute, anchored to the repository rather than to wherever the process
+# happens to stand. These were `Path("run/kernel-watch/...")`, which is right
+# for as long as nothing ever moves the working directory -- and things do:
+# every worker that runs a program is given a directory of its own, and the
+# harvest runs in the same process as the loop that starts them. A relative
+# constant then resolves somewhere else, silently, and the harvest writes its
+# memory of which kernels it has seen into a scratch tree about to be deleted.
+# Nothing raises; it simply forgets, and re-checks every kernel forever.
+SEEN = config.ROOT / "run" / "kernel-watch" / "seen.json"
+WORK = config.ROOT / "run" / "kernel-watch" / "kernels"
 
 # What marks a cell as holding the agent: a def the engine can call, or a
 # module-level binding of one, which is how a factory-built policy is
@@ -432,7 +442,7 @@ def inline_written(source: str, written: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def resolve_in_sandbox(source: str) -> object:
+def resolve_in_sandbox(source: str) -> str:
     """Run the engine's loader over untrusted source from a scratch directory.
 
     Resolving means EXECUTING it, so a stranger's code gets two things it must
@@ -457,22 +467,31 @@ def resolve_in_sandbox(source: str) -> object:
         source: Candidate agent source.
 
     Returns:
-        The callable the loader selects.
+        The name of the callable the loader selects.
     """
-    import os
-    import tempfile
+    return pools.isolated(entrypoint_name, source)
 
+
+def entrypoint_name(source: str) -> str:
+    """The name of the callable the loader selects. Runs in `isolated`'s child.
+
+    A name rather than the callable, because this crosses a process boundary
+    and a freshly-imported function does not pickle. Both callers only ever
+    wanted the name or the fact that one resolved at all.
+
+    Args:
+        source: Candidate agent source.
+
+    Returns:
+        The selected callable's name.
+    """
     from kaggle_environments.agent import get_last_callable
 
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="kernel-watch-") as sandbox:
-        os.chdir(sandbox)
-        try:
-            return get_last_callable(source, path="main.py")
-        except SystemExit as exit_call:
-            raise RuntimeError(f"source called sys.exit({exit_call.code})") from None
-        finally:
-            os.chdir(origin)
+    try:
+        selected = get_last_callable(source, path="main.py")
+    except SystemExit as exit_call:
+        raise RuntimeError(f"source called sys.exit({exit_call.code})") from None
+    return getattr(selected, "__name__", repr(selected))
 
 
 def loadable(source: str) -> bool:
@@ -592,8 +611,7 @@ def resolved_entrypoint(path: Path) -> str:
         The selected callable's name. These artifacts shadow ``agent``, so the
         surviving definition is often not the one that plays.
     """
-    selected = resolve_in_sandbox(path.read_text(encoding="utf-8"))
-    return getattr(selected, "__name__", repr(selected))
+    return resolve_in_sandbox(path.read_text(encoding="utf-8"))
 
 
 def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float, int]:
@@ -615,9 +633,6 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     Returns:
         The equal-weighted field rate, its Wilson bounds, and the games played.
     """
-    import os
-    import tempfile
-
     from kaggriculture.campaign import roster
     from kaggriculture.campaign.field_gate import score_field
     from kaggriculture.report import wilson_interval
@@ -631,13 +646,9 @@ def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float
     # directories included -- stops resolving the moment the sandbox does.
     absolute = path.resolve()
     seeds = tuple(range(700_000, 700_000 + gate_seeds))
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="kernel-watch-gate-") as sandbox:
-        os.chdir(sandbox)
-        try:
-            rates, _ = score_field(absolute, seeds, workers, list(roster.TRAINING))
-        finally:
-            os.chdir(origin)
+    rates, _ = pools.isolated(
+        score_field, absolute, seeds, workers, list(roster.TRAINING)
+    )
     games = len(rates) * len(seeds) * 2
     equal = sum(rates.values()) / len(rates)
     low, high = wilson_interval(equal * games, games)

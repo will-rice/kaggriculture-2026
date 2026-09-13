@@ -6,25 +6,38 @@ tournament over this pool, which is how the competition itself ranks a field.
 There is no weight for a candidate to buy a promotion with and no single
 opponent it must beat -- only a field it has to finish above.
 
-Champions join as gatekeepers, so a later candidate has to beat every program
-the campaign has already confirmed as well as the vendored kernels. Nothing
-leaves. The pool used to keep the highest-rated eight and drop the rest, on
-the reasoning that an opponent every candidate beats separates two candidates
-no better than a coin.
+The pool holds two kinds of thing on two different terms.
 
-That reasoning holds for a win rate and fails for a rating, and it cost us a
-real thing: champion_1 was trimmed out early, and champion_37 -- promoted
-thirty times later and rated five log-odds above it -- beats it only 0.729 of
-the time, where a rating fitted through the surviving chain says 0.994. The
-pool had discarded the one agent that counters our champion, and no gate could
-have noticed, because the gate only ever saw what the pool still held.
+Harvested agents never leave. They are the only evidence about the field we
+are actually scored against, the campaign cannot produce another one, and the
+competition publishes them faster than they go stale -- so the harvest adds
+and nothing removes.
 
-So the pool keeps everything and `sample` draws the opponents for one gate
-from it: anchors that span the range and are played every time, the
-highest-rated contenders, and a random remainder. A rating is fitted over
-every pairing anyone has ever played, so a candidate only has to add its own
-edges to that graph rather than meet the whole field. Paths are stored here
-and shown nowhere.
+Our own champions are kept to the best `config.POOL_CHAMPIONS`. They join as
+gatekeepers, so a candidate must beat what the campaign has already confirmed;
+but the tenth-best rung of a ladder we built ourselves teaches a candidate
+nothing the best rung does not, and keeping every one of them is what produced
+the monoculture: sixty-nine champions holding ten of a gate's twenty-four
+slots, so nearly half of every gate replayed our own ancestry.
+
+Nothing used to leave at all, on the reasoning that champion_1 counters
+champion_37 at 0.729 where a rating fitted through the surviving chain says
+0.994 -- a counter the pool had discarded and no gate could notice. Both
+halves of that read differently now. The discrepancy was measured inside a
+lineage where every champion was 86.5% one recording and self-play drew thirty
+games in thirty-two, which is exactly where a rate and a fit come apart for
+want of decided games. And the field is not the non-transitive thing that
+argument assumed: a round-robin of fourteen public implementations over 96
+fresh seeds in both seats found no intransitive triple, the newer beating the
+older in 86 of 91 chronological pairs. On a ladder, an agent that rates low is
+the one worth dropping.
+
+`sample` draws one gate's opponents from what remains: anchors that span the
+range and are played every time, every harvested agent, the highest-rated
+contenders, and a random remainder. A rating is fitted over every pairing
+anyone has ever played -- retired champions included, since their games stay
+on the record -- so a candidate only has to add its own edges to that graph
+rather than meet the whole field. Paths are stored here and shown nowhere.
 """
 
 import math
@@ -37,6 +50,12 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from kaggriculture.campaign import config, roster
+
+# What `gate.promote` names a champion, and so how one is told apart from a
+# harvested agent. The two are kept on different terms -- ours are trimmed to
+# the best few, a published agent never is -- and this is the only thing that
+# distinguishes them.
+CHAMPION_PREFIX = "champion_"
 
 
 class Pool(BaseModel):
@@ -152,18 +171,22 @@ class Pool(BaseModel):
             drawn += rng.sample(remainder, min(room, len(remainder)))
         return drawn[: config.GATE_OPPONENTS]
 
-    def add_champion(self, name: str, path: str) -> None:
-        """Put ``name`` in the pool as an opponent every later candidate faces.
+    def add_champion(self, path: str) -> None:
+        """Put our champion in the pool, replacing whichever one was there.
 
-        Nothing ever leaves. There was a trim that kept the highest-rated
-        eight, and it discarded champion_1 -- which counters our current
-        champion at 0.729 where the rating says 0.994. A field this
-        non-transitive cannot afford to drop an agent for rating low, because
-        rating low against the field and beating *us* are different facts.
+        One key, `config.POOL_CHAMPION`, overwritten every promotion, because
+        there is one champion. Nothing is trimmed and no rating decides anything.
+
+        It used to add `champion_N` and trim "our" champions to
+        `POOL_CHAMPIONS = 8` by the `champion_` prefix. That prefix is
+        overloaded -- the pool also holds `champion_1` and `champion_65` from the
+        abandoned tape lineage, which are opponents, not rungs of ours -- so the
+        trim could retire an agent the pool was keeping on purpose, and on
+        2026-09-12 a promotion numbering itself from an empty champions directory
+        picked `champion_1` and overwrote the tape agent of that name outright.
 
         Args:
-            name: The champion's opponent name.
-            path: The champion's own immutable copy.
+            path: The champion's own immutable copy, which the pool plays.
         """
-        self.opponents[name] = path
-        self.history.append({"action": "add_champion", "name": name, "ts": time.time()})
+        self.opponents[config.POOL_CHAMPION] = path
+        self.history.append({"action": "add_champion", "path": path, "ts": time.time()})

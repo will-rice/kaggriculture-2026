@@ -29,29 +29,53 @@ CRASHER = (
 
 
 @pytest.mark.local_data
-def test_score_draws_fresh_seeds_and_averages_the_pool(
+def test_score_plays_the_block_and_averages_the_pool(
     tmp_path: Path,
 ) -> None:
-    """Seeds are drawn per call, and every opponent counts the same."""
+    """It plays the seasons it is given, and every opponent counts the same.
+
+    The seeds assertion was `len(result.seeds) == config.GATE_SEEDS` until
+    2026-09-13, which contradicted both this docstring and the call right above
+    it: `score` stopped drawing its own block and started taking one from the
+    caller, so a test handing it `[5, 6]` was asserting that two seeds were
+    sixteen. It reports back the block it was given.
+    """
     agent = tmp_path / "main.py"
     agent.write_text(PASS, encoding="utf-8")
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
-    result = evaluator.score(agent, "prog", p, random.Random(1), workers=WORKERS)
-    assert len(result.seeds) == config.GATE_SEEDS
+    result = evaluator.score(
+        agent, "prog", p, random.Random(1), [5, 6], workers=WORKERS
+    )
+    assert sorted(result.seeds) == [5, 6]
+    # Both seats of both seasons, which is what makes a rate over them a rate.
+    assert result.games == 4
     assert result.rates == {"v54": 0.0} and result.fitness == 0.0
 
 
 @pytest.mark.local_data
-def test_two_calls_draw_different_seeds(tmp_path: Path) -> None:
-    """Ranking must not reuse one seed block, or drift becomes overfitting."""
+def test_a_call_plays_the_seasons_it_is_handed(tmp_path: Path) -> None:
+    """The caller owns the seasons, so two candidates can share a block.
+
+    They used to be drawn per call, which meant no two programs were ever
+    ranked on the same seasons -- and a season is most of what the rating
+    measures. One unchanged agent through the gate five times, opponents held
+    fixed and only the seeds moving, gave fitted ratings from -3.466 to -2.226:
+    a standard deviation of 0.491, where varying the opponents instead moved it
+    0.070.
+
+    The drift the old draw protected against is now `loop.Campaign.seasons`,
+    which rotates the block; it is not this function's to decide.
+    """
     agent = tmp_path / "main.py"
     agent.write_text(PASS, encoding="utf-8")
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
-    rng = random.Random(2)
-    assert (
-        evaluator.score(agent, "prog", p, rng, workers=WORKERS).seeds
-        != evaluator.score(agent, "prog", p, rng, workers=WORKERS).seeds
-    )
+    block = [7, 8]
+
+    first = evaluator.score(agent, "prog", p, random.Random(2), block, workers=WORKERS)
+    again = evaluator.score(agent, "prog", p, random.Random(3), block, workers=WORKERS)
+
+    assert sorted(first.seeds) == sorted(block)
+    assert first.seeds == again.seeds
 
 
 def test_a_program_in_the_pool_is_never_played_against_itself(
@@ -80,7 +104,7 @@ def test_a_program_in_the_pool_is_never_played_against_itself(
     p.save(registry)
 
     ranked = evaluator.score(
-        champion, "champion_1", p, random.Random(4), WORKERS, registry
+        champion, "champion_1", p, random.Random(4), [5, 6], WORKERS, registry
     )
 
     assert set(ranked.rates) == {"other"} and set(ranked.intervals) == {"other"}
@@ -113,7 +137,7 @@ def test_score_diverts_what_a_candidate_writes_away_from_the_caller(
     monkeypatch.setattr(config, "GATE_SEEDS", 1)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
-    evaluator.score(agent, "prog", p, random_module.Random(3), workers=WORKERS)
+    evaluator.score(agent, "prog", p, random_module.Random(3), [5, 6], workers=WORKERS)
 
     assert list(workspace.iterdir()) == []
     assert Path.cwd() == workspace
@@ -134,7 +158,7 @@ def test_score_reports_an_interval_beside_every_rate(
     monkeypatch.setattr(config, "GATE_SEEDS", 2)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
-    result = evaluator.score(agent, "prog", p, random.Random(1), WORKERS)
+    result = evaluator.score(agent, "prog", p, random.Random(1), [5, 6], WORKERS)
 
     assert result.program_id == "prog" and result.games == 4
     assert result.rates["v54"] == 0.0
@@ -155,7 +179,7 @@ def test_score_lets_a_crash_propagate_and_still_restores_the_cwd(
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
     with pytest.raises(RuntimeError):
-        evaluator.score(agent, "prog", p, random.Random(1), WORKERS)
+        evaluator.score(agent, "prog", p, random.Random(1), [5, 6], WORKERS)
 
     assert Path.cwd() == workspace
 
@@ -222,3 +246,91 @@ def test_a_pairing_that_drew_every_game_has_no_evidence_either_way() -> None:
     """
     assert evaluator._contested(played("t", [(7.0, 7.0)] * 32), ["t"]) == {"t": (0, 0)}
     assert evaluator.wilson_interval(0, 0) == (0.0, 1.0)
+
+
+@pytest.mark.local_data
+def test_every_game_it_scores_is_a_game_the_round_can_improve(tmp_path: Path) -> None:
+    """Every game, grouped by opponent, narrowest first.
+
+    This used to keep the single narrowest game against each opponent and drop
+    the rest, so a round was asked to improve a program on one game in
+    thirty-two of what it was about to be scored on -- and the thirty-one it
+    could not see were decided by the same policy for the same reasons. The
+    days are already rendered by the time this runs, so keeping them costs the
+    write and nothing else.
+
+    Narrowest first because that is the game a small change would have turned;
+    the widest shows the failure at its starkest and the least reachable, so it
+    goes last rather than first.
+    """
+    agent = tmp_path / "main.py"
+    agent.write_text(PASS, encoding="utf-8")
+    p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
+
+    result = evaluator.score(
+        agent, "prog", p, random.Random(4), [11, 12], workers=WORKERS
+    )
+
+    seasons = result.states["v54"]
+    assert len(seasons) == result.games, "one recorded season per game scored"
+    assert all(len(game.days) == len(seasons[0].days) for game in seasons)
+    assert len(seasons[0].days) > 1, "a season is its days, not one terminal row"
+    # Whole games, because the seat is what lets the days be written out the
+    # way the corpus writes them, and days alone do not carry it.
+    assert {game.seat for game in seasons} == {0, 1}
+    assert {game.seed for game in seasons} == {11, 12}
+    gaps = [abs(game.ours - game.theirs) for game in seasons]
+    assert gaps == sorted(gaps), "narrowest first, so season 1 is the reachable one"
+
+
+def rated(program_id: str, rates: dict[str, float]) -> evaluator.Result:
+    """A result carrying nothing but the rates a comparison reads."""
+    return evaluator.Result(
+        program_id=program_id,
+        fitness=sum(rates.values()) / len(rates),
+        field=None,
+        rates=rates,
+        margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
+        games=2,
+        seeds=[1],
+        hardest=next(iter(rates)),
+        states={},
+    )
+
+
+def test_a_result_is_compared_over_the_opponents_both_programs_played() -> None:
+    """A pool that grew between two evaluations must not decide the comparison.
+
+    Harvest enrolled an opponent at 14:01 on 2026-09-13, mid-session, and a mean
+    over a pool that gained an agent is not the same number as a mean over the
+    pool before it. Here the child faces one extra opponent it beats outright:
+    on `fitness` it looks ahead, and over what both actually played it is behind.
+    """
+    parent = rated("parent", {"a": 0.40, "b": 0.40})
+    child = rated("child", {"a": 0.30, "b": 0.30, "harvested": 1.0})
+
+    assert child.fitness > parent.fitness, "the whole-pool mean favours the child"
+    assert not child.beats(parent), "over the shared two it is 0.30 against 0.40"
+    assert parent.beats(child)
+
+
+def test_a_tie_is_not_an_improvement() -> None:
+    """Two programs that draw every game are the same program.
+
+    Equality keeps the incumbent, so a round that changed nothing measurable
+    does not become what the next round builds on.
+    """
+    held = rated("parent", {"a": 0.5, "b": 0.5})
+    same = rated("child", {"a": 0.5, "b": 0.5})
+
+    assert not same.beats(held)
+    assert not held.beats(same)
+
+
+def test_two_results_with_no_opponent_in_common_are_not_a_comparison() -> None:
+    """No shared opponent is no evidence, and no evidence keeps the incumbent."""
+    parent = rated("parent", {"a": 0.1})
+    child = rated("child", {"b": 0.9})
+
+    assert not child.beats(parent)
+    assert not parent.beats(child)

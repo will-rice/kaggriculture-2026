@@ -1,0 +1,46 @@
+# The one games database: the recorded ladder and every game this campaign
+# plays, in one place so a question can span both.
+#
+# ClickHouse rather than SQLite or Postgres, for the two properties the
+# campaign actually needs at once. Eight sessions record in parallel -- SQLite
+# admits one writer and a lock or a busy timeout only decides how the second
+# one fails. And the questions are analytical: an average of one measure across
+# every day of a billion rows reads one column here and thirty-three in a
+# row-oriented store. The compression is the third thing and it changes the
+# shape of the problem rather than the speed of it: these are small integers
+# repeating down a season, which is the case columnar compression is best at.
+#
+# Bound to localhost. Nothing outside this machine has any business here, and
+# the database holds every opponent's recorded games.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: kaggriculture-games
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      # On /data, which has the room; the repository disk does not.
+      - /data/kaggriculture/clickhouse:/var/lib/clickhouse
+      # The SQLite the corpus was extracted into, so the server can migrate it
+      # with its own `sqlite()` table function -- no export, no CSV, no Python
+      # between the two. It has to sit under `user_files`, which is where
+      # ClickHouse will read a local file from and nowhere else. Read-only and
+      # the one file, rather than the directory: `user_files` is a path the
+      # server walks, and pointing it at a tree that contains its own data
+      # directory is a loop waiting to be found.
+      - /data/kaggriculture/games.sqlite:/var/lib/clickhouse/user_files/games.sqlite:ro
+    environment:
+      CLICKHOUSE_DB: games
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    # The box has 251 GB and 64 cores, and the campaign needs most of both to
+    # play games. This is what the database may take while that runs.
+    deploy:
+      resources:
+        limits:
+          memory: 64G
+    restart: unless-stopped

@@ -125,140 +125,125 @@ def test_edges_already_on_the_record_are_not_played_again(
     assert again == []
 
 
-def test_a_candidate_must_out_rate_the_floor_by_the_margin() -> None:
-    """The bar is a rating gap, not a rank.
+def beat(
+    rate: float,
+    decided: int,
+    field: float = 0.30,
+    champion_field: float = 0.20,
+    champion: str = "floor",
+    shared: int = 20,
+) -> tuple[evaluator.Result, gate.Champion]:
+    """A candidate and the champion it is judged against.
 
-    A rank has no margin in it -- a candidate a hair above the champion topped
-    the table and promoted, and at these sample sizes the hair is usually
-    noise. And a rank over a *sample* is not a rank at all: a candidate draws
-    sixteen opponents out of dozens, so "top of the table" would mean top of
-    whichever sixteen it happened to draw, and an easy draw would promote.
+    ``field`` and ``champion_field`` are each side's win rate over the opponents
+    they share, so the two conditions can be moved independently: ``rate`` and
+    ``decided`` drive the head-to-head, and the two field figures drive the
+    win-rate comparison.
     """
-    margin = config.PROMOTION_MARGIN
-
-    clear, why = gate.promotion(
-        {"mine": 1.0, "floor": 1.0 - margin, "other": 0.0},
-        "mine",
-        "floor",
-        decisive=config.DECISIVE_GAMES,
+    rates = {champion: rate, **{f"public_{i}": field for i in range(shared)}}
+    theirs = {f"public_{i}": champion_field for i in range(shared)}
+    result = evaluator.Result(
+        program_id="mine",
+        fitness=rate,
+        field=field,
+        rates=rates,
+        margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
+        decisive={champion: decided, **{f"public_{i}": 32 for i in range(shared)}},
+        games=32,
+        seeds=[1, 2, 3, 4],
+        hardest=champion,
+        states={},
     )
-    assert clear and "above floor" in why
-
-    # Ahead of the floor, and by less than the bar.
-    close, why = gate.promotion(
-        {"mine": 1.0, "floor": 1.0 - margin / 2, "other": 0.0},
-        "mine",
-        "floor",
-        decisive=config.DECISIVE_GAMES,
+    standing = gate.Champion(
+        name=champion,
+        path=f"/champions/{champion}.py",
+        tarball="",
+        result=result.model_copy(update={"program_id": champion, "rates": theirs}),
     )
-    assert not close and "the bar is" in why
+    return result, standing
 
 
-def test_leading_the_field_is_not_enough_to_replace_the_floor() -> None:
-    """Top of the table and level with the champion promotes nothing.
+def test_a_better_rate_and_a_decisive_win_promotes() -> None:
+    """Both conditions, and this is the case that clears them.
 
-    Rank alone has no margin in it, and over a sampled draw a rank is
-    estimated through the fit rather than measured. It is exactly the case the
-    margin exists for.
+    0.30 against the shared opponents where the champion has 0.20 is well past
+    twice the error of the difference, and 22 of 32 against the champion is where
+    the Wilson lower bound crosses 0.5.
     """
-    ranked = {"mine": 2.0, "floor": 2.0 - config.PROMOTION_MARGIN / 3, "third": 0.0}
+    clear, why = gate.promotion(*beat(22 / 32, 32))
 
-    clear, _ = gate.promotion(ranked, "mine", "floor", decisive=config.DECISIVE_GAMES)
-
-    assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
-    assert not clear
+    assert clear, why
+    assert "against the field" in why and "lower bound" in why
 
 
-def test_clearing_the_floor_is_not_enough_without_topping_the_field() -> None:
-    """The two questions came apart within an hour of the pool growing.
+def test_a_better_rate_without_the_pairing_does_not_promote() -> None:
+    """Beating the field on average is not beating the program it replaces.
 
-    Candidates promoted at third and fourth of sixty-four for clearing a floor
-    that was no longer the best agent in the field. Beating the agent you
-    replace says the ratchet turned; being the best says it is worth turning.
+    An agent can win more of the field and still lose to the specific one it is
+    taking the slot from, which is not a ratchet.
     """
-    ranked = {
-        "leader": 3.0,
-        "runner_up": 2.5,
-        "mine": 2.0,
-        "floor": 2.0 - 2 * config.PROMOTION_MARGIN,
-    }
+    close, why = gate.promotion(*beat(21 / 32, 32))
 
-    clear, why = gate.promotion(ranked, "mine", "floor", decisive=config.DECISIVE_GAMES)
-
-    # Comfortably past the floor, and third of four.
-    assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
-    assert not clear
-    assert "3 of 4" in why and "below leader" in why
+    assert not close
+    assert "not shown to beat it" in why
 
 
-def test_before_there_is_a_floor_the_field_is_the_bar() -> None:
-    """The first promotion of a run has nothing to be a margin above."""
-    enough = config.DECISIVE_GAMES
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None, decisive=enough)[0]
-    assert not gate.promotion({"mine": 0.4, "a": 0.5}, "mine", None, decisive=enough)[0]
-    # And a floor the fit has never heard of is no floor either.
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", "gone", decisive=enough)[0]
-    # No floor means nothing to be indistinguishable from, so the decisive
-    # bar has nothing to say and a fresh run is not blocked by it.
-    assert gate.promotion({"mine": 1.0, "a": 0.5}, "mine", None, decisive=0)[0]
+def test_winning_the_pairing_while_losing_the_field_does_not_promote() -> None:
+    """The condition the campaign learned it needed, twice, on 2026-09-13.
+
+    `champion_3` was promoted at a field rate of 0.114 over a champion at 0.155,
+    and `champion_8` at 0.221 over one at 0.244 -- each having beaten the program
+    it replaced decisively. Two of nine promotions handed back field ground,
+    which is a ratchet turning the wrong way.
+    """
+    worse, why = gate.promotion(*beat(28 / 32, 32, field=0.114, champion_field=0.155))
+
+    assert not worse
+    assert "inside twice its error" in why
 
 
-def test_second_place_is_not_promoted_however_close() -> None:
-    """A floor that rose on anything but the best would not be the best."""
-    ok, why = gate.promotion(
-        {"a": 0.9001, "c": 0.9000, "b": -0.5}, "c", decisive=config.DECISIVE_GAMES
+def test_a_rate_inside_the_noise_does_not_promote() -> None:
+    """A higher number is not a better program.
+
+    At 20 shared opponents and 32 games each the standard error of a rate near
+    0.22 is about 0.014, so the bar is near 0.029. `champion_8` to `champion_9`
+    was +0.0044, a fifth of it. Promoting on any improvement is the winner's
+    curse: 78 of 471 programs once topped a noisy ranking and none survived a
+    deeper look.
+    """
+    noise, why = gate.promotion(*beat(28 / 32, 32, field=0.2253, champion_field=0.2209))
+
+    assert not noise
+    assert "inside twice its error" in why
+
+
+def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:
+    """Two programs that draw are the same program, whatever the rate says.
+
+    champion_55 was promoted over champion_54 on two wins and thirty exact draws
+    in 32 games; 2/2 reads as 1.000. `DECISIVE_GAMES` covers the band the
+    interval does not -- 4 to 7 decided out of 32 is a candidate drawing 78% to
+    88% of its games with the champion -- and below 4 the interval refuses on its
+    own, since 3/3 is 0.438.
+    """
+    drawn, why = gate.promotion(*beat(1.0, 2))
+
+    assert not drawn
+    assert "only 2 of its games" in why and "the same game" in why
+
+    thin, why = gate.promotion(*beat(1.0, 7))
+    assert not thin and "the bar is 8" in why
+
+
+def test_an_unplayed_champion_is_not_a_measurement() -> None:
+    """A champion that moved under a running evaluation was never played."""
+    result, standing = beat(1.0, 32)
+    missing, why = gate.promotion(
+        result, standing.model_copy(update={"name": "someone_else"})
     )
 
-    assert not ok
-    assert "2 of 3" in why and "below a" in why
-
-
-def test_the_reason_says_where_it_placed_not_who_it_failed_to_beat() -> None:
-    """A place is something a next round can aim at; a list of losses is not.
-
-    The absolute rule this replaced named every opponent a program did not
-    beat, which for a program that beat none of them was the whole pool and
-    told it nothing about which to attack first.
-    """
-    ok, why = gate.promotion(
-        {"a": 2.0, "b": 1.0, "c": 0.0, "mine": -1.0},
-        "mine",
-        decisive=config.DECISIVE_GAMES,
-    )
-
-    assert not ok
-    assert why.startswith("4 of 4")
-    assert "below a" in why
-
-
-def test_one_bad_matchup_does_not_sink_a_top_rating() -> None:
-    """Where the tournament and the old absolute rule actually disagree.
-
-    Measured on the pool of 2026-09-06, the second-strongest published agent
-    wins 78.6% of everything and loses one matchup at 0.062. The rule this
-    replaced turned that agent away; a tournament ranks it where it belongs.
-    """
-    # `mine` is rated top despite the standings being the only thing the gate
-    # reads -- the rate that would have failed an absolute rule is inside the
-    # fit, not beside it.
-    assert gate.promotion(
-        {"mine": 1.5, "a": 1.0, "b": 0.2}, "mine", decisive=config.DECISIVE_GAMES
-    )[0]
-
-
-def test_the_standings_are_over_the_pool_and_nothing_else() -> None:
-    """The gate is a place in one tournament, not a score against a set.
-
-    There is no held-out set any more and no second measurement: seeds
-    are drawn fresh every evaluation, so every rate here was already
-    measured on maps this program was never selected on.
-    """
-    candidate = result("c", 0.8, {"a": 0.9, "b": 0.8})
-
-    assert gate.promotion(
-        {"c": 1.0, "a": 0.1, "b": -0.4}, "c", decisive=config.DECISIVE_GAMES
-    )[0]
-    assert set(candidate.rates) == {"a", "b"}
+    assert not missing
+    assert "did not play someone_else" in why
 
 
 def _paths(tmp_path: Path) -> config.Run:
@@ -345,7 +330,11 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
         champion=gate.promote(paths=paths, program=program, result=_result()),
     )
     gate.enroll(champion, p, paths)
-    assert champion.name == "champion_1"
+    # The pool key is fixed -- there is one champion -- and the numbering is on
+    # the file, which is what keeps a history without colliding with the tape
+    # lineage's `champion_1` already in the pool.
+    assert champion.name == config.POOL_CHAMPION
+    assert Path(champion.path).name == "champion_1.py"
     floor = paths.floor / "main.py"
     assert (
         floor.read_text() == source.read_text()
@@ -357,7 +346,7 @@ def test_promote_writes_a_read_only_floor_and_updates_the_pool(
         and (kept.stat().st_mode & 0o777) == 0o444
     )
     saved = pool.Pool.load(paths.pool)
-    assert "champion_1" in saved.names()
+    assert config.POOL_CHAMPION in saved.names()
 
 
 def test_promote_refuses_a_champion_name_the_directory_already_holds(
@@ -405,10 +394,14 @@ def test_the_pool_registers_each_champion_own_file_not_the_shared_floor(
     )
 
     saved = pool.Pool.load(paths.pool)
-    one, two = saved.opponents["champion_1"], saved.opponents["champion_2"]
-    assert one != two
-    assert Path(one).read_text() == Path(first.source_path).read_text()
-    assert Path(two).read_text() == Path(second.source_path).read_text()
+    # One key, so the second promotion replaces the first in the pool. Both files
+    # are still on disk under their own numbers, which is where the history is.
+    held = saved.opponents[config.POOL_CHAMPION]
+    assert Path(held).read_text() == Path(second.source_path).read_text()
+    assert Path(held).name == "champion_2.py"
+    assert (paths.champions / "champion_1.py").read_text() == Path(
+        first.source_path
+    ).read_text()
     floor = paths.floor / "main.py"
     assert floor.read_text() == Path(second.source_path).read_text()
 
@@ -458,7 +451,7 @@ def test_champion_numbering_survives_a_pool_retirement(
     )
     gate.enroll(gate.record(champion, paths), retired, paths)
 
-    assert champion.name == "champion_4"
+    assert Path(champion.path).name == "champion_4.py"
     assert sorted(p.name for p in paths.champions.glob("champion_*.py")) == [
         "champion_1.py",
         "champion_2.py",
@@ -516,40 +509,4 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
         paths=paths, program=program, result=result("p9", 0.8, {"a": 0.9, "b": 0.6})
     )
     gate.enroll(gate.record(champion, paths), reloaded, paths)
-    assert champion.name == "champion_2"
-
-
-def test_a_candidate_that_draws_the_floor_is_the_floor() -> None:
-    """Out-rating the champion is not the same as beating it.
-
-    The numbers are champion_55's, measured 2026-09-08. It was promoted over
-    champion_54 on a rating gap the bar reads as "about a 54% head-to-head".
-    Their thirty-two games were two wins by five units and thirty exact draws:
-    the same program, plus a rounding error. A rating is fitted over every
-    pairing on the record, so the gap came from beating *ancestors* -- which
-    champion_54 also beat -- while the pairing that decides whether anything
-    improved was drawn.
-    """
-    ranked = {"mine": 2.0, "floor": 2.0 - 2 * config.PROMOTION_MARGIN, "old": 0.0}
-
-    stuck, why = gate.promotion(ranked, "mine", "floor", decisive=2)
-
-    # Top of the field and comfortably past the margin -- the old bar, cleared.
-    assert sorted(ranked, key=lambda n: -ranked[n])[0] == "mine"
-    assert ranked["mine"] - ranked["floor"] > config.PROMOTION_MARGIN
-    assert not stuck
-    assert "the two play the same game" in why
-
-
-def test_the_decisive_bar_is_read_on_games_not_on_the_rate() -> None:
-    """Only one of the two shapes behind a rate of 0.53125 is evidence.
-
-    Thirty draws and two wins score exactly as seventeen wins and fifteen
-    losses do. So the bar counts games that ended with a winner. The same candidate, the
-    same rating gap, and the only thing that differs is whether the pairing
-    was ever decided.
-    """
-    ranked = {"mine": 2.0, "floor": 2.0 - 2 * config.PROMOTION_MARGIN, "old": 0.0}
-
-    assert not gate.promotion(ranked, "mine", "floor", decisive=2)[0]
-    assert gate.promotion(ranked, "mine", "floor", decisive=32)[0]
+    assert Path(champion.path).name == "champion_2.py"

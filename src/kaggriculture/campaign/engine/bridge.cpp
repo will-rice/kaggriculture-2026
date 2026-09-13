@@ -120,6 +120,15 @@ void* kag_new(std::uint64_t seed, std::int32_t episode_steps) {
 
 void kag_free(void* sim) { delete static_cast<kag::Sim*>(sim); }
 
+// A plan search wants to try many continuations from one position, and
+// replaying the episode from step 0 for each of them is the whole cost of
+// the search. `Sim` is `Config` and `State`, both flat value types with no
+// pointer, vector or string in them, and the day's randomness is rebuilt
+// from `(seed, day)` on the spot rather than carried -- so the copy
+// constructor is the whole of a fork, and a forked position steps
+// identically to the one it came from.
+void* kag_clone(const void* sim) { return new kag::Sim(*static_cast<const kag::Sim*>(sim)); }
+
 void kag_step(void* sim, const PackedAction* a0, const PackedAction* a1) {
     static_cast<kag::Sim*>(sim)->step(unpack(*a0), unpack(*a1));
 }

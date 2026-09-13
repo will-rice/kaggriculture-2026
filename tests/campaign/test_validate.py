@@ -111,6 +111,20 @@ def test_ctypes_is_not_importable(tmp_path: Path) -> None:
     assert verdict.status == "imports" and "ctypes" in verdict.reason
 
 
+def test_a_recording_cannot_travel_into_a_candidate(tmp_path: Path) -> None:
+    """`base64` and `zlib` are refused: they are how a recorded season travels.
+
+    They were allowed for a seed that carried one, and what the campaign then
+    spent 521 sessions on was the repair layer around a 720-step recording it
+    could not read -- byte-identical through 69 promotions, 86.5% of every
+    action emitted, and worth 3,000 once emptied. Neither module is dangerous;
+    both are refused so a policy stays something the search can edit.
+    """
+    for module in ("base64", "zlib"):
+        verdict = validate.validate(write(tmp_path, f"import {module}\n" + GOOD))
+        assert verdict.status == "imports" and module in verdict.reason
+
+
 def test_dunder_import_bypasses_the_import_statement_check(tmp_path: Path) -> None:
     """`__import__` reaches a module without ever naming it in an import."""
     source = GOOD + '\nsock = __import__("socket")\n'

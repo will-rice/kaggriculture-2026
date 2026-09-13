@@ -24,7 +24,7 @@ Re-run it when new archives land. It takes about as long as one pass of
 import argparse
 import logging
 
-from kaggriculture.campaign import dataset, tapes
+from kaggriculture.campaign import config, dataset, tapes
 
 LOGGER = logging.getLogger(__name__)
 # How many of the ladder's teams to name at the end.
@@ -50,7 +50,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--database",
-        default=dataset.DATABASE,
+        default=config.GAMES_DB,
         help="where to write it (default: %(default)s)",
     )
     arguments = parser.parse_args()

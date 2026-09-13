@@ -8,7 +8,6 @@ database, so the ledger is the only place it is written down.
 """
 
 import json
-import math
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -167,37 +166,33 @@ class Database:
         self._apply({"event": "failure", "failure": failure.model_dump()})
 
     def top(self, k: int) -> list[Program]:
-        """Return the `k` best programs, best first.
+        """Return the `k` best programs, best first: most games won.
 
-        Ranked on the Bradley-Terry rating, which is what the gate promotes on
-        and what the competition ranks by. It decides two things: who the exam
-        block is spent on, and which program a new session starts from. Both
-        want the same answer as the gate, and for a while they did not: this
-        ranked on ``fitness``, the mean win rate, so the search climbed one
-        hill while being judged on another. Over 184 rated programs the
-        campaign peaked around the fiftieth and wandered after -- a session
-        was as likely to start from the tenth best as the best, because
-        `fitness` did not agree with the gate about which was which.
+        On the win rate, because every candidate now plays the whole pool on
+        the same seeds in both seats and that makes the rate directly
+        comparable. It ranked on the Bradley-Terry rating until 2026-09-12, for
+        a reason that was sound at the time -- the gate promoted on the rating,
+        so selection and the bar wanted the same answer -- and for one that
+        never was: that a rate "counts beating the pool's weakest agent for as
+        much as beating its strongest", which is a complaint about the
+        objective rather than the estimator, and the objective is to win games.
 
-        A mean win rate is also the wrong shape: it counts beating the pool's
-        weakest agent for as much as beating its strongest, while a rating
-        does not, and the pool is now the top of the tournament precisely so
-        that the difference matters.
+        The rating had to go because it stopped separating anything at the top.
+        Measured 2026-09-12: the best program the campaign has produced sat at
+        rating rank 1 behind a program winning 12.5 points fewer games, on an
+        identical fitted rating of -1.983, so `PARENT_DECAY ** rank` drew the
+        worse one half the time and the better one a quarter. The second and
+        third best by games won were at rating ranks 14 and 10, outside the
+        parent pool entirely.
 
         Then on the mean bank margin across opponents. That tie-break is what
-        makes the opening hours a search rather than a random walk: until some
-        program wins a game every rating is the same number, sorting on rating
-        alone leaves the ties in insertion order, and the margins say which of
-        those came closest. A program with no rating at all -- the seed, or
-        anything written before the tournament -- sorts below every rated one
-        rather than above them.
+        makes the opening hours a search rather than a random walk: before the
+        first win every rate is 0.0, sorting on it alone leaves the ties in
+        insertion order, and the margins say which of those came closest.
         """
         return sorted(
             self._programs.values(),
-            key=lambda p: (
-                p.rating if p.rating is not None else -math.inf,
-                mean_margin(p),
-            ),
+            key=lambda p: (p.fitness, mean_margin(p)),
             reverse=True,
         )[:k]
 

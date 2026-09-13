@@ -50,6 +50,26 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (  # noqa: E402
 ROOT = Path(__file__).resolve().parents[3]
 RUN = ROOT / "run" / "campaign"
 OPPONENTS = Path("/data/kaggriculture/opponents")
+# The one database. The nightly extraction writes the recorded ladder into it
+# and the loop writes every game it plays into it, because the questions worth
+# asking span both -- is this lineage converging on what the field does, or
+# somewhere else -- and that is only askable while both are rows in one table.
+# `episodes.source` says which writer owns a row, so the rebuild replaces the
+# ladder and never touches a game the campaign played.
+# Where the one games database answers. ClickHouse on localhost, started by
+# the repository's `docker-compose.yml`: the recorded ladder and every game the
+# campaign plays, in one store, because the questions worth asking span both.
+GAMES_URL = os.environ.get("KAGGRICULTURE_GAMES_URL", "http://127.0.0.1:8123")
+# The database inside that server. Here rather than in `games` because
+# `dataset` names it too, and the two modules importing each other to agree
+# on a string is how they come to disagree on one.
+GAMES_DB = "games"
+# Skills copied into every round's workspace. They live in the repository, beside
+# the code whose schema they describe, rather than in the host's codex
+# configuration: a skill that documents `browse`'s tables and is kept somewhere
+# the tests cannot reach is a skill that goes stale the first time a column is
+# renamed, and goes stale silently.
+SKILLS = ROOT / ".agents" / "skills"
 # Where an opponent whose source predates the vendored drop still lives; the
 # roster names one. Both roots are stated here so no other module spells out
 # a path under /data.
@@ -112,12 +132,23 @@ MARKET_OPS: list[str] = [
 # One codex session per worker; eight fit the machine beside their
 # evaluations. Spec section 8.
 SESSIONS = 8
-# Codex calls in one session, each continuing from the program the last one
-# produced, and the only thing that ends a session besides a round clearing the
-# bar or failing. There is no clock on a round or on a session: a round runs the
-# skills this login has installed, which take as long as they take, and a cap
-# only ever cut one off before it had written anything.
-ROUNDS_PER_SESSION = 5
+# Consecutive codex calls against one opponent before the session moves to the
+# next, and a session works through every opponent in the pool. So its length is
+# the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
+# a promotion, a call that ran to no verdict, or the run stopping.
+#
+# There is no fixed cap any more. `ROUNDS_PER_SESSION = 12` was one, and it made
+# the session length arbitrary -- twelve rounds covered one opponent or twelve
+# depending on how the games happened to be walked. Both ways of walking them
+# shipped on 2026-09-12 and both were wrong: the flat list gave twelve seasons
+# against whichever agent `games.ordered` puts first, since it is matchup-major
+# and that is the one the program loses to hardest; striding matchups gave one
+# game against each of twelve, which is twelve first impressions.
+#
+# Twelve attempts is what learning an opponent takes, and the season advances
+# inside the block, so they are twelve maps against the same agent rather than
+# twelve tries at one game.
+ROUNDS_PER_OPPONENT = 12
 # Seeds a program is scored on: drawn fresh every evaluation and played in
 # both seats against every pool opponent. This is the whole measurement -- one
 # gate, one number, and promotion decided on it.
@@ -154,6 +185,22 @@ GATE_SEEDS = 16
 # its ancestors were selected on. The reserved block was a held-out set for a
 # search that is always, structurally, held out.
 GATE_SEED_RANGE = range(1, 1_000_000)
+# Candidates that share one block of seasons before a fresh block is drawn.
+#
+# Sharing is what makes two candidates comparable at all. The seeds used to be
+# drawn per call, so no two programs were ever ranked on the same seasons --
+# and a season is most of what the rating measures. One unchanged agent
+# through the gate five times, opponents held fixed and only the seeds moving,
+# gave fitted ratings from -3.466 to -2.226: a standard deviation of 0.491,
+# against a promotion bar that used to be 0.15. Holding the seeds and varying
+# the opponents instead moved it 0.070, so the maps are seven times the draw.
+#
+# Rotating is what keeps the note above this constant true -- a block that
+# never moved would be one the search gets selected against, which is exactly
+# what the reserved held-out set existed to prevent. Sixty-four is a few
+# generations of eight concurrent sessions: long enough that the candidates
+# being compared share a block, short enough that no lineage lives in one.
+SEED_ROTATION = 64
 # Opponents drawn for one gate. The pool itself is now everything the campaign
 # has ever produced or harvested and nothing leaves it, so this is a sample
 # and not the pool: a rating is fitted over every pairing anyone has ever
@@ -191,29 +238,78 @@ GATE_OPPONENTS = 24
 # quietly discarded.
 GATE_ANCHORS = (
     "champion_1",
-    "champion_10",
-    "champion_20",
-    "champion_30",
+    "champion_65",
     "thomastschinkel_router",
     "router_v1",
 )
+# Four, and every one of them a different agent. It was six, and four of those
+# were champion_1, _10, _20 and _30 -- which read as four points spanning the
+# strength range and were four ages of one recording. The 720-step table
+# underneath that lineage is byte-identical from its seed through champion_69,
+# sha ef59f6f4a545d342, and 86.5% of every action any of them emits comes
+# straight out of it; what differs between them is the repair layer over the
+# other 13%.
+#
+# An anchor's whole job is to be a fixed point a rating is calibrated against,
+# so anchoring the scale to one agent at four ages is the failure that
+# calibration exists to prevent. champion_65 replaces the three: it is the
+# strongest of that lineage and the bar a submission has to clear, so it earns
+# a slot on its own account rather than as a reference point.
+#
+# The rest of that lineage left the pool with them. Sixty-nine champions held
+# ten of a gate's twenty-four slots, which bought ten readings of one
+# recording; its run is kept whole under `run/campaign-tape-lineage/` and its
+# pairings stay in `field.json`, so the fit still places it.
 # Highest-rated agents drawn beyond the anchors and the vendored set. Four
 # rather than six because the leader is already drawn through `always` and the
 # vendored opponents now take a dozen slots: the contenders were competing for
 # room with the only cross-population evidence the gate gets.
 GATE_CONTENDERS = 4
-# How far above the champion's rating a candidate must sit to replace it, in
-# log-odds. Promotion used to mean topping a tournament of eight, which is a
-# rank and so has no margin in it at all: a candidate a hair above the
-# champion promoted, and the hair was usually noise.
+# How many of our own champions stay in the pool. Harvested agents are never
+# trimmed and these are, because the two are different kinds of evidence: a
+# published agent says something about the field we are scored against and
+# the campaign cannot produce another one, while the tenth-best rung of our
+# own ladder says nothing the best rung does not.
 #
-# A rating has units, so the bar can be stated. 0.15 log-odds is about a 54%
-# head-to-head, and at sixteen seeds a pairing the standard error on a
-# candidate's rating is well inside that -- which is the point. Selecting the
-# maximum of a noisy estimator is biased upward by construction, and this is
-# the guard: 78 of 471 programs once topped a noisy gate and none of them
-# survived a deeper measurement.
-PROMOTION_MARGIN = 0.15
+# Eight, because that is roughly a third of a gate's draw -- enough that a
+# candidate must beat its recent ancestry rather than only the current
+# champion, and few enough that the other two thirds stay outside agents.
+# Unbounded is what produced the monoculture: sixty-nine champions holding ten
+# of twenty-four slots, so nearly half of every gate replayed our own lineage.
+# The pool key our champion occupies. One key, overwritten on every promotion,
+# because there is one champion.
+#
+# Not `champion_N`. `POOL_CHAMPIONS = 8` used to trim "our" champions by the
+# `champion_` prefix, and that prefix is overloaded: the pool also holds
+# `champion_1` and `champion_65` from the abandoned tape lineage, which are
+# opponents rather than rungs of ours. On 2026-09-12 a promotion numbered itself
+# from this run's empty champions directory, picked `champion_1`, and silently
+# replaced the tape agent of that name -- an agent the pool was keeping
+# specifically because it counters our lineage.
+#
+# A key that cannot be produced by harvesting or by the old lineage ends both
+# problems: nothing to collide with, and nothing to scan a prefix for.
+POOL_CHAMPION = "ours"
+# There is no promotion margin any more, and this note is here so nobody adds
+# one back.
+#
+# It was `PROMOTION_MARGIN = 0.15` of rating, about 26 Elo, and its job was to
+# stop the winner's curse: selecting the maximum of a noisy estimator is
+# biased upward by construction, and 78 of 471 programs once topped a noisy
+# gate with none surviving a deeper look. The reasoning was right and the
+# instrument was never checked against it. Measured 2026-09-11: one unchanged
+# agent's fitted rating moves with a standard deviation of 0.745 across draws
+# -- 129 Elo -- so the bar sat a fifth of a standard deviation out and
+# filtered almost none of the noise it was aimed at. What it did filter
+# reliably was a real improvement too small to clear it.
+#
+# A fixed size cannot be the answer to a quantity that varies with the draw,
+# the candidate's strength and how many games were decided. `gate.promotion`
+# asks for significance instead: the gate already plays the candidate against
+# the champion over every gate seed in both seats, which is one set of seasons
+# played twice and therefore paired, and a margin larger than twice its own
+# error is a demonstration. That bar tightens when the measurement is good and
+# refuses when it is not, which is the whole of what the constant was for.
 # The fewest games a candidate must actually decide against the floor before
 # the margin above means anything.
 #
@@ -450,29 +546,49 @@ WANDB_PROJECT = "kaggriculture-2026"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of anything a codex call is given.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"
+# How often the campaign takes newly published kernels into its pool, and how
+# many refs it considers each time.
+#
+# `harvest` was written as the other half of the ratchet -- champions join on
+# every promotion and nothing else does, so left alone the pool becomes the
+# campaign playing itself. It ran on 2026-09-01 and 2026-09-06 and then
+# nothing ran it, which is the whole of why the pool reached 69 champions
+# against 12 published agents, all of them frozen at the older of those dates.
+# A field that turns over in days was being gated against a five-day-old
+# snapshot of itself.
+#
+# So the loop harvests rather than a person remembering to. Hourly because
+# that is the rate the competition publishes at and a kernel costs one
+# 720-step game to check; forty refs because that is roughly five days of
+# publications, so a restart after an outage catches up in one pass.
+HARVEST_INTERVAL_SECONDS = 3600
+HARVEST_LIMIT = 40
 # The campaign this checkout runs. Everything that writes takes a `Run`, so
 # this is the only place the live one is named -- a dry run and a test each
 # construct their own and nothing has to be swapped out from under anyone.
 LIVE = Run(root=RUN, pool=POOL)
-# The published agent a cold start begins from, and the one number that says
-# why it rather than another: fit over `FIELD` on 2026-09-06 it rated +1.78
-# against +0.64 for the next opponent and -2.67 for the last, so it is the
-# top of the field by a clear point of rating.
+# `pb75e380571fc`, the best program the campaign's own rule-based lineage ever
+# wrote: 491 lines that decide the season turn by turn from the observation --
+# analytic market prices, crop and livestock forecasts on actual production
+# dates, workers assigned by value. No recorded actions anywhere in it.
 #
-# The campaign spent 381 programs evolving upward from a thirty-line skeleton
-# and never once topped the tournament -- 95% of every rate it measured was a
-# shutout, because a program that loses every game to eleven of twelve
-# opponents has no gradient to climb. Starting from the strongest published
-# agent starts the search where the gradient is: every opponent is within
-# reach of it, so an edit that helps shows up as a rate that moves.
+# It replaces `thomastschinkel_router`, which was adopted on 2026-09-07 on the
+# reading that the rule-based search had no gradient: 95% of every rate it
+# measured was a shutout. That reading was of the wrong number. Win rate was
+# flat because a young lineage beats nobody, while the mean bank margin
+# underneath it ran from -179,647 to -8,444 -- 171,000 coins of clean,
+# well-ordered signal, already recorded on every program, already the
+# tie-break `Database.top` sorts on. The record over that run went -119,258,
+# then -10,446, then -8,444, the last of them 585 seconds before the run was
+# stopped. It was accelerating when we read it as dead.
 #
-# What makes this legitimate is the competition's own sharing rule -- this
-# agent is published, and published code is the field's to build on -- and
-# what makes it worth anything is the gate, which is unchanged: a candidate
-# is promoted only when it tops the tournament, and this agent is *in* that
-# tournament. Tying the seed does not promote. Only beating it does.
+# What we adopted instead turned out to be a 720-step recording with a repair
+# layer around it: 86.5% of champion_69's actions came out of the table
+# verbatim, the table was byte-identical from the seed through 69 promotions,
+# and emptying it dropped the agent to 3,000 -- what passing every turn banks.
+# The search never touched the policy because it never could; 29,820
+# characters of base64 do not fit in a prompt.
 #
-# It is 619 lines in one file, which matters: a round hands the model the
-# whole program, and the 3,778-line `shopforge` or the 316KB tuned kernels
-# would spend a call being read rather than improved.
-SEED = OPPONENTS / "thomastschinkel_router" / "main.py"
+# So the lineage starts from a program that plays, and `ALLOWED_IMPORTS` no
+# longer admits `base64` or `zlib`, which is what a recording needs to travel.
+SEED = ROOT / "src" / "kaggriculture" / "seed" / "main.py"

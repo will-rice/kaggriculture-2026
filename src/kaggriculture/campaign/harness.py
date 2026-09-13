@@ -6,15 +6,17 @@ a harness error rather than a quietly wrong fitness.
 """
 
 import argparse
+import csv
+import hashlib
+import io
 import logging
-import os
 import random
 import shutil
+import statistics
 import sys
 import tarfile
 import tempfile
 from collections.abc import Callable, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -25,7 +27,7 @@ from kaggle_environments.core import Environment
 from kaggle_environments.utils import Struct, structify
 from pydantic import BaseModel
 
-from kaggriculture.campaign import arena, config, dataset, roster
+from kaggriculture.campaign import arena, config, dataset, pools, roster
 from kaggriculture.campaign.engine.wrapper import Engine, render_private
 from kaggriculture.constants import ENVIRONMENT, EPISODE_STEPS
 
@@ -157,11 +159,19 @@ class Margin(BaseModel):
         mean: Mean of ``ours - theirs`` over those games.
         worst: The lowest such difference.
         best: The highest.
+        error: The standard error on ``mean``, so it can be read as a
+            measurement rather than a number. Promotion turns on this: a
+            candidate replaces the champion when its margin over it is larger
+            than twice this, which is a question with a statistical answer
+            rather than a constant somebody chose. Defaulted, so a result
+            stored before it existed still loads -- and zero there means
+            "unknown", which no comparison can clear.
     """
 
     mean: float
     worst: float
     best: float
+    error: float = 0.0
 
 
 class Game(BaseModel):
@@ -205,12 +215,28 @@ class CheckReport(BaseModel):
         bank: Seat zero's money when the run stopped.
         worst_step_seconds: The slowest single call to the agent.
         error: The failure, or None if the run finished.
+        fingerprint: Seat zero's whole action sequence, hashed. Two agents
+            that play this identically are one agent under two names, which
+            the published field produces constantly -- the same work reposted,
+            a notebook and its fork, a Python agent and its C++ build. Free
+            here because the check already emits every action to play the
+            game, and worth having because a duplicate opponent costs a gate
+            real time and tells it nothing new. Empty when the run failed,
+            since a crash is not an identity.
+        last: The name of the callable Kaggle would load, which must be
+            `agent`. Reported from here because this is where the module is
+            imported: `validate` used to import it a second time, outside any
+            sandbox, purely to read this one string -- so a candidate's
+            module-level code ran in the validator's own directory for the
+            sake of a name the check already knew.
     """
 
     loaded: bool
     bank: float
     worst_step_seconds: float
     error: str | None
+    fingerprint: str = ""
+    last: str = ""
 
 
 def main() -> None:
@@ -340,7 +366,19 @@ def margins(games: list[Game], names: list[str]) -> dict[str, Margin]:
     out = {}
     for name in names:
         gaps = [game.ours - game.theirs for game in games if game.opponent == name]
-        out[name] = Margin(mean=sum(gaps) / len(gaps), worst=min(gaps), best=max(gaps))
+        mean = sum(gaps) / len(gaps)
+        # The games against one opponent are the same seasons played in both
+        # seats, so this is a paired comparison and the error is small: the
+        # episode's own swing lands on both sides and cancels. Measured
+        # 2026-09-10: a plan's bank varies by 19.5% across seasons, and the
+        # gap between two plans on the same seasons by a quarter of that.
+        spread = statistics.stdev(gaps) if len(gaps) > 1 else 0.0
+        out[name] = Margin(
+            mean=mean,
+            worst=min(gaps),
+            best=max(gaps),
+            error=spread / len(gaps) ** 0.5,
+        )
     return out
 
 
@@ -430,6 +468,16 @@ def _tally(traded: dict[int, dict[str, list[int]]], actions: Sequence[Any]) -> N
         orders = action.get("market") if isinstance(action, dict) else None
         for order in orders or ():
             parts = list(order) if isinstance(order, list | tuple) else [order]
+            # An empty order has no verb to count. The engine drops one
+            # silently, so a program can emit it and play a perfectly good
+            # game -- `ahmedberatozer_notebook07b5f4563e` submits
+            # `[['HIRE'], []]` on step 121 and four harvested opponents did
+            # the same. This used to read `parts[0]` regardless, so the
+            # bookkeeping raised `IndexError` where the game itself had no
+            # complaint, and an opponent doing something legal took the whole
+            # campaign down on the next gate.
+            if not parts:
+                continue
             running = traded[player].setdefault(str(parts[0]), [0, 0])
             running[0] += 1
             running[1] += int(parts[2]) if len(parts) > 2 else 0
@@ -487,18 +535,83 @@ def _day(
     )
 
 
+# The columns that are not a measure: the per-crop breakdowns the measures
+# total up, and the shared prices. One column per key, so a reader can ask
+# about WHEAT rather than about "crops".
+SPREADS = ("plants", "animals", "seeds", "shed")
+
+
+def day_csv(games: Sequence[tuple[dict[str, int], Sequence[Day]]]) -> str:
+    """Every day of every game as one CSV, each game named by its own keys.
+
+    The keys lead each row and say which game it belongs to -- the campaign
+    names a game by matchup and season, a round replaying one names it by seed
+    and seat -- and the columns after them are the same either way. That is the
+    point of this living in one place: a round reads the campaign's seasons,
+    replays one itself, and lays the two side by side, which only works while
+    both are written by the same function.
+
+    The width is why it is a file and not a table. A markdown table has room
+    for about fifteen columns before it stops being readable and a `Day`
+    carries sixty-odd: the quantities `dataset.measures` defines for each
+    side, the per-crop breakdowns behind four of those totals, and the
+    market's prices. Quadrants on day three and fertilizer on day five
+    separate the stronger side from the weaker in 99% and 100% of their paired
+    samples, and both were measured, stored and shown to nobody for want of
+    room in a table.
+
+    Args:
+        games: One entry per game: the keys naming it, and its days in order.
+
+    Returns:
+        The whole CSV, header first. Empty when there are no days.
+    """
+    rows = [_row(keys, day) for keys, days in games for day in days]
+    if not rows:
+        return ""
+    # The union, because a crop nobody planted on day one has no key on day
+    # one. Ordered by first appearance so the reading order is the writing
+    # order rather than the alphabet, and blank where a row has no value --
+    # which is a count of zero.
+    columns: dict[str, None] = {}
+    for row in rows:
+        columns.update(dict.fromkeys(row))
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=list(columns), restval="")
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue()
+
+
+def _row(keys: dict[str, int], day: Day) -> dict[str, object]:
+    """One day of one game, flattened: the keys that name it, then every column.
+
+    A dict per row rather than a fixed column list because the breakdowns are
+    keyed by crop, so which columns exist depends on what was planted -- and a
+    fixed list is how a quantity comes to be measured, stored, and shown to
+    nobody.
+    """
+    row: dict[str, object] = {**keys, "day": day.day}
+    for side in ("ours", "theirs"):
+        for measure, value in getattr(day, side).items():
+            row[f"{side}_{measure}"] = value
+        for spread in SPREADS:
+            counts = getattr(day, f"{side}_{spread}", None)
+            for item, count in (counts or {}).items():
+                row[f"{side}_{spread}_{item}"] = count
+    for item, price in day.prices.items():
+        row[f"price_{item}"] = price
+    return row
+
+
 def _one(work: Work) -> Game:
     """Play one game on the engine port. Runs in a fresh process per game.
 
-    Playing a candidate executes it, and a candidate is evolved source that
-    may write files, so the game runs with the working directory moved into a
-    scratch tree that is removed afterwards. This is the one place every
-    execution path -- fast, deep, and a sandbox's own ``campaign play`` --
-    passes through, so isolating here isolates all of them. Both sources are
-    resolved to absolute paths before the move, because a relative one stops
-    resolving the moment it happens, and the cwd is restored before the
-    scratch tree is removed so nothing is left standing in a deleted
-    directory.
+    Playing a candidate executes it, and a candidate is evolved source that may
+    write files, so the game runs inside a directory of its own -- given by the
+    pool that submitted it, not taken here. Both sources are resolved to
+    absolute paths first, because a relative one stops resolving the moment
+    that directory changes.
     """
     agent_path, opponent_name, opponent_path, seed, seat, days = work
     resolved = (
@@ -509,13 +622,54 @@ def _one(work: Work) -> Game:
         seat,
         days,
     )
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="campaign-game-") as scratch:
-        os.chdir(scratch)
-        try:
-            return _play_one(resolved)
-        finally:
-            os.chdir(origin)
+    try:
+        return _play_one(resolved)
+    except Exception as error:
+        # A process pool sends the exception back without the frames that
+        # raised it, so a failure here reaches the loop as a bare `IndexError`
+        # or `FileNotFoundError` with nothing to chase. Three separate crashes
+        # on 2026-09-11 each cost a reproduction to find out which opponent
+        # and which line, so the game says so itself.
+        raise RuntimeError(
+            f"{type(error).__name__} playing {opponent_name} "
+            f"on seed {seed} from seat {seat}: {error}"
+        ) from error
+
+
+def game(
+    agent: Path,
+    opponent: Path,
+    seed: int,
+    seat: int,
+    days: bool = False,
+    name: str = "opponent",
+) -> Game:
+    """Play one game between two files, here in the calling process.
+
+    The public door onto a single game, for a caller that holds two paths
+    rather than a pool: `measure.py`, which a round runs to compare its edit
+    against the program it started from.
+
+    It exists so that there is one play loop. `measure` used to carry its own
+    -- load both, read the observation, step the engine -- which is the shape
+    where a measurement and the thing it measures share a mistake and agree
+    with each other about it, and where a change to how a game is played
+    reaches the campaign's games and not the round's. A round is now measuring
+    with the same function the gate scores with.
+
+    Args:
+        agent: The program being measured, which holds ``seat``.
+        opponent: The program it plays.
+        seed: The episode seed.
+        seat: The seat ``agent`` holds, 0 or 1.
+        days: Record the day table, for a caller that wants to read the season
+            rather than only its result.
+        name: What to call the opponent if the game raises.
+
+    Returns:
+        The `Game`, from ``agent``'s point of view.
+    """
+    return _one((str(agent), name, str(opponent), seed, seat, days))
 
 
 def _play_one(work: Work) -> Game:
@@ -621,7 +775,7 @@ def play(
     ]
     # Named `executor` rather than `pool`, which is what this was: the
     # opponent pool arrived as a parameter and quietly shadowed it.
-    with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as executor:
+    with pools.workers(workers) as executor:
         games = list(executor.map(_one, work))
     # A crash is a failure, never a score: an agent that raised banked its
     # untouched opening money and would otherwise read as an ordinary loss,
@@ -687,25 +841,31 @@ def _replay(seat_zero: str, seat_one: str, seed: int) -> tuple[int, int]:
     Returns:
         Both seats' final banks, seat zero first.
     """
-    with ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as pool:
+    with pools.workers(1) as pool:
         return pool.submit(_reference, (seat_zero, seat_one, seed)).result()
 
 
 def _reference(work: tuple[str, str, int]) -> tuple[int, int]:
-    """Run one reference-engine game in a scratch directory. Runs in a child."""
+    """Run one reference-engine game. Runs in a child, in its own directory."""
     seat_zero, seat_one, seed = work
     sources = (str(Path(seat_zero).resolve()), str(Path(seat_one).resolve()))
-    origin = Path.cwd()
-    with tempfile.TemporaryDirectory(prefix="campaign-reference-") as scratch:
-        os.chdir(scratch)
-        try:
-            return arena.run_banks(*sources, seed)
-        finally:
-            os.chdir(origin)
+    return arena.run_banks(*sources, seed)
 
 
 def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     """Load as Kaggle does and play ``steps`` turns against itself on the reference.
+
+    Runs in a scratch directory, because loading a program runs its top-level
+    code and playing it runs the rest. `_one` and `_reference` have both moved
+    the working directory for this reason all along; this did not, and it is
+    the path the *least* trusted code in the system takes -- `harvest` calls it
+    on a kernel downloaded from the competition minutes earlier, before that
+    kernel is anything but a file we fetched.
+
+    Found on 2026-09-11, after a harvested agent overwrote the repository's own
+    `main.py` with a 158KB replay agent and left a `teacher_bootstrap.tar.gz`
+    beside it. Nothing was lost -- `main.py` is three tracked lines -- and the
+    same write against an untracked file would not have been noticed at all.
 
     Args:
         agent: The candidate's ``main.py``.
@@ -714,6 +874,28 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
     Returns:
         What happened: whether it loaded, its bank, its worst call, any failure.
     """
+    return pools.isolated(_check_in_child, str(Path(agent).resolve()), steps)
+
+
+def _check_in_child(agent: str, steps: int) -> CheckReport:
+    """`check`'s body, as `isolated` runs it: in a child, in its own directory.
+
+    A child, because the sandbox is a working directory and a working
+    directory is the whole process's. The first version moved the *caller's*,
+    which was briefly correct and then catastrophic: a spawned worker inherits
+    the cwd of whoever spawned it, so every game the loop started while a
+    harvest was checking a kernel began life inside that check's scratch tree,
+    and the check then removed it from under them. The campaign died on
+    `FileNotFoundError: /tmp/campaign-check-56ludna7` an hour after the
+    isolation was added to stop a harvested agent writing into the repository.
+
+    A path as a string and a plain int, because both cross to the child.
+    """
+    return _check(Path(agent), steps)
+
+
+def _check(agent: Path, steps: int) -> CheckReport:
+    """The check itself; the caller has put it in a directory of its own."""
     try:
         policy = load_agent(agent)
     except Exception as error:  # noqa: BLE001 - the report is the point
@@ -723,10 +905,14 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
             worst_step_seconds=0.0,
             error=f"{type(error).__name__}: {error}",
         )
+    last = getattr(policy, "__name__", "<anonymous>")
     arity = argument_count(policy)
     environment = make(ENVIRONMENT, configuration={"episodeSteps": EPISODE_STEPS})
     environment.reset()
     worst = 0.0
+    # Seat zero's actions as they are emitted, so the identity below costs
+    # nothing beyond the game this already plays.
+    played = hashlib.sha256()
     try:
         for _ in range(steps):
             if environment.done:
@@ -740,6 +926,7 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
                 started = perf_counter()
                 actions.append(policy(*arguments))
                 worst = max(worst, perf_counter() - started)
+            played.update(repr(actions[0]).encode())
             environment.step(actions)
     except Exception as error:  # noqa: BLE001
         return CheckReport(
@@ -747,12 +934,15 @@ def check(agent: Path, steps: int = EPISODE_STEPS) -> CheckReport:
             bank=0.0,
             worst_step_seconds=worst,
             error=f"{type(error).__name__}: {error}",
+            last=last,
         )
     return CheckReport(
         loaded=True,
         bank=float(environment.state[0].observation["farms"][0]["money"]),
         worst_step_seconds=worst,
         error=None,
+        fingerprint=played.hexdigest()[:16],
+        last=last,
     )
 
 

@@ -151,11 +151,20 @@ def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
 
     This is not hypothetical: a sweep gated from the repository root overwrote
     `main.py`, our own competition entrypoint, and left four agent files and a
-    tarball behind. The scan sandboxes resolution, and `gate` sandboxes the
-    play too, because that is where the engine runs with our working
-    directory.
+    tarball behind.
+
+    What is checked here is the wiring: that `gate` hands the play to
+    `pools.isolated` and hands it an absolute path. The isolation itself --
+    that a task cannot write where its caller stands -- belongs to `pools` and
+    is asserted in `test_pools.py`, against a task that really does write.
+
+    The split is not tidiness. `isolated` forks, and a forked child re-imports
+    rather than inheriting, so nothing this test patched would reach the play
+    anyway: the old version of this test patched `harness.play` and asserted
+    the patch had run, which after the fork stopped being true of the code
+    under test and started being true of nothing.
     """
-    from kaggriculture.campaign import harness, roster
+    from kaggriculture.campaign import pools, roster
 
     monkeypatch.chdir(tmp_path)
     ours = tmp_path / "main.py"
@@ -165,31 +174,21 @@ def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
     opponent = tmp_path / "opponent.py"
     opponent.write_text(WRITES_ON_LOAD, encoding="utf-8")
     monkeypatch.setattr(roster, "TRAINING", {"only": opponent})
-    played: list[Path] = []
+    sent: list[tuple[object, ...]] = []
 
-    def record(
-        agent: Path, opponents: list[str], seeds: object, workers: int
-    ) -> list[harness.Game]:
-        """Stand in for the harness, executing the agents the way it would."""
-        played.append(agent)
-        for source in (agent, *(roster.TRAINING[name] for name in opponents)):
-            exec(compile(Path(source).read_text(), str(source), "exec"), {})
-        return [
-            harness.Game(
-                opponent="only",
-                seed=1,
-                seat=0,
-                ours=1.0,
-                theirs=1.0,
-                worst_step_seconds=0.0,
-            )
-        ]
+    def record(call: object, *args: object) -> tuple[dict[str, float], None]:
+        """Stand in for the fork, recording what would have crossed into it."""
+        sent.append((call, *args))
+        return {"only": 1.0}, None
 
-    monkeypatch.setattr(harness, "play", record)
+    monkeypatch.setattr(pools, "isolated", record)
 
     kernel_watch.gate(candidate, gate_seeds=1, workers=1)
 
-    assert played and played[0].is_absolute()
+    assert sent, "the play did not go through `pools.isolated`"
+    played = sent[0][1]
+    assert isinstance(played, Path) and played.is_absolute()
+    assert played == candidate.resolve()
     assert ours.read_text(encoding="utf-8") == "# our real entrypoint"
 
 

@@ -195,8 +195,15 @@ def test_margins_are_the_bank_gap_over_the_games_against_each_opponent() -> None
 
     margins = harness.margins(games, ["near", "far"])
 
-    assert margins["near"] == harness.Margin(mean=0.0, worst=-10.0, best=10.0)
-    assert margins["far"] == harness.Margin(mean=-890.0, worst=-890.0, best=-890.0)
+    assert margins["near"] == harness.Margin(
+        mean=0.0, worst=-10.0, best=10.0, error=10.0
+    )
+    # One game, so the spread -- and the error on it -- is not defined by any
+    # sample: reported as zero, which promotion reads as "not measured" and
+    # refuses rather than mistaking for certainty.
+    assert margins["far"] == harness.Margin(
+        mean=-890.0, worst=-890.0, best=-890.0, error=0.0
+    )
 
 
 @pytest.mark.local_data
@@ -504,3 +511,91 @@ def test_a_day_row_counts_what_each_farm_was_growing(
         # Neglected ground goes to weeds, which is a tile lost and worth
         # seeing: this agent waters one tile and leaves the rest.
         assert max(row.ours_weeds for row in game.days) > 0
+
+
+def test_checking_an_agent_cannot_write_where_it_was_checked_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loading a program runs it, and `check` runs the least trusted code there is.
+
+    `harvest` puts a kernel downloaded from the competition minutes earlier
+    through this, before it is anything but a file we fetched. On 2026-09-11
+    one of them overwrote the repository's own `main.py` with a 158KB replay
+    agent and dropped a `teacher_bootstrap.tar.gz` beside it. `_one` and
+    `_reference` had both moved the working directory for exactly this reason;
+    this path never did.
+    """
+    litter = (
+        "import pathlib\n"
+        "pathlib.Path('escaped.txt').write_text('written at import')\n"
+        "\n"
+        "def agent(observation, configuration=None):\n"
+        "    pathlib.Path('escaped-playing.txt').write_text('written while playing')\n"
+        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+    )
+    agent = tmp_path / "litterer.py"
+    agent.write_text(litter, encoding="utf-8")
+    here = tmp_path / "where-it-is-run-from"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    report = harness.check(agent, steps=3)
+
+    assert report.loaded and report.error is None
+    # It wrote both files somewhere; nowhere this can see.
+    assert sorted(path.name for path in here.iterdir()) == []
+    assert not (tmp_path / "escaped.txt").exists()
+    assert not (tmp_path / "escaped-playing.txt").exists()
+
+
+def test_checking_an_agent_does_not_move_the_callers_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller stays where it was, and so does anything it spawns next.
+
+    Isolating by moving the *caller's* directory was briefly correct and then
+    catastrophic. A spawned worker inherits the cwd of whoever spawned it, so
+    every game the loop started while a harvest was checking a kernel began
+    inside that check's scratch tree; when the check finished and removed it,
+    those workers stood in a directory that no longer existed. The campaign
+    died on `FileNotFoundError: /tmp/campaign-check-...` within the hour.
+    """
+    agent = tmp_path / "litterer.py"
+    agent.write_text(WRITING_AGENT, encoding="utf-8")
+    here = tmp_path / "where-it-is-run-from"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    report = harness.check(agent, steps=3)
+
+    assert report.loaded and report.error is None
+    # The caller never moved, so a process spawned after this starts somewhere
+    # that still exists.
+    assert Path.cwd() == here.resolve()
+    # And the agent's scribble landed in the child's scratch, not here.
+    assert sorted(path.name for path in here.iterdir()) == []
+
+
+def test_an_empty_market_order_does_not_take_the_campaign_down() -> None:
+    """A program may submit an order with nothing in it, and the engine shrugs.
+
+    `ahmedberatozer_notebook07b5f4563e` submits `[['HIRE'], []]` on step 121,
+    and four harvested opponents did the same. The engine drops the empty one
+    and plays on; this bookkeeping read its first element regardless and raised
+    `IndexError`, which is not a failure the game had. A legal opponent
+    therefore took down every gate that drew it -- five of twenty-seven in the
+    pool on the day it was found, and the campaign died on its first round.
+    """
+    traded: dict[int, dict[str, list[int]]] = {0: {}, 1: {}}
+
+    harness._tally(
+        traded,
+        [
+            {"market": [["HIRE"], [], ["SELL", "WHEAT", 3]]},
+            {"market": []},
+        ],
+    )
+
+    # The empty one carries no verb to count; the real ones are counted.
+    assert traded[0] == {"HIRE": [1, 0], "SELL": [1, 3]}
+    assert traded[1] == {}

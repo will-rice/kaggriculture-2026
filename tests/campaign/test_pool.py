@@ -30,11 +30,19 @@ def test_a_champion_joins_and_nothing_leaves_with_it() -> None:
     """
     p = five()
 
-    p.add_champion("champ", "/x/champ.py")
+    p.add_champion("/x/champ.py")
 
-    assert p.names() == [*"abcde", "champ"]
-    assert p.opponents["champ"] == "/x/champ.py"
+    # One key, `config.POOL_CHAMPION`, whatever the champion's file is called.
+    # It used to take the name too and add `champion_N`, which collided with the
+    # tape lineage's `champion_1` already in the pool and replaced it.
+    assert p.names() == [*"abcde", config.POOL_CHAMPION]
+    assert p.opponents[config.POOL_CHAMPION] == "/x/champ.py"
     assert p.history[-1]["action"] == "add_champion"
+
+    # And a second promotion overwrites rather than accumulating.
+    p.add_champion("/x/next.py")
+    assert p.names() == [*"abcde", config.POOL_CHAMPION]
+    assert p.opponents[config.POOL_CHAMPION] == "/x/next.py"
 
 
 def test_the_draw_always_contains_every_anchor(
@@ -163,7 +171,7 @@ def test_the_candidate_is_never_drawn_against_itself() -> None:
 def test_round_trips_through_json(tmp_path: Path) -> None:
     """save() then load() reproduces the same pool."""
     p = five()
-    p.add_champion("champ", "/x/champ.py")
+    p.add_champion("/x/champ.py")
 
     p.save(tmp_path / "pool.json")
 
@@ -213,3 +221,39 @@ def test_the_floor_survives_a_draw_too_small_to_hold_everyone(
 
     assert "d" in drawn
     assert len(drawn) == 2
+
+
+def test_adding_our_champion_touches_nothing_else() -> None:
+    """One slot is overwritten and every other opponent stays exactly as it was.
+
+    Champions used to accumulate under `champion_N` and be trimmed to the best
+    `POOL_CHAMPIONS = 8` by a rating, on the reasoning that a published agent is
+    evidence the campaign cannot manufacture while "the tenth-best rung says
+    nothing the best one does not". Keeping all of them is what put sixty-nine in
+    the pool, holding ten of a gate's twenty-four slots.
+
+    Both halves are gone because there is one champion now. The trim is also what
+    made the `champion_` prefix dangerous: the pool holds `champion_1` and
+    `champion_65` from the abandoned tape lineage, which are opponents rather
+    than rungs of ours, and a prefix scan cannot tell them apart. On 2026-09-12 a
+    promotion numbering itself from an empty champions directory took the name
+    `champion_1` and replaced the tape agent outright.
+    """
+    opponents = {
+        "champion_1": "/tape/1.py",
+        "champion_65": "/tape/65.py",
+        "router_v1": "/public/a.py",
+        "shopforge": "/public/b.py",
+    }
+    subject = pool.Pool(opponents=dict(opponents))
+
+    subject.add_champion("/champions/champion_3.py")
+
+    assert subject.opponents[config.POOL_CHAMPION] == "/champions/champion_3.py"
+    assert {k: v for k, v in subject.opponents.items() if k in opponents} == opponents
+    assert len(subject.opponents) == len(opponents) + 1
+
+    # A second promotion replaces ours and still touches nothing else.
+    subject.add_champion("/champions/champion_4.py")
+    assert subject.opponents[config.POOL_CHAMPION] == "/champions/champion_4.py"
+    assert len(subject.opponents) == len(opponents) + 1

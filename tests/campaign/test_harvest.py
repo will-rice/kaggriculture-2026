@@ -1,5 +1,6 @@
 """Taking a newly published kernel into the pool."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,9 @@ def test_a_kernel_that_plays_joins_the_pool(
     """
     monkeypatch.setattr(harvest.config, "OPPONENTS", tmp_path / "opponents")
     monkeypatch.setattr(kernel_watch, "SEEN", tmp_path / "seen.json")
+    # Scoped, or a test writes the campaign's real fingerprint index and
+    # the next run reads its own agent back as a duplicate.
+    monkeypatch.setattr(harvest, "FINGERPRINTS", tmp_path / "fingerprints.json")
     monkeypatch.setattr(
         harvest.kernel_watch, "discover", lambda author, limit: ["a/good", "a/broken"]
     )
@@ -134,6 +138,9 @@ def test_a_kernel_already_in_the_pool_is_not_taken_twice(
     """
     monkeypatch.setattr(harvest.config, "OPPONENTS", tmp_path / "opponents")
     monkeypatch.setattr(kernel_watch, "SEEN", tmp_path / "seen.json")
+    # Scoped, or a test writes the campaign's real fingerprint index and
+    # the next run reads its own agent back as a duplicate.
+    monkeypatch.setattr(harvest, "FINGERPRINTS", tmp_path / "fingerprints.json")
     monkeypatch.setattr(
         harvest.kernel_watch, "discover", lambda author, limit: ["a/good"]
     )
@@ -147,3 +154,39 @@ def test_a_kernel_already_in_the_pool_is_not_taken_twice(
 
     assert added == []
     assert pool.Pool.load(registry).opponents["a_good"] == "/somewhere/main.py"
+
+
+def test_the_same_agent_is_not_enrolled_twice_under_two_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The published field reposts itself, and a duplicate opponent costs games.
+
+    Measured on 2026-09-11: `aurax7/kaggriculture-reactive-router` plays the
+    identical 719 actions as `ahmedberatozer/notebook07b5f4563e`, and the
+    harvest enrolled both because it only asked whether each could play. A
+    gate that draws them both spends two slots learning one thing, and the
+    field average counts one agent twice.
+    """
+    monkeypatch.setattr(harvest.config, "OPPONENTS", tmp_path / "opponents")
+    monkeypatch.setattr(harvest, "FINGERPRINTS", tmp_path / "fingerprints.json")
+    monkeypatch.setattr(kernel_watch, "SEEN", tmp_path / "seen.json")
+    # Scoped, or a test writes the campaign's real fingerprint index and
+    # the next run reads its own agent back as a duplicate.
+    monkeypatch.setattr(harvest, "FINGERPRINTS", tmp_path / "fingerprints.json")
+    monkeypatch.setattr(
+        harvest.kernel_watch,
+        "discover",
+        lambda author, limit: ["one/agent", "another/repost"],
+    )
+    monkeypatch.setattr(harvest.kernel_watch, "build_compiled", lambda ref: None)
+    # The same source under two refs, which is what a fork or a rename is.
+    monkeypatch.setattr(harvest.kernel_watch, "extract", lambda ref: PASS)
+    monkeypatch.setattr(harvest.kernel_watch, "WORK", tmp_path / "work")
+
+    found = harvest.vendored(2, set())
+
+    assert list(found) == ["one_agent"]
+    # And it is remembered, so tomorrow's harvest refuses the repost too
+    # without having to meet it in the same batch.
+    stored = json.loads((tmp_path / "fingerprints.json").read_text(encoding="utf-8"))
+    assert list(stored.values()) == ["one_agent"]

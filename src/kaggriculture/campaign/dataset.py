@@ -33,23 +33,20 @@ counts answer.
 """
 
 import logging
-import sqlite3
-import statistics
-import tempfile
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 from tqdm import tqdm
 
 from kaggriculture.campaign import config, rating, tapes
 
+if TYPE_CHECKING:  # `games` imports this module for the measure names.
+    from kaggriculture.campaign import games
+
 LOGGER = logging.getLogger(__name__)
 
-# Beside the archives it is built from, because it is the same data in another
-# shape and it is far too big for the repository.
-DATABASE = config.EPISODES.parent / "corpus.sqlite"
 # Processes to divide the archives over. The same reasoning as
 # the loop is usually running while this is, and the loop is what must not
 # slow down.
@@ -109,191 +106,131 @@ TALLIED = (
 # Counted but never summed: neither carries a quantity in the tape.
 COUNTED = (("hire_orders", "HIRE"), ("land_orders", "BUY_LAND"))
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS episodes (
-    episode    TEXT PRIMARY KEY,
-    kaggle_id  INTEGER,
-    seed       INTEGER,
-    engine     TEXT,
-    played     TEXT,
-    team_0     TEXT,
-    team_1     TEXT,
-    bank_0     REAL,
-    bank_1     REAL,
-    winner     INTEGER
-);
-CREATE TABLE IF NOT EXISTS days (
-    episode    TEXT,
-    seat       INTEGER,
-    day        INTEGER,
-    team       TEXT,
-    bank       REAL,
-    planted    INTEGER,
-    ripe       INTEGER,
-    yield_held INTEGER,
-    pens       INTEGER,
-    weeds      INTEGER,
-    bare       INTEGER,
-    quadrants  INTEGER,
-    hands      INTEGER,
-    seeds      INTEGER,
-    shed       INTEGER,
-    shops      INTEGER,
-    watered    INTEGER,
-    dry_worst  INTEGER,
-    fertilised INTEGER,
-    fed        INTEGER,
-    hungry_worst INTEGER,
-    cared      INTEGER,
-    plant_age  REAL,
-    sell_orders   INTEGER,
-    sold_units    INTEGER,
-    buy_orders    INTEGER,
-    bought_units  INTEGER,
-    seed_orders   INTEGER,
-    seed_units    INTEGER,
-    animal_orders INTEGER,
-    animal_units  INTEGER,
-    hire_orders   INTEGER,
-    land_orders   INTEGER
-);
-CREATE TABLE IF NOT EXISTS holdings (
-    episode    TEXT,
-    seat       INTEGER,
-    day        INTEGER,
-    kind       TEXT,
-    item       TEXT,
-    count      INTEGER
-);
-CREATE TABLE IF NOT EXISTS orders (
-    episode    TEXT,
-    seat       INTEGER,
-    day        INTEGER,
-    hour       INTEGER,
-    verb       TEXT,
-    item       TEXT,
-    quantity   INTEGER
-);
-CREATE TABLE IF NOT EXISTS moves (
-    episode    TEXT,
-    seat       INTEGER,
-    day        INTEGER,
-    hour       INTEGER,
-    actor      INTEGER,
-    verb       TEXT,
-    argument   TEXT
-);
-CREATE TABLE IF NOT EXISTS prices (
-    episode    TEXT,
-    day        INTEGER,
-    item       TEXT,
-    price      INTEGER,
-    stock      INTEGER
-);
-CREATE TABLE IF NOT EXISTS teams (
-    team       TEXT PRIMARY KEY,
-    games      INTEGER,
-    wins       INTEGER,
-    rating     REAL,
-    place      INTEGER
-);
-"""
 # Built after the load, not before: an index makes every insert cost a tree
 # walk, and there are twenty million of them.
-INDEXES = """
-CREATE INDEX IF NOT EXISTS days_episode ON days (episode, seat);
-CREATE INDEX IF NOT EXISTS days_team ON days (team, day);
-CREATE INDEX IF NOT EXISTS holdings_day ON holdings (episode, seat, day);
-CREATE INDEX IF NOT EXISTS orders_day ON orders (episode, seat, day);
-CREATE INDEX IF NOT EXISTS moves_day ON moves (episode, seat, day);
-CREATE INDEX IF NOT EXISTS prices_day ON prices (episode, day);
-"""
 # The day row's own columns, in declaration order and without its keys. Read
 # off the schema so a column added there is measured, stored and asked about
 # with nothing to remember.
-COLUMNS = tuple(
-    line.split()[0]
-    for line in SCHEMA[SCHEMA.index("days (") : SCHEMA.index("holdings (")].splitlines()
-    if line.startswith("    ")
-)[4:]
+# Every quantity `measures` returns, in the order it returns them. Written out
+# rather than parsed from a CREATE TABLE: the table this used to be read from
+# was SQLite's, and the schema that matters now belongs to `games`, which
+# imports this. One list, and `measures` is checked against it.
+COLUMNS = (
+    "bank",
+    "planted",
+    "ripe",
+    "yield_held",
+    "pens",
+    "weeds",
+    "bare",
+    "quadrants",
+    "hands",
+    "seeds",
+    "shed",
+    "shops",
+    "watered",
+    "dry_worst",
+    "fertilised",
+    "fed",
+    "hungry_worst",
+    "cared",
+    "plant_age",
+    "sell_orders",
+    "sold_units",
+    "buy_orders",
+    "bought_units",
+    "seed_orders",
+    "seed_units",
+    "animal_orders",
+    "animal_units",
+    "hire_orders",
+    "land_orders",
+)
 
 TABLES = ("episodes", "days", "holdings", "orders", "moves", "prices")
 # Written by `rate` after the load, from what the load produced.
 DERIVED = ("teams",)
 
 
-def build(corpus: list[Path], database: Path = DATABASE, workers: int = WORKERS) -> int:
-    """Read every game in ``corpus`` into ``database``, replacing it.
+def build(
+    corpus: list[Path],
+    database: str = config.GAMES_DB,
+    workers: int = WORKERS,
+) -> int:
+    """Read every game in ``corpus`` into the one database, replacing the ladder.
 
-    One process per archive, each writing its own SQLite file, then merged.
-    Merged rather than written into one database because SQLite takes a
-    single writer and the parse is what we are trying to parallelise; a
-    worker that spent its time waiting on a write lock would divide nothing.
+    One process per archive, each inserting straight into ClickHouse. It used
+    to write a SQLite file each, merge twenty-five of them and load the result
+    -- three steps that existed because SQLite takes a single writer and the
+    parse is what we were trying to parallelise. The store admits parallel
+    writers, so the shards, the merge and the load all go: a worker parses an
+    archive and sends it.
+
+    Built into a staging database and swapped in a partition at a time. On
+    2026-09-09 a build that deleted first hit one unreadable market order
+    fifty-five minutes in and left no corpus at all -- not a stale one, none.
+    `REPLACE PARTITION` is atomic per table, so a failed rebuild leaves the
+    ladder exactly as it was, and the campaign's own games are in the other
+    partition and are never touched either way.
 
     Args:
         corpus: The archives to read, from `tapes.archives`.
-        database: Where to write. Replaced, not appended to -- a half-built
-            dataset that looks complete is worse than no dataset. Built beside
-            it and renamed over it on success, so the existing corpus survives
-            a failed rebuild.
+        database: The database to write to.
         workers: Processes to divide the archives over.
 
     Returns:
         How many episodes were read.
     """
-    # Built beside the live corpus and renamed over it only once it is whole.
-    # This used to unlink first, and on 2026-09-09 a single unreadable market
-    # order in one archive of twenty-five ended a fifty-five minute extraction
-    # with no corpus at all -- not a stale one, none. The rename is atomic, so
-    # the guarantee that mattered (never a half-built dataset that looks
-    # complete) is kept without the window where there is nothing.
-    with tempfile.TemporaryDirectory(dir=database.parent) as scratch:
-        shards = [Path(scratch) / f"{archive.stem}.sqlite" for archive in corpus]
-        building = Path(scratch) / "corpus.sqlite"
+    from kaggriculture.campaign import games
+
+    games.create(database)
+    staging = f"{database}_building"
+    games.query(f"DROP DATABASE IF EXISTS {staging}")
+    games.create(staging)
+    try:
         with ProcessPoolExecutor(max_workers=min(workers, len(corpus))) as pool:
-            done = pool.map(_shard, corpus, shards)
+            done = pool.map(_ingest, corpus, [staging] * len(corpus))
             counts = list(tqdm(done, total=len(corpus), desc="archives"))
-        LOGGER.info("read %d episodes; merging %d shards", sum(counts), len(shards))
-        total = _merge(shards, building)
-        building.replace(database)
-        return total
-
-
-def _shard(archive: Path, out: Path) -> int:
-    """Read one archive into its own database. Runs in a worker process."""
-    played = archive.stem[-10:]
-    connection = sqlite3.connect(out)
-    connection.executescript(SCHEMA)
-    read = 0
-    for episode in tapes.qualifying_episodes(archive):
-        _insert(connection, episode, played)
-        read += 1
-    connection.commit()
-    connection.close()
-    return read
-
-
-def _merge(shards: list[Path], database: Path) -> int:
-    """Fold every shard into one database and index it."""
-    connection = sqlite3.connect(database)
-    connection.executescript(SCHEMA)
-    for shard in shards:
-        connection.execute("ATTACH DATABASE ? AS shard", (str(shard),))
-        for table in TABLES:
-            connection.execute(f"INSERT INTO {table} SELECT * FROM shard.{table}")  # noqa: S608 - table names are this module's own constants
-        connection.commit()
-        connection.execute("DETACH DATABASE shard")
-    connection.executescript(INDEXES)
-    connection.commit()
-    total = connection.execute("SELECT count(*) FROM episodes").fetchone()[0]
-    connection.close()
+        # Every partitioned table, with no exceptions to remember: a table
+        # with no ladder rows swaps an empty partition for an empty one.
+        for name, table in games.TABLES.items():
+            if table.partition:
+                games.query(
+                    f"ALTER TABLE {database}.{name} "
+                    f"REPLACE PARTITION 'ladder' FROM {staging}.{name}"
+                )
+    finally:
+        games.query(f"DROP DATABASE IF EXISTS {staging}")
+    total = sum(counts)
+    # The ladder is derived from what was just read, so it is rebuilt with
+    # it: everything downstream reads `teams`, and a corpus whose ratings
+    # are a day older than its games is the sort of stale nobody notices.
+    rate(database)
+    LOGGER.info("read %d episodes from %d archives", total, len(corpus))
     return total
 
 
-def _insert(
-    connection: sqlite3.Connection, episode: tapes.Episode, played: str
-) -> None:
-    """Write every row one recorded game produces."""
+def _ingest(archive: Path, database: str) -> int:
+    """Parse one archive and send it. Runs in a worker process.
+
+    The rows are held for the whole archive and sent a table at a time, which
+    is the batching ClickHouse asks for: `async_insert` exists to coalesce many
+    small writes and only adds latency to a writer that already arrives with a
+    batch of its own.
+    """
+    from kaggriculture.campaign import games
+
+    batch = games.Batch("ladder")
+    read = 0
+    for episode in tapes.qualifying_episodes(archive):
+        _rows(batch, episode, archive.stem[-10:])
+        read += 1
+    batch.send(database)
+    return read
+
+
+def _rows(batch: "games.Batch", episode: tapes.Episode, played: str) -> None:
+    """Hold every row one recorded game produces."""
     identity = episode.info
     # `is None` rather than `or`: an EpisodeId of 0 is an episode id, and
     # `or` sends it to the seed instead, where it collides with whichever
@@ -304,12 +241,12 @@ def _insert(
     final = episode.steps[-1][0]["observation"]["farms"]
     banks = [float(farm["money"]) for farm in final]
     teams = list(identity.get("TeamNames") or ["", ""])
-    winner = None if banks[0] == banks[1] else int(banks[1] > banks[0])
-    connection.execute(
-        "INSERT OR REPLACE INTO episodes VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (
+    winner = -1 if banks[0] == banks[1] else int(banks[1] > banks[0])
+    batch.add(
+        "episodes",
+        [
             key,
-            identity.get("EpisodeId"),
+            identity.get("EpisodeId") or 0,
             episode.seed,
             episode.engine_version,
             played,
@@ -318,14 +255,14 @@ def _insert(
             banks[0],
             banks[1],
             winner,
-        ),
+        ],
     )
     submitted = list(_orders(episode, key))
-    connection.executemany("INSERT INTO orders VALUES (?,?,?,?,?,?,?)", submitted)
+    for order in submitted:
+        batch.add("orders", order)
     running = _running(submitted)
-    connection.executemany(
-        "INSERT INTO moves VALUES (?,?,?,?,?,?,?)", _moves(episode, key)
-    )
+    for move in _moves(episode, key):
+        batch.add("moves", move)
     for day in range(DAYS):
         # Addressed by day rather than walked, which is why there is no
         # special case for the last one here: day 29 hour 23 is step 719 and
@@ -337,28 +274,24 @@ def _insert(
         step = episode.steps[day * HOURS + LAST_HOUR]
         for seat in (0, 1):
             observation = step[seat]["observation"]
-            connection.execute(
-                "INSERT INTO days VALUES (" + ",".join("?" * (4 + len(COLUMNS))) + ")",
-                (
+            batch.add(
+                "days",
+                [
                     key,
                     seat,
                     day,
                     teams[seat],
                     *_row(observation, seat, day, running[seat][day]),
-                ),
+                ],
             )
-            connection.executemany(
-                "INSERT INTO holdings VALUES (?,?,?,?,?,?)",
-                ((key, seat, day, *row) for row in _holdings(observation, seat)),
-            )
+            for row in _holdings(observation, seat):
+                batch.add("holdings", [key, seat, day, *row])
         market = step[0]["observation"]["market"]
-        connection.executemany(
-            "INSERT INTO prices VALUES (?,?,?,?,?)",
-            (
-                (key, day, item, price, (market.get("inventory") or {}).get(item))
-                for item, price in (market.get("prices") or {}).items()
-            ),
-        )
+        for item, price in (market.get("prices") or {}).items():
+            batch.add(
+                "prices",
+                [key, day, item, price, (market.get("inventory") or {}).get(item) or 0],
+            )
 
 
 def _running(submitted: list[tuple]) -> dict[int, list[dict[str, list[int]]]]:
@@ -575,92 +508,76 @@ def _moves(episode: tapes.Episode, key: str) -> Iterator[tuple]:
                 )
 
 
-def counts(database: Path = DATABASE) -> dict[str, int]:
-    """Rows per table, for a caller that wants to say what it built."""
-    connection = sqlite3.connect(database)
-    try:
-        return {
-            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608 - table names are this module's own constants
-            for table in TABLES + DERIVED
-        }
-    finally:
-        connection.close()
+def counts(database: str = config.GAMES_DB) -> dict[str, int]:
+    """How many rows each table holds, recorded and played together."""
+    from kaggriculture.campaign import games
+
+    return {
+        table: int(games.query(f"SELECT count() FROM {database}.{table}"))
+        for table in games.TABLES
+    }
 
 
-def summarise(database: Path = DATABASE) -> str:
-    """What the dataset holds, as lines: rows per table and the field it saw."""
-    lines = [f"{table:<10}{rows:>12,}" for table, rows in counts(database).items()]
-    connection = sqlite3.connect(database)
-    try:
-        teams = connection.execute(
-            "SELECT count(DISTINCT team) FROM (SELECT team_0 AS team FROM episodes "
-            "UNION SELECT team_1 FROM episodes)"
-        ).fetchone()[0]
-        span = connection.execute(
-            "SELECT min(played), max(played) FROM episodes"
-        ).fetchone()
-    finally:
-        connection.close()
-    lines.append(f"{teams} distinct teams, {span[0]} to {span[1]}")
-    return "\n".join(lines)
+def summarise(database: str = config.GAMES_DB) -> str:
+    """One line per table, for a person at a terminal."""
+    return "\n".join(
+        f"{table:12} {rows:>12,}" for table, rows in counts(database).items()
+    )
 
 
-def rate(database: Path = DATABASE, least: int = LEAST, window: int = WINDOW) -> int:
-    """Fit one Bradley-Terry strength per team and store it in ``teams``.
+def rate(
+    database: str = config.GAMES_DB, least: int = LEAST, window: int = WINDOW
+) -> int:
+    """Fit a rating per recorded team over the last ``window`` days of games.
 
-    A win rate says who won and takes no view on who they played; over a
-    ladder where hundreds of teams meet unevenly that is most of the number.
-    The agent this campaign was seeded from wins 74% of 668 games and rates
-    46th of 160, and the difference between those two readings is the
-    schedule.
-
-    Only teams inside the largest connected group are rated: a team whose
-    opponents all fell below ``least`` has no path to a comparison, and a
-    rating fitted for it would be the prior wearing a number.
-
-    Args:
-        database: The dataset, already built.
-        least: The fewest games a team must have played to be rated.
-        window: Days back to read. The field turns over inside a fortnight,
-            so a rating over everything rates two disjoint fields at once.
+    Bradley-Terry has no notion of time and the ladder moves under everyone, so
+    the fit reads a window rather than everything: a byte-identical agent
+    scored 2386.8 on 2026-09-03 and 1418.0 five days later, and the two halves
+    of the corpus share not one name in their top tens.
 
     Returns:
         How many teams were rated.
     """
-    connection = sqlite3.connect(database)
-    try:
-        # `rate` is its own entry point, run against a database `build` may
-        # have written before this table existed.
-        connection.executescript(SCHEMA)
-        played = connection.execute(
-            "SELECT team_0, team_1, winner FROM episodes "
-            "WHERE winner IS NOT NULL AND played >= ?",
-            (recent(connection, window),),
-        ).fetchall()
-        rows = _rate(played, least)
-        connection.execute("DELETE FROM teams")
-        connection.executemany("INSERT INTO teams VALUES (?,?,?,?,?)", rows)
-        connection.commit()
-        return len(rows)
-    finally:
-        connection.close()
+    from kaggriculture.campaign import games
 
-
-def recent(connection: sqlite3.Connection, window: int = WINDOW) -> str:
-    """The first archive day inside the window, counted back from the newest.
-
-    Off the data rather than off the clock. The fetch can be days behind --
-    it was four days behind this morning -- and a window measured from today
-    would then be half empty or wholly so, which is a rating over nothing
-    rather than a rating over the recent field.
-    """
-    days = [
-        row[0]
-        for row in connection.execute(
-            "SELECT DISTINCT played FROM episodes ORDER BY played DESC"
-        )
+    played = [
+        (row.split("\t")[0], row.split("\t")[1], int(row.split("\t")[2]))
+        for row in games.query(
+            f"SELECT team_0, team_1, winner FROM {database}.episodes "
+            f"WHERE source = 'ladder' AND played >= '{recent(database, window)}' "
+            "AND winner >= 0 AND team_0 != '' AND team_1 != '' FORMAT TabSeparated"
+        ).splitlines()
+        if row
     ]
-    return days[min(window, len(days)) - 1] if days else ""
+    rated = _rate(played, least)
+    games.query(f"TRUNCATE TABLE IF EXISTS {database}.teams")
+    if rated:
+        games.query(
+            f"INSERT INTO {database}.teams (team, games, wins, rating, place) "
+            "FORMAT TabSeparated",
+            ("\n".join(games._row(row) for row in rated) + "\n").encode(),
+        )
+    return len(rated)
+
+
+def recent(database: str = config.GAMES_DB, window: int = WINDOW) -> str:
+    """The earliest day the rating window includes, as the corpus dates them."""
+    from kaggriculture.campaign import games
+
+    span = games.query(
+        f"SELECT min(played), max(played) FROM {database}.episodes "
+        "WHERE source = 'ladder' AND played != '' FORMAT TabSeparated"
+    )
+    if not span or "\t" not in span:
+        return ""
+    earliest, latest = span.split("\t")
+    # Counted back from the newest day present, not from today: the fetch runs
+    # behind the ladder, so a window measured from the clock would begin after
+    # the last archive ends and select nothing. Clamped to the oldest day for
+    # the same reason -- more window than corpus is the whole corpus, not an
+    # error.
+    start = games.query(f"SELECT toString(toDate('{latest}') - {window - 1})")
+    return max(start, earliest)
 
 
 def _rate(played: list[tuple], least: int) -> list[tuple]:
@@ -721,334 +638,60 @@ def _connected(pairs: dict[tuple[str, str], list[int]]) -> set[str]:
     return best
 
 
-def ladder(database: Path = DATABASE) -> list[tuple]:
-    """Every rated team, strongest first, as `rate` stored them."""
-    connection = sqlite3.connect(database)
-    try:
-        return connection.execute(
-            "SELECT team, games, wins, rating, place FROM teams ORDER BY place"
-        ).fetchall()
-    finally:
-        connection.close()
+def ladder(database: str = config.GAMES_DB) -> list[tuple]:
+    """Every rated team, strongest first: team, games, wins, rating, place."""
+    from kaggriculture.campaign import games
 
-
-# The quantities a build order is stated in, and the only ones a round can act
-# on: each is a column of the day table a round is already shown, so it can
-# read its own number straight off the row beside it. `land_orders` is absent
-# for that reason and quadrants stand in for it -- land is bought to unlock a
-# quadrant, so the two move together and only one of them is visible in a game.
-TARGETS = (
-    "bank",
-    "quadrants",
-    "planted",
-    "fertilised",
-    "pens",
-    "hands",
-    "seeds",
-    "shed",
-    "weeds",
-)
-# How many rated agents the build order is read from, and the days it is
-# stated on. Enough that no single agent's habits carry a column, and few
-# enough that it is the top of the ladder rather than the middle of it -- so
-# it is a share of the field rather than a count. Twenty-five was an eighth of
-# the 185 teams a whole-corpus fit rated; the same eighth of the 82 a ten-day
-# window rates is twelve, and taking twenty-five of those would be describing
-# the top third.
-BEST = 12
-MARKS = (0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 17, 20, 23, 25, 27, 29)
-
-
-class Opening(NamedTuple):
-    """One group of top agents that open the same way, and how strong they are.
-
-    Attributes:
-        signature: The day the group takes its second quadrant, and its third.
-            Discrete, and consistent to a tenth of a day inside a team.
-        teams: The agents that open this way, strongest first.
-        rating: Their mean Bradley-Terry rating.
-    """
-
-    signature: tuple[int, int]
-    teams: list[str]
-    rating: float
-
-    def describe(self) -> str:
-        """The opening in words, for a table caption."""
-        second, third = self.signature
-        return (
-            f"second quadrant day {second}, third day {third}"
-            if third < NEVER
-            else f"second quadrant day {second}, no third"
+    return [
+        (team, int(played), int(wins), float(rating), int(place))
+        for team, played, wins, rating, place in (
+            row.split("	")
+            for row in games.query(
+                f"SELECT team, games, wins, rating, place FROM {database}.teams "
+                "ORDER BY place FORMAT TabSeparated"
+            ).splitlines()
+            if row
         )
-
-
-def openings(
-    database: Path = DATABASE, best: int = BEST, window: int = WINDOW
-) -> list[Opening]:
-    """The strongest agents grouped by how they open, best group first.
-
-    Averaging across the top of the ladder destroys the variable that separates
-    it. Measured 2026-09-09: the top twelve hold a mean 1.16 quadrants on day
-    three, which is 84% of them holding one and 16% holding two -- a mixture,
-    and not a number any agent has. The three best agents on the ladder take
-    their second quadrant on day three and nobody else does, and they sit 0.9
-    log-odds clear of fourth. The mean deletes exactly that.
-
-    Grouping is safe because the opening belongs to the team rather than to the
-    game: within a team the day of the second quadrant varies by a tenth of a
-    day, while between teams it ranges from three to six.
-
-    Args:
-        database: The dataset, already built and rated.
-        best: How many rated agents to group, strongest first.
-        window: Days back to read, matching the rating's own window.
-
-    Returns:
-        One `Opening` per distinct signature, by mean rating, strongest first.
-
-    Raises:
-        ValueError: Nothing is rated yet, so there is no top to group.
-    """
-    # `ladder` rows are (team, games, wins, rating, place); the rating is the
-    # fourth, and taking the second silently groups by game count instead.
-    rated = [(team, rating) for team, _, _, rating, _ in ladder(database)[:best]]
-    if not rated:
-        raise ValueError(f"no rated teams in {database}; run `rate` first")
-    connection = sqlite3.connect(database)
-    try:
-        first = recent(connection, window)
-        signatures = {team: _signature(connection, team, first) for team, _ in rated}
-    finally:
-        connection.close()
-    grouped: dict[tuple[int, int], list[tuple[str, float]]] = {}
-    for team, value in rated:
-        grouped.setdefault(signatures[team], []).append((team, value))
-    out = [
-        Opening(
-            signature=signature,
-            teams=[team for team, _ in sorted(members, key=lambda m: -m[1])],
-            rating=sum(value for _, value in members) / len(members),
-        )
-        for signature, members in grouped.items()
     ]
-    return sorted(out, key=lambda opening: -opening.rating)
 
 
-def _signature(
-    connection: sqlite3.Connection, team: str, first: str
-) -> tuple[int, int]:
-    """The median day this team reaches its second and third quadrant.
-
-    The median rather than the mean, because the quantity is a day and a team
-    that never reaches a third quadrant in one game should not drag its
-    signature halfway to never.
-    """
-    rows = connection.execute(
-        "SELECT min(CASE WHEN d.quadrants >= 2 THEN d.day END), "
-        "min(CASE WHEN d.quadrants >= 3 THEN d.day END) "
-        "FROM days d JOIN episodes e ON e.episode = d.episode "
-        "WHERE d.team = ? AND e.played >= ? GROUP BY d.episode, d.seat",
-        (team, first),
-    ).fetchall()
-    if not rows:
-        return (NEVER, NEVER)
-    return (
-        int(statistics.median([NEVER if r[0] is None else r[0] for r in rows])),
-        int(statistics.median([NEVER if r[1] is None else r[1] for r in rows])),
-    )
-
-
-class Order(NamedTuple):
-    """One order the strongest opening sends on one day.
-
-    Attributes:
-        day: The day it is sent.
-        verb: The market op, as the engine names it.
-        item: What it acts on, or "" for `HIRE` and `BUY_LAND`, which take
-            none.
-        share: Fraction of that opening's seat-games that send it at all.
-        count: How many go out on that day, when any do. A median, because a
-            mean over a count of orders is a fraction of an order and nobody
-            can send 3.3 of them.
-        quantity: Units per order, likewise a median, or 0 where the order
-            takes no quantity.
-    """
-
-    day: int
-    verb: str
-    item: str
-    share: float
-    count: int
-    quantity: int
-
-    def describe(self) -> str:
-        """The order as a line a reader can act on."""
-        amount = f" x{self.quantity}" if self.quantity else ""
-        what = f" {self.item}" if self.item else ""
-        every = "" if self.share > 0.98 else f", in {self.share:.0%} of games"
-        return f"{self.count} x `{self.verb}{what}`{amount}{every}"
-
-
-def opening_orders(
-    database: Path = DATABASE,
-    teams: list[str] | None = None,
-    days: int = OPENING_DAYS,
-    window: int = WINDOW,
-    shown: int = OPENING_ORDERS,
-) -> list[Order]:
-    """The orders one opening actually sends, day by day.
-
-    Every artifact built from this corpus reduces a game to per-day holdings
-    and throws the sequence away, and the holdings are then averaged into
-    something unplayable: 1.2 quadrants on day three is 84% of the group
-    holding one and 16% holding two, and nobody can buy a fifth of a quadrant.
-
-    Nothing in the corpus is impossible, though. Every order in it was sent by
-    a real agent in a real game, and the table is 29.5M of them. So this reads
-    the orders rather than their accumulated effect, and reports a median count
-    rather than a mean, because a mean over orders is a fraction of an order.
-
-    Aggregate over a group and naming no agent, which is the footing the build
-    order and the report already stand on.
-
-    Args:
-        database: The dataset, already built and rated.
-        teams: Read from these agents; the strongest opening when None.
-        days: How many days of the opening to read.
-        window: Days back to read, matching the rating's own window.
-        shown: How many distinct orders to keep per day, most sent first.
-
-    Returns:
-        Every kept order, by day and then by how often it is sent.
-    """
-    group = teams or openings(database, window=window)[0].teams
-    marks = ",".join("?" * len(group))
-    connection = sqlite3.connect(database)
-    out: list[Order] = []
-    try:
-        first = recent(connection, window)
-        seats = connection.execute(
-            f"SELECT count(DISTINCT o.episode || o.seat) FROM orders o "  # noqa: S608 - names are this module's own
-            f"JOIN days d ON d.episode = o.episode AND d.seat = o.seat "
-            f"AND d.day = 0 JOIN episodes e ON e.episode = o.episode "
-            f"WHERE d.team IN ({marks}) AND e.played >= ?",
-            (*group, first),
-        ).fetchone()[0]
-        if not seats:
-            return out
-        for day in range(days):
-            rows = connection.execute(
-                f"SELECT o.verb, coalesce(o.item, ''), "  # noqa: S608
-                f"count(DISTINCT o.episode || o.seat), count(*), "
-                f"coalesce(avg(o.quantity), 0) FROM orders o "
-                f"JOIN days d ON d.episode = o.episode AND d.seat = o.seat "
-                f"AND d.day = 0 JOIN episodes e ON e.episode = o.episode "
-                f"WHERE d.team IN ({marks}) AND e.played >= ? AND o.day = ? "
-                f"GROUP BY o.verb, o.item ORDER BY count(*) DESC LIMIT ?",
-                (*group, first, day, shown),
-            ).fetchall()
-            for verb, item, sending, total, quantity in rows:
-                out.append(
-                    Order(
-                        day=day,
-                        verb=verb,
-                        item=item,
-                        share=sending / seats,
-                        count=round(total / max(sending, 1)),
-                        quantity=round(quantity),
-                    )
-                )
-    finally:
-        connection.close()
-    return out
-
-
-def build_order(
-    database: Path = DATABASE,
-    best: int = BEST,
-    window: int = WINDOW,
-    teams: list[str] | None = None,
-) -> dict[str, list[float]]:
-    """What the strongest agents hold on each day, averaged over their games.
-
-    The `winning_pace` tables this replaces were medians over the winning side
-    of every game, which is the wrong half of the corpus: about half of a
-    ladder's winners are the weaker agent having a good day, and eleven
-    quantities measured that way came back between 45% and 60%. Averaged over
-    the top of a rating instead, the same games say something a round can act
-    on -- and say it sharply, since the strongest separations in the whole
-    corpus are quadrants and fertilizer in the first week.
-
-    Args:
-        database: The dataset, already built and rated.
-        best: How many rated agents to read from, strongest first. Ignored
-            when ``teams`` is given.
-        window: Days back to average over, matching the rating's own window.
-            Averaged over everything, the table blends fields that no longer
-            play each other.
-        teams: Read from exactly these agents instead of the top ``best``.
-            What `openings` is for: a mean over agents that open differently
-            describes none of them, and the mixture is measured -- 84% of the
-            top twelve hold one quadrant on day three and 16% hold two.
-
-    Returns:
-        ``{quantity: [value on each of MARKS]}``, and ``"day"`` itself.
-
-    Raises:
-        ValueError: Nothing is rated yet, so there is no top to read from.
-    """
-    top = teams or [team for team, *_ in ladder(database)[:best]]
-    if not top:
-        raise ValueError(f"no rated teams in {database}; run `rate` first")
-    marks = ",".join("?" * len(top))
-    columns = ", ".join(f"avg({name})" for name in TARGETS)
-    connection = sqlite3.connect(database)
-    try:
-        first = recent(connection, window)
-        rows = [
-            connection.execute(
-                f"SELECT {columns} FROM days d "  # noqa: S608 - column names are this module's own constants
-                f"JOIN episodes e ON e.episode = d.episode "
-                f"WHERE d.day = ? AND d.team IN ({marks}) AND e.played >= ?",
-                (day, *top, first),
-            ).fetchone()
-            for day in MARKS
-        ]
-    finally:
-        connection.close()
-    out: dict[str, list[float]] = {"day": [float(day) for day in MARKS]}
-    for index, name in enumerate(TARGETS):
-        out[name] = [float(row[index] or 0.0) for row in rows]
-    return out
-
-
-def leaderboard(database: Path = DATABASE, least: int = 30) -> list[tuple]:
-    """Every team's record over the corpus, most games won first.
+def leaderboard(database: str = config.GAMES_DB, least: int = 30) -> list[tuple]:
+    """Every team's record over the recorded games, most games won first.
 
     A win rate, not a rating: it says who wins and takes no view on schedule
-    strength. `rating.standings` fits the Bradley-Terry model this feeds.
+    strength. `rate` fits the Bradley-Terry model that does, and `ladder`
+    reads it. This is read straight off the games so that it means something
+    whether or not a fit has been run.
 
     Args:
-        database: The dataset.
+        database: The one games database.
         least: Ignore teams with fewer games than this; a team that played
             twice and won both is not the best agent on the ladder.
     """
-    connection = sqlite3.connect(database)
-    try:
-        return connection.execute(
-            """
-            WITH seats AS (
-                SELECT team_0 AS team, winner = 0 AS won FROM episodes
-                WHERE winner IS NOT NULL
-                UNION ALL
-                SELECT team_1, winner = 1 FROM episodes WHERE winner IS NOT NULL
-            )
-            SELECT team, count(*) AS games, avg(won) AS rate
-            FROM seats GROUP BY team HAVING games >= ?
-            ORDER BY rate DESC
-            """,
-            (least,),
-        ).fetchall()
-    finally:
-        connection.close()
+    from kaggriculture.campaign import games
+
+    return [
+        (team, int(played), float(rate_))
+        for team, played, rate_ in (
+            row.split("	")
+            for row in games.query(
+                f"""
+                WITH seats AS (
+                    SELECT team_0 AS team, winner = 0 AS won
+                    FROM {database}.episodes
+                    WHERE source = 'ladder' AND winner >= 0
+                    UNION ALL
+                    SELECT team_1 AS team, winner = 1 AS won
+                    FROM {database}.episodes
+                    WHERE source = 'ladder' AND winner >= 0
+                )
+                SELECT team, count() AS played, avg(won) AS rate
+                FROM seats WHERE team != ''
+                GROUP BY team HAVING played >= {least}
+                ORDER BY rate DESC, played DESC
+                FORMAT TabSeparated
+                """
+            ).splitlines()
+            if row
+        )
+    ]

@@ -47,6 +47,7 @@ a tree the next launch refuses to start on.
 """
 
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -59,6 +60,7 @@ from kaggriculture.campaign import config, harness, rating, roster
 from kaggriculture.campaign.archive import Program
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.pool import Pool
+from kaggriculture.report import wilson_interval
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,7 +76,11 @@ class Champion(BaseModel):
     Attributes:
         name: The champion's pool name, e.g. "champion_3".
         path: The immutable copy under the runs ``champions`` the pool plays.
-        tarball: The archive a cut uploads, written by this promotion.
+        tarball: The archive a cut uploads, written by this promotion. Empty
+            for champion zero, which is the seed enthroned at startup so that
+            there is no pre-champion regime: nothing would ever submit it, and
+            packaging needs the licence and the served skeleton, which a bare
+            run directory does not have.
         result: The measurement it was promoted on, which is also what a
             session is shown of the program it starts from.
     """
@@ -200,96 +206,98 @@ def standing(
 
 
 def promotion(
-    standings: dict[str, float],
-    name: str,
-    champion: str | None = None,
+    result: Result,
+    champion: "Champion | None",
     *,
-    decisive: int,
+    decisive_bar: int = config.DECISIVE_GAMES,
 ) -> tuple[bool, str]:
-    """Whether the candidate tops the field *and* clears the floor by the margin.
+    """Whether the candidate is better than the champion, on both counts.
 
-    The bar used to be a rank -- top of a Bradley-Terry tournament over the
-    eight pool opponents. A rank was the right shape while the pool *was* the
-    tournament and every candidate played all of it. It stopped being right
-    for two reasons at once.
+    Two conditions, and both are required:
 
-    A rank has no margin in it. A candidate a hair above the champion topped
-    the table and promoted, and at these sample sizes the hair is usually
-    noise; selecting the maximum of a noisy estimator is biased upward by
-    construction, which is how 78 of 471 programs once cleared a gate that
-    none of them survived a deeper look at.
+    1. **A higher win rate**, over the opponents both were measured against,
+       beyond twice the error of the difference.
+    2. **Beating the champion head-to-head**: the Wilson lower bound of its rate
+       against the champion above 0.5, over at least ``decisive_bar`` decided
+       games.
 
-    And a rank over a *sample* is not a rank. A candidate now draws sixteen
-    opponents out of dozens, so "top of the table" would mean top of whichever
-    sixteen it happened to draw, and an easy draw would promote.
+    Neither implies the other, and the campaign has now produced both failures.
+    Condition 2 alone promoted `champion_3` at a field rate of 0.114 over a
+    champion at 0.155, and `champion_8` at 0.221 over one at 0.244: two of nine
+    promotions handing back field ground while winning the pairing decisively.
+    Condition 1 alone would promote an agent that beats the field on average and
+    loses to the specific program it replaces, which is not a ratchet.
 
-    So the bar is both, and they answer different questions. Topping the field
-    says this is the best agent there is; clearing the floor by
-    `config.PROMOTION_MARGIN` says it is measurably better than the one it
-    replaces, rather than a hair ahead on noise.
+    The rate is compared on common opponents because the two were measured in
+    different seed blocks against a pool that harvest grows, so their own
+    `fitness` figures are not the same question. Restricting to the opponents
+    both played is the same discipline that turns a 0.331-against-24 and a
+    0.221-against-33 into a comparable 0.283 and 0.214.
 
-    Neither alone is enough. A rank has no margin in it, and over a sampled
-    draw it is estimated through the fit rather than measured. A gap over the
-    floor is directly measured -- the floor is drawn every round -- but says
-    nothing about the rest of the field, and the two came apart within an hour
-    of the pool growing: candidates promoted at third and fourth of 64 for
-    clearing a floor that was no longer the best agent in it.
+    It is still not paired -- different blocks means different maps, and the
+    difference carries both measurements' noise. Twice the error of the
+    difference is what stands in for that: at 41 opponents and 32 games each the
+    standard error of a rate near 0.22 is 0.011, so the bar is about 0.023, and
+    it tightens or loosens with the evidence rather than being a constant nobody
+    checked against the noise.
 
     Args:
-        standings: Every agent's rating, from one fit over the whole record.
-        name: The candidate's name in those standings.
-        champion: The floor to beat, or None before there is one, when
-            leading the field is the bar.
-        decisive: Games against that floor that ended with a winner. A
-            candidate that drew nearly every game against the agent it is
-            replacing is that agent, whatever the fit says. Required and
-            keyword-only: a default would have to be either zero, which
-            silently blocks every promotion, or large, which silently allows
-            them -- and this gate has already spent seven hours blocked by a
-            condition nobody could see.
+        result: The candidate's evaluation, which played the champion.
+        champion: The champion it must beat, or None when there is none.
+        decisive_bar: Decided games required before the pairing is read.
 
     Returns:
         Whether to promote, and a reason either way.
     """
-    ranked = sorted(standings, key=lambda agent: -standings[agent])
-    place = ranked.index(name) + 1
-    mine = standings[name]
-    if place != 1:
-        best = ranked[0]
+    if champion is None:
+        return False, "no champion to beat"
+    name = champion.name
+    if name not in result.rates:
+        return False, f"did not play {name}"
+
+    common = sorted((set(result.rates) & set(champion.result.rates)) - {name})
+    if not common:
+        return False, f"no opponent in common with {name}"
+    mine = sum(result.rates[one] for one in common) / len(common)
+    theirs = sum(champion.result.rates[one] for one in common) / len(common)
+    played = max(1, len(common) * max(1, result.games))
+    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
+    bar = 2 * error
+    if mine - theirs <= bar:
         return False, (
-            f"{place} of {len(ranked)} at {mine:+.3f}, "
-            f"below {best} at {standings[best]:+.3f}"
+            f"{mine:.3f} against the field where {name} has {theirs:.3f} over "
+            f"{len(common)} shared opponents: {mine - theirs:+.3f} is inside "
+            f"twice its error of {bar:.3f}"
         )
-    if champion is None or champion not in standings:
-        # The first promotion of a run, and it happens once.
-        return True, f"top of {len(ranked)} at {mine:+.3f}, with no floor yet"
-    floor = standings[champion]
-    gap = mine - floor
-    # Before the margin is read, the games behind it have to exist. The gap is
-    # a rating difference and a rating is fitted over every pairing on the
-    # record, so a candidate can out-rate the floor on its wins against
-    # *ancestors* -- which its parent also beat -- while drawing the floor
-    # itself. That is not an improvement over the floor; it is a re-measurement
-    # of what the floor already had.
-    if decisive < config.DECISIVE_GAMES:
+
+    decided = result.decisive.get(name, 0)
+    rate = result.rates[name]
+    if decided < decisive_bar:
         return False, (
-            f"top of {len(ranked)} at {mine:+.3f}, {gap:+.3f} above {champion}, "
-            f"but only {decisive} of its games against {champion} were decided "
-            f"and the bar is {config.DECISIVE_GAMES}: the two play the same game"
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f}, but only "
+            f"{decided} of its games against {name} were decided and the bar is "
+            f"{decisive_bar}: the two play the same game"
         )
-    if gap >= config.PROMOTION_MARGIN:
+    low, _ = wilson_interval(rate * decided, decided)
+    if low > 0.5:
         return True, (
-            f"top of {len(ranked)} at {mine:+.3f}, "
-            f"{gap:+.3f} above {champion} at {floor:+.3f}"
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f}, and beat "
+            f"{name} at {rate:.3f} over {decided} decided, lower bound {low:.3f}"
         )
     return False, (
-        f"top of {len(ranked)} at {mine:+.3f} but only {gap:+.3f} above "
-        f"{champion} at {floor:+.3f}, and the bar is "
-        f"{config.PROMOTION_MARGIN:+.3f}"
+        f"{mine:.3f} against the field over {name}'s {theirs:.3f}, but "
+        f"{rate:.3f} against {name} over {decided} decided has lower bound "
+        f"{low:.3f}: not shown to beat it"
     )
 
 
-def promote(program: Program, result: Result, paths: config.Run) -> Champion:
+def promote(
+    program: Program,
+    result: Result,
+    paths: config.Run,
+    *,
+    package: bool = True,
+) -> Champion:
     """The file half of a promotion: the tarball, the champion's copy, the floor.
 
     Every file this writes is one nothing else owns, so it is safe to call
@@ -307,9 +315,14 @@ def promote(program: Program, result: Result, paths: config.Run) -> Champion:
         program: The archive entry being promoted.
         result: Its measurement.
         paths: The run the champion is written into.
+        package: Whether to build the submission tarball. Champion zero passes
+            False: it is the seed being enthroned at startup rather than
+            something a round won, so there is nothing to submit yet, and
+            packaging it fails on the skeleton's `LICENSE`.
 
     Returns:
-        The champion record, for ``enroll`` and ``record`` to act on.
+        The champion record, for ``enroll`` and ``record`` to act on. Its
+        ``tarball`` is empty when ``package`` is False.
 
     Raises:
         FileExistsError: The champions directory already holds this name.
@@ -317,9 +330,13 @@ def promote(program: Program, result: Result, paths: config.Run) -> Champion:
     # Numbered off the champions directory, which only ever grows. Counting
     # the pool's `champion_` members instead would renumber after a
     # retirement and hand the sixth promotion a name the fifth already has.
+    # The file is numbered for history; the pool key is not. They were the same
+    # string until 2026-09-12, when numbering from this run's empty champions
+    # directory produced `champion_1` and the pool already had one of those --
+    # the tape lineage's, which `enroll` then overwrote.
     number = 1 + sum(1 for _ in paths.champions.glob("champion_*.py"))
-    name = f"champion_{number}"
-    kept = paths.champions / f"{name}.py"
+    name = config.POOL_CHAMPION
+    kept = paths.champions / f"champion_{number}.py"
     if kept.exists():
         raise FileExistsError(
             f"{kept} already exists: something other than a promotion has "
@@ -331,10 +348,11 @@ def promote(program: Program, result: Result, paths: config.Run) -> Champion:
         # The tarball is built in here and moved into place whole. Packaging
         # writes a file at a time and can fail part way through; a half-built
         # archive under `champions/` would be a cut waiting to upload it.
-        built = harness.package(source, Path(scratch) / f"{name}.tar.gz")
         paths.champions.mkdir(parents=True, exist_ok=True)
-        tarball = paths.champions / f"{name}.tar.gz"
-        shutil.move(str(built), str(tarball))
+        tarball = paths.champions / f"champion_{number}.tar.gz"
+        if package:
+            built = harness.package(source, Path(scratch) / f"champion_{number}.tar.gz")
+            shutil.move(str(built), str(tarball))
 
     code = source.read_text(encoding="utf-8")
     kept.write_text(code, encoding="utf-8")
@@ -348,7 +366,12 @@ def promote(program: Program, result: Result, paths: config.Run) -> Champion:
     floor.chmod(0o444)
 
     LOGGER.info("promoted %s to %s", program.id, name)
-    return Champion(name=name, path=str(kept), tarball=str(tarball), result=result)
+    return Champion(
+        name=name,
+        path=str(kept),
+        tarball=str(tarball) if package else "",
+        result=result,
+    )
 
 
 def enroll(champion: Champion, pool: Pool, paths: config.Run) -> None:
@@ -364,9 +387,17 @@ def enroll(champion: Champion, pool: Pool, paths: config.Run) -> None:
         pool: The opponent pool, updated and saved in place.
         paths: The run whose pool file it is saved to.
     """
-    pool.add_champion(champion.name, champion.path)
+    # No rating is fitted here any more. It decided which of our champions to
+    # retire, and there is one champion now: the key it occupies is overwritten
+    # and nothing else in the pool is touched.
+    pool.add_champion(champion.path)
     pool.save(paths.pool)
-    LOGGER.info("%s joined the pool", champion.name)
+    LOGGER.info(
+        "%s holds the %s slot; pool is %d",
+        Path(champion.path).stem,
+        champion.name,
+        len(pool.opponents),
+    )
 
 
 def record(champion: Champion, paths: config.Run) -> Champion:

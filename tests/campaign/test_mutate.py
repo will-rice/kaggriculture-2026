@@ -328,7 +328,20 @@ def test_the_reasoning_effort_is_passed_on_every_call(
     Exercised through a real ``codex`` on PATH rather than a substituted
     COMMAND, because the flags are only appended when the command *is* codex
     -- which is exactly the branch a substituted COMMAND skips.
+
+    `.env` is pointed at an empty file of this test's own and the variable is
+    removed from the environment, so `mutate.model` falls through to the
+    constant and the assertion below is about the flag being passed rather
+    than about whichever slug the host happens to be running today. Both
+    halves are needed: `load_dotenv` only ever adds to `os.environ`, so any
+    earlier read of the real `.env` -- this process makes one per call --
+    leaves the host's slug set for the life of the interpreter, and moving
+    `ENV` afterwards cannot take it back out.
     """
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("CAMPAIGN_CODEX_FALLBACK_MODEL", raising=False)
     box = workspace(tmp_path)
     binaries = tmp_path / "bin"
     binaries.mkdir()
@@ -348,3 +361,78 @@ def test_the_reasoning_effort_is_passed_on_every_call(
     assert f"model_reasoning_effort={config.CODEX_REASONING}" in passed
     # Beside the model, so a call names both rather than inheriting either.
     assert config.CODEX_MODEL in passed
+
+
+def test_the_model_changes_under_a_running_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Edit `.env` and the next round asks for the new model. No restart.
+
+    A process's environment is fixed when it is spawned, so exporting a
+    variable in a shell cannot reach a loop that is already running. The file
+    is the part of the environment a running process can re-read, so it is
+    reloaded at every call rather than once at startup -- which is the whole
+    difference between "set the model" and "set the model without stopping
+    the campaign".
+    """
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_CODEX_MODEL", raising=False)
+    env = tmp_path / ".env"
+
+    env.write_text("CAMPAIGN_CODEX_MODEL=first-model\n", encoding="utf-8")
+    before = mutate.model()
+    # The same process, no restart, nothing re-imported.
+    env.write_text("CAMPAIGN_CODEX_MODEL=second-model\n", encoding="utf-8")
+    after = mutate.model()
+
+    assert before == "first-model"
+    assert after == "second-model", "the change did not reach a running process"
+
+
+def test_an_unset_model_is_the_campaigns_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing in the environment means the value the repository commits to.
+
+    So a campaign started with no configuration runs the model the code says,
+    and a typo in `.env` is a changed model rather than a missing one.
+    """
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("CAMPAIGN_CODEX_FALLBACK_MODEL", raising=False)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+
+    assert mutate.model() == config.CODEX_MODEL
+    assert mutate.fallback() == config.CODEX_FALLBACK_MODEL
+
+
+def test_a_round_asks_for_whatever_the_model_is_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mutator reads it at the call, not at construction.
+
+    Binding it in `__init__` was the bug this replaces: the default argument
+    evaluated once at import, so the campaign's model was fixed before the
+    first round and could not be anything else without a restart.
+    """
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_CODEX_MODEL", raising=False)
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.CodexMutator,
+        "COMMAND",
+        [
+            "bash",
+            "-c",
+            "printf 'def agent(o, c=None):\\n    return {}\\n' > child.py",
+        ],
+    )
+    mutator = mutate.CodexMutator()
+
+    (tmp_path / ".env").write_text("CAMPAIGN_CODEX_MODEL=alpha\n", encoding="utf-8")
+    first = asyncio.run(mutator(box, MESSAGE, "p20"))
+    (tmp_path / ".env").write_text("CAMPAIGN_CODEX_MODEL=beta\n", encoding="utf-8")
+    second = asyncio.run(mutator(box, MESSAGE, "p21"))
+
+    assert first.model == "alpha"
+    assert second.model == "beta"

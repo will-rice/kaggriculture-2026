@@ -24,6 +24,7 @@ the first promotion and a strong one displaces a champion. That is the same
 rule everything else in the pool lives by.
 """
 
+import json
 import logging
 import re
 import shutil
@@ -33,6 +34,10 @@ from kaggriculture.campaign import config, harness, kernel_watch
 from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
+
+# What each harvested opponent plays like, so the same agent is not enrolled
+# twice under two names. Beside the pool, because it outlives pool membership.
+FINGERPRINTS = config.POOL.with_name("fingerprints.json")
 
 # Turns a kernel ref into an opponent name. The vendored opponents are named
 # for their author and kernel -- `boatlee_v29`, `pilkwang_economic` -- and the
@@ -54,6 +59,31 @@ def opponent_name(ref: str) -> str:
     user, _, slug = ref.partition("/")
     name = UNSAFE.sub("_", f"{user}_{slug}".lower()).strip("_")
     return name[:NAME_LIMIT].rstrip("_")
+
+
+def assess(entry: Path, steps: int = 720) -> tuple[str, str]:
+    """Why this kernel cannot be an opponent, and what it plays like.
+
+    One game answers both, so they are read together rather than played twice.
+
+    Args:
+        entry: The kernel's ``main.py``.
+        steps: Turns to play.
+
+    Returns:
+        The problem and the fingerprint. The problem is "" when it plays; the
+        fingerprint is "" when it does not.
+    """
+    report = harness.check(entry, steps=steps)
+    if not report.loaded or report.error is not None:
+        return report.error or "did not load", ""
+    if report.worst_step_seconds > harness.LATENCY_BUDGET:
+        return (
+            f"worst step {report.worst_step_seconds:.3f}s, over the "
+            f"{harness.LATENCY_BUDGET}s an opponent may take",
+            "",
+        )
+    return "", report.fingerprint
 
 
 def playable(entry: Path, steps: int = 720) -> str:
@@ -100,14 +130,91 @@ def vendor(entry: Path, name: str) -> Path:
         The vendored ``main.py``.
     """
     target = config.OPPONENTS / name
+    # Built beside the target and renamed onto it, never written in place.
+    # `config.OPPONENTS` is read continuously while this runs: every game
+    # resolves an opponent's path under it, and `copycheck` walks the whole
+    # tree reading every file. A `rmtree` followed by a `copytree` leaves that
+    # tree half-built for the length of the copy, and a reader landing inside
+    # the gap gets `FileNotFoundError` -- which is what killed the run at
+    # 02:37 on 2026-09-11, on the first harvest that ever ran while games
+    # were playing. `Pool.save` has renamed for this reason all along; this
+    # did not, because nothing used to harvest and evaluate at the same time.
+    staging = config.OPPONENTS / f".incoming-{name}"
+    retired = config.OPPONENTS / f".retired-{name}"
+    for scratch in (staging, retired):
+        if scratch.exists():
+            shutil.rmtree(scratch)
+    shutil.copytree(entry.parent, staging)
     if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(entry.parent, target)
+        target.rename(retired)
+    staging.rename(target)
+    shutil.rmtree(retired, ignore_errors=True)
     return target / entry.name
+
+
+def vendored(limit: int, known: set[str], author: str | None = None) -> dict[str, str]:
+    """Discover, check and vendor newly published kernels. Touches no pool.
+
+    Everything here is slow and none of it is the pool's: a listing, a
+    download, a build, and a 720-step game per candidate. Keeping the pool out
+    of it is what lets the campaign harvest while it runs -- the work goes to a
+    thread and the caller adds the results on the loop, where nothing else is
+    writing. A load-modify-save from a thread would drop any champion promoted
+    while this was downloading.
+
+    Args:
+        limit: How many new refs to take.
+        known: Opponent names already held, which are skipped.
+        author: Restrict to one author, or None for the whole competition.
+
+    Returns:
+        Opponent name to vendored path, for whatever proved it can play.
+    """
+    refs = kernel_watch.discover(author, limit)
+    if not refs:
+        LOGGER.info("nothing new published")
+        return {}
+    seen = _fingerprints()
+    found: dict[str, str] = {}
+    for ref in refs:
+        name = opponent_name(ref)
+        if name in known:
+            LOGGER.info("%s: already in the pool as %s", ref, name)
+            continue
+        entry = _entrypoint(ref)
+        if entry is None:
+            LOGGER.info("%s: no agent this can build or extract; skipped", ref)
+            continue
+        problem, fingerprint = assess(entry)
+        if problem:
+            LOGGER.info("%s: %s; skipped", ref, problem)
+            continue
+        # The published field reposts itself constantly -- a fork, a rename, a
+        # C++ build of a Python agent -- and a duplicate opponent costs a gate
+        # real games while telling it nothing. Caught here on 2026-09-11:
+        # `aurax7/kaggriculture-reactive-router` plays the identical 719
+        # actions as `ahmedberatozer/notebook07b5f4563e`, and both were
+        # enrolled before this existed.
+        if fingerprint in seen:
+            LOGGER.info("%s: plays exactly as %s; skipped", ref, seen[fingerprint])
+            continue
+        seen[fingerprint] = name
+        found[name] = str(vendor(entry, name))
+        LOGGER.info("%s: enrolled as %s", ref, name)
+    _remember_fingerprints(seen)
+    # Remembered whatever happened to them: a kernel that could not be built
+    # will not build tomorrow either, and re-checking every one of them every
+    # day is how a daily job turns into an hourly one.
+    kernel_watch.remember(refs)
+    return found
 
 
 def harvest(limit: int, pool_file: Path, author: str | None = None) -> list[str]:
     """Discover, check and enroll newly published kernels as opponents.
+
+    The pool half of `vendored`, for a harvest run by hand against a campaign
+    that is not running. The campaign harvests through `vendored` instead, so
+    that it owns the pool write itself.
 
     Args:
         limit: How many new refs to take.
@@ -117,37 +224,38 @@ def harvest(limit: int, pool_file: Path, author: str | None = None) -> list[str]
     Returns:
         The opponent names added.
     """
-    refs = kernel_watch.discover(author, limit)
-    if not refs:
-        LOGGER.info("nothing new published")
-        return []
     pool = Pool.load(pool_file) if pool_file.exists() else Pool.initial()
-    added: list[str] = []
-    for ref in refs:
-        name = opponent_name(ref)
-        if name in pool.opponents:
-            LOGGER.info("%s: already in the pool as %s", ref, name)
-            continue
-        entry = _entrypoint(ref)
-        if entry is None:
-            LOGGER.info("%s: no agent this can build or extract; skipped", ref)
-            continue
-        problem = playable(entry)
-        if problem:
-            LOGGER.info("%s: %s; skipped", ref, problem)
-            continue
-        vendored = vendor(entry, name)
-        pool.opponents[name] = str(vendored)
-        added.append(name)
-        LOGGER.info("%s: enrolled as %s", ref, name)
-    # Remembered whatever happened to them: a kernel that could not be built
-    # will not build tomorrow either, and re-checking every one of them every
-    # day is how a daily job turns into an hourly one.
-    kernel_watch.remember(refs)
-    if added:
+    found = vendored(limit, set(pool.opponents), author)
+    pool.opponents.update(found)
+    if found:
         pool.save(pool_file)
-        LOGGER.info("pool: %d added, now %d opponents", len(added), len(pool.opponents))
-    return added
+        LOGGER.info("pool: %d added, now %d opponents", len(found), len(pool.opponents))
+    return list(found)
+
+
+def _fingerprints() -> dict[str, str]:
+    """What every opponent harvested so far plays like, by fingerprint.
+
+    Kept beside the pool rather than in it, because it is about the agents and
+    not about who is currently an opponent: a kernel republished after its
+    twin left the pool is still the same agent.
+
+    Opponents enrolled before this file existed are absent from it, so the
+    first harvests cannot catch a duplicate of one. They fill in as those
+    kernels are seen again, and every harvest is protected within itself from
+    the first.
+    """
+    if not FINGERPRINTS.exists():
+        return {}
+    return json.loads(FINGERPRINTS.read_text(encoding="utf-8"))
+
+
+def _remember_fingerprints(seen: dict[str, str]) -> None:
+    """Write the fingerprint index back, so the next harvest knows them."""
+    FINGERPRINTS.parent.mkdir(parents=True, exist_ok=True)
+    FINGERPRINTS.write_text(
+        json.dumps(seen, indent=1, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _entrypoint(ref: str) -> Path | None:

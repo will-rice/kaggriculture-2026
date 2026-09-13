@@ -6,36 +6,30 @@ It edits that file and stops. The loop plays every game, so there is nothing
 here about running a harness, no engine to read and no workspace to manage --
 and no file we assemble that an opponent's path could leak through.
 
-The message is spec section 4's six parts, in order: the game, the program,
-the verdict on it, the states behind that verdict, the lineage's recent
-failures, and the instruction -- and one part the spec did not have, between
-the states and the lineage: what the recorded ladder's winners do that this
-program does not. One function composes it and every round is composed by it,
-the first included, so the model never sees a round that is shaped differently
-from the others.
+The message is the game's rules, the constraints on the program, one game to
+work on, and the instruction. One function composes it and every round is
+composed by it, the first included, so the model never sees a round shaped
+differently from the others.
 
-Two of those parts come from the public replay archive rather than from
-anything the campaign played, and they are not the same thing. `winning_pace`
-is what the winners held on each day, a median over the corpus; the claim
-store is what the winners did *differently*, measured inside single games
-where both sides had the same map and the same prices and one of them lost.
-The first is a reference to read a program's own day tables against. The
-second is selected: only the claims this program is on the other side of
-reach it.
+A round is feedback on one game. It is named rather than rendered: every game
+the campaign has played and every game it recorded off the competition are rows
+in one database, so the message carries the episode key and the query, and a
+round reads whichever columns its own question wants. It used to carry a table
+of every matchup in the evaluation instead -- twenty-four rows standing for 768
+games -- which says the program is losing and nothing about a decision it made.
+
+Nothing measured off other agents' games reaches a round; see the note on the
+build order below for what happened when it did.
 """
 
-import ast
 import logging
 import re
 from pathlib import Path
-from typing import NamedTuple
 
 from kaggriculture.campaign import (
     archive,
-    evaluator,
-    gate,
+    config,
     harness,
-    strategy,
     validate,
 )
 
@@ -47,48 +41,24 @@ TASK_PROMPT = Path(__file__).with_name("task_prompt.md")
 # be read end to end -- what a round is told, and in what order -- without
 # reconstructing it from `compose`.
 ROUND_PROMPT = Path(__file__).with_name("round_prompt.md")
-# What the strongest agents hold on each day, written by `build-order` over
-# the extracted corpus. It is here because the message already gives a round
-# its own banks and tiles each day and gives it nothing to read them against
-# -- and because the agents at the top of the leaderboard publish no kernels,
-# so their games are the only view of them there is.
-#
-# It replaced `winning_pace.md`, which took medians over the winning side of
-# every game. That is the wrong half of the corpus: about half of a ladder's
-# winners are the weaker agent having a good day, and eleven quantities
-# measured that way came back between 45% and 60%. A snapshot of a moving
-# field either way -- rebuilt nightly, because the ladder turns over.
-BUILD_ORDER = Path(__file__).with_name("build_order.md")
-
-# How many claims a round is shown. The store is meant to grow -- every day's
-# archives can propose more -- and the message is not, so what bounds it is
-# not the size of the store but how many of its claims this particular program
-# is on the wrong side of. Five is enough to be actionable and few enough that
-# each one is read.
-MOST_CLAIMS = 5
-# A claim is selected when the program is on the other side of it in more than
-# this share of its recorded games. Half, because one game against one
-# opponent is a matchup and not a habit: a program that plants late against
-# the one opponent that rushes it is not a program that plants late.
-MOSTLY = 0.5
+# Nothing measured off other agents' games reaches a round, and the reason is
+# a measurement rather than a preference. A `build_order.md` used to hold what
+# the strongest agents hold on each day and the message carried it whole.
+# Measured 2026-09-10: clustered to one opening the median candidate scored
+# 0.275 over 68 gates with promotions about one an hour; supplied as the orders
+# those agents send, the median fell to 0.026 over 156 gates and nothing
+# promoted in ten hours. The ceiling hardly moved, 0.940 to 0.914, so good
+# programs did not get worse -- most programs became broken. What a model does
+# with another strategy's schedule is bolt it on and break the economy
+# underneath, which is what three separate experiments found. The file and the
+# constant that named it are gone; a round has the games database and can ask
+# it whatever it wants.
 
 # Rendered from the gate's own whitelist, so the model is never told a
 # different set from the one that rejects it. One file ships, so this list is
 # the program's whole dependency surface.
 IMPORTS = ", ".join(f"`{name}`" for name in sorted(validate.ALLOWED_IMPORTS))
 
-# The one line that differs between a program that topped the tournament and
-# one that did not. Everything else in that paragraph is the same either way,
-# so only this is chosen here; the rest is in the template.
-PLACED_TOP = (
-    "Top of it, so this program is the champion and every later candidate has "
-    "to beat it. That is the bar, and it is not the job: win the games below "
-    "by more."
-)
-PLACED_BELOW = (
-    "Every place gained is progress, whoever it comes against -- but the way "
-    "to gain one is to play the seasons below better, not to target an agent."
-)
 
 # How many of a lineage's failures are sent, and how much of each. The last
 # few are what a next attempt can act on; an older one is about a program two
@@ -98,81 +68,37 @@ PLACED_BELOW = (
 RECENT_FAILURES = 3
 REASON_CHARS = 200
 
-# Day tables shown, at 30 rows each. Every opponent the program did not beat
-# outright earns one, worst first, and this bounds a message that is otherwise
-# a whole pool's worth of games -- twelve of them is 360 rows of eleven
-# columns, most of it about opponents the program is already close to.
-#
-# The cut used to be a rate at or below 0.5, which was right for a lineage
-# losing nearly everything and inverted the moment the campaign was seeded
-# from a strong agent: a program winning 0.875 against eight opponents was
-# told "nothing to show", so the better a program got the less it was shown of
-# how it played. The games it loses one in eight of are exactly the ones it
-# has to win to top the standings.
-MOST_TABLES = 6
+# How many of the edits already made to this program are sent. Best first,
+# which is `Database.children`'s own order: what a round can act on is the
+# direction that came closest and the ones that lost ground, and with eight
+# sessions editing the same champion the list is long enough to need a cut.
+RECENT_ATTEMPTS = 3
 
-# How many already-scored siblings are shown, and how much of each one's own
-# account of itself. Best first, so the list is both the ceiling reached from
-# here and the directions already measured. Without it eight workers start
-# every session from the same program knowing nothing of each other, and the
-# same dead end is re-explored in parallel for as long as the campaign runs;
-# AlphaEvolve and FAMOU both feed prior candidates' measured performance into
-# the next prompt, and this is that.
-SIBLINGS = 8
-CHANGE_CHARS = 160
+# How a round reaches the games. One database holds every game this campaign
+# has played and every game recorded off the competition, and a round asks it
+# questions rather than being handed a copy: the size of the evidence stops
+# being the message's problem, which is the only property that scales.
+GAMES = config.GAMES_URL
 
-# The instruction, and there is one. It says the bar the gate actually applies
-# -- finish top of the standings -- rather than naming a way to go about it.
+
+# One instruction. There were five once -- FAMOU appendix C.2's rewrites, drawn
+# per session -- and two of them, "a completely different algorithm" and "a
+# novel approach inspired by this one", took 54% of every call the campaign
+# made and returned 476 programs of which one scored above nought.
+INSTRUCTION = "Write a program that beats the opponent."
+# The objective, and nothing about how to reach it.
 #
-# There were five, FAMOU appendix C.2's rewrites, drawn one per session on the
-# theory that eight workers starting from one champion would otherwise explore
-# in one direction. Measured over the 476 programs of the first router-seeded
-# run, that is not what they bought:
+# It was "finish every season with a larger bank than it did" until
+# 2026-09-12, chosen as shaping because the gate of the champion_69 era was
+# saturated with the lineage's own ancestors and rank had no gradient left in
+# it. The pool has since inverted -- thirty-two of thirty-four opponents are
+# harvested public agents and the campaign holds no champions -- so winning is
+# the signal with the gradient now.
 #
-#     different      134 programs   mean fitness 0.000   best 0.000
-#     inspired       125            mean 0.013           best 0.911
-#     restructure     84            mean 0.844           best 0.940
-#     improve         70            mean 0.825           best 0.969
-#     tune            62            mean 0.883           best 0.964
-#
-# Every one of the 134 `different` programs scored exactly nought, and
-# `inspired` landed once in 125. Together they are 54% of every call the
-# campaign made. The cause is the seed: "replace it with a completely
-# different algorithm" costs nothing against a thirty-line skeleton and means
-# deleting a rated agent when the program is a published one, and a farm bot
-# written from scratch loses every game to this pool. The three that survived
-# are within 0.06 of each other, which is three ways of saying the same thing.
-#
-# What varies between sessions is the program they start from and what the
-# siblings section says has already been tried from it. That was always the
-# real source of spread; the draw was noise on top of it.
-INSTRUCTION = (
-    "Change `child.py` so that it finishes each game above with a larger bank "
-    "than it did. Not a better place in the table -- a bigger margin in the "
-    "games themselves, and most of all in the ones it already wins narrowly. "
-    "Every table above is one season played out day by day; find where this "
-    "program left money on the field and take it. Small, local changes are "
-    "welcome, and so is replacing whatever part of it is playing badly."
-)
-# Margin rather than rank, and the reason is a measurement rather than a
-# preference.
-#
-# The gate has stopped separating anything. Fourteen of champion_69's
-# twenty-four opponents are saturated and every one of them is ours -- a
-# candidate beats the whole lineage almost always -- so "finish top of the
-# standings" is a step function over a table with no gradient left in it. Every
-# one of those saturated games is still a season of 719 decisions, and some of
-# them are bad ones; summarising the season to a win throws that away.
-#
-# Margin is dense where rank is sparse. A program can always win by more, and
-# the day tables it is shown are seasons rather than verdicts.
-#
-# The competition does not score margin -- it is relative bank, and the size of
-# the win never counts -- which is exactly why this is the *instruction* and
-# not the bar. Promotion still runs on a Bradley-Terry fit that is blind to
-# margin by design, so a program that wins bigger and no more often gains
-# nothing at the gate. The shaping steers the search; it does not decide it.
-INSTRUCTION_NAME = "margin"
+# It also asked for the wrong thing. A round told to improve a margin improves
+# the program it was handed, and seventy-nine rounds did exactly that without
+# once leaving that program's shape.
+INSTRUCTION_NAME = "win"
 
 
 class Message:
@@ -233,365 +159,48 @@ class Message:
 ROUND = Message(ROUND_PROMPT)
 
 
-def _rate_rows(result: evaluator.Result) -> str:
-    """One row per pool opponent: the rate, and how far apart the banks ended.
+def _game_lines(name: str, played: tuple[int, int, harness.Game] | None) -> list[str]:
+    """Name one game, its result, and the query that reads it back.
 
-    A win rate says how often and a margin says by how much, which is what
-    separates an opponent a program nearly beats from one it is nowhere near.
-    """
-    return "\n".join(
-        f"| {opponent} | {rate:.3f} | {result.margins[opponent].mean:+.0f} | "
-        f"{result.margins[opponent].worst:+.0f} | "
-        f"{result.margins[opponent].best:+.0f} |"
-        for opponent, rate in result.rates.items()
-    )
+    One game, because a round is feedback on a game. The message used to carry
+    a table of every matchup in the evaluation -- twenty-four rows standing for
+    768 games -- which is a number a round cannot act on: it says the program
+    is losing and nothing about any decision it made.
 
-
-def _standing_rows(name: str, standings: dict[str, float]) -> str:
-    """The tournament table, best first, with this program marked.
-
-    It goes in whole. A place says more than a yes or a no, and every place
-    gained is progress the next round can aim at.
-    """
-    return "\n".join(
-        f"| {place} | {'**' + agent + '**' if agent == name else agent} "
-        f"| {value:+.3f} |"
-        for place, (agent, value) in enumerate(
-            sorted(standings.items(), key=lambda pair: -pair[1]), start=1
-        )
-    )
-
-
-def _rival(
-    name: str, standings: dict[str, float], states: dict[str, list[harness.Day]]
-) -> str:
-    """The opponent directly above ``name``, whose game is worth studying.
-
-    The gate is a tournament, so the next place is taken from whoever is one
-    rung up -- not from the agent the program does worst against, which under
-    an absolute gate was the binding constraint and under this one is usually
-    just the strongest agent in the pool. A program at the bottom of the table
-    loses to that agent sixteen games to nothing; the one above it is a game
-    it sometimes wins.
+    The game itself is not rendered here. At full width one season is 8,888
+    characters across 68 columns, and it is already in the games database along
+    with every game the competition has recorded, so what belongs in the
+    message is its name and the query. A round reads whichever columns its own
+    question wants instead of whichever fifteen would fit in a table.
 
     Args:
-        name: The program's own name in the standings.
-        standings: Every agent's rating from the tournament it is part of.
-        states: The day tables available, one per opponent played.
+        name: The program's id, which prefixes its episode keys.
+        played: The matchup, the season and the game, or None before there is
+            an evaluation to draw one from.
 
     Returns:
-        An opponent name with a day table, above ``name`` if there is one.
+        Lines of a markdown section, or nothing at all when there is no game.
     """
-    ranked = [
-        agent
-        for agent in sorted(standings, key=lambda other: -standings[other])
-        if agent == name or agent in states
-    ]
-    place = ranked.index(name)
-    # Top of the table has nobody above it; then the nearest challenger below
-    # is what it has to stay ahead of.
-    above = ranked[place - 1] if place else ranked[1]
-    return above
-
-
-def _states_lines(
-    result: evaluator.Result, rival: str, standings: dict[str, float]
-) -> list[str]:
-    """Render one game against every opponent that took a game off the program.
-
-    The losses, because that is where there is something to learn -- and a
-    loss is a game lost, not a matchup lost. An opponent beaten 0.875 has
-    taken one game in eight, and those are precisely the games that decide
-    whether the program finishes top; only an opponent it has beaten every
-    single time has nothing left to teach. Worst first, capped at
-    ``MOST_TABLES``, so the agents it has never taken a game from come before
-    the ones it splits with.
-
-    One game each, and the closest one played -- the game a small change would
-    have flipped, rather than the widest loss, which shows the failure at its
-    starkest and least reachable.
-
-    Args:
-        result: The evaluation, for its rates and its day tables.
-        rival: The agent directly above in the standings, marked because
-            passing it is the next place available.
-        standings: Every agent's rating, to order what is shown.
-
-    Returns:
-        Lines of a markdown section: one table per opponent not beaten.
-    """
-    lost = sorted(
-        (
-            name
-            for name, rate in result.rates.items()
-            if rate < 1.0 and name in result.states
-        ),
-        key=lambda name: (result.rates[name], result.margins[name].mean),
-    )[:MOST_TABLES]
-    if not lost:
-        return [
-            "## Every match, day by day",
-            "",
-            "Nothing to show: this program won every game against every "
-            "opponent in the pool.",
-        ]
-    lines = [
-        "## The matches it lost, day by day",
-        "",
-        f"One game against each of the {len(lost)} opponents that took a game "
-        "off it, worst first. A rate below 1.000 is a game lost, and those are "
-        "the games that decide where it finishes: the ones at the top it has "
-        "never beaten at all, and the ones lower down it beats most of the "
-        "time and still drops points to. Each table is the closest game played "
-        "against that opponent -- the one a small change would have flipped, "
-        "rather than the widest loss, which shows the failure at its starkest "
-        "and least reachable.",
-        "",
-        "Each row is how that day closed. You are shown both sides because you "
-        "are the program's author; the program itself cannot see the "
-        "opponent's shed or seed while it plays. A farm column reads "
-        "`crops / animals / weeds`, counted in tiles, and `-` where there are "
-        "none. Tiles are public, so the opponent's farm is here on the same "
-        "terms as yours; its seed and carried inventory are private and are "
-        "not. `quads` is unlocked quadrants of four and `fert` is growing "
-        "tiles still under fertilizer -- the two the corpus separates the "
-        "strongest agents from the rest on, and the two the build-order table "
-        "above states.",
-    ]
-    for opponent in lost:
-        mark = (
-            " -- directly above you, and the next place you can take"
-            if opponent == rival
-            else ""
-        )
-        lines += [
-            "",
-            f"### `{opponent}`, won {result.rates[opponent]:.3f}{mark}",
-            "",
-            "| day | our bank | their bank | our farm | their farm | our quads | "
-            "their quads | our fert | their fert | our seed | our shed | "
-            "their shed | our hands | their hands | prices |",
-            "| --- |" + " --- |" * 14,
-        ]
-        for day in result.states[opponent]:
-            lines.append(
-                f"| {day.day} | {day.ours_bank:.0f} | {day.theirs_bank:.0f} | "
-                f"{_farm(day.ours_plants, day.ours_animals, day.ours_weeds)} | "
-                f"{_farm(day.theirs_plants, day.theirs_animals, day.theirs_weeds)} | "
-                f"{day.ours_quadrants} | {day.theirs_quadrants} | "
-                f"{day.ours_fertilised} | {day.theirs_fertilised} | "
-                f"{_items(day.ours_seeds)} | "
-                f"{_items(day.ours_shed)} | {_items(day.theirs_shed)} | "
-                f"{day.ours_hands} | {day.theirs_hands} | {_items(day.prices)} |"
-            )
-    del standings
-    return lines
-
-
-def _both_sides(day: harness.Day) -> dict[str, tuple[float, float]]:
-    """Every quantity the corpus measures, for both sides of one recorded day.
-
-    All thirty of them, and it is one line because a `Day` now carries what
-    `dataset.measures` defines rather than a hand-picked few. That matters
-    more than it looks: this used to be a literal mapping of the handful the
-    day row happened to name, so a settled claim about anything else was
-    measured, stored, and silently dropped here -- including the two widest
-    separations in the whole corpus, which had been added to the day *table*
-    and not to this.
-
-    A claim about a quantity nobody measured still cannot be selected, and
-    that is now the same statement as "a quantity the dataset does not have".
-    """
-    return {name: (value, day.theirs[name]) for name, value in day.ours.items()}
-
-
-class Gap(NamedTuple):
-    """One claim a program is on the wrong side of, and by how much.
-
-    Attributes:
-        claim: What the corpus settled.
-        wrong: Its own games sitting on the other side of it.
-        seen: Its own games that could speak to it either way.
-        ours: What it averaged on that quantity, over those games.
-        theirs: What its opponents averaged, over the same games.
-    """
-
-    claim: strategy.Claim
-    wrong: int
-    seen: int
-    ours: float
-    theirs: float
-
-
-def _against(claim: strategy.Claim, states: dict[str, list[harness.Day]]) -> Gap:
-    """Measure one program against one claim, over every game it played.
-
-    Every game, not only the ones whose tables the message prints: what is
-    being asked is how this program plays, and six tables were chosen to bound
-    a message rather than to describe it.
-
-    The figures travel with the verdict. A claim that says only "you are on the
-    wrong side of `hungry_worst` on day seven" names a quantity the day table
-    does not print, so a round would be told it is behind on something it
-    cannot find a number for anywhere in the message.
-
-    Args:
-        claim: The claim to check.
-        states: One recorded game per opponent, day by day.
-
-    Returns:
-        A `Gap`; ``seen`` is zero for a day nobody reached.
-    """
-    wrong = seen = 0
-    mine = yours = 0.0
-    for days in states.values():
-        for day in days:
-            if day.day != claim.form.day:
-                continue
-            pair = _both_sides(day).get(claim.form.quantity)
-            if pair is None:
-                continue
-            seen += 1
-            wrong += claim.wrong_side(*pair)
-            mine += pair[0]
-            yours += pair[1]
-    return Gap(
-        claim, wrong, seen, mine / seen if seen else 0.0, yours / seen if seen else 0.0
-    )
-
-
-def selected(
-    store: strategy.Strategies, states: dict[str, list[harness.Day]]
-) -> list[Gap]:
-    """The settled claims this program plays the other way round, worst first.
-
-    Not the claims that are true -- those are a reading list. The ones worth a
-    round's attention are the true ones this program is not doing, which is
-    why a claim carries a form and not only a sentence: the same form that
-    counts the corpus decides whether this program is the exception. That is
-    also what keeps the message the size of the gap rather than the size of
-    the store.
-
-    Args:
-        store: The claims and what has been measured of them.
-        states: One recorded game per opponent, day by day.
-
-    Returns:
-        At most ``MOST_CLAIMS`` gaps, the ones the program is furthest from
-        first, each carrying its own figures.
-    """
-    scored = []
-    for claim in store.settled():
-        gap = _against(claim, states)
-        if gap.seen and gap.wrong / gap.seen > MOSTLY:
-            # Ordered by how far this program is from the claim, then by how
-            # far the corpus separates the sides on it -- a claim at 90% is a
-            # firmer thing to be told than one at 66%.
-            separation = abs(claim.agreement - 0.5)
-            scored.append((gap.wrong / gap.seen, separation, gap))
-    scored.sort(key=lambda row: (-row[0], -row[1]))
-    return [gap for _, _, gap in scored[:MOST_CLAIMS]]
-
-
-def _claim_lines(claims: list[Gap]) -> list[str]:
-    """Render what the corpus confirmed and this program is not doing.
-
-    Args:
-        claims: What `selected` returned, furthest first.
-
-    Returns:
-        Lines of a markdown section, or nothing at all when the program is
-        already on the right side of everything the corpus has confirmed.
-    """
-    if not claims:
+    if played is None:
         return []
-    lines = [
-        "## What the strongest agents on the ladder do differently",
+    matchup, season, game = played
+    episode = f"{name}m{matchup}s{season}"
+    finish = game.ours - game.theirs
+    return [
+        "## The game",
         "",
-        "Measured over every recorded game of the public ladder. The agents "
-        "at the top of it publish no kernels, so their games are the only "
-        "view of them there is, and none of them is in the pool above.",
+        f"Episode `{episode}`. It held seat {game.seat} and finished "
+        f"{game.ours:,.0f} against {game.theirs:,.0f}, {finish:+,.0f}.",
         "",
-        "Each line was checked inside single games, comparing the two players "
-        "at the same day's close -- same map, same prices, same opponent -- "
-        "so a difference is about what the two players did and not about the "
-        "game they were given. The comparison is between the stronger and the "
-        "weaker *agent*, by a rating fitted over the whole field, and not "
-        "between the winner and the loser of that game: about half of all "
-        "games are won by the weaker side, and measured that way none of "
-        "these separates at all.",
+        "Every day of it, both sides, is in the games database, along with "
+        "every game the competition has recorded:",
         "",
-        "Every line below is one your own games put you on the other side of. "
-        "They are tendencies of strong play, not rules of the game: a "
-        "tendency holding in 70% of games fails in the other 30%, and a "
-        "program that wins by breaking one has beaten it rather than the "
-        "other way round. Furthest first.",
+        f"    curl -s {GAMES} --data-binary "
+        + f"\"select * from games.days where episode='{episode}'"
+        + ' order by day, seat format Pretty"',
         "",
-        "| what the corpus says | yours | theirs | games on the other side |",
-        "| --- | --- | --- | --- |",
+        "The `query-games` skill has the schema.",
     ]
-    for gap in claims:
-        lines.append(
-            f"| {gap.claim.reads()} | {gap.ours:,.1f} | {gap.theirs:,.1f} "
-            f"| {gap.wrong} of {gap.seen} |"
-        )
-    return lines
-
-
-def _summary(program: archive.Program) -> str:
-    """A program's own account of what it changed: its module docstring.
-
-    Every round is asked to say in a docstring at the top of the file what it
-    changed and why, so this is the author's summary rather than ours. Its
-    absence is not a failure -- the program still ran and still scored, and
-    the row is worth showing for the number alone.
-
-    Args:
-        program: The stored program to read.
-
-    Returns:
-        The docstring collapsed onto one line and cut, or "" if there is none.
-    """
-    source = Path(program.source_path).read_text(encoding="utf-8")
-    try:
-        docstring = ast.get_docstring(ast.parse(source))
-    except SyntaxError:
-        # It was validated before it was stored, so this is a file changed
-        # underneath us rather than a program that never parsed.
-        return ""
-    return " ".join((docstring or "").split())[:CHANGE_CHARS]
-
-
-def _sibling_lines(name: str, siblings: list[archive.Program]) -> list[str]:
-    """Render what earlier rounds made of this same program, and what it scored.
-
-    Args:
-        name: The program they were all written from, by name.
-        siblings: Its children, best first.
-
-    Returns:
-        Lines of a markdown section: one row per attempt.
-    """
-    shown = siblings[:SIBLINGS]
-    lines = [
-        f"## What has already been made of `{name}`",
-        "",
-        f"{len(siblings)} program(s) have been written from `{name}` and scored, "
-        f"the best {len(shown)} of them below. These are results, not mistakes: "
-        "each one ran and was played against the same pool on the same terms as "
-        "the table above. A direction here has been measured, so repeating it "
-        "spends a round to learn what this table already says; the rate to beat "
-        "from where you stand is the best of them.",
-        "",
-        "| attempt | instruction | win rate | what it changed |",
-        "| --- | --- | --- | --- |",
-    ]
-    for program in shown:
-        lines.append(
-            f"| {program.id} | {program.instruction} | {program.fitness:.3f} | "
-            f"{_summary(program) or '-'} |"
-        )
-    return lines
 
 
 def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
@@ -622,74 +231,120 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     return lines
 
 
-def _items(counts: dict[str, int]) -> str:
-    """Render a shed or a price list as ``WHEAT 12, EGG 3``; "-" when empty."""
-    return ", ".join(f"{item} {n}" for item, n in counts.items()) or "-"
+def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> list[str]:
+    """Render the edits already made to this program and what they scored.
 
+    A round is a fresh call that remembers nothing of the ones before it, so
+    without this a session's twelve consecutive attempts on one opponent are
+    twelve independent guesses rather than twelve steps of a search. Early on
+    guessing works, because when a program is bad most changes help; at 0.316
+    against the field most changes hurt, and a search that cannot tell which
+    way it moved stops climbing. Measured 2026-09-13: thirteen rounds, eight of
+    them above the program they started from by +0.005 to +0.024, and nothing
+    carried between them.
 
-def _farm(plants: dict[str, int], animals: dict[str, int], weeds: int) -> str:
-    """Render one side's worked tiles as ``crops / animals / weeds``."""
-    return f"{_items(plants)} / {_items(animals)} / {weeds or '-'}"
+    `Database.children` has held this list all along -- "what the next round is
+    told has already been tried from where it stands" -- and `compose` counted
+    it for a log line. It was always empty, because a session advanced onto
+    whatever its last round wrote, so the program being composed against was
+    new and had no children yet. It fills up now that a round that lost ground
+    hands the next one the program it started from.
+
+    The edits are files rather than diffs in the message, the way the game is
+    an episode key rather than a table: a round diffs whichever of them its own
+    question is about, and one that does not care pays nothing for them.
+
+    The deltas are whole-pool means differenced, not `Result.beats`'s comparison
+    over the opponents both sides played. A sibling and the program it was
+    edited from are measured minutes apart and almost always against the same
+    pool, so the two agree; across a harvest the delta is off by about a
+    forty-eighth of a rate difference. This is a direction for a round to read
+    and not the comparison anything is decided on, which is why it is the cheap
+    one.
+
+    Args:
+        name: The program in ``child.py``, by name.
+        rate: Its mean win rate over the opponents it was measured on, so the
+            deltas below have something to be deltas from.
+        siblings: Programs written from it, best first, already copied into the
+            round's directory as ``tried_1.py`` and so on.
+
+    Returns:
+        Lines of a markdown section, one bullet per edit.
+    """
+    lines = [
+        f"## Edits already tried on `{name}`",
+        "",
+        f"`child.py` wins {rate:.3f} of its games against the pool. These "
+        "programs were written from it and played, best first, and each one is "
+        "in your directory:",
+        "",
+    ]
+    for number, program in enumerate(siblings[:RECENT_ATTEMPTS], start=1):
+        lines.append(
+            f"- `tried_{number}.py` scored {program.fitness:.3f} "
+            f"({program.fitness - rate:+.3f})"
+        )
+    lines += [
+        "",
+        "Diff them against `child.py` to see what each one changed. A better "
+        "score is a direction to go further in; a worse one is a direction "
+        "already measured and lost.",
+    ]
+    return lines
 
 
 def compose(
     name: str,
-    result: evaluator.Result,
+    played: tuple[int, int, harness.Game] | None,
+    rate: float,
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
-    standings: dict[str, float],
 ) -> str:
     """Compose the message for one round.
+
+    A rating used to be passed in and is not any more. It was never rendered --
+    a place is not something a round can act on, it cannot choose its opponents
+    or its rank -- and it cost a Bradley-Terry fit per round to compute an
+    argument nothing read.
 
     Args:
         name: What the program in ``child.py`` is called -- a pool name or a
             database id. It is interpolated raw, so it must never be a path.
-        result: The loop's fast evaluation of that program: the verdict, and
-            the day table of one game behind it.
+        played: The one game this round is feedback on, as its matchup, its
+            season and the game itself. None before there is an evaluation.
+        rate: The program's mean win rate over the opponents it was measured
+            on, which is the number the edits below are deltas from.
         failures: Every failure the ledger holds against that program, oldest
             first. The caller hands over what it has and this cuts it to the
             last few, so a caller cannot forget to.
         siblings: Programs already written from ``name`` and scored, best
-            first. Cut to ``SIBLINGS`` here for the same reason.
+            first. The caller hands over what it has and this cuts it to the
+            first few, and `round` copies the same ones into the directory.
         instruction: ``INSTRUCTION``, with any stagnation note the caller
             prepended.
-        standings: Every agent's rating from the tournament this program's
-            results are part of, itself included.
 
     Returns:
         The whole message, for codex's standard input.
     """
-    rival = _rival(name, standings, result.states)
-    # No floor is passed, so this asks only whether the program tops the
-    # field -- which is the half of the verdict worth putting in front of a
-    # model. The decisive bar guards the other half, replacing the agent that
-    # stands, and with no floor named there is nothing to be indistinguishable
-    # from; zero is the right value and the branch above never reads it.
-    cleared, why = gate.promotion(standings, name, decisive=0)
-    # Opened here rather than at import, so a store the daily measurement
-    # has rewritten reaches a campaign that is already running.
-    # A lineage with nothing against it gets no section at all: a heading over
-    # an empty list is noise in a message the model reads every round. The
-    # template puts each on its own line, so an empty one leaves no gap.
+    # A section that would be empty is rendered as nothing at all, heading
+    # included: a heading over an empty list is noise in a message the model
+    # reads every round. The template puts each on its own line, so an empty
+    # one leaves no gap.
+    section = _game_lines(name, played)
+    tried = _tried_lines(name, rate, siblings) if siblings else []
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
-        name=name,
         imports=IMPORTS,
-        seeds=len(result.seeds),
-        rates=_rate_rows(result),
-        verdict=why,
-        placing=PLACED_TOP if cleared else PLACED_BELOW,
-        standings=_standing_rows(name, standings),
-        states="\n".join(_states_lines(result, rival, standings)) + "\n",
-        siblings="\n".join(_sibling_lines(name, siblings)) + "\n" if siblings else "",
+        game="\n".join(section) + "\n" if section else "",
+        tried="\n".join(tried) + "\n" if tried else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         instruction=instruction,
     )
     LOGGER.info(
-        "composed a round on %s (rival: %s, %d prior, %d failures)",
+        "composed a round on %s (%d prior, %d failures)",
         name,
-        rival,
         len(siblings),
         len(failures),
     )

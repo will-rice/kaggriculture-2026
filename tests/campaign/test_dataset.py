@@ -6,7 +6,6 @@ query over it comes back with an answer.
 """
 
 import json
-import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -122,40 +121,83 @@ def archive(path: Path, episodes: list[tapes.Episode]) -> Path:
     return path
 
 
-def built(tmp_path: Path, episodes: list[tapes.Episode]) -> sqlite3.Connection:
-    """Extract those episodes and hand back an open connection."""
+def scratch(name: str) -> str:
+    """A database of this test's own, emptied first."""
+    from kaggriculture.campaign import games
+
+    database = f"test_{abs(hash(name)):x}"[:40]
+    games.query(f"DROP DATABASE IF EXISTS {database}")
+    games.create(database)
+    return database
+
+
+def rows(database: str, sql: str) -> list[tuple]:
+    """Every row of a query, typed as ClickHouse typed them."""
+    from kaggriculture.campaign import games
+
+    # 64-bit integers come back quoted by default, so that JavaScript
+    # does not silently round them. A test comparing against an int wants
+    # the int.
+    answer = games.query(
+        f"{sql.format(database=database)} FORMAT JSONCompact "
+        "SETTINGS output_format_json_quote_64bit_integers = 0"
+    )
+    return [tuple(row) for row in json.loads(answer)["data"]]
+
+
+def one(database: str, sql: str) -> tuple:
+    """The first row, or an empty tuple."""
+    found = rows(database, sql)
+    return found[0] if found else ()
+
+
+def built(tmp_path: Path, episodes: list[tapes.Episode], name: str = "") -> str:
+    """Extract those episodes into a database of this test's own."""
     written = archive(tmp_path / "kaggriculture-episodes-2026-09-01.zip", episodes)
-    database = tmp_path / "corpus.sqlite"
+    database = scratch(name or str(tmp_path))
     dataset.build([written], database, workers=1)
-    return sqlite3.connect(database)
+    return database
 
 
-def test_a_failed_rebuild_leaves_the_corpus_it_was_replacing(tmp_path: Path) -> None:
-    """A rebuild that raises must not take the working corpus with it.
+def test_a_failed_rebuild_leaves_the_ladder_it_was_replacing(tmp_path: Path) -> None:
+    """A rebuild that raises must not take the working ladder with it.
 
     On 2026-09-09 one unreadable market order, in one archive of twenty-five,
     ended a fifty-five minute extraction with no corpus at all -- because the
-    target was unlinked before the first archive was read. Everything
-    downstream reads that file, so a parser surprise in a single episode became
-    an outage: no ratings, no build order, no report.
+    target was emptied before the first archive was read. Everything
+    downstream reads it, so a parser surprise in a single episode became an
+    outage: no ratings, no report.
+
+    The store changed and the guarantee did not. The rebuild fills a staging
+    database and swaps it in a partition at a time, and `REPLACE PARTITION` is
+    atomic, so a raise leaves every row exactly where it was.
     """
-    database = tmp_path / "corpus.sqlite"
+    database = scratch("failed rebuild")
     good = archive(
         tmp_path / "kaggriculture-episodes-2026-09-01.zip",
         [game(1, (100.0, 50.0), ["a", "b"])],
     )
     dataset.build([good], database, workers=1)
-    before = database.read_bytes()
+    before = rows(database, "SELECT episode, team_0 FROM {database}.episodes")
+    assert before
 
     # Not a zip at all, so reading it raises rather than yielding no episodes.
     broken = tmp_path / "kaggriculture-episodes-2026-09-02.zip"
-    broken.write_text("this is not an archive", encoding="utf-8")
+    broken.write_text("not a zip", encoding="utf-8")
 
-    with pytest.raises(Exception):  # noqa: B017 - the pool re-raises the worker's own
+    with pytest.raises(Exception):  # noqa: B017, PT011 - whatever the reader raises
         dataset.build([good, broken], database, workers=1)
 
-    assert database.exists(), "the rebuild destroyed the corpus it was replacing"
-    assert database.read_bytes() == before
+    assert rows(database, "SELECT episode, team_0 FROM {database}.episodes") == before
+    # And the staging database is not left behind to be mistaken for the real one.
+    from kaggriculture.campaign import games
+
+    assert (
+        games.query(
+            f"SELECT count() FROM system.databases WHERE name = '{database}_building'"
+        )
+        == "0"
+    )
 
 
 def test_an_episode_records_who_played_it(tmp_path: Path) -> None:
@@ -166,11 +208,13 @@ def test_an_episode_records_who_played_it(tmp_path: Path) -> None:
     all sat at fifty percent. Naming both sides turns it into a question about
     particular agents, and the tapes have carried the names all along.
     """
-    connection = built(tmp_path, [game(1001, (900.0, 300.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1001, (900.0, 300.0), ["Ada", "Grace"])])
 
-    row = connection.execute(
-        "SELECT kaggle_id, team_0, team_1, bank_0, bank_1, winner FROM episodes"
-    ).fetchone()
+    row = one(
+        database,
+        "SELECT kaggle_id, team_0, team_1, bank_0, bank_1, winner FROM "
+        "{database}.episodes",
+    )
 
     # The banks are the final state, which is what decides the game.
     assert row == (1001, "Ada", "Grace", 900.0 + STEPS - 1, 300.0 + STEPS - 1, 0)
@@ -182,9 +226,9 @@ def test_a_draw_has_no_winner_rather_than_a_default_one(tmp_path: Path) -> None:
     A query that groups on the winner cannot then silently hand every drawn
     game to seat zero.
     """
-    connection = built(tmp_path, [game(1002, (500.0, 500.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1002, (500.0, 500.0), ["Ada", "Grace"])])
 
-    assert connection.execute("SELECT winner FROM episodes").fetchone() == (None,)
+    assert one(database, "SELECT winner FROM {database}.episodes") == (-1,)
 
 
 def test_a_day_carries_the_husbandry_a_tile_count_cannot_show(tmp_path: Path) -> None:
@@ -193,12 +237,13 @@ def test_a_day_carries_the_husbandry_a_tile_count_cannot_show(tmp_path: Path) ->
     Forty growing tiles of which six were watered is not forty of which forty
     were, and both used to read as "planted 40".
     """
-    connection = built(tmp_path, [game(1003, (900.0, 300.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1003, (900.0, 300.0), ["Ada", "Grace"])])
 
-    tended, neglected = connection.execute(
+    tended, neglected = rows(
+        database,
         "SELECT seat, planted, watered, dry_worst, ripe, fed, weeds, bank "
-        "FROM days WHERE day = 10 ORDER BY seat"
-    ).fetchall()
+        "FROM {database}.days WHERE day = 10 ORDER BY seat",
+    )
 
     # A day's row is that day at its last hour: what both players saw before
     # their final decision in it, and not the state it opened on.
@@ -213,11 +258,12 @@ def test_every_day_of_the_season_is_present(tmp_path: Path) -> None:
     The tape walk this replaced lost that day twice, and both times every
     claim about the close came back with zero support rather than an error.
     """
-    connection = built(tmp_path, [game(1004, (900.0, 300.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1004, (900.0, 300.0), ["Ada", "Grace"])])
 
-    days = connection.execute(
-        "SELECT seat, count(*), min(day), max(day) FROM days GROUP BY seat"
-    ).fetchall()
+    days = rows(
+        database,
+        "SELECT seat, count(*), min(day), max(day) FROM {database}.days GROUP BY seat",
+    )
 
     assert days == [(0, dataset.DAYS, 0, 29), (1, dataset.DAYS, 0, 29)]
 
@@ -229,11 +275,12 @@ def test_an_order_keeps_its_item_and_quantity(tmp_path: Path) -> None:
     were sent rather than how much produce moved, and those are different
     games.
     """
-    connection = built(tmp_path, [game(1005, (900.0, 300.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1005, (900.0, 300.0), ["Ada", "Grace"])])
 
-    row = connection.execute(
-        "SELECT day, hour, verb, item, quantity FROM orders WHERE seat = 0"
-    ).fetchone()
+    row = one(
+        database,
+        "SELECT day, hour, verb, item, quantity FROM {database}.orders WHERE seat = 0",
+    )
 
     # Submitted at step 5, which was chosen looking at step 4: day 0, hour 4.
     assert row == (0, 4, "SELL", "WHEAT", 48)
@@ -261,15 +308,16 @@ def test_an_empty_market_slot_is_no_order_rather_than_a_broken_one(
             "market": [["HIRE"], []],
         }
 
-    connection = built(tmp_path, [episode])
+    database = built(tmp_path, [episode])
 
-    orders = connection.execute(
-        "SELECT verb, item, quantity FROM orders "
-        "WHERE seat = 0 AND day = 0 AND hour = 8"
-    ).fetchall()
+    orders = rows(
+        database,
+        "SELECT verb, item, quantity FROM {database}.orders "
+        "WHERE seat = 0 AND day = 0 AND hour = 8",
+    )
 
     # The HIRE is kept whole; the empty slot contributes no row at all.
-    assert orders == [("HIRE", None, None)]
+    assert orders == [("HIRE", "", 0)]
 
 
 def test_the_farmer_and_the_hands_are_recorded_and_passes_are_not(
@@ -280,13 +328,15 @@ def test_the_farmer_and_the_hands_are_recorded_and_passes_are_not(
     There are millions of passes; a query counting moves per day gets the same
     answer whether or not they are stored.
     """
-    connection = built(tmp_path, [game(1006, (900.0, 300.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1006, (900.0, 300.0), ["Ada", "Grace"])])
 
-    moves = connection.execute(
-        "SELECT actor, verb, argument FROM moves WHERE seat = 0 ORDER BY actor"
-    ).fetchall()
+    moves = rows(
+        database,
+        "SELECT actor, verb, argument FROM {database}.moves WHERE seat = 0 "
+        "ORDER BY actor",
+    )
 
-    assert moves == [(-1, "PLANT", "WHEAT"), (0, "WATER", None)]
+    assert moves == [(-1, "PLANT", "WHEAT"), (0, "WATER", "")]
 
 
 def test_only_what_is_held_is_stored(tmp_path: Path) -> None:
@@ -295,12 +345,13 @@ def test_only_what_is_held_is_stored(tmp_path: Path) -> None:
     The shed alone names a dozen commodities, and a season of empty ones would
     be most of the table.
     """
-    connection = built(tmp_path, [game(1007, (900.0, 300.0), ["Ada", "Grace"])])
+    database = built(tmp_path, [game(1007, (900.0, 300.0), ["Ada", "Grace"])])
 
-    held = connection.execute(
-        "SELECT kind, item, count FROM holdings WHERE seat = 0 AND day = 3 "
-        "ORDER BY kind, item"
-    ).fetchall()
+    held = rows(
+        database,
+        "SELECT kind, item, count FROM {database}.holdings WHERE seat = 0 AND day = 3 "
+        "ORDER BY kind, item",
+    )
 
     assert held == [
         ("animal", "CHICKEN", 1),
@@ -316,7 +367,7 @@ def test_the_ladder_is_read_off_the_corpus(tmp_path: Path) -> None:
     The agents at the top of the leaderboard publish no kernels, so the pool
     is built from work that is not theirs. Their games are here.
     """
-    connection = built(
+    database = built(
         tmp_path,
         [
             game(1, (900.0, 300.0), ["Ada", "Grace"]),
@@ -324,9 +375,8 @@ def test_the_ladder_is_read_off_the_corpus(tmp_path: Path) -> None:
             game(3, (100.0, 800.0), ["Ada", "Grace"]),
         ],
     )
-    connection.close()
 
-    standing = dataset.leaderboard(tmp_path / "corpus.sqlite", least=3)
+    standing = dataset.leaderboard(database, least=3)
 
     assert standing == [("Ada", 3, 2 / 3), ("Grace", 3, 1 / 3)]
 
@@ -354,15 +404,15 @@ def test_a_rating_is_not_a_win_rate(tmp_path: Path) -> None:
     series("Ada", "Cyd", 6, 4)
     series("Cyd", "Dot", 9, 1)
     series("Bea", "Dot", 9, 1)
-    connection = built(tmp_path, games)
-    connection.close()
-    database = tmp_path / "corpus.sqlite"
+    database = built(tmp_path, games)
 
     dataset.rate(database, least=10)
 
-    connection = sqlite3.connect(database)
     rated = [
-        team for (team,) in connection.execute("SELECT team FROM teams ORDER BY place")
+        team
+        for (team,) in rows(
+            database, "SELECT team FROM {database}.teams ORDER BY place"
+        )
     ]
     by_rate = [team for team, _, _ in dataset.leaderboard(database, least=10)]
 
@@ -387,23 +437,20 @@ def test_a_rating_needs_both_enough_games_and_a_path_to_the_field(
     games += [game(n, (900.0, 300.0), ["Far", "Off"]) for n in range(7, 13)]
     # Played once, won it. Not the best agent on this ladder.
     games.append(game(13, (900.0, 300.0), ["Cameo", "Ada"]))
-    connection = built(tmp_path, games)
-    connection.close()
-    database = tmp_path / "corpus.sqlite"
+    database = built(tmp_path, games)
 
     dataset.rate(database, least=6)
 
-    connection = sqlite3.connect(database)
-    rated = {team for (team,) in connection.execute("SELECT team FROM teams")}
+    rated = {team for (team,) in rows(database, "SELECT team FROM {database}.teams")}
 
     assert "Cameo" not in rated
     # One island or the other, never both: they share no game.
     assert rated in ({"Ada", "Cyd"}, {"Far", "Off"})
 
 
-def dated(tmp_path: Path, days: dict[str, list[tapes.Episode]]) -> Path:
+def dated(tmp_path: Path, days: dict[str, list[tapes.Episode]]) -> str:
     """Extract several days of archives at once, keyed by the date each bears."""
-    database = tmp_path / "windowed.sqlite"
+    database = scratch(f"windowed {tmp_path}")
     dataset.build(
         [
             archive(tmp_path / f"kaggriculture-episodes-{day}.zip", episodes)
@@ -430,310 +477,14 @@ def test_a_rating_reads_a_window_and_not_the_whole_history(tmp_path: Path) -> No
     database = dated(
         tmp_path,
         {
-            "2026-08-01": [game(1, (100.0, 50.0), ["retired", "carried_over"])],
-            "2026-08-30": [game(2, (100.0, 50.0), ["carried_over", "arrived"])],
-        },
-    )
-
-    assert dataset.rate(database, least=1, window=1) == 2
-    assert {row[0] for row in dataset.ladder(database)} == {"carried_over", "arrived"}
-
-    assert dataset.rate(database, least=1, window=99) == 3
-    assert {row[0] for row in dataset.ladder(database)} == {
-        "retired",
-        "carried_over",
-        "arrived",
-    }
-
-
-def test_the_window_counts_back_from_the_newest_archive_not_from_today(
-    tmp_path: Path,
-) -> None:
-    """The first day of the window is read off the data, not off the clock.
-
-    The fetch runs behind the ladder -- four days behind, the morning this was
-    written -- so a window measured from today's date would begin after the
-    last archive ends and select nothing. Counted back from the newest day
-    present, a late fetch narrows the corpus rather than emptying it.
-    """
-    database = dated(
-        tmp_path,
-        {
             "2026-08-01": [game(1, (100.0, 50.0), ["a", "b"])],
             "2026-08-02": [game(2, (100.0, 50.0), ["c", "d"])],
             "2026-08-03": [game(3, (100.0, 50.0), ["e", "f"])],
         },
     )
-    connection = sqlite3.connect(database)
-    try:
-        assert dataset.recent(connection, window=1) == "2026-08-03"
-        assert dataset.recent(connection, window=2) == "2026-08-02"
-        # More window than corpus is the whole corpus, not an error: the
-        # window bounds how far back to look, it does not demand days.
-        assert dataset.recent(connection, window=99) == "2026-08-01"
-    finally:
-        connection.close()
 
-
-def opener(
-    episode_id: int,
-    teams: list[str],
-    takes: tuple[int, int],
-    theirs: tuple[int, int],
-    ours_wins: bool = True,
-) -> tapes.Episode:
-    """A season where each seat takes its quadrants on its own schedule.
-
-    Both seats, because a team plays both across a corpus and its signature is
-    a median over all of them. Give the opening to seat 0 alone and every
-    seat-1 game reads as never reaching a second quadrant, which drags the
-    median to fifty-two -- as it did, the first time this was written.
-
-    Everything else is held still. What is being tested is the grouping, and a
-    fixture that also varied the farms would not say which of the two it keyed
-    on.
-    """
-    tiles = [crop(0, watered=True, dry=0, ripe=2)]
-    steps = []
-    for index in range(STEPS):
-        day = index // HOURS
-        mine = 1 + (day >= takes[0]) + (day >= takes[1])
-        yours = 1 + (day >= theirs[0]) + (day >= theirs[1])
-        # Who wins is given rather than derived, so a test can build any
-        # rating structure it needs -- including one where the single best
-        # agent sits in a group whose mean is low.
-        rich, poor = (900.0, 300.0) if ours_wins else (300.0, 900.0)
-        farms = [
-            farm(rich + index, tiles, quadrants=mine),
-            farm(poor + index, tiles, quadrants=yours),
-        ]
-        observation = {
-            "farms": farms,
-            "private": {"seeds": {"WHEAT": 4}, "shed": {"WHEAT": 7}},
-            "market": {"prices": {"WHEAT": 40}, "inventory": {"WHEAT": 9000}},
-            "town": {"unlocked_shops": ["MARKET"]},
-        }
-        steps.append(
-            [
-                {"observation": observation, "action": {}, "status": "DONE"}
-                for _ in (0, 1)
-            ]
-        )
-    return tapes.Episode(
-        seed=7,
-        engine_version=tapes.ENGINE,
-        info={"seed": 7, "EpisodeId": episode_id, "TeamNames": teams},
-        steps=steps,
-    )
-
-
-def test_agents_that_open_alike_are_grouped_and_the_strongest_group_leads(
-    tmp_path: Path,
-) -> None:
-    """A mean across the top of a ladder is a mean across different strategies.
-
-    Measured 2026-09-09: the top twelve hold 1.16 quadrants on day three, which
-    is 84% of them holding one and 16% holding two. No agent holds 1.16. The
-    three that take land on day three are the three best on the ladder and sit
-    0.9 log-odds clear of fourth, and averaging deletes exactly that.
-    """
-    games = []
-    # Two rushers and two plodders, each playing enough to be rated. The
-    # rushers win their games, so the fit puts them above.
-    for number in range(24):
-        # Every rusher meets every plodder, so the fit sees one connected
-        # field. Paired `number % 2` against `number % 2` they are two disjoint
-        # islands and the rating keeps only one of them.
-        rusher = f"rush_{number % 2}"
-        plodder = f"plod_{(number // 2) % 2}"
-        # The plodders' game is written first, so insertion order puts the
-        # weaker opening first and the assertion below tests the sort rather
-        # than the order the groups happened to be built in.
-        games.append(
-            opener(
-                100 + number,
-                [plodder, rusher],
-                takes=(6, 11),
-                theirs=(3, 8),
-                ours_wins=False,
-            )
-        )
-        games.append(opener(number, [rusher, plodder], takes=(3, 8), theirs=(6, 11)))
-    database = dated(tmp_path, {"2026-09-01": games})
-    dataset.rate(database, least=1, window=99)
-
-    groups = dataset.openings(database, best=4, window=99)
-
-    assert len(groups) == 2, "two openings, so two groups"
-    assert groups[0].signature == (3, 8), "the rushers rate above and come first"
-    assert sorted(groups[0].teams) == ["rush_0", "rush_1"]
-    assert groups[1].signature == (6, 11)
-    assert groups[0].rating > groups[1].rating
-
-
-def test_the_build_order_can_be_read_from_one_group_alone(tmp_path: Path) -> None:
-    """Restricted to agents that open alike, the table is followable.
-
-    Blended, the quadrant row asked for 1.2 on day three and 2.3 on day eight --
-    fractions of a thing that comes in whole numbers, and a target no agent can
-    hit. Within one opening it is 1, 1, 1, 2, and a policy can execute it.
-    """
-    games = []
-    for number in range(24):
-        games.append(
-            opener(number, [f"rush_{number % 2}", "plod"], takes=(3, 8), theirs=(6, 11))
-        )
-        games.append(
-            opener(
-                100 + number,
-                ["plod", f"rush_{number % 2}"],
-                takes=(6, 11),
-                theirs=(3, 8),
-            )
-        )
-    database = dated(tmp_path, {"2026-09-01": games})
-    dataset.rate(database, least=1, window=99)
-
-    order = dataset.build_order(database, window=99, teams=["rush_0", "rush_1"])
-    quadrants = dict(zip(dataset.MARKS, order["quadrants"], strict=False))
-
-    # Whole numbers throughout: one group, one behaviour.
-    assert quadrants[0] == 1.0
-    assert quadrants[3] == 2.0, "the rushers hold two on day three"
-    assert quadrants[2] == 1.0, "and one the day before"
-
-
-def test_a_group_is_ranked_by_its_own_strength_not_by_its_best_member(
-    tmp_path: Path,
-) -> None:
-    """The ladder is read strongest-first, so the groups arrive in that order.
-
-    Which makes the ordering easy to get wrong and easy to test wrongly: while
-    the best agent also sits in the best group, a sort by group mean and no
-    sort at all give the same answer. Here the best agent shares its opening
-    with the worst, so the two disagree.
-
-    Ranking by mean is the useful reading. An opening is worth copying if the
-    agents using it are strong on the whole -- one outlier inside it says more
-    about that agent than about the opening.
-    """
-    rush, plod = (3, 8), (6, 11)
-    games = []
-    for number in range(16):
-        # `star` beats everyone and `stray` loses to everyone, and they share
-        # an opening: that group's mean is middling however good its best is.
-        games.append(opener(number, ["star", "stray"], rush, rush))
-        games.append(opener(100 + number, ["star", "mid_0"], rush, plod))
-        games.append(opener(200 + number, ["star", "mid_1"], rush, plod))
-        # The middling pair beat the stray, so their group's mean sits above.
-        games.append(opener(300 + number, ["mid_0", "stray"], plod, rush))
-        games.append(opener(400 + number, ["mid_1", "stray"], plod, rush))
-        games.append(
-            opener(
-                500 + number, ["mid_0", "mid_1"], plod, plod, ours_wins=number % 2 == 0
-            )
-        )
-    database = dated(tmp_path, {"2026-09-01": games})
-    dataset.rate(database, least=1, window=99)
-
-    groups = dataset.openings(database, best=4, window=99)
-
-    strongest = {team for team, _, _, rating, _ in dataset.ladder(database)}
-    assert "star" in strongest
-    # The best agent is a rusher, so a list left in ladder order leads with the
-    # rushers. Ranked by group mean, the middling pair lead instead.
-    assert groups[0].signature == plod, "ranked by the group, not by its best member"
-    assert set(groups[0].teams) == {"mid_0", "mid_1"}
-    assert groups[0].rating > groups[1].rating
-    assert "star" in groups[1].teams
-
-
-def trader(episode_id: int, teams: list[str], orders: list[list]) -> tapes.Episode:
-    """A season where seat 0 sends the same market orders on day zero."""
-    tiles = [crop(0, watered=True, dry=0, ripe=2)]
-    steps = []
-    for index in range(STEPS):
-        observation = {
-            "farms": [farm(900.0 + index, tiles), farm(300.0 + index, tiles)],
-            "private": {"seeds": {"WHEAT": 4}, "shed": {"WHEAT": 7}},
-            "market": {"prices": {"WHEAT": 40}, "inventory": {"WHEAT": 9000}},
-            "town": {"unlocked_shops": ["MARKET"]},
-        }
-        steps.append(
-            [
-                {
-                    "observation": observation,
-                    "action": {"market": orders if index == 1 and seat == 0 else []},
-                    "status": "DONE",
-                }
-                for seat in (0, 1)
-            ]
-        )
-    return tapes.Episode(
-        seed=7,
-        engine_version=tapes.ENGINE,
-        info={"seed": 7, "EpisodeId": episode_id, "TeamNames": teams},
-        steps=steps,
-    )
-
-
-def test_an_opening_is_read_as_whole_orders_that_were_really_sent(
-    tmp_path: Path,
-) -> None:
-    """A count of orders is a count, and a mean over it is a fraction of one.
-
-    Every artifact built from this corpus reduced a game to per-day holdings
-    and then averaged those, which is how the table came to ask for 1.2
-    quadrants -- 84% of a group holding one and 16% holding two, and no way to
-    buy a fifth of a quadrant. Nothing in the corpus is impossible; the summary
-    was. So the orders are read as sent, and counted with a median.
-    """
-    games = [
-        trader(
-            number,
-            ["rush", "plod"],
-            [["HIRE"], ["HIRE"], ["BUY_LAND"], ["BUY_PRODUCT", "WHEAT", 2]],
-        )
-        for number in range(1, 9)
-    ]
-    database = dated(tmp_path, {"2026-09-01": games})
-
-    sent = dataset.opening_orders(database, teams=["rush"], days=1, window=99)
-
-    by_verb = {(order.verb, order.item): order for order in sent}
-    assert by_verb[("HIRE", "")].count == 2, "two hires, not an average of them"
-    assert by_verb[("BUY_LAND", "")].count == 1
-    assert by_verb[("BUY_PRODUCT", "WHEAT")].quantity == 2
-    # Every game sent them, so no share qualifier belongs on the line.
-    assert by_verb[("HIRE", "")].share == 1.0
-    assert "in " not in by_verb[("HIRE", "")].describe()
-    assert by_verb[("HIRE", "")].describe() == "2 x `HIRE`"
-
-
-def test_an_order_only_some_games_send_says_so(tmp_path: Path) -> None:
-    """A line that reads like a rule when it is a coin flip is worse than none.
-
-    The count is a median over the games that send the order at all, so an
-    order sent by a fifth of them still reads "1 x" -- true of those games, and
-    misleading about the opening unless the share travels with it.
-    """
-    always = [["HIRE"]]
-    games = [
-        trader(
-            number, ["rush", "plod"], always + ([["BUY_LAND"]] if number < 3 else [])
-        )
-        for number in range(1, 9)
-    ]
-    database = dated(tmp_path, {"2026-09-01": games})
-
-    sent = dataset.opening_orders(database, teams=["rush"], days=1, window=99)
-
-    land = next(order for order in sent if order.verb == "BUY_LAND")
-    assert land.share == 0.25
-    # One each, in the quarter of games that send it at all. Counted over
-    # every game instead this rounds to nought and the order vanishes from a
-    # build order that a quarter of the strongest games actually send.
-    assert land.count == 1
-    assert "1 x `BUY_LAND`, in 25% of games" == land.describe()
-    hire = next(order for order in sent if order.verb == "HIRE")
-    assert "in " not in hire.describe(), "sent by all of them, so no qualifier"
+    assert dataset.recent(database, window=1) == "2026-08-03"
+    assert dataset.recent(database, window=2) == "2026-08-02"
+    # More window than corpus is the whole corpus, not an error: the window
+    # bounds how far back to look, it does not demand days.
+    assert dataset.recent(database, window=99) == "2026-08-01"

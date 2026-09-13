@@ -29,7 +29,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, harness, roster
+from kaggriculture.campaign import harness, roster
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
 
@@ -74,11 +74,33 @@ class Result(BaseModel):
             what a round is *shown* is chosen from the standings instead,
             because the gate is a tournament and the agent to study is the one
             directly above, not the one furthest away.
-        states: One game against each opponent, day by day: the narrowest
-            loss, or the narrowest win where it lost none. Every opponent,
-            because which one is worth showing depends on the standings and
-            those are not fitted until after this returns -- and the games are
-            played either way, so keeping their tables costs nothing.
+        states: Every game played, grouped by the opponent it was played
+            against and narrowest first within each group.
+
+            Whole games rather than their day tables alone. A `Game` carries
+            the seed it was played on and the seat the candidate held, and
+            those are what let the days be written out as the public corpus
+            writes them -- which records an absolute seat, having no notion of
+            "ours". Keeping only the days meant inventing a seat at the point
+            of writing, and an invented seat is a row that looks like a corpus
+            row and is not one.
+
+            All of them, because a round can only improve a game it is shown
+            and the campaign scores every one of them. It used to keep the
+            single narrowest game against each opponent and drop the other
+            thirty-one, which quietly decided on a round's behalf that the
+            other thirty-one held nothing -- and the games are played either
+            way, with their days already rendered, so keeping them costs
+            nothing but the write.
+
+            Grouped, because the grouping is what makes two seasons
+            comparable. Within one group the opponent is fixed and what varies
+            between seasons is the world: the map, the prices, the seat. That
+            is the axis a general program has to hold up across. Across groups
+            the adversary varies too, so a difference between two of them says
+            nothing about either -- and the only reading that survives is
+            "that opponent does this", which is the fitting the message exists
+            not to encourage.
     """
 
     program_id: str
@@ -91,7 +113,36 @@ class Result(BaseModel):
     games: int = 0
     seeds: list[int]
     hardest: str
-    states: dict[str, list[harness.Day]]
+    states: dict[str, list[harness.Game]]
+
+    def beats(self, other: "Result") -> bool:
+        """Whether this scored better than ``other`` over what both played.
+
+        The shared opponents rather than `fitness`, because the pool grows
+        while a session runs -- harvest enrolled one at 14:01 on 2026-09-13,
+        mid-session -- and a mean over a pool that gained an agent is not the
+        same number as a mean over the pool before it. The shift is about a
+        forty-seventh of a rate difference, which is the size of the
+        improvements this comparison exists to tell apart.
+
+        Ties go to ``other``. Two programs that draw every game are the same
+        program however their sources differ, and there is no reason to move
+        onto one of them.
+
+        Args:
+            other: The result to compare against, usually the program this one
+                was edited from.
+
+        Returns:
+            True when this result is the better of the two. False when they
+            share no opponent, which is not a comparison.
+        """
+        common = sorted(set(self.rates) & set(other.rates))
+        if not common:
+            return False
+        mine = sum(self.rates[one] for one in common) / len(common)
+        theirs = sum(other.rates[one] for one in common) / len(common)
+        return mine > theirs
 
 
 def _mean(rates: dict[str, float]) -> float:
@@ -170,17 +221,30 @@ def score(
     program_id: str,
     pool: Pool,
     rng: random.Random,
+    seeds: Sequence[int],
     workers: int,
     pool_file: Path | None = None,
     standings: dict[str, float] | None = None,
     always: Sequence[str] = (),
 ) -> Result:
-    """Mean win rate over ``GATE_SEEDS`` fresh seeds, both seats.
+    """Mean win rate over ``GATE_SEEDS`` seasons, both seats.
 
-    The seeds are drawn per call from the whole range, so no two programs are
-    ranked on the same maps and none is ever measured on maps it or its
-    ancestors were selected on. That is what a held-out set is for, and it is
-    why there is no longer one: redrawing every call gives it continuously.
+    The seeds come from the caller so that every candidate in one round plays
+    the same seasons, and are redrawn between rounds. Both halves matter and
+    they pull in opposite directions.
+
+    Redrawing is what a held-out set was for: no program is ever measured on
+    maps it or its ancestors were selected on, and getting that continuously
+    is why there is no reserved block any more.
+
+    Sharing is what makes two candidates comparable. Drawn per call, they were
+    never ranked on the same seasons, and a season is most of what a rating
+    measures: one unchanged agent put through this five times, opponents held
+    fixed and only the seeds moving, produced fitted ratings from -3.466 to
+    -2.226 -- a standard deviation of 0.491 against a promotion bar that used
+    to be 0.15. Holding the seeds and varying the *opponents* instead moved it
+    0.070. The maps are seven times the draw, which was the opposite of what
+    this looked like before it was measured.
 
     Every game is played with its day table recorded, because one of them is
     what the loop shows a model of how its program played. Which one is not
@@ -193,7 +257,8 @@ def score(
         agent: The candidate's ``main.py``.
         program_id: The program being scored, so it is not among them.
         pool: The opponents to measure against.
-        rng: The generator the seeds are drawn from.
+        rng: The generator the opponent draw comes from.
+        seeds: The seasons to play, shared by every candidate in this round.
         workers: Processes to fan the games over.
         pool_file: Where a champion's name resolves from, since the
             roster only knows the vendored opponents.
@@ -213,15 +278,29 @@ def score(
             failed evaluation, never a zero score, so this propagates.
     """
     measured = opponents(pool, program_id, agent)
-    # A sample, not the pool. Nothing leaves the pool any more, so it is
-    # everything the campaign has produced or harvested and a candidate cannot
-    # play all of it -- sixty opponents is nearly four thousand games for one
-    # verdict. A rating does not need it to: the fit spans every pairing on
-    # the record, so a candidate adds sixteen edges and is placed against the
-    # rest through them.
-    names = measured.sample(standings or {}, rng, program_id, always)
-    seeds = rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
-    games = harness.play(agent, names, seeds, workers, days=True, pool=pool_file)
+    # The whole pool, not a sample of it, and that is what lets a win rate be
+    # the answer on its own.
+    #
+    # It was a draw of `GATE_OPPONENTS` from the pool, and the draw is the only
+    # reason this ever needed a Bradley-Terry fit: two candidates measured
+    # against different samples have win rates that are not comparable, so a
+    # rating was fitted across every pairing on the record to place them
+    # against each other through opponents neither had played. That bought a
+    # rating whose additive constant is undefined, a dependence on other
+    # agents' stored pairings, and 0.745 of fit noise on an unchanged agent --
+    # to avoid 320 games.
+    #
+    # Measured 2026-09-12: 24 of 34 opponents is 768 games and 6.4 minutes at
+    # five workers; all 34 is 1,088 games and 9.1 minutes, against a codex call
+    # that takes ten to twenty-five. Played by everyone on the same seeds in
+    # both seats, the design is complete and balanced, and the win rate is then
+    # the whole of what a rating was estimating.
+    #
+    # This does make the pool's size a cost multiplier where it used to be
+    # free: sixty opponents is sixteen minutes an evaluation and a hundred is
+    # twenty-seven, so the cap on the pool is load-bearing now.
+    names = measured.names()
+    games = harness.play(agent, names, list(seeds), workers, days=True, pool=pool_file)
     rates = _rates(games, names)
     contested = _contested(games, names)
     # Ties on the rate are broken by the margin, because before the first win
@@ -230,14 +309,17 @@ def score(
     # one it came closest to beating.
     margins = harness.margins(games, names)
     hardest = min(rates, key=lambda name: (rates[name], margins[name].mean))
-    # The narrowest game against each: the one a small change would have
-    # flipped, which is what a round can act on. Taking the widest loss
-    # instead showed the failure at its starkest and the least reachable.
+    # Every game, grouped by opponent, narrowest first within each group. The
+    # narrowest is the one a small change would have flipped, so it leads; the
+    # widest shows the failure at its starkest and the least reachable, so it
+    # does not. This used to keep the narrowest alone and drop the other
+    # thirty-one against each opponent, which is a round being told about one
+    # thirty-second of what it is scored on.
     states = {
-        name: min(
+        name: sorted(
             (game for game in games if game.opponent == name),
             key=lambda game: abs(game.ours - game.theirs),
-        ).days
+        )
         for name in names
     }
     played = 2 * len(seeds)

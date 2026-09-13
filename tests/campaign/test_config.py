@@ -92,7 +92,11 @@ def test_core_budget_leaves_headroom() -> None:
 def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
     assert config.SESSIONS == 8
-    assert config.ROUNDS_PER_SESSION == 5
+    # Twelve consecutive attempts against one opponent, and a session works
+    # through every opponent in the pool -- so a session's length is the pool's
+    # rather than a constant, and there is no ROUNDS_PER_SESSION.
+    assert config.ROUNDS_PER_OPPONENT == 12
+    assert not hasattr(config, "ROUNDS_PER_SESSION")
     # Sixteen seeds over twenty-four opponents: 768 games a candidate, up from
     # the 512 that sixteen opponents cost. The budget goes into opponents
     # because a rating's precision comes from the whole graph -- one more
@@ -115,8 +119,10 @@ def test_constants_match_the_spec_table() -> None:
         f"{config.GATE_OPPONENTS}: the draw would truncate the vendored set, "
         "which is the only cross-population evidence the gate gets"
     )
-    # A bar with units in it. A rank had none, and promoted on a hair.
-    assert config.PROMOTION_MARGIN > 0
+    # There is deliberately no promotion margin: a fixed bar could not
+    # answer a noise level that varies, and `gate.promotion` asks for a
+    # margin beyond twice its own error instead.
+    assert not hasattr(config, "PROMOTION_MARGIN")
     assert config.STAGNATION_SESSIONS == 40
     assert config.CODEX_MODEL == "gpt-5.6-luna"
     assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
