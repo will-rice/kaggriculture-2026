@@ -1,7 +1,10 @@
 """Where somebody else's program may run, and where it may write."""
 
 import ast
+import multiprocessing
 import os
+import signal
+import time
 from pathlib import Path
 
 from kaggriculture.campaign import config, kernel_watch, pools
@@ -200,3 +203,77 @@ def test_no_campaign_path_depends_on_where_the_process_stands() -> None:
         f"{', '.join(relative)} is relative to the working directory, which "
         "the campaign moves. Anchor it to `config.ROOT`."
     )
+
+
+def spin(marker: str) -> None:
+    """Report this worker, then never return. The shape of a wedged candidate."""
+    Path(marker).write_text(str(os.getpid()), encoding="utf-8")
+    while True:
+        pass
+
+
+def hold_a_spinning_worker(marker: str) -> None:
+    """Hand a pool a task that never returns, and wait on it forever.
+
+    The middle process of the three: the one `validate` kills, and not the one
+    running the candidate. Module-level so `spawn` can import it.
+    """
+    with pools.workers(1) as pool:
+        pool.submit(spin, marker).result()
+
+
+def alive(pid: int) -> bool:
+    """Whether a process still exists, reaped zombies included."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_worker_dies_with_the_process_that_started_it(tmp_path: Path) -> None:
+    """Kill the middle process; the worker under it must not survive.
+
+    This is the arrangement `validate` makes on every candidate that hangs on
+    import, which is a thing evolved source does: the validator hands the file
+    to a child, the child plays it in a worker of its own, and when the
+    deadline passes the validator kills the child. `SIGKILL` runs no cleanup,
+    so the pool in that child is never shut down and the worker -- the process
+    actually running the candidate -- is orphaned mid-task and keeps going.
+
+    Left alone it holds a core and the `multiprocessing` resource tracker's
+    pipe, and the tracker's pipe is what the interpreter that started all of
+    this waits on to exit. The suite passed in three minutes on 2026-09-14 and
+    the process sat for an hour afterwards on exactly one of these.
+
+    Three real processes and no stand-in for any of them, because every part
+    of the arrangement that matters is a kernel behaviour: what `SIGKILL`
+    skips, what re-parenting does, and whose death the worker is told about.
+    """
+    marker = tmp_path / "worker.pid"
+    middle = multiprocessing.get_context("spawn").Process(
+        target=hold_a_spinning_worker, args=(str(marker),)
+    )
+    middle.start()
+
+    deadline = time.monotonic() + 60
+    while not (marker.exists() and marker.read_text(encoding="utf-8").isdigit()):
+        assert time.monotonic() < deadline, "the worker never reported itself"
+        time.sleep(0.05)
+    worker = int(marker.read_text(encoding="utf-8"))
+
+    try:
+        middle.kill()
+        middle.join()
+
+        deadline = time.monotonic() + 30
+        while alive(worker):
+            assert time.monotonic() < deadline, (
+                f"worker {worker} outlived the process that started it"
+            )
+            time.sleep(0.05)
+    finally:
+        # A failure here means the thing this test exists to prevent, and
+        # leaving it running would wedge the interpreter reporting it.
+        if alive(worker):
+            os.kill(worker, signal.SIGKILL)
