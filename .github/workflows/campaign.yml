@@ -4,6 +4,14 @@
 # opponent corpus, the episode archive or the Kaggle image are marked
 # `local_data` and skip here (tests/conftest.py); pre-commit runs them on
 # the box that has the data.
+#
+# The games database is *not* one of those. It holds no vendored anything --
+# the live tests each build a database of their own and drop it -- and it is
+# where this week's two silent failures both lived: two tables whose partition
+# keys had drifted froze the corpus for four days, and a reader left on SQLite
+# after the migration took the nightly job down. Neither was visible here,
+# because without a server those tests raise `Connection refused` rather than
+# skip, and the whole check has been red on main since that migration landed.
 name: campaign
 
 on:
@@ -13,6 +21,19 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    services:
+      # The version the compose file pins, on the port `config.GAMES_URL`
+      # defaults to. Empty at startup and never seeded: what the live tests
+      # check is the storage's own behaviour, and each builds what it needs.
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget --spider -q http://127.0.0.1:8123/ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
