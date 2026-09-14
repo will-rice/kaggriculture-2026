@@ -117,10 +117,15 @@ def main() -> None:
     """Cluster the corpus into families and write one tape opponent for each."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
+    # The window the ratings are fitted over, not a date. This runs nightly
+    # now, and a pinned day would widen by one every night until the families
+    # were clustered over two fields that share no names -- which is the same
+    # reason `dataset.recent` exists and the same window `evidence` measures a
+    # claim over.
     parser.add_argument(
         "--since",
-        default="2026-09-06",
-        help="only games played this day or later (default: %(default)s)",
+        default=dataset.recent(),
+        help="only games played this day or later (default: the rating window)",
     )
     parser.add_argument(
         "--threshold",
@@ -134,10 +139,13 @@ def main() -> None:
         default=LEAST,
         help="episodes an agent needs to be clustered (default: %(default)s)",
     )
+    # Beside the harvested kernels, not under them: the loop adopts what it
+    # finds here by the `family_` prefix its names carry, and a directory of
+    # its own would be a second place to keep opponents.
     parser.add_argument(
         "--out",
         type=Path,
-        default=config.OPPONENTS / "families",
+        default=config.OPPONENTS,
         help="where the tapes are written (default: %(default)s)",
     )
     arguments = parser.parse_args()

@@ -514,25 +514,36 @@ class Campaign:
         published agents, and those frozen on the day someone last ran the
         harvest by hand.
 
+        Two sources, because the field has two halves. Newly published kernels
+        are discovered, downloaded, built and played here. Tape opponents are
+        not: the nightly corpus job clusters the day's replays into behavioural
+        families and writes one tape each, and what this does is notice them.
+
         Discovery, the download, the build and the 720-step check all go to a
         thread, because each is slow and none of them is the pool's. The pool
         is changed here, on the loop, where `gate.promote` also changes it and
         nothing runs at the same time. A load-modify-save from that thread
-        would quietly drop any champion promoted while it was downloading.
+        would quietly drop any champion promoted while it was downloading --
+        which is also why the nightly job writes tapes to disk and leaves them
+        there, rather than joining them to the pool itself.
 
         A failed harvest is not a failed campaign: the competition's API is
         somebody else's uptime, and a run that has been evaluating for hours
-        must not end because a listing timed out.
+        must not end because a listing timed out. The families are taken first
+        and kept whatever the listing does, for the same reason -- they are a
+        glob of the local disk, and nothing about them can fail that way.
         """
         while True:
             await asyncio.sleep(config.HARVEST_INTERVAL_SECONDS)
+            found = harvest.families(set(self.pool.opponents))
             try:
-                found = await asyncio.to_thread(
-                    harvest.vendored, config.HARVEST_LIMIT, set(self.pool.opponents)
+                found |= await asyncio.to_thread(
+                    harvest.vendored,
+                    config.HARVEST_LIMIT,
+                    set(self.pool.opponents) | set(found),
                 )
             except Exception:
                 LOGGER.exception("harvest failed; the campaign continues")
-                continue
             if not found:
                 continue
             self.pool.opponents.update(found)
