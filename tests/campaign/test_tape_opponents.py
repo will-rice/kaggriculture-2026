@@ -13,11 +13,12 @@ the result was going to say so.
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from kaggriculture.campaign import games, harness
-from kaggriculture.scripts.tape_opponents import _slug, tape, write_agent
+from kaggriculture.scripts.tape_opponents import tape, write_agent
 
 
 def test_a_family_is_named_the_same_way_in_every_process() -> None:
@@ -62,7 +63,7 @@ def test_a_family_is_named_the_same_way_in_every_process() -> None:
 @pytest.mark.local_data
 @pytest.mark.parametrize("index", range(3), ids=lambda i: f"episode{i}")
 def test_both_seats_of_a_recorded_game_replay_to_the_recorded_banks(
-    index: int, tmp_path
+    index: int, tmp_path: Path
 ) -> None:
     """Tape both sides of one recorded episode, play them, and compare.
 
