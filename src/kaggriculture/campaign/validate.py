@@ -28,7 +28,9 @@ life of the run. The candidate's code runs one layer further in, inside
 
 import ast
 import multiprocessing
+import os
 import queue
+import signal
 import time
 from multiprocessing.queues import Queue
 from pathlib import Path
@@ -256,11 +258,20 @@ def _dynamic_child(agent: str, steps: int, results: "Queue[dict]") -> None:
     candidate's own code runs inside `harness.check`, in a directory of its
     own, and no longer here.
 
+    The first thing it does is leave its parent's process group, because the
+    last thing that may happen to it is being killed for taking too long. It
+    is not the process running the candidate -- `harness.check` opens a worker
+    for that, one layer further in -- so killing this process alone ends the
+    supervisor and leaves the supervised, mid-task, with no parent and no
+    reason to stop. A session of its own makes the whole family addressable by
+    the one thing that knows when to end it.
+
     Args:
         agent: The candidate's `main.py` as an absolute path string.
         steps: How many turns `harness.check` plays before stopping.
         results: Where the verdict goes, as a plain dict.
     """
+    os.setsid()
     results.put(_dynamic(Path(agent), steps).model_dump())
 
 
@@ -327,8 +338,7 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
                     ),
                 )
             if time.monotonic() >= deadline:
-                process.kill()
-                process.join()
+                _kill_the_family(process)
                 return Verdict(
                     status="too_slow",
                     reason=(
@@ -339,6 +349,36 @@ def _dynamic_verdict(agent: Path, steps: int) -> Verdict:
                 )
     process.join()
     return Verdict.model_validate(payload)
+
+
+def _kill_the_family(process: "multiprocessing.process.BaseProcess") -> None:
+    """End the check: the child, and everything the child started.
+
+    `Process.kill` signals one process. The candidate runs two deep -- this
+    child supervises, `harness.check`'s worker executes -- so on 2026-09-14
+    the one program that had to be stopped was the one process left running:
+    orphaned to init, spinning at a core, and still holding the write end of
+    the `multiprocessing` resource tracker's pipe, which is what the
+    interpreter above waits on to exit. The suite passed in 184s and then sat
+    for an hour; three of these were alive on the workstation at once.
+
+    `_dynamic_child` calls `setsid` before anything else, so by the time a
+    deadline can pass there is a group to name and everything the check
+    started is in it. A child that has not got that far has started nothing,
+    and is killed by the line below on its own account.
+
+    Args:
+        process: The check's child, started, running in a session of its own.
+    """
+    pid = process.pid
+    if pid is None:
+        raise RuntimeError("the check's child was never started")
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Not a group yet, so not a family yet either: `setsid` had not run.
+        process.kill()
+    process.join()
 
 
 def validate(agent: Path, steps: int = 720, seed: Path | None = None) -> Verdict:
