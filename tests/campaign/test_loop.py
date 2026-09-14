@@ -1927,6 +1927,47 @@ def _champion(name: str, fitness: float) -> gate.Champion:
     )
 
 
+def test_a_champion_measured_on_other_seasons_is_not_a_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The gate needs the champion measured on the block the candidate played.
+
+    `champion.json` carries the result the champion was promoted on, and the
+    seasons move: `GATE_SEED_ROTATION` draws a fresh block every sixty-four
+    candidates and every launch draws one. Measured 2026-09-14, champion_12
+    scored 0.454 over fifty shared opponents on the block it was promoted on
+    and 0.205 over the same fifty on the block drawn eight hours later -- a
+    drift of 0.249 against a promotion bar of 0.035. Twenty-two candidates were
+    turned away that morning for failing to reach a number the champion itself
+    could no longer reach; they had scored 0.234 to 0.366 and every one of them
+    had beaten it.
+
+    So a baseline from another block is refused rather than used. A session
+    measures the program it starts from, so the champion is re-measured on the
+    current block eight times a generation and the refusal is a short window
+    after a rotation, not a wall.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    standing = _champion("ours", 0.5)
+    played = _gate_result("cand", {"v54": 0.9})
+
+    # Nothing measured yet: there is a champion and no way to compare with it.
+    assert campaign.paired(standing, played) is None
+
+    # Measured, but on seasons this candidate never played.
+    elsewhere = _gate_result("ours", {"v54": 0.5})
+    campaign.champion_baseline = (standing.path, (99,), elsewhere)
+    assert campaign.paired(standing, played) is None
+
+    # Measured on the same seasons: the comparison is that measurement, and
+    # not the one frozen at promotion time.
+    here = _gate_result("ours", {"v54": 0.2})
+    campaign.champion_baseline = (standing.path, tuple(played.seeds), here)
+    paired = campaign.paired(standing, played)
+    assert paired is not None
+    assert paired.result.rates == {"v54": 0.2}, "the gate used the stale result"
+
+
 def test_the_gate_asks_for_the_floor_and_not_the_whole_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
