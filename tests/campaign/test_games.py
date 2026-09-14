@@ -8,42 +8,13 @@ checked against a stand-in for the thing being relied on.
 """
 
 import logging
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from kaggriculture.campaign import dataset, games
 
-from .fixtures import day, game
-
-
-def running() -> bool:
-    """Whether the server is up, so the suite can say why it skipped."""
-    try:
-        return games.query("SELECT 1") == "1"
-    except (urllib.error.URLError, OSError, RuntimeError):
-        return False
-
-
-live = pytest.mark.skipif(not running(), reason="no ClickHouse on GAMES_URL")
-
-
-@pytest.fixture
-def scratch(request: pytest.FixtureRequest) -> str:
-    """A database of this test's own, with the real schema, dropped after.
-
-    Every live test takes this rather than writing into the campaign's own.
-    They used not to, and tidied up afterwards instead -- which means tidying
-    the tables somebody remembered: a write goes to five of them, the teardown
-    cleared one, and ten probe episodes were sitting in the real store before
-    anything noticed.
-    """
-    name = f"test_{abs(hash(request.node.name)):x}"[:40]
-    games.query(f"DROP DATABASE IF EXISTS {name}")
-    request.addfinalizer(lambda: games.query(f"DROP DATABASE IF EXISTS {name}"))
-    games.create(name)
-    return name
+from .fixtures import day, game, live
 
 
 def test_the_column_types_come_from_what_the_measures_actually_hold() -> None:
