@@ -39,6 +39,7 @@ the same material the corpus extraction reads.
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -48,7 +49,7 @@ import zlib
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from kaggriculture.campaign import config, games
+from kaggriculture.campaign import config, dataset, games
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +67,10 @@ class Profile(NamedTuple):
         episode: The episode its tape is taken from.
         seat: Which side of that episode was its.
         played: The day that episode was played, which names its archive.
+        rating: Its Bradley-Terry rating over the recorded corpus, which is
+            what decides who represents a family. Agents that never played
+            enough to be rated sit at negative infinity and are taken only when
+            a family holds nothing else.
         features: The values `FEATURES` names, in that order.
     """
 
@@ -75,6 +80,7 @@ class Profile(NamedTuple):
     episode: str
     seat: int
     played: str
+    rating: float
     features: tuple[float, ...]
 
 
@@ -182,6 +188,10 @@ def measured(since: str, least: int) -> list[Profile]:
         One profile per agent: its name, its episode count, the features it is
         clustered on, and the episode a tape would be taken from.
     """
+    # The rating the corpus fits over every recorded pairing, which is what
+    # picks a family's representative. An agent with too few games to rate is
+    # absent here and sorts last.
+    rated = {team: value for team, _, _, value, _ in dataset.ladder(games.DATABASE)}
     picked = ", ".join(
         f"round(median(if(d.day = {day}, d.{column}, null)), 3) as {name}"
         for name, day, column, _ in FEATURES
@@ -210,6 +220,7 @@ def measured(since: str, least: int) -> list[Profile]:
                 episode=episode,
                 seat=seat,
                 played=played,
+                rating=rated.get(parts[0], -math.inf),
                 features=values,
             )
         )
@@ -317,22 +328,38 @@ def _distance(a: tuple[float, ...], b: tuple[float, ...]) -> float:
 def representative(family: list[Profile]) -> Profile:
     """The agent whose record the family's tape is taken from.
 
-    The one with the most episodes, because the members play the same plan and
-    what distinguishes them is how completely each was recorded.
+    The strongest of them, by the rating the corpus fits over every recorded
+    pairing. This was the one with the most episodes, on the reasoning that the
+    members play the same plan and what separates them is how completely each
+    was recorded. They are near-identical and not identical -- five accounts
+    finishing on the same bank to the unit still differ in the last few percent
+    -- and the most-copied fork is not the best-executed one. Taking the best
+    makes each family's opponent the hardest version of that strategy, which is
+    what a gate should be made of.
+
+    Episodes break a tie, because a rating over more games is the surer one.
     """
-    return max(family, key=lambda p: p.episodes)
+    return max(family, key=lambda p: (p.rating, p.episodes))
 
 
 def _slug(team: str) -> str:
     """A directory name for a team, which may hold spaces or any script.
 
-    The corpus records display names -- "Crop Dusta", "3정훈" -- and a pool
-    entry is a directory. Anything outside the roster's alphabet becomes an
-    underscore, and a name that reduces to nothing keeps a hash of itself, so
-    that two names that both reduce to nothing do not collide.
+    The corpus records display names -- "Crop Dusta", "3정훈", "沒有道歉 沒有道歉"
+    -- and a pool entry is a directory. Anything outside the roster's alphabet
+    becomes an underscore, and a name that reduces to nothing keeps a digest of
+    itself, so that two names that both reduce to nothing do not collide.
+
+    `blake2b` and not `hash`, which is salted per process: the same agent came
+    back as `family_3f90f6864ce77c74` and `family_4bb6499b2120bae3` on two
+    consecutive runs, so re-running would have enrolled a second pool entry for
+    a family that already had one, and gone on doing it.
     """
     kept = "".join(c if c.isalnum() and c.isascii() else "_" for c in team).strip("_")
-    return f"family_{kept.lower()}"[:40] if kept else f"family_{abs(hash(team)):x}"[:40]
+    if kept:
+        return f"family_{kept.lower()}"[:40]
+    digest = hashlib.blake2b(team.encode(), digest_size=8).hexdigest()
+    return f"family_{digest}"
 
 
 def tape(played: str, episode: str, seat: int) -> dict[str, Action]:
@@ -365,10 +392,21 @@ def tape(played: str, episode: str, seat: int) -> dict[str, Action]:
         if member is None:
             raise FileNotFoundError(f"episode {episode} is not in {path.name}")
         steps = json.loads(archive.read(member))["steps"]
+    # An archived action is filed under the state it produced, not the state it
+    # was taken at: `replay_corpus.replay` advances the engine with `steps[N]`'s
+    # action and then compares the result against `steps[N]`'s observation, so
+    # that action was returned one step earlier. The actions therefore run from
+    # index 1 to 719 and replay at steps 0 to 718 -- which is exactly the 719
+    # calls a seat gets, the last recorded state being the one nobody acts on.
+    #
+    # Keyed at the index instead, every command fires a step late, and for a
+    # plan that walks blind that is not an approximation: the units stand one
+    # move from where the plan expects them, so `PLANT` meets a tile that is not
+    # `Tile::Empty` and the engine no-ops it in silence.
     return {
-        str(index): step[seat]["action"]
+        str(index - 1): step[seat]["action"]
         for index, step in enumerate(steps)
-        if step[seat].get("action")
+        if index > 0 and step[seat].get("action")
     }
 
 
