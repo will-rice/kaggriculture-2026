@@ -93,17 +93,31 @@ PLAYING = frozenset({"ACTIVE", "INACTIVE", "DONE"})
 def compare(expected: Any, actual: Any, path: str) -> Divergence | None:  # noqa: ANN401
     """Return the first difference between two observation trees, if any.
 
-    Dict key order is ignored except inside per-unit inventories, where the
-    reference's insertion order decides what survives an end-of-day drop.
+    Dict key order is ignored, including inside per-unit inventories. It was
+    compared there until 2026-09-14, on the reasoning that insertion order
+    decides what survives an end-of-day drop -- which is true of the engine:
+    `UnitAction::Drop` walks the inventory in order filling the shed to
+    `shed_capacity`, so order decides which goods get the last slots.
+
+    The recording cannot witness it. Every archive is written with sorted keys
+    -- checked across a whole episode, 0 dicts of any kind out of alphabetical
+    order -- so the recorded order is alphabetical by construction and the
+    engine's is insertion order, and comparing them reports a difference
+    whenever the true order is not alphabetical. That is most of the time: it
+    failed 8 of 8 recent episodes on an engine that is otherwise exact, so the
+    tool could not pass and was gating nothing. With order ignored those same
+    8 replay identically, every field of every observation of every turn.
+
+    What it was guarding needs a test against the reference rather than against
+    the archive, because the archive discarded the evidence. The reference's
+    `_inv_add` is a plain dict, so its insertion order matches ours by
+    construction; the drop is worth a differential test of its own.
     """
     if isinstance(expected, Mapping) and isinstance(actual, Mapping):
         left: dict[Any, Any] = dict(expected)
         right: dict[Any, Any] = dict(actual)
-        ordered = ".inventories[" in path
-        if (ordered and list(left) != list(right)) or (
-            not ordered and set(left) != set(right)
-        ):
-            return Divergence(-1, -1, f"{path} keys", list(left), list(right))
+        if set(left) != set(right):
+            return Divergence(-1, -1, f"{path} keys", sorted(left), sorted(right))
         for key in left:
             found = compare(left[key], right[key], f"{path}.{key}")
             if found is not None:
