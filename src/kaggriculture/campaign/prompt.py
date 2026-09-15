@@ -87,7 +87,8 @@ GAMES = config.GAMES_URL
 # made and returned 476 programs of which one scored above nought.
 INSTRUCTION = (
     "Write a program that beats the opponent. Commit to the season's plan "
-    "before it starts, then carry it out."
+    "before it starts, then carry it out. `measure.py` plays as many seasons "
+    "as you ask it to: search for that plan, do not only check an edit."
 )
 # The objective, and the shape it is to be pursued in.
 #
@@ -115,6 +116,17 @@ INSTRUCTION = (
 # same opponent and 694 of 720 against a different one -- it does not look at
 # the board at all -- and it still holds champion_14, fourteen champions of
 # per-turn adaptation, to 0.5625. Adaptation is not where the coins are.
+#
+# The third sentence is the same change aimed at the other half of the
+# problem. A round has been able to play its own games since `measure.py`
+# arrived on 2026-09-10 -- paired, both seats, a difference of 5,000 coins
+# resolved in about four games where the gate needs 114 -- and no message has
+# ever mentioned the file. The only place it is named is the `query-games`
+# skill, under the heading "Then measure the change", which is the whole
+# difficulty: it reads as a way to check an edit that has already been
+# decided, and a round that believes that will tweak and verify rather than
+# search. No transcript is kept, so how often it is actually run is not
+# something this can cite -- only that nothing ever asked for it.
 #
 # The gate is unchanged, so this costs nothing if it is wrong: a candidate of
 # the new shape is promoted only by beating champion_14 over the same pool as
