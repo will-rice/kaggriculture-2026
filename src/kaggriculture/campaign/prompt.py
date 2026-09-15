@@ -85,8 +85,40 @@ GAMES = config.GAMES_URL
 # per session -- and two of them, "a completely different algorithm" and "a
 # novel approach inspired by this one", took 54% of every call the campaign
 # made and returned 476 programs of which one scored above nought.
-INSTRUCTION = "Write a program that beats the opponent. Watch the market."
-# The objective, and one place to look.
+INSTRUCTION = (
+    "Write a program that beats the opponent. Commit to the season's plan "
+    "before it starts, then carry it out."
+)
+# The objective, and the shape it is to be pursued in.
+#
+# The second sentence was replaced on 2026-09-15. What it replaced is kept
+# below because the reasoning still holds and only stopped being the binding
+# constraint.
+#
+# Commitment is the thing this lineage has never had, and the measurement that
+# says so is old. In the tape lineage the plan was worth ~136,680 mean bank and
+# everything 69 promotions added on top of it was worth +440: the tape was
+# byte-identical from the seed to champion_69, and 521 sessions never touched
+# it. The search was not lazy, it was locked out -- a plan reaches a proposer as
+# 29,820 chars of base64, which does not fit in a prompt beside a 3,220-line
+# program.
+#
+# It still does not fit, and `base64` and `zlib` are no longer importable
+# either, so a round cannot be handed a table to edit and cannot ship one. What
+# it can write is the thing that produces a plan: decide the season up front,
+# then execute. That is the only form of long-horizon commitment available to
+# it -- buy on day 3 for a day-22 payoff is not something a per-turn rule
+# reaches by improving the program it was handed.
+#
+# What makes it worth the round: the tape lineage's own first champion replays
+# a fixed plan, 720 of 720 commands identical on a different season against the
+# same opponent and 694 of 720 against a different one -- it does not look at
+# the board at all -- and it still holds champion_14, fourteen champions of
+# per-turn adaptation, to 0.5625. Adaptation is not where the coins are.
+#
+# The gate is unchanged, so this costs nothing if it is wrong: a candidate of
+# the new shape is promoted only by beating champion_14 over the same pool as
+# anything else.
 #
 # The second sentence was added on 2026-09-14 and is a deliberate exception to
 # the line below it. champion_12 had stood for five and a half hours of loop
@@ -121,7 +153,7 @@ INSTRUCTION = "Write a program that beats the opponent. Watch the market."
 # It also asked for the wrong thing. A round told to improve a margin improves
 # the program it was handed, and seventy-nine rounds did exactly that without
 # once leaving that program's shape.
-INSTRUCTION_NAME = "win"
+INSTRUCTION_NAME = "plan"
 
 
 class Message:
