@@ -49,9 +49,8 @@ what it measured; never read opponent source.
 
 ### Clock and resolution
 
-A season is `30` days, numbered `0` to `29`, of `24` hours each: `720` states
-and `719` policy calls. Every decision is one of those 719, and a decision made
-on day `3` is still being paid for on day `22`.
+A season is `30` days, numbered `0` to `29`. A decision made on day `3` is
+still being paid for on day `22`.
 
 The board defaults to `10×10`; both players start with `$3000`. Days and hours
 are zero-based, with `24` hour labels per day. An ordinary day-end follows the
