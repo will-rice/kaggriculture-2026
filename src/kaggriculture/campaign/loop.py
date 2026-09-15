@@ -644,7 +644,13 @@ class Campaign:
                 ]
                 playing = against[attempt % len(against)]
             message = prompt.compose(
-                name, playing, result.fitness, failures, siblings, instruction
+                name,
+                playing,
+                result.fitness,
+                failures,
+                siblings,
+                instruction,
+                source.read_text(encoding="utf-8"),
             )
             outcome = await self.round(source, name, result, message, siblings, drawn)
             rounds += 1

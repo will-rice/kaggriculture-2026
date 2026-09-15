@@ -13,6 +13,7 @@ Placeholders, all filled on every round:
   {tried}        the edits already made to this program and what they scored,
                  or empty before any has been
   {failures}     the lineage's recent rejected attempts, or empty
+  {schedule}     which days of the season the program has already decided
   {instruction}  what to do
 -->
 
@@ -52,6 +53,7 @@ opponent your lineage did not start from.
 {game}
 {tried}
 {failures}
+{schedule}
 
 ## Your instruction
 

@@ -22,6 +22,7 @@ Nothing measured off other agents' games reaches a round; see the note on the
 build order below for what happened when it did.
 """
 
+import ast
 import logging
 import re
 from pathlib import Path
@@ -361,6 +362,76 @@ def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> lis
     return lines
 
 
+def schedule(source: str) -> dict[int, int]:
+    """How many of a program's conditions name a particular day.
+
+    A proxy for commitment, and a deliberately crude one: a decision taken at a
+    fixed day is a plan whether it is written as a table or as `if day == 3`,
+    and counting the days a program's conditions name is the cheapest way to
+    see which parts of the season it has decided in advance.
+
+    It undercounts. A decision committed to a day whose quantity is computed
+    from inventory still reads as one condition, and a schedule expressed
+    through a variable rather than a literal is invisible here. What it is for
+    is the shape: measured on champion_15, 30 of 46 named day 29 and eight days
+    of the season carried the other 16.
+
+    Args:
+        source: The program, as text.
+
+    Returns:
+        Day to how many conditions name it, empty if the source will not parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    counted: dict[int, int] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        parts = [node.left, *node.comparators]
+        if not any(_names_the_day(part) for part in parts):
+            continue
+        for part in parts:
+            if isinstance(part, ast.Constant) and isinstance(part.value, int):
+                counted[part.value] = counted.get(part.value, 0) + 1
+    return dict(sorted(counted.items()))
+
+
+def _names_the_day(node: ast.expr) -> bool:
+    """Whether this operand is the season's day, however it was reached."""
+    if isinstance(node, ast.Name):
+        return node.id == "day"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "day"
+    if isinstance(node, ast.Subscript):
+        index = node.slice
+        return isinstance(index, ast.Constant) and index.value == "day"
+    return False
+
+
+def _schedule_lines(source: str) -> list[str]:
+    """Where the program has already decided, and where it decides as it goes."""
+    counted = schedule(source)
+    if not counted:
+        return []
+    named = ", ".join(f"day {day}: {count}" for day, count in counted.items())
+    silent = [day for day in range(30) if day not in counted]
+    lines = [
+        "## Where your program has already decided",
+        "",
+        f"Conditions in `child.py` that name a day, counted: {named}.",
+    ]
+    if silent:
+        lines.append(
+            "It names no day at "
+            + ", ".join(str(day) for day in silent)
+            + " -- on those days it decides as it goes."
+        )
+    return lines
+
+
 def compose(
     name: str,
     played: tuple[int, int, harness.Game] | None,
@@ -368,6 +439,7 @@ def compose(
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
+    source: str = "",
 ) -> str:
     """Compose the message for one round.
 
@@ -391,6 +463,8 @@ def compose(
             first few, and `round` copies the same ones into the directory.
         instruction: ``INSTRUCTION``, with any stagnation note the caller
             prepended.
+        source: The program in ``child.py``, so the message can show which days
+            of the season it has already decided. Empty renders no section.
 
     Returns:
         The whole message, for codex's standard input.
@@ -401,12 +475,14 @@ def compose(
     # one leaves no gap.
     section = _game_lines(name, played)
     tried = _tried_lines(name, rate, siblings) if siblings else []
+    committed = _schedule_lines(source) if source else []
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         imports=IMPORTS,
         game="\n".join(section) + "\n" if section else "",
         tried="\n".join(tried) + "\n" if tried else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
+        schedule="\n".join(committed) + "\n" if committed else "",
         instruction=instruction,
     )
     LOGGER.info(

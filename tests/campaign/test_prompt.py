@@ -556,3 +556,52 @@ def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
 
     assert "the competition has recorded" in text
     assert prompt.GAMES in text
+
+
+COMMITTED = """
+def agent(observation, configuration=None):
+    day = observation["day"]
+    if day == 3:
+        return {"farmer": ["PLANT"], "hands": [], "market": []}
+    if day == 3 and observation["hour"] > 4:
+        return {"farmer": ["WATER"], "hands": [], "market": []}
+    if day >= 29:
+        return {"farmer": ["SELL"], "hands": [], "market": []}
+    if observation["cash"] > 500:
+        return {"farmer": ["BUY"], "hands": [], "market": []}
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
+
+def test_the_days_a_program_has_decided_are_counted_and_the_rest_named() -> None:
+    """What a round is shown about its own commitment.
+
+    A decision taken at a fixed day is a plan whether it is written as a table
+    or as `if day == 3`, and champion_15 put 32 of its 57 such conditions on
+    day 29 -- an endgame, not a season. The count is what lets a round see that
+    about itself; the days it names none of are the same fact from the other
+    side, and they are what the message actually says out loud.
+
+    The cash condition is here to be ignored: a comparison that names no day
+    is not a commitment to one, however many numbers it holds.
+    """
+    counted = prompt.schedule(COMMITTED)
+
+    assert counted == {3: 2, 29: 1}, counted
+    shown = "\n".join(prompt._schedule_lines(COMMITTED))
+    assert "day 3: 2" in shown and "day 29: 1" in shown
+    assert "500" not in shown, "a cash threshold was counted as a day"
+    # Every day it never names, so the silence is legible rather than implied.
+    for day in (0, 1, 2, 4, 28):
+        assert f"{day}" in shown.split("It names no day at")[1]
+
+
+def test_a_program_that_will_not_parse_is_shown_no_schedule() -> None:
+    """The message is composed before the gate rejects a broken edit.
+
+    `compose` runs on whatever the last round left in `child.py`, and a round
+    that wrote something unparseable must still get a message rather than take
+    the session down with a `SyntaxError` from the part that describes it.
+    """
+    assert prompt.schedule("def agent(o, c=None):\n    return {") == {}
+    assert prompt._schedule_lines("this is not python(") == []
