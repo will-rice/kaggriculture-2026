@@ -437,6 +437,27 @@ class Campaign:
         # alone cannot tell the gate that the champion moved mid-evaluation --
         # the file can.
         self.champion_played: dict[str, str] = {}
+        # The champion as measured on a given block, by the file measured and
+        # the seasons it was measured on. The gate compares a candidate against
+        # the champion, and the champion in `champion.json` carries the result
+        # it was promoted on -- a different block, and now a different pool.
+        #
+        # That comparison is not one. Measured 2026-09-14: champion_12 scored
+        # 0.454 over fifty shared opponents when it was promoted and 0.205 over
+        # the same fifty on the block drawn eight hours later, a drift of 0.249
+        # against a promotion bar of 0.035. Every one of the twenty-two
+        # candidates the gate turned away that morning had beaten it -- they
+        # ranged 0.234 to 0.366 -- and were refused for failing to reach a
+        # number the champion itself could no longer reach. The bar is sized
+        # for the sampling noise inside a block; the seasons are worth an order
+        # of magnitude more than that, which `GATE_SEED_ROTATION`'s own note
+        # records as an unchanged agent moving 1.24 log-odds across five
+        # blocks.
+        #
+        # A session measures the program it starts from, so the champion is
+        # re-measured on the current block eight times a generation for free.
+        # This keeps the latest of those.
+        self.champion_baseline: tuple[str, tuple[int, ...], Result] | None = None
         # A promotion writes the floor and swaps the champion's pool slot; eight
         # sessions promoting at once would race on both.
         self.promotions = asyncio.Lock()
@@ -493,25 +514,36 @@ class Campaign:
         published agents, and those frozen on the day someone last ran the
         harvest by hand.
 
+        Two sources, because the field has two halves. Newly published kernels
+        are discovered, downloaded, built and played here. Tape opponents are
+        not: the nightly corpus job clusters the day's replays into behavioural
+        families and writes one tape each, and what this does is notice them.
+
         Discovery, the download, the build and the 720-step check all go to a
         thread, because each is slow and none of them is the pool's. The pool
         is changed here, on the loop, where `gate.promote` also changes it and
         nothing runs at the same time. A load-modify-save from that thread
-        would quietly drop any champion promoted while it was downloading.
+        would quietly drop any champion promoted while it was downloading --
+        which is also why the nightly job writes tapes to disk and leaves them
+        there, rather than joining them to the pool itself.
 
         A failed harvest is not a failed campaign: the competition's API is
         somebody else's uptime, and a run that has been evaluating for hours
-        must not end because a listing timed out.
+        must not end because a listing timed out. The families are taken first
+        and kept whatever the listing does, for the same reason -- they are a
+        glob of the local disk, and nothing about them can fail that way.
         """
         while True:
             await asyncio.sleep(config.HARVEST_INTERVAL_SECONDS)
+            found = harvest.families(set(self.pool.opponents))
             try:
-                found = await asyncio.to_thread(
-                    harvest.vendored, config.HARVEST_LIMIT, set(self.pool.opponents)
+                found |= await asyncio.to_thread(
+                    harvest.vendored,
+                    config.HARVEST_LIMIT,
+                    set(self.pool.opponents) | set(found),
                 )
             except Exception:
                 LOGGER.exception("harvest failed; the campaign continues")
-                continue
             if not found:
                 continue
             self.pool.opponents.update(found)
@@ -572,6 +604,13 @@ class Campaign:
         # the floor is in the pool, so the next evaluation of anything would
         # raise too. The run stops rather than mutating what cannot play.
         result = await self.measure(source, name)
+        # A session that starts from the champion has just measured it on the
+        # current block, which is the only thing a candidate on that block can
+        # fairly be compared against. `gate` reads it; `champion.json` carries
+        # the result the champion was promoted on and cannot be repeated.
+        standing = self.state.champion
+        if standing is not None and str(source) == standing.path:
+            self.champion_baseline = (standing.path, tuple(result.seeds), result)
         # One instruction, the same every round: the bar the gate applies.
         # There were five drawn per session, and two of them -- "a completely
         # different algorithm" and "a novel approach inspired by this one" --
@@ -923,6 +962,20 @@ class Campaign:
                     }
                 )
                 return False
+            standing = self.paired(standing, result)
+            if standing is None and self.state.champion is not None:
+                LOGGER.info(
+                    "%s: the champion has not been measured on these seasons; "
+                    "not promoted",
+                    program_id,
+                )
+                self.log.log(
+                    {
+                        **self.promotion_record(result, False, baseline, table),
+                        "gate/stale": 1,
+                    }
+                )
+                return False
             verdict, why = gate.promotion(result, standing)
             # Logged either way. `why` is the only account of what the gate
             # decided and it used to be written only when the answer was yes:
@@ -966,6 +1019,35 @@ class Campaign:
             self.log.log(self.promotion_record(result, verdict, baseline, table))
             self.champion_played.pop(program_id, None)
             return verdict
+
+    def paired(self, standing: "Champion | None", result: Result) -> "Champion | None":
+        """The champion as measured on the seasons this candidate played.
+
+        The gate's question is whether a candidate beat the champion, and the
+        two have to have been measured on the same world for that to be a
+        question at all. The seasons are most of the world: an unchanged agent
+        through five blocks fitted ratings from -3.466 to -2.226, and
+        champion_12 scored 0.454 over fifty shared opponents on the block it
+        was promoted on and 0.205 over the same fifty eight hours later. The
+        promotion bar is 0.035, so a rotation swamps it by a factor of seven.
+
+        Args:
+            standing: The champion, carrying the result it was promoted on.
+            result: The candidate's evaluation, whose seeds say which block it
+                played.
+
+        Returns:
+            The champion with its measurement on those seasons, or None when
+            there is no such measurement and the comparison cannot be made.
+            None with no champion at all is champion zero's own gate and is
+            not a refusal; the caller tells the two apart.
+        """
+        if standing is None or self.champion_baseline is None:
+            return None
+        path, seeds, measured = self.champion_baseline
+        if path != standing.path or seeds != tuple(result.seeds):
+            return None
+        return standing.model_copy(update={"result": measured})
 
     def floor(self) -> str | None:
         """The champion's name, or None before there is one.

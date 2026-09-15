@@ -93,17 +93,36 @@ PLAYING = frozenset({"ACTIVE", "INACTIVE", "DONE"})
 def compare(expected: Any, actual: Any, path: str) -> Divergence | None:  # noqa: ANN401
     """Return the first difference between two observation trees, if any.
 
-    Dict key order is ignored except inside per-unit inventories, where the
-    reference's insertion order decides what survives an end-of-day drop.
+    Dict key order is ignored, including inside per-unit inventories. It was
+    compared there until 2026-09-14, on the reasoning that insertion order
+    decides what survives an end-of-day drop -- which is true of the engine:
+    `UnitAction::Drop` walks the inventory in order filling the shed to
+    `shed_capacity`, so order decides which goods get the last slots.
+
+    The recording cannot witness it. Every archive is written with sorted keys
+    -- checked across a whole episode, 0 dicts of any kind out of alphabetical
+    order -- so the recorded order is alphabetical by construction and the
+    engine's is insertion order, and comparing them reports a difference
+    whenever the true order is not alphabetical. That is most of the time: it
+    failed 8 of 8 recent episodes on an engine that is otherwise exact, so the
+    tool could not pass and was gating nothing. With order ignored those same
+    8 replay identically, every field of every observation of every turn.
+
+    What it was guarding is already covered where it can be, and is unreachable
+    where it cannot. The shed's contents are compared field by field like every
+    other measure, and the eight episodes that replay identically contain 14
+    drops with the shed at 90 or more of its 100 capacity. The case where order
+    decides -- a drop that overflows while the unit carries two or more items --
+    happens 0 times in 2,422 drops over 30 episodes. So there is nothing here to
+    pin that a synthetic input would not be inventing, and both implementations
+    walk their own insertion order, which the reference's plain-dict `_inv_add`
+    makes identical to ours by construction.
     """
     if isinstance(expected, Mapping) and isinstance(actual, Mapping):
         left: dict[Any, Any] = dict(expected)
         right: dict[Any, Any] = dict(actual)
-        ordered = ".inventories[" in path
-        if (ordered and list(left) != list(right)) or (
-            not ordered and set(left) != set(right)
-        ):
-            return Divergence(-1, -1, f"{path} keys", list(left), list(right))
+        if set(left) != set(right):
+            return Divergence(-1, -1, f"{path} keys", sorted(left), sorted(right))
         for key in left:
             found = compare(left[key], right[key], f"{path}.{key}")
             if found is not None:

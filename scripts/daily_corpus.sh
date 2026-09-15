@@ -28,13 +28,39 @@ GENERATED=(
 
 cd "$WORKTREE"
 git fetch --quiet origin main
-git reset --quiet --hard origin/main
+
+# Discard what this job writes, and nothing else. `reset --hard` discarded
+# both indiscriminately, unattended, at one in the morning -- and this worktree
+# had `main` itself checked out, so that included any commit left on it. Four
+# nightly resets have been fast-forwards that lost nothing, which is luck
+# rather than a property of the command.
+git restore --quiet --worktree --staged -- "${GENERATED[@]}"
+intruder=$(git status --porcelain --untracked-files=no)
+if [ -n "$intruder" ]; then
+  echo "=== $(date -u +%FT%TZ) changes here are not this job's; not running ==="
+  echo "$intruder"
+  exit 1
+fi
+
+# Detached, because this job owns no branch. It needs a tree at origin/main and
+# a commit to push from, and it pushes `HEAD:main` already -- holding the
+# branch bought nothing and cost two things: every run moved it, and no other
+# worktree in this repository could check main out while this one held it.
+git checkout --quiet --detach origin/main
 
 echo "=== $(date -u +%FT%TZ) extracting corpus ==="
 uv run extract-corpus
 
 echo "=== $(date -u +%FT%TZ) measuring claims ==="
 uv run strategies
+
+# The field the campaign is gated against, refreshed from the day that just
+# landed. Clustering wants the whole corpus and belongs here rather than in
+# the loop; the loop takes what this writes and joins it to the pool, where
+# it is the only writer. A family already on disk keeps its name, so this
+# rewrites the tape of one that has a stronger member now and adds the rest.
+echo "=== $(date -u +%FT%TZ) farming tape opponents ==="
+uv run tape-opponents
 
 echo "=== $(date -u +%FT%TZ) rebuilding the build order ==="
 uv run build-order

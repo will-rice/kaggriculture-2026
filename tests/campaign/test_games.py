@@ -7,42 +7,14 @@ count written as a float lands in an integer column -- and none of that can be
 checked against a stand-in for the thing being relied on.
 """
 
-import urllib.error
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from kaggriculture.campaign import dataset, games
 
-from .fixtures import day, game
-
-
-def running() -> bool:
-    """Whether the server is up, so the suite can say why it skipped."""
-    try:
-        return games.query("SELECT 1") == "1"
-    except (urllib.error.URLError, OSError, RuntimeError):
-        return False
-
-
-live = pytest.mark.skipif(not running(), reason="no ClickHouse on GAMES_URL")
-
-
-@pytest.fixture
-def scratch(request: pytest.FixtureRequest) -> str:
-    """A database of this test's own, with the real schema, dropped after.
-
-    Every live test takes this rather than writing into the campaign's own.
-    They used not to, and tidied up afterwards instead -- which means tidying
-    the tables somebody remembered: a write goes to five of them, the teardown
-    cleared one, and ten probe episodes were sitting in the real store before
-    anything noticed.
-    """
-    name = f"test_{abs(hash(request.node.name)):x}"[:40]
-    games.query(f"DROP DATABASE IF EXISTS {name}")
-    request.addfinalizer(lambda: games.query(f"DROP DATABASE IF EXISTS {name}"))
-    games.create(name)
-    return name
+from .fixtures import day, game, live
 
 
 def test_the_column_types_come_from_what_the_measures_actually_hold() -> None:
@@ -193,6 +165,37 @@ def test_a_program_recorded_twice_is_one_program(scratch: str) -> None:
     assert rows == "9", "the re-record did not replace the first"
 
 
+@live
+def test_the_opponent_is_recorded_by_roster_name(scratch: str) -> None:
+    """A matchup index is not an opponent, so the name goes in beside it.
+
+    Both sides were written as the literal "opponent" until 2026-09-13, which
+    cost the whole audit trail: the games were all there and correctly grouped,
+    and nothing said which agent a group was. `candidate` holds the index and no
+    name; the index is not the order the rates are recorded in; and `Pool.names`
+    is insertion order with the scored program removed, so the champion sits
+    mid-pool and every opponent after it shifts by one depending on who is being
+    measured. Two evaluations do not agree on what matchup 7 means.
+
+    Seat 1 here, so the assertions also pin which column is whose: getting that
+    backwards would write our own banks under the opponent's name and read as a
+    program that loses to itself.
+    """
+    games.record("probe", [(7, 1, "probe", game([day(0, 5.0, 3.0)], seat=1))], scratch)
+
+    sides = games.query(
+        f"SELECT team_0, team_1 FROM {scratch}.episodes "
+        "WHERE episode = 'probem7s1' FORMAT TabSeparated"
+    )
+    teams = games.query(
+        f"SELECT seat, team FROM {scratch}.days WHERE episode = 'probem7s1' "
+        "ORDER BY seat FORMAT TabSeparated"
+    )
+
+    assert sides == "v54\tprobe", "seat 1 is ours, so team_0 is the opponent"
+    assert teams == "0\tv54\n1\tprobe"
+
+
 def test_a_name_carrying_a_tab_cannot_shift_the_columns() -> None:
     """TabSeparated's delimiters are the escape's whole reason.
 
@@ -280,6 +283,48 @@ def test_a_database_built_before_a_column_existed_gains_it(scratch: str) -> None
     assert (
         games.query(f"SELECT source FROM {scratch}.candidate FORMAT TabSeparated")
         == "campaign"
+    )
+
+
+@live
+def test_a_live_table_that_lost_its_partition_key_says_so(
+    scratch: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partition key cannot be altered, so drift has to be reported.
+
+    `episodes` and `candidate` were both unpartitioned in the long-lived
+    database on 2026-09-13, having been built before `TABLES` gave them a key.
+    `CREATE TABLE IF NOT EXISTS` is silent about them and the columns
+    reconciliation cannot help, because ClickHouse has no `ALTER` for a
+    partition key. So every corpus rebuild from 2026-09-09 on built its staging
+    database, failed `REPLACE PARTITION` with "Wrong number of fields in the
+    partition expression", tore the staging down and left the old rows -- and
+    the corpus sat four days stale with nothing else to show for it.
+
+    `test_every_table_is_partitioned_on_the_column_the_rebuild_swaps` checks the
+    declaration against itself and passed throughout. Only the live table
+    disagreed.
+    """
+    games.query(f"DROP TABLE {scratch}.episodes")
+    games.query(
+        f"CREATE TABLE {scratch}.episodes (episode String, source "
+        "LowCardinality(String), version UInt64) ENGINE = ReplacingMergeTree(version) "
+        "ORDER BY (source, episode)"
+    )
+    assert (
+        games.query(
+            f"SELECT partition_key FROM system.tables WHERE database = '{scratch}' "
+            "AND name = 'episodes' FORMAT TabSeparated"
+        )
+        == ""
+    ), "the fixture did not reproduce an unpartitioned table"
+
+    with caplog.at_level(logging.WARNING):
+        games.create(scratch)
+
+    said = [record.getMessage() for record in caplog.records]
+    assert any("episodes is partitioned by nothing" in line for line in said), (
+        f"no warning named the drift: {said}"
     )
 
 

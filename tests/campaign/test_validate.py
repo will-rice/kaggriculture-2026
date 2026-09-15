@@ -1,5 +1,7 @@
 """Everything that rejects a candidate before a game is scored."""
 
+import os
+import signal
 import time
 from pathlib import Path
 
@@ -235,6 +237,26 @@ def test_a_candidate_that_exits_while_loading_is_a_crash_not_a_wait(
     assert time.monotonic() - started < 15
 
 
+def orphans() -> set[int]:
+    """Every spawned worker on this box whose parent is gone.
+
+    What a worker becomes when whatever started it dies: re-parented to init,
+    and still doing whatever it was doing. Zombies are not that -- they hold
+    no core and no file descriptor, and init reaps them within the moment.
+    """
+    found = set()
+    for status in Path("/proc").glob("[0-9]*/status"):
+        try:
+            fields = status.read_text(encoding="utf-8")
+            command = status.with_name("cmdline").read_bytes()
+        except OSError:
+            continue  # it exited between the glob and the read
+        orphaned = b"spawn_main" in command and "\nPPid:\t1\n" in fields
+        if orphaned and "\nState:\tZ" not in fields:
+            found.add(int(status.parent.name))
+    return found
+
+
 def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -254,6 +276,7 @@ def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
     # The real constant, not a stand-in: sixty seconds of import allowance is
     # right for a campaign and wrong for a suite that must fail fast.
     monkeypatch.setattr(validate, "LOAD_ALLOWANCE", 2.0)
+    standing = orphans()
     started = time.monotonic()
 
     verdict = validate.validate(write(tmp_path, WEDGING_AGENT), steps=5)
@@ -263,6 +286,24 @@ def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
     # Bounded by the steps asked for, so the suite pays five seconds and not
     # the seven hundred a full episode would allow.
     assert time.monotonic() - started < 60
+
+    # And it is stopped, not merely stopped waiting on. The child killed here
+    # supervises; the candidate runs a process further in, so for an hour on
+    # 2026-09-14 this verdict was returned while the program it rejected went
+    # on spinning at a core -- orphaned, holding the resource tracker's pipe,
+    # and so holding the interpreter above open as well.
+    try:
+        deadline = time.monotonic() + 10
+        while orphans() - standing:
+            assert time.monotonic() < deadline, (
+                f"the candidate outlived its verdict: {orphans() - standing}"
+            )
+            time.sleep(0.05)
+    finally:
+        # A failure here is a process spinning at a core that nothing else
+        # will ever stop, and it would hold this interpreter open too.
+        for stray in orphans() - standing:
+            os.kill(stray, signal.SIGKILL)
 
 
 @pytest.mark.local_data

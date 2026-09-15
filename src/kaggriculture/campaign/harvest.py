@@ -152,6 +152,41 @@ def vendor(entry: Path, name: str) -> Path:
     return target / entry.name
 
 
+# Tape opponents are written one directory to a family, and the prefix is what
+# tells them from the kernels vendored beside them: `config.OPPONENTS` holds
+# 36 of these against 83 harvested agents named for their authors.
+FAMILY = "family_*"
+
+
+def families(known: set[str], root: Path = config.OPPONENTS) -> dict[str, str]:
+    """Family tapes already on disk that the pool does not hold. Touches no pool.
+
+    The nightly corpus job clusters the day's replays and writes one tape per
+    behavioural family. Clustering is its work, not the loop's -- it wants the
+    whole corpus and runs once the archive lands -- so what is left here is to
+    notice what it wrote, which is a glob.
+
+    Split from `vendored` for the same reason the two run on one schedule: this
+    reads the local disk and cannot fail on somebody else's uptime, and a
+    listing that times out must not be what stops the field from growing.
+
+    Args:
+        known: Opponent names already held, which are skipped.
+        root: Where the tapes are written.
+
+    Returns:
+        Opponent name to its `main.py`, for every family not already held.
+    """
+    found = {
+        entry.parent.name: str(entry)
+        for entry in sorted(root.glob(f"{FAMILY}/main.py"))
+        if entry.parent.name not in known
+    }
+    if found:
+        LOGGER.info("%d new tape famil(ies) on disk", len(found))
+    return found
+
+
 def vendored(limit: int, known: set[str], author: str | None = None) -> dict[str, str]:
     """Discover, check and vendor newly published kernels. Touches no pool.
 

@@ -1,6 +1,10 @@
-"""Days and games, built by hand, for the tests that need one of each."""
+"""Days and games built by hand, and a database to put them in."""
 
-from kaggriculture.campaign import dataset, harness
+import urllib.error
+
+import pytest
+
+from kaggriculture.campaign import dataset, games, harness
 
 
 def measured(**held: float) -> dict[str, float]:
@@ -43,3 +47,15 @@ def game(days: list[harness.Day], seat: int = 0) -> harness.Game:
         worst_step_seconds=0.0,
         days=days,
     )
+
+
+def running() -> bool:
+    """Whether ClickHouse is answering on `GAMES_URL`."""
+    try:
+        games.query("SELECT 1")
+    except (urllib.error.URLError, OSError, RuntimeError):
+        return False
+    return True
+
+
+live = pytest.mark.skipif(not running(), reason="no ClickHouse on GAMES_URL")

@@ -37,7 +37,9 @@ relative path resolved inside a sandbox is a file written somewhere that is
 about to be removed.
 """
 
+import ctypes
 import os
+import signal
 import tempfile
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -79,6 +81,50 @@ class Sandbox(ProcessPoolExecutor):
         return cast("Future[T]", super().submit(_sandboxed, fn, *args, **kwargs))
 
 
+# Linux's `prctl(2)` request to be signalled when the process that started
+# this one dies: `PR_SET_PDEATHSIG`, whose argument is the signal to send.
+PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent() -> None:
+    """Ask the kernel to kill this worker when its parent process dies.
+
+    A worker runs somebody else's program, and somebody else's program does
+    not have to stop. `validate` bounds one that never finishes loading by
+    killing the child it handed the candidate to -- and that child is not the
+    one running it. The candidate runs a process deeper, in a worker of its
+    own, and `SIGKILL` on the middle process leaves that worker spinning at a
+    core with no parent, its pool never shut down because nothing lived to
+    shut it down.
+
+    They do not merely leak a core. A spawned worker inherits the write end
+    of the `multiprocessing` resource tracker's pipe, and the tracker exits
+    when that pipe reaches EOF, so one orphan holding it open means the
+    interpreter that started all of this cannot exit either: it waits in
+    `waitpid` for a tracker waiting on an EOF that will never come. That is
+    what `pre-commit` was doing on 2026-09-14, when the suite passed in three
+    minutes and the process then sat for an hour against a single orphan --
+    `tracker_fd=16`, cwd `/tmp/campaign-worker-fe84at5g`, spinning at a core,
+    re-parented to init -- left by the one test that feeds the validator a
+    candidate which never finishes loading.
+
+    Killing the process group instead would fix the one call site that kills a
+    middle process. This covers every worker the campaign starts, wherever it
+    is started from.
+
+    The initializer, not `_sandboxed`: a worker exists before it is given a
+    task, and the window before its first one is exactly when the pool above
+    it is still being built.
+    """
+    if ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL):
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    # The parent can die between the fork and the line above, and then the
+    # signal the kernel now promises has already been and gone. Re-parenting
+    # to init is what that looks like from here.
+    if os.getppid() == 1:
+        os._exit(1)
+
+
 def workers(count: int) -> Sandbox:
     """A pool that runs one task per process, each in a directory of its own.
 
@@ -92,7 +138,9 @@ def workers(count: int) -> Sandbox:
     Returns:
         The pool, to be used as a context manager.
     """
-    return Sandbox(max_workers=count, max_tasks_per_child=1)
+    return Sandbox(
+        max_workers=count, max_tasks_per_child=1, initializer=_die_with_parent
+    )
 
 
 def isolated(call: Callable[..., T], *args: object) -> T:

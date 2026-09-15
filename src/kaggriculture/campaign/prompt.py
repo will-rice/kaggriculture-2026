@@ -85,8 +85,31 @@ GAMES = config.GAMES_URL
 # per session -- and two of them, "a completely different algorithm" and "a
 # novel approach inspired by this one", took 54% of every call the campaign
 # made and returned 476 programs of which one scored above nought.
-INSTRUCTION = "Write a program that beats the opponent."
-# The objective, and nothing about how to reach it.
+INSTRUCTION = "Write a program that beats the opponent. Watch the market."
+# The objective, and one place to look.
+#
+# The second sentence was added on 2026-09-14 and is a deliberate exception to
+# the line below it. champion_12 had stood for five and a half hours of loop
+# time with every one of the eight candidates after it scoring *below* it, the
+# closest by 0.008 -- not gains too small to prove, which is what the gate was
+# taught to resolve that morning, but no gains at all.
+#
+# What the audit of its losses found: against the nine opponents it wins least
+# against it plants 50.7 tiles and sells 1,356 units, and against the nine it
+# wins most it plants 49.6 and sells 1,354 -- identical to within a percent --
+# while banking 95,564 against 110,197. The entire 14,633 is the price it sold
+# into. Those nine opponents are three strategies counted nine times, they move
+# 46 times the volume of the ones it beats, and they are 39 forks and 13% of
+# every recent game on the real ladder. Its sell rule reads no price at all: a
+# hardcoded table of hours for one crop on four days, and a food reserve.
+#
+# It names a variable and not a technique, and nothing about what to do with
+# it. What it buys is a test: the information was already reachable -- the
+# prices are in `games.prices` per episode per day and the skill stopped
+# forbidding the comparison that finds this on 2026-09-13 -- and ten of twelve
+# candidates were already editing the sell block, moving the four integers in
+# that table and nothing else. If the next pass still only moves integers, the
+# constraint was never what a round was told.
 #
 # It was "finish every season with a larger bank than it did" until
 # 2026-09-12, chosen as shaping because the gate of the champion_69 era was

@@ -190,3 +190,26 @@ def test_the_same_agent_is_not_enrolled_twice_under_two_names(
     # without having to meet it in the same batch.
     stored = json.loads((tmp_path / "fingerprints.json").read_text(encoding="utf-8"))
     assert list(stored.values()) == ["one_agent"]
+
+
+def test_only_the_tape_families_are_taken_from_the_opponents_directory(
+    tmp_path: Path,
+) -> None:
+    """The nightly job's tapes, and not the kernels vendored beside them.
+
+    Both live in `config.OPPONENTS` -- 36 families against 83 agents named for
+    the authors who published them -- and the prefix is what tells them apart.
+    `vendored` owns the kernels: it discovers, downloads, builds and plays one
+    before enrolling it, and a glob that swept them up would enrol whatever was
+    mid-download with none of that done.
+    """
+    for name in ("family_a", "family_b", "ahmedberatozer_v36", "yhay81_router"):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "main.py").write_text(PASS, encoding="utf-8")
+    # Written but not finished: a family whose tape is not on disk yet.
+    (tmp_path / "family_halfway").mkdir()
+
+    found = harvest.families({"family_b"}, tmp_path)
+
+    assert found == {"family_a": str(tmp_path / "family_a" / "main.py")}
