@@ -195,16 +195,18 @@ def test_the_message_carries_the_rules_and_its_own_play() -> None:
     assert prompt.GAMES in text
     assert "Episode `champion_1m1s1`" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
-    assert "/data" not in text
+    assert str(config.ROOT) not in text
 
 
-def test_the_message_carries_no_path_at_all() -> None:
-    """The doctrine: nothing the loop composes carries an opponent's path.
+def test_the_message_carries_no_path_into_the_campaign_itself() -> None:
+    """The half of the doctrine that survived 2026-09-15.
 
-    Everything a model is given is this string, so this is the whole of the
-    campaign's exposure. Names no longer travel either -- see
-    `test_no_opponent_is_named_anywhere_in_the_message` -- so what is left to
-    check here is that nothing which could be opened reaches a round.
+    Opponents opened that day: they are published kernels under Apache-2.0,
+    the field derives from them in the open, and the message now says where
+    they are. What stays shut is this campaign's own tree -- the archive, the
+    champions, the pool file, the run. A round edits a copy in a directory of
+    its own on purpose, and a path into `config.ROOT` is a round that can edit
+    the record of what every other round did.
     """
     text = prompt.compose(
         "champion_1",
@@ -215,9 +217,11 @@ def test_the_message_carries_no_path_at_all() -> None:
         IMPROVE,
     )
 
-    assert "/data/kaggriculture" not in text
-    assert not re.search(r"/(?:home|data|Users|tmp)/\S*", text)
     assert str(config.ROOT) not in text
+    assert "/data/kaggriculture/campaign" not in text, "the pool and run are ours"
+    assert not re.search(r"/(?:home|Users|tmp)/\S*", text)
+    # And the one path it is now meant to carry.
+    assert "/data/kaggriculture/opponents" in text
 
 
 def test_the_message_states_the_imports_the_gate_actually_allows() -> None:

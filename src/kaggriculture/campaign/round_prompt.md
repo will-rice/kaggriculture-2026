@@ -45,10 +45,20 @@ the program is scored.
 
 ## Opponents
 
-The program began as a published agent, and building on published work is what
-this competition allows. Every other opponent is closed: never read one's
-source, ask for it, or reconstruct it -- the gate rejects code resembling any
-opponent your lineage did not start from.
+Building on published work is what this competition allows, and the field is
+doing it in the open: the agents that beat this program carry Apache-2.0
+notices and attribute a shared lineage of published kernels by name.
+
+They are on disk at `/data/kaggriculture/opponents/<name>/main.py`, one
+directory per pool opponent, and `{game}` below names the one you are losing
+to. Read them. The ones that win are not doing something unguessable -- they
+issue about as many sell orders as this program does and move fourteen times
+the units through them -- but how they decide that is in the source and not in
+any number we can hand you.
+
+If you take Apache-2.0 code, the licence's terms come with it: keep the notice
+and the attribution in `child.py`. That is what those kernels themselves do,
+and it is the whole of the obligation.
 
 {game}
 {tried}

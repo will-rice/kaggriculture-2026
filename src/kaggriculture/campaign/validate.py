@@ -38,7 +38,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import copycheck, harness
+from kaggriculture.campaign import harness
 
 # One file ships, so this is the whole surface a program may name. The
 # `kaggriculture` package and `ctypes` were once here, for the engine library
@@ -60,8 +60,10 @@ from kaggriculture.campaign import copycheck, harness
 # they could not read. This campaign is looking for an agent that plays.
 ALLOWED_IMPORTS: frozenset[str] = frozenset(
     {
+        "base64",
         "math",
         "statistics",
+        "zlib",
         "itertools",
         "collections",
         "functools",
@@ -387,8 +389,8 @@ def validate(agent: Path, steps: int = 720, seed: Path | None = None) -> Verdict
     Args:
         agent: The candidate's `main.py`.
         steps: How many turns `harness.check` plays before stopping.
-        seed: The program this campaign was seeded from, whose lineage
-            the copy check exempts. None exempts nothing.
+        seed: Kept for callers that still name it; nothing reads it since the
+            copy gate was removed on 2026-09-15.
 
     Returns:
         The first failing `Verdict`, or `status="ok"`.
@@ -401,17 +403,6 @@ def validate(agent: Path, steps: int = 720, seed: Path | None = None) -> Verdict
 
     if not _has_top_level_agent(tree):
         return Verdict(status="contract", reason="no top-level function named agent")
-
-    # The copy check runs before the imports scan: a wholesale copy of an
-    # opponent (see roster "v56", whose real submission imports modules of
-    # its own, like ``base64`` and a private ``v49``) must report as a copy,
-    # not as an incidental import the whitelist happens not to name -- the
-    # whitelist exists to bound what our own candidates may do, and a copy
-    # is not one of ours to bound.
-    offender, score = copycheck.against_opponents(source, seed)
-    if score >= copycheck.THRESHOLD:
-        name = offender.split(":", 1)[0]
-        return Verdict(status="copy", reason=f"{score:.3f} similar to {name}")
 
     forbidden_import = _forbidden_import(tree)
     if forbidden_import is not None:

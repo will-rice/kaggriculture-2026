@@ -43,7 +43,6 @@ from git import Actor, Repo
 from kaggriculture.campaign import (
     archive,
     config,
-    copycheck,
     dataset,
     evaluator,
     gate,
@@ -166,8 +165,6 @@ def tiny_run(
     # the pipeline rather than today's ladder.
     corpus = tmp_path / "no-opponents"
     corpus.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(copycheck, "CORPUS_ROOTS", (corpus,))
-    copycheck._corpus.cache_clear()
     root = tmp_path / "run"
     return config.Run(root=root, pool=root / "pool.json")
 
@@ -1034,10 +1031,10 @@ def test_a_round_is_told_a_name_and_never_a_path(
     # inside the quotes rather than the whole of what they hold.
     assert f"`{champion.name}m" in handed.message
     assert str(tmp_path) not in handed.message
-    assert "/data/kaggriculture" not in handed.message
+    assert "/data/kaggriculture/campaign" not in handed.message
     # The doctrine lives in `round_prompt.md` now, so this asserts on what
     # was actually delivered rather than on a constant that could drift.
-    assert "Every other opponent is closed" in handed.message
+    assert "keep the notice" in handed.message, "the licence obligation travels"
 
 
 def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
@@ -1058,7 +1055,9 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     fitting -- and that half is asserted in `test_prompt`, against the
     composed message, where "seed" is not also a word in the game's rules.
     What is left here is the branch: this session drew from the database, and
-    nothing openable reached the call.
+    no path into the campaign's own tree reached the call. The opponents'
+    directory is a different matter since 2026-09-15 and is named on purpose;
+    the archive, the champions and the pool are not.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -1072,10 +1071,10 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     assert state.champion is not None
     handed = mutator.seen[0]
     assert str(tmp_path) not in handed.message
-    assert "/data/kaggriculture" not in handed.message
+    assert "/data/kaggriculture/campaign" not in handed.message
     # The doctrine lives in `round_prompt.md` now, so this asserts on what
     # was actually delivered rather than on a constant that could drift.
-    assert "Every other opponent is closed" in handed.message
+    assert "keep the notice" in handed.message, "the licence obligation travels"
 
 
 def _repository(root: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
