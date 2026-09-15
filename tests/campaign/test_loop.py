@@ -2150,7 +2150,6 @@ def test_the_campaign_harvests_while_it_runs(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(loop.harvest, "families", lambda known: {})
     monkeypatch.setattr(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
@@ -2179,40 +2178,11 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.harvest, "vendored", refuses)
-    monkeypatch.setattr(loop.harvest, "families", lambda known: {})
     before = dict(campaign.pool.opponents)
 
     asyncio.run(_one_harvest(campaign))
 
     assert campaign.pool.opponents == before
-
-
-def test_a_failed_listing_still_takes_the_tapes_the_night_left(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """The two halves of the field do not share a failure.
-
-    Kernels are discovered over the competition's API and tape families are a
-    glob of a directory the nightly job wrote hours ago. Taking them in one
-    `try` would mean a rate-limited listing -- somebody else's uptime -- also
-    froze the half of the field that never left this machine.
-    """
-    campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
-
-    def refuses(limit: int, known: set) -> dict:
-        """A listing that fails, the way a rate-limited one does."""
-        raise RuntimeError("kaggle said no")
-
-    monkeypatch.setattr(loop.harvest, "vendored", refuses)
-    monkeypatch.setattr(
-        loop.harvest, "families", lambda known: {"family_x": "/tapes/family_x/main.py"}
-    )
-
-    asyncio.run(_one_harvest(campaign))
-
-    assert campaign.pool.opponents["family_x"] == "/tapes/family_x/main.py"
-    assert "family_x" in pool.Pool.load(campaign.paths.pool).opponents
 
 
 def test_a_round_is_given_its_parent_and_a_way_to_play(
