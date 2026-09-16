@@ -223,21 +223,27 @@ def test_the_floor_survives_a_draw_too_small_to_hold_everyone(
     assert len(drawn) == 2
 
 
-def test_adding_our_champion_touches_nothing_else() -> None:
-    """One slot is overwritten and every other opponent stays exactly as it was.
+def test_a_beaten_champion_stays_in_the_pool() -> None:
+    """A promotion moves the old champion aside; it does not delete it.
 
-    Champions used to accumulate under `champion_N` and be trimmed to the best
-    `POOL_CHAMPIONS = 8` by a rating, on the reasoning that a published agent is
-    evidence the campaign cannot manufacture while "the tenth-best rung says
-    nothing the best one does not". Keeping all of them is what put sixty-nine in
-    the pool, holding ten of a gate's twenty-four slots.
+    The gate's field comparison excludes the champion itself, so the pool has
+    to hold something the champion does not already beat or a candidate has
+    nothing to fail against. On 2026-09-16 it held nothing of the sort:
+    champion_19 beat all 67 harvested agents, its rate pinned at 1.000, and no
+    program that could ever exist scores higher than that. Fifty candidates
+    were evaluated and refused in the six hours after it, every one of them at
+    0.993 or 0.994 "where ours scored 1.000".
 
-    Both halves are gone because there is one champion now. The trim is also what
-    made the `champion_` prefix dangerous: the pool holds `champion_1` and
-    `champion_65` from the abandoned tape lineage, which are opponents rather
-    than rungs of ours, and a prefix scan cannot tell them apart. On 2026-09-12 a
-    promotion numbering itself from an empty champions directory took the name
-    `champion_1` and replaced the tape agent outright.
+    So every rung stays. `ours` is the current champion and is overwritten;
+    the one it displaces is kept as `ours_N`, numbered from its own file, and
+    nothing removes it.
+
+    `ours_`, not `champion_`. That prefix is overloaded -- `champion_1` and
+    `champion_65` here are the abandoned tape lineage, opponents rather than
+    rungs of ours -- and on 2026-09-12 a promotion numbering itself from an
+    empty champions directory took the name `champion_1` and overwrote the
+    tape agent outright. Harvested names are an author and a kernel slug, so
+    nothing but a promotion can produce `ours_`.
     """
     opponents = {
         "champion_1": "/tape/1.py",
@@ -251,9 +257,19 @@ def test_adding_our_champion_touches_nothing_else() -> None:
 
     assert subject.opponents[config.POOL_CHAMPION] == "/champions/champion_3.py"
     assert {k: v for k, v in subject.opponents.items() if k in opponents} == opponents
-    assert len(subject.opponents) == len(opponents) + 1
+    assert len(subject.opponents) == len(opponents) + 1, "the first has nothing to keep"
 
-    # A second promotion replaces ours and still touches nothing else.
     subject.add_champion("/champions/champion_4.py")
+
     assert subject.opponents[config.POOL_CHAMPION] == "/champions/champion_4.py"
-    assert len(subject.opponents) == len(opponents) + 1
+    assert subject.opponents["ours_3"] == "/champions/champion_3.py"
+    assert len(subject.opponents) == len(opponents) + 2
+    # And the tape lineage is still exactly where it was, which is the whole
+    # reason the key is not `champion_3`.
+    assert {k: v for k, v in subject.opponents.items() if k in opponents} == opponents
+
+    subject.add_champion("/champions/champion_5.py")
+
+    assert subject.opponents["ours_3"] == "/champions/champion_3.py"
+    assert subject.opponents["ours_4"] == "/champions/champion_4.py"
+    assert len(subject.opponents) == len(opponents) + 3, "nothing is trimmed"

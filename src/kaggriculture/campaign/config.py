@@ -290,6 +290,12 @@ GATE_CONTENDERS = 4
 # A key that cannot be produced by harvesting or by the old lineage ends both
 # problems: nothing to collide with, and nothing to scan a prefix for.
 POOL_CHAMPION = "ours"
+# What a retired champion is called, numbered from the promotion that retired
+# it: `ours_16`, `ours_17`. Not `champion_N`, which is the prefix that caused
+# the collision above -- `ours_` cannot be produced by harvesting, whose names
+# are an author and a kernel slug, nor by the tape lineage, whose agents are
+# `champion_N`.
+POOL_ANCESTOR = "ours_{number}"
 # There is no promotion margin any more, and this note is here so nobody adds
 # one back.
 #
