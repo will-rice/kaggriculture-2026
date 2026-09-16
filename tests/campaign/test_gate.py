@@ -522,3 +522,88 @@ def test_a_second_promotion_on_the_saved_pool_yields_champion_2(
     )
     gate.enroll(gate.record(champion, paths), reloaded, paths)
     assert Path(champion.path).name == "champion_2.py"
+
+
+def banked(
+    rate: float,
+    decided: int,
+    margin: float,
+    champion_margin: float,
+    error: float = 300.0,
+    shared: int = 20,
+) -> tuple[evaluator.Result, gate.Champion]:
+    """A candidate level on win rate, differing only in coins a game.
+
+    Both sides beat the field at the same rate, so the first condition turns
+    entirely on the margin -- which is the case the guard exists for, and the
+    one the win rate stopped being able to see once it reached 1.000.
+    """
+    names = [f"public_{i}" for i in range(shared)]
+    rates = {"floor": rate, **dict.fromkeys(names, 0.60)}
+
+    def result_for(pid: str, coins: float, keys: list[str]) -> evaluator.Result:
+        return evaluator.Result(
+            program_id=pid,
+            fitness=rate,
+            field=0.60,
+            rates={k: rates[k] for k in keys},
+            margins={
+                k: harness.Margin(mean=coins, worst=coins, best=coins, error=error)
+                for k in keys
+            },
+            games=decided,
+            seeds=[1, 2],
+            hardest=names[0],
+            decisive={"floor": decided},
+            states={},
+        )
+
+    champion = gate.Champion(
+        name="floor",
+        path="/x/floor.py",
+        tarball="/x/floor.tar.gz",
+        result=result_for("floor", champion_margin, names),
+    )
+    return result_for("mine", margin, ["floor", *names]), champion
+
+
+def test_banking_less_than_the_champion_is_a_regression(tmp_path: Path) -> None:
+    """Level on wins and behind on coins does not promote.
+
+    A round-robin of fourteen public implementations over 96 fresh seeds, run by
+    another team and published in the competition's discussions, found no
+    intransitive triple, the newer implementation winning 86 of 91 chronological
+    pairs, and the ordering tracking average final money closely. A stronger
+    economy is a stronger agent here, so a candidate that wins its pairing while
+    banking less against the same field has taken something out of the economy
+    that the pairing did not charge it for.
+    """
+    poorer, why = gate.promotion(
+        *banked(28 / 32, 32, margin=4_000, champion_margin=9_000)
+    )
+
+    assert not poorer
+    assert "coins a game" in why, why
+
+
+def test_banking_more_at_a_level_rate_still_promotes(tmp_path: Path) -> None:
+    """The guard refuses a regression; it does not demand an improvement.
+
+    The pairing remains what decides, so a candidate level on the field and
+    ahead on coins passes the first condition and is judged on the head-to-head
+    like anything else.
+    """
+    richer, why = gate.promotion(
+        *banked(28 / 32, 32, margin=14_000, champion_margin=9_000)
+    )
+
+    assert richer, why
+
+
+def test_a_margin_gap_inside_its_own_noise_is_not_a_regression() -> None:
+    """Coins carry an error bar too, and a few hundred of them is not evidence."""
+    close, why = gate.promotion(
+        *banked(28 / 32, 32, margin=8_900, champion_margin=9_000)
+    )
+
+    assert close, why

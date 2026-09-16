@@ -215,12 +215,23 @@ def promotion(
 
     Two conditions, and both are required:
 
-    1. **No worse against the field**, over the opponents both were measured
-       against: behind by more than twice the error of the difference is a
-       refusal, and anything from level upward passes.
+    1. **No worse against the field**, on two measures -- the win rate over the
+       opponents both were measured against, and the mean final bank margin over
+       the same ones. Behind on either by more than twice the error of the
+       difference is a refusal; anything from level upward passes.
     2. **Beating the champion head-to-head**: the Wilson lower bound of its rate
        against the champion above 0.5, over at least ``decisive_bar`` decided
        games.
+
+    The margin joined the first condition on 2026-09-16, on a measurement
+    published in the competition's own discussions: a round-robin of fourteen
+    public implementations spanning a month, over 96 fresh seeds and both seats,
+    found no intransitive triple, the newer implementation winning 86 of 91
+    chronological pairs, and "the ordering tracks average final money remarkably
+    closely". A stronger economy is a stronger agent here, which makes the
+    margin evidence about strength rather than a consolation prize -- and it has
+    no ceiling, where the win rate reached 1.000 on this pool the same day and
+    stopped separating anything.
 
     Neither implies the other, and the campaign has now produced both failures.
     Condition 2 alone promoted `champion_3` at a field rate of 0.114 over a
@@ -286,6 +297,14 @@ def promotion(
             f"more than twice its error of {bar:.3f}"
         )
 
+    lead, coins = _margin_gap(result, champion, common)
+    if -lead > coins:
+        return False, (
+            f"{mine:.3f} against the field, level with {name}, but "
+            f"{lead:+,.0f} coins a game over {len(common)} shared opponents is "
+            f"behind by more than twice its error of {coins:,.0f}"
+        )
+
     decided = result.decisive.get(name, 0)
     rate = result.rates[name]
     if decided < decisive_bar:
@@ -305,6 +324,40 @@ def promotion(
         f"{rate:.3f} against {name} over {decided} decided has lower bound "
         f"{low:.3f}: not shown to beat it"
     )
+
+
+def _margin_gap(
+    result: Result, champion: "Champion", common: list[str]
+) -> tuple[float, float]:
+    """The candidate's lead in coins a game over the champion, and its noise.
+
+    Mean final bank margin over the opponents both were measured against, one
+    minus the other, against twice the standard error of the difference. Each
+    opponent's margin carries its own error from the games behind it, so the
+    error of the mean is the root of the summed squares over the count -- the
+    same test the rate gets, on the measure that still has room to move.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it must not be worse than.
+        common: The opponents both played, already cut by the caller.
+
+    Returns:
+        The lead in coins a game, and twice its error.
+    """
+    mine = [result.margins[one] for one in common if one in result.margins]
+    theirs = [
+        champion.result.margins[one] for one in common if one in champion.result.margins
+    ]
+    if not mine or not theirs:
+        return 0.0, 0.0
+    lead = sum(m.mean for m in mine) / len(mine) - sum(m.mean for m in theirs) / len(
+        theirs
+    )
+    noise = math.sqrt(
+        sum(m.error**2 for m in mine) + sum(m.error**2 for m in theirs)
+    ) / max(1, len(common))
+    return lead, 2 * noise
 
 
 def promote(

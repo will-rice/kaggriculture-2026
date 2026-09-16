@@ -87,11 +87,24 @@ GAMES = config.GAMES_URL
 # novel approach inspired by this one", took 54% of every call the campaign
 # made and returned 476 programs of which one scored above nought.
 INSTRUCTION = (
-    "Write a program that beats the opponent. Commit to the season's plan "
-    "before it starts, then carry it out. `measure.py` plays as many seasons "
-    "as you ask it to: search for that plan, do not only check an edit."
+    "Find where this program loses, and fix that. `measure.py` plays as many "
+    "seasons as you ask it to: run the experiment that would show your change "
+    "is not an improvement, and keep it only if it survives."
 )
-# The objective, and the shape it is to be pursued in.
+# The objective, and the method.
+#
+# Rewritten 2026-09-16 into the loop a top competitor published as his own --
+# "the better prompt is not: build the optimal agent, but: where does this
+# agent lose, and what experiment could disprove the proposed improvement?" --
+# by a team whose agent this campaign vendored at a public score of 2,863. The
+# round already holds the two things that needs: one game it is losing, and a
+# paired harness that resolves a 5,000-coin difference in about four games.
+#
+# What it replaces asked for a committed season plan, and that was measured
+# inert: champions 14, 15 and 16 carried an identical 57 day-keyed conditions
+# with 36 of them on the last two days, and the field rate climbed anyway. An
+# instruction does not change a 2,300-line program's shape by asking.
+#
 #
 # The second sentence was replaced on 2026-09-15. What it replaced is kept
 # below because the reasoning still holds and only stopped being the binding
