@@ -199,22 +199,34 @@ def test_winning_the_pairing_while_losing_the_field_does_not_promote() -> None:
     worse, why = gate.promotion(*beat(28 / 32, 32, field=0.114, champion_field=0.155))
 
     assert not worse
-    assert "inside twice its error" in why
+    assert "behind by more than twice its error" in why
 
 
-def test_a_rate_inside_the_noise_does_not_promote() -> None:
-    """A higher number is not a better program.
+def test_a_rate_level_with_the_champion_promotes_on_the_pairing() -> None:
+    """Being level on the field is not a reason to refuse. Losing the pairing is.
 
-    At 20 shared opponents and 32 games each the standard error of a rate near
-    0.22 is about 0.014, so the bar is near 0.029. `champion_8` to `champion_9`
-    was +0.0044, a fifth of it. Promoting on any improvement is the winner's
+    The field rate demanded an improvement until 2026-09-16, on the winner's
     curse: 78 of 471 programs once topped a noisy ranking and none survived a
-    deeper look.
-    """
-    noise, why = gate.promotion(*beat(28 / 32, 32, field=0.2253, champion_field=0.2209))
+    deeper look. That reasoning was about selecting the maximum of a noisy
+    estimator, and the pairing is not one -- the Wilson lower bound over
+    `DECISIVE_GAMES` decided games is a calibrated test, which is why it is the
+    condition that does the deciding here.
 
-    assert not noise
-    assert "inside twice its error" in why
+    What ended the old rule is that it stopped being answerable. champion_19
+    beat every agent in the pool, so its field rate was 1.000 and no program
+    that could exist scores higher; fifty candidates were refused in six hours
+    without the pairing ever being read, two of them beating champion_19 31-1
+    and 30-2.
+    """
+    level, why = gate.promotion(*beat(28 / 32, 32, field=0.2253, champion_field=0.2209))
+
+    assert level, why
+
+    # And the pairing still has to be won, level field or not.
+    drawn, why = gate.promotion(*beat(17 / 32, 32, field=0.2253, champion_field=0.2209))
+
+    assert not drawn
+    assert "not shown to beat it" in why
 
 
 def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:

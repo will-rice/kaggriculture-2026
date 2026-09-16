@@ -215,8 +215,9 @@ def promotion(
 
     Two conditions, and both are required:
 
-    1. **A higher win rate**, over the opponents both were measured against,
-       beyond twice the error of the difference.
+    1. **No worse against the field**, over the opponents both were measured
+       against: behind by more than twice the error of the difference is a
+       refusal, and anything from level upward passes.
     2. **Beating the champion head-to-head**: the Wilson lower bound of its rate
        against the champion above 0.5, over at least ``decisive_bar`` decided
        games.
@@ -227,6 +228,21 @@ def promotion(
     promotions handing back field ground while winning the pairing decisively.
     Condition 1 alone would promote an agent that beats the field on average and
     loses to the specific program it replaces, which is not a ratchet.
+
+    Condition 1 demanded a *higher* rate until 2026-09-16, and that stopped
+    being a question a program could answer. champion_19 beat every agent in
+    the pool: its rate was 1.000, nothing scores higher than 1.000, and the
+    fifty candidates evaluated in the six hours after it were refused without
+    the second condition ever being reached. Two of them, `p0d46cde4bbcd` and
+    `p3c94d98c9d60`, beat champion_19 head-to-head 31-1 and 30-2 while sitting
+    in the database as rejects, and seven programs stood at fitness 1.0000 with
+    up to 1.000-against-0.000 between them -- a gate that called them identical
+    was discarding the only signal that separated them.
+
+    So the field rate keeps the job it can still do, which is refusing a
+    regression, and the pairing does the discriminating. That is also the
+    competition's own objective: wins against the agent you are matched with,
+    not a coin total and not an average over a field you already beat.
 
     The rate is compared on common opponents because the two were measured in
     different seed blocks against a pool that harvest grows, so their own
@@ -263,11 +279,11 @@ def promotion(
     played = max(1, len(common) * max(1, result.games))
     error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
     bar = 2 * error
-    if mine - theirs <= bar:
+    if theirs - mine > bar:
         return False, (
             f"{mine:.3f} against the field where {name} has {theirs:.3f} over "
-            f"{len(common)} shared opponents: {mine - theirs:+.3f} is inside "
-            f"twice its error of {bar:.3f}"
+            f"{len(common)} shared opponents: {mine - theirs:+.3f} is behind by "
+            f"more than twice its error of {bar:.3f}"
         )
 
     decided = result.decisive.get(name, 0)
