@@ -40,6 +40,7 @@ import math
 import random
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import uuid
@@ -738,7 +739,23 @@ class Campaign:
             # is still the loop's: it plays every scored game itself, against
             # opponents this never sees, and nothing a round reports is read.
             shutil.copy(source, box / "parent.py")
-            shutil.copy(Path(measure.__file__), box / "measure.py")
+            # Copied with a shebang naming the interpreter this loop is
+            # running, and marked executable, because a round's own guess is
+            # wrong and it pays to guess. `python` is not on the PATH a round's
+            # commands see, `python3` is the system 3.10 with no
+            # `kaggriculture` in it, and the package is installed editable into
+            # a virtual environment a round has no reason to know about. Every
+            # round was rediscovering that by trial: one died having spent its
+            # whole call on "I will wait for the search for `kaggriculture` to
+            # complete", and the file's own docstring had told it to run
+            # `python measure.py`, which is the one command that cannot work.
+            runner = box / "measure.py"
+            runner.write_text(
+                f"#!{sys.executable}\n"
+                + Path(measure.__file__).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
             # And the edits already made to this program, which the message
             # names and scores. A score says a direction lost ground; the file
             # is what says which direction it was, and `measure.py` will play

@@ -3,8 +3,12 @@
 Copied into every round's directory beside `child.py` and `parent.py`, so a
 round can test an edit instead of shipping it and hoping. Two ways to run it:
 
-    python measure.py              every season, both seats, and the verdict
-    python measure.py --replay 103 one season, day by day, written to a file
+    ./measure.py              every season, both seats, and the verdict
+    ./measure.py --replay 103 one season, day by day, written to a file
+
+Run it as `./measure.py`, not `python measure.py`: the loop copies this file
+with a shebang naming the interpreter that can import what it needs, and the
+interpreters on a round's PATH cannot.
 
 The campaign used to hand a round a program, a table of results and nothing to
 run, and the loop's own docstring said so: the model "measures nothing, owns

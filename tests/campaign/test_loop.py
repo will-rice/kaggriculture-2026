@@ -29,6 +29,7 @@ import os
 import random
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2231,6 +2232,9 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             seen["skill"] = (
                 workspace / self.SKILLS_DIR / "query-games" / "SKILL.md"
             ).exists()
+            runner = workspace / "measure.py"
+            seen["shebang"] = runner.read_text(encoding="utf-8").splitlines()[0]
+            seen["runnable"] = os.access(runner, os.X_OK)
             raise asyncio.CancelledError
 
     campaign.mutator = Inspect()
@@ -2262,6 +2266,14 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER
+    # And it can be run without knowing anything about where the campaign lives.
+    # A round's commands do not see an interpreter that can import the package:
+    # `python` is not on their PATH and `python3` is a system one without it, so
+    # every round was working that out by trial and one spent its whole call on
+    # it. The shebang is the answer and it has to name this interpreter, not a
+    # `/usr/bin/env` lookup that would find the wrong one.
+    assert seen["shebang"] == f"#!{sys.executable}"
+    assert seen["runnable"], "a round cannot run ./measure.py"
 
 
 def test_candidates_share_a_block_of_seasons_and_it_rotates(

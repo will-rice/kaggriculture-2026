@@ -129,9 +129,22 @@ MARKET_OPS: list[str] = [
     "SELL",
 ]
 
-# One codex session per worker; eight fit the machine beside their
-# evaluations. Spec section 8.
-SESSIONS = 8
+# One session per worker. Eight fit the machine beside their evaluations, and
+# eight is what this was while codex billed per call and the only limit was the
+# machine.
+#
+# Two, because the limit now is a quota window rather than a core. `agy` refills
+# on a five-hour clock, and on 2026-09-17 eight sessions took the Gemini pool
+# from 94% to zero in twenty minutes -- then every one of the eight walked into
+# the wall mid-round, so the window bought eight abandoned rounds and not one
+# verdict. Concurrency cannot buy more rounds than the quota holds; all it
+# decides is how many are in flight, unfinished, when the wall arrives.
+#
+# It also decides how fast each one measures. `--workers` is
+# `CORE_BUDGET // SESSIONS`, so two sessions give a round twenty cores instead
+# of five, and a round that can play its seasons four times as fast is a round
+# that measures before it edits rather than guessing because measuring was slow.
+SESSIONS = 2
 # Consecutive codex calls against one opponent before the session moves to the
 # next, and a session works through every opponent in the pool. So its length is
 # the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
