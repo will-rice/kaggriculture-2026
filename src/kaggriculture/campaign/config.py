@@ -126,6 +126,11 @@ CROPS: list[str] = list(PRODUCTS[:5])
 # work thirty-nine hands beside its farmer, whatever any one champion happens
 # to hire.
 MAX_UNITS = 40
+# `kaggriculture.json` sets `"episodeSteps": 720`, and the interpreter fires
+# DONE at `step >= cfg.episodeSteps - 2`, on the step whose actions it just
+# read. So step 718 is the last one a unit acts on and a season is 719 acting
+# steps -- which is exactly how long every route in a plan is.
+SEASON = 719
 MARKET_OPS: list[str] = [
     "NONE",
     "HIRE",

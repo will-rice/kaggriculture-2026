@@ -177,6 +177,20 @@ class Action(BaseModel):
     )
 
 
+Season = Annotated[
+    list[Annotated[int, Field(ge=0)]],
+    Field(
+        min_length=config.SEASON,
+        max_length=config.SEASON,
+        description=(
+            f"One index into `actions` for each of the {config.SEASON} steps a "
+            "season has. Shorter and the farm stands idle for the rest of the "
+            "year; longer and the tail is never reached."
+        ),
+    ),
+]
+
+
 class ShopRoute(BaseModel):
     """Which route to walk when the map unlocks these two shops.
 
@@ -211,31 +225,37 @@ class Plan(BaseModel):
     """The strategy a program plays: the season, the paths, and the lookup.
 
     Attributes:
-        actions: The scripted season, step by step.
-        routes: The paths those steps walk, as tile indices, by route number.
+        actions: The pool of distinct steps a route can cite.
+        routes: One season each, as indices into `actions`, by route number.
         shops: Which route to walk for the shops a map happens to unlock.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     actions: list[Action] = Field(
+        min_length=1,
         description=(
-            "The season, scripted step by step and walked in order: entry N is "
-            "what the farm does on step N. This is what the agent actually does "
-            "on the board, and it is the largest part of a plan by far -- the "
-            "champion's is 3,982 steps."
+            "Every distinct step any route can play, in no particular order. A "
+            "step is not owned by the position it sits at here: routes cite "
+            "entries by index, and two routes that do the same thing on some "
+            "step cite the same entry. So this is a pool, and it is smaller "
+            "than the seasons it spells out -- the champion's 41 routes are "
+            f"{config.SEASON} steps each, {41 * config.SEASON:,} step slots in "
+            "all, drawn from 3,982 entries here."
         ),
     )
-    routes: dict[str, list[int]] = Field(
+    routes: dict[str, Season] = Field(
+        min_length=1,
         description=(
-            "The paths the shop lookup chooses between, keyed by the number it "
-            "chooses them by. The numbering is not a range and does not have to "
-            "be contiguous -- the champion's are 0 to 12 and 100 to 128 -- and a "
-            "path is the tiles it walks in order, as indices into the board. "
-            "Repeats are meaningful: standing still is walking the same tile "
-            "twice."
+            "One whole season per route, keyed by the number the shop lookup "
+            "chooses it by. A season is not a path across the board: it is "
+            f"{config.SEASON} indices into `actions`, one per step, so entry N "
+            "is which pooled step the farm plays on step N. Repeats are normal "
+            "and are what makes the pool small -- a step the farm plays forty "
+            "times is one entry in `actions` cited forty times here. The "
+            "numbering is not a range and need not be contiguous: the "
+            "champion's are 0 to 12 and 100 to 128."
         ),
-        examples=[{"0": [0, 1, 2], "101": [4, 5, 6]}],
     )
     shops: list[ShopRoute] = Field(
         description=(
@@ -245,6 +265,29 @@ class Plan(BaseModel):
             "champion carries all 64 ordered pairs of the eight shops."
         ),
     )
+
+    @model_validator(mode="after")
+    def _steps_exist(self) -> "Plan":
+        """Every index a season cites has to name a step the pool holds.
+
+        An index past the end is the one way a plan can be internally
+        well-formed and still unplayable: the program subscripts `actions` with
+        it while building the tape and dies before the first move, which the
+        scoreboard shows as a forfeit rather than as an error.
+        """
+        last = len(self.actions)
+        over = {
+            f"route {at} cites {max(past)}"
+            for at, season in self.routes.items()
+            if (past := [step for step in season if step >= last])
+        }
+        if over:
+            raise ValueError(
+                f"seasons cite steps `actions` does not hold -- it has "
+                f"{last}, so the last index is {last - 1}: "
+                f"{', '.join(sorted(over))}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _routes_exist(self) -> "Plan":

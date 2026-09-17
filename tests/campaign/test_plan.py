@@ -23,10 +23,20 @@ from kaggriculture.campaign.plan import Plan
 # every boundary, and the one that was missing handed every round an agent that
 # forfeited every game it played.
 PLAN = {
-    "actions": [{"farmer": ["PASS"], "hands": [], "market": []}],
-    # The route the lookup names has to be one that is here, which is the first
-    # thing the schema checks and the first thing this fixture got wrong.
-    "routes": {"101": [1, 2, 3], "112": [3, 2, 1]},
+    # A pool of distinct steps. Which position a step sits at here means
+    # nothing; the seasons below are what put them in an order.
+    "actions": [
+        {"farmer": ["PASS"], "hands": [], "market": []},
+        {"farmer": ["NORTH"], "hands": [], "market": [["SELL", "WHEAT", 3]]},
+    ],
+    # Two whole seasons, each one index per step. The route the lookup names has
+    # to be one that is here and every index has to name a step the pool holds,
+    # which are the two things the schema checks and the two things this fixture
+    # got wrong -- it cited steps 1, 2 and 3 of a one-step pool.
+    "routes": {
+        "101": [step % 2 for step in range(config.SEASON)],
+        "112": [0] * config.SEASON,
+    },
     "shops": [{"route": 101, "shops": ["BAKERY", "BAKERY"]}],
 }
 
@@ -34,13 +44,10 @@ PLAN = {
 def packed(data: dict) -> str:
     """A program carrying `data` the way a champion carries its plan.
 
-    The program keeps routes as a dict keyed by number; the round is handed the
-    list a schema can describe. This writes the program's form, so what these
-    tests build is what a champion actually is.
+    The schema is the plan's own shape, so there is nothing to convert: what
+    these tests build is what a champion actually is.
     """
-    carried = Plan.model_validate(data).model_dump(
-        mode="json", context={"packed": True}
-    )
+    carried = Plan.model_validate(data).model_dump(mode="json")
     blob = base64.b85encode(
         zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
@@ -212,11 +219,29 @@ def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
     and the campaign reads that as a bad idea instead of a broken file.
     """
     for wrong, says in (
-        # The relational rule, which no field constraint can express: one field
-        # has to agree with another.
+        # The relational rules, which no field constraint can express: one
+        # field has to agree with another.
         (
             {"shops": [{"route": 999, "shops": ["BAKERY", "BAKERY"]}]},
             "does not hold",
+        ),
+        # A season citing a step past the end of the pool. This is the shape a
+        # generator reaches for first, because an index is just a number and
+        # nothing local to it is wrong.
+        (
+            {"routes": {"101": [len(PLAN["actions"])] * config.SEASON}},
+            "cites",
+        ),
+        # A season that is not a season. Short and the farm idles out the year
+        # on `PASS`, long and the tail is never read -- either way the plan is
+        # not the thing it claims to be.
+        (
+            {"routes": {"101": [0] * (config.SEASON - 1)}},
+            f"at least {config.SEASON}",
+        ),
+        (
+            {"routes": {"101": [0] * (config.SEASON + 1)}},
+            f"at most {config.SEASON}",
         ),
         # And the rest, which the types carry, so the message names the path.
         (
