@@ -13,21 +13,20 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, mutate, plan
+from kaggriculture.campaign import config, harness, mutate, plan, roster
 from kaggriculture.campaign.plan import Plan
 
 # A program shaped like a champion: imports, a packed plan under a generated
 # name, and an agent that reads it.
-# A command is the positional list the program itself carries -- said in the
-# schema as a bounded list of tokens, because a tuple becomes `prefixItems` and
-# that is the one shape OpenAI's strict mode refuses. Routes are the exception:
-# they are a list of `{id, tiles}` where the program keeps a dict, because an
-# object with writer-chosen keys is the other thing it refuses.
+# The plan exactly as a program carries it. The schema describes this and does
+# not reshape it: a schema that differs from its data needs a conversion at
+# every boundary, and the one that was missing handed every round an agent that
+# forfeited every game it played.
 PLAN = {
     "actions": [{"farmer": ["PASS"], "hands": [], "market": []}],
     # The route the lookup names has to be one that is here, which is the first
     # thing the schema checks and the first thing this fixture got wrong.
-    "routes": [{"id": 101, "tiles": [1, 2, 3]}, {"id": 112, "tiles": [3, 2, 1]}],
+    "routes": {"101": [1, 2, 3], "112": [3, 2, 1]},
     "shops": [{"route": 101, "shops": ["BAKERY", "BAKERY"]}],
 }
 
@@ -267,19 +266,27 @@ def test_the_schema_carries_the_rules_rather_than_checking_them_after() -> None:
     # The whole of the engine's list, not a subset kept by subtraction: a bare
     # `PLANT` is a no-op the engine runs, so the schema can say it.
     assert defs["UnitOp"]["enum"] == config.UNIT_OPS
-    assert defs["MarketOp"]["enum"] == config.MARKET_OPS
     assert "BAKERY" in defs["ShopName"]["enum"], "and the shop names"
+    market = json.dumps(defs["Action"]["properties"]["market"])
+    for verb in config.MARKET_OPS:
+        if verb != "NONE":
+            assert verb in market, f"{verb} is a shape the market can take"
 
     # A command is a bounded list whose tokens are those vocabularies, which is
     # the program's own shape and a shape every provider's strict mode takes --
     # a tuple would be `prefixItems`, and that is the one OpenAI refuses.
-    farmer = defs["Action"]["properties"]["farmer"]
-    assert farmer["minItems"] == 1 and farmer["maxItems"] == 3
-    assert "#/$defs/UnitOp" in json.dumps(farmer["items"])
-    assert "#/$defs/ItemName" in json.dumps(farmer["items"])
-    # And a map's two shops are said as a length, for the same reason.
+    farmer = json.dumps(defs["Action"]["properties"]["farmer"])
+    # One shape per arity, which is the only way a schema constrains a
+    # *position*: given a bounded list of tokens instead, GLM wrote
+    # `["FERTILIZER", "HARVEST"]` and it validated.
+    assert "prefixItems" in farmer
+    assert "#/$defs/UnitOp" in farmer and "#/$defs/CropName" in farmer
+    # And a map's two shops are said as a length.
     shops = defs["ShopRoute"]["properties"]["shops"]
     assert shops["minItems"] == 2 and shops["maxItems"] == 2
+    # Routes are the mapping the program keeps, described rather than reshaped.
+    routes = schema["properties"]["routes"]
+    assert routes["type"] == "object", "the shape the plan has, not a tidier one"
 
 
 def test_the_schema_takes_the_plan_the_champion_actually_carries() -> None:
@@ -396,28 +403,6 @@ def test_the_schema_refuses_what_it_can_and_describes_the_rest() -> None:
                 plan.Plan.model_validate({**PLAN, "actions": [wrong]})
 
 
-def test_the_schema_cannot_say_which_verb_takes_which_name() -> None:
-    """The gap, asserted so nobody discovers it by trusting the schema.
-
-    `action.rs` drops each of these -- an animal cannot be sold, only wheat and
-    fertilizer can be bought, eggs are not planted -- and a bounded list of
-    tokens has no way to refuse them. The descriptions say so; the types cannot.
-    """
-    for dropped in (
-        step(market=[["SELL", "COW", 1]]),
-        step(market=[["BUY_PRODUCT", "STRAWBERRY", 1]]),
-        step(market=[["BUY_SEED", "EGG", 1]]),
-        step(farmer=["PLANT", "EGG"]),
-        step(market=[["BUY_ANIMAL", "WHEAT", 1]]),
-    ):
-        plan.Plan.model_validate({**PLAN, "actions": [dropped]})
-
-    # And the rule is in the text a writer is handed instead.
-    market = plan.Plan.model_json_schema()["$defs"]["Action"]["properties"]["market"]
-    said = json.dumps(market)
-    assert "a product" in said and "only" in said
-
-
 def test_every_field_tells_a_writer_what_to_produce() -> None:
     """The schema is the whole of what a structured call is told.
 
@@ -435,15 +420,15 @@ def test_every_field_tells_a_writer_what_to_produce() -> None:
         ("Plan", schema["properties"]),
         *(
             (name, schema["$defs"][name]["properties"])
-            for name in ("Action", "Route", "ShopRoute")
+            for name in ("Action", "ShopRoute")
         ),
     ):
         for field, spec in properties.items():
             (described if spec.get("description") else bare).append(f"{where}.{field}")
 
     assert not bare, f"fields a writer is told nothing about: {bare}"
-    # Three on the plan, three on a step, two on a route, two on a lookup.
-    assert len(described) == 10, described
+    # Three on the plan, three on a step, two on a lookup.
+    assert len(described) == 8, described
 
     # And the descriptions carry the things that cannot be read off a type:
     # what the field means, what order it is in, what it has to agree with.
@@ -452,3 +437,34 @@ def test_every_field_tells_a_writer_what_to_produce() -> None:
         in (schema["$defs"]["Action"]["properties"]["hands"]["description"])
     )
     assert "id" in schema["$defs"]["ShopRoute"]["properties"]["route"]["description"]
+    assert "not a range" in schema["properties"]["routes"]["description"]
+
+
+@pytest.mark.slow
+def test_the_plan_a_round_is_handed_still_plays(tmp_path: Path) -> None:
+    """The split form has to play the season the whole one plays.
+
+    Every other test here reads files and compares data, and all of them passed
+    while a round was being handed an agent that forfeited every game it played:
+    `plan.json` keeps routes as a list, the program indexes them by number, and
+    nothing noticed because a crashed agent simply loses. Only playing catches
+    that, so this plays.
+    """
+    champion = config.LIVE.floor / "main.py"
+    if not champion.exists():
+        pytest.skip("no live champion in this checkout")
+    source = champion.read_text(encoding="utf-8")
+
+    whole = tmp_path / "whole"
+    apart = tmp_path / "apart"
+    whole.mkdir()
+    apart.mkdir()
+    (whole / "main.py").write_text(source, encoding="utf-8")
+    plan.lay_out(source, apart, name="main.py")
+
+    opponent = roster.path("ours_20", config.POOL)
+    entire = harness.game(whole / "main.py", opponent, seed=11, seat=0)
+    split = harness.game(apart / "main.py", opponent, seed=11, seat=0)
+
+    assert entire.ours > 0, "the champion banks something"
+    assert (split.ours, split.theirs) == (entire.ours, entire.theirs)

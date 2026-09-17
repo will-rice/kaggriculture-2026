@@ -47,15 +47,12 @@ import re
 import zlib
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    SerializationInfo,
-    field_serializer,
-    field_validator,
     model_validator,
 )
 
@@ -96,44 +93,52 @@ DATA = json.loads(
 # `enum: [...]` -- so a generator handed this can only spell a verb the engine
 # has, which a validator could report only after the writing was done.
 UnitOp = StrEnum("UnitOp", {op: op for op in config.UNIT_OPS})
-MarketOp = StrEnum("MarketOp", {op: op for op in config.MARKET_OPS})
 ItemName = StrEnum("ItemName", {name: name for name in config.ITEMS})
 ShopName = StrEnum("ShopName", {name: name for name in config.SHOP_NAMES})
 
 # A command is `[verb]`, `[verb, name]` or `[verb, name, count]` -- the shape
-# `action.rs` reads, and the shape the program already carries. Said as a
-# bounded list of tokens rather than a tuple: a tuple becomes `prefixItems`,
-# which is the one thing OpenAI's strict mode will not take, while a length is
-# something every provider accepts. The cost is that the schema cannot say
-# which verb takes which name; the descriptions say it instead.
+# `action.rs` reads, and the shape the program carries. Said as a tuple per
+# arity, because that is the only way a schema constrains a *position*: given a
+# bounded list of tokens instead, GLM produced `["FERTILIZER", "HARVEST"]` and
+# an order beginning with an integer, both of which validated and neither of
+# which the engine would act on. Given these, the same model wrote
+# `["PLANT", "WHEAT"]` first time.
+#
+# The cost is that a tuple becomes `prefixItems`, which OpenAI's strict mode
+# refuses -- so OpenAI is not a generator for this plan. DeepSeek and GLM take
+# it, and they are the ones with the output length a whole plan needs.
+CropName = StrEnum("CropName", {name: name for name in config.CROPS})
+ProductName = StrEnum("ProductName", {name: name for name in config.PRODUCTS})
+AnimalName = StrEnum("AnimalName", {name: name for name in config.ANIMALS})
+
 UnitCommand = Annotated[
-    list[UnitOp | ItemName | int],
+    tuple[UnitOp]
+    | tuple[Literal["PICKUP", "PLACE"], ItemName]
+    | tuple[Literal["PICKUP", "PLACE"], ItemName, int]
+    | tuple[Literal["PLANT"], CropName],
     Field(
-        min_length=1,
-        max_length=3,
         description=(
-            "One command: the verb first, then what it acts on, then how many. "
-            "Most verbs are the verb alone -- `['NORTH']`, `['HARVEST']`. "
-            "`PICKUP` and `PLACE` take an item and may take a count: "
-            "`['PICKUP', 'COW']` or `['PICKUP', 'COW', 2]`. `PLANT` takes one of "
-            "the five crops and no count: `['PLANT', 'WHEAT']`. A verb the engine "
-            "does not know is read as a pass."
+            "One command: the verb first, then what it acts on. Most verbs are "
+            "the verb alone. `PICKUP` and `PLACE` take an item and may take a "
+            "count; `PLANT` takes one of the five crops and no count."
         ),
         examples=[["PASS"], ["NORTH"], ["PLANT", "WHEAT"], ["PICKUP", "COW", 2]],
     ),
 ]
 
 MarketCommand = Annotated[
-    list[MarketOp | ItemName | int],
+    tuple[()]
+    | tuple[Literal["HIRE", "BUY_LAND"]]
+    | tuple[Literal["SELL"], ProductName, int]
+    | tuple[Literal["BUY_SEED"], CropName, int]
+    | tuple[Literal["BUY_PRODUCT"], Literal["WHEAT", "FERTILIZER"], int]
+    | tuple[Literal["BUY_ANIMAL"], AnimalName, int],
     Field(
-        max_length=3,
         description=(
-            "One order: the verb first, then what it moves, then how many. "
-            "`HIRE` and `BUY_LAND` are the verb alone. `SELL` takes a product, "
-            "`BUY_SEED` a crop, `BUY_ANIMAL` an animal, and `BUY_PRODUCT` only "
-            "wheat or fertilizer -- each with a count, and an order whose count "
-            "is zero or less is dropped. The empty list places nothing, which is "
-            "legal and common."
+            "One order: the verb, what it moves, and how many. `HIRE` and "
+            "`BUY_LAND` stand alone. Each moving verb takes the names its own "
+            "arm accepts, and an order whose count is zero or less is dropped. "
+            "The empty list places nothing, which is legal and common."
         ),
         examples=[[], ["HIRE"], ["SELL", "WHEAT", 30], ["BUY_ANIMAL", "COW", 2]],
     ),
@@ -169,41 +174,6 @@ class Action(BaseModel):
             "players' orders resolve in per-unit lockstep, so position matters "
             "when both sides reach for the same goods. May be empty."
         ),
-    )
-
-
-class Route(BaseModel):
-    """One path, as the tile indices it walks in order.
-
-    A list rather than the dict the program keeps, because strict structured
-    output refuses an object whose keys are the writer's to choose, and a plan
-    that cannot be a schema cannot be generated against one. The numbering is
-    not a range -- the champion's routes are 0 to 12 and 100 to 128 -- so the
-    id travels with the path rather than being its position.
-
-    Attributes:
-        id: The number `shops` refers to this route by.
-        tiles: The tiles it walks, in order.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: int = Field(
-        description=(
-            "The number `shops` refers to this route by. The numbering is not a "
-            "range and does not have to be contiguous: the champion's routes are "
-            "0 to 12 and 100 to 128."
-        ),
-        examples=[0, 101, 128],
-    )
-    tiles: list[int] = Field(
-        description=(
-            "The tiles this route walks, in order, as indices into the board. "
-            "Repeats are meaningful -- standing still is walking the same tile "
-            "twice -- and every route in the champion is the same length as the "
-            "season it is walked over."
-        ),
-        examples=[[0, 1, 2, 3, 4]],
     )
 
 
@@ -256,11 +226,16 @@ class Plan(BaseModel):
             "champion's is 3,982 steps."
         ),
     )
-    routes: list[Route] = Field(
+    routes: dict[str, list[int]] = Field(
         description=(
-            "The paths the shop lookup chooses between, each with the number it "
-            "is chosen by."
+            "The paths the shop lookup chooses between, keyed by the number it "
+            "chooses them by. The numbering is not a range and does not have to "
+            "be contiguous -- the champion's are 0 to 12 and 100 to 128 -- and a "
+            "path is the tiles it walks in order, as indices into the board. "
+            "Repeats are meaningful: standing still is walking the same tile "
+            "twice."
         ),
+        examples=[{"0": [0, 1, 2], "101": [4, 5, 6]}],
     )
     shops: list[ShopRoute] = Field(
         description=(
@@ -271,45 +246,6 @@ class Plan(BaseModel):
         ),
     )
 
-    @field_validator("routes", mode="before")
-    @classmethod
-    def _take_the_programs_own_shape(cls, routes: object) -> object:
-        """Accept the dict a program keeps as well as the list a schema takes.
-
-        The program indexes its routes by number, which is an object whose keys
-        are the writer's to choose -- and strict structured output refuses one.
-        So the schema says a list, and this takes either.
-
-        Args:
-            routes: Whatever was handed in.
-
-        Returns:
-            The list form, if it arrived as the program's dict.
-        """
-        if isinstance(routes, dict):
-            return [
-                {"id": int(str(at)), "tiles": tiles} for at, tiles in routes.items()
-            ]
-        return routes
-
-    @field_serializer("routes")
-    def _give_back_the_shape_asked_for(
-        self, routes: list["Route"], info: SerializationInfo
-    ) -> object:
-        """The list by default, the program's dict when packing one.
-
-        Args:
-            routes: The routes, as the model holds them.
-            info: Carries the caller's context; `packed` asks for the program's
-                shape.
-
-        Returns:
-            A list of routes, or a dict of them keyed by number.
-        """
-        if (info.context or {}).get("packed"):
-            return {str(route.id): route.tiles for route in routes}
-        return [{"id": route.id, "tiles": route.tiles} for route in routes]
-
     @model_validator(mode="after")
     def _routes_exist(self) -> "Plan":
         """Every route the lookup names has to be a route that is there.
@@ -318,10 +254,11 @@ class Plan(BaseModel):
         number that was never in it, and the agent would find that out by
         failing mid-season.
         """
-        known = {route.id for route in self.routes}
-        missing = sorted({entry.route for entry in self.shops} - known)
+        missing = sorted(
+            {entry.route for entry in self.shops if str(entry.route) not in self.routes}
+        )
         if missing:
-            have = ", ".join(str(one) for one in sorted(known)[:6])
+            have = ", ".join(sorted(self.routes, key=int)[:6])
             raise ValueError(
                 f"shops point at routes {missing} that `routes` does not hold "
                 f"(it has {have}, ...)"
@@ -379,9 +316,7 @@ def join(controller: str, plan: dict) -> str:
     found = UNPACKED.search(controller)
     if found is None:
         raise ValueError("this controller has no plan loader to pack back into")
-    carried = Plan.model_validate(plan).model_dump(
-        mode="json", context={"packed": True}
-    )
+    carried = Plan.model_validate(plan).model_dump(mode="json")
     packed = base64.b85encode(
         zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
