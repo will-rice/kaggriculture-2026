@@ -32,6 +32,10 @@ import re
 import zlib
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+from kaggriculture.campaign import config
+
 # The plan as a program carries it: a generated name, then the three calls.
 # The name is captured so it can be put back; it differs between programs.
 PACKED = re.compile(
@@ -61,6 +65,163 @@ DATA = json.loads(
     (pathlib.Path(__file__).with_name({file!r})).read_text(encoding="utf-8")
 )
 """
+
+
+class Action(BaseModel):
+    """One step of the season: what the farmer does, the hands, and the market.
+
+    A command is a verb and its arguments -- `["PASS"]`, `["PICKUP", "COW"]`,
+    `["BUY_PRODUCT", "WHEAT", 13]` -- and the vocabularies are the engine's own
+    enums, so a verb this rejects is one `sim.hpp` would not have understood
+    either.
+
+    Attributes:
+        farmer: The farmer's command for this step.
+        hands: One command per hired hand, up to twelve, and none at the start.
+        market: The orders placed this step. An empty command is allowed here
+            and occurs 283 times in the champion's own plan; it is a step that
+            places nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    farmer: list[str | int]
+    hands: list[list[str | int]]
+    market: list[list[str | int]]
+
+    @field_validator("farmer")
+    @classmethod
+    def _farmer_acts(cls, command: list[str | int]) -> list[str | int]:
+        """The farmer acts every step, and the verb is one the engine has."""
+        return _command(command, config.UNIT_OPS, "farmer", empty=False)
+
+    @field_validator("hands")
+    @classmethod
+    def _hands_act(cls, commands: list[list[str | int]]) -> list[list[str | int]]:
+        """Every hand that exists acts, with the same vocabulary."""
+        for command in commands:
+            _command(command, config.UNIT_OPS, "a hand", empty=False)
+        return commands
+
+    @field_validator("market")
+    @classmethod
+    def _orders_are_orders(
+        cls, commands: list[list[str | int]]
+    ) -> list[list[str | int]]:
+        """Market orders, or nothing at all."""
+        for command in commands:
+            _command(command, config.MARKET_OPS, "a market order", empty=True)
+        return commands
+
+
+def _command(
+    command: list[str | int], vocabulary: list[str], whose: str, empty: bool
+) -> list[str | int]:
+    """Check one verb and its arguments.
+
+    Args:
+        command: The command to check.
+        vocabulary: The verbs the engine accepts here.
+        whose: What to call it if it is wrong.
+        empty: Whether an empty command means "do nothing" or is a mistake.
+
+    Returns:
+        The command, unchanged.
+
+    Raises:
+        ValueError: The command is empty where it may not be, too long, or
+            names a verb the engine does not have.
+    """
+    if not command:
+        if empty:
+            return command
+        raise ValueError(f"{whose} has no verb")
+    verb = command[0]
+    if verb not in vocabulary:
+        raise ValueError(f"{whose} says {verb!r}, which the engine has no op for")
+    if len(command) > 3:
+        raise ValueError(f"{whose} has {len(command)} parts; the engine reads three")
+    return command
+
+
+class ShopRoute(BaseModel):
+    """Which route to walk when the map unlocks these two shops.
+
+    This is the table worth editing. It is 64 lines, and it is the whole of
+    how the plan adapts to a map: change a route here and the agent plays a
+    different season.
+
+    Attributes:
+        shops: The two shops the map has, by the engine's own names.
+        route: The route to walk, which has to be one `routes` holds.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shops: list[str]
+    route: int
+
+    @field_validator("shops")
+    @classmethod
+    def _two_known_shops(cls, shops: list[str]) -> list[str]:
+        """Two of them, both names the engine unlocks."""
+        if len(shops) != 2:
+            raise ValueError(f"a map unlocks two shops, not {len(shops)}")
+        for shop in shops:
+            if shop not in config.SHOP_NAMES:
+                raise ValueError(f"{shop!r} is not a shop the engine has")
+        return shops
+
+
+class Plan(BaseModel):
+    """The strategy a program plays: the season, the paths, and the lookup.
+
+    Attributes:
+        actions: The scripted season, step by step.
+        routes: The paths those steps walk, as tile indices, by route number.
+        shops: Which route to walk for the shops a map happens to unlock.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[Action]
+    routes: dict[str, list[int]]
+    shops: list[ShopRoute]
+
+    @model_validator(mode="after")
+    def _routes_exist(self) -> "Plan":
+        """Every route the lookup names has to be a route that is there.
+
+        The likeliest way to break this file is to point a shop pair at a route
+        number that was never in it, and the agent would find that out by
+        failing mid-season.
+        """
+        missing = sorted(
+            {entry.route for entry in self.shops if str(entry.route) not in self.routes}
+        )
+        if missing:
+            have = ", ".join(sorted(self.routes, key=int)[:6])
+            raise ValueError(
+                f"shops point at routes {missing} that `routes` does not hold "
+                f"(it has {have}, ...)"
+            )
+        return self
+
+
+def validated(data: dict) -> dict:
+    """The plan, checked, or a refusal that says what is wrong with it.
+
+    Args:
+        data: A plan as read from `plan.json`.
+
+    Returns:
+        The same plan, once it is known to be one.
+
+    Raises:
+        ValueError: It is not, with the first thing wrong named.
+    """
+    Plan.model_validate(data)
+    return data
 
 
 def carries(source: str) -> bool:
@@ -166,4 +327,9 @@ def gather(box: Path, name: str = "child.py") -> str:
         # No loader left: the round rewrote the program around its own data,
         # and what it wrote is what it meant. The plan file is a leftover.
         return source
-    return join(source, json.loads(plan_file.read_text(encoding="utf-8")))
+    # Checked here, where the round can still be told it wrote nothing usable.
+    # Unchecked, a plan with a verb the engine has no op for, or a shop pair
+    # pointing at a route that is not there, is a program that forfeits every
+    # game -- and the campaign would read that as a bad idea rather than a
+    # broken file.
+    return join(source, validated(json.loads(plan_file.read_text(encoding="utf-8"))))

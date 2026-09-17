@@ -19,7 +19,9 @@ from kaggriculture.campaign import mutate, plan
 # name, and an agent that reads it.
 PLAN = {
     "actions": [{"farmer": ["PASS"], "hands": [], "market": []}],
-    "routes": {"0": [1, 2, 3]},
+    # The route the lookup names has to be one that is here, which is the first
+    # thing the schema checks and the first thing this fixture got wrong.
+    "routes": {"101": [1, 2, 3], "112": [3, 2, 1]},
     "shops": [{"shops": ["BAKERY", "BAKERY"], "route": 101}],
 }
 
@@ -178,6 +180,44 @@ def test_a_round_that_changes_nothing_is_still_no_output(tmp_path: Path) -> None
     result = asyncio.run(mutator(tmp_path, "improve it", "p41"))
 
     assert result.status == "no_output" and result.child is None
+
+
+def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
+    """A bad edit is refused here, where it is still a sentence rather than a loss.
+
+    Unchecked, each of these ships a program that forfeits every game it plays,
+    and the campaign reads that as a bad idea instead of a broken file.
+    """
+    for wrong, says in (
+        ({"shops": [{"shops": ["BAKERY", "BAKERY"], "route": 999}]}, "does not hold"),
+        ({"actions": [{"farmer": ["TELEPORT"], "hands": [], "market": []}]}, "no op"),
+        (
+            {"shops": [{"shops": ["BAKERY", "BAKERY", "BAKERY"], "route": 101}]},
+            "two shops",
+        ),
+        ({"actions": [{"farmer": [], "hands": [], "market": []}]}, "no verb"),
+    ):
+        with pytest.raises(ValueError, match=says):
+            plan.validated({**PLAN, **wrong})
+
+
+def test_the_schema_takes_the_plan_the_champion_actually_carries() -> None:
+    """Whatever it rejects, it has to accept the one in play.
+
+    The shapes are irregular in ways a schema written from imagination would
+    forbid: the farmer's command is one, two or three parts; a market order can
+    be empty, and 283 of them are; a step has between zero and twelve hands.
+    """
+    champion = Path("run/campaign/floor/agent/main.py")
+    if not champion.exists():
+        pytest.skip("no live champion in this checkout")
+
+    _, data = plan.split(champion.read_text(encoding="utf-8"))
+    checked = plan.Plan.model_validate(data)
+
+    assert len(checked.actions) == 3982
+    assert any(not action.market for action in checked.actions)
+    assert max(len(action.hands) for action in checked.actions) == 12
 
 
 def test_the_real_champion_survives_the_round_trip() -> None:
