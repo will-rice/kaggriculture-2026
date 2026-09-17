@@ -69,13 +69,13 @@ from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.gate import Champion
 from kaggriculture.campaign.harness import OpponentCrash
 from kaggriculture.campaign.mutate import (
-    CodexMutator,
     FakeMutator,
     Mutation,
     Mutator,
-    fallback,
-    model,
-    validate_model,
+    asked_model,
+    build,
+    selected,
+    validate_models,
 )
 from kaggriculture.campaign.pool import Pool
 
@@ -133,15 +133,15 @@ def main(argv: list[str] | None = None) -> None:
         # time; caught here, before the run opens or a call is ever made.
         # Through the accessors, because `.env` is where the slug is chosen
         # now: validating the constant would pass a run that never uses it.
-        validate_model(model())
-        if fallback():
-            validate_model(fallback())
+        # Against the catalog of whichever program is driving, because the two
+        # share no vocabulary at all.
+        validate_models()
     # 1. wandb, named for the revision of the code that produced the run.
     log = _open_run(dry_run=args.dry_run)
     mutator: Mutator = (
         FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
         if args.dry_run
-        else CodexMutator()
+        else build()
     )
     try:
         # 2-4. the event loop, the workers, and the gate they fire.
@@ -209,7 +209,7 @@ def _open_run(dry_run: bool) -> wandb.Run:
     dirty = Git(config.ROOT).status("--porcelain", "--", "src")
     if dirty:
         raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
-    started_on = model()
+    started_on = asked_model()
     name = Repo(config.ROOT).head.commit.hexsha[:7]
     log = wandb.init(
         entity=config.WANDB_ENTITY,
@@ -220,8 +220,11 @@ def _open_run(dry_run: bool) -> wandb.Run:
         mode="disabled" if dry_run else "online",
         config={
             **{key: getattr(config, key) for key in HYPERPARAMETERS},
-            "CODEX_MODEL": started_on,
-            "CODEX_FALLBACK_MODEL": fallback(),
+            # Not `CODEX_MODEL`: it has held a codex slug and now holds
+            # whatever `MUTATOR` names, and a key that lies about which
+            # program produced a run is how the switch hides.
+            "MUTATOR": selected(),
+            "MUTATOR_MODEL": started_on,
         },
     )
     log.define_metric("sessions")
@@ -744,12 +747,15 @@ class Campaign:
                 siblings[: prompt.RECENT_ATTEMPTS], start=1
             ):
                 shutil.copy(program.source_path, box / f"tried_{number}.py")
-            # And how to ask it, as a skill rather than as more message. Codex
-            # discovers `.codex/skills` under its working directory, so a
-            # round that wants the schema and the queries worth running opens
-            # them, and a round with a different question pays nothing for
-            # them. The message is read every round; this is read on demand.
-            shutil.copytree(config.SKILLS, box / ".codex" / "skills")
+            # And how to ask it, as a skill rather than as more message, at
+            # whichever path the driving program looks for one: codex reads
+            # `.codex/skills` under its working directory, agy walks up from
+            # it for `.agents`. So a round that wants the schema and the
+            # queries worth running opens them, and a round with a different
+            # question pays nothing for them -- both programs disclose a skill
+            # by name and description and load it only if asked. The message
+            # is read every round; this is read on demand.
+            shutil.copytree(config.SKILLS, box / self.mutator.SKILLS_DIR)
             mutation = await self.mutator(box, message, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1

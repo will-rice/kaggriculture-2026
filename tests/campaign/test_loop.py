@@ -310,9 +310,12 @@ class Recorder:
 
     The loop removes a round's directory once its program is in the database,
     so what a call was given has to be read while it is running. This is the
-    same contract ``FakeMutator`` meets, and nothing but the codex process is
-    stood in for.
+    same contract ``FakeMutator`` meets, and nothing but the driving process is
+    stood in for -- including where that process reads its skills, which the
+    loop asks the mutator for rather than deciding itself.
     """
+
+    SKILLS_DIR = Path(".agents") / "skills"
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the recorder.
@@ -916,7 +919,14 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
     ``main`` ever sees it.
     """
     env = tmp_path / ".env"
-    env.write_text("CAMPAIGN_CODEX_MODEL=gpt-5.6-astra\n", encoding="utf-8")
+    # And the driver, because the campaign runs `agy` by default and each
+    # program's models are checked against its own catalog: without this the
+    # typo is never looked at, which is exactly what happened when the default
+    # moved.
+    env.write_text(
+        "CAMPAIGN_MUTATOR=codex\nCAMPAIGN_CODEX_MODEL=gpt-5.6-astra\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(mutate, "ENV", env)
     monkeypatch.setattr(
         mutate,
@@ -1394,7 +1404,9 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
 
     handed = mutator.seen[0]
-    assert handed.held == [".codex", "child.py", "measure.py", "parent.py"]
+    assert handed.held == sorted(
+        [Recorder.SKILLS_DIR.parts[0], "child.py", "measure.py", "parent.py"]
+    )
     assert not handed.where.exists()
 
 
@@ -2108,14 +2120,19 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
 
-    async def cancelled(
-        workspace: Path, message: str, program_id: str
-    ) -> mutate.Mutation:
+    class Cancelled:
         """A call killed mid-flight, which is what the pacer does to a slow one."""
-        assert workspace.exists(), "the round never made a workspace to leak"
-        raise asyncio.CancelledError
 
-    campaign.mutator = cancelled
+        SKILLS_DIR = Path(".agents") / "skills"
+
+        async def __call__(
+            self, workspace: Path, message: str, program_id: str
+        ) -> mutate.Mutation:
+            """Check the directory is there to be leaked, then die."""
+            assert workspace.exists(), "the round never made a workspace to leak"
+            raise asyncio.CancelledError
+
+    campaign.mutator = Cancelled()
     # Workspaces come from `tempfile.mkdtemp`, so pointing the module at
     # `tmp_path` keeps this test's leak out of the machine's own /tmp and
     # clear of any already sitting there.
@@ -2200,18 +2217,23 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     seen: dict[str, object] = {}
 
-    async def inspect(
-        workspace: Path, message: str, program_id: str
-    ) -> mutate.Mutation:
+    class Inspect:
         """A call that only reports what it was handed."""
-        seen["files"] = sorted(path.name for path in workspace.iterdir())
-        seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
-        seen["skill"] = (
-            workspace / ".codex" / "skills" / "query-games" / "SKILL.md"
-        ).exists()
-        raise asyncio.CancelledError
 
-    campaign.mutator = inspect
+        SKILLS_DIR = Path(".agents") / "skills"
+
+        async def __call__(
+            self, workspace: Path, message: str, program_id: str
+        ) -> mutate.Mutation:
+            """Note the directory, then leave without writing anything."""
+            seen["files"] = sorted(path.name for path in workspace.iterdir())
+            seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
+            seen["skill"] = (
+                workspace / self.SKILLS_DIR / "query-games" / "SKILL.md"
+            ).exists()
+            raise asyncio.CancelledError
+
+    campaign.mutator = Inspect()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     source = _write(tmp_path / "parent-source.py", SELLER)
 
@@ -2227,8 +2249,11 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             )
         )
 
-    assert seen["files"] == [".codex", "child.py", "measure.py", "parent.py"]
-    # The skills go in where codex looks for them, under its working directory.
+    assert seen["files"] == sorted(
+        [Inspect.SKILLS_DIR.parts[0], "child.py", "measure.py", "parent.py"]
+    )
+    # The skills go where the driving program looks for them: `.codex/skills`
+    # under codex's working directory, `.agents` for agy to walk up to.
     assert seen["skill"], "the round was given no query-games skill"
     # Every game behind the verdict, at a width no message could carry. The
     # message holds the index; this is what the index points at.

@@ -1,12 +1,24 @@
-"""One mutation: one codex call on one file, or a fake that edits a constant.
+"""One mutation: one model call on one file, or a fake that edits a constant.
 
 A call is given a directory holding ``child.py`` and nothing else, and the
-whole message on standard input. It edits that file and stops; the loop reads
-it back, scores it, and composes the next round's message from the result.
+whole message -- on standard input for codex, as an argument for agy. It edits
+that file and stops; the loop reads it back, scores it, and composes the next
+round's message from the result.
 
-The codex command is a class attribute so a test can replace it with ``true``
-or ``sleep``; the rest of the module never changes between the fake and the
-real thing.
+Two programs can drive a round. `config.MUTATOR` chooses, and `build` returns
+it. They exist side by side because an entitlement ran out rather than because
+either is better: codex has no quota on this account until 2026-09-22, and agy
+bills a different one.
+
+Neither program's own report of how it went is read. Both will exit 0 having
+done nothing -- codex ends a turn with a question instead of an edit, and agy
+returns ``"status": "SUCCESS"`` when its ``--print-timeout`` expires mid-turn,
+after announcing that it finished. `_written` compares the file against what
+the round was handed, and that comparison is the whole verdict.
+
+Each command is a class attribute so a test can replace it with ``true``
+or ``sleep``; the rest of the module never changes between the fakes and the
+real things.
 
 Both mutators are awaitable, because the loop runs many rounds at once on
 one event loop: codex is an ``asyncio`` child process, and the fake's file
@@ -46,6 +58,9 @@ LOGGER = logging.getLogger(__name__)
 # lookup, not a model turn, so no quota is spent running it. A test replaces
 # this with a command that prints a small catalog of its own.
 MODEL_CATALOG_COMMAND = ["codex", "debug", "models"]
+# The same for agy. Also a local lookup rather than a model turn: it spends
+# no quota, and `agy -p /usage` is how the quota itself is read.
+AGY_CATALOG_COMMAND = ["agy", "models"]
 
 
 def known_models() -> set[str]:
@@ -123,6 +138,71 @@ def validate_model(model: str) -> None:
         )
 
 
+def agy_model() -> str:
+    """The agy model to ask for, read fresh at every call.
+
+    Read from `.env` at the call for the reason `model` is: a running
+    campaign cannot be reached by exporting a variable, and the file is the
+    part of its environment it can re-read.
+
+    Returns:
+        The slug from the environment, or `config.AGY_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_AGY_MODEL") or config.AGY_MODEL
+
+
+def agy_fallback() -> str:
+    """The agy model retried once when the first fails without a verdict.
+
+    Returns:
+        The slug from the environment, or `config.AGY_FALLBACK_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    value = os.environ.get("CAMPAIGN_AGY_FALLBACK_MODEL")
+    return config.AGY_FALLBACK_MODEL if value is None else value
+
+
+def known_agy_models() -> set[str]:
+    """The model slugs this agy login is entitled to.
+
+    ``agy models`` prints one ``slug<TAB>label`` line per model on standard
+    output and its progress line on standard error, so the parse is the first
+    field of every line. It documents an ``--output-format json`` that agy
+    1.2.4 does not have -- the flag is refused outright -- which is why this
+    reads the text.
+
+    Returns:
+        Every slug the catalog lists.
+    """
+    output = subprocess.run(
+        AGY_CATALOG_COMMAND, capture_output=True, check=True, text=True
+    ).stdout
+    return {
+        line.split("\t", 1)[0].strip() for line in output.splitlines() if line.strip()
+    }
+
+
+def validate_agy_model(model: str) -> None:
+    """Fails fast when ``model`` is not a slug this agy login recognizes.
+
+    agy does fail a bad slug itself, loudly and non-zero. It fails it once
+    per round, though, and a campaign that discovers its model was misspelled
+    one session at a time has spent the night finding out.
+
+    Args:
+        model: The model to check.
+
+    Raises:
+        SystemExit: ``model`` is not in `known_agy_models`.
+    """
+    if model not in known_agy_models():
+        raise SystemExit(
+            f"{model!r} is not a model this agy login knows about "
+            "(run `agy models` to check the spelling)"
+        )
+
+
 class Mutation(BaseModel):
     """The outcome of one mutation call.
 
@@ -157,6 +237,14 @@ class Mutation(BaseModel):
 
 class Mutator(Protocol):
     """Something that turns one file and one message into a child program."""
+
+    # Where this program discovers skills, relative to the workspace. The
+    # loop copies `config.SKILLS` there, and the two programs do not agree:
+    # codex reads `.codex/skills` under its working directory, agy walks up
+    # from it looking for `.agents`. Hardcoding either in the loop is how a
+    # round silently loses the schema and the queries worth running -- it
+    # still runs, it just never finds them -- so the mutator names its own.
+    SKILLS_DIR: Path
 
     async def __call__(
         self, workspace: Path, message: str, program_id: str
@@ -196,6 +284,8 @@ class CodexMutator:
     # `--skip-git-repo-check` because a call runs in a temporary directory
     # holding one file, not in a repository: codex refuses an untrusted
     # directory otherwise, and the directory is deliberately not one.
+    SKILLS_DIR = Path(".codex") / "skills"
+
     COMMAND = [
         "codex",
         "exec",
@@ -367,6 +457,213 @@ class CodexMutator:
         )
 
 
+class AgyMutator:
+    """Runs one ``agy --print`` over one file and reports the result.
+
+    The second way to run a round, because the first one ran out: codex bills
+    an entitlement that is empty until 2026-09-22 and `agy` bills a different
+    one. Everything about the shape is the same -- one directory, one file,
+    one message, a verdict the loop decides for itself -- and three things
+    about the mechanics are not.
+
+    The message goes on the command line, not standard input: ``--print``
+    takes its prompt as a value, and a valueless ``-p`` is an error rather
+    than a read from stdin. (``--input-format stream-json`` does read stdin,
+    one turn per NDJSON line, which is a session driver and not this.)
+
+    ``--add-dir`` is not optional. Without it the workspace is outside
+    anything the call may touch, and the failure is quiet in the worst way:
+    on 2026-09-16 a probe run without it reported having read a file it
+    never opened and set a value it had invented. The directory is passed
+    both as ``cwd`` -- which is where agy starts walking to find
+    ``.agents`` -- and as ``--add-dir``, which is what actually grants it.
+
+    ``"status": "SUCCESS"`` and an exit code of 0 mean neither that the round
+    finished nor that it did anything. Measured on agy 1.2.4: a call whose
+    ``--print-timeout`` expired mid-turn returned its partial answer, said
+    ``SUCCESS``, exited 0, and left ``child.py`` exactly as it was found --
+    having announced in its own last message that it had completed the task.
+    So the verdict here is what it is for codex and for the same reason:
+    ``_written`` compares the file against what the round was handed, and
+    nothing the round says about itself is read.
+
+    Two flags are deliberately absent. ``--sandbox`` restricts the terminal,
+    and a round has to be able to run ``measure.py``; commands already run
+    without prompting because the host's settings say
+    ``toolPermission: proceed-in-sandbox``. ``--disable-slash-commands``
+    would stop skill expansion, and the workspace skill in ``SKILLS_DIR`` is
+    the point -- it is discovered even in a temporary directory that is not a
+    repository (probed 2026-09-16). Skills are disclosed progressively, so
+    the host's own eight cost their descriptions and nothing more unless a
+    round chooses to open one.
+    """
+
+    SKILLS_DIR = Path(".agents") / "skills"
+
+    # Overridden by tests with something like ``["true"]``; the message and
+    # the flags are only appended when the command actually is agy.
+    COMMAND = ["agy", "--print"]
+
+    def __init__(self, model: str = "", fallback: str | None = None) -> None:
+        """Initializes the mutator.
+
+        Args:
+            model: The agy model to request, or "" to read it per call.
+            fallback: The model to retry on, once, when a call on ``model``
+                fails without a verdict. "" never retries; None reads it per
+                call.
+        """
+        self.model = model
+        self.fallback = fallback
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Runs one agy call in ``workspace``, retrying once on the fallback.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, composed by ``prompt.compose``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` describing what happened, on whichever model
+            produced it.
+        """
+        asked = self.model or agy_model()
+        retry = agy_fallback() if self.fallback is None else self.fallback
+        mutation = await self.call(workspace, message, program_id, asked)
+        if mutation.status != "exec_error" or not retry:
+            return mutation
+        LOGGER.warning(
+            "agy call for %s failed on %s (%s); retrying on %s",
+            program_id,
+            asked,
+            mutation.reason[:120],
+            retry,
+        )
+        log = workspace / "agy.jsonl"
+        log.replace(log.with_name(f"agy.{asked}.failed.jsonl"))
+        retried = await self.call(workspace, message, program_id, retry)
+        return retried.model_copy(
+            update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
+        )
+
+    async def call(
+        self, workspace: Path, message: str, program_id: str, model: str
+    ) -> Mutation:
+        """Runs one agy call in ``workspace`` on ``model``.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, passed as ``--print``'s value.
+            program_id: The child program id.
+            model: The agy model to request.
+
+        Returns:
+            A `Mutation` describing what happened.
+        """
+        started = time.perf_counter()
+        given = (workspace / "child.py").read_text(encoding="utf-8")
+        command = [*self.COMMAND]
+        if command[0] == "agy":
+            command += [
+                message,
+                # One JSON object per line: typed `init` and `step_update`
+                # events as the round works, and a terminal `result` event
+                # carrying the answer and the token usage. The plain `json`
+                # format returns the same result object and nothing of the
+                # steps, and a round that dies leaves that file empty.
+                "--output-format",
+                "stream-json",
+                "--mode",
+                "accept-edits",
+                "--add-dir",
+                str(workspace),
+                "--model",
+                model,
+                "--print-timeout",
+                config.AGY_TIMEOUT,
+            ]
+        log = workspace / "agy.jsonl"
+        with log.open("w", encoding="utf-8") as handle:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                # The prompt is an argument here, so nothing is written in.
+                # Closed rather than inherited: agy reads a controlling
+                # terminal for an OAuth code when its stdin is a pipe, and a
+                # round that waits on one nobody is watching waits for hours.
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=handle,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+                start_new_session=True,
+                env={**os.environ, "CAMPAIGN_AGY_MODEL": model},
+            )
+            try:
+                _, stderr = await process.communicate()
+            except asyncio.CancelledError:
+                # agy runs shell commands, schedules background tasks and can
+                # invoke subagents of its own, and it only terminates those on
+                # a clean exit -- which a killed parent never reaches. So the
+                # group goes, or a restart finds a round still playing seasons
+                # against a directory nothing owns and a core the budget has
+                # already promised to somebody else.
+                LOGGER.warning(
+                    "agy call for %s cancelled, killed pgid %s",
+                    program_id,
+                    kill_group(process),
+                )
+                await process.wait()
+                raise
+        result = await asyncio.to_thread(_agy_result, log)
+        if process.returncode != 0:
+            # Only a cascade-level failure gets here: a model slug agy cannot
+            # resolve, an interrupt, a crash. A refused tool or a failed
+            # command inside the round is not one of them and exits 0.
+            reason = _agy_reason(result) or stderr.decode(errors="replace")[-500:]
+            LOGGER.warning(
+                "agy call for %s exited %s on %s: %s",
+                program_id,
+                process.returncode,
+                model,
+                reason[:200],
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=0,
+                output_tokens=0,
+                model=model,
+            )
+        usage = result.get("usage") or {}
+        child = _written(workspace, given)
+        if child is None:
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="no_output",
+                reason=_agy_reason(result) or "child.py missing, empty or unchanged",
+                seconds=time.perf_counter() - started,
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                model=model,
+            )
+        return Mutation(
+            program_id=program_id,
+            child=child,
+            status="ok",
+            reason="",
+            seconds=time.perf_counter() - started,
+            input_tokens=int(usage.get("input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            model=model,
+        )
+
+
 def kill_group(process: asyncio.subprocess.Process) -> int | None:
     """SIGKILL a session's whole process group and return the group it killed.
 
@@ -492,8 +789,62 @@ def _last_message(log: Path) -> str:
     return last[:200]
 
 
+def _agy_result(log: Path) -> dict:
+    """The payload of agy's terminal ``result`` event, or {}.
+
+    Args:
+        log: Path to the ``agy.jsonl`` transcript.
+
+    Returns:
+        The last ``result`` event's payload -- ``status``, ``response``,
+        ``usage``, and ``denied_actions`` when the round was refused
+        something -- or {} if the stream ended before one was written.
+    """
+    found: dict = {}
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "result":
+            found = event.get("result") or {}
+    return found
+
+
+def _agy_reason(result: dict) -> str:
+    """Why a call is worth no child, read off its ``result`` event.
+
+    ``denied_actions`` comes first when it is there. It is the difference
+    between a round that would not make the edit and a round that was not
+    allowed to, and it names the rule that would have permitted it -- which
+    is the distinction a day was lost to on 2026-09-16, when a missing
+    ``--add-dir`` was read as a model inventing an answer.
+
+    Args:
+        result: The payload from `_agy_result`.
+
+    Returns:
+        A short explanation, or "" when the result says nothing useful.
+    """
+    parts = []
+    status = result.get("status", "")
+    if status and status != "SUCCESS":
+        parts.append(str(status))
+    denied = result.get("denied_actions")
+    if denied:
+        parts.append(f"denied: {denied}")
+    response = str(result.get("response", "")).strip()
+    if response:
+        parts.append(response[:200])
+    return "; ".join(parts)[:300]
+
+
 class FakeMutator:
     """Edits ``child.py`` in place through ``edit``. For dry runs and tests."""
+
+    # Nothing reads them, but the loop still lays them out, so a dry run
+    # exercises the same copy a real round does.
+    SKILLS_DIR = Path(".agents") / "skills"
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the mutator.
@@ -542,3 +893,57 @@ class FakeMutator:
             child: The file to rewrite.
         """
         child.write_text(self.edit(child.read_text(encoding="utf-8")), encoding="utf-8")
+
+
+def selected() -> str:
+    """Which program drives a round, read fresh so it can change.
+
+    Returns:
+        "codex" or "agy".
+
+    Raises:
+        SystemExit: The name is neither.
+    """
+    load_dotenv(ENV, override=True)
+    kind = os.environ.get("CAMPAIGN_MUTATOR") or config.MUTATOR
+    if kind not in ("codex", "agy"):
+        raise SystemExit(f"{kind!r} is not a mutator; use 'codex' or 'agy'")
+    return kind
+
+
+def build() -> Mutator:
+    """The mutator `selected` names.
+
+    Returns:
+        A mutator reading its own model per call.
+    """
+    return CodexMutator() if selected() == "codex" else AgyMutator()
+
+
+def asked_model() -> str:
+    """The model the selected mutator will ask for.
+
+    Returns:
+        The slug, for the run's own record of what it opened on.
+    """
+    return model() if selected() == "codex" else agy_model()
+
+
+def validate_models() -> None:
+    """Checks the selected mutator's models against its own catalog.
+
+    Each program has its own vocabulary and neither knows the other's:
+    `gpt-5.6-luna` is not a slug agy has ever heard of, and validating it
+    against the wrong catalog would refuse a run that was going to work.
+
+    Raises:
+        SystemExit: Either model is not one the login knows.
+    """
+    if selected() == "codex":
+        validate_model(model())
+        if fallback():
+            validate_model(fallback())
+        return
+    validate_agy_model(agy_model())
+    if agy_fallback():
+        validate_agy_model(agy_fallback())

@@ -450,6 +450,39 @@ CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 # `ultra`, which adds automatic task delegation; that is a different execution
 # shape rather than more thinking, and a round already has a shape.
 CODEX_REASONING = "max"
+
+# Which program drives a round: "codex" or "agy" (the Antigravity CLI). Read
+# per round through `mutate.selected`, so it can change under a running
+# campaign the way the model can.
+#
+# It is "agy" because the codex quota this account had is exhausted until
+# 2026-09-22 08:09 and the deadline is 2026-09-30, which left six of the
+# fourteen remaining days with no rounds at all. `agy` bills a different
+# entitlement entirely -- and two of them: `agy -p /usage` reports a Gemini
+# pool and a separate "Claude and GPT models" pool, the second untouched at
+# 100% while the codex one is at zero. So the wall the campaign hit was one
+# vendor's, not the account's.
+MUTATOR = "agy"
+# The model an `agy` round asks for. Sonnet rather than a flash model because
+# a round reads the champion and its opponents and edits a program, and the
+# cheap end of the catalog has already failed that once: `gemini-3.6-flash-low`
+# produced garbage on a two-step shell-and-edit probe that `-medium` completed.
+# It also spends the pool that has quota rather than the one that is 2% down.
+AGY_MODEL = "claude-sonnet-4-6"
+# Retried once when the first call fails without a verdict, across pools on
+# purpose: a Claude-pool refusal (rate limit, capacity) is exactly the failure
+# a same-pool retry would hit again.
+AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
+# How long one `agy` round may run.
+#
+# Deliberately far above the 5m default, for the reason a round cap was
+# removed from codex: the only cap this ever had cut calls off before they had
+# written anything. It has to be said out loud here because an expired
+# `--print-timeout` does not look like a failure -- agy returns the partial
+# answer, reports `"status": "SUCCESS"` and exits 0 (measured on 1.2.4, with
+# `child.py` untouched). Nothing but the file says whether the round worked,
+# which is why `_written` is what decides the verdict.
+AGY_TIMEOUT = "3h"
 SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The database id of the program a cold start seeds itself from. The copy the
 # cold start writes under a run's `programs` is the campaign's lineage: every
