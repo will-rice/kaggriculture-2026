@@ -20,6 +20,19 @@ open, grep and edit like any other file. `join` puts them back into the single
 self-contained program every other part of the campaign expects -- the gate,
 the archive, the pool, the validator and the submission all still see one file.
 
+Commands are models rather than the positional lists a program carries, because
+a fixed-length heterogeneous array is not something every provider's schema
+subset can say: it was eighty violations of OpenAI's, and nothing else in the
+schema broke a rule. As `{"verb": "PLANT", "crop": "WHEAT"}` the same thing is
+said in a shape they all take, and said more precisely -- one model per verb,
+each carrying only the arguments that verb accepts. The program still reads
+`["PLANT", "WHEAT"]`; that form is a serialization, converted at the boundary.
+
+For OpenAI's strict mode, hand the model to
+`openai.lib._pydantic.to_strict_json_schema`, which closes the objects and
+inlines the `$ref`s that carry descriptions. DeepSeek and GLM take
+`model_json_schema()` as it is -- both were asked.
+
 `join(split(source))` returns the same plan and the same controller. It also
 happens to return the same bytes for the champions in play -- the models are
 declared in the order those programs write their keys -- but nothing depends on
@@ -34,7 +47,7 @@ import re
 import zlib
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 from pydantic import (
     BaseModel,
@@ -82,66 +95,53 @@ DATA = json.loads(
 # `MOp` are the vocabularies, and pydantic renders an enum into the schema as
 # `enum: [...]` -- so a generator handed this can only spell a verb the engine
 # has, which a validator could report only after the writing was done.
+UnitOp = StrEnum("UnitOp", {op: op for op in config.UNIT_OPS})
+MarketOp = StrEnum("MarketOp", {op: op for op in config.MARKET_OPS})
 ItemName = StrEnum("ItemName", {name: name for name in config.ITEMS})
-ProductName = StrEnum("ProductName", {name: name for name in config.PRODUCTS})
-CropName = StrEnum("CropName", {name: name for name in config.CROPS})
-AnimalName = StrEnum("AnimalName", {name: name for name in config.ANIMALS})
 ShopName = StrEnum("ShopName", {name: name for name in config.SHOP_NAMES})
 
-# Every unit op that is a verb on its own. `action.rs` gives `PICKUP`, `PLACE`
-# and `PLANT` arguments and reads the rest as the verb alone -- and `PASS`
-# shares its arm with every op the engine does not know, so an unknown verb is
-# a pass rather than an error.
-PLAIN_UNIT_OPS = [
-    op for op in config.UNIT_OPS if op not in ("PICKUP", "PLACE", "PLANT")
-]
-PlainUnitOp = StrEnum("PlainUnitOp", {op: op for op in PLAIN_UNIT_OPS})
-
-# A count. Not `gt=0`, though `action.rs` drops an order whose count is zero or
-# less: the champion carries `["SELL", "STRAWBERRY", 0]` at step 449, the engine
-# runs that plan without complaint, and a schema that refused it would refuse a
-# legal plan. So the rule is said where a writer reads it rather than enforced
-# where it would reject what already plays.
-Count = Annotated[
-    int,
-    Field(description="How many. An order with a count of zero or less is dropped."),
-]
-
-# One command, shaped as the parser reads it.
+# A command is `[verb]`, `[verb, name]` or `[verb, name, count]` -- the shape
+# `action.rs` reads, and the shape the program already carries. Said as a
+# bounded list of tokens rather than a tuple: a tuple becomes `prefixItems`,
+# which is the one thing OpenAI's strict mode will not take, while a length is
+# something every provider accepts. The cost is that the schema cannot say
+# which verb takes which name; the descriptions say it instead.
 UnitCommand = Annotated[
-    tuple[PlainUnitOp]
-    | tuple[Literal["PICKUP"], ItemName]
-    | tuple[Literal["PICKUP"], ItemName, Count]
-    | tuple[Literal["PLACE"], ItemName]
-    | tuple[Literal["PLACE"], ItemName, Count]
-    | tuple[Literal["PLANT"], CropName],
-    Field(description="A verb the farmer or a hand performs, and its arguments."),
+    list[UnitOp | ItemName | int],
+    Field(
+        min_length=1,
+        max_length=3,
+        description=(
+            "One command: the verb first, then what it acts on, then how many. "
+            "Most verbs are the verb alone -- `['NORTH']`, `['HARVEST']`. "
+            "`PICKUP` and `PLACE` take an item and may take a count: "
+            "`['PICKUP', 'COW']` or `['PICKUP', 'COW', 2]`. `PLANT` takes one of "
+            "the five crops and no count: `['PLANT', 'WHEAT']`. A verb the engine "
+            "does not know is read as a pass."
+        ),
+        examples=[["PASS"], ["NORTH"], ["PLANT", "WHEAT"], ["PICKUP", "COW", 2]],
+    ),
 ]
 
-# And one order. `HIRE` and `BUY_LAND` are verbs alone; the four that move goods
-# each take the names their own arm accepts. An empty order is legal and
-# common: the engine drops it, and 283 of the champion's steps place one.
 MarketCommand = Annotated[
-    tuple[()]
-    | tuple[Literal["HIRE"]]
-    | tuple[Literal["BUY_LAND"]]
-    | tuple[Literal["SELL"], ProductName, Count]
-    | tuple[Literal["BUY_SEED"], CropName, Count]
-    | tuple[Literal["BUY_PRODUCT"], Literal["WHEAT", "FERTILIZER"], Count]
-    | tuple[Literal["BUY_ANIMAL"], AnimalName, Count],
-    Field(description="An order to place this step, or nothing."),
+    list[MarketOp | ItemName | int],
+    Field(
+        max_length=3,
+        description=(
+            "One order: the verb first, then what it moves, then how many. "
+            "`HIRE` and `BUY_LAND` are the verb alone. `SELL` takes a product, "
+            "`BUY_SEED` a crop, `BUY_ANIMAL` an animal, and `BUY_PRODUCT` only "
+            "wheat or fertilizer -- each with a count, and an order whose count "
+            "is zero or less is dropped. The empty list places nothing, which is "
+            "legal and common."
+        ),
+        examples=[[], ["HIRE"], ["SELL", "WHEAT", 30], ["BUY_ANIMAL", "COW", 2]],
+    ),
 ]
 
 
 class Action(BaseModel):
-    """One step of the season: what the farmer does, the hands, and the market.
-
-    Attributes:
-        farmer: The farmer's command for this step. It always acts.
-        hands: One command per hired hand, up to the twelve the champion
-            reaches, and none at the start of a season.
-        market: The orders placed this step.
-    """
+    """One step of the season: what the farmer does, the hands, and the market."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -150,11 +150,7 @@ class Action(BaseModel):
             "The farmer's own command for this step. The farmer always acts, so "
             "this is never empty; `['PASS']` is how it does nothing."
         ),
-        examples=[["PASS"], ["NORTH"], ["PLANT", "WHEAT"], ["PICKUP", "COW", 2]],
     )
-    # `sim.hpp` keeps `MAX_UNITS` slots for the farmer and its hands, so a
-    # farm can work thirty-nine. The first schema said twelve, which is
-    # what this champion hires -- and would have refused a legal plan.
     hands: list[UnitCommand] = Field(
         max_length=config.MAX_UNITS - 1,
         description=(
@@ -162,9 +158,10 @@ class Action(BaseModel):
             "hired: the first entry is the first hand. Empty at the start of a "
             "season, before anything has hired, and never longer than the number "
             "of hands the farm actually has -- a command addressed to a hand that "
-            "does not exist is ignored."
+            "does not exist is ignored. A farm can work at most "
+            f"{config.MAX_UNITS - 1}, which is every unit slot the engine keeps "
+            "beside the farmer."
         ),
-        examples=[[], [["PASS"]], [["NORTH"], ["PICKUP", "COW"]]],
     )
     market: list[MarketCommand] = Field(
         description=(
@@ -172,7 +169,6 @@ class Action(BaseModel):
             "players' orders resolve in per-unit lockstep, so position matters "
             "when both sides reach for the same goods. May be empty."
         ),
-        examples=[[], [["HIRE"]], [["SELL", "WHEAT", 30], ["BUY_SEED", "MELON", 2]]],
     )
 
 
@@ -217,30 +213,25 @@ class ShopRoute(BaseModel):
     This is the table worth editing. It is 64 entries, and it is the whole of
     how the plan adapts to a map: change a route here and the agent plays a
     different season.
-
-    Attributes:
-        shops: The two shops the map has, by the engine's own names.
-        route: The route to walk, which has to be one `routes` holds.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    # Declared in the order a program writes them. Pydantic serialises in
-    # declaration order, so the other way round re-packs an untouched plan
-    # into different bytes -- and then a round that changed nothing looks
-    # like one that rewrote the strategy.
+    # Declared in the order a program writes them, so an untouched plan packs
+    # back into the same bytes and diffs between champions stay legible.
     route: int = Field(
         description=(
-            "Which route to walk on a map with those two shops. This has to be "
+            "Which route to walk on a map with these two shops. This has to be "
             "the `id` of a route the plan holds, or the agent has nowhere to walk."
         ),
         examples=[101, 112],
     )
-
-    shops: tuple[ShopName, ShopName] = Field(
+    shops: list[ShopName] = Field(
+        min_length=2,
+        max_length=2,
         description=(
-            "The two shops this map unlocks, in the engine's own order. The pair "
-            "is what a map is identified by, and both may be the same shop."
+            "The two shops this map unlocks, in the engine's own order. Both may "
+            "be the same shop, and the champion carries all sixty-four pairs."
         ),
         examples=[["BAKERY", "BAKERY"], ["BAKERY", "YARN_STORE"]],
     )

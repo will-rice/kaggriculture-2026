@@ -14,19 +14,21 @@ from pathlib import Path
 import pytest
 
 from kaggriculture.campaign import config, mutate, plan
+from kaggriculture.campaign.plan import Plan
 
 # A program shaped like a champion: imports, a packed plan under a generated
 # name, and an agent that reads it.
-# Routes are a list of `{id, tiles}` rather than the dict the program keeps,
-# because strict structured output refuses an object whose keys are the
-# writer's to choose -- and a plan that cannot be a schema cannot be generated
-# against one. `split` and `join` convert at the boundary.
+# A command is the positional list the program itself carries -- said in the
+# schema as a bounded list of tokens, because a tuple becomes `prefixItems` and
+# that is the one shape OpenAI's strict mode refuses. Routes are the exception:
+# they are a list of `{id, tiles}` where the program keeps a dict, because an
+# object with writer-chosen keys is the other thing it refuses.
 PLAN = {
     "actions": [{"farmer": ["PASS"], "hands": [], "market": []}],
     # The route the lookup names has to be one that is here, which is the first
     # thing the schema checks and the first thing this fixture got wrong.
     "routes": [{"id": 101, "tiles": [1, 2, 3]}, {"id": 112, "tiles": [3, 2, 1]}],
-    "shops": [{"shops": ["BAKERY", "BAKERY"], "route": 101}],
+    "shops": [{"route": 101, "shops": ["BAKERY", "BAKERY"]}],
 }
 
 
@@ -37,10 +39,9 @@ def packed(data: dict) -> str:
     list a schema can describe. This writes the program's form, so what these
     tests build is what a champion actually is.
     """
-    carried = {
-        **data,
-        "routes": {str(route["id"]): route["tiles"] for route in data["routes"]},
-    }
+    carried = Plan.model_validate(data).model_dump(
+        mode="json", context={"packed": True}
+    )
     blob = base64.b85encode(
         zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
@@ -214,14 +215,34 @@ def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
     for wrong, says in (
         # The relational rule, which no field constraint can express: one field
         # has to agree with another.
-        ({"shops": [{"shops": ["BAKERY", "BAKERY"], "route": 999}]}, "does not hold"),
-        # And the rest, which the types carry, so the message names the path.
-        ({"actions": [{"farmer": ["TELEPORT"], "hands": [], "market": []}]}, "farmer"),
         (
-            {"shops": [{"shops": ["BAKERY", "BAKERY", "BAKERY"], "route": 101}]},
+            {"shops": [{"route": 999, "shops": ["BAKERY", "BAKERY"]}]},
+            "does not hold",
+        ),
+        # And the rest, which the types carry, so the message names the path.
+        (
+            {"actions": [{"farmer": {"verb": "TELEPORT"}, "hands": [], "market": []}]},
+            "farmer",
+        ),
+        (
+            {"shops": [{"route": 101, "shops": ["NOT_A_SHOP", "BAKERY"]}]},
             "shops",
         ),
-        ({"actions": [{"farmer": [], "hands": [], "market": []}]}, "farmer"),
+        # A crop the engine does not grow. A bare `PLANT` with no crop at all is
+        # not here: `action.rs` reads one as a no-op and plays the season, so the
+        # schema says it too.
+        (
+            {
+                "actions": [
+                    {
+                        "farmer": {"verb": "PLANT", "crop": "EGG"},
+                        "hands": [],
+                        "market": [],
+                    }
+                ]
+            },
+            "crop",
+        ),
     ):
         with pytest.raises(ValueError, match=says):
             plan.Plan.model_validate({**PLAN, **wrong})
@@ -241,24 +262,24 @@ def test_the_schema_carries_the_rules_rather_than_checking_them_after() -> None:
 
     # The vocabularies are named types the fields point at, which is how
     # pydantic renders an enum: `{"enum": [...]}` under `$defs`.
-    assert "HARVEST" in defs["PlainUnitOp"]["enum"], "the verbs that stand alone"
-    assert "TELEPORT" not in defs["PlainUnitOp"]["enum"]
-    assert defs["CropName"]["enum"] == config.CROPS, "the engine's own crops"
-    assert defs["ProductName"]["enum"] == config.PRODUCTS
+    assert "HARVEST" in defs["UnitOp"]["enum"], "the engine's verbs"
+    assert "TELEPORT" not in defs["UnitOp"]["enum"]
+    # The whole of the engine's list, not a subset kept by subtraction: a bare
+    # `PLANT` is a no-op the engine runs, so the schema can say it.
+    assert defs["UnitOp"]["enum"] == config.UNIT_OPS
+    assert defs["MarketOp"]["enum"] == config.MARKET_OPS
     assert "BAKERY" in defs["ShopName"]["enum"], "and the shop names"
-    # The verbs that take arguments are shapes rather than members, so they are
-    # not in the plain list: `PLANT` only ever appears beside a crop.
-    assert "PLANT" not in defs["PlainUnitOp"]["enum"]
 
-    # And the fields reach them, so a generator reading the schema is held to
-    # the vocabulary rather than told about it afterwards.
-    farmer = json.dumps(defs["Action"]["properties"]["farmer"])
-    assert "#/$defs/PlainUnitOp" in farmer and "#/$defs/CropName" in farmer
-    assert '"const": "PLANT"' in farmer or '"PLANT"' in farmer
-    shops = json.dumps(defs["ShopRoute"]["properties"]["shops"])
-    assert "#/$defs/ShopName" in shops
-    # Two shops, said in the schema rather than by a validator afterwards.
-    assert '"minItems": 2' in shops and '"maxItems": 2' in shops
+    # A command is a bounded list whose tokens are those vocabularies, which is
+    # the program's own shape and a shape every provider's strict mode takes --
+    # a tuple would be `prefixItems`, and that is the one OpenAI refuses.
+    farmer = defs["Action"]["properties"]["farmer"]
+    assert farmer["minItems"] == 1 and farmer["maxItems"] == 3
+    assert "#/$defs/UnitOp" in json.dumps(farmer["items"])
+    assert "#/$defs/ItemName" in json.dumps(farmer["items"])
+    # And a map's two shops are said as a length, for the same reason.
+    shops = defs["ShopRoute"]["properties"]["shops"]
+    assert shops["minItems"] == 2 and shops["maxItems"] == 2
 
 
 def test_the_schema_takes_the_plan_the_champion_actually_carries() -> None:
@@ -312,7 +333,7 @@ def test_the_schema_accepts_everything_the_engine_acts_on() -> None:
     """
     legal = [
         # A farm can work thirty-nine hands: `sim.hpp` keeps MAX_UNITS slots for
-        # the farmer and its hands. The first schema capped this at twelve.
+        # the farmer and its hands, and the first schema capped this at twelve.
         step(hands=[["PASS"]] * (config.MAX_UNITS - 1)),
         # `PICKUP` and `PLACE` take an item, and the count is optional.
         step(farmer=["PICKUP", "COW"]),
@@ -339,33 +360,62 @@ def test_the_schema_accepts_everything_the_engine_acts_on() -> None:
     plan.Plan.model_validate({**PLAN, "actions": legal})
 
 
-def test_the_schema_refuses_what_the_engine_would_never_act_on() -> None:
-    """The per-verb argument rules, which `action.rs` applies one arm at a time.
+def test_the_schema_refuses_what_it_can_and_describes_the_rest() -> None:
+    """What a bounded list of tokens can say, and what it cannot.
 
-    Each of these parses to `Invalid` or a no-op: the order occupies its slot
-    and never executes. A generator that can spell them wastes a season finding
-    out, and nothing in the champion's plan does.
+    It can say the vocabulary and the arity: a verb the engine has no op for, a
+    command with no verb at all, a command longer than three parts, a map with
+    three shops, more hands than the engine keeps slots for.
+
+    It cannot say which verb takes which name -- `["SELL", "COW", 1]` is three
+    tokens from the right vocabularies and the schema has no way to object, even
+    though `action.rs` drops it. Saying that would mean one shape per verb, which
+    means `prefixItems`, which is the one thing OpenAI's strict mode refuses. So
+    those rules live in the field descriptions, where a writer reads them, and
+    the cost is that a generator can still spell an order the engine will drop.
     """
     for wrong in (
-        # `SELL` takes a product, and an animal is not one.
-        step(market=[["SELL", "COW", 1]]),
-        # `BUY_PRODUCT` takes wheat or fertiliser, whatever else is an item.
-        step(market=[["BUY_PRODUCT", "STRAWBERRY", 1]]),
-        # `BUY_SEED` and `PLANT` take crops; eggs are not planted.
-        step(market=[["BUY_SEED", "EGG", 1]]),
-        step(farmer=["PLANT", "EGG"]),
-        # `BUY_ANIMAL` takes an animal.
-        step(market=[["BUY_ANIMAL", "WHEAT", 1]]),
         # A verb the engine has no arm for reads as a pass; it is a mistake in
         # the writing rather than a strategy.
         step(farmer=["TELEPORT"]),
-        # The moving verbs need their count: two parts is `Invalid`.
-        step(market=[["SELL", "WHEAT"]]),
-        # And a farm cannot work more hands than the engine has slots for.
+        # The farmer always acts, so its command is never empty.
+        step(farmer=[]),
+        # Three parts is all the engine reads.
+        step(farmer=["PICKUP", "COW", 2, "EXTRA"]),
+        # A map unlocks two shops.
+        step(),
+        # And a farm cannot work more hands than the engine keeps slots for.
         step(hands=[["PASS"]] * config.MAX_UNITS),
     ):
         with pytest.raises(ValueError):
-            plan.Plan.model_validate({**PLAN, "actions": [wrong]})
+            if wrong == step():
+                plan.Plan.model_validate(
+                    {**PLAN, "shops": [{"route": 101, "shops": ["BAKERY"]}]}
+                )
+            else:
+                plan.Plan.model_validate({**PLAN, "actions": [wrong]})
+
+
+def test_the_schema_cannot_say_which_verb_takes_which_name() -> None:
+    """The gap, asserted so nobody discovers it by trusting the schema.
+
+    `action.rs` drops each of these -- an animal cannot be sold, only wheat and
+    fertilizer can be bought, eggs are not planted -- and a bounded list of
+    tokens has no way to refuse them. The descriptions say so; the types cannot.
+    """
+    for dropped in (
+        step(market=[["SELL", "COW", 1]]),
+        step(market=[["BUY_PRODUCT", "STRAWBERRY", 1]]),
+        step(market=[["BUY_SEED", "EGG", 1]]),
+        step(farmer=["PLANT", "EGG"]),
+        step(market=[["BUY_ANIMAL", "WHEAT", 1]]),
+    ):
+        plan.Plan.model_validate({**PLAN, "actions": [dropped]})
+
+    # And the rule is in the text a writer is handed instead.
+    market = plan.Plan.model_json_schema()["$defs"]["Action"]["properties"]["market"]
+    said = json.dumps(market)
+    assert "a product" in said and "only" in said
 
 
 def test_every_field_tells_a_writer_what_to_produce() -> None:
