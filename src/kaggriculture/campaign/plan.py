@@ -20,10 +20,12 @@ open, grep and edit like any other file. `join` puts them back into the single
 self-contained program every other part of the campaign expects -- the gate,
 the archive, the pool, the validator and the submission all still see one file.
 
-`join(split(source))` returns the original source byte for byte when the plan
-is untouched, which is asserted rather than hoped: the encoding is
-`separators=(",", ":")` at level 9, and that reproduces what the agent already
-carries.
+`join(split(source))` returns the same plan and the same controller. It also
+happens to return the same bytes for the champions in play -- the models are
+declared in the order those programs write their keys -- but nothing depends on
+that. A round's verdict compares `gather` before against `gather` after, and
+both sides are packed by this module in the same process, so key order and
+separators cancel out.
 """
 
 import base64
@@ -34,7 +36,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from kaggriculture.campaign import config
 
@@ -215,19 +225,24 @@ class ShopRoute(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    shops: tuple[ShopName, ShopName] = Field(
-        description=(
-            "The two shops this map unlocks, in the engine's own order. The pair "
-            "is what a map is identified by, and both may be the same shop."
-        ),
-        examples=[["BAKERY", "BAKERY"], ["BAKERY", "YARN_STORE"]],
-    )
+    # Declared in the order a program writes them. Pydantic serialises in
+    # declaration order, so the other way round re-packs an untouched plan
+    # into different bytes -- and then a round that changed nothing looks
+    # like one that rewrote the strategy.
     route: int = Field(
         description=(
             "Which route to walk on a map with those two shops. This has to be "
             "the `id` of a route the plan holds, or the agent has nowhere to walk."
         ),
         examples=[101, 112],
+    )
+
+    shops: tuple[ShopName, ShopName] = Field(
+        description=(
+            "The two shops this map unlocks, in the engine's own order. The pair "
+            "is what a map is identified by, and both may be the same shop."
+        ),
+        examples=[["BAKERY", "BAKERY"], ["BAKERY", "YARN_STORE"]],
     )
 
 
@@ -265,6 +280,45 @@ class Plan(BaseModel):
         ),
     )
 
+    @field_validator("routes", mode="before")
+    @classmethod
+    def _take_the_programs_own_shape(cls, routes: object) -> object:
+        """Accept the dict a program keeps as well as the list a schema takes.
+
+        The program indexes its routes by number, which is an object whose keys
+        are the writer's to choose -- and strict structured output refuses one.
+        So the schema says a list, and this takes either.
+
+        Args:
+            routes: Whatever was handed in.
+
+        Returns:
+            The list form, if it arrived as the program's dict.
+        """
+        if isinstance(routes, dict):
+            return [
+                {"id": int(str(at)), "tiles": tiles} for at, tiles in routes.items()
+            ]
+        return routes
+
+    @field_serializer("routes")
+    def _give_back_the_shape_asked_for(
+        self, routes: list["Route"], info: SerializationInfo
+    ) -> object:
+        """The list by default, the program's dict when packing one.
+
+        Args:
+            routes: The routes, as the model holds them.
+            info: Carries the caller's context; `packed` asks for the program's
+                shape.
+
+        Returns:
+            A list of routes, or a dict of them keyed by number.
+        """
+        if (info.context or {}).get("packed"):
+            return {str(route.id): route.tiles for route in routes}
+        return [{"id": route.id, "tiles": route.tiles} for route in routes]
+
     @model_validator(mode="after")
     def _routes_exist(self) -> "Plan":
         """Every route the lookup names has to be a route that is there.
@@ -282,32 +336,6 @@ class Plan(BaseModel):
                 f"(it has {have}, ...)"
             )
         return self
-
-
-def validated(data: dict) -> dict:
-    """The plan, checked, or a refusal that says what is wrong with it.
-
-    Args:
-        data: A plan as read from `plan.json`.
-
-    Returns:
-        The same plan, once it is known to be one.
-
-    Raises:
-        ValueError: It is not, with the first thing wrong named.
-    """
-    Plan.model_validate(data)
-    return data
-
-
-def _routes_as_list(routes: dict) -> list[dict]:
-    """The program's dict of paths, as the list a schema can describe."""
-    return [{"id": int(number), "tiles": tiles} for number, tiles in routes.items()]
-
-
-def _routes_as_dict(routes: list) -> dict:
-    """And back, as the program reads them."""
-    return {str(route["id"]): route["tiles"] for route in routes}
 
 
 def carries(source: str) -> bool:
@@ -337,8 +365,8 @@ def split(source: str) -> tuple[str, dict]:
     found = PACKED.search(source)
     if found is None:
         raise ValueError("this program carries no packed plan")
-    packed = json.loads(zlib.decompress(base64.b85decode(found.group("payload"))))
-    plan = {**packed, "routes": _routes_as_list(packed["routes"])}
+    carried = json.loads(zlib.decompress(base64.b85decode(found.group("payload"))))
+    plan = Plan.model_validate(carried).model_dump(mode="json")
     line = LOADER.format(name=found.group("name"), module=PLAN_MODULE)
     return source[: found.start()] + line + source[found.end() :], plan
 
@@ -360,7 +388,9 @@ def join(controller: str, plan: dict) -> str:
     found = UNPACKED.search(controller)
     if found is None:
         raise ValueError("this controller has no plan loader to pack back into")
-    carried = {**plan, "routes": _routes_as_dict(plan["routes"])}
+    carried = Plan.model_validate(plan).model_dump(
+        mode="json", context={"packed": True}
+    )
     packed = base64.b85encode(
         zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
@@ -420,4 +450,4 @@ def gather(box: Path, name: str = "child.py") -> str:
     # pointing at a route that is not there, is a program that forfeits every
     # game -- and the campaign would read that as a bad idea rather than a
     # broken file.
-    return join(source, validated(json.loads(plan_file.read_text(encoding="utf-8"))))
+    return join(source, json.loads(plan_file.read_text(encoding="utf-8")))

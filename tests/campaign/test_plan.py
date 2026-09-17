@@ -53,11 +53,17 @@ def packed(data: dict) -> str:
 
 
 def test_a_plan_comes_out_and_goes_back_unchanged() -> None:
-    """`join(split(x))` is `x`, to the byte.
+    """The plan survives the trip, and the controller is not touched on the way.
 
-    It has to be exact, because the packed line is what the archive keeps and
-    the submission ships: a program that came back merely equivalent would make
-    every stored hash disagree with itself.
+    What matters is the plan as data and the Python around it, not the bytes the
+    packing happens to produce: key order and separators are the serialiser's
+    business, and a program that comes back with its keys in another order plays
+    exactly the same season.
+
+    Nothing downstream compares these bytes either. A round's verdict is
+    `gather` before against `gather` after, and both sides of that are packed by
+    the same code in the same process -- so a round that changed nothing reads as
+    nothing whatever order the keys come out in.
     """
     source = packed(PLAN)
 
@@ -65,7 +71,11 @@ def test_a_plan_comes_out_and_goes_back_unchanged() -> None:
 
     assert data == PLAN
     assert "b85decode" not in controller
-    assert plan.join(controller, data) == source
+
+    whole = plan.join(controller, data)
+    again, back = plan.split(whole)
+    assert back == PLAN, "the plan is the same plan"
+    assert again == controller, "and the controller was never touched"
 
 
 def test_the_controller_is_what_is_left_when_the_plan_goes() -> None:
@@ -214,7 +224,7 @@ def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
         ({"actions": [{"farmer": [], "hands": [], "market": []}]}, "farmer"),
     ):
         with pytest.raises(ValueError, match=says):
-            plan.validated({**PLAN, **wrong})
+            plan.Plan.model_validate({**PLAN, **wrong})
 
 
 def test_the_schema_carries_the_rules_rather_than_checking_them_after() -> None:
@@ -280,7 +290,12 @@ def test_the_real_champion_survives_the_round_trip() -> None:
     controller, data = plan.split(source)
 
     assert {*data} == {"actions", "routes", "shops"}
-    assert plan.join(controller, data) == source
+    # The plan, not the bytes. This champion happens to come back byte for byte
+    # -- the models are declared in the order it writes its keys -- but that is
+    # a tidy archive rather than a property anything depends on, and a champion
+    # that ordered them differently would still be the same program.
+    _, back = plan.split(plan.join(controller, data))
+    assert back == data
 
 
 def step(**parts: object) -> dict:
@@ -321,7 +336,7 @@ def test_the_schema_accepts_everything_the_engine_acts_on() -> None:
         step(market=[["BUY_ANIMAL", "SHEEP", 2]]),
     ]
 
-    plan.validated({**PLAN, "actions": legal})
+    plan.Plan.model_validate({**PLAN, "actions": legal})
 
 
 def test_the_schema_refuses_what_the_engine_would_never_act_on() -> None:
@@ -350,7 +365,7 @@ def test_the_schema_refuses_what_the_engine_would_never_act_on() -> None:
         step(hands=[["PASS"]] * config.MAX_UNITS),
     ):
         with pytest.raises(ValueError):
-            plan.validated({**PLAN, "actions": [wrong]})
+            plan.Plan.model_validate({**PLAN, "actions": [wrong]})
 
 
 def test_every_field_tells_a_writer_what_to_produce() -> None:
