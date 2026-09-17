@@ -13,23 +13,36 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import mutate, plan
+from kaggriculture.campaign import config, mutate, plan
 
 # A program shaped like a champion: imports, a packed plan under a generated
 # name, and an agent that reads it.
+# Routes are a list of `{id, tiles}` rather than the dict the program keeps,
+# because strict structured output refuses an object whose keys are the
+# writer's to choose -- and a plan that cannot be a schema cannot be generated
+# against one. `split` and `join` convert at the boundary.
 PLAN = {
     "actions": [{"farmer": ["PASS"], "hands": [], "market": []}],
     # The route the lookup names has to be one that is here, which is the first
     # thing the schema checks and the first thing this fixture got wrong.
-    "routes": {"101": [1, 2, 3], "112": [3, 2, 1]},
+    "routes": [{"id": 101, "tiles": [1, 2, 3]}, {"id": 112, "tiles": [3, 2, 1]}],
     "shops": [{"shops": ["BAKERY", "BAKERY"], "route": 101}],
 }
 
 
 def packed(data: dict) -> str:
-    """A program carrying `data` the way a champion carries its plan."""
+    """A program carrying `data` the way a champion carries its plan.
+
+    The program keeps routes as a dict keyed by number; the round is handed the
+    list a schema can describe. This writes the program's form, so what these
+    tests build is what a champion actually is.
+    """
+    carried = {
+        **data,
+        "routes": {str(route["id"]): route["tiles"] for route in data["routes"]},
+    }
     blob = base64.b85encode(
-        zlib.compress(json.dumps(data, separators=(",", ":")).encode(), 9)
+        zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
     return (
         "import base64\nimport json\nimport zlib\n"
@@ -189,16 +202,49 @@ def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
     and the campaign reads that as a bad idea instead of a broken file.
     """
     for wrong, says in (
+        # The relational rule, which no field constraint can express: one field
+        # has to agree with another.
         ({"shops": [{"shops": ["BAKERY", "BAKERY"], "route": 999}]}, "does not hold"),
-        ({"actions": [{"farmer": ["TELEPORT"], "hands": [], "market": []}]}, "no op"),
+        # And the rest, which the types carry, so the message names the path.
+        ({"actions": [{"farmer": ["TELEPORT"], "hands": [], "market": []}]}, "farmer"),
         (
             {"shops": [{"shops": ["BAKERY", "BAKERY", "BAKERY"], "route": 101}]},
-            "two shops",
+            "shops",
         ),
-        ({"actions": [{"farmer": [], "hands": [], "market": []}]}, "no verb"),
+        ({"actions": [{"farmer": [], "hands": [], "market": []}]}, "farmer"),
     ):
         with pytest.raises(ValueError, match=says):
             plan.validated({**PLAN, **wrong})
+
+
+def test_the_schema_carries_the_rules_rather_than_checking_them_after() -> None:
+    """A generator reads the schema, not the validators.
+
+    `model_json_schema` is the whole of what a structured call is told, so a
+    rule kept in a `field_validator` is a rule the writer never sees: it emits
+    a verb the engine has no op for and finds out by being refused. As types,
+    the vocabulary and the arities are in the schema, and strict decoding
+    cannot spell anything else.
+    """
+    schema = plan.Plan.model_json_schema()
+    defs = schema["$defs"]
+
+    # The vocabularies are named types the fields point at, which is how
+    # pydantic renders an enum: `{"enum": [...]}` under `$defs`.
+    assert "PLANT" in defs["UnitOp"]["enum"], "the engine's ops are in the schema"
+    assert "HARVEST" in defs["UnitOp"]["enum"]
+    assert "TELEPORT" not in defs["UnitOp"]["enum"]
+    assert "BAKERY" in defs["ShopName"]["enum"], "and the shop names"
+    assert defs["UnitOp"]["enum"] == config.UNIT_OPS, "the engine's own list, in order"
+
+    # And the fields reach them, so a generator reading the schema is held to
+    # the vocabulary rather than told about it afterwards.
+    farmer = json.dumps(defs["Action"]["properties"]["farmer"])
+    assert "#/$defs/UnitOp" in farmer
+    shops = json.dumps(defs["ShopRoute"]["properties"]["shops"])
+    assert "#/$defs/ShopName" in shops
+    # Two shops, said in the schema rather than by a validator afterwards.
+    assert '"minItems": 2' in shops and '"maxItems": 2' in shops
 
 
 def test_the_schema_takes_the_plan_the_champion_actually_carries() -> None:

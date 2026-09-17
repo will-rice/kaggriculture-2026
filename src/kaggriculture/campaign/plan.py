@@ -30,9 +30,11 @@ import base64
 import json
 import re
 import zlib
+from enum import StrEnum
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kaggriculture.campaign import config
 
@@ -66,88 +68,69 @@ DATA = json.loads(
 )
 """
 
+# The engine's own enums, as types rather than as checks. `sim.hpp`'s `Op` and
+# `MOp` are the vocabularies, and pydantic renders an enum into the schema as
+# `enum: [...]` -- so a generator handed this can only spell a verb the engine
+# has, which a validator could report only after the writing was done.
+UnitOp = StrEnum("UnitOp", {op: op for op in config.UNIT_OPS})
+MarketOp = StrEnum("MarketOp", {op: op for op in config.MARKET_OPS})
+ShopName = StrEnum("ShopName", {name: name for name in config.SHOP_NAMES})
+
+# A command is a verb and what it acts on, and the arities are the engine's:
+# a move is one part, `PICKUP COW` is two, `BUY_PRODUCT WHEAT 13` is three.
+UnitCommand = Annotated[
+    tuple[UnitOp] | tuple[UnitOp, str] | tuple[UnitOp, str, int],
+    Field(description="A verb the farmer or a hand performs, and its arguments."),
+]
+# The market takes the same shape, and also nothing at all: 283 of the
+# champion's steps place an empty order.
+MarketCommand = Annotated[
+    tuple[()] | tuple[MarketOp] | tuple[MarketOp, str, int],
+    Field(description="An order to place this step, or nothing."),
+]
+
 
 class Action(BaseModel):
     """One step of the season: what the farmer does, the hands, and the market.
 
-    A command is a verb and its arguments -- `["PASS"]`, `["PICKUP", "COW"]`,
-    `["BUY_PRODUCT", "WHEAT", 13]` -- and the vocabularies are the engine's own
-    enums, so a verb this rejects is one `sim.hpp` would not have understood
-    either.
-
     Attributes:
-        farmer: The farmer's command for this step.
-        hands: One command per hired hand, up to twelve, and none at the start.
-        market: The orders placed this step. An empty command is allowed here
-            and occurs 283 times in the champion's own plan; it is a step that
-            places nothing.
+        farmer: The farmer's command for this step. It always acts.
+        hands: One command per hired hand, up to the twelve the champion
+            reaches, and none at the start of a season.
+        market: The orders placed this step.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    farmer: list[str | int]
-    hands: list[list[str | int]]
-    market: list[list[str | int]]
-
-    @field_validator("farmer")
-    @classmethod
-    def _farmer_acts(cls, command: list[str | int]) -> list[str | int]:
-        """The farmer acts every step, and the verb is one the engine has."""
-        return _command(command, config.UNIT_OPS, "farmer", empty=False)
-
-    @field_validator("hands")
-    @classmethod
-    def _hands_act(cls, commands: list[list[str | int]]) -> list[list[str | int]]:
-        """Every hand that exists acts, with the same vocabulary."""
-        for command in commands:
-            _command(command, config.UNIT_OPS, "a hand", empty=False)
-        return commands
-
-    @field_validator("market")
-    @classmethod
-    def _orders_are_orders(
-        cls, commands: list[list[str | int]]
-    ) -> list[list[str | int]]:
-        """Market orders, or nothing at all."""
-        for command in commands:
-            _command(command, config.MARKET_OPS, "a market order", empty=True)
-        return commands
+    farmer: UnitCommand
+    hands: list[UnitCommand] = Field(max_length=12)
+    market: list[MarketCommand]
 
 
-def _command(
-    command: list[str | int], vocabulary: list[str], whose: str, empty: bool
-) -> list[str | int]:
-    """Check one verb and its arguments.
+class Route(BaseModel):
+    """One path, as the tile indices it walks in order.
 
-    Args:
-        command: The command to check.
-        vocabulary: The verbs the engine accepts here.
-        whose: What to call it if it is wrong.
-        empty: Whether an empty command means "do nothing" or is a mistake.
+    A list rather than the dict the program keeps, because strict structured
+    output refuses an object whose keys are the writer's to choose, and a plan
+    that cannot be a schema cannot be generated against one. The numbering is
+    not a range -- the champion's routes are 0 to 12 and 100 to 128 -- so the
+    id travels with the path rather than being its position.
 
-    Returns:
-        The command, unchanged.
-
-    Raises:
-        ValueError: The command is empty where it may not be, too long, or
-            names a verb the engine does not have.
+    Attributes:
+        id: The number `shops` refers to this route by.
+        tiles: The tiles it walks, in order.
     """
-    if not command:
-        if empty:
-            return command
-        raise ValueError(f"{whose} has no verb")
-    verb = command[0]
-    if verb not in vocabulary:
-        raise ValueError(f"{whose} says {verb!r}, which the engine has no op for")
-    if len(command) > 3:
-        raise ValueError(f"{whose} has {len(command)} parts; the engine reads three")
-    return command
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    tiles: list[int]
 
 
 class ShopRoute(BaseModel):
     """Which route to walk when the map unlocks these two shops.
 
-    This is the table worth editing. It is 64 lines, and it is the whole of
+    This is the table worth editing. It is 64 entries, and it is the whole of
     how the plan adapts to a map: change a route here and the agent plays a
     different season.
 
@@ -158,19 +141,8 @@ class ShopRoute(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    shops: list[str]
+    shops: tuple[ShopName, ShopName]
     route: int
-
-    @field_validator("shops")
-    @classmethod
-    def _two_known_shops(cls, shops: list[str]) -> list[str]:
-        """Two of them, both names the engine unlocks."""
-        if len(shops) != 2:
-            raise ValueError(f"a map unlocks two shops, not {len(shops)}")
-        for shop in shops:
-            if shop not in config.SHOP_NAMES:
-                raise ValueError(f"{shop!r} is not a shop the engine has")
-        return shops
 
 
 class Plan(BaseModel):
@@ -185,7 +157,7 @@ class Plan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actions: list[Action]
-    routes: dict[str, list[int]]
+    routes: list[Route]
     shops: list[ShopRoute]
 
     @model_validator(mode="after")
@@ -196,11 +168,10 @@ class Plan(BaseModel):
         number that was never in it, and the agent would find that out by
         failing mid-season.
         """
-        missing = sorted(
-            {entry.route for entry in self.shops if str(entry.route) not in self.routes}
-        )
+        known = {route.id for route in self.routes}
+        missing = sorted({entry.route for entry in self.shops} - known)
         if missing:
-            have = ", ".join(sorted(self.routes, key=int)[:6])
+            have = ", ".join(str(one) for one in sorted(known)[:6])
             raise ValueError(
                 f"shops point at routes {missing} that `routes` does not hold "
                 f"(it has {have}, ...)"
@@ -222,6 +193,16 @@ def validated(data: dict) -> dict:
     """
     Plan.model_validate(data)
     return data
+
+
+def _routes_as_list(routes: dict) -> list[dict]:
+    """The program's dict of paths, as the list a schema can describe."""
+    return [{"id": int(number), "tiles": tiles} for number, tiles in routes.items()]
+
+
+def _routes_as_dict(routes: list) -> dict:
+    """And back, as the program reads them."""
+    return {str(route["id"]): route["tiles"] for route in routes}
 
 
 def carries(source: str) -> bool:
@@ -251,7 +232,8 @@ def split(source: str) -> tuple[str, dict]:
     found = PACKED.search(source)
     if found is None:
         raise ValueError("this program carries no packed plan")
-    plan = json.loads(zlib.decompress(base64.b85decode(found.group("payload"))))
+    packed = json.loads(zlib.decompress(base64.b85decode(found.group("payload"))))
+    plan = {**packed, "routes": _routes_as_list(packed["routes"])}
     line = LOADER.format(name=found.group("name"), module=PLAN_MODULE)
     return source[: found.start()] + line + source[found.end() :], plan
 
@@ -273,8 +255,9 @@ def join(controller: str, plan: dict) -> str:
     found = UNPACKED.search(controller)
     if found is None:
         raise ValueError("this controller has no plan loader to pack back into")
+    carried = {**plan, "routes": _routes_as_dict(plan["routes"])}
     packed = base64.b85encode(
-        zlib.compress(json.dumps(plan, separators=(",", ":")).encode(), 9)
+        zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
     if "'" in packed:
         raise ValueError("the packed plan holds a quote")
