@@ -243,6 +243,13 @@ def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
             {"routes": {"101": [0] * (config.SEASON + 1)}},
             f"at most {config.SEASON}",
         ),
+        # A route key the program cannot turn into a number. `int(k)` on it is
+        # a crash at load, before a move is made, and a generator asked for a
+        # plan reached for exactly this: a route called "season".
+        (
+            {"routes": {"season": [0] * config.SEASON}},
+            "string_pattern_mismatch",
+        ),
         # And the rest, which the types carry, so the message names the path.
         (
             {"actions": [{"farmer": {"verb": "TELEPORT"}, "hands": [], "market": []}]},

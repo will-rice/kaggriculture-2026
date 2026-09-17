@@ -177,6 +177,17 @@ class Action(BaseModel):
     )
 
 
+# The program keys its routes with `int(k)`, so a key that is not a number is a
+# crash before the first move. A generator reaches for one: asked for a plan,
+# GLM wrote a route called "season" beside route "100".
+RouteId = Annotated[
+    str,
+    Field(
+        pattern=r"^(0|[1-9][0-9]*)$",
+        description="The route's number, written as a string of digits.",
+    ),
+]
+
 Season = Annotated[
     list[Annotated[int, Field(ge=0)]],
     Field(
@@ -244,7 +255,7 @@ class Plan(BaseModel):
             "all, drawn from 3,982 entries here."
         ),
     )
-    routes: dict[str, Season] = Field(
+    routes: dict[RouteId, Season] = Field(
         min_length=1,
         description=(
             "One whole season per route, keyed by the number the shop lookup "
