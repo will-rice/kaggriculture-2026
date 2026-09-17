@@ -62,6 +62,7 @@ from kaggriculture.campaign import (
     gate,
     harvest,
     measure,
+    plan,
     prompt,
     rating,
     validate,
@@ -725,7 +726,13 @@ class Campaign:
         ) as scratch:
             box = Path(scratch)
             child = box / "child.py"
-            shutil.copy(source, child)
+            # Apart, so the round can read and edit the plan: `child.py` is the
+            # controller with one import where 94,490 characters of base85 used
+            # to be, and `plan.json` is the strategy as readable JSON. No round
+            # had ever changed the plan -- champions 17 to 24 carry a
+            # byte-identical blob -- because as text it is unreadable and
+            # nothing said it was data.
+            plan.lay_out(source.read_text(encoding="utf-8"), box)
             # The gate writes a champion read-only so nothing can edit the file
             # the pool plays, and `shutil.copy` carries that mode across. This
             # copy is the one file the call must be able to write.
@@ -774,6 +781,12 @@ class Campaign:
             # is read every round; this is read on demand.
             shutil.copytree(config.SKILLS, box / self.mutator.SKILLS_DIR)
             mutation = await self.mutator(box, message, program_id)
+            # And back together before anything downstream looks at it. The
+            # gate, the archive, the pool, the validator and the submission all
+            # expect one self-contained file, and none of them has to learn
+            # otherwise.
+            if mutation.child is not None:
+                mutation.child.write_text(plan.gather(box), encoding="utf-8")
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.

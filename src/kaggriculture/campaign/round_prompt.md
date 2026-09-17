@@ -21,11 +21,32 @@ Placeholders, all filled on every round:
 
 ## Your program
 
-`child.py` in your working directory is the program. Edit it in place: it is
-the only file read, and whatever it holds when you finish is what the campaign
-plays. It must stay one self-contained file whose last top-level callable is
-`agent(observation, configuration)` -- that is what Kaggle loads, and a
-program that crashes forfeits every game.
+`child.py` in your working directory is the program, and `plan.json` beside it
+is the strategy it plays. Edit either, in place. Both are read: what the
+campaign plays is `child.py` with `plan.json` packed back into it, as one
+self-contained file whose last top-level callable is
+`agent(observation, configuration)` -- that is what Kaggle loads, and a program
+that crashes forfeits every game.
+
+`plan.json` holds three things, and they decide what the agent does on the
+board:
+
+- `shops` maps the two shops a map happens to have to a route number. This is
+  the smallest change that makes the agent play a different game, and it is 64
+  lines.
+- `routes` are the paths those numbers name, as tile indices.
+- `actions` is the scripted season, step by step: the farmer's move, each
+  hand's moves, and the market orders, for 3,982 steps.
+
+It came from a solver, and no round before this one could read it -- it shipped
+as a single line of base85 and was left untouched through eight promotions
+while the controller around it was rewritten again and again. That is why
+children keep drawing with the champion: the two share this file, so they play
+the same game, and the gate cannot tell them apart. An edit here is an edit to
+what the agent does; an edit to `child.py` alone is an edit to how it is
+steered.
+
+Both are worth doing. Measure either the same way.
 
 The directory is yours and is thrown away after this call.
 

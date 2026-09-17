@@ -50,7 +50,7 @@ from typing import Literal, Protocol
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, plan
 
 LOGGER = logging.getLogger(__name__)
 
@@ -377,7 +377,7 @@ class CodexMutator:
         started = time.perf_counter()
         # What the round was handed. A call that ends with the file exactly
         # as it found it has written nothing, however cleanly it exited.
-        given = (workspace / "child.py").read_text(encoding="utf-8")
+        given = plan.gather(workspace)
         command = [*self.COMMAND]
         if command[0] == "codex":
             command += ["-m", model, "-C", str(workspace)]
@@ -626,7 +626,7 @@ class AgyMutator:
             A `Mutation` describing what happened.
         """
         started = time.perf_counter()
-        given = (workspace / "child.py").read_text(encoding="utf-8")
+        given = plan.gather(workspace)
         command = self.invocation(workspace, message, model)
         log = workspace / "agy.jsonl"
         with log.open("w", encoding="utf-8") as handle:
@@ -880,7 +880,7 @@ class OpenCodeMutator:
             A `Mutation` describing what happened.
         """
         started = time.perf_counter()
-        given = (workspace / "child.py").read_text(encoding="utf-8")
+        given = plan.gather(workspace)
         log = workspace / "opencode.ndjson"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
@@ -999,7 +999,10 @@ def _written(workspace: Path, given: str) -> Path | None:
     child = workspace / "child.py"
     if not child.exists():
         return None
-    source = child.read_text(encoding="utf-8")
+    # The whole program, which is `child.py` with whatever `plan.json` holds
+    # packed back into it. A round that changed only the plan changed the
+    # agent, and reading `child.py` alone would report that as nothing.
+    source = plan.gather(workspace)
     if not source.strip() or source == given:
         return None
     return child
