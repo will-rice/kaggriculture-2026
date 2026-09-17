@@ -839,3 +839,214 @@ def test_a_stand_in_command_is_left_exactly_as_it_is() -> None:
     mutator.COMMAND = ["true"]
 
     assert mutator.invocation(Path("/tmp/a-round"), MESSAGE, "any") == ["true"]
+
+
+# What `opencode run --format json` writes: one JSON object per line. Token
+# counts and the price live on `step_finish`, one per step, so a call's total is
+# their sum -- and the price is the only one of the three drivers that reports
+# what it charged.
+OPENCODE_WROTE_A_CHILD = (
+    '{"type":"step_start","part":{"type":"step-start"}}\n'
+    '{"type":"tool_use","part":{"tool":"bash","state":{"status":"completed"}}}\n'
+    '{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls",'
+    '"tokens":{"input":900,"output":40,"cache":{"read":17204,"write":110}},'
+    '"cost":0.0201}}\n'
+    '{"type":"text","part":{"text":"Measured, then made one change."}}\n'
+    '{"type":"step_finish","part":{"type":"step-finish","reason":"stop",'
+    '"tokens":{"input":100,"output":60,"cache":{"read":9000,"write":0}},'
+    '"cost":0.0212}}\n'
+)
+
+# And one that read its file, said something, and edited nothing.
+OPENCODE_SAID_NOTHING_USEFUL = (
+    '{"type":"text","part":{"text":"I could not find a change worth making."}}\n'
+    '{"type":"step_finish","part":{"type":"step-finish","reason":"stop",'
+    '"tokens":{"input":50,"output":10},"cost":0.0009}}\n'
+)
+
+# A stand-in opencode that writes a child and reports it.
+OPENCODE_CHILD = f"""
+printf 'def agent(o, c=None):\\n    return {{}}\\n' > child.py
+printf '%s' '{OPENCODE_WROTE_A_CHILD}'
+"""
+
+# And one that fails outright on one seller, or writes a child on the other.
+OPENCODE_SELLER_OR_CHILD = f"""
+if [ "$1" = "fail" ]; then
+  printf 'provider error: 429 rate limited\\n' 1>&2
+  exit 1
+fi
+{OPENCODE_CHILD}
+"""
+
+
+def test_a_round_is_confined_to_its_own_directory() -> None:
+    """``--dir`` is the containment, and it is asserted because losing it is quiet.
+
+    A round without it resolves its project by walking up from wherever the
+    caller stood, and the caller is the loop standing in the repository: the
+    first probe read the campaign's source, ran its git history, listed
+    `run/campaign` and played 32 real games there while the directory it had
+    been handed sat empty. Nothing about that looked like a missing flag.
+    """
+    box = Path("/tmp/a-round")
+    invocation = mutate.OpenCodeMutator().invocation(box, MESSAGE, "seller/model")
+
+    assert invocation[:2] == ["opencode", "run"]
+    assert invocation[2] == MESSAGE
+    assert invocation[invocation.index("--dir") + 1] == str(box)
+    assert invocation[invocation.index("--format") + 1] == "json"
+    assert invocation[invocation.index("-m") + 1] == "seller/model"
+
+
+def test_a_round_may_not_reach_outside_its_box_even_if_it_asks() -> None:
+    """Containment is policy, not the round's good manners.
+
+    `--auto` would approve `external_directory` along with everything else, and
+    a round that can be talked into reading one path outside its box can be
+    talked into reading the champion archive. So the policy denies it and the
+    round runs freely only where it lives.
+    """
+    policy = mutate.OpenCodeMutator.POLICY["permission"]
+
+    assert policy["external_directory"] == "deny"
+    # A question in an empty room ends the turn; better not to reach for it.
+    assert policy["question"] == "deny"
+    # And the tools a round actually works with are its own.
+    assert policy["bash"] == "allow" and policy["edit"] == "allow"
+
+
+def test_opencode_sums_the_tokens_and_the_price_across_the_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round is many steps, so what it billed is their sum."""
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.OpenCodeMutator, "COMMAND", ["bash", "-c", OPENCODE_CHILD]
+    )
+
+    result = asyncio.run(mutate.OpenCodeMutator()(box, MESSAGE, "p30"))
+
+    assert result.status == "ok" and result.child == box / "child.py"
+    assert result.input_tokens == 1000 and result.output_tokens == 100
+    assert (box / "opencode.ndjson").exists()
+
+
+def test_the_price_of_a_call_is_read_even_though_no_field_carries_it(
+    tmp_path: Path,
+) -> None:
+    """`Spent` is what the transcript says the seller charged.
+
+    Cached prompt tokens are deliberately not added to the input count: the
+    seller bills them at another rate, and what this feeds is a number the other
+    two drivers report the same way. The dollars are the honest total.
+    """
+    log = tmp_path / "opencode.ndjson"
+    log.write_text(OPENCODE_WROTE_A_CHILD, encoding="utf-8")
+
+    spent = mutate._opencode_usage(log)
+
+    assert spent.input_tokens == 1000 and spent.output_tokens == 100
+    assert spent.dollars == pytest.approx(0.0413)
+
+
+def test_a_round_that_edits_nothing_is_no_output_whatever_it_said(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file decides, and the round's own account of itself is kept but unread."""
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.OpenCodeMutator,
+        "COMMAND",
+        ["printf", "%s", OPENCODE_SAID_NOTHING_USEFUL],
+    )
+
+    result = asyncio.run(mutate.OpenCodeMutator()(box, MESSAGE, "p31"))
+
+    assert result.status == "no_output" and result.child is None
+    assert (box / "child.py").read_text() == PARENT
+    assert "worth making" in result.reason
+
+
+def test_opencode_reports_exec_error_on_a_non_zero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seller that refuses the turn is an exec_error carrying what it said."""
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.OpenCodeMutator,
+        "COMMAND",
+        ["sh", "-c", "echo 'provider error: 429' 1>&2; exit 1"],
+    )
+
+    result = asyncio.run(mutate.OpenCodeMutator()(box, MESSAGE, "p32"))
+
+    assert result.status == "exec_error" and "429" in result.reason
+
+
+def test_a_refusing_seller_is_retried_at_another_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback is the same model bought elsewhere, which is the point.
+
+    A rate limit or a dropped turn is a fact about the seller rather than about
+    the model, so the retry keeps the model and changes the shop: the campaign
+    reaches `gpt-5.6-luna` through OpenRouter and through OpenCode's own plan,
+    and they do not run out together.
+    """
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.OpenCodeMutator,
+        "COMMAND",
+        ["bash", "-c", OPENCODE_SELLER_OR_CHILD, "_", "fail"],
+    )
+
+    result = asyncio.run(
+        mutate.OpenCodeMutator(
+            model="openrouter/openai/gpt-5.6-luna",
+            fallback="opencode-go/gpt-5.6-luna",
+        )(box, MESSAGE, "p33")
+    )
+
+    assert result.status == "exec_error" and result.fallback
+    # The first seller's transcript is kept beside the retry's, named for it.
+    assert (box / "opencode.openrouter-openai-gpt-5.6-luna.failed.ndjson").exists()
+
+
+def test_every_driver_is_reachable_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`CAMPAIGN_MUTATOR` names one of three, and the loop knows no more than that."""
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_MUTATOR", raising=False)
+    env = tmp_path / ".env"
+
+    for name, driver in (
+        ("codex", mutate.CodexMutator),
+        ("agy", mutate.AgyMutator),
+        ("opencode", mutate.OpenCodeMutator),
+    ):
+        env.write_text(f"CAMPAIGN_MUTATOR={name}\n", encoding="utf-8")
+        assert isinstance(mutate.build(), driver)
+
+    env.write_text("CAMPAIGN_MUTATOR=opencode\n", encoding="utf-8")
+    assert mutate.asked_model() == mutate.opencode_model()
+
+
+def test_an_unset_opencode_model_is_the_campaigns_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing in the environment means the sellers the repository commits to."""
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_OPENCODE_MODEL", raising=False)
+    monkeypatch.delenv("CAMPAIGN_OPENCODE_FALLBACK_MODEL", raising=False)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+
+    assert mutate.opencode_model() == config.OPENCODE_MODEL
+    assert mutate.opencode_fallback() == config.OPENCODE_FALLBACK_MODEL
+    # The same model from two shops, which is what makes the retry worth making.
+    assert config.OPENCODE_MODEL != config.OPENCODE_FALLBACK_MODEL
+    assert (
+        config.OPENCODE_MODEL.rsplit("/", 1)[-1]
+        == (config.OPENCODE_FALLBACK_MODEL.rsplit("/", 1)[-1])
+    )

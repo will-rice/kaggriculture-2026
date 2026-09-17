@@ -61,6 +61,9 @@ MODEL_CATALOG_COMMAND = ["codex", "debug", "models"]
 # The same for agy. Also a local lookup rather than a model turn: it spends
 # no quota, and `agy -p /usage` is how the quota itself is read.
 AGY_CATALOG_COMMAND = ["agy", "models"]
+# And OpenCode's, which lists every provider this install is signed
+# into at once, so the catalog is the union rather than one seller's.
+OPENCODE_CATALOG_COMMAND = ["opencode", "models"]
 
 
 def known_models() -> set[str]:
@@ -730,6 +733,235 @@ class AgyMutator:
         )
 
 
+class OpenCodeMutator:
+    """Runs one ``opencode run`` over one file and reports the result.
+
+    The third driver, and the first whose limit is money rather than a clock.
+    codex bills an entitlement that is empty until 2026-09-22, and agy bills two
+    five-hour buckets that eight sessions drained in twenty minutes; OpenCode
+    reaches a seller that charges per token, so a round costs about five cents
+    and how many rounds are left in a day is a question about the budget.
+
+    Three things it needs, all of them documented rather than discovered.
+
+    ``--dir`` names the round's directory, and it is the whole of the
+    containment. Without it OpenCode resolves its project by walking up from
+    wherever the caller happened to be standing, and the caller is the loop,
+    standing in the repository: the first probe read the campaign's source, ran
+    its git history, listed ``run/campaign`` and played 32 real games there,
+    while the directory it had been handed sat empty in /tmp. ``--dir`` is
+    authoritative over both the process's own directory and the ``PWD`` it
+    inherits, measured against a deliberately hostile pair of both.
+
+    ``external_directory`` stays denied. ``--auto`` would approve it along with
+    everything else, and a round that can be talked into reading one path
+    outside its box can be talked into reading the champion archive. Denying it
+    by policy means containment does not rest on the round's goodwill; what a
+    round still runs freely is its own directory, which is all a round is.
+
+    Skills are left alone. ``.agents/skills`` is one of OpenCode's own discovery
+    paths -- the same directory agy walks up for -- so a round finds the schema
+    and the queries worth running without being told, and the host's own skills
+    arrive with them. That costs a few thousand tokens and is worth paying:
+    those are the skills that tell a model to measure before it concludes.
+    """
+
+    SKILLS_DIR = Path(".agents") / "skills"
+
+    # Overridden by tests; the flags are only appended when it really is
+    # opencode.
+    COMMAND = ["opencode", "run"]
+
+    # The campaign's say over the host's, merged last of every config source.
+    # The host's own `opencode.jsonc` is tuned for a different project
+    # altogether, and a round should not inherit a file the campaign does not
+    # own -- the same reason the codex effort is passed per call.
+    POLICY = {
+        "permission": {
+            "bash": "allow",
+            "edit": "allow",
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "skill": {"*": "allow"},
+            # The one that is not a convenience.
+            "external_directory": "deny",
+            # A round that asks a question in a room with nobody in it has
+            # spent its turn; better it never reaches for the tool.
+            "question": "deny",
+        }
+    }
+
+    def __init__(self, model: str = "", fallback: str | None = None) -> None:
+        """Initializes the mutator.
+
+        Args:
+            model: The ``provider/model`` to request, or "" to read it per call.
+            fallback: The model to retry on, once, when a call fails without a
+                verdict. "" never retries; None reads it per call.
+        """
+        self.model = model
+        self.fallback = fallback
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Runs one opencode call in ``workspace``, retrying once on the fallback.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, composed by ``prompt.compose``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` describing what happened, on whichever model produced
+            it.
+        """
+        asked = self.model or opencode_model()
+        retry = opencode_fallback() if self.fallback is None else self.fallback
+        mutation = await self.call(workspace, message, program_id, asked)
+        if mutation.status != "exec_error" or not retry:
+            return mutation
+        LOGGER.warning(
+            "opencode call for %s failed on %s (%s); retrying on %s",
+            program_id,
+            asked,
+            mutation.reason[:120],
+            retry,
+        )
+        log = workspace / "opencode.ndjson"
+        spent = asked.replace("/", "-")
+        log.replace(log.with_name(f"opencode.{spent}.failed.ndjson"))
+        retried = await self.call(workspace, message, program_id, retry)
+        return retried.model_copy(
+            update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
+        )
+
+    def invocation(self, workspace: Path, message: str, model: str) -> list[str]:
+        """The whole command line one round runs as.
+
+        Separate from `call` so the flags can be asserted on without spending a
+        call, because none of them fails loudly: a round that loses ``--dir``
+        still runs, and reports on a directory that is not its own.
+
+        Args:
+            workspace: The directory the round works in.
+            message: The whole prompt.
+            model: The ``provider/model`` to request.
+
+        Returns:
+            The argument vector, unchanged when ``COMMAND`` is a stand-in.
+        """
+        command = [*self.COMMAND]
+        if command[0] != "opencode":
+            return command
+        return command + [
+            message,
+            "--dir",
+            str(workspace),
+            "--format",
+            "json",
+            "-m",
+            model,
+        ]
+
+    async def call(
+        self, workspace: Path, message: str, program_id: str, model: str
+    ) -> Mutation:
+        """Runs one opencode call in ``workspace`` on ``model``.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt.
+            program_id: The child program id.
+            model: The ``provider/model`` to request.
+
+        Returns:
+            A `Mutation` describing what happened.
+        """
+        started = time.perf_counter()
+        given = (workspace / "child.py").read_text(encoding="utf-8")
+        log = workspace / "opencode.ndjson"
+        with log.open("w", encoding="utf-8") as handle:
+            process = await asyncio.create_subprocess_exec(
+                *self.invocation(workspace, message, model),
+                # The prompt is an argument; nothing is written in, and a round
+                # that blocks reading a terminal nobody is at blocks for hours.
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=handle,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+                start_new_session=True,
+                env={
+                    **os.environ,
+                    "OPENCODE_CONFIG_CONTENT": json.dumps(self.POLICY),
+                },
+            )
+            try:
+                _, stderr = await process.communicate()
+            except asyncio.CancelledError:
+                # opencode runs shell commands of its own, so killing only the
+                # direct child would leave a season playing against a directory
+                # nothing owns, on a core the budget has already promised out.
+                LOGGER.warning(
+                    "opencode call for %s cancelled, killed pgid %s",
+                    program_id,
+                    kill_group(process),
+                )
+                await process.wait()
+                raise
+        spent = await asyncio.to_thread(_opencode_usage, log)
+        if process.returncode != 0:
+            reason = stderr.decode(errors="replace")[-500:] or "opencode exited nonzero"
+            LOGGER.warning(
+                "opencode call for %s exited %s on %s: %s",
+                program_id,
+                process.returncode,
+                model,
+                reason[:200],
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=spent.input_tokens,
+                output_tokens=spent.output_tokens,
+                model=model,
+            )
+        child = _written(workspace, given)
+        if child is None:
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="no_output",
+                reason=await asyncio.to_thread(_opencode_last_text, log)
+                or "child.py missing, empty or unchanged",
+                seconds=time.perf_counter() - started,
+                input_tokens=spent.input_tokens,
+                output_tokens=spent.output_tokens,
+                model=model,
+            )
+        # The only driver that says what it charged, so it is worth saying.
+        LOGGER.info(
+            "opencode round %s wrote a child on %s for $%.4f",
+            program_id,
+            model,
+            spent.dollars,
+        )
+        return Mutation(
+            program_id=program_id,
+            child=child,
+            status="ok",
+            reason="",
+            seconds=time.perf_counter() - started,
+            input_tokens=spent.input_tokens,
+            output_tokens=spent.output_tokens,
+            model=model,
+        )
+
+
 def kill_group(process: asyncio.subprocess.Process) -> int | None:
     """SIGKILL a session's whole process group and return the group it killed.
 
@@ -908,6 +1140,72 @@ def _agy_reason(result: dict) -> str:
     return "; ".join(parts)[:300]
 
 
+class Spent(BaseModel):
+    """What one opencode call billed.
+
+    Attributes:
+        input_tokens: Prompt tokens, summed across the call's steps.
+        output_tokens: Completion tokens, summed the same way.
+        dollars: What the seller charged, which only this driver reports.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    dollars: float
+
+
+def _opencode_usage(log: Path) -> Spent:
+    """Sums the tokens and the cost across an opencode run.
+
+    Every ``step_finish`` event carries a `tokens` object and a `cost`, and a
+    round is many steps, so the call's total is their sum. Cached prompt tokens
+    are reported separately by the seller and are not added here: they are
+    charged at a different rate, and what this feeds is a token count the other
+    drivers report the same way.
+
+    Args:
+        log: Path to the ``opencode.ndjson`` transcript.
+
+    Returns:
+        The totals, zeroed when the stream carries none.
+    """
+    tokens_in = tokens_out = 0
+    dollars = 0.0
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "step_finish":
+            continue
+        part = event.get("part") or {}
+        tokens = part.get("tokens") or {}
+        tokens_in += int(tokens.get("input", 0))
+        tokens_out += int(tokens.get("output", 0))
+        dollars += float(part.get("cost", 0.0))
+    return Spent(input_tokens=tokens_in, output_tokens=tokens_out, dollars=dollars)
+
+
+def _opencode_last_text(log: Path) -> str:
+    """The last thing the round said, for a call that wrote nothing.
+
+    Args:
+        log: Path to the ``opencode.ndjson`` transcript.
+
+    Returns:
+        The first 200 characters of the last ``text`` event, or "".
+    """
+    last = ""
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "text":
+            last = str((event.get("part") or {}).get("text", "")) or last
+    return last[:200]
+
+
 class FakeMutator:
     """Edits ``child.py`` in place through ``edit``. For dry runs and tests."""
 
@@ -964,6 +1262,68 @@ class FakeMutator:
         child.write_text(self.edit(child.read_text(encoding="utf-8")), encoding="utf-8")
 
 
+def opencode_model() -> str:
+    """The ``provider/model`` an opencode round asks for, read at every call.
+
+    Returns:
+        The slug from the environment, or `config.OPENCODE_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_OPENCODE_MODEL") or config.OPENCODE_MODEL
+
+
+def opencode_fallback() -> str:
+    """The seller retried once when the first fails without a verdict.
+
+    Returns:
+        The slug from the environment, or `config.OPENCODE_FALLBACK_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    value = os.environ.get("CAMPAIGN_OPENCODE_FALLBACK_MODEL")
+    return config.OPENCODE_FALLBACK_MODEL if value is None else value
+
+
+def known_opencode_models() -> set[str]:
+    """Every ``provider/model`` this opencode install can reach.
+
+    ``opencode models`` prints one per line across every authenticated
+    provider.
+
+    Returns:
+        The slugs it lists.
+    """
+    output = subprocess.run(
+        OPENCODE_CATALOG_COMMAND, capture_output=True, check=True, text=True
+    ).stdout
+    return {line.strip() for line in output.splitlines() if "/" in line}
+
+
+def validate_opencode_model(model: str) -> None:
+    """Fails fast when ``model`` is not one this install can reach.
+
+    Args:
+        model: The ``provider/model`` to check.
+
+    Raises:
+        SystemExit: ``model`` is not in `known_opencode_models`.
+    """
+    if model not in known_opencode_models():
+        raise SystemExit(
+            f"{model!r} is not a model this opencode install can reach "
+            "(run `opencode models` to check the spelling, and "
+            "`opencode auth list` to see which sellers are signed in)"
+        )
+
+
+# Every program that can drive a round. The selection names one of these and
+# `build` returns it; nothing else in the loop knows there is more than one.
+DRIVERS: dict[str, type] = {
+    "codex": CodexMutator,
+    "agy": AgyMutator,
+    "opencode": OpenCodeMutator,
+}
+
+
 def selected() -> str:
     """Which program drives a round, read fresh so it can change.
 
@@ -975,8 +1335,9 @@ def selected() -> str:
     """
     load_dotenv(ENV, override=True)
     kind = os.environ.get("CAMPAIGN_MUTATOR") or config.MUTATOR
-    if kind not in ("codex", "agy"):
-        raise SystemExit(f"{kind!r} is not a mutator; use 'codex' or 'agy'")
+    if kind not in DRIVERS:
+        named = ", ".join(repr(name) for name in DRIVERS)
+        raise SystemExit(f"{kind!r} is not a mutator; use one of {named}")
     return kind
 
 
@@ -986,7 +1347,7 @@ def build() -> Mutator:
     Returns:
         A mutator reading its own model per call.
     """
-    return CodexMutator() if selected() == "codex" else AgyMutator()
+    return DRIVERS[selected()]()
 
 
 def asked_model() -> str:
@@ -995,7 +1356,11 @@ def asked_model() -> str:
     Returns:
         The slug, for the run's own record of what it opened on.
     """
-    return model() if selected() == "codex" else agy_model()
+    return {
+        "codex": model,
+        "agy": agy_model,
+        "opencode": opencode_model,
+    }[selected()]()
 
 
 def validate_models() -> None:
@@ -1008,11 +1373,11 @@ def validate_models() -> None:
     Raises:
         SystemExit: Either model is not one the login knows.
     """
-    if selected() == "codex":
-        validate_model(model())
-        if fallback():
-            validate_model(fallback())
-        return
-    validate_agy_model(agy_model())
-    if agy_fallback():
-        validate_agy_model(agy_fallback())
+    check, asked, retry = {
+        "codex": (validate_model, model, fallback),
+        "agy": (validate_agy_model, agy_model, agy_fallback),
+        "opencode": (validate_opencode_model, opencode_model, opencode_fallback),
+    }[selected()]
+    check(asked())
+    if retry():
+        check(retry())

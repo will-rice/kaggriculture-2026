@@ -496,6 +496,20 @@ AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
 # `child.py` untouched). Nothing but the file says whether the round worked,
 # which is why `_written` is what decides the verdict.
 AGY_TIMEOUT = "3h"
+
+# The model an `opencode` round asks for, as `provider/model`.
+#
+# `gpt-5.6-luna` because it is the model this lineage was already climbing with
+# through codex, and OpenRouter sells it by the token with no window at all:
+# $0.20 a million input, about five cents for a round of the size measured
+# here. The quota walls that stopped the campaign -- codex until 2026-09-22,
+# agy's five-hour buckets -- are not a shape this provider has.
+OPENCODE_MODEL = "openrouter/openai/gpt-5.6-luna"
+# Retried once on the same model from a different seller, which is the only
+# fallback that answers the failure a fallback is for: a provider refusing,
+# rate-limiting or dropping the turn is a fact about that seller and not about
+# the model.
+OPENCODE_FALLBACK_MODEL = "opencode-go/gpt-5.6-luna"
 SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The database id of the program a cold start seeds itself from. The copy the
 # cold start writes under a run's `programs` is the campaign's lineage: every
