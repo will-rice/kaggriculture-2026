@@ -351,3 +351,39 @@ def test_the_schema_refuses_what_the_engine_would_never_act_on() -> None:
     ):
         with pytest.raises(ValueError):
             plan.validated({**PLAN, "actions": [wrong]})
+
+
+def test_every_field_tells_a_writer_what_to_produce() -> None:
+    """The schema is the whole of what a structured call is told.
+
+    A docstring's `Attributes:` section documents the source and reaches
+    nothing else: `model_json_schema()` carried nine of eleven fields with no
+    description at all, which is a bare `array` and a title pydantic invented
+    from the attribute name. A writer handed that has to guess what `shops`
+    means, what order `hands` is in, and what `route` has to agree with.
+    """
+    schema = plan.Plan.model_json_schema()
+
+    described: list[str] = []
+    bare: list[str] = []
+    for where, properties in (
+        ("Plan", schema["properties"]),
+        *(
+            (name, schema["$defs"][name]["properties"])
+            for name in ("Action", "Route", "ShopRoute")
+        ),
+    ):
+        for field, spec in properties.items():
+            (described if spec.get("description") else bare).append(f"{where}.{field}")
+
+    assert not bare, f"fields a writer is told nothing about: {bare}"
+    # Three on the plan, three on a step, two on a route, two on a lookup.
+    assert len(described) == 10, described
+
+    # And the descriptions carry the things that cannot be read off a type:
+    # what the field means, what order it is in, what it has to agree with.
+    assert (
+        "order they were hired"
+        in (schema["$defs"]["Action"]["properties"]["hands"]["description"])
+    )
+    assert "id" in schema["$defs"]["ShopRoute"]["properties"]["route"]["description"]

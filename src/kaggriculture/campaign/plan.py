@@ -135,12 +135,35 @@ class Action(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    farmer: UnitCommand
+    farmer: UnitCommand = Field(
+        description=(
+            "The farmer's own command for this step. The farmer always acts, so "
+            "this is never empty; `['PASS']` is how it does nothing."
+        ),
+        examples=[["PASS"], ["NORTH"], ["PLANT", "WHEAT"], ["PICKUP", "COW", 2]],
+    )
     # `sim.hpp` keeps `MAX_UNITS` slots for the farmer and its hands, so a
     # farm can work thirty-nine. The first schema said twelve, which is
     # what this champion hires -- and would have refused a legal plan.
-    hands: list[UnitCommand] = Field(max_length=config.MAX_UNITS - 1)
-    market: list[MarketCommand]
+    hands: list[UnitCommand] = Field(
+        max_length=config.MAX_UNITS - 1,
+        description=(
+            "One command for each hand hired so far, in the order they were "
+            "hired: the first entry is the first hand. Empty at the start of a "
+            "season, before anything has hired, and never longer than the number "
+            "of hands the farm actually has -- a command addressed to a hand that "
+            "does not exist is ignored."
+        ),
+        examples=[[], [["PASS"]], [["NORTH"], ["PICKUP", "COW"]]],
+    )
+    market: list[MarketCommand] = Field(
+        description=(
+            "The orders to place this step, in the order they are placed. Both "
+            "players' orders resolve in per-unit lockstep, so position matters "
+            "when both sides reach for the same goods. May be empty."
+        ),
+        examples=[[], [["HIRE"]], [["SELL", "WHEAT", 30], ["BUY_SEED", "MELON", 2]]],
+    )
 
 
 class Route(BaseModel):
@@ -159,8 +182,23 @@ class Route(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: int
-    tiles: list[int]
+    id: int = Field(
+        description=(
+            "The number `shops` refers to this route by. The numbering is not a "
+            "range and does not have to be contiguous: the champion's routes are "
+            "0 to 12 and 100 to 128."
+        ),
+        examples=[0, 101, 128],
+    )
+    tiles: list[int] = Field(
+        description=(
+            "The tiles this route walks, in order, as indices into the board. "
+            "Repeats are meaningful -- standing still is walking the same tile "
+            "twice -- and every route in the champion is the same length as the "
+            "season it is walked over."
+        ),
+        examples=[[0, 1, 2, 3, 4]],
+    )
 
 
 class ShopRoute(BaseModel):
@@ -177,8 +215,20 @@ class ShopRoute(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    shops: tuple[ShopName, ShopName]
-    route: int
+    shops: tuple[ShopName, ShopName] = Field(
+        description=(
+            "The two shops this map unlocks, in the engine's own order. The pair "
+            "is what a map is identified by, and both may be the same shop."
+        ),
+        examples=[["BAKERY", "BAKERY"], ["BAKERY", "YARN_STORE"]],
+    )
+    route: int = Field(
+        description=(
+            "Which route to walk on a map with those two shops. This has to be "
+            "the `id` of a route the plan holds, or the agent has nowhere to walk."
+        ),
+        examples=[101, 112],
+    )
 
 
 class Plan(BaseModel):
@@ -192,9 +242,28 @@ class Plan(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actions: list[Action]
-    routes: list[Route]
-    shops: list[ShopRoute]
+    actions: list[Action] = Field(
+        description=(
+            "The season, scripted step by step and walked in order: entry N is "
+            "what the farm does on step N. This is what the agent actually does "
+            "on the board, and it is the largest part of a plan by far -- the "
+            "champion's is 3,982 steps."
+        ),
+    )
+    routes: list[Route] = Field(
+        description=(
+            "The paths the shop lookup chooses between, each with the number it "
+            "is chosen by."
+        ),
+    )
+    shops: list[ShopRoute] = Field(
+        description=(
+            "Which route to walk for each pair of shops a map can unlock. This is "
+            "the whole of how the plan adapts to the map it is dealt: everything "
+            "else is fixed, and this decides which fixed thing gets played. The "
+            "champion carries all 64 ordered pairs of the eight shops."
+        ),
+    )
 
     @model_validator(mode="after")
     def _routes_exist(self) -> "Plan":
