@@ -231,16 +231,20 @@ def test_the_schema_carries_the_rules_rather_than_checking_them_after() -> None:
 
     # The vocabularies are named types the fields point at, which is how
     # pydantic renders an enum: `{"enum": [...]}` under `$defs`.
-    assert "PLANT" in defs["UnitOp"]["enum"], "the engine's ops are in the schema"
-    assert "HARVEST" in defs["UnitOp"]["enum"]
-    assert "TELEPORT" not in defs["UnitOp"]["enum"]
+    assert "HARVEST" in defs["PlainUnitOp"]["enum"], "the verbs that stand alone"
+    assert "TELEPORT" not in defs["PlainUnitOp"]["enum"]
+    assert defs["CropName"]["enum"] == config.CROPS, "the engine's own crops"
+    assert defs["ProductName"]["enum"] == config.PRODUCTS
     assert "BAKERY" in defs["ShopName"]["enum"], "and the shop names"
-    assert defs["UnitOp"]["enum"] == config.UNIT_OPS, "the engine's own list, in order"
+    # The verbs that take arguments are shapes rather than members, so they are
+    # not in the plain list: `PLANT` only ever appears beside a crop.
+    assert "PLANT" not in defs["PlainUnitOp"]["enum"]
 
     # And the fields reach them, so a generator reading the schema is held to
     # the vocabulary rather than told about it afterwards.
     farmer = json.dumps(defs["Action"]["properties"]["farmer"])
-    assert "#/$defs/UnitOp" in farmer
+    assert "#/$defs/PlainUnitOp" in farmer and "#/$defs/CropName" in farmer
+    assert '"const": "PLANT"' in farmer or '"PLANT"' in farmer
     shops = json.dumps(defs["ShopRoute"]["properties"]["shops"])
     assert "#/$defs/ShopName" in shops
     # Two shops, said in the schema rather than by a validator afterwards.
@@ -277,3 +281,73 @@ def test_the_real_champion_survives_the_round_trip() -> None:
 
     assert {*data} == {"actions", "routes", "shops"}
     assert plan.join(controller, data) == source
+
+
+def step(**parts: object) -> dict:
+    """One action, defaulting to a farmer that passes and an empty board."""
+    return {"farmer": ["PASS"], "hands": [], "market": [], **parts}
+
+
+def test_the_schema_accepts_everything_the_engine_acts_on() -> None:
+    """Whatever it refuses, it may not refuse a plan that plays.
+
+    These are shapes `action.rs` parses and acts on, and the first schema --
+    written from one champion's habits rather than from the parser -- refused
+    two of them. A schema that rejects a legal plan costs a round for nothing.
+    """
+    legal = [
+        # A farm can work thirty-nine hands: `sim.hpp` keeps MAX_UNITS slots for
+        # the farmer and its hands. The first schema capped this at twelve.
+        step(hands=[["PASS"]] * (config.MAX_UNITS - 1)),
+        # `PICKUP` and `PLACE` take an item, and the count is optional.
+        step(farmer=["PICKUP", "COW"]),
+        step(farmer=["PICKUP", "COW", 2]),
+        step(farmer=["PLACE", "WHEAT"]),
+        # `PLANT` takes a crop and no count at all.
+        step(farmer=["PLANT", "STRAWBERRY"]),
+        # Verbs that stand alone.
+        step(farmer=["COLLECT_FERTILIZER"]),
+        step(market=[["HIRE"], ["BUY_LAND"]]),
+        # An empty order: the engine drops it, and 283 of the champion's steps
+        # place one.
+        step(market=[[]]),
+        # A count of zero is dropped rather than refused, and the champion
+        # carries `["SELL", "STRAWBERRY", 0]` at step 449.
+        step(market=[["SELL", "STRAWBERRY", 0]]),
+        # Each moving verb with the names its own arm accepts.
+        step(market=[["SELL", "WOOL", 3]]),
+        step(market=[["BUY_SEED", "MELON", 1]]),
+        step(market=[["BUY_PRODUCT", "FERTILIZER", 5]]),
+        step(market=[["BUY_ANIMAL", "SHEEP", 2]]),
+    ]
+
+    plan.validated({**PLAN, "actions": legal})
+
+
+def test_the_schema_refuses_what_the_engine_would_never_act_on() -> None:
+    """The per-verb argument rules, which `action.rs` applies one arm at a time.
+
+    Each of these parses to `Invalid` or a no-op: the order occupies its slot
+    and never executes. A generator that can spell them wastes a season finding
+    out, and nothing in the champion's plan does.
+    """
+    for wrong in (
+        # `SELL` takes a product, and an animal is not one.
+        step(market=[["SELL", "COW", 1]]),
+        # `BUY_PRODUCT` takes wheat or fertiliser, whatever else is an item.
+        step(market=[["BUY_PRODUCT", "STRAWBERRY", 1]]),
+        # `BUY_SEED` and `PLANT` take crops; eggs are not planted.
+        step(market=[["BUY_SEED", "EGG", 1]]),
+        step(farmer=["PLANT", "EGG"]),
+        # `BUY_ANIMAL` takes an animal.
+        step(market=[["BUY_ANIMAL", "WHEAT", 1]]),
+        # A verb the engine has no arm for reads as a pass; it is a mistake in
+        # the writing rather than a strategy.
+        step(farmer=["TELEPORT"]),
+        # The moving verbs need their count: two parts is `Invalid`.
+        step(market=[["SELL", "WHEAT"]]),
+        # And a farm cannot work more hands than the engine has slots for.
+        step(hands=[["PASS"]] * config.MAX_UNITS),
+    ):
+        with pytest.raises(ValueError):
+            plan.validated({**PLAN, "actions": [wrong]})

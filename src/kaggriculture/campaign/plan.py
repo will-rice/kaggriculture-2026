@@ -32,7 +32,7 @@ import re
 import zlib
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -72,20 +72,53 @@ DATA = json.loads(
 # `MOp` are the vocabularies, and pydantic renders an enum into the schema as
 # `enum: [...]` -- so a generator handed this can only spell a verb the engine
 # has, which a validator could report only after the writing was done.
-UnitOp = StrEnum("UnitOp", {op: op for op in config.UNIT_OPS})
-MarketOp = StrEnum("MarketOp", {op: op for op in config.MARKET_OPS})
+ItemName = StrEnum("ItemName", {name: name for name in config.ITEMS})
+ProductName = StrEnum("ProductName", {name: name for name in config.PRODUCTS})
+CropName = StrEnum("CropName", {name: name for name in config.CROPS})
+AnimalName = StrEnum("AnimalName", {name: name for name in config.ANIMALS})
 ShopName = StrEnum("ShopName", {name: name for name in config.SHOP_NAMES})
 
-# A command is a verb and what it acts on, and the arities are the engine's:
-# a move is one part, `PICKUP COW` is two, `BUY_PRODUCT WHEAT 13` is three.
+# Every unit op that is a verb on its own. `action.rs` gives `PICKUP`, `PLACE`
+# and `PLANT` arguments and reads the rest as the verb alone -- and `PASS`
+# shares its arm with every op the engine does not know, so an unknown verb is
+# a pass rather than an error.
+PLAIN_UNIT_OPS = [
+    op for op in config.UNIT_OPS if op not in ("PICKUP", "PLACE", "PLANT")
+]
+PlainUnitOp = StrEnum("PlainUnitOp", {op: op for op in PLAIN_UNIT_OPS})
+
+# A count. Not `gt=0`, though `action.rs` drops an order whose count is zero or
+# less: the champion carries `["SELL", "STRAWBERRY", 0]` at step 449, the engine
+# runs that plan without complaint, and a schema that refused it would refuse a
+# legal plan. So the rule is said where a writer reads it rather than enforced
+# where it would reject what already plays.
+Count = Annotated[
+    int,
+    Field(description="How many. An order with a count of zero or less is dropped."),
+]
+
+# One command, shaped as the parser reads it.
 UnitCommand = Annotated[
-    tuple[UnitOp] | tuple[UnitOp, str] | tuple[UnitOp, str, int],
+    tuple[PlainUnitOp]
+    | tuple[Literal["PICKUP"], ItemName]
+    | tuple[Literal["PICKUP"], ItemName, Count]
+    | tuple[Literal["PLACE"], ItemName]
+    | tuple[Literal["PLACE"], ItemName, Count]
+    | tuple[Literal["PLANT"], CropName],
     Field(description="A verb the farmer or a hand performs, and its arguments."),
 ]
-# The market takes the same shape, and also nothing at all: 283 of the
-# champion's steps place an empty order.
+
+# And one order. `HIRE` and `BUY_LAND` are verbs alone; the four that move goods
+# each take the names their own arm accepts. An empty order is legal and
+# common: the engine drops it, and 283 of the champion's steps place one.
 MarketCommand = Annotated[
-    tuple[()] | tuple[MarketOp] | tuple[MarketOp, str, int],
+    tuple[()]
+    | tuple[Literal["HIRE"]]
+    | tuple[Literal["BUY_LAND"]]
+    | tuple[Literal["SELL"], ProductName, Count]
+    | tuple[Literal["BUY_SEED"], CropName, Count]
+    | tuple[Literal["BUY_PRODUCT"], Literal["WHEAT", "FERTILIZER"], Count]
+    | tuple[Literal["BUY_ANIMAL"], AnimalName, Count],
     Field(description="An order to place this step, or nothing."),
 ]
 
@@ -103,7 +136,10 @@ class Action(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     farmer: UnitCommand
-    hands: list[UnitCommand] = Field(max_length=12)
+    # `sim.hpp` keeps `MAX_UNITS` slots for the farmer and its hands, so a
+    # farm can work thirty-nine. The first schema said twelve, which is
+    # what this champion hires -- and would have refused a legal plan.
+    hands: list[UnitCommand] = Field(max_length=config.MAX_UNITS - 1)
     market: list[MarketCommand]
 
 

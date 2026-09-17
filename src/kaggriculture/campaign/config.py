@@ -119,6 +119,13 @@ UNIT_OPS: list[str] = [
     "COLLECT_FERTILIZER",
     "CARE",
 ]
+# The five plantable ones: `tables.rs`'s `Crop` enum, which is the first five
+# items. `PLANT` and `BUY_SEED` take one of these and nothing else.
+CROPS: list[str] = list(PRODUCTS[:5])
+# `sim.hpp`: `constexpr int MAX_UNITS = 40; // farmer + hands`. So a farm can
+# work thirty-nine hands beside its farmer, whatever any one champion happens
+# to hire.
+MAX_UNITS = 40
 MARKET_OPS: list[str] = [
     "NONE",
     "HIRE",
