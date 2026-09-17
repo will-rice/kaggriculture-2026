@@ -470,6 +470,84 @@ AGY_WROTE_A_CHILD = (
     '"usage":{"input_tokens":31,"output_tokens":9}}}\n'
 )
 
+# And a run that failed without reaching a verdict. This is the quota wall as
+# agy reported it on 2026-09-16, after a round had read the program, played 32
+# seasons and queried the corpus over eight hundred seconds: the exit code is
+# still 0 and the only thing that says otherwise is `status`.
+AGY_OUT_OF_QUOTA = (
+    '{"event":"result","result":{"status":"ERROR","error":'
+    '"Individual quota reached. Please upgrade your subscription to increase '
+    'your limits. Resets in 4h18m40s.","response":"Let me read child.py",'
+    '"usage":{"input_tokens":208584,"output_tokens":8200}}}\n'
+)
+
+
+def test_a_run_that_failed_without_a_verdict_is_an_exec_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quota wall is not a round that chose to write nothing.
+
+    The distinction pays for itself: `no_output` spends the round and moves on,
+    while `exec_error` retries on the fallback -- which is on the other quota
+    pool for exactly this reason. Measured once at eight hundred seconds of real
+    work, which as `no_output` would have been thrown away.
+    """
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.AgyMutator, "COMMAND", ["printf", "%s", AGY_OUT_OF_QUOTA]
+    )
+
+    result = asyncio.run(
+        mutate.AgyMutator(model="asked", fallback="")(box, MESSAGE, "p26")
+    )
+
+    assert result.status == "exec_error"
+    assert "quota reached" in result.reason
+    # Billed even though it produced nothing, so the telemetry says what it cost.
+    assert result.input_tokens == 208584 and result.output_tokens == 8200
+
+
+def test_a_quota_wall_is_retried_on_the_other_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wall the campaign actually hits, and the round it need not lose.
+
+    agy bills two entitlements that run down separately -- the Gemini models
+    share one, the Claude and GPT models another -- so a wall is a property of
+    the pool rather than of the account, and the fallback is chosen on the other
+    side of it. Measured: four sonnet rounds on a 310KB champion exhausted the
+    Claude five-hour limit while the Gemini one was untouched.
+    """
+    box = workspace(tmp_path)
+    monkeypatch.setattr(
+        mutate.AgyMutator,
+        "COMMAND",
+        ["bash", "-c", AGY_WALL_OR_CHILD, "_", "claude-pool"],
+    )
+
+    result = asyncio.run(
+        mutate.AgyMutator(model="claude-pool", fallback="gemini-pool")(
+            box, MESSAGE, "p27"
+        )
+    )
+
+    assert result.status == "ok" and result.fallback
+    assert result.model == "gemini-pool"
+    assert (box / "child.py").read_text() != PARENT
+    assert (box / "agy.claude-pool.failed.jsonl").exists()
+
+
+# A stand-in agy that walks into the quota wall on one pool -- exiting 0, as it
+# does -- and writes a child on the other.
+AGY_WALL_OR_CHILD = f"""
+if [ "$CAMPAIGN_AGY_MODEL" = "$1" ]; then
+  printf '%s' '{AGY_OUT_OF_QUOTA}'
+  exit 0
+fi
+printf 'def agent(o, c=None):\\n    return {{}}\\n' > child.py
+printf '%s' '{AGY_WROTE_A_CHILD}'
+"""
+
 # A stand-in agy that writes a child and reports it.
 AGY_CHILD = f"""
 printf 'def agent(o, c=None):\\n    return {{}}\\n' > child.py
@@ -723,3 +801,41 @@ def test_the_agy_catalog_is_read_as_the_text_agy_prints(
         "gemini-3.8-flash-medium",
         "claude-opus-4-6-thinking",
     }
+
+
+def test_a_round_is_invoked_with_everything_it_needs_to_measure() -> None:
+    """The flags a round cannot work without, asserted rather than assumed.
+
+    None of these fails loudly. A round missing ``--add-dir`` reports reading a
+    file it never opened; a round that cannot reach the interpreter reads its
+    own file, runs no measurement at all, and comes back ``no_output`` having
+    spent a whole call. Both were measured, and neither looks like a missing
+    flag from the outside.
+    """
+    box = Path("/tmp/a-round")
+    invocation = mutate.AgyMutator().invocation(box, MESSAGE, "claude-sonnet-4-6")
+
+    assert invocation[0] == "agy"
+    # The prompt is an argument, and a valueless `--print` is an error rather
+    # than a read from standard input.
+    assert invocation[1:3] == ["--print", MESSAGE]
+    assert invocation[invocation.index("--add-dir") + 1] == str(box)
+    assert invocation[invocation.index("--model") + 1] == "claude-sonnet-4-6"
+    assert invocation[invocation.index("--print-timeout") + 1] == config.AGY_TIMEOUT
+    assert invocation[invocation.index("--output-format") + 1] == "stream-json"
+    assert invocation[invocation.index("--mode") + 1] == "accept-edits"
+    # The grant that lets a round run `measure.py`, which is the whole point of
+    # a round: without it the call reads its file and measures nothing.
+    assert any("skip-permissions" in argument for argument in invocation)
+    # `--sandbox` restricts the terminal, which is the one thing a round needs.
+    assert "--sandbox" not in invocation
+    # And skills stay discoverable: the workspace copy is the point.
+    assert "--disable-slash-commands" not in invocation
+
+
+def test_a_stand_in_command_is_left_exactly_as_it_is() -> None:
+    """A test's own command gets no flags, or it would not be a stand-in."""
+    mutator = mutate.AgyMutator()
+    mutator.COMMAND = ["true"]
+
+    assert mutator.invocation(Path("/tmp/a-round"), MESSAGE, "any") == ["true"]

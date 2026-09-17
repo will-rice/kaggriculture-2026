@@ -549,6 +549,65 @@ class AgyMutator:
             update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
         )
 
+    def invocation(self, workspace: Path, message: str, model: str) -> list[str]:
+        """The whole command line one round runs as.
+
+        Separate from `call` so that the flags can be asserted on without
+        spending a call. Losing one of them does not fail loudly -- it produces
+        a round that reads its file, cannot measure anything, and reports
+        `no_output` -- so they are worth a test.
+
+        Args:
+            workspace: The directory the round works in.
+            message: The whole prompt, passed as ``--print``'s value.
+            model: The agy model to request.
+
+        Returns:
+            The argument vector, unchanged when ``COMMAND`` is a stand-in.
+        """
+        command = [*self.COMMAND]
+        if command[0] != "agy":
+            return command
+        return command + [
+            message,
+            # One JSON object per line: typed `init` and `step_update` events
+            # as the round works, and a terminal `result` event carrying the
+            # answer and the token usage. The plain `json` format returns that
+            # same result object and nothing of the steps.
+            "--output-format",
+            "stream-json",
+            "--mode",
+            "accept-edits",
+            "--add-dir",
+            str(workspace),
+            # Without this a round can read and edit its own file and run
+            # nothing that matters. agy confines a command to the directories
+            # its workspace grants, and the interpreter the loop runs under
+            # lives outside them: `python measure.py` came back "command not
+            # found" while that interpreter was on the PATH the round had
+            # inherited, and `python3` found the system 3.10 with no
+            # `kaggriculture` in it. A round that cannot measure is worth
+            # nothing -- the one measured this way spent 226 seconds and 75,000
+            # tokens hunting the filesystem for the package and edited nothing.
+            #
+            # Granting the directories instead was measured and is worse: it
+            # takes the round's own box out of the middle of its workspace, and
+            # the round stops being able to find `child.py` at all, hunting the
+            # repository instead at 265,000 tokens a round. It also hands a
+            # round `gate.py`, which is the program that scores it.
+            #
+            # So this, which is what a codex round has always run as: `-s
+            # workspace-write` with `approval_policy=never` is the same posture
+            # and a wider one. What either reaches is a throwaway directory
+            # holding one agent, and the loop still plays every scored game
+            # itself against opponents the round never sees.
+            "--dangerously-skip-permissions",
+            "--model",
+            model,
+            "--print-timeout",
+            config.AGY_TIMEOUT,
+        ]
+
     async def call(
         self, workspace: Path, message: str, program_id: str, model: str
     ) -> Mutation:
@@ -565,26 +624,7 @@ class AgyMutator:
         """
         started = time.perf_counter()
         given = (workspace / "child.py").read_text(encoding="utf-8")
-        command = [*self.COMMAND]
-        if command[0] == "agy":
-            command += [
-                message,
-                # One JSON object per line: typed `init` and `step_update`
-                # events as the round works, and a terminal `result` event
-                # carrying the answer and the token usage. The plain `json`
-                # format returns the same result object and nothing of the
-                # steps, and a round that dies leaves that file empty.
-                "--output-format",
-                "stream-json",
-                "--mode",
-                "accept-edits",
-                "--add-dir",
-                str(workspace),
-                "--model",
-                model,
-                "--print-timeout",
-                config.AGY_TIMEOUT,
-            ]
+        command = self.invocation(workspace, message, model)
         log = workspace / "agy.jsonl"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
@@ -640,6 +680,32 @@ class AgyMutator:
                 model=model,
             )
         usage = result.get("usage") or {}
+        if result.get("status") not in ("SUCCESS", None):
+            # The run failed without reaching a verdict, and said so in the
+            # one place that carries it: agy still exits 0. Measured on
+            # 2026-09-16, when a round that had read the program, played 32
+            # seasons and queried the corpus ended on `"status": "ERROR"` with
+            # "Individual quota reached ... Resets in 4h18m40s" -- eight
+            # hundred seconds of real work, and as `no_output` it would have
+            # been spent for nothing and never retried. This is what the
+            # fallback is for, and why the fallback is on the other pool.
+            reason = _agy_reason(result)
+            LOGGER.warning(
+                "agy call for %s failed without a verdict on %s: %s",
+                program_id,
+                model,
+                reason[:200],
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                model=model,
+            )
         child = _written(workspace, given)
         if child is None:
             return Mutation(
@@ -830,6 +896,9 @@ def _agy_reason(result: dict) -> str:
     status = result.get("status", "")
     if status and status != "SUCCESS":
         parts.append(str(status))
+    error = result.get("error")
+    if error:
+        parts.append(str(error))
     denied = result.get("denied_actions")
     if denied:
         parts.append(f"denied: {denied}")
