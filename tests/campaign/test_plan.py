@@ -500,3 +500,106 @@ def test_the_plan_a_round_is_handed_still_plays(tmp_path: Path) -> None:
 
     assert entire.ours > 0, "the champion banks something"
     assert (split.ours, split.theirs) == (entire.ours, entire.theirs)
+
+
+def test_a_season_written_out_packs_back_to_the_same_play() -> None:
+    """A plan is its play, not its pool: unfold and fold change one, not the other.
+
+    The pool is a dedupe, so the entry a step lands at depends on the order the
+    seasons are walked. What has to survive is which step each route plays on
+    each of its steps, which is what this compares.
+    """
+    champion = plan.Plan.model_validate(PLAN)
+    packed = plan.fold(plan.unfold(champion), champion)
+
+    assert plan.unfold(packed).routes == plan.unfold(champion).routes
+    assert sorted(packed.routes, key=int) == sorted(champion.routes, key=int)
+
+
+def test_one_written_season_is_a_whole_plan() -> None:
+    """A writer supplies a season; the program may ask for any route it knows.
+
+    The program's shop table sends some maps to routes a writer never named,
+    and a route it cannot find is a `KeyError` before the first move. So every
+    route the plan being replaced holds comes back, playing the written season
+    where there is nothing better.
+    """
+    champion = plan.Plan.model_validate(PLAN)
+    written = plan.unfold(champion)
+    one = plan.Written(routes={"101": written.routes["101"]}, shops=[])
+
+    folded = plan.fold(one, champion)
+
+    assert sorted(folded.routes, key=int) == sorted(champion.routes, key=int)
+    assert len({tuple(season) for season in folded.routes.values()}) == 1
+    assert plan.unfold(folded).routes["112"] == plan.unfold(champion).routes["101"]
+
+
+def test_a_written_season_is_steps_and_never_an_index() -> None:
+    """The schema a generator reads has no integer to put in a season.
+
+    Handed the pooled form, the model filled the array by counting: 715 of 718
+    transitions were +1, into a pool of one entry. Nothing in that form could
+    have said otherwise, because no schema coupled an index to the pool.
+    """
+    season = plan.Written.model_json_schema()["properties"]["routes"]
+    # The key carries a pattern, so a season sits under `patternProperties`
+    # rather than `additionalProperties`.
+    (step,) = season["patternProperties"].values()
+
+    assert step["minItems"] == config.SEASON and step["maxItems"] == config.SEASON
+    assert "$ref" in json.dumps(step["items"]), "a step, not a number"
+    assert "actions" not in plan.Written.model_fields, "the pool is not written"
+
+
+def test_a_written_plan_names_what_is_wrong_with_it() -> None:
+    """Refused here, where it is still a sentence rather than a lost game."""
+    steps = [{"farmer": ["PASS"], "hands": [], "market": []}] * config.SEASON
+    for wrong, says in (
+        ({"routes": {"100": steps[:-1]}}, f"at least {config.SEASON}"),
+        ({"routes": {"season": steps}}, "string_pattern_mismatch"),
+        # A crop the engine does not grow, at one step out of seven hundred.
+        (
+            {
+                "routes": {
+                    "100": [
+                        *steps[:-1],
+                        {"farmer": ["PLANT", "EGG"], "hands": [], "market": []},
+                    ]
+                }
+            },
+            "farmer",
+        ),
+    ):
+        with pytest.raises(ValueError, match=says):
+            plan.Written.model_validate({"routes": {}, "shops": [], **wrong})
+
+
+@pytest.mark.slow
+def test_a_folded_season_plays(tmp_path: Path) -> None:
+    """Written out and packed back, the champion banks what the champion banks.
+
+    Every data comparison above passed once while the program they described
+    forfeited every game it played, because a crashed agent simply loses. So
+    this plays, and it compares banks rather than asking whether one was made:
+    a fold that sent every step to the pool's first entry still banked money,
+    because that step is a wheat trade and 719 of them still trade.
+    """
+    source = config.LIVE.floor / "main.py"
+    if not source.exists():
+        pytest.skip("no live champion in this checkout")
+    controller, carried = plan.split(source.read_text(encoding="utf-8"))
+    whole = plan.Plan.model_validate(carried)
+
+    packed = plan.fold(plan.unfold(whole), whole)
+    agent = tmp_path / "main.py"
+    agent.write_text(
+        plan.join(controller, packed.model_dump(mode="json")), encoding="utf-8"
+    )
+
+    opponent = roster.path("ours_24", config.POOL)
+    champion = harness.game(source, opponent, seed=11, seat=0)
+    folded = harness.game(agent, opponent, seed=11, seat=0)
+
+    assert champion.ours > 0, "the champion banks something to compare against"
+    assert (folded.ours, folded.theirs) == (champion.ours, champion.theirs)

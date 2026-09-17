@@ -320,6 +320,114 @@ class Plan(BaseModel):
         return self
 
 
+Steps = Annotated[
+    list[Action],
+    Field(
+        min_length=config.SEASON,
+        max_length=config.SEASON,
+        description=(
+            f"A season written out: what the farm does on each of the "
+            f"{config.SEASON} steps, in order, step 0 first."
+        ),
+    ),
+]
+
+
+class Written(BaseModel):
+    """A plan as it is written, before it is packed into one.
+
+    The difference from `Plan` is that a season here is its steps rather than
+    indices into a pool. Pooling saves the program 4.9MB and costs a writer
+    everything: an index is legal at every position whatever it points at, so a
+    schema can bound the array's length and nothing else, and what came back
+    was the array filled by counting. Written out, every position is a command
+    and the same rules that govern one govern all 719.
+
+    Attributes:
+        routes: One written season per route number.
+        shops: Which route to walk for the shops a map happens to unlock.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    routes: dict[RouteId, Steps] = Field(
+        min_length=1,
+        description=(
+            "A season for each route, keyed by the number the shop lookup "
+            "chooses it by. Writing one is a whole plan: a route the program "
+            "asks for and this does not name plays the lowest-numbered season "
+            "here, so the farm always has something to do."
+        ),
+    )
+    shops: list[ShopRoute] = Field(
+        description=(
+            "Which route to walk for each pair of shops a map can unlock. Only "
+            "pairs worth treating differently need an entry -- anything not "
+            "named here plays the lowest-numbered season."
+        ),
+    )
+
+
+def fold(written: Written, over: Plan) -> Plan:
+    """Pack written seasons into the shape a program expects.
+
+    Steps that are the same step become one pooled entry cited many times,
+    which is the whole of what the pool is. Every route `over` holds gets a
+    season, so the program can ask for any of them: the written one where
+    there is one, and the lowest-numbered written season otherwise.
+
+    Args:
+        written: The seasons as they were written.
+        over: The plan being replaced, which says what routes are asked for.
+
+    Returns:
+        A plan in the program's own form.
+    """
+    pool: list[dict] = []
+    at_index: dict[str, int] = {}
+    seasons: dict[str, list[int]] = {}
+    for route, steps in written.routes.items():
+        season = []
+        for step in steps:
+            body = step.model_dump(mode="json")
+            key = json.dumps(body, sort_keys=True, separators=(",", ":"))
+            if key not in at_index:
+                at_index[key] = len(pool)
+                pool.append(body)
+            season.append(at_index[key])
+        seasons[route] = season
+
+    spare = seasons[min(seasons, key=int)]
+    routes = {route: seasons.get(route, spare) for route in over.routes}
+    named = {entry.route for entry in written.shops}
+    shops = list(written.shops) + [
+        entry for entry in over.shops if entry.route not in named
+    ]
+    return Plan(
+        actions=pool,
+        routes=routes | seasons,
+        shops=[entry for entry in shops if str(entry.route) in routes | seasons],
+    )
+
+
+def unfold(plan: Plan) -> Written:
+    """A plan's seasons written out, which is what a generator is given to beat.
+
+    Args:
+        plan: A plan in the program's own form.
+
+    Returns:
+        The same seasons, step by step.
+    """
+    return Written(
+        routes={
+            route: [plan.actions[step] for step in season]
+            for route, season in plan.routes.items()
+        },
+        shops=plan.shops,
+    )
+
+
 def carries(source: str) -> bool:
     """Whether this program has a packed plan to take out.
 
