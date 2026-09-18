@@ -74,6 +74,9 @@ UNPACKED = re.compile(
 )
 
 PLAN_FILE = "plan.json"
+# What the farm does on a step no season names: nothing. A written season may
+# stop short of the year, and this is what the rest of it is.
+IDLE: dict = {"farmer": ["PASS"], "hands": [], "market": []}
 PLAN_MODULE = "_plan"
 # The three lines that stand between the agent and its plan. They are a module
 # rather than a path read because the agent is exec'd without a `__file__` --
@@ -347,11 +350,13 @@ Stretches = Annotated[
         min_length=1,
         max_length=config.SEASON,
         description=(
-            f"A season, as stretches in the order they are played. The counts "
-            f"have to add up to exactly {config.SEASON}, which is the whole "
-            f"season: there is no step the farm has nothing to do on. There is "
-            f"no minimum number of stretches -- one step held for the whole "
-            f"season is legal, and so is {config.SEASON} stretches of one."
+            f"A season, as stretches in the order they are played. The season "
+            f"is {config.SEASON} steps long; the counts may add up to less "
+            f"than that, and the farm then does nothing for the rest of the "
+            f"year, but they may not add up to more, because a step past the "
+            f"end is never played. There is no minimum number of stretches -- "
+            f"one step held for the whole season is legal, and so is "
+            f"{config.SEASON} stretches of one."
         ),
     ),
 ]
@@ -393,22 +398,29 @@ class Written(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _seasons_are_whole(self) -> "Written":
-        """Every season's stretches have to add up to a season.
+    def _seasons_fit(self) -> "Written":
+        """No season may run past the end of the year.
 
-        Short and the farm has no instruction for the rest of the year; long and
-        the tail is never reached. Either way the plan is not the thing it says
-        it is, and the arithmetic is the one part of this a writer has to do.
+        A season that stops short is fine and means the farm is idle for the
+        rest of it -- that is what an unstated step means, and it is what both
+        models wrote out longhand when they had nothing more to say. One that
+        runs long is a different thing: the steps past the end cannot be played
+        at all, so the writer has lost count of the year rather than finished
+        early with it.
+
+        Requiring an exact total was the same mistake as requiring 719 entries.
+        A model wrote five stretches covering 699 steps, twenty short, and the
+        whole strategy was refused over the arithmetic.
         """
-        wrong = {
+        over = {
             f"route {route} covers {total}"
             for route, stretches in self.routes.items()
-            if (total := sum(stretch.steps for stretch in stretches)) != config.SEASON
+            if (total := sum(stretch.steps for stretch in stretches)) > config.SEASON
         }
-        if wrong:
+        if over:
             raise ValueError(
-                f"a season is {config.SEASON} steps and these do not add up to "
-                f"it: {', '.join(sorted(wrong))}"
+                f"a season is {config.SEASON} steps and these run past the end "
+                f"of it: {', '.join(sorted(over))}"
             )
         return self
 
@@ -443,6 +455,15 @@ def fold(written: Written, over: Plan) -> Plan:
             # A stretch held for twenty steps is one pooled entry cited twenty
             # times, which is what the pool is for.
             season.extend([at_index[key]] * stretch.steps)
+        # A season that stopped short is idle for the rest of the year. The
+        # program indexes a season by step number and every step has to be
+        # there, so the idleness is written out rather than left implied.
+        if len(season) < config.SEASON:
+            key = json.dumps(IDLE, sort_keys=True, separators=(",", ":"))
+            if key not in at_index:
+                at_index[key] = len(pool)
+                pool.append(IDLE)
+            season.extend([at_index[key]] * (config.SEASON - len(season)))
         seasons[route] = season
 
     spare = seasons[min(seasons, key=int)]

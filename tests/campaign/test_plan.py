@@ -606,10 +606,23 @@ def test_a_written_plan_names_what_is_wrong_with_it() -> None:
     pause = {"farmer": ["PASS"], "hands": [], "market": []}
     whole = [{"step": pause, "steps": config.SEASON}]
     for wrong, says in (
-        # The arithmetic, which is the one thing a writer has to get right: a
-        # season that stops short leaves the farm with no instruction for the
-        # rest of the year, and one that runs long has a tail never reached.
-        ({"routes": {"100": [{"step": pause, "steps": 10}]}}, "do not add up"),
+        # A season that runs past the end of the year. Stopping short is legal
+        # and means the farm is idle for the rest, which is what both models
+        # wrote out longhand; running over cannot be played at all.
+        (
+            {
+                "routes": {
+                    "100": [
+                        {"step": pause, "steps": 400},
+                        {
+                            "step": {"farmer": ["WATER"], "hands": [], "market": []},
+                            "steps": 400,
+                        },
+                    ]
+                }
+            },
+            "run past the end",
+        ),
         (
             {"routes": {"100": [{"step": pause, "steps": config.SEASON + 1}]}},
             "less than or equal",
@@ -713,3 +726,35 @@ def test_the_plan_a_round_opens_is_not_one_line_per_index() -> None:
     digits = sum(1 for line in theirs if line.strip().rstrip(",").isdigit())
     assert digits > len(ours), "most of the old file was one number per line"
     assert not [line for line in ours if line.strip().rstrip(",").isdigit()]
+
+
+def test_a_season_that_stops_short_leaves_the_farm_idle() -> None:
+    """A writer that runs out of plan is not a writer that has to be refused.
+
+    The stretches had to sum to exactly 719 for one commit, which is the same
+    mistake as requiring 719 entries in a smaller size: a model wrote five
+    stretches covering 699 steps, twenty short, and the whole strategy was
+    thrown away over the arithmetic. It then tried twice more and gave up.
+
+    So a short season is legal and the rest of the year is idle -- which is what
+    the models were writing out longhand anyway, both ending on a long `PASS` --
+    and `fold` writes that idleness into the season, because the program indexes
+    a season by step number and every step has to be there.
+    """
+    champion = plan.Plan.model_validate(PLAN)
+    working = {"farmer": ["WATER"], "hands": [], "market": []}
+    short = plan.Written.model_validate(
+        {
+            "routes": {"100": [{"step": working, "steps": config.SEASON - 20}]},
+            "shops": [],
+        }
+    )
+
+    folded = plan.fold(short, champion)
+    season = [folded.actions[at] for at in folded.routes["100"]]
+
+    assert len(season) == config.SEASON, "the program needs every step"
+    assert all(step.farmer[0] == "WATER" for step in season[: config.SEASON - 20])
+    assert all(step.model_dump(mode="json") == plan.IDLE for step in season[-20:])
+    # Two pooled entries: the step it named, and doing nothing.
+    assert len(folded.actions) == 2
