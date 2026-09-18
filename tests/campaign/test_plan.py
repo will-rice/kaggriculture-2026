@@ -38,6 +38,19 @@ PLAN = {
         "112": [0] * config.SEASON,
     },
     "shops": [{"route": 101, "shops": ["BAKERY", "BAKERY"]}],
+    # The chassis layers, which a program keeps on a line of its own and the
+    # plan is the source of. Here because the plan is the whole strategy now.
+    "settings": {
+        "hand_align": True,
+        "weed_repair": True,
+        "sell_lead": True,
+        "front_run": False,
+        "budget_guard": False,
+        "room_guard": True,
+        "clamp_sells": True,
+        "dead_stock": False,
+        "terminal_liquidation": False,
+    },
 }
 
 
@@ -51,9 +64,18 @@ def packed(data: dict) -> str:
     blob = base64.b85encode(
         zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
+    opening = carried["actions"][0]["market"]
+    yarn = {
+        tuple(entry["shops"]): entry["route"]
+        for entry in carried["shops"]
+        if "YARN_STORE" in entry["shops"]
+    }
     return (
         "import base64\nimport json\nimport zlib\n"
         f"_R108_DATA=json.loads(zlib.decompress(base64.b85decode('{blob}')))\n"
+        f"_SETTINGS={data['settings']!r}\n"
+        f"_R42_OPENING={[list(order) for order in opening]!r}\n"
+        f"_R110_OLD_SHOPS={yarn!r}\n"
         "def agent(observation, configuration=None):\n"
         "    return _R108_DATA['actions'][0]\n"
     )
@@ -350,7 +372,7 @@ def test_the_real_champion_survives_the_round_trip() -> None:
 
     controller, data = plan.split(source)
 
-    assert {*data} == {"actions", "routes", "shops"}
+    assert {*data} == {"actions", "routes", "shops", "settings"}
     # The plan, not the bytes. This champion happens to come back byte for byte
     # -- the models are declared in the order it writes its keys -- but that is
     # a tidy archive rather than a property anything depends on, and a champion
@@ -460,8 +482,10 @@ def test_every_field_tells_a_writer_what_to_produce() -> None:
             (described if spec.get("description") else bare).append(f"{where}.{field}")
 
     assert not bare, f"fields a writer is told nothing about: {bare}"
-    # Three on the plan, three on a step, two on a lookup.
-    assert len(described) == 8, described
+    # Four on the plan, three on a step, two on a lookup. The fourth is the
+    # chassis's layers, which used to be a line in the controller that no round
+    # editing the plan could reach.
+    assert len(described) == 9, described
 
     # And the descriptions carry the things that cannot be read off a type:
     # what the field means, what order it is in, what it has to agree with.
@@ -696,10 +720,11 @@ def test_the_plan_a_round_opens_is_addressable_by_line() -> None:
     lines = text.splitlines()
 
     assert json.loads(text) == PLAN, "still the same plan, still ordinary JSON"
-    # One line per step, per season and per lookup entry, and eight lines of
-    # structure: the brace, the three keys, their three closers, and the brace.
+    # One line per step, per season and per lookup entry, and nine lines of
+    # structure: the brace, the four keys, three closers for the parts that
+    # have them, the settings on one line, and the closing brace.
     assert len(lines) == (
-        len(PLAN["actions"]) + len(PLAN["routes"]) + len(PLAN["shops"]) + 8
+        len(PLAN["actions"]) + len(PLAN["routes"]) + len(PLAN["shops"]) + 9
     )
     for at, step in enumerate(PLAN["actions"]):
         line = lines[at + plan.FIRST_STEP_LINE - 1].strip().rstrip(",")
@@ -759,3 +784,68 @@ def test_a_season_that_stops_short_leaves_the_farm_idle() -> None:
     assert all(step.model_dump(mode="json") == plan.IDLE for step in season[-20:])
     # Two pooled entries: the step it named, and doing nothing.
     assert len(folded.actions) == 2
+
+
+def test_the_plan_carries_the_strategy_the_controller_used_to_keep() -> None:
+    """What the chassis is built with comes out of the program and goes back.
+
+    Three things decided strategy from the controller's own source, where a
+    round told to edit `plan.json` could not reach them: which reactive layers
+    are on, what to buy on the first step, and a second shops-to-route table for
+    a map that unlocks a YARN_STORE. The round message told every round the plan
+    was what the farm does and the controller only steered it, and that was
+    false for all three.
+    """
+    program = packed(PLAN)
+    _, taken = plan.split(program)
+
+    assert taken["settings"] == PLAN["settings"], "the layers are the plan's now"
+    # `_R42_OPENING` overwrites step 0's market in every route, so the plan's
+    # own `actions[0]` never ran. It is the opening itself now. Compared
+    # through the model, because a bare dict literal's value type is the union
+    # of every field and the checker cannot call that subscript sound.
+    assert (
+        Plan.model_validate(taken).actions[0].market
+        == Plan.model_validate(PLAN).actions[0].market
+    )
+
+
+def test_editing_the_settings_changes_the_program() -> None:
+    """A switch flipped in the plan is a switch flipped in what ships.
+
+    This is the whole point of moving them: the chassis reads `_SETTINGS` from
+    its own line, and that line is written from the plan, so the plan decides.
+    """
+    controller, taken = plan.split(packed(PLAN))
+    assert taken["settings"]["front_run"] is False
+
+    taken["settings"]["front_run"] = True
+    built = plan.join(controller, taken)
+
+    assert "'front_run': True" in built, "the program was not rebuilt with it"
+    _, again = plan.split(built)
+    assert again["settings"]["front_run"] is True
+
+
+@pytest.mark.slow
+def test_the_consolidated_champion_plays_the_same_game(tmp_path: Path) -> None:
+    """Taking the strategy out and putting it back changes no game.
+
+    Every data comparison in this module has passed at least once while the
+    program it described forfeited every game it played, so what settles a
+    change to `split` and `join` is banks: same seed, same seat, same opponent,
+    same number out.
+    """
+    source = config.LIVE.floor / "main.py"
+    if not source.exists():
+        pytest.skip("no live champion in this checkout")
+    controller, taken = plan.split(source.read_text(encoding="utf-8"))
+    rebuilt = tmp_path / "main.py"
+    rebuilt.write_text(plan.join(controller, taken), encoding="utf-8")
+
+    opponent = roster.path("ours_24", config.POOL)
+    theirs = harness.game(source, opponent, seed=11, seat=0)
+    ours = harness.game(rebuilt, opponent, seed=11, seat=0)
+
+    assert theirs.ours > 0, "the champion banks something to compare against"
+    assert (ours.ours, ours.theirs) == (theirs.ours, theirs.theirs)

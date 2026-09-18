@@ -41,6 +41,7 @@ both sides are packed by this module in the same process, so key order and
 separators cancel out.
 """
 
+import ast
 import base64
 import json
 import re
@@ -235,6 +236,63 @@ class ShopRoute(BaseModel):
     )
 
 
+# The controller's own lines, which `join` regenerates from the plan. Each is a
+# single top-level assignment of a literal, which is what makes projecting into
+# them safe: nothing about the controller's code has to change.
+CARRIED_SETTINGS = re.compile(r"^_SETTINGS\s*=\s*(\{[^\n]*\})$", re.MULTILINE)
+CARRIED_OPENING = re.compile(r"^_R42_OPENING\s*=\s*(\[[^\n]*\])$", re.MULTILINE)
+CARRIED_YARN = re.compile(r"^_R110_OLD_SHOPS\s*=\s*(\{[^\n]*\})$", re.MULTILINE)
+
+
+class Settings(BaseModel):
+    """Which of the chassis's reactive layers the program is built with.
+
+    The chassis replays a season and wraps it in layers that each watch the
+    board, and every one is switchable. They are strategy rather than
+    mechanism: whether to sell ahead of the opponent, whether to liquidate at
+    the end, whether to fund a block's purchases before it makes them.
+
+    Described from the chassis's own table, because `dead_stock` and
+    `room_guard` say nothing on their own.
+
+    All 512 combinations were played on 2026-09-18. The champion's ranked fifth
+    and the best in the whole space did not survive a wider block -- it lost by
+    37 a game over 400 -- so these are a settled question rather than a place to
+    look for gains.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hand_align: bool = Field(
+        description="Pad or truncate the hand commands to the hands actually hired."
+    )
+    weed_repair: bool = Field(
+        description="DIG a weed blocking a PLANT or BUILD, then replay the step."
+    )
+    sell_lead: bool = Field(description="Sell the next step's lots one step early.")
+    front_run: bool = Field(
+        description=(
+            "Sell before the opponent's own scheduled sale, taking the price "
+            "first. Needs their plan to predict from."
+        )
+    )
+    budget_guard: bool = Field(
+        description="Fund each block's purchases before the block makes them."
+    )
+    room_guard: bool = Field(
+        description="Keep the shed at or under 99 at the last hour of the day."
+    )
+    clamp_sells: bool = Field(
+        description="Trim a SELL down to what the shed is projected to hold."
+    )
+    dead_stock: bool = Field(
+        description="Sell stock the rest of the season is never going to sell."
+    )
+    terminal_liquidation: bool = Field(
+        description="On the last step, sell the whole projected shed."
+    )
+
+
 class Plan(BaseModel):
     """The strategy a program plays: the season, the paths, and the lookup.
 
@@ -277,6 +335,14 @@ class Plan(BaseModel):
             "the whole of how the plan adapts to the map it is dealt: everything "
             "else is fixed, and this decides which fixed thing gets played. The "
             "champion carries all 64 ordered pairs of the eight shops."
+        ),
+    )
+
+    settings: Settings = Field(
+        description=(
+            "Which of the chassis's reactive layers to switch on. These live in "
+            "the program's own source as `_SETTINGS`, and are written back there "
+            "when the plan is packed, so changing one here changes the agent."
         ),
     )
 
@@ -474,6 +540,9 @@ def fold(written: Written, over: Plan) -> Plan:
     ]
     return Plan(
         actions=pool,
+        # A writer supplies seasons, not a chassis, so the layers stay as the
+        # plan being replaced had them.
+        settings=over.settings,
         routes=routes | seasons,
         shops=[entry for entry in shops if str(entry.route) in routes | seasons],
     )
@@ -534,9 +603,49 @@ def split(source: str) -> tuple[str, dict]:
     if found is None:
         raise ValueError("this program carries no packed plan")
     carried = json.loads(zlib.decompress(base64.b85decode(found.group("payload"))))
+
+    # The strategy the controller keeps in its own source. Read here so the
+    # plan is the whole of it, and written back by `join`.
+    carried["settings"] = ast.literal_eval(_carried(source, CARRIED_SETTINGS))
+    # `_R42_OPENING` replaces step 0's market orders in every route, so the
+    # plan's own `actions[0]` never runs. Every route cites entry 0 there and
+    # nothing cites it elsewhere, so putting the opening in it is exact.
+    carried["actions"][0]["market"] = ast.literal_eval(
+        _carried(source, CARRIED_OPENING)
+    )
+    # One lookup. The controller's table decides a map that unlocked a
+    # YARN_STORE and the packed one decides the rest, so each carries a dead
+    # half; this takes every pair from whichever table actually decides it.
+    theirs = ast.literal_eval(_carried(source, CARRIED_YARN))
+    carried["shops"] = [
+        dict(entry, route=theirs[tuple(entry["shops"])])
+        if "YARN_STORE" in entry["shops"]
+        else entry
+        for entry in carried["shops"]
+    ]
+
     plan = Plan.model_validate(carried).model_dump(mode="json")
     line = LOADER.format(name=found.group("name"), module=PLAN_MODULE)
     return source[: found.start()] + line + source[found.end() :], plan
+
+
+def _carried(source: str, pattern: re.Pattern[str]) -> str:
+    """The literal a controller keeps on one of its own lines.
+
+    Args:
+        source: The program's source.
+        pattern: The line to find.
+
+    Returns:
+        The literal's text.
+
+    Raises:
+        ValueError: The program does not carry that line.
+    """
+    found = pattern.search(source)
+    if found is None:
+        raise ValueError(f"this program carries no {pattern.pattern.split(chr(92))[0]}")
+    return found.group(1)
 
 
 def join(controller: str, plan: dict) -> str:
@@ -556,7 +665,24 @@ def join(controller: str, plan: dict) -> str:
     found = UNPACKED.search(controller)
     if found is None:
         raise ValueError("this controller has no plan loader to pack back into")
-    carried = Plan.model_validate(plan).model_dump(mode="json")
+    whole = Plan.model_validate(plan)
+    carried = whole.model_dump(mode="json")
+
+    # Back into the lines the controller reads them from. The settings and the
+    # opening are not packed with the rest: the controller takes them from its
+    # own source, and a copy in the blob would be a second answer to the same
+    # question.
+    settings = carried.pop("settings")
+    opening = carried["actions"][0]["market"]
+    # Only the pairs that table is consulted for. It decides a map that
+    # unlocked a YARN_STORE and nothing else, so its other 49 entries were
+    # never read and are not carried back.
+    shops = {
+        tuple(entry["shops"]): entry["route"]
+        for entry in carried["shops"]
+        if "YARN_STORE" in entry["shops"]
+    }
+
     packed = base64.b85encode(
         zlib.compress(json.dumps(carried, separators=(",", ":")).encode(), 9)
     ).decode()
@@ -566,7 +692,17 @@ def join(controller: str, plan: dict) -> str:
         f"{found.group('name')}=json.loads(zlib.decompress("
         f"base64.b85decode('{packed}')))"
     )
-    return controller[: found.start()] + line + controller[found.end() :]
+    source = controller[: found.start()] + line + controller[found.end() :]
+    for pattern, value in (
+        (CARRIED_SETTINGS, settings),
+        (CARRIED_OPENING, [list(order) for order in opening]),
+        (CARRIED_YARN, shops),
+    ):
+        if pattern.search(source) is None:
+            raise ValueError(f"this controller has no {pattern.pattern[1:12]} line")
+        written = f"{pattern.pattern[1:].split(chr(92))[0]}={value!r}"
+        source = pattern.sub(lambda _, w=written: w, source, count=1)
+    return source
 
 
 # `actions[N]` is line `N + FIRST_STEP_LINE` of the file `readable` writes: line
@@ -605,7 +741,8 @@ def readable(plan: dict) -> str:
     return (
         f'{{\n "actions": [\n{steps}\n ],\n'
         f' "routes": {{\n{seasons}\n }},\n'
-        f' "shops": [\n{shops}\n ]\n}}\n'
+        f' "shops": [\n{shops}\n ],\n'
+        f' "settings": {json.dumps(plan["settings"], separators=compact)}\n}}\n'
     )
 
 
