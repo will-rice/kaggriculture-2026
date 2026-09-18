@@ -656,6 +656,7 @@ class Campaign:
                 siblings,
                 instruction,
                 source.read_text(encoding="utf-8"),
+                self.paths.champions,
             )
             outcome = await self.round(source, name, result, message, siblings, drawn)
             rounds += 1

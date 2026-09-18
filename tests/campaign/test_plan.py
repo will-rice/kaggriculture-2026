@@ -862,3 +862,59 @@ def test_the_consolidated_champion_plays_the_same_game(tmp_path: Path) -> None:
 
     assert theirs.ours > 0, "the champion banks something to compare against"
     assert (ours.ours, ours.theirs) == (theirs.ours, theirs.theirs)
+
+
+def test_an_edit_is_described_by_the_rule_it_follows() -> None:
+    """A rule applied across the pool is named as a rule, not as a count.
+
+    The edit that became champion_26 changed 389 pooled steps, and calling that
+    "389 pooled steps changed" hides the only thing a later round could use: it
+    was one transformation, every `SELL WHEAT` tripled. The size that matters is
+    the step-slots it decides, not the steps it touched.
+    """
+    after = json.loads(json.dumps(PLAN))
+    for step in after["actions"]:
+        for order in step["market"]:
+            if len(order) == 3 and order[0] == "SELL" and order[1] == "WHEAT":
+                order[2] *= 3
+
+    said = plan.described(PLAN, after)
+
+    assert "SELL WHEAT" in said and "x3" in said
+    # One pooled step carries the order, and season 101 plays it 360 times.
+    assert "step-slots" in said
+
+
+def test_an_edit_that_is_not_a_rule_is_not_described_as_one() -> None:
+    """Two unrelated changes are a count, because they are not a rule.
+
+    Describing them as one would hand a later round a pattern that was never
+    there, which is worse than handing it nothing.
+    """
+    after = json.loads(json.dumps(PLAN))
+    after["actions"][1]["market"][0][2] = 99
+    after["actions"][0]["farmer"] = ["NORTH"]
+
+    said = plan.described(PLAN, after)
+
+    assert "pooled step" in said
+    assert "SELL" not in said, "a farmer change is not a market rule"
+
+
+def test_a_plan_that_did_not_move_says_so() -> None:
+    """The lineage's first 145 programs would all render this."""
+    assert plan.described(PLAN, json.loads(json.dumps(PLAN))) == "the plan is unchanged"
+
+
+def test_the_other_parts_are_described_too() -> None:
+    """A season repointed, a shop pair moved and a switch flipped each show."""
+    after = json.loads(json.dumps(PLAN))
+    after["routes"]["112"] = [1] * config.SEASON
+    after["shops"][0]["route"] = 112
+    after["settings"]["front_run"] = True
+
+    said = plan.described(PLAN, after)
+
+    assert "season" in said and "112" in said
+    assert "shop pair" in said
+    assert "front_run=True" in said

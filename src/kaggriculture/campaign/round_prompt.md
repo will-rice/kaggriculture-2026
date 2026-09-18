@@ -14,6 +14,7 @@ Placeholders, all filled on every round:
                  or empty before any has been
   {failures}     the lineage's recent rejected attempts, or empty
   {schedule}     which days of the season the program has already decided
+  {kept}         every plan change that has survived a gate, or empty
   {instruction}  what to do
 -->
 
@@ -131,6 +132,8 @@ and it is the whole of the obligation.
 {tried}
 {failures}
 {schedule}
+
+{kept}
 
 ## Your instruction
 

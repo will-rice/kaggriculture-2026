@@ -597,6 +597,105 @@ def unfold(plan: Plan) -> Written:
     return Written(routes=routes, shops=plan.shops)
 
 
+def described(before: dict, after: dict) -> str:
+    """What changed between two plans, in the terms a round would change them.
+
+    A round is told what the rounds before it scored and never what they did.
+    The edits this lineage has kept were a rule across the pool -- every
+    `SELL WHEAT` tripled, 395 orders at once -- and two orders added to one step
+    played forty times; a score alone carries neither forward.
+
+    Args:
+        before: The plan that was, as `split` returns one.
+        after: The plan that replaced it.
+
+    Returns:
+        One line saying what moved, or that nothing did.
+    """
+    said = []
+
+    was = dict(enumerate(before["actions"]))
+    now = dict(enumerate(after["actions"]))
+    moved = [at for at in was if at in now and was[at] != now[at]]
+    if len(now) != len(was):
+        said.append(f"the pool went from {len(was):,} steps to {len(now):,}")
+    if moved:
+        # How often the changed steps are actually played, which is the size of
+        # the edit rather than the size of the diff.
+        cited = sum(
+            season.count(at) for season in after["routes"].values() for at in moved
+        )
+        label = _one_rule(was, now, moved) or (
+            f"{len(moved)} pooled step{'' if len(moved) == 1 else 's'}"
+        )
+        said.append(f"{label} changed, deciding {cited:,} step-slots")
+
+    repointed = [
+        at
+        for at in before["routes"]
+        if at in after["routes"] and before["routes"][at] != after["routes"][at]
+    ]
+    if repointed:
+        said.append(
+            f"{len(repointed)} season{'' if len(repointed) == 1 else 's'} "
+            f"repointed: {', '.join(repointed[:4])}"
+        )
+
+    theirs = {tuple(one["shops"]): one["route"] for one in before["shops"]}
+    ours = {tuple(one["shops"]): one["route"] for one in after["shops"]}
+    lookup = [pair for pair in theirs if ours.get(pair) != theirs[pair]]
+    if lookup:
+        shown = ", ".join(f"{' + '.join(pair)} -> {ours[pair]}" for pair in lookup[:2])
+        said.append(
+            f"{len(lookup)} shop pair{'' if len(lookup) == 1 else 's'} "
+            f"repointed: {shown}"
+        )
+
+    switches = [
+        name
+        for name, value in before.get("settings", {}).items()
+        if after.get("settings", {}).get(name) != value
+    ]
+    if switches:
+        said.append(
+            "settings changed: "
+            + ", ".join(f"{name}={after['settings'][name]}" for name in switches)
+        )
+    return "; ".join(said) if said else "the plan is unchanged"
+
+
+def _one_rule(was: dict, now: dict, moved: list[int]) -> str:
+    """The rule a change follows, when every changed order follows one.
+
+    A round that edits by rule -- every `SELL MELON`, capped -- changes hundreds
+    of steps with one transformation, and saying "389 pooled steps changed" hides
+    that. This returns the rule when there is one and nothing when there is not,
+    because a diff that is not a rule should not be described as one.
+    """
+    rules = set()
+    ratios = set()
+    for at in moved:
+        old, new = was[at], now[at]
+        if old["farmer"] != new["farmer"] or old["hands"] != new["hands"]:
+            return ""
+        if len(old["market"]) != len(new["market"]):
+            return ""
+        # The same length by the check above it, which is what `strict` says.
+        for one, other in zip(old["market"], new["market"], strict=True):
+            if one == other:
+                continue
+            if len(one) != 3 or len(other) != 3 or one[:2] != other[:2]:
+                return ""
+            rules.add((one[0], one[1]))
+            ratios.add(round(other[2] / one[2], 3) if one[2] else None)
+    if len(rules) != 1:
+        return ""
+    ((verb, item),) = rules
+    if len(ratios) == 1 and (factor := next(iter(ratios))):
+        return f"every `{verb} {item}` x{factor:g} ({len(moved)} steps)"
+    return f"every `{verb} {item}` ({len(moved)} steps)"
+
+
 def carries(source: str) -> bool:
     """Whether this program has a packed plan to take out.
 

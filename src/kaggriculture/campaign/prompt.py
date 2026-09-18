@@ -31,6 +31,7 @@ from kaggriculture.campaign import (
     archive,
     config,
     harness,
+    plan,
     validate,
 )
 
@@ -74,6 +75,9 @@ REASON_CHARS = 200
 # direction that came closest and the ones that lost ground, and with eight
 # sessions editing the same champion the list is long enough to need a cut.
 RECENT_ATTEMPTS = 3
+# How many past promotions to show. Enough to see the shape of what has
+# worked, without the message growing a history nobody reads.
+KEPT_EDITS = 6
 
 # How a round reaches the games. One database holds every game this campaign
 # has played and every game recorded off the competition, and a round asks it
@@ -319,6 +323,53 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     return lines
 
 
+def _kept_lines(champions: Path) -> list[str]:
+    """What every promotion before this one changed in the plan.
+
+    A round is told what its siblings scored and never what they did, so the
+    shape of an edit that worked has to be rediscovered each time. These are the
+    changes that survived a gate, in the terms a round would make them in.
+
+    Args:
+        champions: The directory every promoted program is written to.
+
+    Returns:
+        The lines to render, or nothing when no promotion has moved the plan.
+    """
+    if not champions.is_dir():
+        return []
+    chain = sorted(
+        champions.glob("champion_*.py"),
+        # Guarded because the glob does not promise a number, even though
+        # every name it matches has one.
+        key=lambda path: (
+            int(found.group(1)) if (found := re.search(r"(\d+)", path.name)) else 0
+        ),
+    )
+    said: list[str] = []
+    before = None
+    for path in chain:
+        source = path.read_text(encoding="utf-8")
+        if not plan.carries(source):
+            continue
+        _, after = plan.split(source)
+        if before is not None:
+            moved = plan.described(before, after)
+            if moved != "the plan is unchanged":
+                said.append(f"- {path.stem}: {moved}")
+        before = after
+    if not said:
+        return []
+    return [
+        "## What has worked",
+        "",
+        "Every change to the plan that has survived a gate, oldest first. A",
+        "score says an edit was kept; this says what it was.",
+        "",
+        *said[-KEPT_EDITS:],
+    ]
+
+
 def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> list[str]:
     """Render the edits already made to this program and what they scored.
 
@@ -460,6 +511,7 @@ def compose(
     siblings: list[archive.Program],
     instruction: str,
     source: str = "",
+    champions: Path | None = None,
 ) -> str:
     """Compose the message for one round.
 
@@ -485,6 +537,9 @@ def compose(
             prepended.
         source: The program in ``child.py``, so the message can show which days
             of the season it has already decided. Empty renders no section.
+        champions: Where every promoted program is written, so the message can
+            say what each promotion changed in the plan rather than only what
+            it scored. None renders no section.
 
     Returns:
         The whole message, for codex's standard input.
@@ -496,6 +551,7 @@ def compose(
     section = _game_lines(name, played)
     tried = _tried_lines(name, rate, siblings) if siblings else []
     committed = _schedule_lines(source) if source else []
+    kept = _kept_lines(champions) if champions else []
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         imports=IMPORTS,
@@ -503,6 +559,7 @@ def compose(
         tried="\n".join(tried) + "\n" if tried else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         schedule="\n".join(committed) + "\n" if committed else "",
+        kept="\n".join(kept) + "\n" if kept else "",
         instruction=instruction,
     )
     LOGGER.info(
