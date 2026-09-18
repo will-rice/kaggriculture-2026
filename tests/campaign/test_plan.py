@@ -50,6 +50,10 @@ PLAN = {
         "clamp_sells": True,
         "dead_stock": False,
         "terminal_liquidation": False,
+        # The two numbers in the chassis's defaults that are choices rather
+        # than restatements of the engine.
+        "block_turns": 72,
+        "min_sell_price": 2,
     },
 }
 
@@ -73,6 +77,15 @@ def packed(data: dict) -> str:
     return (
         "import base64\nimport json\nimport zlib\n"
         f"_R108_DATA=json.loads(zlib.decompress(base64.b85decode('{blob}')))\n"
+        # The chassis's defaults, which a program carries and `split` reads
+        # before applying the overrides -- the same order the chassis builds
+        # its config in. The four engine facts are here because a real program
+        # has them and the schema has to leave them alone.
+        "DEFAULT_SETTINGS = {\n"
+        "    'block_turns': 72, 'min_sell_price': 2,\n"
+        "    'shed_capacity': 100, 'board_size': 10,\n"
+        "    'max_orders': 10, 'turns_per_day': 24,\n"
+        "}\n"
         f"_SETTINGS={data['settings']!r}\n"
         f"_R42_OPENING={[list(order) for order in opening]!r}\n"
         f"_R110_OLD_SHOPS={yarn!r}\n"

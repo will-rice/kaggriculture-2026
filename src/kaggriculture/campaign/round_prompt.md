@@ -28,7 +28,7 @@ self-contained file whose last top-level callable is
 `agent(observation, configuration)` -- that is what Kaggle loads, and a program
 that crashes forfeits every game.
 
-`plan.json` holds three things, and they decide what the agent does on the
+`plan.json` holds four things, and they decide what the agent does on the
 board:
 
 - `actions` is a pool of every distinct step any season plays: the farmer's
@@ -42,10 +42,39 @@ board:
 - `shops` maps the two shops a map happens to have to a route number, so it
   chooses which season gets played. 64 lines, and the smallest change that
   makes the agent play a different game.
+- `settings` switches the chassis's nine reactive layers on and off: selling
+  ahead of the opponent, liquidating at the end, funding a block before it
+  spends. These were in `child.py` until today, where no round editing the plan
+  could reach them. All 512 combinations have now been played and the current
+  one is the best, so this part is a settled question rather than somewhere to
+  look.
 
 So there are two kinds of edit. Changing a pooled step changes that step
 everywhere every season cites it. Changing a season's indices changes the order
 without touching a step. Both are real edits; neither is the other.
+
+## How big an edit has to be to be worth making
+
+The margins that decide these games are small next to the banks. The champion
+banks around 100,000 and beats the field by between 279 and 3,242. So an edit
+worth keeping has to be worth hundreds, and most edits are worth nothing:
+
+- One quantity changed on one pooled step was measured at **+6**. Twenty-two of
+  twenty-four such edits changed the score by nothing at all, because a game
+  plays one route and any one route cites only 18% of the pool.
+- The same change applied to _every_ pooled step matching a rule -- every
+  `SELL MELON`, capped -- moved **1,269** on a single seed. A grep for
+  `SELL MELON` reaches 61 pooled steps deciding 543 step-slots; `HIRE` reaches
+  400 steps and 2,169 slots.
+
+Edit by rule, not by point. Work out what is wrong from the game's rules --
+which goods collapse on a glut, when a hire pays for itself -- then change every
+step that does it. `plan.json` is ordinary JSON: read it, transform it with a
+few lines of Python, write it back.
+
+And measure enough games. A difference of 40 needs hundreds of paired games to
+see; on eight games the noise is larger than anything you are likely to have
+changed, and an edit kept on eight games is a coin flip.
 
 It came from a solver, and no round before this one could read it -- it shipped
 as a single line of base85 and was left untouched through eight promotions

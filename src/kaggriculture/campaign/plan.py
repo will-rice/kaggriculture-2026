@@ -241,6 +241,9 @@ class ShopRoute(BaseModel):
 # them safe: nothing about the controller's code has to change.
 CARRIED_SETTINGS = re.compile(r"^_SETTINGS\s*=\s*(\{[^\n]*\})$", re.MULTILINE)
 CARRIED_OPENING = re.compile(r"^_R42_OPENING\s*=\s*(\[[^\n]*\])$", re.MULTILINE)
+CARRIED_DEFAULTS = re.compile(
+    r"^DEFAULT_SETTINGS\s*=\s*(\{.*?^\})$", re.MULTILINE | re.DOTALL
+)
 CARRIED_YARN = re.compile(r"^_R110_OLD_SHOPS\s*=\s*(\{[^\n]*\})$", re.MULTILINE)
 
 
@@ -290,6 +293,25 @@ class Settings(BaseModel):
     )
     terminal_liquidation: bool = Field(
         description="On the last step, sell the whole projected shed."
+    )
+
+    block_turns: int = Field(
+        ge=1,
+        le=config.SEASON,
+        description=(
+            "How many steps ahead the budget guard funds. The season runs in "
+            "blocks of this many, and each block's purchases are paid for "
+            "before it makes them."
+        ),
+        examples=[72],
+    )
+    min_sell_price: int = Field(
+        ge=1,
+        description=(
+            "Refuse to sell anything priced below this. The engine floors a "
+            "price at $1, so 2 means never sell into the floor."
+        ),
+        examples=[2],
     )
 
 
@@ -606,7 +628,15 @@ def split(source: str) -> tuple[str, dict]:
 
     # The strategy the controller keeps in its own source. Read here so the
     # plan is the whole of it, and written back by `join`.
-    carried["settings"] = ast.literal_eval(_carried(source, CARRIED_SETTINGS))
+    # The chassis builds its config as the defaults with the overrides applied,
+    # so this reads it the same way rather than guessing which line a value is
+    # on. Only the keys the schema names are taken; the rest of
+    # `DEFAULT_SETTINGS` restates the engine.
+    chassis = ast.literal_eval(_carried(source, CARRIED_DEFAULTS))
+    chassis.update(ast.literal_eval(_carried(source, CARRIED_SETTINGS)))
+    carried["settings"] = {
+        name: chassis[name] for name in Settings.model_fields if name in chassis
+    }
     # `_R42_OPENING` replaces step 0's market orders in every route, so the
     # plan's own `actions[0]` never runs. Every route cites entry 0 there and
     # nothing cites it elsewhere, so putting the opening in it is exact.
