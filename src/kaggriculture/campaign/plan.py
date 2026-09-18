@@ -320,14 +320,38 @@ class Plan(BaseModel):
         return self
 
 
-Steps = Annotated[
-    list[Action],
+class Stretch(BaseModel):
+    """One step, and how many steps in a row the farm plays it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: Action = Field(
+        description="What the farm does on each step of this stretch.",
+    )
+    steps: int = Field(
+        ge=1,
+        le=config.SEASON,
+        description=(
+            "How many steps in a row to play it. One means this step alone. "
+            "Use a longer stretch for a rhythm the farm holds -- watering the "
+            "same ground, feeding the same animals -- and one for a step that "
+            "is its own decision."
+        ),
+        examples=[1, 24],
+    )
+
+
+Stretches = Annotated[
+    list[Stretch],
     Field(
-        min_length=config.SEASON,
+        min_length=1,
         max_length=config.SEASON,
         description=(
-            f"A season written out: what the farm does on each of the "
-            f"{config.SEASON} steps, in order, step 0 first."
+            f"A season, as stretches in the order they are played. The counts "
+            f"have to add up to exactly {config.SEASON}, which is the whole "
+            f"season: there is no step the farm has nothing to do on. There is "
+            f"no minimum number of stretches -- one step held for the whole "
+            f"season is legal, and so is {config.SEASON} stretches of one."
         ),
     ),
 ]
@@ -336,12 +360,13 @@ Steps = Annotated[
 class Written(BaseModel):
     """A plan as it is written, before it is packed into one.
 
-    The difference from `Plan` is that a season here is its steps rather than
-    indices into a pool. Pooling saves the program 4.9MB and costs a writer
-    everything: an index is legal at every position whatever it points at, so a
-    schema can bound the array's length and nothing else, and what came back
-    was the array filled by counting. Written out, every position is a command
-    and the same rules that govern one govern all 719.
+    The difference from `Plan` is that a season here is the steps themselves,
+    in stretches, rather than indices into a pool. Two of our own constraints
+    had to go for that to be writable. Indices, because no schema can say an
+    index points at anything in particular, so a model filled the array by
+    counting. And the fixed length of 719, because a model that has worked out
+    a good year still has to reach 719 entries, and `PASS` is the cheapest
+    thing to put in the rest -- which is what three models did.
 
     Attributes:
         routes: One written season per route number.
@@ -350,7 +375,7 @@ class Written(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    routes: dict[RouteId, Steps] = Field(
+    routes: dict[RouteId, Stretches] = Field(
         min_length=1,
         description=(
             "A season for each route, keyed by the number the shop lookup "
@@ -367,14 +392,35 @@ class Written(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _seasons_are_whole(self) -> "Written":
+        """Every season's stretches have to add up to a season.
+
+        Short and the farm has no instruction for the rest of the year; long and
+        the tail is never reached. Either way the plan is not the thing it says
+        it is, and the arithmetic is the one part of this a writer has to do.
+        """
+        wrong = {
+            f"route {route} covers {total}"
+            for route, stretches in self.routes.items()
+            if (total := sum(stretch.steps for stretch in stretches)) != config.SEASON
+        }
+        if wrong:
+            raise ValueError(
+                f"a season is {config.SEASON} steps and these do not add up to "
+                f"it: {', '.join(sorted(wrong))}"
+            )
+        return self
+
 
 def fold(written: Written, over: Plan) -> Plan:
     """Pack written seasons into the shape a program expects.
 
-    Steps that are the same step become one pooled entry cited many times,
-    which is the whole of what the pool is. Every route `over` holds gets a
-    season, so the program can ask for any of them: the written one where
-    there is one, and the lowest-numbered written season otherwise.
+    A stretch becomes as many citations as it is long, and steps that are the
+    same step become one pooled entry however many stretches reach for it.
+    Every route `over` holds gets a season, so the program can ask for any of
+    them: the written one where there is one, and the lowest-numbered written
+    season otherwise.
 
     Args:
         written: The seasons as they were written.
@@ -386,15 +432,17 @@ def fold(written: Written, over: Plan) -> Plan:
     pool: list[dict] = []
     at_index: dict[str, int] = {}
     seasons: dict[str, list[int]] = {}
-    for route, steps in written.routes.items():
-        season = []
-        for step in steps:
-            body = step.model_dump(mode="json")
+    for route, stretches in written.routes.items():
+        season: list[int] = []
+        for stretch in stretches:
+            body = stretch.step.model_dump(mode="json")
             key = json.dumps(body, sort_keys=True, separators=(",", ":"))
             if key not in at_index:
                 at_index[key] = len(pool)
                 pool.append(body)
-            season.append(at_index[key])
+            # A stretch held for twenty steps is one pooled entry cited twenty
+            # times, which is what the pool is for.
+            season.extend([at_index[key]] * stretch.steps)
         seasons[route] = season
 
     spare = seasons[min(seasons, key=int)]
@@ -413,19 +461,28 @@ def fold(written: Written, over: Plan) -> Plan:
 def unfold(plan: Plan) -> Written:
     """A plan's seasons written out, which is what a generator is given to beat.
 
+    Consecutive steps that are the same step collapse into one stretch, so a
+    season that holds a rhythm comes back as few entries and one that decides
+    every step comes back as many. The champion decides nearly every step, so
+    it round-trips at close to one stretch per step.
+
     Args:
         plan: A plan in the program's own form.
 
     Returns:
-        The same seasons, step by step.
+        The same seasons, as stretches.
     """
-    return Written(
-        routes={
-            route: [plan.actions[step] for step in season]
-            for route, season in plan.routes.items()
-        },
-        shops=plan.shops,
-    )
+    routes: dict[str, list[Stretch]] = {}
+    for route, season in plan.routes.items():
+        stretches: list[Stretch] = []
+        for step in season:
+            playing = plan.actions[step]
+            if stretches and stretches[-1].step == playing:
+                stretches[-1].steps += 1
+            else:
+                stretches.append(Stretch(step=playing, steps=1))
+        routes[route] = stretches
+    return Written(routes=routes, shops=plan.shops)
 
 
 def carries(source: str) -> bool:

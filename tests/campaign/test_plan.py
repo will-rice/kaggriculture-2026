@@ -542,33 +542,97 @@ def test_a_written_season_is_steps_and_never_an_index() -> None:
     transitions were +1, into a pool of one entry. Nothing in that form could
     have said otherwise, because no schema coupled an index to the pool.
     """
-    season = plan.Written.model_json_schema()["properties"]["routes"]
+    schema = plan.Written.model_json_schema()
     # The key carries a pattern, so a season sits under `patternProperties`
     # rather than `additionalProperties`.
-    (step,) = season["patternProperties"].values()
+    (season,) = schema["properties"]["routes"]["patternProperties"].values()
 
-    assert step["minItems"] == config.SEASON and step["maxItems"] == config.SEASON
-    assert "$ref" in json.dumps(step["items"]), "a step, not a number"
+    assert "#/$defs/Stretch" in json.dumps(season["items"]), "a step, not a number"
+    assert set(schema["$defs"]["Stretch"]["properties"]) == {"step", "steps"}
+    assert "#/$defs/Action" in json.dumps(schema["$defs"]["Stretch"]["properties"])
     assert "actions" not in plan.Written.model_fields, "the pool is not written"
+
+
+def test_a_written_season_need_not_be_seven_hundred_entries_long() -> None:
+    """The floor of 719 was ours, and it is what forced the padding.
+
+    A model that has worked out a year still had to reach 719 array entries, and
+    the cheapest thing to put in the rest is `PASS`. Three models did exactly
+    that: 719, 719 and 713 of their steps were the same step. A season is
+    stretches now, so a plan for the year can be stated in as many entries as it
+    actually has decisions in it.
+    """
+    schema = plan.Written.model_json_schema()
+    (season,) = schema["properties"]["routes"]["patternProperties"].values()
+
+    assert season["minItems"] == 1, "a short season has to be writable"
+    assert season["maxItems"] == config.SEASON, "and no longer than a season"
+
+    # Three stretches covering the year, which the old schema refused.
+    hold = {"farmer": ["WATER"], "hands": [], "market": []}
+    short = plan.Written.model_validate(
+        {
+            "routes": {
+                "100": [
+                    {
+                        "step": {"farmer": ["PASS"], "hands": [], "market": []},
+                        "steps": 1,
+                    },
+                    {
+                        "step": {
+                            "farmer": ["PLANT", "WHEAT"],
+                            "hands": [],
+                            "market": [],
+                        },
+                        "steps": 1,
+                    },
+                    {"step": hold, "steps": config.SEASON - 2},
+                ]
+            },
+            "shops": [],
+        }
+    )
+    assert len(short.routes["100"]) == 3
+    # And it is a whole season once packed: one pooled step per distinct step,
+    # cited as many times as its stretch is long.
+    champion = plan.Plan.model_validate(PLAN)
+    folded = plan.fold(short, champion)
+    assert len(folded.routes["100"]) == config.SEASON
+    assert len(folded.actions) == 3
 
 
 def test_a_written_plan_names_what_is_wrong_with_it() -> None:
     """Refused here, where it is still a sentence rather than a lost game."""
-    steps = [{"farmer": ["PASS"], "hands": [], "market": []}] * config.SEASON
+    pause = {"farmer": ["PASS"], "hands": [], "market": []}
+    whole = [{"step": pause, "steps": config.SEASON}]
     for wrong, says in (
-        ({"routes": {"100": steps[:-1]}}, f"at least {config.SEASON}"),
-        ({"routes": {"season": steps}}, "string_pattern_mismatch"),
-        # A crop the engine does not grow, at one step out of seven hundred.
+        # The arithmetic, which is the one thing a writer has to get right: a
+        # season that stops short leaves the farm with no instruction for the
+        # rest of the year, and one that runs long has a tail never reached.
+        ({"routes": {"100": [{"step": pause, "steps": 10}]}}, "do not add up"),
+        (
+            {"routes": {"100": [{"step": pause, "steps": config.SEASON + 1}]}},
+            "less than or equal",
+        ),
+        ({"routes": {"season": whole}}, "string_pattern_mismatch"),
+        # A crop the engine does not grow, in one stretch out of two.
         (
             {
                 "routes": {
                     "100": [
-                        *steps[:-1],
-                        {"farmer": ["PLANT", "EGG"], "hands": [], "market": []},
+                        {"step": pause, "steps": config.SEASON - 1},
+                        {
+                            "step": {
+                                "farmer": ["PLANT", "EGG"],
+                                "hands": [],
+                                "market": [],
+                            },
+                            "steps": 1,
+                        },
                     ]
                 }
             },
-            "farmer",
+            "step",
         ),
     ):
         with pytest.raises(ValueError, match=says):
