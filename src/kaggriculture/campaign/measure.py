@@ -38,11 +38,13 @@ prompt promised and nothing has ever written: the campaign's own games went to
 the games database, and the reference outlived the file. They are in the
 database, day by day and both sides, which is where to read them against this.
 
-A game costs about two and a half seconds -- the engine steps in microseconds,
-and the programs themselves are what take the time -- so the default comparison
-is thirty-two games spread over as many cores as the machine has spare. Play
-more seeds if a result is close: the error falls with the square root of the
-count.
+A game costs about a tenth of a second spread over the cores the machine has
+spare -- the engine steps in microseconds and the programs themselves are what
+take the time -- so the default comparison is a hundred and twenty-eight games
+in roughly twelve seconds. Play more seasons if a result is close, and expect
+to need four times as many to halve the error: it falls with the square root of
+the count, so going from four seasons to eight is not worth the wait and going
+from four to sixty-four is.
 
 What this says is not the verdict. The campaign plays every scored game itself,
 against opponents this never sees, and that is what promotes a program. This is
@@ -59,7 +61,15 @@ from kaggriculture.campaign import config, harness, pools
 HERE = pathlib.Path(__file__).resolve().parent
 # Fixed, so two runs of this compare the same seasons and a difference between
 # them is the edit rather than the draw.
-SEEDS = tuple(range(101, 117))
+#
+# Sixty-four of them, because sixteen was a ceiling rather than a default: a
+# round that measured +63 with a spread of +/-185 had already played every
+# season it was allowed, while being told to play more if the result was close.
+# The edits this lineage has kept were worth +108 and +346 a game, and +/-185
+# cannot see the first. The gate still draws its own seeds, which a round never
+# sees, so widening this improves a round's own decision without touching the
+# thing that promotes.
+SEEDS = tuple(range(101, 165))
 
 
 def main() -> None:
@@ -129,14 +139,45 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
         pair = statistics.mean(sides)
         print(f"  {seed:<8} {sides[0]:>+10,.0f} {sides[1]:>+10,.0f} {pair:>+10,.0f}")
 
+    # What the numbers mean, said in coins. A round read "inside the error" five
+    # times and shipped anyway; the gate then spent a full cycle establishing
+    # what these runs had already told it.
     if mean > 2 * error and error:
-        print("\nthe edit is ahead by more than twice its error: keep it")
-    elif mean < -2 * error and error:
-        print("\nthe edit is behind by more than twice its error: revert it")
-    else:
         print(
-            "\ninside the error, so this says nothing yet -- play more seeds,"
-            "\nor make a change big enough to see"
+            f"\nKEEP IT. The edit is worth {mean:+,.0f} a game and the noise in "
+            f"this measurement is +/-{error:,.0f}, so the gain is real: it is "
+            f"{mean / error:.1f} times the noise."
+        )
+    elif mean < -2 * error and error:
+        print(
+            f"\nREVERT IT. The edit costs {mean:+,.0f} a game against noise of "
+            f"+/-{error:,.0f}, so the loss is real: it is {abs(mean) / error:.1f} "
+            f"times the noise."
+        )
+    else:
+        # How many seasons would make this difference readable. The error falls
+        # with the square root of the games, so the answer is rarely "a few
+        # more".
+        need = (
+            min(
+                len(SEEDS),
+                max(seeds * 4, int(seeds * (2 * error / abs(mean)) ** 2) + 1),
+            )
+            if mean
+            else len(SEEDS)
+        )
+        print(
+            f"\nTHIS SAYS NOTHING. The edit measured {mean:+,.0f} a game but the "
+            f"noise in {len(gaps)} games is +/-{error:,.0f}, which is larger, so "
+            f"you cannot tell whether it helped or hurt."
+            f"\n\nTwo ways forward, and picking neither means shipping a coin "
+            f"flip:"
+            f"\n  - play more seasons: `--seeds {need}` would roughly settle a "
+            f"difference this size, because the noise falls with the square root "
+            f"of the games"
+            f"\n  - or make a bigger change. Edits that have been kept in this "
+            f"lineage were worth +108 and +346 a game; an edit worth tens will "
+            f"not be visible here and will not matter on the ladder either."
         )
     worst = min(SEEDS[:seeds], key=lambda s: _paired(played, s))
     print(f"\nthe season this edit does worst on is {worst}: `--replay {worst}`")

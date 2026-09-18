@@ -72,9 +72,17 @@ which goods collapse on a glut, when a hire pays for itself -- then change every
 step that does it. `plan.json` is ordinary JSON: read it, transform it with a
 few lines of Python, write it back.
 
-And measure enough games. A difference of 40 needs hundreds of paired games to
-see; on eight games the noise is larger than anything you are likely to have
-changed, and an edit kept on eight games is a coin flip.
+And measure enough seasons. `./measure.py` defaults to 64 of them, 128 games,
+in about fifteen seconds, and it tells you in coins whether what you measured is
+bigger than the noise in the measurement. Take the default. A round before you
+ran `--seeds 4` four separate times, was told four times that the result said
+nothing, and shipped anyway; the gate then spent twenty minutes establishing
+what those four runs had already said for free.
+
+Small samples do not merely say less, they mislead. The same edit measured +454
+with a spread of 13 over four seasons, +314 over sixteen, and +255 over
+sixty-four: the small sample was both wrong about the size and falsely confident
+about it, because four seasons that happen to agree look like certainty.
 
 It came from a solver, and no round before this one could read it -- it shipped
 as a single line of base85 and was left untouched through eight promotions
