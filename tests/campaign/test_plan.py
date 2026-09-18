@@ -603,3 +603,49 @@ def test_a_folded_season_plays(tmp_path: Path) -> None:
 
     assert champion.ours > 0, "the champion banks something to compare against"
     assert (folded.ours, folded.theirs) == (champion.ours, champion.theirs)
+
+
+def test_the_plan_a_round_opens_is_addressable_by_line() -> None:
+    """One step per line, so an index into `actions` is a line number.
+
+    `json.dumps(indent=1)` puts every index of every season on a line of its
+    own: 213,302 lines for the champion, 29,479 of them a single digit. A round
+    is told to edit that file and never has. What makes it editable is not that
+    it is smaller but that the two halves address each other -- `actions[N]` is
+    line `N + FIRST_STEP_LINE`, so a season's index is somewhere to go.
+    """
+    text = plan.readable(PLAN)
+    lines = text.splitlines()
+
+    assert json.loads(text) == PLAN, "still the same plan, still ordinary JSON"
+    # One line per step, per season and per lookup entry, and eight lines of
+    # structure: the brace, the three keys, their three closers, and the brace.
+    assert len(lines) == (
+        len(PLAN["actions"]) + len(PLAN["routes"]) + len(PLAN["shops"]) + 8
+    )
+    for at, step in enumerate(PLAN["actions"]):
+        line = lines[at + plan.FIRST_STEP_LINE - 1].strip().rstrip(",")
+        assert json.loads(line) == step, f"actions[{at}] is not on its own line"
+    # And a whole season on one line, so a round can read one at a time.
+    # Indexed through the model rather than the fixture: a bare dict literal's
+    # value type is the union of all three fields, so `PLAN["routes"]["101"]`
+    # is a subscript the checker cannot call sound.
+    (season,) = [line for line in lines if line.strip().startswith('"101"')]
+    written = json.loads(season.split(": ", 1)[1].rstrip(","))
+    assert written == Plan.model_validate(PLAN).routes["101"]
+
+
+def test_the_plan_a_round_opens_is_not_one_line_per_index() -> None:
+    """The layout it replaced, so the reason for this one stays measured.
+
+    This is the whole defect in one assertion: the same plan, written the way
+    `lay_out` used to write it, is more than ten times the lines and most of
+    them hold one digit.
+    """
+    theirs = json.dumps(PLAN, indent=1, sort_keys=True).splitlines()
+    ours = plan.readable(PLAN).splitlines()
+
+    assert len(theirs) > 10 * len(ours)
+    digits = sum(1 for line in theirs if line.strip().rstrip(",").isdigit())
+    assert digits > len(ours), "most of the old file was one number per line"
+    assert not [line for line in ours if line.strip().rstrip(",").isdigit()]

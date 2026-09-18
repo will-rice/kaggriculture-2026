@@ -491,6 +491,46 @@ def join(controller: str, plan: dict) -> str:
     return controller[: found.start()] + line + controller[found.end() :]
 
 
+# `actions[N]` is line `N + FIRST_STEP_LINE` of the file `readable` writes: line
+# 1 opens the object, line 2 opens `actions`, so the first step is line 3. That
+# is what lets a round go from an index in a season to the step it names.
+FIRST_STEP_LINE = 3
+
+
+def readable(plan: dict) -> str:
+    """The plan as a file a round can address, one part of it per line.
+
+    `json.dumps(indent=1)` renders the champion's plan as 213,302 lines and
+    1.93MB, and 29,479 of those lines hold a single digit -- every index of
+    every season on a line of its own. Nothing reads that and nothing greps it
+    usefully, which is the likeliest reason no round has ever edited the plan
+    despite being told to. One step per line is 4,095 lines, and it makes an
+    index into `actions` a line number.
+
+    Args:
+        plan: The plan, as `split` returns it.
+
+    Returns:
+        The file's text, which is still ordinary JSON.
+    """
+    compact = (",", ":")
+    steps = ",\n".join(
+        f"  {json.dumps(step, separators=compact)}" for step in plan["actions"]
+    )
+    seasons = ",\n".join(
+        f"  {json.dumps(at)}: {json.dumps(plan['routes'][at], separators=compact)}"
+        for at in sorted(plan["routes"], key=int)
+    )
+    shops = ",\n".join(
+        f"  {json.dumps(entry, separators=compact)}" for entry in plan["shops"]
+    )
+    return (
+        f'{{\n "actions": [\n{steps}\n ],\n'
+        f' "routes": {{\n{seasons}\n }},\n'
+        f' "shops": [\n{shops}\n ]\n}}\n'
+    )
+
+
 def lay_out(source: str, box: Path, name: str = "child.py") -> None:
     """Write a program into a round's directory, plan alongside.
 
@@ -507,9 +547,7 @@ def lay_out(source: str, box: Path, name: str = "child.py") -> None:
         return
     controller, plan = split(source)
     (box / name).write_text(controller, encoding="utf-8")
-    (box / PLAN_FILE).write_text(
-        json.dumps(plan, indent=1, sort_keys=True), encoding="utf-8"
-    )
+    (box / PLAN_FILE).write_text(readable(plan), encoding="utf-8")
     (box / f"{PLAN_MODULE}.py").write_text(
         PLAN_LOADER_SOURCE.format(file=PLAN_FILE), encoding="utf-8"
     )

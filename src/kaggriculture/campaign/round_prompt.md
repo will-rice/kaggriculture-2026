@@ -31,12 +31,21 @@ that crashes forfeits every game.
 `plan.json` holds three things, and they decide what the agent does on the
 board:
 
-- `shops` maps the two shops a map happens to have to a route number. This is
-  the smallest change that makes the agent play a different game, and it is 64
-  lines.
-- `routes` are the paths those numbers name, as tile indices.
-- `actions` is the scripted season, step by step: the farmer's move, each
-  hand's moves, and the market orders, for 3,982 steps.
+- `actions` is a pool of every distinct step any season plays: the farmer's
+  move, each hand's move, and the market orders. Where a step sits in the pool
+  means nothing. One step per line, so `actions[N]` is line `N + 3` of the file
+  and you can go straight to it.
+- `routes` is one whole season per route number: 719 indices into `actions`,
+  one per step, so entry N says which pooled step the farm plays on step N.
+  These are not board tiles. A step the farm plays forty times is one pooled
+  entry cited forty times. One season per line.
+- `shops` maps the two shops a map happens to have to a route number, so it
+  chooses which season gets played. 64 lines, and the smallest change that
+  makes the agent play a different game.
+
+So there are two kinds of edit. Changing a pooled step changes that step
+everywhere every season cites it. Changing a season's indices changes the order
+without touching a step. Both are real edits; neither is the other.
 
 It came from a solver, and no round before this one could read it -- it shipped
 as a single line of base85 and was left untouched through eight promotions
