@@ -248,6 +248,11 @@ class Mutator(Protocol):
     # round silently loses the schema and the queries worth running -- it
     # still runs, it just never finds them -- so the mutator names its own.
     SKILLS_DIR: Path
+    # And what this driver calls the transcript it leaves behind, as a glob,
+    # because a retry writes a second one beside the first. Named here for the
+    # same reason `SKILLS_DIR` is: the loop copies it out and has no business
+    # knowing which program wrote it.
+    TRANSCRIPTS: str
 
     async def __call__(
         self, workspace: Path, message: str, program_id: str
@@ -288,6 +293,7 @@ class CodexMutator:
     # holding one file, not in a repository: codex refuses an untrusted
     # directory otherwise, and the directory is deliberately not one.
     SKILLS_DIR = Path(".codex") / "skills"
+    TRANSCRIPTS = "codex*.jsonl"
 
     COMMAND = [
         "codex",
@@ -502,6 +508,7 @@ class AgyMutator:
     """
 
     SKILLS_DIR = Path(".agents") / "skills"
+    TRANSCRIPTS = "agy*.jsonl"
 
     # Overridden by tests with something like ``["true"]``; the message and
     # the flags are only appended when the command actually is agy.
@@ -767,6 +774,7 @@ class OpenCodeMutator:
     """
 
     SKILLS_DIR = Path(".agents") / "skills"
+    TRANSCRIPTS = "opencode*.ndjson"
 
     # Overridden by tests; the flags are only appended when it really is
     # opencode.
@@ -1213,8 +1221,10 @@ class FakeMutator:
     """Edits ``child.py`` in place through ``edit``. For dry runs and tests."""
 
     # Nothing reads them, but the loop still lays them out, so a dry run
-    # exercises the same copy a real round does.
+    # exercises the same copy a real round does. It writes no transcript, and
+    # the glob simply matches nothing.
     SKILLS_DIR = Path(".agents") / "skills"
+    TRANSCRIPTS = "fake*.jsonl"
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the mutator.

@@ -25,6 +25,7 @@ the promotion rule is then the real one, deciding on the numbers it is given.
 
 import asyncio
 import inspect
+import json
 import os
 import random
 import signal
@@ -317,6 +318,7 @@ class Recorder:
     """
 
     SKILLS_DIR = Path(".agents") / "skills"
+    TRANSCRIPTS = "agy*.jsonl"
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the recorder.
@@ -351,6 +353,13 @@ class Recorder:
             )
         )
         child.write_text(self.edit(source), encoding="utf-8")
+        # Every driver leaves one of these, and the loop copies it out before
+        # the workspace goes. Written after the round has noted what it was
+        # handed, because a transcript is what the round leaves rather than
+        # something it was given.
+        (workspace / "agy.jsonl").write_text(
+            f'{{"round": "{program_id}"}}\n', encoding="utf-8"
+        )
         return mutate.Mutation(
             program_id=program_id,
             child=child,
@@ -2125,6 +2134,7 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
         """A call killed mid-flight, which is what the pacer does to a slow one."""
 
         SKILLS_DIR = Path(".agents") / "skills"
+        TRANSCRIPTS = "agy*.jsonl"
 
         async def __call__(
             self, workspace: Path, message: str, program_id: str
@@ -2222,6 +2232,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         """A call that only reports what it was handed."""
 
         SKILLS_DIR = Path(".agents") / "skills"
+        TRANSCRIPTS = "agy*.jsonl"
 
         async def __call__(
             self, workspace: Path, message: str, program_id: str
@@ -2319,3 +2330,33 @@ async def _one_harvest(campaign: loop.Campaign) -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.slow
+def test_a_rounds_transcript_outlives_the_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """What a round did is kept, because the score cannot say it.
+
+    A child whose plan is unchanged can mean the round never opened
+    `plan.json`, or that it edited it, measured the edit worse and backed it
+    out -- and the second is the round doing exactly what it was told. The
+    workspace is temporary and used to take the only record of which with it.
+
+    Kept under the run's own directory rather than a module constant, so a dry
+    run does not write its transcripts into the live campaign's -- which is the
+    mistake `config.Run` exists to prevent and which this first repeated.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path, paths)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+
+    kept = sorted(paths.rounds.glob("*/agy.jsonl"))
+    assert kept, "the round's transcript went with the workspace"
+    # Keyed by the program the round wrote, so it joins the archive.
+    for transcript in kept:
+        assert json.loads(transcript.read_text())["round"] == transcript.parent.name
+    assert paths.rounds.is_relative_to(paths.root), "a run owns its own transcripts"

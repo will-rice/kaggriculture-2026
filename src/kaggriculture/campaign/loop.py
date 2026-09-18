@@ -781,6 +781,15 @@ class Campaign:
             # is read every round; this is read on demand.
             shutil.copytree(config.SKILLS, box / self.mutator.SKILLS_DIR)
             mutation = await self.mutator(box, message, program_id)
+            # What the round did, before the workspace takes it. A child whose
+            # plan is unchanged can mean the round never opened `plan.json`, or
+            # that it edited it, measured the edit worse and backed it out --
+            # which is the round doing what it was told. The score cannot tell
+            # those apart and the transcript can.
+            kept_at = self.paths.rounds / program_id
+            for transcript in sorted(box.glob(self.mutator.TRANSCRIPTS)):
+                kept_at.mkdir(parents=True, exist_ok=True)
+                shutil.copy(transcript, kept_at / transcript.name)
             # And back together before anything downstream looks at it. The
             # gate, the archive, the pool, the validator and the submission all
             # expect one self-contained file, and none of them has to learn

@@ -571,6 +571,20 @@ class Run:
         return self.root / "programs"
 
     @property
+    def rounds(self) -> Path:
+        """Where a round's own transcript is kept, by program id.
+
+        The workspace a round works in is temporary and takes the transcript
+        with it, which leaves the child and its score as the only record. That
+        cannot tell a round which never opened `plan.json` from one which
+        edited it, measured the edit worse and backed it out -- and the second
+        is the round doing exactly what it was told. A transcript runs to
+        hundreds of kilobytes, so this grows; it is worth the disk while what a
+        round does with the plan is the open question.
+        """
+        return self.root / "rounds"
+
+    @property
     def seed_program(self) -> Path:
         """The cold start's own copy of the seed: the campaign's lineage."""
         return self.programs / f"{SEED_ID}.py"
