@@ -11,6 +11,7 @@ from kaggriculture.campaign import (
     dataset,
     evaluator,
     harness,
+    plan,
     prompt,
     validate,
 )
@@ -282,6 +283,13 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
     assert isinstance(prompt.INSTRUCTION, str)
     assert prompt.INSTRUCTION.strip()
     assert not isinstance(prompt.INSTRUCTION_NAME, (list, tuple, set, dict))
+    # It has to name the file the round is being asked to change, and that is
+    # not an editorial choice. 215 rounds were filed under the instruction name
+    # "plan" while the instruction itself said only to fix "this program", and
+    # every one of them read that as the controller: the plan came out of all
+    # 142 programs that carry one byte-identical. Named by the constant, so this
+    # tracks the file rather than the phrasing around it.
+    assert plan.PLAN_FILE in prompt.INSTRUCTION
     # And it reaches the round whole, since a truncated instruction is an
     # instruction to do something else.
     text = prompt.compose(

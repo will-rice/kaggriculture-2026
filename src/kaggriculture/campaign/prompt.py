@@ -87,9 +87,11 @@ GAMES = config.GAMES_URL
 # novel approach inspired by this one", took 54% of every call the campaign
 # made and returned 476 programs of which one scored above nought.
 INSTRUCTION = (
-    "Find where this program loses, and fix that. `measure.py` plays as many "
-    "seasons as you ask it to: run the experiment that would show your change "
-    "is not an improvement, and keep it only if it survives."
+    "Find where this program loses, and change `plan.json` to fix it -- the "
+    "plan is what the farm does, and the controller only steers it. "
+    "`measure.py` plays as many seasons as you ask it to: run the experiment "
+    "that would show your change is not an improvement, and keep it only if it "
+    "survives."
 )
 # The objective, and the method.
 #
@@ -118,12 +120,17 @@ INSTRUCTION = (
 # 29,820 chars of base64, which does not fit in a prompt beside a 3,220-line
 # program.
 #
-# It still does not fit, and `base64` and `zlib` are no longer importable
-# either, so a round cannot be handed a table to edit and cannot ship one. What
-# it can write is the thing that produces a plan: decide the season up front,
-# then execute. That is the only form of long-horizon commitment available to
-# it -- buy on day 3 for a day-22 payoff is not something a per-turn rule
-# reaches by improving the program it was handed.
+# That was true when it was written and is not now. `base64`, `zlib`, `json`
+# and `pathlib` are all on the whitelist -- the champion imports them to unpack
+# its own plan -- and a round is handed the plan as `plan.json`, 4,095 lines
+# with one step to a line, which `gather` packs back in. So the table can be
+# edited and can be shipped, and the instruction names it.
+#
+# Which is the whole of what changed on 2026-09-18. The method is untouched:
+# find where it loses, and run the experiment that would show the fix is not
+# one. What is added is where to look, because 215 rounds filed under the name
+# "plan" left the plan byte-identical -- one hash across 142 programs -- and
+# for 212 of them it was a line of base85 they could not read.
 #
 # What makes it worth the round: the tape lineage's own first champion replays
 # a fixed plan, 720 of 720 commands identical on a different season against the
