@@ -56,6 +56,8 @@ import os
 import pathlib
 import statistics
 
+import scipy.stats
+
 from kaggriculture.campaign import config, harness, pools
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -124,15 +126,32 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
     second is an improvement to the program rather than to its luck on one map.
     """
     played = _games(child, parent, SEEDS[:seeds], days=False)
+    # One number per season, because the two seats of a season correlate at
+    # 1.000: swapping them cancels seat advantage, it does not draw a second
+    # independent sample. Counting games made the error 1.42 times too small.
+    seasons = [
+        statistics.fmean(
+            game.ours - game.theirs for game in played if game.seed == seed
+        )
+        for seed in SEEDS[:seeds]
+    ]
     gaps = [game.ours - game.theirs for game in played]
     wins = sum(gap > 0 for gap in gaps)
     draws = sum(gap == 0 for gap in gaps)
-    mean = statistics.mean(gaps)
-    error = statistics.stdev(gaps) / len(gaps) ** 0.5 if len(gaps) > 1 else 0.0
+    mean = statistics.mean(seasons)
+    error = statistics.stdev(seasons) / len(seasons) ** 0.5 if len(seasons) > 1 else 0.0
+    # And the multiplier that makes the interval mean what it says. Two is
+    # right when the spread is known; it is estimated here from the same few
+    # seasons, so a small sample needs a wider one. Without this, 26% of
+    # four-season draws printed an interval that excluded the truth.
+    bar = float(scipy.stats.t.ppf(0.975, len(seasons) - 1)) if len(seasons) > 1 else 0.0
 
     print(f"child.py against parent.py, {len(gaps)} games over both seats")
     print(f"  won {wins}   drew {draws}   lost {len(gaps) - wins - draws}")
-    print(f"  mean relative bank {mean:+,.0f} +/- {error:,.0f}\n")
+    print(
+        f"  mean relative bank {mean:+,.0f} +/- {bar * error:,.0f} "
+        f"over {len(seasons)} seasons\n"
+    )
     print("  season   seat 0     seat 1     paired")
     for seed in SEEDS[:seeds]:
         sides = [game.ours - game.theirs for game in played if game.seed == seed]
@@ -142,17 +161,17 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
     # What the numbers mean, said in coins. A round read "inside the error" five
     # times and shipped anyway; the gate then spent a full cycle establishing
     # what these runs had already told it.
-    if mean > 2 * error and error:
+    if mean > bar * error and error:
         print(
             f"\nKEEP IT. The edit is worth {mean:+,.0f} a game and the noise in "
-            f"this measurement is +/-{error:,.0f}, so the gain is real: it is "
-            f"{mean / error:.1f} times the noise."
+            f"this measurement is +/-{bar * error:,.0f}, so the gain is real: it is "
+            f"{mean / (bar * error):.1f} times that."
         )
-    elif mean < -2 * error and error:
+    elif mean < -bar * error and error:
         print(
             f"\nREVERT IT. The edit costs {mean:+,.0f} a game against noise of "
-            f"+/-{error:,.0f}, so the loss is real: it is {abs(mean) / error:.1f} "
-            f"times the noise."
+            f"+/-{bar * error:,.0f}, so the loss is real: it is "
+            f"{abs(mean) / (bar * error):.1f} times that."
         )
     else:
         # How many seasons would make this difference readable. The error falls
@@ -161,15 +180,15 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
         need = (
             min(
                 len(SEEDS),
-                max(seeds * 4, int(seeds * (2 * error / abs(mean)) ** 2) + 1),
+                max(seeds * 4, int(seeds * (bar * error / abs(mean)) ** 2) + 1),
             )
             if mean
             else len(SEEDS)
         )
         print(
             f"\nTHIS SAYS NOTHING. The edit measured {mean:+,.0f} a game but the "
-            f"noise in {len(gaps)} games is +/-{error:,.0f}, which is larger, so "
-            f"you cannot tell whether it helped or hurt."
+            f"noise in {len(seasons)} seasons is +/-{bar * error:,.0f}, which "
+            f"is larger, so you cannot tell whether it helped or hurt."
             f"\n\nTwo ways forward, and picking neither means shipping a coin "
             f"flip:"
             f"\n  - play more seasons: `--seeds {need}` would roughly settle a "
