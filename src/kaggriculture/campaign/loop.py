@@ -192,7 +192,17 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="fake calls, no log, every write under run/campaign/dry-run",
     )
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    # Absolute from here on. An evaluation worker is given a directory of its
+    # own and `chdir`s into it, so a relative path stops resolving the moment a
+    # game starts -- which is minutes after the mistake was made, and reads as
+    # a crashed agent rather than a bad argument. `--run-root` is resolved for
+    # a slower version of the same fault: `gate.promote` writes the champion's
+    # path into the pool as text, so a relative root seeds relative paths into
+    # a file every later gate reads.
+    for flag in ("seed_agent", "run_root", "pool"):
+        setattr(parsed, flag, getattr(parsed, flag).resolve())
+    return parsed
 
 
 def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:

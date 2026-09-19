@@ -2393,3 +2393,41 @@ def test_a_rounds_transcript_outlives_the_round(
     for transcript in kept:
         assert json.loads(transcript.read_text())["round"] == transcript.parent.name
     assert paths.rounds.is_relative_to(paths.root), "a run owns its own transcripts"
+
+
+def test_every_path_argument_comes_back_absolute() -> None:
+    """The island's first launch died on a relative `--seed-agent`.
+
+    An evaluation worker is given a directory of its own and `chdir`s into it,
+    so a relative path resolves at parse time and not at the moment a game
+    actually opens the file. Every seat raised `FileNotFoundError` minutes
+    later, which reads as a crashed agent rather than as a bad argument.
+
+    `--pool` is read by those same workers. `--run-root` fails more slowly:
+    `gate.promote` writes the champion's path into the pool as text, so a
+    relative root would seed relative paths into a file every later gate reads.
+    """
+    parsed = loop._arguments(
+        [
+            "--seed-agent",
+            "run/island/empty_plan_seed.py",
+            "--run-root",
+            "run/island",
+            "--pool",
+            "run/island/pool.json",
+        ]
+    )
+
+    assert parsed.seed_agent.is_absolute(), parsed.seed_agent
+    assert parsed.run_root.is_absolute(), parsed.run_root
+    assert parsed.pool.is_absolute(), parsed.pool
+    assert parsed.seed_agent.name == "empty_plan_seed.py"
+
+
+def test_the_defaults_are_left_where_they_already_pointed() -> None:
+    """Resolving must not move a default that was already absolute."""
+    parsed = loop._arguments([])
+
+    assert parsed.run_root == config.RUN
+    assert parsed.pool == config.POOL
+    assert parsed.seed_agent == config.SEED
