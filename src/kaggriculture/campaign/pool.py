@@ -94,6 +94,44 @@ class Pool(BaseModel):
         """Every opponent currently in the pool."""
         return list(self.opponents)
 
+    def adopt(self, root: Path) -> list[str]:
+        """Take every vendored agent under ``root`` the pool does not hold.
+
+        Agents reach ``root`` from two writers and only one of them ever
+        wrote the pool. `harvest` adds what it vendors. `tape_opponents`
+        writes the families it rebuilds from recorded episodes and stops
+        there, on a comment saying "the loop adopts what it finds here by
+        the `family_` prefix its names carry" -- and nothing adopted them.
+        Measured 2026-09-19: sixty-one playable agents sat unplayed in the
+        opponents directory, thirty-six of them families rebuilt from the
+        ladder we are scored against.
+
+        So membership is read from the directory rather than from whichever
+        script remembered to call `save`. A vendored agent is in the pool
+        because it is on disk, which is a thing a new writer cannot get
+        wrong the way it could forget a call.
+
+        Matched on the resolved path, never on the directory name. The
+        roster holds a dozen of these under short aliases -- `v56` is
+        `kaito_v56` -- so adopting by name would enrol a second entry
+        against the same file, and a candidate would play that agent twice
+        with both copies counting toward its rate.
+
+        Args:
+            root: The opponents directory.
+
+        Returns:
+            The names adopted, sorted, for the caller to log.
+        """
+        held = {Path(one).resolve() for one in self.opponents.values()}
+        found = sorted(
+            one.name
+            for one in root.iterdir()
+            if (one / "main.py").exists() and (one / "main.py").resolve() not in held
+        )
+        self.opponents.update({one: str(root / one / "main.py") for one in found})
+        return found
+
     def sample(
         self,
         standings: dict[str, float],

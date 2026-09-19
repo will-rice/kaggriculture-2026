@@ -273,3 +273,69 @@ def test_a_beaten_champion_stays_in_the_pool() -> None:
     assert subject.opponents["ours_3"] == "/champions/champion_3.py"
     assert subject.opponents["ours_4"] == "/champions/champion_4.py"
     assert len(subject.opponents) == len(opponents) + 3, "nothing is trimmed"
+
+
+def vendored(root: Path, *names: str) -> Path:
+    """An opponents directory holding ``names``, each with a ``main.py``."""
+    for name in names:
+        (root / name).mkdir(parents=True)
+        (root / name / "main.py").write_text("def agent(obs, cfg): ...", "utf-8")
+    return root
+
+
+def test_an_agent_on_disk_the_pool_never_held_is_adopted(tmp_path: Path) -> None:
+    """The gap `tape_opponents` left open for sixty-one agents.
+
+    Two scripts write the opponents directory and only `harvest` ever wrote
+    membership, so the families rebuilt from recorded ladder episodes were
+    never played by anything. Membership comes from the directory now, which
+    a new writer cannot forget the way it could forget a call.
+    """
+    root = vendored(tmp_path / "opponents", "family_ymg_aq", "kaito_v56")
+    held = pool.Pool(opponents={})
+
+    adopted = held.adopt(root)
+
+    assert adopted == ["family_ymg_aq", "kaito_v56"]
+    assert held.opponents["family_ymg_aq"] == str(root / "family_ymg_aq" / "main.py")
+
+
+def test_an_agent_the_roster_holds_under_an_alias_is_not_adopted_twice(
+    tmp_path: Path,
+) -> None:
+    """Matched on the path, because the roster renames a dozen of these.
+
+    `v56` is the roster's name for `kaito_v56`. Adopting by directory name
+    would enrol the same file a second time, and a candidate would play that
+    agent twice with both copies counting toward its rate.
+    """
+    root = vendored(tmp_path / "opponents", "kaito_v56")
+    held = pool.Pool(opponents={"v56": str(root / "kaito_v56" / "main.py")})
+
+    adopted = held.adopt(root)
+
+    assert adopted == []
+    assert held.names() == ["v56"]
+
+
+def test_a_directory_without_an_agent_in_it_is_not_an_opponent(
+    tmp_path: Path,
+) -> None:
+    """The opponents directory also holds a README and loose scripts."""
+    root = tmp_path / "opponents"
+    (root / "notes").mkdir(parents=True)
+    (root / "notes" / "README.md").write_text("not an agent", "utf-8")
+    vendored(root, "real_agent")
+    held = pool.Pool(opponents={})
+
+    assert held.adopt(root) == ["real_agent"]
+
+
+def test_adopting_twice_adds_nothing_the_second_time(tmp_path: Path) -> None:
+    """Every launch calls this, so it has to be idempotent."""
+    root = vendored(tmp_path / "opponents", "one", "two")
+    held = pool.Pool(opponents={})
+
+    assert held.adopt(root) == ["one", "two"]
+    assert held.adopt(root) == []
+    assert len(held.names()) == 2

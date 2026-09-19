@@ -607,3 +607,121 @@ def test_a_margin_gap_inside_its_own_noise_is_not_a_regression() -> None:
     )
 
     assert close, why
+
+
+# champion_29 against its pool, measured 2026-09-19: eighty-nine opponents it
+# sweeps and nineteen that take something off it. The shape matters, not the
+# names -- a champion at a flat 1.000 has no variance, so the field condition's
+# bar collapses to 0.002 and it catches a thrown matchup by itself. At the
+# measured spread the bar is 0.0097 and the slip hides under it, which is the
+# situation the per-opponent guard exists for.
+CONTESTED = (
+    0.156,
+    0.156,
+    0.406,
+    0.469,
+    0.656,
+    0.750,
+    0.812,
+    0.812,
+    0.844,
+    0.906,
+    0.906,
+    0.906,
+    0.938,
+    0.938,
+    0.938,
+    0.969,
+    0.969,
+    0.969,
+    0.969,
+)
+SWEPT = 88
+
+
+def saturated(
+    slip_to: float,
+    *,
+    champion_has: float = 1.0,
+    champion: str = "floor",
+) -> tuple[evaluator.Result, gate.Champion]:
+    """A candidate and champion on the field champion_29 was measured against.
+
+    ``slip_to`` is the candidate's rate against the one opponent it has lost
+    ground on; ``champion_has`` is the champion's rate against that same one.
+    Everywhere else the two are identical, so the mean moves by exactly the
+    slip over the shared count and nothing else.
+    """
+    theirs = {"slipped": champion_has}
+    for index, rate in enumerate(CONTESTED):
+        theirs[f"contested_{index}"] = rate
+    for index in range(SWEPT):
+        theirs[f"public_{index}"] = 1.0
+
+    rates = {champion: 22 / 32, **theirs, "slipped": slip_to}
+    result = evaluator.Result(
+        program_id="mine",
+        fitness=sum(rates.values()) / len(rates),
+        field=1.0,
+        rates=rates,
+        margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
+        decisive={champion: 32, **dict.fromkeys(theirs, 32)},
+        games=32,
+        seeds=[1, 2, 3, 4],
+        hardest="slipped",
+        states={},
+    )
+    standing = gate.Champion(
+        name=champion,
+        path=f"/champions/{champion}.py",
+        tarball="",
+        result=result.model_copy(update={"program_id": champion, "rates": theirs}),
+    )
+    return result, standing
+
+
+def test_one_matchup_collapsing_is_refused_though_the_mean_is_level() -> None:
+    """The hole a mean over a swept field cannot see.
+
+    Measured 2026-09-19 on champion_29: 89 of 108 opponents at 1.000, so a
+    candidate that throws one matchup away moves the mean by a fraction of its
+    bar and the field condition waves it through. The reason returned has to be
+    the per-opponent one, which is also the proof this got past the mean.
+    """
+    refused, why = gate.promotion(*saturated(0.656))
+
+    assert not refused
+    assert "slipped" in why and "1.000 to 0.656" in why
+    assert "a mean over the field cannot see" in why
+
+
+def test_a_certain_collapse_carries_no_sampling_error_to_clear() -> None:
+    """1.000 against 0.000 is not a question about noise.
+
+    Both sides are deterministic, so the standard error of the difference is
+    zero and a bar that multiplies it would let the worst regression there is
+    through on a technicality.
+    """
+    refused, why = gate.promotion(*saturated(0.0))
+
+    assert not refused
+    assert "1.000 to 0.000" in why
+
+
+def test_a_drop_inside_the_per_opponent_noise_still_promotes() -> None:
+    """The guard is a tripwire for a collapse, not a ban on losing a game.
+
+    Four games in thirty-two against one opponent out of a hundred and seven is
+    inside the Bonferroni-corrected bar, and refusing it would be refusing the
+    draw rather than the program.
+    """
+    promoted, why = gate.promotion(*saturated(0.875))
+
+    assert promoted, why
+
+
+def test_the_guard_does_not_fire_on_ground_the_candidate_gained() -> None:
+    """Beating the champion against an opponent is not a regression."""
+    promoted, why = gate.promotion(*saturated(1.0, champion_has=0.656))
+
+    assert promoted, why

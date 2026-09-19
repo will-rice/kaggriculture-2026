@@ -54,6 +54,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
+import scipy.stats
 from pydantic import BaseModel
 
 from kaggriculture.campaign import config, harness, rating, roster
@@ -211,15 +212,20 @@ def promotion(
     *,
     decisive_bar: int = config.DECISIVE_GAMES,
 ) -> tuple[bool, str]:
-    """Whether the candidate is better than the champion, on both counts.
+    """Whether the candidate is better than the champion, on every count.
 
-    Two conditions, and both are required:
+    Three conditions, and all of them are required:
 
     1. **No worse against the field**, on two measures -- the win rate over the
        opponents both were measured against, and the mean final bank margin over
        the same ones. Behind on either by more than twice the error of the
        difference is a refusal; anything from level upward passes.
-    2. **Beating the champion head-to-head**: the Wilson lower bound of its rate
+    2. **No matchup thrown away**: no single opponent the candidate has fallen
+       behind the champion against by more than the joint noise, corrected for
+       the number of opponents tested. `_slipped` carries why a mean cannot do
+       this job -- on a field the champion sweeps, one matchup discarded moves
+       the mean by a fraction of its own bar.
+    3. **Beating the champion head-to-head**: the Wilson lower bound of its rate
        against the champion above 0.5, over at least ``decisive_bar`` decided
        games.
 
@@ -305,6 +311,20 @@ def promotion(
             f"behind by more than twice its error of {coins:,.0f}"
         )
 
+    slipped = _slipped(result, champion, common)
+    if slipped:
+        one, mine_one, theirs_one = slipped[0]
+        return False, (
+            f"{mine:.3f} against the field, level with {name} on the mean, but "
+            f"{one} took it from {theirs_one:.3f} to {mine_one:.3f}"
+            + (
+                f" and {len(slipped) - 1} more opponent(s) with it"
+                if len(slipped) > 1
+                else ""
+            )
+            + ": a mean over the field cannot see one matchup thrown away"
+        )
+
     decided = result.decisive.get(name, 0)
     rate = result.rates[name]
     if decided < decisive_bar:
@@ -324,6 +344,75 @@ def promotion(
         f"{rate:.3f} against {name} over {decided} decided has lower bound "
         f"{low:.3f}: not shown to beat it"
     )
+
+
+def _slipped(
+    result: Result, champion: "Champion", common: list[str]
+) -> list[tuple[str, float, float]]:
+    """Opponents the candidate lost ground against, beyond the joint noise.
+
+    The field condition is a mean over every shared opponent, and a mean is
+    the wrong instrument for the question it is asked. Measured 2026-09-19 on
+    champion_29: 89 of its 108 opponents sit at 1.000 and only five take more
+    than a game off it. Throwing the worst of those away outright -- 0.156 to
+    0.000 -- moves the mean by 0.0014 against a bar of 0.0096, so the gate
+    cannot see a candidate discarding one of the few matchups it still has to
+    lose. Repairing that same opponent is 0.33 of the bar, so it cannot see
+    the repair either. Per opponent, that change is 3.1 standard errors: the
+    evidence is there and averaging over a field of ceilings is what destroys
+    it.
+
+    So the regression guard is asked per opponent, where the evidence is, and
+    the mean keeps only the job it can still do.
+
+    The bar carries a Bonferroni correction. At 1.96 apiece over a hundred and
+    seventy opponents a candidate would be refused four times over by chance,
+    so a per-opponent test at the mean's confidence is a gate that never
+    opens. The family is the opponents where a slip is possible at all -- the
+    champion has to have something to lose -- which is a count the candidate
+    does not influence, so the correction is not chosen after seeing it. It
+    cannot be narrowed to the contested few: an opponent sitting at 1.000 is
+    exactly where a collapse has the most room to happen, so excluding it
+    would blind the guard to the case it exists for.
+
+    What that buys, at a family of about 170 and 32 games an opponent: one
+    opponent falling from 1.000 by 0.30 or more is refused, and a fall of
+    0.25 is not. Smaller slips are left to the mean, which sees them once
+    there are enough of them to matter -- five opponents each losing 0.25
+    moves it 0.0074 against a bar of 0.0043. A single matchup quietly
+    discarded is the hole this closes; a broad sag was never the hole.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it must not fall behind.
+        common: Opponents both were measured against, the champion excluded.
+
+    Returns:
+        ``(name, candidate rate, champion rate)`` per slip, worst first.
+    """
+    family = [one for one in common if champion.result.rates[one] > 0]
+    if not family:
+        return []
+    # One-sided: a candidate pulling ahead of the champion on some opponent is
+    # not a regression, and spending half the alpha on that tail would only
+    # make the guard harder to trip.
+    bar = float(scipy.stats.norm.ppf(1 - 0.05 / len(family)))
+    mine_games = max(1, result.games)
+    theirs_games = max(1, champion.result.games)
+    slipped = []
+    for one in family:
+        mine = result.rates[one]
+        theirs = champion.result.rates[one]
+        if mine >= theirs:
+            continue
+        error = math.sqrt(
+            mine * (1 - mine) / mine_games + theirs * (1 - theirs) / theirs_games
+        )
+        # Both sides deterministic and different is a certain slip, not a
+        # sampling question: 1.000 against 0.000 has no error to clear.
+        if error == 0.0 or theirs - mine > bar * error:
+            slipped.append((one, mine, theirs))
+    return sorted(slipped, key=lambda row: row[1] - row[2])
 
 
 def _margin_gap(

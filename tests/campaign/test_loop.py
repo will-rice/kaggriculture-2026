@@ -171,6 +171,15 @@ def tiny_run(
     return config.Run(root=root, pool=root / "pool.json")
 
 
+UNVENDORED = Path("/nonexistent-opponents-directory")
+"""What these tests pass as the opponents directory.
+
+They build the pool they mean, agent by agent, so there is nothing on disk for
+them to adopt. Pointing this at a path that does not exist says that, and keeps
+the machine's data box out of a unit test.
+"""
+
+
 def pass_pool(tmp_path: Path, paths: config.Run) -> pool.Pool:
     """A saved one-opponent pool whose opponent is a PASS agent."""
     opponents = pool.Pool(opponents={"pass": str(_write(tmp_path / "pass.py", PASS))})
@@ -428,6 +437,7 @@ def test_a_better_child_is_promoted(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 2
@@ -474,6 +484,7 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # `config.ROOT` is the real checkout until here, because packaging a
@@ -515,6 +526,7 @@ def test_the_seed_is_champion_zero(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # Measured at the cold start, then enthroned: in the pool, on the floor,
@@ -583,6 +595,7 @@ def test_eight_workers_run_at_once(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == config.SESSIONS
@@ -614,12 +627,12 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     assert [handed.child for handed in mutator.seen] == [PASS]
     assert (paths.champions / "champion_2.py").read_text() == SELLER
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     assert mutator.seen[1].child == SELLER
     assert f"`{config.POOL_CHAMPION}m" in mutator.seen[1].message
@@ -650,7 +663,9 @@ def test_a_program_is_gated_once(
     seed = _write(tmp_path / "seed.py", PASS)
     for session in range(4):
         mutator = mutate.FakeMutator(edit=lambda s, n=session: f"{s}\n# child {n}\n")
-        loop.run(1, mutator, WORKERS, seed, random.Random(session), log, paths)
+        loop.run(
+            1, mutator, WORKERS, seed, random.Random(session), log, paths, UNVENDORED
+        )
 
     written = [name for name in scored if name not in {champion.name, config.SEED_ID}]
     assert len(written) > 2
@@ -692,6 +707,7 @@ def test_the_pool_is_changed_on_the_loop_thread(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.champion is not None
@@ -724,6 +740,7 @@ def test_a_promotion_logs_the_tarball_a_cut_uploads(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # One artifact: champion zero is not packaged, so only the promotion that
@@ -769,6 +786,7 @@ def test_a_provider_failure_is_not_the_lineages_failure(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 1
@@ -814,6 +832,7 @@ def test_a_broken_pool_opponent_stops_the_run(
             rng=random.Random(0),
             log=log,
             paths=paths,
+            opponents=UNVENDORED,
         )
 
     assert '"event": "failure"' not in paths.archive.read_text()
@@ -853,6 +872,7 @@ def test_cancellation_kills_the_session_process_group(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 0
@@ -883,8 +903,8 @@ def test_stagnation_switches_the_starting_program(
     marked = f"{SELLER}\n# a child of the champion\n"
     mutator = Recorder(edit=lambda _: marked)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second = mutator.seen
     assert first.child == SELLER and "no promotion" not in first.message
@@ -1011,6 +1031,7 @@ def test_a_restart_resumes_state_json_and_champion_json(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 7 and state.sessions_since_promotion == 3
@@ -1044,7 +1065,7 @@ def test_a_round_is_told_a_name_and_never_a_path(
     mutator = Recorder(edit=lambda _: SELLER)
     seed = _write(tmp_path / "seed.py", PASS)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     handed = mutator.seen[0]
     # The episode key is `<name>m<matchup>s<season>`, so the name is a prefix
@@ -1085,7 +1106,9 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     mutator = Recorder(edit=lambda source: source + "\n# edited\n")
     seed = _write(tmp_path / "seed.py", PASS)
 
-    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    state = loop.run(
+        1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED
+    )
 
     # Champion zero, so a session is handed a champion's name rather than an id.
     assert state.champion is not None
@@ -1228,7 +1251,7 @@ def test_a_session_is_rounds_and_each_continues_from_the_last(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda source: source + "# a round\n")
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     handed = [given.child for given in mutator.seen]
     assert handed == [PASS, PASS + "# a round\n", PASS + "# a round\n" * 2]
@@ -1264,7 +1287,7 @@ def test_a_round_that_lost_ground_is_not_what_the_next_one_builds_on(
     written = iter([better, PASS, better + "# and further\n"])
     mutator = Recorder(edit=lambda _: next(written))
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second, third = mutator.seen
     assert first.child == PASS
@@ -1296,7 +1319,7 @@ def test_the_database_records_which_model_wrote_each_program(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda source: source + "# a round\n")
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     database = archive.Database(paths.archive, paths.programs)
     assert database.get(config.SEED_ID).model == ""
@@ -1323,7 +1346,9 @@ def test_a_round_that_clears_the_bar_ends_the_session(
     # opponent, which is what beating them all means.
     mutator = Recorder(edit=lambda _: SELLER)
 
-    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    state = loop.run(
+        1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED
+    )
 
     # Ended before the round cap, and ended because the floor moved.
     assert 0 < len(mutator.seen) < 3
@@ -1355,6 +1380,7 @@ def test_a_round_that_writes_nothing_feeds_the_next_one(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
@@ -1381,7 +1407,7 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     written = iter(["def agent(observation, configuration=None)\n", SELLER])
     mutator = Recorder(edit=lambda _: next(written))
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second = mutator.seen
     assert "produced nothing" not in first.message
@@ -1411,7 +1437,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     handed = mutator.seen[0]
     assert handed.held == sorted(
@@ -1444,7 +1470,7 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     message = mutator.seen[0].message
     # One game, named by the program that played it -- champion zero, which is
@@ -1490,6 +1516,7 @@ def test_calls_that_never_reach_a_verdict_stop_the_campaign(
             rng=random.Random(0),
             log=log,
             paths=paths,
+            opponents=UNVENDORED,
         )
 
     # The seed and nothing else: three sessions ran and the database is as
@@ -1539,6 +1566,7 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 4
@@ -1605,6 +1633,7 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # The verdict is what matters, not which way it went: an opponent this
@@ -1695,8 +1724,10 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda source: source + "\n# edited\n")
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
-    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
+    state = loop.run(
+        1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED
+    )
 
     # There is always a champion now, so the note has something true to say from
     # the first session: the line it names is champion zero's. It used to be
@@ -1734,6 +1765,7 @@ def test_a_round_logs_the_win_rate_and_the_place_it_bought(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     call = calls_of(records)[-1]
@@ -1768,6 +1800,7 @@ def test_a_program_carries_the_rating_it_was_given(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     database = archive.Database(paths.archive, paths.programs)
@@ -2352,7 +2385,7 @@ def test_a_rounds_transcript_outlives_the_round(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     kept = sorted(paths.rounds.glob("*/agy.jsonl"))
     assert kept, "the round's transcript went with the workspace"

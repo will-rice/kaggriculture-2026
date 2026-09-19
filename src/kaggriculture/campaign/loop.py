@@ -289,11 +289,17 @@ def run(
     rng: random.Random,
     log: wandb.Run,
     paths: config.Run,
+    opponents: Path = config.OPPONENTS,
 ) -> State:
     """Load what a restart resumes, seed an empty database, drive the workers.
 
     ``sessions`` is how many this run starts; what is in flight when the last
     is taken is drained. Returns the state as of the last completed session.
+
+    ``opponents`` is the directory pool membership is read from, an argument
+    rather than a global so that what a run measures against is something the
+    caller states. A test that builds a two-opponent pool and then silently
+    plays the machine's whole data directory is not testing what it says.
     """
     resume = state_file(paths)
     state = (
@@ -309,6 +315,14 @@ def run(
         state.champion = champion
         LOGGER.info("resuming on champion %s from champion.json", champion.name)
     pool = Pool.load(paths.pool) if paths.pool.exists() else Pool.initial()
+    # Whatever has been vendored since the last launch joins here rather than
+    # waiting for the script that wrote it to remember the pool. Two writers
+    # fill the opponents directory and only `harvest` ever wrote membership,
+    # so sixty-one playable agents -- thirty-six of them families rebuilt from
+    # recorded ladder episodes -- had never been played by anything.
+    adopted = pool.adopt(opponents) if opponents.exists() else []
+    if adopted:
+        LOGGER.info("adopted %d opponents from %s", len(adopted), opponents)
     # A champion's name resolves through the pool file, so the pool on disk
     # must be current before anything plays a game.
     pool.save(paths.pool)
