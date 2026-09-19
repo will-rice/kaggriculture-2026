@@ -68,22 +68,31 @@ worth keeping has to be worth hundreds, and most edits are worth nothing:
   `SELL MELON` reaches 61 pooled steps deciding 543 step-slots; `HIRE` reaches
   400 steps and 2,169 slots.
 
-Edit by rule, not by point. Work out what is wrong from the game's rules --
-which goods collapse on a glut, when a hire pays for itself -- then change every
-step that does it. `plan.json` is ordinary JSON: read it, transform it with a
-few lines of Python, write it back.
+So the useful unit is a rule and not a step: work out from the game's rules what
+this program is getting wrong -- which goods collapse on a glut, what an hour of
+a unit's time is worth, when another hire pays for itself -- and change every
+step that does it. `plan.json` is ordinary JSON; read it, transform it with a few
+lines of Python, write it back.
 
-And measure enough seasons. `./measure.py` defaults to 64 of them, 128 games,
-in about fifteen seconds, and it tells you in coins whether what you measured is
-bigger than the noise in the measurement. Take the default. A round before you
-ran `--seeds 4` four separate times, was told four times that the result said
-nothing, and shipped anyway; the gate then spent twenty minutes establishing
-what those four runs had already said for free.
+Nothing limits you to one rule. Eight of them have measured positive
+independently, and whether they add up is not known, because they have only ever
+been tried one at a time. The market is shared and finite, so they may well
+fight: selling more of two goods at once moves both prices against you. Stack
+them and find out -- but measure after each one you add rather than at the end,
+because a bundle that nets positive can carry a losing rule inside it, and the
+gate promotes whole programs. An edit that rides in on a better one is inherited
+by every program after it.
+
+`./measure.py` plays your child against the program you started from and tells
+you, in coins, both what your change is worth and how much noise is in the
+figure. Read the second number. If it is larger than the first, the run has told
+you nothing at all, and the two ways out are more seasons or a bigger change --
+128 games take fifteen seconds, so there is no reason to be economical about it.
 
 Small samples do not merely say less, they mislead. The same edit measured +454
-with a spread of 13 over four seasons, +314 over sixteen, and +255 over
-sixty-four: the small sample was both wrong about the size and falsely confident
-about it, because four seasons that happen to agree look like certainty.
+over four seasons, +314 over sixteen, and +255 over sixty-four: the small sample
+was wrong about the size and confident about being wrong, because a handful of
+seasons that happen to agree is indistinguishable from certainty.
 
 It came from a solver, and no round before this one could read it -- it shipped
 as a single line of base85 and was left untouched through eight promotions
