@@ -58,7 +58,7 @@ import statistics
 
 import scipy.stats
 
-from kaggriculture.campaign import config, harness, pools
+from kaggriculture.campaign import config, games, harness, pools
 
 HERE = pathlib.Path(__file__).resolve().parent
 # Fixed, so two runs of this compare the same seasons and a difference between
@@ -83,6 +83,9 @@ def main() -> None:
     child, parent = args.child.resolve(), args.parent.resolve()
     if args.replay is not None:
         replay(child, parent, args.replay)
+        return
+    if args.against is not None:
+        against(child, parent, args.against, args.seeds)
         return
     compare(child, parent, args.seeds)
 
@@ -111,6 +114,17 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SEED",
         help=f"write one season day by day, from {SEEDS[0]} to {SEEDS[-1]}",
+    )
+    argue.add_argument(
+        "--against",
+        default=None,
+        metavar="EPISODE",
+        help=(
+            "measure both programs against the matchup of this episode instead "
+            "of against each other, which is how to tell whether an edit helped "
+            "the matchup this round was given. Takes the episode key from the "
+            "message, e.g. `--against p1a2b3c4m1s1`"
+        ),
     )
     argue.add_argument("--child", type=pathlib.Path, default=HERE / "child.py")
     argue.add_argument("--parent", type=pathlib.Path, default=HERE / "parent.py")
@@ -158,6 +172,26 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
         pair = statistics.mean(sides)
         print(f"  {seed:<8} {sides[0]:>+10,.0f} {sides[1]:>+10,.0f} {pair:>+10,.0f}")
 
+    _verdict(mean, error, bar, seasons, seeds)
+    worst = min(SEEDS[:seeds], key=lambda s: _paired(played, s))
+    print(f"\nthe season this edit does worst on is {worst}: `--replay {worst}`")
+
+
+def _verdict(mean: float, error: float, bar: float, seasons: list, seeds: int) -> None:
+    """Say in coins whether a measured difference is real.
+
+    Shared by both measurements. They ask different questions -- does this beat
+    its parent, does this help the matchup it was given -- but the reading is
+    the same arithmetic against the same noise, and a round that learned to
+    read one should not have to learn a second wording for the other.
+
+    Args:
+        mean: The paired difference, in coins a game.
+        error: Its standard error over seasons.
+        bar: The t multiplier for the season count.
+        seasons: The per-season differences, for reporting the count.
+        seeds: Seasons played, so a wider block can be suggested.
+    """
     # What the numbers mean, said in coins. A round read "inside the error" five
     # times and shipped anyway; the gate then spent a full cycle establishing
     # what these runs had already told it.
@@ -198,8 +232,123 @@ def compare(child: pathlib.Path, parent: pathlib.Path, seeds: int) -> None:
             f"lineage were worth +108 and +346 a game; an edit worth tens will "
             f"not be visible here and will not matter on the ladder either."
         )
-    worst = min(SEEDS[:seeds], key=lambda s: _paired(played, s))
-    print(f"\nthe season this edit does worst on is {worst}: `--replay {worst}`")
+
+
+def against(
+    child: pathlib.Path, parent: pathlib.Path, episode: str, seeds: int
+) -> None:
+    """Did the edit help against the matchup the round was aimed at?
+
+    `compare` answers a different question -- whether the edit beats its own
+    parent -- and that is the question a round was being graded on while being
+    told to work on a matchup. An edit that takes games off matchup 1 has no
+    reason to beat a sibling, so the instrument said neutral and the round
+    dropped it. Twenty-nine champions never closed a three-percent gap that way.
+
+    Both programs play the same opponent on the same seeds in both seats, and
+    what is reported is the difference between them per season. Paired that
+    way, the map and the seat cancel and what is left is the edit.
+
+    Addressed by episode key rather than by opponent name, and reported as
+    "the matchup" throughout, because the name is the one thing that must not
+    reach a round. Given a pool it could identify, the previous lineage evolved
+    opponent fingerprinting -- recognising specific agents by their sheep and
+    cow counts -- which solves "beat this pool" and is worth nothing against an
+    agent it has never seen.
+
+    Args:
+        child: The edited program.
+        parent: What it was edited from.
+        episode: The episode key from the message, `<id>m<matchup>s<season>`.
+        seeds: How many seasons, from the fixed block.
+
+    Raises:
+        SystemExit: No such episode is on the record, which is a mistyped key
+            rather than a measurement worth ten minutes.
+    """
+    opponent = _matchup(episode)
+    block = list(SEEDS[:seeds])
+    mine = _versus(child, opponent, block)
+    theirs = _versus(parent, opponent, block)
+
+    # Keyed by season and seat, so the subtraction is between the same game
+    # played by two programs rather than between two draws.
+    seasons = []
+    for seed in block:
+        pairs = [
+            mine[(seed, seat)] - theirs[(seed, seat)]
+            for seat in (0, 1)
+            if (seed, seat) in mine and (seed, seat) in theirs
+        ]
+        if pairs:
+            seasons.append(statistics.fmean(pairs))
+
+    won = sum(one > 0 for one in mine.values())
+    was = sum(one > 0 for one in theirs.values())
+    ours = statistics.fmean(mine.values())
+    base = statistics.fmean(theirs.values())
+    print(f"child.py and parent.py against the matchup of {episode}")
+    print(f"  child  won {won} of {len(mine)}, mean {ours:+,.0f}")
+    print(f"  parent won {was} of {len(theirs)}, mean {base:+,.0f}")
+
+    mean = statistics.fmean(seasons)
+    error = statistics.stdev(seasons) / len(seasons) ** 0.5 if len(seasons) > 1 else 0.0
+    bar = float(scipy.stats.t.ppf(0.975, len(seasons) - 1)) if len(seasons) > 1 else 0.0
+    print(
+        f"\n  the edit is worth {mean:+,.0f} a game against this opponent, "
+        f"+/-{bar * error:,.0f} over {len(seasons)} seasons\n"
+    )
+    print("  season      child     parent     paired")
+    for seed, paired in zip(block, seasons, strict=False):
+        child_season = statistics.fmean(mine[(seed, seat)] for seat in (0, 1))
+        parent_season = statistics.fmean(theirs[(seed, seat)] for seat in (0, 1))
+        print(
+            f"  {seed:<8} {child_season:>+10,.0f} "
+            f"{parent_season:>+10,.0f} {paired:>+10,.0f}"
+        )
+
+    _verdict(mean, error, bar, seasons, seeds)
+
+
+def _versus(
+    agent: pathlib.Path, opponent: str, seeds: list
+) -> dict[tuple[int, int], float]:
+    """One program's bank margin against one opponent, by season and seat."""
+    games = harness.play(agent, [opponent], seeds, _spare_cores(), pool=config.POOL)
+    return {(game.seed, game.seat): game.ours - game.theirs for game in games}
+
+
+def _matchup(episode: str) -> str:
+    """Which opponent an episode was played against.
+
+    Read from the games database rather than passed in, so the name never has to
+    appear in a message or in this script's output. Every game the campaign
+    plays is recorded with both sides by roster name, and the episode key is
+    `<id>m<matchup>s<season>`, so the id is the part before the first `m` and
+    the opponent is whichever side is not it.
+
+    Args:
+        episode: The episode key from the message.
+
+    Returns:
+        The opponent's pool name, for `harness.play` to resolve.
+
+    Raises:
+        SystemExit: No such episode, which is a mistyped key.
+    """
+    quoted = episode.replace("'", "")
+    rows = games.query(
+        "select team_0, team_1 from games.episodes "
+        f"where episode = '{quoted}' limit 1 format TabSeparated"
+    ).strip()
+    if not rows:
+        raise SystemExit(
+            f"no episode {episode!r} on the record. Use the key from `The game` "
+            "section of the message, which looks like `p1a2b3c4m1s1`."
+        )
+    first, second = rows.split("\t")[:2]
+    mine = episode.split("m")[0]
+    return second if first == mine else first
 
 
 def replay(child: pathlib.Path, parent: pathlib.Path, seed: int) -> None:

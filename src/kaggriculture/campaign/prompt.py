@@ -284,6 +284,12 @@ def _game_lines(name: str, played: tuple[int, int, harness.Game] | None) -> list
         f"Episode `{episode}`. It held seat {game.seat} and finished "
         f"{game.ours:,.0f} against {game.theirs:,.0f}, {finish:+,.0f}.",
         "",
+        f"That is the matchup this round is on, and beating it is the job. "
+        f"`./measure.py --against {episode}` plays your child and the program "
+        f"you started from against it on the same seasons and reports the "
+        f"difference. Plain `./measure.py` plays them against each other, which "
+        f"says nothing about this matchup.",
+        "",
         "Every day of it, both sides, is in the games database, along with "
         "every game the competition has recorded:",
         "",

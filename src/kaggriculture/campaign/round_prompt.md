@@ -83,11 +83,25 @@ because a bundle that nets positive can carry a losing rule inside it, and the
 gate promotes whole programs. An edit that rides in on a better one is inherited
 by every program after it.
 
-`./measure.py` plays your child against the program you started from and tells
-you, in coins, both what your change is worth and how much noise is in the
-figure. Read the second number. If it is larger than the first, the run has told
-you nothing at all, and the two ways out are more seasons or a bigger change --
-128 games take fifteen seconds, so there is no reason to be economical about it.
+`./measure.py --against <episode>` plays your child and the program you started
+from against the matchup of that episode, on the same seasons and both seats, and
+reports the difference between them. `The game` section gives the episode key:
+that matchup is the one taking the most games off us, and beating it is the job.
+This is the measurement that answers that.
+
+Plain `./measure.py`, with no `--against`, plays your child against the program
+you started from instead. That is a different question and for a while it was
+the only one available, which is how this lineage spent twenty-nine promotions
+without closing a three-percent gap: rounds were aimed at a matchup and graded
+against a sibling, so every edit that helped the matchup measured neutral and
+was thrown away. Use it to check you have not broken the program in general, not
+to decide whether you have done the thing you were asked.
+
+Either way you get, in coins, both what your change is worth and how much noise
+is in the figure. Read the second number. If it is larger than the first, the run
+has told you nothing at all, and the two ways out are more seasons or a bigger
+change -- 128 games take fifteen seconds, so there is no reason to be economical
+about it.
 
 Small samples do not merely say less, they mislead. The same edit measured +454
 over four seasons, +314 over sixteen, and +255 over sixty-four: the small sample
