@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> None:
     # place: a path captured in a default argument never moved.
     root = args.run_root / "dry-run" if args.dry_run else args.run_root
     paths = config.Run(
-        root=root, pool=root / "pool.json" if args.dry_run else config.POOL
+        root=root, pool=root / "pool.json" if args.dry_run else args.pool
     )
     if args.dry_run:
         LOGGER.info("dry run: every write goes under %s", paths.root)
@@ -139,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
         # share no vocabulary at all.
         validate_models()
     # 1. wandb, named for the revision of the code that produced the run.
-    log = _open_run(dry_run=args.dry_run)
+    log = _open_run(dry_run=args.dry_run, tag=args.tag)
     mutator: Mutator = (
         FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
         if args.dry_run
@@ -178,6 +178,15 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     # module to move one -- which is what used to happen, and what silently
     # failed against a path captured in a default argument.
     parser.add_argument("--run-root", type=Path, default=config.RUN)
+    # The pool this campaign measures against. A flag because two lineages
+    # can now run at once and a pool is read-modify-written on every
+    # promotion: sharing one would have them racing, and both writing the
+    # single `POOL_CHAMPION` key and their own `ours_N` series into it.
+    parser.add_argument("--pool", type=Path, default=config.POOL)
+    # Distinguishes this run's wandb id from another on the same revision.
+    # The id is the commit sha, which is the right name for one lineage and
+    # the same name for two.
+    parser.add_argument("--tag", default="")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -186,7 +195,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _open_run(dry_run: bool) -> wandb.Run:
+def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
     """Open the run this campaign logs to, named for the revision that made it.
 
     Two axes, because a session is many rounds now: everything a round
@@ -212,7 +221,8 @@ def _open_run(dry_run: bool) -> wandb.Run:
     if dirty:
         raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
     started_on = asked_model()
-    name = Repo(config.ROOT).head.commit.hexsha[:7]
+    # The revision, and what distinguishes one lineage on it from another.
+    name = Repo(config.ROOT).head.commit.hexsha[:7] + (f"-{tag}" if tag else "")
     log = wandb.init(
         entity=config.WANDB_ENTITY,
         project=config.WANDB_PROJECT,
