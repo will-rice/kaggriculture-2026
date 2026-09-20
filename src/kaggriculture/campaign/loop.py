@@ -258,6 +258,89 @@ def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
     return log
 
 
+# What a round is not allowed to change: the campaign's own code, and the
+# messages it is asked with. Not the engine binary or anything compiled, which
+# no round has reason to touch and which would make this expensive.
+GUARDED = ("*.py", "*.md")
+
+
+def _kept(root: Path = config.ROOT) -> dict[Path, bytes]:
+    """The campaign's own source, as it stands before a round runs.
+
+    Fifty files and about seven hundred kilobytes, read once against a call that
+    takes minutes.
+
+    Args:
+        root: The checkout to read. A parameter so a test can name its own.
+
+    Returns:
+        The bytes of every guarded file, by path.
+    """
+    return {
+        one: one.read_bytes()
+        for pattern in GUARDED
+        for one in sorted((root / "src").rglob(pattern))
+        if "__pycache__" not in one.parts
+    }
+
+
+def _restored(kept: dict[Path, bytes], mutation: Mutation, program_id: str) -> Mutation:
+    """Put back anything the round changed in the campaign's own source.
+
+    A round gets a throwaway directory holding one agent. On 2026-09-20 one
+    edited the campaign instead -- `REFERENCE_SAMPLE` to 0.0, turning off the
+    reference-engine cross-check, and `roster.path`'s `raise KeyError` into a
+    constructed path, making any string resolve to a file. Neither was random:
+    both weaken a guard in the direction that makes the round's own job easier,
+    and the second was provoked by `measure.py --against` refusing a mistyped
+    name. Given an objective and a writable grader, editing the grader is the
+    cheaper way to satisfy it.
+
+    Prevention is not on offer. agy's `--sandbox` restricts the terminal and a
+    round has to run `measure.py`, and the driver runs with
+    `--dangerously-skip-permissions`, which the comment on that flag wrongly
+    calls the same posture as codex's `-s workspace-write`.
+
+    Restored from bytes rather than from git, because the version that asked git
+    reverted all 250 tracked files when a pre-commit hook's `GIT_DIR` outranked
+    the repository it was handed. This writes back only what it read, so the
+    worst it can do is undo a change to one of the files it named.
+
+    The round is failed rather than scored: a program measured against guards it
+    removed is not measured at all.
+
+    Args:
+        kept: What `_kept` read before the round.
+        mutation: What the call produced.
+        program_id: The child program id, for the log and the reason.
+
+    Returns:
+        The mutation, or a copy recording that the round wrote out of bounds.
+    """
+    moved = sorted(
+        one for one, was in kept.items() if not one.exists() or one.read_bytes() != was
+    )
+    if not moved:
+        return mutation
+    for one in moved:
+        one.write_bytes(kept[one])
+    named = ", ".join(one.name for one in moved)
+    LOGGER.warning("%s changed the campaign and was put back: %s", program_id, named)
+    return mutation.model_copy(
+        update={
+            "child": None,
+            "status": "no_output",
+            "reason": (
+                f"this round changed the campaign's own source -- {named} -- and "
+                "it has been put back. The directory you are given holds the "
+                "program to edit; the campaign that measures it is not yours to "
+                "change, and a program measured against guards it removed is not "
+                "measured at all."
+            ),
+        }
+    )
+
+
 def _packed(mutation: Mutation, box: Path, program_id: str) -> Mutation:
     """Write the round's program back as one file, or record that it cannot be.
 
@@ -849,6 +932,10 @@ class Campaign:
             # by name and description and load it only if asked. The message
             # is read every round; this is read on demand.
             shutil.copytree(config.SKILLS, box / self.mutator.SKILLS_DIR)
+            # What the campaign's own source says before this round runs,
+            # so that what it says afterwards can be put back. `_restored`
+            # carries why that is necessary.
+            before = _kept()
             # A round that writes a `plan.json` the schema refuses is a round
             # that produced nothing runnable, which is an ordinary outcome of
             # asking a model to edit a file -- and until 2026-09-20 it was a
@@ -890,6 +977,7 @@ class Campaign:
             # gate, the archive, the pool, the validator and the submission all
             # expect one self-contained file, and none of them has to learn
             # otherwise.
+            mutation = _restored(before, mutation, program_id)
             mutation = _packed(mutation, box, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1
