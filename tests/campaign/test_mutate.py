@@ -1160,23 +1160,6 @@ def test_a_round_that_ran_and_wrote_nothing_is_not_passed_along() -> None:
     assert got.status == "no_output"
 
 
-def test_every_program_out_returns_the_last_refusal() -> None:
-    """The round fails, and the reason says why rather than going blank."""
-    asked: list[str] = []
-    rotation = mutate.Rotating(
-        [
-            Stub("agy", spent("Individual quota reached"), asked),
-            Stub("codex", spent("You've hit your usage limit"), asked),
-        ]
-    )
-
-    got = asyncio.run(rotation(Path("/tmp"), "message", "p1"))
-
-    assert asked == ["agy", "codex"]
-    assert got.status == "exec_error"
-    assert "usage limit" in got.reason
-
-
 def test_the_workspace_suits_whichever_program_serves_the_call() -> None:
     """Which one answers is not known until it is asked.
 
@@ -1269,3 +1252,84 @@ def test_the_two_agy_entries_are_not_the_same_object(
 
     assert agy[0] is not agy[1]
     assert agy[0].source is not agy[1].source
+
+
+class Reviving:
+    """A driver that refuses for a while and then answers."""
+
+    def __init__(self, refusals: int, asked: list) -> None:
+        self.SKILLS_DIRS: tuple[Path, ...] = (Path(".x") / "skills",)
+        self.TRANSCRIPTS: tuple[str, ...] = ("x*.jsonl",)
+        self.refusals = refusals
+        self.asked = asked
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> mutate.Mutation:
+        """Refuses the first `refusals` asks, then answers."""
+        self.asked.append(len(self.asked))
+        if len(self.asked) <= self.refusals:
+            return spent("ERROR; Individual quota reached. Resets in 2h48m38s.")
+        return answered()
+
+
+def test_an_exhausted_rotation_waits_instead_of_failing_the_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spinning against a wall is worse than idling against it.
+
+    On 2026-09-20 every program was out and the rotation returned the refusal,
+    so the round failed and the loop composed another -- sixteen refusals in
+    three minutes. A round that produced nothing counts toward
+    `STAGNATION_SESSIONS` and is shown to the next round as its own history, so
+    an outage would have the campaign decide its champion had gone stale when
+    nothing had run.
+    """
+    monkeypatch.setattr(config, "QUOTA_WAIT", 0)
+    asked: list[int] = []
+    rotation = mutate.Rotating([Reviving(refusals=2, asked=asked)])
+
+    got = asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+
+    assert got.status == "ok"
+    assert len(asked) == 3
+
+
+def test_the_wait_is_what_it_is_configured_to_be(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Polling is free next to an answer, but it is not free of a clock."""
+    monkeypatch.setattr(config, "QUOTA_WAIT", 7)
+    slept: list[float] = []
+
+    async def note(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(mutate.asyncio, "sleep", note)
+    asked: list[int] = []
+    rotation = mutate.Rotating([Reviving(refusals=2, asked=asked)])
+
+    asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+
+    assert slept == [7, 7]
+
+
+def test_waiting_ends_when_the_loop_is_shut_down() -> None:
+    """Cancellation is what ends the wait, because nothing else does.
+
+    The rotation does not give up on its own -- that is the point -- so the only
+    thing that must be able to end it is the cancellation a stopping loop
+    delivers to every round in flight.
+    """
+    asked: list[int] = []
+    # Never revives, so only cancellation can end this.
+    rotation = mutate.Rotating([Reviving(refusals=10**6, asked=asked)])
+
+    async def stopped() -> None:
+        task = asyncio.create_task(rotation(Path("/tmp"), "message", "p1"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(stopped())

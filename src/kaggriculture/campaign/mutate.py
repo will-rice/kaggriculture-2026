@@ -1506,24 +1506,44 @@ class Rotating:
             message: The whole prompt.
             program_id: The child program id.
 
+        Waits and asks again when every one of them is out, rather than
+        failing the round: a round that produced nothing counts toward
+        `STAGNATION_SESSIONS` and is shown to the next round as its own
+        history, so spinning against a wall would have the campaign mistake an
+        outage for a champion that had gone stale.
+
         Returns:
-            The first outcome that is not an exhausted entitlement, or the last
-            refusal when every program is out.
+            The first outcome that is not an exhausted entitlement. Does not
+            return while every program is refusing; cancellation is what ends
+            the wait, which is what shutting the loop down delivers.
         """
-        outcome = None
-        for driver in self.drivers:
-            outcome = await driver(workspace, message, program_id)
-            if not out_of_quota(outcome):
-                return outcome
-            LOGGER.warning(
-                "%s: %s has no quota (%s); trying the next program",
+        assert self.drivers, "a rotation with no drivers in it"
+        waited = 0
+        while True:
+            for driver in self.drivers:
+                outcome = await driver(workspace, message, program_id)
+                if not out_of_quota(outcome):
+                    if waited:
+                        LOGGER.info("%s: quota is back after %ds", program_id, waited)
+                    return outcome
+                LOGGER.warning(
+                    "%s: %s has no quota (%s); trying the next program",
+                    program_id,
+                    type(driver).__name__,
+                    outcome.reason[:80],
+                )
+            # Everything is out. Waiting rather than failing, because a round
+            # that produced nothing counts toward stagnation and is shown to the
+            # next round as its own history -- so spinning would have the
+            # campaign mistake an outage for a champion that had gone stale.
+            LOGGER.error(
+                "%s: every program is out of quota; waiting %ds (%s)",
                 program_id,
-                type(driver).__name__,
-                outcome.reason[:80],
+                config.QUOTA_WAIT,
+                outcome.reason[:120],
             )
-        LOGGER.error("%s: every program is out of quota", program_id)
-        assert outcome is not None, "a rotation with no drivers in it"
-        return outcome
+            await asyncio.sleep(config.QUOTA_WAIT)
+            waited += config.QUOTA_WAIT
 
 
 def build() -> "Rotating":

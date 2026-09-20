@@ -421,6 +421,20 @@ SCRATCH_AGENT = (
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
+# How long the rotation waits before asking again when every program is out of
+# quota.
+#
+# It used to return the refusal and let the round fail, which spun: sixteen
+# refusals inside three minutes on 2026-09-20, as fast as four sessions could
+# ask. Failing is worse than idling -- a round that produced nothing counts
+# toward `STAGNATION_SESSIONS`, so an outage would have the campaign decide its
+# champion had gone stale when nothing had run, and the failures are shown to
+# the next round as though they were its own.
+#
+# Five minutes because a refusal costs seconds, so the poll is free next to the
+# ten-to-twenty-five minutes an answer takes, and the shortest reset seen so far
+# is a five-hour window.
+QUOTA_WAIT = 5 * 60
 # Calls in a row that may run to no verdict before the campaign stops. A call
 # that never reached the model is nobody's failure and writes nothing, so
 # without this the loop spins at full rate on an expired login, a withdrawn

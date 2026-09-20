@@ -243,9 +243,17 @@ def _dynamic(agent: Path, steps: int) -> Verdict:
             worst_step_seconds=report.worst_step_seconds,
         )
     if report.worst_step_seconds > harness.LATENCY_BUDGET:
+        # Once more before refusing. This is the maximum of about seven hundred
+        # timed calls, so a single scheduling hiccup sets it: the same floor
+        # measured 0.631s, 0.041s and 0.099s on three consecutive runs while
+        # typically taking 0.07. The threshold is unchanged and worth keeping,
+        # since a program over Kaggle's own limit does not run at all -- but a
+        # program that is genuinely too slow is too slow twice.
+        report = harness.check(agent, steps=steps)
+    if report.worst_step_seconds > harness.LATENCY_BUDGET:
         return Verdict(
             status="too_slow",
-            reason=f"worst step {report.worst_step_seconds:.3f}s",
+            reason=f"worst step {report.worst_step_seconds:.3f}s, twice",
             worst_step_seconds=report.worst_step_seconds,
         )
     return Verdict(status="ok", reason="", worst_step_seconds=report.worst_step_seconds)
