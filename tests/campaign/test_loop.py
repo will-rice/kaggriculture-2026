@@ -326,8 +326,8 @@ class Recorder:
     loop asks the mutator for rather than deciding itself.
     """
 
-    SKILLS_DIR = Path(".agents") / "skills"
-    TRANSCRIPTS = "agy*.jsonl"
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the recorder.
@@ -1441,7 +1441,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
 
     handed = mutator.seen[0]
     assert handed.held == sorted(
-        [Recorder.SKILLS_DIR.parts[0], "child.py", "measure.py", "parent.py"]
+        [Recorder.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
     )
     assert not handed.where.exists()
 
@@ -2166,8 +2166,8 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
     class Cancelled:
         """A call killed mid-flight, which is what the pacer does to a slow one."""
 
-        SKILLS_DIR = Path(".agents") / "skills"
-        TRANSCRIPTS = "agy*.jsonl"
+        SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+        TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
 
         async def __call__(
             self, workspace: Path, message: str, program_id: str
@@ -2264,8 +2264,8 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     class Inspect:
         """A call that only reports what it was handed."""
 
-        SKILLS_DIR = Path(".agents") / "skills"
-        TRANSCRIPTS = "agy*.jsonl"
+        SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+        TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
 
         async def __call__(
             self, workspace: Path, message: str, program_id: str
@@ -2274,7 +2274,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             seen["files"] = sorted(path.name for path in workspace.iterdir())
             seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
             seen["skill"] = (
-                workspace / self.SKILLS_DIR / "query-games" / "SKILL.md"
+                workspace / self.SKILLS_DIRS[0] / "query-games" / "SKILL.md"
             ).exists()
             runner = workspace / "measure.py"
             seen["shebang"] = runner.read_text(encoding="utf-8").splitlines()[0]
@@ -2298,7 +2298,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         )
 
     assert seen["files"] == sorted(
-        [Inspect.SKILLS_DIR.parts[0], "child.py", "measure.py", "parent.py"]
+        [Inspect.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
     )
     # The skills go where the driving program looks for them: `.codex/skills`
     # under codex's working directory, `.agents` for agy to walk up to.

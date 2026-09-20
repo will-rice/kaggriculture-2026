@@ -699,8 +699,8 @@ def test_each_mutator_names_the_directory_its_own_program_reads() -> None:
     why this is asserted rather than left to be noticed: it just never finds
     the schema or the queries worth running.
     """
-    assert mutate.CodexMutator.SKILLS_DIR == Path(".codex") / "skills"
-    assert mutate.AgyMutator.SKILLS_DIR == Path(".agents") / "skills"
+    assert mutate.CodexMutator.SKILLS_DIRS == (Path(".codex") / "skills",)
+    assert mutate.AgyMutator.SKILLS_DIRS == (Path(".agents") / "skills",)
 
 
 def test_the_selection_decides_which_program_and_which_vocabulary(
@@ -717,11 +717,11 @@ def test_the_selection_decides_which_program_and_which_vocabulary(
     env = tmp_path / ".env"
 
     env.write_text("CAMPAIGN_MUTATOR=codex\n", encoding="utf-8")
-    assert isinstance(mutate.build(), mutate.CodexMutator)
+    assert isinstance(mutate.build().drivers[0], mutate.CodexMutator)
     assert mutate.asked_model() == mutate.model()
 
     env.write_text("CAMPAIGN_MUTATOR=agy\n", encoding="utf-8")
-    assert isinstance(mutate.build(), mutate.AgyMutator)
+    assert isinstance(mutate.build().drivers[0], mutate.AgyMutator)
     assert mutate.asked_model() == mutate.agy_model()
 
 
@@ -1027,7 +1027,7 @@ def test_every_driver_is_reachable_by_name(
         ("opencode", mutate.OpenCodeMutator),
     ):
         env.write_text(f"CAMPAIGN_MUTATOR={name}\n", encoding="utf-8")
-        assert isinstance(mutate.build(), driver)
+        assert isinstance(mutate.build().drivers[0], driver)
 
     env.write_text("CAMPAIGN_MUTATOR=opencode\n", encoding="utf-8")
     assert mutate.asked_model() == mutate.opencode_model()
@@ -1050,3 +1050,155 @@ def test_an_unset_opencode_model_is_the_campaigns_own(
         config.OPENCODE_MODEL.rsplit("/", 1)[-1]
         == (config.OPENCODE_FALLBACK_MODEL.rsplit("/", 1)[-1])
     )
+
+
+def spent(reason: str) -> mutate.Mutation:
+    """A call that came back because the entitlement is gone."""
+    return mutate.Mutation(
+        program_id="p1",
+        child=None,
+        status="exec_error",
+        reason=reason,
+        seconds=0.2,
+        input_tokens=0,
+        output_tokens=0,
+        model="whichever",
+    )
+
+
+def answered() -> mutate.Mutation:
+    """A call that actually ran."""
+    return mutate.Mutation(
+        program_id="p1",
+        child=Path("/tmp/child.py"),
+        status="ok",
+        reason="",
+        seconds=90.0,
+        input_tokens=10,
+        output_tokens=10,
+        model="whichever",
+    )
+
+
+class Stub:
+    """A driver that returns what it was told to, and records being asked."""
+
+    def __init__(self, name: str, gives: mutate.Mutation, asked: list) -> None:
+        self.SKILLS_DIRS: tuple[Path, ...] = (Path(f".{name}") / "skills",)
+        self.TRANSCRIPTS: tuple[str, ...] = (f"{name}*.jsonl",)
+        self.name = name
+        self.gives = gives
+        self.asked = asked
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> mutate.Mutation:
+        """Records that this driver was asked, and answers as told."""
+        self.asked.append(self.name)
+        return self.gives
+
+
+def test_a_program_out_of_quota_hands_the_round_to_the_next() -> None:
+    """What cost two days about ten hours.
+
+    agy's entitlement ran out at 00:44 on 2026-09-19 and both lineages sat idle
+    until morning. The three bill separate accounts, so the others were still
+    worth asking.
+    """
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [
+            Stub(
+                "agy", spent("ERROR; Individual quota reached. Resets in 2h48m"), asked
+            ),
+            Stub("codex", answered(), asked),
+        ]
+    )
+
+    got = asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+
+    assert asked == ["agy", "codex"]
+    assert got.status == "ok"
+
+
+def test_a_program_with_quota_is_the_only_one_asked() -> None:
+    """A run with quota must behave exactly as it did before rotation existed."""
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [Stub("agy", answered(), asked), Stub("codex", answered(), asked)]
+    )
+
+    asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+
+    assert asked == ["agy"]
+
+
+def test_a_round_that_ran_and_wrote_nothing_is_not_passed_along() -> None:
+    """Only an exhausted entitlement moves a call. A bad round is a bad round.
+
+    Passing those along would spend three entitlements on one failure and hide
+    which program produced it.
+    """
+    asked: list[str] = []
+    nothing = mutate.Mutation(
+        program_id="p1",
+        child=None,
+        status="no_output",
+        reason="I will review the results shortly",
+        seconds=48.0,
+        input_tokens=5,
+        output_tokens=5,
+        model="whichever",
+    )
+    rotation = mutate.Rotating(
+        [Stub("agy", nothing, asked), Stub("codex", answered(), asked)]
+    )
+
+    got = asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+
+    assert asked == ["agy"]
+    assert got.status == "no_output"
+
+
+def test_every_program_out_returns_the_last_refusal() -> None:
+    """The round fails, and the reason says why rather than going blank."""
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [
+            Stub("agy", spent("Individual quota reached"), asked),
+            Stub("codex", spent("You've hit your usage limit"), asked),
+        ]
+    )
+
+    got = asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+
+    assert asked == ["agy", "codex"]
+    assert got.status == "exec_error"
+    assert "usage limit" in got.reason
+
+
+def test_the_workspace_suits_whichever_program_serves_the_call() -> None:
+    """Which one answers is not known until it is asked.
+
+    codex reads `.codex/skills`; agy and opencode walk up for `.agents`. The
+    loop prepares the directory first, so it has to prepare all of them -- a
+    round that finds no skills still runs, it just never finds the schema.
+    """
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [Stub("agy", answered(), asked), Stub("codex", answered(), asked)]
+    )
+
+    assert set(rotation.SKILLS_DIRS) == {
+        Path(".agy") / "skills",
+        Path(".codex") / "skills",
+    }
+    assert set(rotation.TRANSCRIPTS) == {"agy*.jsonl", "codex*.jsonl"}
+
+
+def test_the_real_rotation_leads_with_the_configured_program() -> None:
+    """`CAMPAIGN_MUTATOR` still decides who is asked first."""
+    built = mutate.build()
+
+    assert type(built.drivers[0]).__name__.lower().startswith(mutate.selected()[:3])
+    assert len(built.drivers) == len(mutate.DRIVERS)

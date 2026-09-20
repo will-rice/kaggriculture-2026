@@ -264,6 +264,23 @@ def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
 GUARDED = ("*.py", "*.md")
 
 
+def _with_skills(box: Path, wanted: tuple[Path, ...]) -> None:
+    """Copy the skills into every place a driver might look for them.
+
+    Which program serves this call is not settled until it is made -- one out
+    of quota hands it to the next -- and the workspace is prepared first. A
+    round that finds no skills still runs; it just never finds the schema or
+    the queries worth running, which is a failure that does not announce
+    itself.
+
+    Args:
+        box: The round's directory.
+        wanted: Where each driver looks, relative to it.
+    """
+    for where in wanted:
+        shutil.copytree(config.SKILLS, box / where)
+
+
 def _kept(root: Path = config.ROOT) -> dict[Path, bytes]:
     """The campaign's own source, as it stands before a round runs.
 
@@ -931,7 +948,10 @@ class Campaign:
             # question pays nothing for them -- both programs disclose a skill
             # by name and description and load it only if asked. The message
             # is read every round; this is read on demand.
-            shutil.copytree(config.SKILLS, box / self.mutator.SKILLS_DIR)
+            # Into every place any driver looks, because which one serves
+            # this call is not settled until it is made: a provider out of
+            # quota hands it to the next.
+            _with_skills(box, self.mutator.SKILLS_DIRS)
             # What the campaign's own source says before this round runs,
             # so that what it says afterwards can be put back. `_restored`
             # carries why that is necessary.
@@ -970,7 +990,10 @@ class Campaign:
             # which is the round doing what it was told. The score cannot tell
             # those apart and the transcript can.
             kept_at = self.paths.rounds / program_id
-            for transcript in sorted(box.glob(self.mutator.TRANSCRIPTS)):
+            written = {
+                one for pattern in self.mutator.TRANSCRIPTS for one in box.glob(pattern)
+            }
+            for transcript in sorted(written):
                 kept_at.mkdir(parents=True, exist_ok=True)
                 shutil.copy(transcript, kept_at / transcript.name)
             # And back together before anything downstream looks at it. The

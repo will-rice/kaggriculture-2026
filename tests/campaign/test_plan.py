@@ -210,8 +210,8 @@ def test_a_mutator_calls_a_plan_only_edit_a_child(tmp_path: Path) -> None:
     class Stand:
         """An opencode that edits the plan and nothing else."""
 
-        SKILLS_DIR = Path(".agents") / "skills"
-        TRANSCRIPTS = "agy*.jsonl"
+        SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+        TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
         COMMAND = ["bash", "-c", edit]
         POLICY: dict = {}
 

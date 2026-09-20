@@ -43,7 +43,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -242,17 +242,22 @@ class Mutator(Protocol):
     """Something that turns one file and one message into a child program."""
 
     # Where this program discovers skills, relative to the workspace. The
-    # loop copies `config.SKILLS` there, and the two programs do not agree:
-    # codex reads `.codex/skills` under its working directory, agy walks up
-    # from it looking for `.agents`. Hardcoding either in the loop is how a
-    # round silently loses the schema and the queries worth running -- it
-    # still runs, it just never finds them -- so the mutator names its own.
-    SKILLS_DIR: Path
-    # And what this driver calls the transcript it leaves behind, as a glob,
-    # because a retry writes a second one beside the first. Named here for the
-    # same reason `SKILLS_DIR` is: the loop copies it out and has no business
-    # knowing which program wrote it.
-    TRANSCRIPTS: str
+    # loop copies `config.SKILLS` into every one of them, and the programs do
+    # not agree: codex reads `.codex/skills` under its working directory, agy
+    # and opencode walk up from it looking for `.agents`. Hardcoding either in
+    # the loop is how a round silently loses the schema and the queries worth
+    # running -- it still runs, it just never finds them.
+    #
+    # Plural because a call can be handed from one program to another when the
+    # first has no quota left, and the workspace is prepared before anybody
+    # knows which will serve it.
+    SKILLS_DIRS: tuple[Path, ...]
+    # And what this driver calls the transcript it leaves behind, as globs,
+    # because a retry writes a second one beside the first and a rotation can
+    # leave one from each program it tried. Named here for the same reason
+    # `SKILLS_DIRS` is: the loop copies them out and has no business knowing
+    # which program wrote which.
+    TRANSCRIPTS: tuple[str, ...]
 
     async def __call__(
         self, workspace: Path, message: str, program_id: str
@@ -292,8 +297,8 @@ class CodexMutator:
     # `--skip-git-repo-check` because a call runs in a temporary directory
     # holding one file, not in a repository: codex refuses an untrusted
     # directory otherwise, and the directory is deliberately not one.
-    SKILLS_DIR = Path(".codex") / "skills"
-    TRANSCRIPTS = "codex*.jsonl"
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".codex") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("codex*.jsonl",)
 
     COMMAND = [
         "codex",
@@ -507,8 +512,8 @@ class AgyMutator:
     round chooses to open one.
     """
 
-    SKILLS_DIR = Path(".agents") / "skills"
-    TRANSCRIPTS = "agy*.jsonl"
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
 
     # Overridden by tests with something like ``["true"]``; the message and
     # the flags are only appended when the command actually is agy.
@@ -773,8 +778,8 @@ class OpenCodeMutator:
     those are the skills that tell a model to measure before it concludes.
     """
 
-    SKILLS_DIR = Path(".agents") / "skills"
-    TRANSCRIPTS = "opencode*.ndjson"
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("opencode*.ndjson",)
 
     # Overridden by tests; the flags are only appended when it really is
     # opencode.
@@ -799,6 +804,31 @@ class OpenCodeMutator:
             "question": "deny",
         }
     }
+
+    # What the provider is allowed to take, in milliseconds. Documented
+    # defaults are 300000 for each and they did not save us -- a hung call
+    # produced nothing for four and a half hours, which means it never got as
+    # far as a request -- so these are the inner of two layers, and
+    # `config.OPENCODE_TIMEOUT` is the outer one that actually caught it.
+    #
+    # `timeout` caps the request, `headerTimeout` the wait for response
+    # headers, `chunkTimeout` the gap between streamed chunks. Named per
+    # provider, so the provider is read off the model: an opencode model is
+    # `provider/model`, sometimes `provider/vendor/model`, and the first
+    # segment is the seller.
+    LIMITS = {"timeout": 600_000, "headerTimeout": 120_000, "chunkTimeout": 120_000}
+
+    def policy(self, model: str) -> dict:
+        """The config this call runs under, with the provider's limits in it.
+
+        Args:
+            model: The ``provider/model`` being requested.
+
+        Returns:
+            `POLICY` with a `provider` section for this call's seller.
+        """
+        seller = model.split("/", 1)[0]
+        return {**self.POLICY, "provider": {seller: {"options": dict(self.LIMITS)}}}
 
     def __init__(self, model: str = "", fallback: str | None = None) -> None:
         """Initializes the mutator.
@@ -902,11 +932,35 @@ class OpenCodeMutator:
                 start_new_session=True,
                 env={
                     **os.environ,
-                    "OPENCODE_CONFIG_CONTENT": json.dumps(self.POLICY),
+                    "OPENCODE_CONFIG_CONTENT": json.dumps(self.policy(model)),
                 },
             )
             try:
-                _, stderr = await process.communicate()
+                _, stderr = await asyncio.wait_for(
+                    process.communicate(), config.OPENCODE_TIMEOUT
+                )
+            except TimeoutError:
+                # The arm that was missing. Same kill as cancellation, because
+                # a hung opencode has the same children a cancelled one does.
+                LOGGER.warning(
+                    "opencode call for %s gave up after %ds, killed pgid %s",
+                    program_id,
+                    config.OPENCODE_TIMEOUT,
+                    kill_group(process),
+                )
+                return Mutation(
+                    program_id=program_id,
+                    child=None,
+                    status="exec_error",
+                    reason=(
+                        f"opencode wrote nothing in {config.OPENCODE_TIMEOUT}s "
+                        "and was killed"
+                    ),
+                    seconds=time.perf_counter() - started,
+                    input_tokens=0,
+                    output_tokens=0,
+                    model=model,
+                )
             except asyncio.CancelledError:
                 # opencode runs shell commands of its own, so killing only the
                 # direct child would leave a season playing against a directory
@@ -1223,8 +1277,8 @@ class FakeMutator:
     # Nothing reads them, but the loop still lays them out, so a dry run
     # exercises the same copy a real round does. It writes no transcript, and
     # the glob simply matches nothing.
-    SKILLS_DIR = Path(".agents") / "skills"
-    TRANSCRIPTS = "fake*.jsonl"
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("fake*.jsonl",)
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the mutator.
@@ -1354,13 +1408,111 @@ def selected() -> str:
     return kind
 
 
-def build() -> Mutator:
-    """The mutator `selected` names.
+# What a program says when the entitlement is gone rather than the call being
+# wrong. agy says "Individual quota reached", codex "You've hit your usage
+# limit"; matched loosely because the wording is theirs to change and the cost
+# of a false match is one call handed to the next program, which is where a
+# true match sends it anyway.
+EXHAUSTED = ("quota", "usage limit", "rate limit", "insufficient_quota")
+
+
+def out_of_quota(mutation: "Mutation") -> bool:
+    """Whether this call failed because the entitlement is spent.
+
+    Args:
+        mutation: What the call came back with.
 
     Returns:
-        A mutator reading its own model per call.
+        True when the failure is an exhausted entitlement rather than a round
+        that ran and wrote nothing.
     """
-    return DRIVERS[selected()]()
+    if mutation.status != "exec_error":
+        return False
+    said = mutation.reason.lower()
+    return any(phrase in said for phrase in EXHAUSTED)
+
+
+class Rotating:
+    """Tries each program in turn until one still has quota to answer with.
+
+    Three programs can drive a round and each bills a different entitlement,
+    which is the only reason there are three. Pinned to one, a run stops when
+    that one stops: agy ran out at 00:44 on 2026-09-19 and both lineages were
+    idle until morning, and on 2026-09-20 all three were out at once.
+
+    Nothing can be checked in advance. They are separate CLIs against separate
+    accounts, and the only tool that reports quota sees just the providers
+    opencode is signed into. So this asks, which is cheap -- a refusal comes
+    back in seconds, where an answer takes ten minutes.
+
+    Order matters and the configured program leads it, so a run with quota does
+    exactly what it did before this existed.
+
+    Attributes:
+        SKILLS_DIRS: Every place any of them looks for skills, so the workspace
+            suits whichever ends up serving the call.
+        TRANSCRIPTS: Every pattern any of them writes, so a call that was
+            passed along leaves both transcripts behind and the log shows it.
+    """
+
+    def __init__(self, drivers: "Sequence[Mutator]") -> None:
+        """Initializes the rotation.
+
+        Args:
+            drivers: The programs to try, in the order to try them.
+        """
+        self.drivers = drivers
+        self.SKILLS_DIRS: tuple[Path, ...] = tuple(
+            dict.fromkeys(one for driver in drivers for one in driver.SKILLS_DIRS)
+        )
+        self.TRANSCRIPTS: tuple[str, ...] = tuple(
+            dict.fromkeys(one for driver in drivers for one in driver.TRANSCRIPTS)
+        )
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> "Mutation":
+        """Asks each program in turn until one answers with something.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt.
+            program_id: The child program id.
+
+        Returns:
+            The first outcome that is not an exhausted entitlement, or the last
+            refusal when every program is out.
+        """
+        outcome = None
+        for driver in self.drivers:
+            outcome = await driver(workspace, message, program_id)
+            if not out_of_quota(outcome):
+                return outcome
+            LOGGER.warning(
+                "%s: %s has no quota (%s); trying the next program",
+                program_id,
+                type(driver).__name__,
+                outcome.reason[:80],
+            )
+        LOGGER.error("%s: every program is out of quota", program_id)
+        assert outcome is not None, "a rotation with no drivers in it"
+        return outcome
+
+
+def build() -> "Rotating":
+    """The program `selected` names, and the others behind it.
+
+    One entitlement running out used to stop a run: agy's did at 00:44 on
+    2026-09-19 and both lineages were idle until morning. The three bill
+    separate accounts, so the others are still worth asking.
+
+    Returns:
+        A rotation, the selected program first, each reading its own model per
+        call.
+    """
+    first = selected()
+    order = [first, *(name for name in DRIVERS if name != first)]
+    return Rotating([DRIVERS[name]() for name in order])
 
 
 def asked_model() -> str:

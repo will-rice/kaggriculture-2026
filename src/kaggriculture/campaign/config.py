@@ -508,6 +508,19 @@ AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
 # `child.py` untouched). Nothing but the file says whether the round worked,
 # which is why `_written` is what decides the verdict.
 AGY_TIMEOUT = "3h"
+# How long one opencode call may take before the loop stops waiting for it.
+#
+# `opencode run` has no timeout flag of its own, and on 2026-09-20 four calls
+# hung for four and a half hours apiece -- three minutes of CPU between them,
+# zero-byte transcripts -- while the loop waited, because nothing told it not
+# to. Its config's `timeout`/`headerTimeout`/`chunkTimeout` were already at
+# their five-minute defaults and did not fire: nothing had streamed, so the
+# hang was upstream of the request, in opencode's own server startup.
+#
+# Forty minutes rather than something tight. A round that is working takes ten
+# to twenty-five, so a shorter cap would throw away good calls to catch a rare
+# bad one; this is a backstop against a hang, not a limit on a round.
+OPENCODE_TIMEOUT = 40 * 60
 
 # The model an `opencode` round asks for, as `provider/model`.
 #
