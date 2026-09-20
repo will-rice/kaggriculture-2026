@@ -166,6 +166,21 @@ def agy_fallback() -> str:
     return config.AGY_FALLBACK_MODEL if value is None else value
 
 
+def agy_second() -> str:
+    """The agy model to ask for on the other entitlement, read at every call.
+
+    agy meters two pools apart -- "Gemini Models" and "Claude and GPT models" --
+    and the model name alone decides which a call bills. Naming one leaves the
+    other unspent, which is how agy came to stop both lineages twice while more
+    than half its entitlement was untouched.
+
+    Returns:
+        The slug from the environment, or `config.AGY_SECOND_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_AGY_SECOND_MODEL") or config.AGY_SECOND_MODEL
+
+
 def known_agy_models() -> set[str]:
     """The model slugs this agy login is entitled to.
 
@@ -519,7 +534,12 @@ class AgyMutator:
     # the flags are only appended when the command actually is agy.
     COMMAND = ["agy", "--print"]
 
-    def __init__(self, model: str = "", fallback: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str = "",
+        fallback: str | None = None,
+        source: "Callable[[], str] | None" = None,
+    ) -> None:
         """Initializes the mutator.
 
         Args:
@@ -527,9 +547,16 @@ class AgyMutator:
             fallback: The model to retry on, once, when a call on ``model``
                 fails without a verdict. "" never retries; None reads it per
                 call.
+            source: Where the per-call slug is read from, which is what picks
+                the entitlement. agy meters two pools apart and the model name
+                alone decides which a call bills, so the rotation holds two of
+                these -- one reading `agy_model`, one reading `agy_second` --
+                and both still read at the call, so either can be moved
+                without stopping a run.
         """
         self.model = model
         self.fallback = fallback
+        self.source = source or agy_model
 
     async def __call__(
         self, workspace: Path, message: str, program_id: str
@@ -545,7 +572,7 @@ class AgyMutator:
             A `Mutation` describing what happened, on whichever model
             produced it.
         """
-        asked = self.model or agy_model()
+        asked = self.model or self.source()
         retry = agy_fallback() if self.fallback is None else self.fallback
         mutation = await self.call(workspace, message, program_id, asked)
         if mutation.status != "exec_error" or not retry:
@@ -1512,7 +1539,15 @@ def build() -> "Rotating":
     """
     first = selected()
     order = [first, *(name for name in DRIVERS if name != first)]
-    return Rotating([DRIVERS[name]() for name in order])
+    drivers: list[Mutator] = []
+    for name in order:
+        drivers.append(DRIVERS[name]())
+        if name == "agy":
+            # Twice, because agy meters two entitlements apart and the model
+            # name alone decides which a call bills. Naming one left the other
+            # unspent while agy stopped both lineages for want of quota.
+            drivers.append(AgyMutator(source=agy_second))
+    return Rotating(drivers)
 
 
 def asked_model() -> str:
@@ -1546,3 +1581,7 @@ def validate_models() -> None:
     check(asked())
     if retry():
         check(retry())
+    # The other entitlement's slug too, whichever program leads: the rotation
+    # holds it either way, and a typo there is a pool that silently never gets
+    # asked rather than a run that fails loudly.
+    validate_agy_model(agy_second())

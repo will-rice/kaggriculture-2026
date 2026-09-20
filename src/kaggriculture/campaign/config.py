@@ -508,6 +508,17 @@ AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
 # `child.py` untouched). Nothing but the file says whether the round worked,
 # which is why `_written` is what decides the verdict.
 AGY_TIMEOUT = "3h"
+# The model agy is asked for on its other entitlement.
+#
+# `agy -p /usage` reports two pools -- "Gemini Models" and "Claude and GPT
+# models" -- and meters them apart. The model name alone decides which a call
+# bills, so naming only one leaves the other unspent: on 2026-09-20 the Gemini
+# pool was down to 34% while Claude and GPT sat at 67%, and agy had already
+# stopped both lineages twice for want of quota.
+#
+# A Gemini model here because `CAMPAIGN_AGY_MODEL` now names a Claude one. The
+# pair is what matters, not which is first.
+AGY_SECOND_MODEL = "gemini-3.1-pro-high"
 # How long one opencode call may take before the loop stops waiting for it.
 #
 # `opencode run` has no timeout flag of its own, and on 2026-09-20 four calls

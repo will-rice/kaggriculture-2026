@@ -1201,4 +1201,71 @@ def test_the_real_rotation_leads_with_the_configured_program() -> None:
     built = mutate.build()
 
     assert type(built.drivers[0]).__name__.lower().startswith(mutate.selected()[:3])
-    assert len(built.drivers) == len(mutate.DRIVERS)
+    # Every program, and agy twice: it meters two entitlements apart and the
+    # model name alone decides which a call bills.
+    assert len(built.drivers) == len(mutate.DRIVERS) + 1
+    assert sum(isinstance(one, mutate.AgyMutator) for one in built.drivers) == 2
+
+
+def test_agy_is_asked_on_both_of_its_entitlements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`agy -p /usage` meters two pools and the model name picks one.
+
+    Measured 2026-09-20: "Gemini Models" at 34% weekly and "Claude and GPT
+    models" at 67%, and agy had already stopped both lineages twice for want of
+    quota while more than half of it sat unspent behind a slug nothing asked
+    for. So the rotation holds agy twice, once per pool.
+    """
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_MUTATOR", raising=False)
+    monkeypatch.delenv("CAMPAIGN_AGY_MODEL", raising=False)
+    monkeypatch.delenv("CAMPAIGN_AGY_SECOND_MODEL", raising=False)
+    (tmp_path / ".env").write_text(
+        "CAMPAIGN_MUTATOR=agy\n"
+        "CAMPAIGN_AGY_MODEL=claude-opus-4-6-thinking\n"
+        "CAMPAIGN_AGY_SECOND_MODEL=gemini-3.1-pro-high\n",
+        encoding="utf-8",
+    )
+
+    drivers = mutate.build().drivers
+    agy = [one for one in drivers if isinstance(one, mutate.AgyMutator)]
+
+    assert len(agy) == 2
+    assert [one.source() for one in agy] == [
+        "claude-opus-4-6-thinking",
+        "gemini-3.1-pro-high",
+    ]
+
+
+def test_the_second_entitlement_follows_its_own_key_at_the_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both slugs are read per call, so either pool can be moved mid-run.
+
+    A campaign cannot be reached by exporting a variable, and stopping one to
+    change a model costs a full champion re-evaluation.
+    """
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_AGY_SECOND_MODEL", raising=False)
+    env = tmp_path / ".env"
+
+    env.write_text("CAMPAIGN_AGY_SECOND_MODEL=gemini-3.8-flash-low\n", encoding="utf-8")
+    assert mutate.agy_second() == "gemini-3.8-flash-low"
+
+    env.write_text("CAMPAIGN_AGY_SECOND_MODEL=gpt-oss-120b-medium\n", encoding="utf-8")
+    assert mutate.agy_second() == "gpt-oss-120b-medium"
+
+
+def test_the_two_agy_entries_are_not_the_same_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One out of quota must not take the other down with it."""
+    monkeypatch.setattr(mutate, "ENV", tmp_path / ".env")
+    monkeypatch.delenv("CAMPAIGN_MUTATOR", raising=False)
+    (tmp_path / ".env").write_text("CAMPAIGN_MUTATOR=agy\n", encoding="utf-8")
+
+    agy = [one for one in mutate.build().drivers if isinstance(one, mutate.AgyMutator)]
+
+    assert agy[0] is not agy[1]
+    assert agy[0].source is not agy[1].source
