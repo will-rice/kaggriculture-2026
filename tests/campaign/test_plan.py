@@ -918,3 +918,63 @@ def test_the_other_parts_are_described_too() -> None:
     assert "season" in said and "112" in said
     assert "shop pair" in said
     assert "front_run=True" in said
+
+
+def test_a_plan_the_schema_refuses_is_a_broken_plan_not_a_pydantic_error(
+    tmp_path: Path,
+) -> None:
+    """What took both lineages down on 2026-09-20.
+
+    A round edited `plan.json` and dropped `settings`. `gather` validated it --
+    which is its job, and its docstring says the check is there "where the round
+    can still be told it wrote nothing usable" -- and raised `ValidationError`,
+    which no caller catches. It went up through the driver, the worker and the
+    task group and killed the run.
+
+    `BrokenPlanError` is a `ValueError` the campaign can tell apart from a pydantic
+    error of its own, which anywhere else would be a bug in the campaign rather
+    than a model writing something malformed.
+    """
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, carried = plan.split(champion)
+    (tmp_path / "child.py").write_text(controller, encoding="utf-8")
+    # Everything but `settings`, which is exactly what the round dropped.
+    (tmp_path / plan.PLAN_FILE).write_text(
+        json.dumps({key: carried[key] for key in ("actions", "routes", "shops")}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(plan.BrokenPlanError) as broken:
+        plan.gather(tmp_path)
+
+    assert plan.PLAN_FILE in str(broken.value)
+    assert "settings" in str(broken.value)
+
+
+def test_a_plan_that_is_not_even_json_is_the_same_kind_of_failure(
+    tmp_path: Path,
+) -> None:
+    """A truncated write is a round that produced nothing, not a crash."""
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, _ = plan.split(champion)
+    (tmp_path / "child.py").write_text(controller, encoding="utf-8")
+    (tmp_path / plan.PLAN_FILE).write_text('{"actions": [', encoding="utf-8")
+
+    with pytest.raises(plan.BrokenPlanError):
+        plan.gather(tmp_path)
+
+
+def test_a_whole_plan_still_packs_back_into_a_program(tmp_path: Path) -> None:
+    """The guard must not have broken the path it guards.
+
+    A mutation-proof for the two above: if `gather` raised on everything they
+    would pass while the campaign could never run a round again.
+    """
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, carried = plan.split(champion)
+    (tmp_path / "child.py").write_text(controller, encoding="utf-8")
+    (tmp_path / plan.PLAN_FILE).write_text(json.dumps(carried), encoding="utf-8")
+
+    packed = plan.gather(tmp_path)
+
+    assert plan.split(packed)[1] == carried

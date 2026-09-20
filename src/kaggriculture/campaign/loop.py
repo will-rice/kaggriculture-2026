@@ -258,6 +258,40 @@ def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
     return log
 
 
+def _packed(mutation: Mutation, box: Path, program_id: str) -> Mutation:
+    """Write the round's program back as one file, or record that it cannot be.
+
+    The gate, the archive, the pool, the validator and the submission all expect
+    one self-contained file, and none of them has to learn otherwise, so the
+    plan is packed back into the program here.
+
+    A round that wrote a `plan.json` the schema refuses produced nothing
+    runnable. That is an ordinary outcome of asking a model to edit a file, and
+    it was a crash until 2026-09-20: `gather` validated, nothing caught what it
+    raised, and the error went up through the worker and the task group and took
+    both lineages down. The reason travels onto the mutation, so the next round
+    on this lineage is told what broke.
+
+    Args:
+        mutation: What the call produced.
+        box: The round's directory.
+        program_id: The child program id, for the log.
+
+    Returns:
+        The mutation, or a copy recording that nothing usable was written.
+    """
+    if mutation.child is None:
+        return mutation
+    try:
+        mutation.child.write_text(plan.gather(box), encoding="utf-8")
+    except plan.BrokenPlanError as broken:
+        LOGGER.warning("%s wrote an unusable plan: %s", program_id, broken)
+        return mutation.model_copy(
+            update={"child": None, "status": "no_output", "reason": str(broken)}
+        )
+    return mutation
+
+
 def state_file(paths: config.Run) -> Path:
     """Where the state a restart resumes from lives, beside the database."""
     return paths.state
@@ -815,7 +849,34 @@ class Campaign:
             # by name and description and load it only if asked. The message
             # is read every round; this is read on demand.
             shutil.copytree(config.SKILLS, box / self.mutator.SKILLS_DIR)
-            mutation = await self.mutator(box, message, program_id)
+            # A round that writes a `plan.json` the schema refuses is a round
+            # that produced nothing runnable, which is an ordinary outcome of
+            # asking a model to edit a file -- and until 2026-09-20 it was a
+            # crash. `gather` validates, nothing caught what it raised, and the
+            # error went up through the driver, the worker and the task group
+            # and took both lineages down with it.
+            #
+            # It surfaced on the retry path, which is how a provider outage
+            # became a campaign outage: the first call failed on an exhausted
+            # quota, the fallback re-entered the driver, and `gather` read the
+            # workspace the first model had already written a broken plan into.
+            #
+            # Caught here rather than in each driver because every round goes
+            # through this function, so a fourth driver cannot forget it.
+            try:
+                mutation = await self.mutator(box, message, program_id)
+            except plan.BrokenPlanError as broken:
+                LOGGER.warning("%s wrote an unusable plan: %s", program_id, broken)
+                mutation = Mutation(
+                    program_id=program_id,
+                    child=None,
+                    status="no_output",
+                    reason=str(broken),
+                    seconds=0.0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    model=asked_model(),
+                )
             # What the round did, before the workspace takes it. A child whose
             # plan is unchanged can mean the round never opened `plan.json`, or
             # that it edited it, measured the edit worse and backed it out --
@@ -829,8 +890,7 @@ class Campaign:
             # gate, the archive, the pool, the validator and the submission all
             # expect one self-contained file, and none of them has to learn
             # otherwise.
-            if mutation.child is not None:
-                mutation.child.write_text(plan.gather(box), encoding="utf-8")
+            mutation = _packed(mutation, box, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.

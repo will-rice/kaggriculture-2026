@@ -54,6 +54,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     model_validator,
 )
 
@@ -897,6 +898,17 @@ def lay_out(source: str, box: Path, name: str = "child.py") -> None:
     )
 
 
+class BrokenPlanError(ValueError):
+    """A round wrote a `plan.json` the schema refuses.
+
+    Raised rather than allowed out as `ValidationError` because the two want
+    different handling: a pydantic error anywhere else in the campaign is a bug
+    in the campaign, and this one is a model writing something malformed, which
+    is an ordinary outcome of asking a model to edit a file. The round is told
+    and the run goes on.
+    """
+
+
 def gather(box: Path, name: str = "child.py") -> str:
     """Read a round's program back as one self-contained file.
 
@@ -920,4 +932,10 @@ def gather(box: Path, name: str = "child.py") -> str:
     # pointing at a route that is not there, is a program that forfeits every
     # game -- and the campaign would read that as a bad idea rather than a
     # broken file.
-    return join(source, json.loads(plan_file.read_text(encoding="utf-8")))
+    try:
+        return join(source, json.loads(plan_file.read_text(encoding="utf-8")))
+    except (ValidationError, json.JSONDecodeError) as broken:
+        raise BrokenPlanError(
+            f"`{PLAN_FILE}` is not a plan this can pack back into a program, so "
+            f"the round produced nothing runnable: {broken}"
+        ) from broken
