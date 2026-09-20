@@ -83,25 +83,40 @@ because a bundle that nets positive can carry a losing rule inside it, and the
 gate promotes whole programs. An edit that rides in on a better one is inherited
 by every program after it.
 
-`./measure.py --against <episode>` plays your child and the program you started
-from against the matchup of that episode, on the same seasons and both seats, and
-reports the difference between them. `The game` section gives the episode key:
-that matchup is the one taking the most games off us, and beating it is the job.
-This is the measurement that answers that.
+`./measure.py --against <episode>` answers both questions your edit has to
+answer, in one run. `The game` section gives the episode key.
 
-Plain `./measure.py`, with no `--against`, plays your child against the program
-you started from instead. That is a different question and for a while it was
-the only one available, which is how this lineage spent twenty-nine promotions
-without closing a three-percent gap: rounds were aimed at a matchup and graded
-against a sibling, so every edit that helped the matchup measured neutral and
-was thrown away. Use it to check you have not broken the program in general, not
-to decide whether you have done the thing you were asked.
+First, against the matchup: your child and the program you started from each
+play that opponent, on the same seasons and both seats, and the difference
+between them is reported. That matchup is the one taking the most games off us,
+and beating it is the job.
 
-Either way you get, in coins, both what your change is worth and how much noise
-is in the figure. Read the second number. If it is larger than the first, the run
+Then, against the program you started from directly. That is the bar the job has
+to clear on the way -- a program is promoted for beating what it replaces, so an
+edit that helps the matchup and loses to its own parent does not get in.
+
+You do not choose between these. For a long time only the second existed, which
+is how this lineage spent twenty-nine promotions without closing a three-percent
+gap: rounds were aimed at a matchup and graded against a sibling, so every edit
+that helped the matchup measured neutral and was thrown away.
+
+Each comes back in coins, with what your change is worth and how much noise is
+in the figure. Read the second number. If it is larger than the first, that run
 has told you nothing at all, and the two ways out are more seasons or a bigger
-change -- 128 games take fifteen seconds, so there is no reason to be economical
-about it.
+change.
+
+Measurements are not instant and you have to wait for them. `--against` plays
+both programs, so the default sixty-four seasons is 256 games and takes about
+two minutes; `--seeds 8` is 32 games and takes about fifteen. Open with
+`--seeds 8` on one edit, and spend the full block only on something that already
+looks worth settling. Do not start several at once -- they share the same cores,
+so three at a time is three times slower, not three times more evidence.
+
+A turn that ends while a measurement is still running produces nothing: the
+round is thrown away, the edit with it, and the next round starts from where
+this one did. Run the command, wait for its output, and read it. If you find
+yourself writing that you will review the results shortly, you are about to
+waste the round -- wait instead.
 
 Small samples do not merely say less, they mislead. The same edit measured +454
 over four seasons, +314 over sixteen, and +255 over sixty-four: the small sample

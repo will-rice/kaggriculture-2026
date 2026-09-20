@@ -165,3 +165,45 @@ def test_the_two_measurements_read_a_difference_the_same_way(
     assert "KEEP IT" in kept
     assert "REVERT IT" in dropped
     assert "THIS SAYS NOTHING" in unknown
+
+
+def test_one_run_answers_both_questions(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round does not choose which measurement to take, because it cannot.
+
+    There were two commands and the round picked between them. When only the
+    head-to-head existed it was the one they used, and it cannot see the matchup
+    a round is sent to beat -- twenty-nine promotions passed without closing a
+    three-percent gap that way. So the run reports the matchup and the
+    head-to-head together, and there is nothing to get wrong.
+    """
+    seen = []
+
+    def both(*arguments: object) -> None:
+        seen.append(arguments[2] if len(arguments) > 2 else None)
+
+    monkeypatch.setattr(measure, "against", lambda *a: seen.append("matchup"))
+    monkeypatch.setattr(measure, "compare", lambda *a: seen.append("head-to-head"))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["measure.py", "--against", "p1a2b3c4m1s1", "--seeds", "4"],
+    )
+
+    measure.main()
+
+    assert seen == ["matchup", "head-to-head"]
+
+
+def test_without_a_matchup_only_the_head_to_head_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first round on a lineage has no game to name, so there is no matchup."""
+    seen = []
+    monkeypatch.setattr(measure, "against", lambda *a: seen.append("matchup"))
+    monkeypatch.setattr(measure, "compare", lambda *a: seen.append("head-to-head"))
+    monkeypatch.setattr("sys.argv", ["measure.py", "--seeds", "4"])
+
+    measure.main()
+
+    assert seen == ["head-to-head"]

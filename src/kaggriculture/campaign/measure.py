@@ -75,7 +75,13 @@ SEEDS = tuple(range(101, 165))
 
 
 def main() -> None:
-    """Compare the two programs, or replay one season of the comparison."""
+    """Say whether the edit helped the matchup, and whether it beats its parent.
+
+    Both, not either. They preview the two things the gate asks -- the matchup
+    is the job a round is given, the head-to-head against the program it started
+    from is the bar the gate promotes on -- and a round offered the choice took
+    the one that could not see its job for twenty-nine promotions.
+    """
     args = parser().parse_args()
 
     # Absolute, because a worker is given a directory of its own and a relative
@@ -84,9 +90,13 @@ def main() -> None:
     if args.replay is not None:
         replay(child, parent, args.replay)
         return
+    # Both questions, always, because a round that has to choose between
+    # them chooses the one that cannot see what it was sent to do. The matchup
+    # first: it is the job, and the head-to-head is the bar the job has to
+    # clear on the way.
     if args.against is not None:
         against(child, parent, args.against, args.seeds)
-        return
+        print()
     compare(child, parent, args.seeds)
 
 
@@ -120,10 +130,12 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         metavar="EPISODE",
         help=(
-            "measure both programs against the matchup of this episode instead "
-            "of against each other, which is how to tell whether an edit helped "
-            "the matchup this round was given. Takes the episode key from the "
-            "message, e.g. `--against p1a2b3c4m1s1`"
+            "also measure both programs against the matchup of this episode, "
+            "which is how to tell whether an edit helped the matchup this round "
+            "was given. Takes the episode key from the message, e.g. "
+            "`--against p1a2b3c4m1s1`. Without it only the head-to-head against "
+            "the program you started from is reported, which cannot see the "
+            "matchup at all"
         ),
     )
     argue.add_argument("--child", type=pathlib.Path, default=HERE / "child.py")
