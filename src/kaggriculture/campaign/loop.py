@@ -596,6 +596,10 @@ class Campaign:
         # rather than in a session, because the eight run at once and a block
         # only makes candidates comparable if they share it.
         self.block: list[int] = []
+        # The extra seasons the champion pairing is played on, drawn with the
+        # block and disjoint from it. `seasons` explains why it is a slice of
+        # the same sample rather than a second draw.
+        self.duel: list[int] = []
         self.measured = 0
         # Calls in a row that ran to no verdict. A call that never reached the
         # model is nobody's failure, so it writes nothing and the worker
@@ -1329,17 +1333,22 @@ class Campaign:
         # Recorded before a game is played, so the gate can tell afterwards
         # whether the champion it is being compared against is the one it met.
         self.champion_played[program_id] = pool.opponents.get(config.POOL_CHAMPION, "")
+        # `seasons` first and on its own line, because it is what rotates the
+        # blocks: read inside the call's argument list it would depend on
+        # left-to-right evaluation order to leave `self.duel` current.
+        block = self.seasons()
         result = await asyncio.to_thread(
             evaluator.score,
             source,
             program_id,
             pool,
             random.Random(self.rng.random()),
-            self.seasons(),
+            block,
             self.workers,
             self.paths.pool,
             table,
             self.must_play(table),
+            self.duel,
         )
         # Every game of it, into the one database the nightly extraction also
         # writes to. Every candidate, not only the ones that survive: what
@@ -1373,10 +1382,19 @@ class Campaign:
         Called on the loop thread, where the counter is nobody else's.
         """
         if self.measured % config.SEED_ROTATION == 0:
-            self.block = self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
+            # One sample split in two, not two samples. `random.sample` cannot
+            # repeat within a draw, so the sweep's seasons and the champion
+            # pairing's extra seasons are disjoint by construction -- and a
+            # season played in both blocks would be the same game counted
+            # twice in that pairing's rate.
+            drawn = self.rng.sample(config.GATE_SEED_RANGE, config.DUEL_SEEDS)
+            self.block = drawn[: config.GATE_SEEDS]
+            self.duel = drawn[config.GATE_SEEDS :]
             LOGGER.info(
-                "seasons: a fresh block of %d after %d candidates",
+                "seasons: a fresh block of %d, and %d more against the "
+                "champion, after %d candidates",
                 config.GATE_SEEDS,
+                len(self.duel),
                 self.measured,
             )
         self.measured += 1

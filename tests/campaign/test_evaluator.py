@@ -78,6 +78,91 @@ def test_a_call_plays_the_seasons_it_is_handed(tmp_path: Path) -> None:
     assert first.seeds == again.seeds
 
 
+@pytest.mark.local_data
+def test_the_champion_pairing_is_played_deeper_than_the_rest_of_the_sweep(
+    tmp_path: Path,
+) -> None:
+    """The one pairing that decides a promotion gets its own seasons.
+
+    Every other opponent is played at the sweep's depth, which is set by what
+    a field of mostly-beaten agents needs. The champion decides the gate on
+    its own, so it is played on those seasons and the duel block as well --
+    and `config.POOL_CHAMPION` is found here rather than passed in, so no
+    caller can deepen the wrong pairing.
+    """
+    agent = tmp_path / "main.py"
+    agent.write_text(PASS, encoding="utf-8")
+    # The champion second, not first. `Pool.names` is insertion order, so a
+    # champion at the head would let "deepen whichever pairing comes first"
+    # pass this unnoticed -- which it did, until the two were swapped.
+    p = pool.Pool(
+        opponents={
+            "v56": str(config.OPPONENTS / "kaito_v56" / "main.py"),
+            config.POOL_CHAMPION: str(config.OPPONENTS / "kaito_v54" / "main.py"),
+        }
+    )
+
+    # `ours` is not a roster name, so it only resolves through the pool file.
+    p.save(tmp_path / "pool.json")
+
+    result = evaluator.score(
+        agent,
+        "prog",
+        p,
+        random.Random(1),
+        [5, 6],
+        workers=WORKERS,
+        pool_file=tmp_path / "pool.json",
+        duel_seeds=[7, 8, 9],
+    )
+
+    # Two seasons in both seats for an ordinary opponent; five for the
+    # champion, because the duel block is played on top of the sweep's.
+    assert len(result.states["v56"]) == 4
+    assert len(result.states[config.POOL_CHAMPION]) == 10
+    # And the sweep's own depth is untouched, because condition 1 reads it as
+    # the games behind every field rate.
+    assert result.games == 4
+
+
+@pytest.mark.local_data
+def test_without_a_duel_block_the_champion_is_played_at_the_sweep_depth(
+    tmp_path: Path,
+) -> None:
+    """The deepening is the duel block's doing, not the champion's name.
+
+    Mutating the guard in `score` to deepen unconditionally has to turn
+    something red, or the test above is only asserting that two numbers differ
+    for some reason it never pinned down.
+    """
+    agent = tmp_path / "main.py"
+    agent.write_text(PASS, encoding="utf-8")
+    # The champion second, not first. `Pool.names` is insertion order, so a
+    # champion at the head would let "deepen whichever pairing comes first"
+    # pass this unnoticed -- which it did, until the two were swapped.
+    p = pool.Pool(
+        opponents={
+            "v56": str(config.OPPONENTS / "kaito_v56" / "main.py"),
+            config.POOL_CHAMPION: str(config.OPPONENTS / "kaito_v54" / "main.py"),
+        }
+    )
+
+    p.save(tmp_path / "pool.json")
+
+    result = evaluator.score(
+        agent,
+        "prog",
+        p,
+        random.Random(1),
+        [5, 6],
+        workers=WORKERS,
+        pool_file=tmp_path / "pool.json",
+    )
+
+    assert len(result.states[config.POOL_CHAMPION]) == 4
+    assert len(result.states["v56"]) == 4
+
+
 def test_a_program_in_the_pool_is_never_played_against_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

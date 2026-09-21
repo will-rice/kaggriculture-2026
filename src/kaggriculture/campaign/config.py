@@ -204,6 +204,25 @@ ROUNDS_PER_OPPONENT = 12
 # graph and one more opponent is a whole new comparison where one more seed is
 # a slightly tighter old one.
 GATE_SEEDS = 16
+# The champion pairing alone, which the gate gives a veto no other opponent
+# has. The sweep above plays every pairing at `GATE_SEEDS`, and against an
+# opponent already beaten 1.000 that is ample -- more games buy nothing once
+# the interval is pinned at the ceiling. The head-to-head is the one pairing
+# whose games decide something, and it was being asked with too few to answer.
+#
+# Measured 2026-09-21. At 32 games a Wilson lower bound above 0.5 needs a rate
+# near 0.675 -- 22 wins of 32 -- so condition 3 was demanding a candidate beat
+# its parent seven games in ten, which is a rout rather than an improvement.
+# `pfe2ed71a20b0` won 0.594 of 32 and was refused at a lower bound of 0.423:
+# a real edge turned away for want of games, not for want of strength.
+#
+# Sixty-four seeds is 128 games and brings the rate needed down to about 0.59,
+# which is the size of edge an incremental improvement actually has. The bar
+# itself does not move -- still a 95% lower bound above 0.5 -- so this buys
+# evidence rather than lowering the standard, and a one-sided bound holds its
+# 5% false-promotion rate at any depth. It costs the 48 seeds the sweep did
+# not already play: 96 games against the sweep's ~5,800, about 1.7%.
+DUEL_SEEDS = 64
 # The whole space. Nothing is reserved any more: a set held back exists to
 # give a number the search cannot steer, and drawing fresh seeds every
 # evaluation already does that -- no program is ever measured on maps it or

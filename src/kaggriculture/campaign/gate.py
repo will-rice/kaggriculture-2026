@@ -227,7 +227,11 @@ def promotion(
        the mean by a fraction of its own bar.
     3. **Beating the champion head-to-head**: the Wilson lower bound of its rate
        against the champion above 0.5, over at least ``decisive_bar`` decided
-       games.
+       games. That pairing is played at `config.DUEL_SEEDS` rather than at the
+       sweep's `GATE_SEEDS`, because it is the only comparison here whose games
+       decide anything: read off the sweep's 32 this condition needed a rate
+       near 0.675 to clear, which is a rout rather than an improvement, and on
+       2026-09-21 it turned away a candidate winning 0.594 of them.
 
     The margin joined the first condition on 2026-09-16, on a measurement
     published in the competition's own discussions: a round-robin of fourteen

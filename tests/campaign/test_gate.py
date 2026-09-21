@@ -176,6 +176,32 @@ def test_a_better_rate_and_a_decisive_win_promotes() -> None:
     assert "against the field" in why and "lower bound" in why
 
 
+def test_the_edge_refused_at_the_sweep_depth_is_proven_at_the_duel_depth() -> None:
+    """One rate, two depths, and only the depth decides it.
+
+    Both calls carry the same head-to-head edge -- 0.59375, an improvement of
+    the size an incremental one actually has. At the sweep's 32 games its
+    Wilson lower bound is 0.423 and the gate refuses; at the duel's 128 it is
+    0.507 and the gate promotes.
+
+    This is `pfe2ed71a20b0`, refused at 15:49 on 2026-09-21 at 0.594 over 32
+    decided with a lower bound of 0.423 while passing every other condition.
+    The bar it failed is unchanged and still required here: a 95% lower bound
+    above 0.5. What it lacked was games, and the pairing that carries the
+    whole decision was being played at a depth chosen for the 180 opponents
+    that do not carry it -- most of them already beaten 1.000, where another
+    game moves nothing.
+    """
+    shallow, why = gate.promotion(*beat(19 / 32, 32))
+
+    assert not shallow
+    assert "not shown to beat it" in why
+
+    deep, why = gate.promotion(*beat(76 / 128, 128))
+
+    assert deep, why
+
+
 def test_a_better_rate_without_the_pairing_does_not_promote() -> None:
     """Beating the field on average is not beating the program it replaces.
 

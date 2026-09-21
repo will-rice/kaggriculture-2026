@@ -1617,6 +1617,7 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         pool_file: Path | None = None,
         standings: dict[str, float] | None = None,
         always: Sequence[str] = (),
+        duel_seeds: Sequence[int] = (),
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
         result = measure(agent, program_id, opponents, rng, seeds, workers, pool_file)
@@ -2349,6 +2350,38 @@ def test_candidates_share_a_block_of_seasons_and_it_rotates(
     # And a block is a full gate's worth of seasons, every time.
     assert all(len(block) == config.GATE_SEEDS for block in blocks)
     assert all(len(set(block)) == len(block) for block in blocks)
+
+
+def test_the_duel_block_never_shares_a_season_with_the_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Both blocks come out of one sample, so neither can repeat the other.
+
+    A season in both blocks is the same game played twice against the
+    champion, and both copies land in that pairing's rate and its decisive
+    count -- inflating the evidence behind the one condition that decides a
+    promotion, which is the opposite of what deepening it is for. Two
+    independent draws would collide rarely rather than never; one draw split
+    in two cannot collide at all.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "SEED_ROTATION", 1)
+    # A narrow range, because over the real one -- a million seeds -- two
+    # independent draws of 16 and 48 collide about once in a thousand runs,
+    # and a test that only fails then is a test that never fails. From 79
+    # seeds two independent draws overlap on about ten every time, while one
+    # sample split in two still cannot repeat itself.
+    monkeypatch.setattr(config, "GATE_SEED_RANGE", range(1, 80))
+
+    for _ in range(5):
+        block = campaign.seasons()
+
+        assert len(block) == config.GATE_SEEDS
+        assert len(campaign.duel) == config.DUEL_SEEDS - config.GATE_SEEDS
+        assert not set(block) & set(campaign.duel)
+        # The pairing is played over both, so together they are the depth the
+        # gate's third condition is read at.
+        assert len(set(block) | set(campaign.duel)) == config.DUEL_SEEDS
 
 
 async def _one_harvest(campaign: loop.Campaign) -> None:
