@@ -454,6 +454,21 @@ STAGNATION_SESSIONS = 40
 # ten-to-twenty-five minutes an answer takes, and the shortest reset seen so far
 # is a five-hour window.
 QUOTA_WAIT = 5 * 60
+# How long a refused entitlement is left alone before it is asked again.
+#
+# The rotation used to rediscover the same exhaustion every round: opus
+# refused, sonnet refused, the gemini pool answered, and the next round opened
+# by asking opus again. Measured 2026-09-21 the pair took about two and a half
+# minutes to refuse, against rounds composing every three -- so most of a
+# round's setup was spent confirming a wall that agy already reports, with a
+# reset time attached, in the refusal itself.
+#
+# Thirty minutes rather than that reset time, which arrives as prose ("Resets
+# in 2h48m38s") and would have to be parsed to be trusted. The cost of being
+# wrong is bounded and small in both directions: at worst half an hour of not
+# using an entitlement that came back early, against a couple of minutes a
+# round saved while it is genuinely out.
+QUOTA_COOLDOWN = 30 * 60
 # Calls in a row that may run to no verdict before the campaign stops. A call
 # that never reached the model is nobody's failure and writes nothing, so
 # without this the loop spins at full rate on an expired login, a withdrawn

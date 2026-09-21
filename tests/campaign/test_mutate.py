@@ -1121,6 +1121,100 @@ def test_a_program_out_of_quota_hands_the_round_to_the_next() -> None:
     assert got.status == "ok"
 
 
+def test_a_refused_program_is_not_asked_again_while_it_cools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The waste this exists to stop, measured on 2026-09-21.
+
+    Every round opened by asking the claude entitlement, waiting about two and
+    a half minutes for opus and sonnet to refuse, and then getting its answer
+    from the gemini pool -- against rounds composing every three minutes. The
+    refusal is not news after the first one: an entitlement that just ran out
+    stays out for hours, and agy says so in the refusal itself.
+    """
+    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 10_000)
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [
+            Stub(
+                "agy", spent("ERROR; Individual quota reached. Resets in 2h48m"), asked
+            ),
+            Stub("gemini", answered(), asked),
+        ]
+    )
+
+    first = asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+    second = asyncio.run(rotation(Path("/tmp"), "message", "p2"))
+
+    assert first.status == "ok" and second.status == "ok"
+    # Asked once, then skipped: the second round goes straight to the one that
+    # answered.
+    assert asked == ["agy", "gemini", "gemini"]
+
+
+def test_a_cooled_program_is_asked_again_once_the_cooldown_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipping is a delay, never a retirement.
+
+    An entitlement comes back, and when it does it is the one the rotation
+    prefers -- it leads the order for a reason. A cooldown that never expired
+    would quietly demote the best program for the rest of the run.
+    """
+    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [
+            Stub(
+                "agy", spent("ERROR; Individual quota reached. Resets in 2h48m"), asked
+            ),
+            Stub("gemini", answered(), asked),
+        ]
+    )
+
+    asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+    asyncio.run(rotation(Path("/tmp"), "message", "p2"))
+
+    assert asked == ["agy", "gemini", "agy", "gemini"]
+
+
+def test_a_program_that_answers_stops_cooling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline left behind an answer would skip a program that works."""
+    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    asked: list[str] = []
+    rotation = mutate.Rotating(
+        [Reviving(refusals=1, asked=[]), Stub("gemini", answered(), asked)]
+    )
+
+    asyncio.run(rotation(Path("/tmp"), "message", "p1"))
+    # Refused, so it carries a deadline -- an expired one here, but a deadline.
+    assert rotation.spent[0] > 0.0
+
+    asyncio.run(rotation(Path("/tmp"), "message", "p2"))
+
+    # Answered, so the deadline is gone rather than left behind to be compared
+    # against on every later round.
+    assert rotation.spent[0] == 0.0
+
+
+def test_the_two_agy_entries_are_told_apart_by_name() -> None:
+    """The log's whole job here, and what it could not do before.
+
+    Two of the rotation's programs are `AgyMutator`; only the model says which
+    entitlement a call bills. With the class name alone a fallback to the
+    gemini pool and a loop stuck on the claude one wrote the same line, and
+    telling them apart on 2026-09-21 needed `/proc/<pid>/cmdline`.
+    """
+    names = [mutate.named(driver) for driver in mutate.build().drivers]
+
+    agy = [one for one in names if one.startswith("AgyMutator")]
+    assert len(agy) == 2, names
+    assert agy[0] != agy[1]
+    assert len(set(names)) == len(names), names
+
+
 def test_a_program_with_quota_is_the_only_one_asked() -> None:
     """A run with quota must behave exactly as it did before rotation existed."""
     asked: list[str] = []
@@ -1286,6 +1380,7 @@ def test_an_exhausted_rotation_waits_instead_of_failing_the_round(
     nothing had run.
     """
     monkeypatch.setattr(config, "QUOTA_WAIT", 0)
+    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
     asked: list[int] = []
     rotation = mutate.Rotating([Reviving(refusals=2, asked=asked)])
 
@@ -1300,6 +1395,7 @@ def test_the_wait_is_what_it_is_configured_to_be(
 ) -> None:
     """Polling is free next to an answer, but it is not free of a clock."""
     monkeypatch.setattr(config, "QUOTA_WAIT", 7)
+    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
     slept: list[float] = []
 
     async def note(seconds: float) -> None:
@@ -1314,13 +1410,16 @@ def test_the_wait_is_what_it_is_configured_to_be(
     assert slept == [7, 7]
 
 
-def test_waiting_ends_when_the_loop_is_shut_down() -> None:
+def test_waiting_ends_when_the_loop_is_shut_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Cancellation is what ends the wait, because nothing else does.
 
     The rotation does not give up on its own -- that is the point -- so the only
     thing that must be able to end it is the cancellation a stopping loop
     delivers to every round in flight.
     """
+    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
     asked: list[int] = []
     # Never revives, so only cancellation can end this.
     rotation = mutate.Rotating([Reviving(refusals=10**6, asked=asked)])

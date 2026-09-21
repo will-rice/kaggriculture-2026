@@ -1443,6 +1443,24 @@ def selected() -> str:
 EXHAUSTED = ("quota", "usage limit", "rate limit", "insufficient_quota")
 
 
+def named(driver: "Mutator") -> str:
+    """What to call a program in the log.
+
+    Two of the rotation's entries are `AgyMutator`, differing only in which
+    entitlement their model bills, so the class name alone cannot say which
+    one refused or which one answered -- and that is exactly the question the
+    log is read to answer.
+
+    Args:
+        driver: The program to name.
+
+    Returns:
+        The class name, and the model where the program chooses one.
+    """
+    source = getattr(driver, "source", None)
+    return f"{type(driver).__name__}({source()})" if source else type(driver).__name__
+
+
 def out_of_quota(mutation: "Mutation") -> bool:
     """Whether this call failed because the entitlement is spent.
 
@@ -1489,6 +1507,11 @@ class Rotating:
             drivers: The programs to try, in the order to try them.
         """
         self.drivers = drivers
+        # When each program may be asked again, as a monotonic deadline. An
+        # entitlement that just refused will refuse for hours, and asking it
+        # anyway costs the round the couple of minutes the refusal takes to
+        # arrive -- paid per round, against rounds that compose every three.
+        self.spent = [0.0] * len(drivers)
         self.SKILLS_DIRS: tuple[Path, ...] = tuple(
             dict.fromkeys(one for driver in drivers for one in driver.SKILLS_DIRS)
         )
@@ -1520,17 +1543,30 @@ class Rotating:
         assert self.drivers, "a rotation with no drivers in it"
         waited = 0
         while True:
-            for driver in self.drivers:
+            # None when every program was still on cooldown this pass, which
+            # is the one case there is no fresh refusal to report.
+            refused: Mutation | None = None
+            for index, driver in enumerate(self.drivers):
+                if self.spent[index] > time.monotonic():
+                    continue
                 outcome = await driver(workspace, message, program_id)
                 if not out_of_quota(outcome):
                     if waited:
                         LOGGER.info("%s: quota is back after %ds", program_id, waited)
+                    # On success too, not only on failure. Every line this
+                    # wrote used to be an error, so the program that was
+                    # working was the one thing the log never mentioned.
+                    LOGGER.info("%s: %s answered", program_id, named(driver))
+                    self.spent[index] = 0.0
                     return outcome
+                self.spent[index] = time.monotonic() + config.QUOTA_COOLDOWN
+                refused = outcome
                 LOGGER.warning(
-                    "%s: %s has no quota (%s); trying the next program",
+                    "%s: %s has no quota (%s); leaving it alone for %ds",
                     program_id,
-                    type(driver).__name__,
+                    named(driver),
                     outcome.reason[:80],
+                    config.QUOTA_COOLDOWN,
                 )
             # Everything is out. Waiting rather than failing, because a round
             # that produced nothing counts toward stagnation and is shown to the
@@ -1540,10 +1576,19 @@ class Rotating:
                 "%s: every program is out of quota; waiting %ds (%s)",
                 program_id,
                 config.QUOTA_WAIT,
-                outcome.reason[:120],
+                refused.reason[:120] if refused else "all of them on cooldown",
             )
-            await asyncio.sleep(config.QUOTA_WAIT)
-            waited += config.QUOTA_WAIT
+            # To the soonest deadline when nothing was even asked, because
+            # waking on `QUOTA_WAIT` would find every program still cooling
+            # and sleep again -- and with one program in the rotation it would
+            # never ask anybody at all.
+            nap = (
+                config.QUOTA_WAIT
+                if refused is not None
+                else max(0.0, min(self.spent) - time.monotonic())
+            )
+            await asyncio.sleep(nap)
+            waited += nap
 
 
 def build() -> "Rotating":
