@@ -295,15 +295,34 @@ def promotion(
     common = sorted((set(result.rates) & set(champion.result.rates)) - {name})
     if not common:
         return False, f"no opponent in common with {name}"
-    mine = sum(result.rates[one] for one in common) / len(common)
-    theirs = sum(champion.result.rates[one] for one in common) / len(common)
-    played = max(1, len(common) * max(1, result.games))
+    # The mean is taken over the opponents the champion does not already
+    # sweep. An opponent at 1.000 has no room above it, so it says nothing
+    # about whether a candidate improved, and on 2026-09-21 there were 145 of
+    # them against 31 that could move -- the difference between a mean of
+    # 0.9661 and one of 0.8075, which is the difference between a number
+    # nobody can read and one that tracks the only games left to win.
+    #
+    # It is not more sensitive, and that was measured rather than assumed: an
+    # opponent at 1.000 contributes `p(1-p) = 0` variance as well as no room,
+    # so dropping those terms shrinks the signal and the noise by the same
+    # factor and the bar lands near one opponent-unit either way. What this
+    # buys is legibility, not power. Power is what `_gained` below is for.
+    #
+    # Chosen by the *champion's* rates and never the candidate's, so a
+    # candidate cannot pick its own denominator. A champion that sweeps
+    # everything leaves it empty and the mean falls back to every shared
+    # opponent -- the champion_19 case, where no program that could exist
+    # scores higher and this condition has nothing left to say.
+    keen = [one for one in common if champion.result.rates[one] < 1.0] or common
+    mine = sum(result.rates[one] for one in keen) / len(keen)
+    theirs = sum(champion.result.rates[one] for one in keen) / len(keen)
+    played = max(1, len(keen) * max(1, result.games))
     error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
     bar = 2 * error
     if theirs - mine > bar:
         return False, (
             f"{mine:.3f} against the field where {name} has {theirs:.3f} over "
-            f"{len(common)} shared opponents: {mine - theirs:+.3f} is behind by "
+            f"{len(keen)} contested opponents: {mine - theirs:+.3f} is behind by "
             f"more than twice its error of {bar:.3f}"
         )
 
@@ -329,6 +348,16 @@ def promotion(
             + ": a mean over the field cannot see one matchup thrown away"
         )
 
+    gained = _gained(result, champion, common)
+    if gained:
+        one, mine_one, theirs_one = gained[0]
+        return True, (
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f} on "
+            f"{len(keen)} contested opponents, nothing given back, and {one} "
+            f"went from {theirs_one:.3f} to {mine_one:.3f}"
+            + (f" with {len(gained) - 1} more opponent(s)" if len(gained) > 1 else "")
+        )
+
     decided = result.decisive.get(name, 0)
     rate = result.rates[name]
     if decided < decisive_bar:
@@ -348,6 +377,70 @@ def promotion(
         f"{rate:.3f} against {name} over {decided} decided has lower bound "
         f"{low:.3f}: not shown to beat it"
     )
+
+
+def _gained(
+    result: Result, champion: "Champion", common: list[str]
+) -> list[tuple[str, float, float]]:
+    """Opponents the candidate pulled ahead on, beyond the joint noise.
+
+    The upward half of `_slipped`, and the reason the gate has an objective
+    rather than only a ratchet. Every other condition refuses a candidate for
+    getting worse; this one promotes it for getting better at a specific
+    opponent, which is where the rating that is left to win actually lives.
+
+    Measured 2026-09-21 on champion_30: of 176 opponents it sweeps 145 at
+    1.000, and of the twelve contested outsiders one --
+    `haideptry_the_2950_peak_farm` -- takes all 32 games. Fixing that is the
+    single most valuable change available and no condition here could see it.
+    The field mean could not: moving it to an even 0.500 shifts the mean by
+    less than half the bar, because a mean spreads one opponent's evidence
+    across every denominator. `_slipped` could not either, by construction --
+    its family needs the champion to have something to lose, and against this
+    opponent the champion has nothing.
+
+    Per opponent the same change is decisive. At 32 games and a family of 31
+    the bar is 2.95 standard errors, which a candidate clears by taking seven
+    games off an opponent the champion takes none from -- about a fifth of an
+    opponent-unit, where the mean needs nine tenths of one.
+
+    The family is the opponents with room above them, the champion's rate
+    below 1.000, which is a count the candidate does not influence. The
+    correction matters as much here as in `_slipped` and in the same
+    direction: at 1.96 apiece over thirty-one opponents a candidate clears by
+    chance better than one time in four, which is a gate that opens on noise.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it is being measured against.
+        common: Opponents both were measured against, the champion excluded.
+
+    Returns:
+        ``(name, candidate rate, champion rate)`` per gain, largest first.
+    """
+    family = [one for one in common if champion.result.rates[one] < 1.0]
+    if not family:
+        return []
+    # One-sided, like the guard: a candidate falling behind on some opponent
+    # is `_slipped`'s business, and it has already refused before this runs.
+    bar = float(scipy.stats.norm.ppf(1 - 0.05 / len(family)))
+    mine_games = max(1, result.games)
+    theirs_games = max(1, champion.result.games)
+    gained = []
+    for one in family:
+        mine = result.rates[one]
+        theirs = champion.result.rates[one]
+        if mine <= theirs:
+            continue
+        error = math.sqrt(
+            mine * (1 - mine) / mine_games + theirs * (1 - theirs) / theirs_games
+        )
+        # Zero error with a gain is a pairing that went 0.000 to 1.000 on
+        # every game of both measurements, which is evidence rather than the
+        # absence of it -- the same reading `_slipped` gives a certain loss.
+        if error == 0.0 or mine - theirs > bar * error:
+            gained.append((one, mine, theirs))
+    return sorted(gained, key=lambda row: row[1] - row[2], reverse=True)
 
 
 def _slipped(

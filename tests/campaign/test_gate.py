@@ -255,6 +255,118 @@ def test_a_rate_level_with_the_champion_promotes_on_the_pairing() -> None:
     assert "not shown to beat it" in why
 
 
+def test_a_gain_on_one_opponent_promotes_without_winning_the_pairing() -> None:
+    """The objective, not the ratchet. The route added 2026-09-21.
+
+    Every other condition refuses a candidate for getting worse. This one
+    promotes it for getting better against a specific opponent, which is where
+    the rating left to win lives: champion_30 sweeps 145 of 176 opponents and
+    takes no games at all off `haideptry_the_2950_peak_farm`, and nothing in
+    the gate could see that fixed. The field mean could not -- one opponent's
+    evidence spread over every denominator is under half the bar -- and
+    `_slipped` could not, because its family needs the champion to have
+    something to lose.
+
+    Here the head-to-head is 17 of 32, a lower bound well under 0.5, so the
+    pairing route refuses. The candidate promotes on the opponent instead.
+    """
+    result, standing = beat(17 / 32, 32)
+    result.rates["public_0"] = 0.719
+    standing.result.rates["public_0"] = 0.20
+
+    clear, why = gate.promotion(result, standing)
+
+    assert clear, why
+    assert "public_0" in why and "0.200 to 0.719" in why
+
+
+def test_a_gain_too_small_to_show_is_not_a_gain() -> None:
+    """The correction is doing real work, so a nudge is not a promotion.
+
+    Without it, at 1.96 apiece over thirty-one opponents a candidate clears by
+    chance better than one time in four, and the gate opens on noise.
+
+    0.500 against the champion's 0.200 is chosen because it is inside the
+    window where the correction is the only thing refusing: the gain is 0.300
+    against a standard error of 0.1132, which clears 1.96 and does not clear
+    2.807. At 0.30-against-0.20 -- the field this helper builds -- nothing is
+    significant either way, so that pairing cannot tell the two bars apart and
+    this test watched a mutation drop the correction and stay green.
+    """
+    result, standing = beat(17 / 32, 32)
+    result.rates["public_0"] = 0.500
+    standing.result.rates["public_0"] = 0.200
+
+    shy, why = gate.promotion(result, standing)
+
+    assert not shy
+    assert "not shown to beat it" in why
+
+
+def test_a_gain_does_not_excuse_ground_given_back_elsewhere() -> None:
+    """Improve somewhere, regress nowhere -- and the regression wins ties.
+
+    `_slipped` runs before the gain route, so a candidate that trades one
+    matchup for another is refused rather than promoted on the half it won.
+    """
+    result, standing = beat(17 / 32, 32)
+    result.rates["public_0"] = 0.719
+    standing.result.rates["public_0"] = 0.20
+    # And one thrown away: a clean sweep the candidate now loses outright.
+    result.rates["public_1"] = 0.0
+    standing.result.rates["public_1"] = 1.0
+
+    traded, why = gate.promotion(result, standing)
+
+    assert not traded
+    assert "public_1" in why and "a mean over the field cannot see" in why
+
+
+def test_the_mean_leaves_out_the_opponents_the_champion_already_sweeps() -> None:
+    """A number a human can read, not a more sensitive one.
+
+    Adding a hundred and fifty swept opponents moves the old mean from 0.300
+    to about 0.906 and the champion's from 0.200 to 0.917, which says nothing
+    a reader can use. The contested mean ignores them, because an opponent at
+    1.000 has no room above it.
+
+    It is not more powerful and the test does not claim it is: an opponent at
+    1.000 contributes zero variance as well as zero room, so signal and noise
+    shrink together and the verdict is the same either way. What changes is
+    what the verdict reports.
+    """
+    result, standing = beat(28 / 32, 32)
+    for i in range(150):
+        result.rates[f"swept_{i}"] = 1.0
+        standing.result.rates[f"swept_{i}"] = 1.0
+
+    clear, why = gate.promotion(result, standing)
+
+    assert clear, why
+    # The twenty that can still move, not the hundred and seventy played.
+    assert "0.300 against the field" in why
+    assert "0.906" not in why
+
+
+def test_a_champion_that_sweeps_everything_still_gets_a_mean() -> None:
+    """champion_19 beat every agent in the pool, and the gate has to cope.
+
+    With no opponent below 1.000 the contested family is empty, so the mean
+    falls back to every shared opponent rather than dividing by zero. There is
+    nothing this condition can say in that state -- no program that exists
+    scores higher -- which is why the pairing decides it.
+    """
+    result, standing = beat(28 / 32, 32)
+    for name in list(standing.result.rates):
+        standing.result.rates[name] = 1.0
+        result.rates[name] = 1.0
+
+    clear, why = gate.promotion(result, standing)
+
+    assert clear, why
+    assert "1.000 against the field" in why
+
+
 def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:
     """Two programs that draw are the same program, whatever the rate says.
 
