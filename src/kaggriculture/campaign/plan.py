@@ -54,7 +54,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    ValidationError,
     model_validator,
 )
 
@@ -934,8 +933,15 @@ def gather(box: Path, name: str = "child.py") -> str:
     # broken file.
     try:
         return join(source, json.loads(plan_file.read_text(encoding="utf-8")))
-    except (ValidationError, json.JSONDecodeError) as broken:
+    except ValueError as broken:
+        # `ValueError` rather than the two the plan can fail with, because the
+        # controller can fail too and does: `join` raises it from eight places
+        # -- no loader to pack back into, no `_SETTINGS` line, a packed plan
+        # holding a quote -- and a round that rewrites `child.py` instead of
+        # `plan.json` hits those. One of them killed the main lineage for ten
+        # hours on 2026-09-21. Both `ValidationError` and `JSONDecodeError`
+        # subclass this, so the wider clause is also the shorter one.
         raise BrokenPlanError(
-            f"`{PLAN_FILE}` is not a plan this can pack back into a program, so "
-            f"the round produced nothing runnable: {broken}"
+            f"what this round wrote does not pack back into a program, so it "
+            f"produced nothing runnable: {broken}"
         ) from broken

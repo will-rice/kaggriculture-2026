@@ -947,8 +947,11 @@ def test_a_plan_the_schema_refuses_is_a_broken_plan_not_a_pydantic_error(
     with pytest.raises(plan.BrokenPlanError) as broken:
         plan.gather(tmp_path)
 
-    assert plan.PLAN_FILE in str(broken.value)
+    # The message does not name `plan.json`: the same failure arrives from the
+    # controller side too, where naming the plan file would be wrong. What it
+    # must carry is which field the round got wrong.
     assert "settings" in str(broken.value)
+    assert "does not pack back into a program" in str(broken.value)
 
 
 def test_a_plan_that_is_not_even_json_is_the_same_kind_of_failure(
@@ -978,3 +981,30 @@ def test_a_whole_plan_still_packs_back_into_a_program(tmp_path: Path) -> None:
     packed = plan.gather(tmp_path)
 
     assert plan.split(packed)[1] == carried
+
+
+def test_a_controller_the_plan_cannot_be_packed_into_is_a_broken_plan(
+    tmp_path: Path,
+) -> None:
+    """What killed the main lineage for ten hours on 2026-09-21.
+
+    The guard added the day before caught the two ways the *plan* can be wrong.
+    `join` raises a plain `ValueError` from eight other places, all about the
+    *controller* -- no loader to pack back into, no `_SETTINGS` line, a packed
+    plan holding a quote -- and a round that rewrites `child.py` instead of
+    `plan.json` hits those. One did, at 01:33, and it went up through the worker
+    and the task group while the island ran on unaware.
+    """
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, carried = plan.split(champion)
+    # A controller that still loads a plan but has lost the line `join` writes
+    # the settings back into.
+    (tmp_path / "child.py").write_text(
+        controller.replace("_SETTINGS=", "_GONE="), encoding="utf-8"
+    )
+    (tmp_path / plan.PLAN_FILE).write_text(json.dumps(carried), encoding="utf-8")
+
+    with pytest.raises(plan.BrokenPlanError) as broken:
+        plan.gather(tmp_path)
+
+    assert "does not pack back into a program" in str(broken.value)
