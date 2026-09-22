@@ -43,12 +43,8 @@ board:
 - `shops` maps the two shops a map happens to have to a route number, so it
   chooses which season gets played. 64 lines, and the smallest change that
   makes the agent play a different game.
-- `settings` switches the chassis's nine reactive layers on and off: selling
-  ahead of the opponent, liquidating at the end, funding a block before it
-  spends. These were in `child.py` until today, where no round editing the plan
-  could reach them. All 512 combinations have now been played and the current
-  one is the best, so this part is a settled question rather than somewhere to
-  look.
+- `settings` switches the chassis's nine reactive layers on and off. The
+  controller's own table names them and says what each one hooks into.
 
 So there are two kinds of edit. Changing a pooled step changes that step
 everywhere every season cites it. Changing a season's indices changes the order
