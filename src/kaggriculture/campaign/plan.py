@@ -727,15 +727,7 @@ def split(source: str) -> tuple[str, dict]:
 
     # The strategy the controller keeps in its own source. Read here so the
     # plan is the whole of it, and written back by `join`.
-    # The chassis builds its config as the defaults with the overrides applied,
-    # so this reads it the same way rather than guessing which line a value is
-    # on. Only the keys the schema names are taken; the rest of
-    # `DEFAULT_SETTINGS` restates the engine.
-    chassis = ast.literal_eval(_carried(source, CARRIED_DEFAULTS))
-    chassis.update(ast.literal_eval(_carried(source, CARRIED_SETTINGS)))
-    carried["settings"] = {
-        name: chassis[name] for name in Settings.model_fields if name in chassis
-    }
+    carried["settings"] = carried_settings(source)
     # `_R42_OPENING` replaces step 0's market orders in every route, so the
     # plan's own `actions[0]` never runs. Every route cites entry 0 there and
     # nothing cites it elsewhere, so putting the opening in it is exact.
@@ -908,6 +900,32 @@ class BrokenPlanError(ValueError):
     """
 
 
+def carried_settings(source: str) -> dict:
+    """The chassis settings a controller keeps in its own source.
+
+    The chassis builds its config as the defaults with the overrides applied,
+    so this reads it the same way rather than guessing which line a value is
+    on. Only the keys the schema names are taken; the rest of
+    `DEFAULT_SETTINGS` restates the engine.
+
+    Read by `split`, which lifts it into the plan so a round sees the whole
+    strategy in one file, and by `gather`, which puts it back when a round
+    rewrote `plan.json` without it.
+
+    Args:
+        source: A controller, packed or unpacked -- both carry the lines.
+
+    Returns:
+        The settings the schema names, defaults under overrides.
+
+    Raises:
+        ValueError: The controller carries no settings lines.
+    """
+    chassis = ast.literal_eval(_carried(source, CARRIED_DEFAULTS))
+    chassis.update(ast.literal_eval(_carried(source, CARRIED_SETTINGS)))
+    return {name: chassis[name] for name in Settings.model_fields if name in chassis}
+
+
 def gather(box: Path, name: str = "child.py") -> str:
     """Read a round's program back as one self-contained file.
 
@@ -932,7 +950,23 @@ def gather(box: Path, name: str = "child.py") -> str:
     # game -- and the campaign would read that as a bad idea rather than a
     # broken file.
     try:
-        return join(source, json.loads(plan_file.read_text(encoding="utf-8")))
+        written = json.loads(plan_file.read_text(encoding="utf-8"))
+        # `settings` is the controller's, not the plan file's: `split` lifts it
+        # out of `_SETTINGS` so a round can see the whole strategy in one
+        # place, and `join` writes it back to the same line. A round that
+        # regenerates `plan.json` and omits it has changed nothing -- the
+        # values are still in the controller this is about to pack -- so take
+        # them from there rather than failing the round over a key it never
+        # meant to touch. Thirteen of twenty-two rounds died on exactly this
+        # overnight on 2026-09-22.
+        #
+        # `isinstance` because a round that wrote a list would otherwise raise
+        # `TypeError` here, which is not a `ValueError` and would go straight
+        # past the clause below and up into the loop -- the shape of crash that
+        # killed the main lineage for ten hours the day before.
+        if isinstance(written, dict) and "settings" not in written:
+            written["settings"] = carried_settings(source)
+        return join(source, written)
     except ValueError as broken:
         # `ValueError` rather than the two the plan can fail with, because the
         # controller can fail too and does: `join` raises it from eight places

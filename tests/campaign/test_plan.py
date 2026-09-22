@@ -925,23 +925,27 @@ def test_a_plan_the_schema_refuses_is_a_broken_plan_not_a_pydantic_error(
 ) -> None:
     """What took both lineages down on 2026-09-20.
 
-    A round edited `plan.json` and dropped `settings`. `gather` validated it --
-    which is its job, and its docstring says the check is there "where the round
-    can still be told it wrote nothing usable" -- and raised `ValidationError`,
-    which no caller catches. It went up through the driver, the worker and the
-    task group and killed the run.
+    A round edited `plan.json`, the result did not satisfy `Plan`, and `gather`
+    raised `ValidationError` -- which no caller catches. It went up through the
+    driver, the worker and the task group and killed the run.
 
     `BrokenPlanError` is a `ValueError` the campaign can tell apart from a pydantic
     error of its own, which anywhere else would be a bug in the campaign rather
     than a model writing something malformed.
+
+    The example used to be a plan with `settings` dropped, because that is what
+    the round that killed the run had written. It is no longer a refusal: those
+    values live in the controller's `_SETTINGS` line rather than in the plan
+    file, so omitting them changes nothing and `gather` fills them back in --
+    see `test_a_plan_written_without_settings_keeps_the_controller_s`. An empty
+    `actions` is a plan that genuinely cannot be packed: every route cites
+    entries in it, so there is no program on the other side.
     """
     champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
     controller, carried = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
-    # Everything but `settings`, which is exactly what the round dropped.
     (tmp_path / plan.PLAN_FILE).write_text(
-        json.dumps({key: carried[key] for key in ("actions", "routes", "shops")}),
-        encoding="utf-8",
+        json.dumps({**carried, "actions": []}), encoding="utf-8"
     )
 
     with pytest.raises(plan.BrokenPlanError) as broken:
@@ -950,7 +954,7 @@ def test_a_plan_the_schema_refuses_is_a_broken_plan_not_a_pydantic_error(
     # The message does not name `plan.json`: the same failure arrives from the
     # controller side too, where naming the plan file would be wrong. What it
     # must carry is which field the round got wrong.
-    assert "settings" in str(broken.value)
+    assert "actions" in str(broken.value)
     assert "does not pack back into a program" in str(broken.value)
 
 
@@ -981,6 +985,75 @@ def test_a_whole_plan_still_packs_back_into_a_program(tmp_path: Path) -> None:
     packed = plan.gather(tmp_path)
 
     assert plan.split(packed)[1] == carried
+
+
+def test_a_plan_written_without_settings_keeps_the_controller_s(
+    tmp_path: Path,
+) -> None:
+    """What cost thirteen of twenty-two rounds overnight on 2026-09-22.
+
+    `settings` is not the plan file's to begin with. It lives in the
+    controller's `_SETTINGS` line; `split` lifts it into the plan so a round
+    sees the whole strategy in one place, and `join` writes it back to that
+    same line. So a round that regenerates `plan.json` and does not restate
+    the key has changed nothing -- and every one of those thirteen rounds died
+    on "1 validation error for Plan / settings / Field required" while its
+    transcript shows it had read the full plan first.
+    """
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, carried = plan.split(champion)
+    (tmp_path / "child.py").write_text(controller, encoding="utf-8")
+    without = {name: value for name, value in carried.items() if name != "settings"}
+    (tmp_path / plan.PLAN_FILE).write_text(json.dumps(without), encoding="utf-8")
+
+    packed = plan.gather(tmp_path)
+
+    _, back = plan.split(packed)
+    assert back["settings"] == carried["settings"]
+
+
+def test_settings_a_round_did_write_are_the_ones_that_are_kept(
+    tmp_path: Path,
+) -> None:
+    """Filling a gap, never overriding a choice.
+
+    Tuning those switches is a thing a round is asked to do, so the value it
+    wrote has to survive. If the controller's copy won instead, the gate would
+    be scoring an edit the round did not make.
+    """
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, carried = plan.split(champion)
+    (tmp_path / "child.py").write_text(controller, encoding="utf-8")
+    chosen = dict(carried["settings"])
+    chosen["front_run"] = not chosen["front_run"]
+    (tmp_path / plan.PLAN_FILE).write_text(
+        json.dumps({**carried, "settings": chosen}), encoding="utf-8"
+    )
+
+    packed = plan.gather(tmp_path)
+
+    _, back = plan.split(packed)
+    assert back["settings"]["front_run"] == chosen["front_run"]
+    assert back["settings"] != carried["settings"]
+
+
+def test_a_plan_that_is_not_an_object_is_still_a_broken_plan(
+    tmp_path: Path,
+) -> None:
+    """The fill-in must not turn one crash into a worse one.
+
+    Subscripting a list raises `TypeError`, which is not a `ValueError` and
+    would go straight past the clause that turns a bad plan into a failed
+    round -- up through the worker and into the loop, which is the shape of
+    crash that killed the main lineage for ten hours on 2026-09-21.
+    """
+    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    controller, _ = plan.split(champion)
+    (tmp_path / "child.py").write_text(controller, encoding="utf-8")
+    (tmp_path / plan.PLAN_FILE).write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+
+    with pytest.raises(plan.BrokenPlanError):
+        plan.gather(tmp_path)
 
 
 def test_a_controller_the_plan_cannot_be_packed_into_is_a_broken_plan(
