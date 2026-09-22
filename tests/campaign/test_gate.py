@@ -367,6 +367,92 @@ def test_a_champion_that_sweeps_everything_still_gets_a_mean() -> None:
     assert "1.000 against the field" in why
 
 
+def test_the_screen_never_refuses_what_the_gate_would_promote() -> None:
+    """The whole safety argument, asserted rather than reasoned about.
+
+    The screen exists to avoid playing 126 opponents at 1.000 to reach a
+    verdict the 58 contested ones already decide. It is only sound because it
+    is the *same* test on the *same* seasons -- so anything `promotion` clears,
+    `screened` must clear too, or the campaign is silently throwing away
+    champions to save twenty minutes.
+    """
+    cases = [
+        # Comfortably ahead on the field, a range of pairings.
+        (17 / 32, 0.30, 0.20),
+        (28 / 32, 0.30, 0.20),
+        (31 / 32, 0.30, 0.20),
+        # The case that separates a correct screen from a stricter one: behind
+        # on the contested mean but inside its noise, and winning the pairing.
+        # `promotion` promotes this; a screen asking for "not behind at all"
+        # would throw the champion away to save twenty minutes.
+        (28 / 32, 0.2209, 0.2253),
+        (30 / 32, 0.2100, 0.2253),
+    ]
+    for rate, field, champion_field in cases:
+        result, standing = beat(rate, 32, field=field, champion_field=champion_field)
+
+        promoted, gated_why = gate.promotion(result, standing)
+        held, why = gate.screened(result, standing)
+
+        if promoted:
+            assert held, f"gate promoted ({gated_why}) but screen refused: {why}"
+
+
+def test_the_screen_refuses_a_candidate_behind_on_the_contested_field() -> None:
+    """And it has to actually refuse something, or it saves nothing.
+
+    0.114 against a champion's 0.155 is the `champion_3` case -- the regression
+    that taught the campaign it needed a field condition at all -- and it is
+    refused here without playing the swept opponents.
+    """
+    result, standing = beat(28 / 32, 32, field=0.114, champion_field=0.155)
+
+    held, why = gate.screened(result, standing)
+
+    assert not held
+    assert "behind by more than twice its error" in why
+
+
+def test_the_screen_and_the_gate_refuse_in_the_same_words() -> None:
+    """One copy of condition 1, so the two cannot drift apart.
+
+    A screen that drifted from the condition it stands in for would start
+    refusing candidates the gate would have promoted, which is the one thing it
+    must never do. They share `_field`; this pins that they still do.
+    """
+    result, standing = beat(28 / 32, 32, field=0.114, champion_field=0.155)
+
+    _, screened_why = gate.screened(result, standing)
+    _, gated_why = gate.promotion(result, standing)
+
+    assert screened_why == gated_why
+
+
+def test_a_screen_with_no_champion_lets_everything_through() -> None:
+    """Champion zero has nothing to be behind, so the sweep just runs."""
+    result, _ = beat(17 / 32, 32)
+
+    held, why = gate.screened(result, None)
+
+    assert held and "no champion" in why
+
+
+def test_the_contested_family_is_the_champion_s_to_choose() -> None:
+    """Never the candidate's, or it picks its own denominator.
+
+    A candidate that swept an opponent the champion does not would otherwise
+    drop that opponent from the comparison -- removing the very matchup it was
+    behind on.
+    """
+    _, standing = beat(17 / 32, 32)
+    standing.result.rates["public_0"] = 1.0
+
+    keen = gate.contested(standing, sorted(standing.result.rates))
+
+    assert "public_0" not in keen
+    assert len(keen) == len(standing.result.rates) - 1
+
+
 def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:
     """Two programs that draw are the same program, whatever the rate says.
 

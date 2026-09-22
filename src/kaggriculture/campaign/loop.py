@@ -44,6 +44,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
@@ -1116,6 +1117,45 @@ class Campaign:
             mutation.child.read_text(encoding="utf-8"), program_id
         )
         try:
+            # The cheap half first. A sweep is 184 opponents where 126 sit at
+            # 1.000 against the champion and cannot move any verdict, and
+            # condition 1 is already read over the 58 that can -- so a
+            # candidate that condition turns away was decided by a third of
+            # the games. Both gates run on 2026-09-22 were exactly that, an
+            # hour each to refuse on a number settled in the first twenty
+            # minutes.
+            #
+            # The same test on the same seasons, so it cannot refuse a
+            # candidate the full gate would promote; anything it passes plays
+            # the whole pool and carries the per-opponent regression check
+            # over every opponent, the swept ones included.
+            against = self.screening()
+            if against is not None:
+                names = gate.contested(
+                    against, sorted(set(against.result.rates) - {against.name})
+                )
+                screen = await self.measure(stored, program_id, only=names, keep=False)
+                held, why = gate.screened(screen, against)
+                if not held:
+                    # Recorded the way a refusal is, not the way a failure is:
+                    # the round ran, produced a program and was judged, and the
+                    # next round is shown what it scored.
+                    table = gate.standing(
+                        program_id, screen.rates, 2 * config.GATE_SEEDS, self.paths
+                    )
+                    self.database.add(
+                        _program(
+                            program_id,
+                            stored,
+                            started_from,
+                            drawn,
+                            mutation.model,
+                            screen,
+                            table,
+                        )
+                    )
+                    LOGGER.info("%s %s screened: %s", program_id, drawn, why)
+                    return Kept(stored, program_id, screen, table, False)
             result = await self.measure(stored, program_id)
         except OpponentCrash:
             raise
@@ -1299,6 +1339,26 @@ class Campaign:
             return None
         return standing.model_copy(update={"result": measured})
 
+    def screening(self) -> "Champion | None":
+        """The champion the screen compares against, or None to skip it.
+
+        `paired` asks the same question of a finished evaluation and answers it
+        from that evaluation's seeds. The screen runs before there is one, so
+        this takes the baseline directly and checks only that it belongs to the
+        champion now standing -- the block is the current one by construction,
+        because the screen and the sweep that follows it share `seasons`.
+
+        Returns:
+            The champion carrying the measurement to compare against, or None
+            when there is nothing comparable and the sweep should just run.
+        """
+        if self.state.champion is None or self.champion_baseline is None:
+            return None
+        path, _, measured = self.champion_baseline
+        if path != self.state.champion.path:
+            return None
+        return self.state.champion.model_copy(update={"result": measured})
+
     def floor(self) -> str | None:
         """The champion's name, or None before there is one.
 
@@ -1310,7 +1370,13 @@ class Campaign:
         """
         return self.state.champion.name if self.state.champion else None
 
-    async def measure(self, source: Path, program_id: str) -> Result:
+    async def measure(
+        self,
+        source: Path,
+        program_id: str,
+        only: Sequence[str] | None = None,
+        keep: bool = True,
+    ) -> Result:
         """Play ``source`` against the pool as it stands, off the loop thread.
 
         This is the campaign's only measurement of a round, and the only one
@@ -1330,6 +1396,17 @@ class Campaign:
         """
         table = rating.standings(rating.Field.load(self.paths.field).everything())
         pool = self.snapshot()
+        if only is not None:
+            # The screen's pool: the opponents that can still move, without
+            # the 126 at 1.000 whose games cannot change the answer it asks.
+            wanted = set(only)
+            pool = Pool(
+                opponents={
+                    name: path
+                    for name, path in pool.opponents.items()
+                    if name in wanted
+                }
+            )
         # Recorded before a game is played, so the gate can tell afterwards
         # whether the champion it is being compared against is the one it met.
         self.champion_played[program_id] = pool.opponents.get(config.POOL_CHAMPION, "")
@@ -1357,9 +1434,10 @@ class Campaign:
         # games nobody kept. Measured at 9.6 MB and 1.3s an evaluation, which
         # is about 11 GB a day at eight sessions -- affordable against the
         # competition's remaining weeks, and off the loop thread either way.
-        await asyncio.to_thread(
-            games.record, program_id, games.played(result, program_id)
-        )
+        if keep:
+            await asyncio.to_thread(
+                games.record, program_id, games.played(result, program_id)
+            )
         return result
 
     def seasons(self) -> list[int]:

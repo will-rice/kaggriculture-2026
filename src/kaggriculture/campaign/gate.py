@@ -313,18 +313,12 @@ def promotion(
     # everything leaves it empty and the mean falls back to every shared
     # opponent -- the champion_19 case, where no program that could exist
     # scores higher and this condition has nothing left to say.
-    keen = [one for one in common if champion.result.rates[one] < 1.0] or common
+    held, why = _field(result, champion, common)
+    if not held:
+        return False, why
+    keen = contested(champion, common)
     mine = sum(result.rates[one] for one in keen) / len(keen)
     theirs = sum(champion.result.rates[one] for one in keen) / len(keen)
-    played = max(1, len(keen) * max(1, result.games))
-    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
-    bar = 2 * error
-    if theirs - mine > bar:
-        return False, (
-            f"{mine:.3f} against the field where {name} has {theirs:.3f} over "
-            f"{len(keen)} contested opponents: {mine - theirs:+.3f} is behind by "
-            f"more than twice its error of {bar:.3f}"
-        )
 
     lead, coins = _margin_gap(result, champion, common)
     if -lead > coins:
@@ -441,6 +435,87 @@ def _gained(
         if error == 0.0 or mine - theirs > bar * error:
             gained.append((one, mine, theirs))
     return sorted(gained, key=lambda row: row[1] - row[2], reverse=True)
+
+
+def contested(champion: "Champion", common: Sequence[str]) -> list[str]:
+    """The opponents the champion does not already sweep.
+
+    An opponent at 1.000 has no room above it, so it can neither show a
+    candidate improving nor decide the mean -- it contributes `p(1-p) = 0`
+    variance along with no room. Measured 2026-09-22 there were 126 of those
+    against 58 that could move.
+
+    Chosen by the champion's rates and never the candidate's, so a candidate
+    cannot pick its own denominator. Empty means the champion sweeps
+    everything -- the champion_19 state -- and the caller falls back to every
+    shared opponent, because there is nothing this can say there.
+
+    Args:
+        champion: The champion the candidate is measured against.
+        common: Opponents both were measured against.
+
+    Returns:
+        Those with room above them, or every one of ``common`` when none has.
+    """
+    return [one for one in common if champion.result.rates[one] < 1.0] or list(common)
+
+
+def _field(
+    result: Result, champion: "Champion", common: Sequence[str]
+) -> tuple[bool, str]:
+    """Whether the candidate holds the field mean over the contested opponents.
+
+    Condition 1, on its own, because `screened` asks exactly this and nothing
+    else. One copy rather than two: a screen that drifted from the condition it
+    stands in for would start refusing candidates the gate would have promoted,
+    which is the one thing a screen must never do.
+    """
+    keen = contested(champion, common)
+    mine = sum(result.rates[one] for one in keen) / len(keen)
+    theirs = sum(champion.result.rates[one] for one in keen) / len(keen)
+    played = max(1, len(keen) * max(1, result.games))
+    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
+    bar = 2 * error
+    if theirs - mine > bar:
+        return False, (
+            f"{mine:.3f} against the field where {champion.name} has "
+            f"{theirs:.3f} over {len(keen)} contested opponents: "
+            f"{mine - theirs:+.3f} is behind by more than twice its error "
+            f"of {bar:.3f}"
+        )
+    return True, f"{mine:.3f} against {champion.name}'s {theirs:.3f}"
+
+
+def screened(result: Result, champion: "Champion | None") -> tuple[bool, str]:
+    """Whether a candidate is worth the whole sweep.
+
+    The same test as the gate's first condition on the same seasons, played
+    against the contested opponents alone. That is deliberate and is the whole
+    safety argument: identical criterion on identical evidence, so a candidate
+    this refuses is one `promotion` would refuse for the same reason and in the
+    same words. Nothing promotable is thrown away.
+
+    What it saves is the rest. A sweep is 184 opponents where 126 sit at 1.000
+    and cannot move a verdict; both gates run on 2026-09-22 spent an hour each
+    to refuse on a number the first third of the games had already settled.
+
+    A candidate it passes plays the full pool, so every promotion still carries
+    the per-opponent regression check over every opponent, swept ones included
+    -- which is where a collapse has the most room to hide.
+
+    Args:
+        result: The candidate measured against the contested opponents.
+        champion: The champion it must not be behind, or None at champion zero.
+
+    Returns:
+        Whether to spend the full sweep, and why not when not.
+    """
+    if champion is None:
+        return True, "no champion to screen against"
+    common = sorted(set(result.rates) & set(champion.result.rates) - {champion.name})
+    if not common:
+        return True, "no opponent in common to screen on"
+    return _field(result, champion, common)
 
 
 def _slipped(
