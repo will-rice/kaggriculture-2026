@@ -64,10 +64,8 @@ worth keeping has to be worth hundreds, and most edits are worth nothing:
   `SELL MELON` reaches 61 pooled steps deciding 543 step-slots; `HIRE` reaches
   400 steps and 2,169 slots.
 
-So the useful unit is a rule and not a step: work out from the game's rules what
-this program is getting wrong -- which goods collapse on a glut, what an hour of
-a unit's time is worth, when another hire pays for itself -- and change every
-step that does it. `plan.json` is ordinary JSON; read it, transform it with a few
+So the useful unit is a rule and not a step: work out what this program is
+getting wrong, and change every step that does it. `plan.json` is ordinary JSON; read it, transform it with a few
 lines of Python, write it back.
 
 Nothing limits you to one rule. Eight of them have measured positive

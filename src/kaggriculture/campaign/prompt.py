@@ -290,14 +290,20 @@ def _game_lines(name: str, played: tuple[int, int, harness.Game] | None) -> list
         f"difference. Plain `./measure.py` plays them against each other, which "
         f"says nothing about this matchup.",
         "",
-        "Every day of it, both sides, is in the games database, along with "
-        "every game the competition has recorded:",
+        "Every day of it, both sides, is in the games database -- and so is "
+        "every game the competition has recorded, twenty-six thousand of them, "
+        "under `source = 'ladder'`. This asks where your season and theirs "
+        "part company:",
         "",
         f"    curl -s {GAMES} --data-binary "
-        + f"\"select * from games.days where episode='{episode}'"
-        + ' order by day, seat format Pretty"',
+        + '"select day,'
+        + " round(avgIf(bank, source = 'ladder')) as ladder,"
+        + " round(avgIf(bank, source = 'campaign')) as ours"
+        + ' from games.days group by day order by day format TabSeparated"',
         "",
-        "The `query-games` skill has the schema.",
+        f"Your own game is `select * from games.days where episode='{episode}' "
+        f"order by day, seat`. The `query-games` skill has the schema and "
+        f"`compare-to-the-field` has the rest of this comparison.",
     ]
 
 
