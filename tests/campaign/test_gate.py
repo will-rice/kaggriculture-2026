@@ -129,16 +129,21 @@ def beat(
     rate: float,
     decided: int,
     field: float = 0.30,
-    champion_field: float = 0.20,
+    champion_field: float = 0.30,
     champion: str = "floor",
     shared: int = 20,
 ) -> tuple[evaluator.Result, gate.Champion]:
     """A candidate and the champion it is judged against.
 
     ``field`` and ``champion_field`` are each side's win rate over the opponents
-    they share, so the two conditions can be moved independently: ``rate`` and
+    they share, so the conditions can be moved independently: ``rate`` and
     ``decided`` drive the head-to-head, and the two field figures drive the
     win-rate comparison.
+
+    They default to level. `public_N` are harvested names, so a candidate ahead
+    of the champion on them promotes on the field route alone -- which is the
+    point of that route and would otherwise fire in every test here, including
+    the ones about the pairing.
     """
     rates = {champion: rate, **{f"public_{i}": field for i in range(shared)}}
     theirs = {f"public_{i}": champion_field for i in range(shared)}
@@ -170,10 +175,14 @@ def test_a_better_rate_and_a_decisive_win_promotes() -> None:
     twice the error of the difference, and 22 of 32 against the champion is where
     the Wilson lower bound crosses 0.5.
     """
-    clear, why = gate.promotion(*beat(22 / 32, 32))
+    clear, why = gate.promotion(*beat(22 / 32, 32, champion_field=0.20))
 
     assert clear, why
-    assert "against the field" in why and "lower bound" in why
+    # Promoted on the field route now: 0.30 against 0.20 over twenty harvested
+    # opponents is past twice its error, so the pairing no longer has to carry
+    # it. The pairing still vetoes a candidate that is *losing*, which this is
+    # not.
+    assert "harvested opponents" in why
 
 
 def test_the_edge_refused_at_the_sweep_depth_is_proven_at_the_duel_depth() -> None:
@@ -451,6 +460,103 @@ def test_the_contested_family_is_the_champion_s_to_choose() -> None:
 
     assert "public_0" not in keen
     assert len(keen) == len(standing.result.rates) - 1
+
+
+def test_beating_the_harvested_field_promotes_though_the_pairing_only_draws() -> None:
+    """The three promotions the gate refused on 2026-09-22.
+
+    `p098e2aa70a53`, `p31be34098b9a` and `pc57169aeb6af` were each +0.083
+    against the twelve contested outsiders -- the agents a ladder position is
+    decided by -- and each was turned away for `0.500 against ours over 8
+    decided`. Eight decided games in a hundred and twenty-eight: a candidate
+    edited from the champion plays the champion the way the champion plays
+    itself, and plays the *field* differently, so the mirror match cannot see
+    the only improvement that moves a rating.
+
+    The other routes could not see it either. Condition 1 averaged those twelve
+    with nineteen matchups against our own history where the candidate was
+    flat, turning +0.083 into +0.035; `_gained` wants one opponent moving about
+    0.3, and this gain was diffuse.
+    """
+    result, standing = beat(0.500, 8, field=0.30, champion_field=0.20)
+
+    clear, why = gate.promotion(result, standing)
+
+    assert clear, why
+    assert "harvested opponents" in why
+    assert "nothing given back" in why
+
+
+def test_the_field_route_will_not_promote_a_candidate_losing_to_its_parent() -> None:
+    """Drawing with your parent is an improvement; losing to it is not.
+
+    A finale field is non-transitive, so "ahead of the field and behind the
+    program it would replace" is exactly the trade the ratchet exists to
+    refuse. The route asks the pairing a weaker question than condition 3 --
+    not "did it win", which 94% draws cannot answer, but "is it losing", which
+    the same games answer.
+    """
+    result, standing = beat(0.20, 128, field=0.30, champion_field=0.20)
+
+    clear, why = gate.promotion(result, standing)
+
+    assert not clear
+    assert "behind the program it would replace" in why
+
+
+def test_a_field_lead_inside_its_noise_is_not_a_route() -> None:
+    """Two standard errors, the same bar condition 1 uses.
+
+    Without it the route promotes on any lead at all, and the winner's curse
+    that cost this campaign 78 of 471 programs comes straight back.
+    """
+    result, standing = beat(0.500, 8, field=0.255, champion_field=0.25)
+
+    clear, why = gate.promotion(result, standing)
+
+    assert not clear
+    assert "not shown to beat it" in why
+
+
+def test_beating_our_own_ancestors_is_not_beating_the_field() -> None:
+    """The route must not fire on a candidate that only improved against us.
+
+    Measured 2026-09-23: nineteen of the thirty-one contested opponents are our
+    own, and the champion beats that history at 0.901 against 0.659 for the
+    twelve that are not. A candidate that gains on the nineteen and is flat on
+    the twelve has not moved a ladder position at all -- it has beaten
+    ancestors it was derived from -- and counting them would promote it.
+    """
+    result, standing = beat(0.500, 8, field=0.30, champion_field=0.30)
+    # Nineteen of ours, where the candidate is well ahead.
+    for i in range(19):
+        result.rates[f"ours_{i}"] = 0.95
+        result.margins[f"ours_{i}"] = harness.Margin(mean=0.0, worst=0.0, best=0.0)
+        result.decisive[f"ours_{i}"] = 32
+        standing.result.rates[f"ours_{i}"] = 0.70
+        standing.result.margins[f"ours_{i}"] = harness.Margin(
+            mean=0.0, worst=0.0, best=0.0
+        )
+
+    clear, why = gate.promotion(result, standing)
+
+    assert not clear, why
+    assert "not shown to beat it" in why
+
+
+def test_our_own_lineage_is_not_the_field() -> None:
+    """The route is about the agents that decide a ladder position.
+
+    Measured 2026-09-23: nineteen of thirty-one contested opponents are ours,
+    and the champion beats its own history at 0.901 while managing 0.659
+    against the twelve that are not. Counting our own would let a candidate
+    promote for beating ancestors it was derived from.
+    """
+    assert gate.ours(config.POOL_CHAMPION)
+    assert gate.ours("ours_16") and gate.ours("family_blurry")
+    assert gate.ours("champion_65")
+    assert not gate.ours("haideptry_the_2950_peak_farm")
+    assert not gate.ours("public_0")
 
 
 def test_a_candidate_that_mostly_draws_is_not_promoted() -> None:

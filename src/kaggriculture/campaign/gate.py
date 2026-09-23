@@ -342,6 +342,28 @@ def promotion(
             + ": a mean over the field cannot see one matchup thrown away"
         )
 
+    ahead, said = _outside(result, champion, common)
+    if ahead:
+        # The pairing still has a veto, just a weaker question than condition
+        # 3 asks below. A mirror match draws 94% of its games, so "did it beat
+        # its parent" is unanswerable for most candidates -- but "is it losing
+        # to its parent" is answerable from the same games, and that is the
+        # one the ratchet needs. Drawing while beating the field is an
+        # improvement; losing while beating the field is the non-transitivity
+        # a finale field punishes.
+        decided = result.decisive.get(name, 0)
+        _, high = wilson_interval(result.rates[name] * decided, decided)
+        if high < 0.5:
+            return False, (
+                f"{said}, but {result.rates[name]:.3f} against {name} over "
+                f"{decided} decided has upper bound {high:.3f}: ahead of the "
+                f"field and behind the program it would replace"
+            )
+        return True, (
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f}, nothing "
+            f"given back, and {said}"
+        )
+
     gained = _gained(result, champion, common)
     if gained:
         one, mine_one, theirs_one = gained[0]
@@ -352,6 +374,37 @@ def promotion(
             + (f" with {len(gained) - 1} more opponent(s)" if len(gained) > 1 else "")
         )
 
+    return _pairing(result, champion, mine, theirs, decisive_bar)
+
+
+def _pairing(
+    result: Result,
+    champion: "Champion",
+    mine: float,
+    theirs: float,
+    decisive_bar: int,
+) -> tuple[bool, str]:
+    """The head-to-head, the last route a candidate has left.
+
+    Lifted out of `promotion` when the field route made it a fourth branch and
+    `promotion` a function nobody could hold in their head at once.
+
+    It is the strictest of the routes and the narrowest: it can only answer for
+    a candidate that plays its parent differently, and most do not -- a
+    candidate edited from the champion draws 94% of its games with it, which is
+    why the other routes exist.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it must beat.
+        mine: The candidate's contested field rate, for the message.
+        theirs: The champion's, for the same.
+        decisive_bar: Decided games required before the pairing is read.
+
+    Returns:
+        Whether it beat the champion, and why either way.
+    """
+    name = champion.name
     decided = result.decisive.get(name, 0)
     rate = result.rates[name]
     if decided < decisive_bar:
@@ -435,6 +488,63 @@ def _gained(
         if error == 0.0 or mine - theirs > bar * error:
             gained.append((one, mine, theirs))
     return sorted(gained, key=lambda row: row[1] - row[2], reverse=True)
+
+
+def ours(name: str) -> bool:
+    """Whether a pool name is one of our own rather than a harvested agent.
+
+    Our champions are `ours_N` under `config.POOL_ANCESTOR` and the standing
+    one is `config.POOL_CHAMPION`; `family_` and `champion_` are the two
+    earlier lineages, kept as opponents. Everything else was harvested from
+    the competition and is what a ladder position is actually decided by.
+    """
+    return name == config.POOL_CHAMPION or name.startswith(
+        ("ours_", "family_", "champion_")
+    )
+
+
+def _outside(
+    result: Result, champion: "Champion", common: Sequence[str]
+) -> tuple[bool, str]:
+    """Whether the candidate is better than the champion against the field.
+
+    The route the gate was missing. Measured 2026-09-23: of thirty-one
+    contested opponents, nineteen are our own lineage and twelve are agents
+    from the competition -- and the champion beats its own history at 0.901
+    while managing 0.659 against the twelve. Only the twelve move a ladder
+    position, and they carry 39% of condition 1.
+
+    So a candidate can be decisively better where it counts and be turned away
+    by all three of the existing conditions: the mean dilutes a diffuse gain,
+    `_gained` wants it concentrated on one opponent, and the head-to-head is a
+    mirror match that draws 94% of the time because a candidate edited from
+    the champion plays the champion the same way it always did.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it is measured against.
+        common: Opponents both played, the champion excluded.
+
+    Returns:
+        Whether it is ahead beyond twice the error, and by how much.
+    """
+    field = [one for one in common if not ours(one)]
+    if not field:
+        return False, "no harvested opponent in common"
+    mine = sum(result.rates[one] for one in field) / len(field)
+    theirs = sum(champion.result.rates[one] for one in field) / len(field)
+    played = max(1, len(field) * max(1, result.games))
+    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
+    if mine - theirs <= 2 * error:
+        return False, (
+            f"{mine:.3f} against {len(field)} harvested opponents where "
+            f"{champion.name} has {theirs:.3f}"
+        )
+    return True, (
+        f"{mine:.3f} against the {len(field)} harvested opponents where "
+        f"{champion.name} has {theirs:.3f}: {mine - theirs:+.3f} is past twice "
+        f"its error of {2 * error:.3f}"
+    )
 
 
 def contested(champion: "Champion", common: Sequence[str]) -> list[str]:
