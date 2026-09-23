@@ -371,9 +371,15 @@ def test_the_schema_takes_the_plan_the_champion_actually_carries() -> None:
     _, data = plan.split(champion.read_text(encoding="utf-8"))
     checked = plan.Plan.model_validate(data)
 
-    assert len(checked.actions) == 3982
+    # Counts, not one count. The champion moves -- champion_32 carries 4,046
+    # actions where champion_30 carried 3,982 -- so pinning the number asserts
+    # which champion is standing, not that the schema accepts it, and every
+    # promotion breaks the test that is supposed to guard promotions.
+    assert len(checked.actions) > 1000
     assert any(not action.market for action in checked.actions)
-    assert max(len(action.hands) for action in checked.actions) == 12
+    # The shapes a schema written from imagination would forbid: a market order
+    # that is empty, and a step with a full crew on it.
+    assert max(len(action.hands) for action in checked.actions) >= 8
 
 
 def test_the_real_champion_survives_the_round_trip() -> None:
