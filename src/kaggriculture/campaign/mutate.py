@@ -1,12 +1,24 @@
-"""One mutation: one codex call on one file, or a fake that edits a constant.
+"""One mutation: one model call on one file, or a fake that edits a constant.
 
 A call is given a directory holding ``child.py`` and nothing else, and the
-whole message on standard input. It edits that file and stops; the loop reads
-it back, scores it, and composes the next round's message from the result.
+whole message -- on standard input for codex, as an argument for agy. It edits
+that file and stops; the loop reads it back, scores it, and composes the next
+round's message from the result.
 
-The codex command is a class attribute so a test can replace it with ``true``
-or ``sleep``; the rest of the module never changes between the fake and the
-real thing.
+Two programs can drive a round. `config.MUTATOR` chooses, and `build` returns
+it. They exist side by side because an entitlement ran out rather than because
+either is better: codex has no quota on this account until 2026-09-22, and agy
+bills a different one.
+
+Neither program's own report of how it went is read. Both will exit 0 having
+done nothing -- codex ends a turn with a question instead of an edit, and agy
+returns ``"status": "SUCCESS"`` when its ``--print-timeout`` expires mid-turn,
+after announcing that it finished. `_written` compares the file against what
+the round was handed, and that comparison is the whole verdict.
+
+Each command is a class attribute so a test can replace it with ``true``
+or ``sleep``; the rest of the module never changes between the fakes and the
+real things.
 
 Both mutators are awaitable, because the loop runs many rounds at once on
 one event loop: codex is an ``asyncio`` child process, and the fake's file
@@ -31,14 +43,14 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal, Protocol
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, plan
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +58,12 @@ LOGGER = logging.getLogger(__name__)
 # lookup, not a model turn, so no quota is spent running it. A test replaces
 # this with a command that prints a small catalog of its own.
 MODEL_CATALOG_COMMAND = ["codex", "debug", "models"]
+# The same for agy. Also a local lookup rather than a model turn: it spends
+# no quota, and `agy -p /usage` is how the quota itself is read.
+AGY_CATALOG_COMMAND = ["agy", "models"]
+# And OpenCode's, which lists every provider this install is signed
+# into at once, so the catalog is the union rather than one seller's.
+OPENCODE_CATALOG_COMMAND = ["opencode", "models"]
 
 
 def known_models() -> set[str]:
@@ -123,6 +141,86 @@ def validate_model(model: str) -> None:
         )
 
 
+def agy_model() -> str:
+    """The agy model to ask for, read fresh at every call.
+
+    Read from `.env` at the call for the reason `model` is: a running
+    campaign cannot be reached by exporting a variable, and the file is the
+    part of its environment it can re-read.
+
+    Returns:
+        The slug from the environment, or `config.AGY_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_AGY_MODEL") or config.AGY_MODEL
+
+
+def agy_fallback() -> str:
+    """The agy model retried once when the first fails without a verdict.
+
+    Returns:
+        The slug from the environment, or `config.AGY_FALLBACK_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    value = os.environ.get("CAMPAIGN_AGY_FALLBACK_MODEL")
+    return config.AGY_FALLBACK_MODEL if value is None else value
+
+
+def agy_second() -> str:
+    """The agy model to ask for on the other entitlement, read at every call.
+
+    agy meters two pools apart -- "Gemini Models" and "Claude and GPT models" --
+    and the model name alone decides which a call bills. Naming one leaves the
+    other unspent, which is how agy came to stop both lineages twice while more
+    than half its entitlement was untouched.
+
+    Returns:
+        The slug from the environment, or `config.AGY_SECOND_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_AGY_SECOND_MODEL") or config.AGY_SECOND_MODEL
+
+
+def known_agy_models() -> set[str]:
+    """The model slugs this agy login is entitled to.
+
+    ``agy models`` prints one ``slug<TAB>label`` line per model on standard
+    output and its progress line on standard error, so the parse is the first
+    field of every line. It documents an ``--output-format json`` that agy
+    1.2.4 does not have -- the flag is refused outright -- which is why this
+    reads the text.
+
+    Returns:
+        Every slug the catalog lists.
+    """
+    output = subprocess.run(
+        AGY_CATALOG_COMMAND, capture_output=True, check=True, text=True
+    ).stdout
+    return {
+        line.split("\t", 1)[0].strip() for line in output.splitlines() if line.strip()
+    }
+
+
+def validate_agy_model(model: str) -> None:
+    """Fails fast when ``model`` is not a slug this agy login recognizes.
+
+    agy does fail a bad slug itself, loudly and non-zero. It fails it once
+    per round, though, and a campaign that discovers its model was misspelled
+    one session at a time has spent the night finding out.
+
+    Args:
+        model: The model to check.
+
+    Raises:
+        SystemExit: ``model`` is not in `known_agy_models`.
+    """
+    if model not in known_agy_models():
+        raise SystemExit(
+            f"{model!r} is not a model this agy login knows about "
+            "(run `agy models` to check the spelling)"
+        )
+
+
 class Mutation(BaseModel):
     """The outcome of one mutation call.
 
@@ -157,6 +255,24 @@ class Mutation(BaseModel):
 
 class Mutator(Protocol):
     """Something that turns one file and one message into a child program."""
+
+    # Where this program discovers skills, relative to the workspace. The
+    # loop copies `config.SKILLS` into every one of them, and the programs do
+    # not agree: codex reads `.codex/skills` under its working directory, agy
+    # and opencode walk up from it looking for `.agents`. Hardcoding either in
+    # the loop is how a round silently loses the schema and the queries worth
+    # running -- it still runs, it just never finds them.
+    #
+    # Plural because a call can be handed from one program to another when the
+    # first has no quota left, and the workspace is prepared before anybody
+    # knows which will serve it.
+    SKILLS_DIRS: tuple[Path, ...]
+    # And what this driver calls the transcript it leaves behind, as globs,
+    # because a retry writes a second one beside the first and a rotation can
+    # leave one from each program it tried. Named here for the same reason
+    # `SKILLS_DIRS` is: the loop copies them out and has no business knowing
+    # which program wrote which.
+    TRANSCRIPTS: tuple[str, ...]
 
     async def __call__(
         self, workspace: Path, message: str, program_id: str
@@ -196,6 +312,9 @@ class CodexMutator:
     # `--skip-git-repo-check` because a call runs in a temporary directory
     # holding one file, not in a repository: codex refuses an untrusted
     # directory otherwise, and the directory is deliberately not one.
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".codex") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("codex*.jsonl",)
+
     COMMAND = [
         "codex",
         "exec",
@@ -284,7 +403,7 @@ class CodexMutator:
         started = time.perf_counter()
         # What the round was handed. A call that ends with the file exactly
         # as it found it has written nothing, however cleanly it exited.
-        given = (workspace / "child.py").read_text(encoding="utf-8")
+        given = plan.gather(workspace)
         command = [*self.COMMAND]
         if command[0] == "codex":
             command += ["-m", model, "-C", str(workspace)]
@@ -367,6 +486,571 @@ class CodexMutator:
         )
 
 
+class AgyMutator:
+    """Runs one ``agy --print`` over one file and reports the result.
+
+    The second way to run a round, because the first one ran out: codex bills
+    an entitlement that is empty until 2026-09-22 and `agy` bills a different
+    one. Everything about the shape is the same -- one directory, one file,
+    one message, a verdict the loop decides for itself -- and three things
+    about the mechanics are not.
+
+    The message goes on the command line, not standard input: ``--print``
+    takes its prompt as a value, and a valueless ``-p`` is an error rather
+    than a read from stdin. (``--input-format stream-json`` does read stdin,
+    one turn per NDJSON line, which is a session driver and not this.)
+
+    ``--add-dir`` is not optional. Without it the workspace is outside
+    anything the call may touch, and the failure is quiet in the worst way:
+    on 2026-09-16 a probe run without it reported having read a file it
+    never opened and set a value it had invented. The directory is passed
+    both as ``cwd`` -- which is where agy starts walking to find
+    ``.agents`` -- and as ``--add-dir``, which is what actually grants it.
+
+    ``"status": "SUCCESS"`` and an exit code of 0 mean neither that the round
+    finished nor that it did anything. Measured on agy 1.2.4: a call whose
+    ``--print-timeout`` expired mid-turn returned its partial answer, said
+    ``SUCCESS``, exited 0, and left ``child.py`` exactly as it was found --
+    having announced in its own last message that it had completed the task.
+    So the verdict here is what it is for codex and for the same reason:
+    ``_written`` compares the file against what the round was handed, and
+    nothing the round says about itself is read.
+
+    Two flags are deliberately absent. ``--sandbox`` restricts the terminal,
+    and a round has to be able to run ``measure.py``; commands already run
+    without prompting because the host's settings say
+    ``toolPermission: proceed-in-sandbox``. ``--disable-slash-commands``
+    would stop skill expansion, and the workspace skill in ``SKILLS_DIR`` is
+    the point -- it is discovered even in a temporary directory that is not a
+    repository (probed 2026-09-16). Skills are disclosed progressively, so
+    the host's own eight cost their descriptions and nothing more unless a
+    round chooses to open one.
+    """
+
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
+
+    # Overridden by tests with something like ``["true"]``; the message and
+    # the flags are only appended when the command actually is agy.
+    COMMAND = ["agy", "--print"]
+
+    def __init__(
+        self,
+        model: str = "",
+        fallback: str | None = None,
+        source: "Callable[[], str] | None" = None,
+    ) -> None:
+        """Initializes the mutator.
+
+        Args:
+            model: The agy model to request, or "" to read it per call.
+            fallback: The model to retry on, once, when a call on ``model``
+                fails without a verdict. "" never retries; None reads it per
+                call.
+            source: Where the per-call slug is read from, which is what picks
+                the entitlement. agy meters two pools apart and the model name
+                alone decides which a call bills, so the rotation holds two of
+                these -- one reading `agy_model`, one reading `agy_second` --
+                and both still read at the call, so either can be moved
+                without stopping a run.
+        """
+        self.model = model
+        self.fallback = fallback
+        self.source = source or agy_model
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Runs one agy call in ``workspace``, retrying once on the fallback.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, composed by ``prompt.compose``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` describing what happened, on whichever model
+            produced it.
+        """
+        asked = self.model or self.source()
+        retry = agy_fallback() if self.fallback is None else self.fallback
+        mutation = await self.call(workspace, message, program_id, asked)
+        if mutation.status != "exec_error" or not retry:
+            return mutation
+        LOGGER.warning(
+            "agy call for %s failed on %s (%s); retrying on %s",
+            program_id,
+            asked,
+            mutation.reason[:120],
+            retry,
+        )
+        log = workspace / "agy.jsonl"
+        log.replace(log.with_name(f"agy.{asked}.failed.jsonl"))
+        retried = await self.call(workspace, message, program_id, retry)
+        return retried.model_copy(
+            update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
+        )
+
+    def invocation(self, workspace: Path, message: str, model: str) -> list[str]:
+        """The whole command line one round runs as.
+
+        Separate from `call` so that the flags can be asserted on without
+        spending a call. Losing one of them does not fail loudly -- it produces
+        a round that reads its file, cannot measure anything, and reports
+        `no_output` -- so they are worth a test.
+
+        Args:
+            workspace: The directory the round works in.
+            message: The whole prompt, passed as ``--print``'s value.
+            model: The agy model to request.
+
+        Returns:
+            The argument vector, unchanged when ``COMMAND`` is a stand-in.
+        """
+        command = [*self.COMMAND]
+        if command[0] != "agy":
+            return command
+        return command + [
+            message,
+            # One JSON object per line: typed `init` and `step_update` events
+            # as the round works, and a terminal `result` event carrying the
+            # answer and the token usage. The plain `json` format returns that
+            # same result object and nothing of the steps.
+            "--output-format",
+            "stream-json",
+            "--mode",
+            "accept-edits",
+            "--add-dir",
+            str(workspace),
+            # Without this a round can read and edit its own file and run
+            # nothing that matters. agy confines a command to the directories
+            # its workspace grants, and the interpreter the loop runs under
+            # lives outside them: `python measure.py` came back "command not
+            # found" while that interpreter was on the PATH the round had
+            # inherited, and `python3` found the system 3.10 with no
+            # `kaggriculture` in it. A round that cannot measure is worth
+            # nothing -- the one measured this way spent 226 seconds and 75,000
+            # tokens hunting the filesystem for the package and edited nothing.
+            #
+            # Granting the directories instead was measured and is worse: it
+            # takes the round's own box out of the middle of its workspace, and
+            # the round stops being able to find `child.py` at all, hunting the
+            # repository instead at 265,000 tokens a round. It also hands a
+            # round `gate.py`, which is the program that scores it.
+            #
+            # So this, which is what a codex round has always run as: `-s
+            # workspace-write` with `approval_policy=never` is the same posture
+            # and a wider one. What either reaches is a throwaway directory
+            # holding one agent, and the loop still plays every scored game
+            # itself against opponents the round never sees.
+            "--dangerously-skip-permissions",
+            "--model",
+            model,
+            "--print-timeout",
+            config.AGY_TIMEOUT,
+        ]
+
+    async def call(
+        self, workspace: Path, message: str, program_id: str, model: str
+    ) -> Mutation:
+        """Runs one agy call in ``workspace`` on ``model``.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, passed as ``--print``'s value.
+            program_id: The child program id.
+            model: The agy model to request.
+
+        Returns:
+            A `Mutation` describing what happened.
+        """
+        started = time.perf_counter()
+        given = plan.gather(workspace)
+        command = self.invocation(workspace, message, model)
+        log = workspace / "agy.jsonl"
+        with log.open("w", encoding="utf-8") as handle:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                # The prompt is an argument here, so nothing is written in.
+                # Closed rather than inherited: agy reads a controlling
+                # terminal for an OAuth code when its stdin is a pipe, and a
+                # round that waits on one nobody is watching waits for hours.
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=handle,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+                start_new_session=True,
+                env={**os.environ, "CAMPAIGN_AGY_MODEL": model},
+            )
+            try:
+                _, stderr = await process.communicate()
+            except asyncio.CancelledError:
+                # agy runs shell commands, schedules background tasks and can
+                # invoke subagents of its own, and it only terminates those on
+                # a clean exit -- which a killed parent never reaches. So the
+                # group goes, or a restart finds a round still playing seasons
+                # against a directory nothing owns and a core the budget has
+                # already promised to somebody else.
+                LOGGER.warning(
+                    "agy call for %s cancelled, killed pgid %s",
+                    program_id,
+                    kill_group(process),
+                )
+                await process.wait()
+                raise
+        result = await asyncio.to_thread(_agy_result, log)
+        if process.returncode != 0:
+            # Only a cascade-level failure gets here: a model slug agy cannot
+            # resolve, an interrupt, a crash. A refused tool or a failed
+            # command inside the round is not one of them and exits 0.
+            reason = _agy_reason(result) or stderr.decode(errors="replace")[-500:]
+            LOGGER.warning(
+                "agy call for %s exited %s on %s: %s",
+                program_id,
+                process.returncode,
+                model,
+                reason[:200],
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=0,
+                output_tokens=0,
+                model=model,
+            )
+        usage = result.get("usage") or {}
+        if result.get("status") not in ("SUCCESS", None):
+            # The run failed without reaching a verdict, and said so in the
+            # one place that carries it: agy still exits 0. Measured on
+            # 2026-09-16, when a round that had read the program, played 32
+            # seasons and queried the corpus ended on `"status": "ERROR"` with
+            # "Individual quota reached ... Resets in 4h18m40s" -- eight
+            # hundred seconds of real work, and as `no_output` it would have
+            # been spent for nothing and never retried. This is what the
+            # fallback is for, and why the fallback is on the other pool.
+            reason = _agy_reason(result)
+            LOGGER.warning(
+                "agy call for %s failed without a verdict on %s: %s",
+                program_id,
+                model,
+                reason[:200],
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                model=model,
+            )
+        child = _written(workspace, given)
+        if child is None:
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="no_output",
+                reason=_agy_reason(result) or "child.py missing, empty or unchanged",
+                seconds=time.perf_counter() - started,
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                model=model,
+            )
+        return Mutation(
+            program_id=program_id,
+            child=child,
+            status="ok",
+            reason="",
+            seconds=time.perf_counter() - started,
+            input_tokens=int(usage.get("input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            model=model,
+        )
+
+
+class OpenCodeMutator:
+    """Runs one ``opencode run`` over one file and reports the result.
+
+    The third driver, and the first whose limit is money rather than a clock.
+    codex bills an entitlement that is empty until 2026-09-22, and agy bills two
+    five-hour buckets that eight sessions drained in twenty minutes; OpenCode
+    reaches a seller that charges per token, so a round costs about five cents
+    and how many rounds are left in a day is a question about the budget.
+
+    Three things it needs, all of them documented rather than discovered.
+
+    ``--dir`` names the round's directory, and it is the whole of the
+    containment. Without it OpenCode resolves its project by walking up from
+    wherever the caller happened to be standing, and the caller is the loop,
+    standing in the repository: the first probe read the campaign's source, ran
+    its git history, listed ``run/campaign`` and played 32 real games there,
+    while the directory it had been handed sat empty in /tmp. ``--dir`` is
+    authoritative over both the process's own directory and the ``PWD`` it
+    inherits, measured against a deliberately hostile pair of both.
+
+    ``external_directory`` stays denied. ``--auto`` would approve it along with
+    everything else, and a round that can be talked into reading one path
+    outside its box can be talked into reading the champion archive. Denying it
+    by policy means containment does not rest on the round's goodwill; what a
+    round still runs freely is its own directory, which is all a round is.
+
+    Skills are left alone. ``.agents/skills`` is one of OpenCode's own discovery
+    paths -- the same directory agy walks up for -- so a round finds the schema
+    and the queries worth running without being told, and the host's own skills
+    arrive with them. That costs a few thousand tokens and is worth paying:
+    those are the skills that tell a model to measure before it concludes.
+    """
+
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("opencode*.ndjson",)
+
+    # Overridden by tests; the flags are only appended when it really is
+    # opencode.
+    COMMAND = ["opencode", "run"]
+
+    # The campaign's say over the host's, merged last of every config source.
+    # The host's own `opencode.jsonc` is tuned for a different project
+    # altogether, and a round should not inherit a file the campaign does not
+    # own -- the same reason the codex effort is passed per call.
+    POLICY = {
+        "permission": {
+            "bash": "allow",
+            "edit": "allow",
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "skill": {"*": "allow"},
+            # The one that is not a convenience.
+            "external_directory": "deny",
+            # A round that asks a question in a room with nobody in it has
+            # spent its turn; better it never reaches for the tool.
+            "question": "deny",
+        }
+    }
+
+    # What the provider is allowed to take, in milliseconds. Documented
+    # defaults are 300000 for each and they did not save us -- a hung call
+    # produced nothing for four and a half hours, which means it never got as
+    # far as a request -- so these are the inner of two layers, and
+    # `config.OPENCODE_TIMEOUT` is the outer one that actually caught it.
+    #
+    # `timeout` caps the request, `headerTimeout` the wait for response
+    # headers, `chunkTimeout` the gap between streamed chunks. Named per
+    # provider, so the provider is read off the model: an opencode model is
+    # `provider/model`, sometimes `provider/vendor/model`, and the first
+    # segment is the seller.
+    LIMITS = {"timeout": 600_000, "headerTimeout": 120_000, "chunkTimeout": 120_000}
+
+    def policy(self, model: str) -> dict:
+        """The config this call runs under, with the provider's limits in it.
+
+        Args:
+            model: The ``provider/model`` being requested.
+
+        Returns:
+            `POLICY` with a `provider` section for this call's seller.
+        """
+        seller = model.split("/", 1)[0]
+        return {**self.POLICY, "provider": {seller: {"options": dict(self.LIMITS)}}}
+
+    def __init__(self, model: str = "", fallback: str | None = None) -> None:
+        """Initializes the mutator.
+
+        Args:
+            model: The ``provider/model`` to request, or "" to read it per call.
+            fallback: The model to retry on, once, when a call fails without a
+                verdict. "" never retries; None reads it per call.
+        """
+        self.model = model
+        self.fallback = fallback
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> Mutation:
+        """Runs one opencode call in ``workspace``, retrying once on the fallback.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt, composed by ``prompt.compose``.
+            program_id: The child program id.
+
+        Returns:
+            A `Mutation` describing what happened, on whichever model produced
+            it.
+        """
+        asked = self.model or opencode_model()
+        retry = opencode_fallback() if self.fallback is None else self.fallback
+        mutation = await self.call(workspace, message, program_id, asked)
+        if mutation.status != "exec_error" or not retry:
+            return mutation
+        LOGGER.warning(
+            "opencode call for %s failed on %s (%s); retrying on %s",
+            program_id,
+            asked,
+            mutation.reason[:120],
+            retry,
+        )
+        log = workspace / "opencode.ndjson"
+        spent = asked.replace("/", "-")
+        log.replace(log.with_name(f"opencode.{spent}.failed.ndjson"))
+        retried = await self.call(workspace, message, program_id, retry)
+        return retried.model_copy(
+            update={"fallback": True, "seconds": mutation.seconds + retried.seconds}
+        )
+
+    def invocation(self, workspace: Path, message: str, model: str) -> list[str]:
+        """The whole command line one round runs as.
+
+        Separate from `call` so the flags can be asserted on without spending a
+        call, because none of them fails loudly: a round that loses ``--dir``
+        still runs, and reports on a directory that is not its own.
+
+        Args:
+            workspace: The directory the round works in.
+            message: The whole prompt.
+            model: The ``provider/model`` to request.
+
+        Returns:
+            The argument vector, unchanged when ``COMMAND`` is a stand-in.
+        """
+        command = [*self.COMMAND]
+        if command[0] != "opencode":
+            return command
+        return command + [
+            message,
+            "--dir",
+            str(workspace),
+            "--format",
+            "json",
+            "-m",
+            model,
+        ]
+
+    async def call(
+        self, workspace: Path, message: str, program_id: str, model: str
+    ) -> Mutation:
+        """Runs one opencode call in ``workspace`` on ``model``.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt.
+            program_id: The child program id.
+            model: The ``provider/model`` to request.
+
+        Returns:
+            A `Mutation` describing what happened.
+        """
+        started = time.perf_counter()
+        given = plan.gather(workspace)
+        log = workspace / "opencode.ndjson"
+        with log.open("w", encoding="utf-8") as handle:
+            process = await asyncio.create_subprocess_exec(
+                *self.invocation(workspace, message, model),
+                # The prompt is an argument; nothing is written in, and a round
+                # that blocks reading a terminal nobody is at blocks for hours.
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=handle,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+                start_new_session=True,
+                env={
+                    **os.environ,
+                    "OPENCODE_CONFIG_CONTENT": json.dumps(self.policy(model)),
+                },
+            )
+            try:
+                _, stderr = await asyncio.wait_for(
+                    process.communicate(), config.OPENCODE_TIMEOUT
+                )
+            except TimeoutError:
+                # The arm that was missing. Same kill as cancellation, because
+                # a hung opencode has the same children a cancelled one does.
+                LOGGER.warning(
+                    "opencode call for %s gave up after %ds, killed pgid %s",
+                    program_id,
+                    config.OPENCODE_TIMEOUT,
+                    kill_group(process),
+                )
+                return Mutation(
+                    program_id=program_id,
+                    child=None,
+                    status="exec_error",
+                    reason=(
+                        f"opencode wrote nothing in {config.OPENCODE_TIMEOUT}s "
+                        "and was killed"
+                    ),
+                    seconds=time.perf_counter() - started,
+                    input_tokens=0,
+                    output_tokens=0,
+                    model=model,
+                )
+            except asyncio.CancelledError:
+                # opencode runs shell commands of its own, so killing only the
+                # direct child would leave a season playing against a directory
+                # nothing owns, on a core the budget has already promised out.
+                LOGGER.warning(
+                    "opencode call for %s cancelled, killed pgid %s",
+                    program_id,
+                    kill_group(process),
+                )
+                await process.wait()
+                raise
+        spent = await asyncio.to_thread(_opencode_usage, log)
+        if process.returncode != 0:
+            reason = stderr.decode(errors="replace")[-500:] or "opencode exited nonzero"
+            LOGGER.warning(
+                "opencode call for %s exited %s on %s: %s",
+                program_id,
+                process.returncode,
+                model,
+                reason[:200],
+            )
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="exec_error",
+                reason=reason,
+                seconds=time.perf_counter() - started,
+                input_tokens=spent.input_tokens,
+                output_tokens=spent.output_tokens,
+                model=model,
+            )
+        child = _written(workspace, given)
+        if child is None:
+            return Mutation(
+                program_id=program_id,
+                child=None,
+                status="no_output",
+                reason=await asyncio.to_thread(_opencode_last_text, log)
+                or "child.py missing, empty or unchanged",
+                seconds=time.perf_counter() - started,
+                input_tokens=spent.input_tokens,
+                output_tokens=spent.output_tokens,
+                model=model,
+            )
+        # The only driver that says what it charged, so it is worth saying.
+        LOGGER.info(
+            "opencode round %s wrote a child on %s for $%.4f",
+            program_id,
+            model,
+            spent.dollars,
+        )
+        return Mutation(
+            program_id=program_id,
+            child=child,
+            status="ok",
+            reason="",
+            seconds=time.perf_counter() - started,
+            input_tokens=spent.input_tokens,
+            output_tokens=spent.output_tokens,
+            model=model,
+        )
+
+
 def kill_group(process: asyncio.subprocess.Process) -> int | None:
     """SIGKILL a session's whole process group and return the group it killed.
 
@@ -404,7 +1088,10 @@ def _written(workspace: Path, given: str) -> Path | None:
     child = workspace / "child.py"
     if not child.exists():
         return None
-    source = child.read_text(encoding="utf-8")
+    # The whole program, which is `child.py` with whatever `plan.json` holds
+    # packed back into it. A round that changed only the plan changed the
+    # agent, and reading `child.py` alone would report that as nothing.
+    source = plan.gather(workspace)
     if not source.strip() or source == given:
         return None
     return child
@@ -492,8 +1179,133 @@ def _last_message(log: Path) -> str:
     return last[:200]
 
 
+def _agy_result(log: Path) -> dict:
+    """The payload of agy's terminal ``result`` event, or {}.
+
+    Args:
+        log: Path to the ``agy.jsonl`` transcript.
+
+    Returns:
+        The last ``result`` event's payload -- ``status``, ``response``,
+        ``usage``, and ``denied_actions`` when the round was refused
+        something -- or {} if the stream ended before one was written.
+    """
+    found: dict = {}
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "result":
+            found = event.get("result") or {}
+    return found
+
+
+def _agy_reason(result: dict) -> str:
+    """Why a call is worth no child, read off its ``result`` event.
+
+    ``denied_actions`` comes first when it is there. It is the difference
+    between a round that would not make the edit and a round that was not
+    allowed to, and it names the rule that would have permitted it -- which
+    is the distinction a day was lost to on 2026-09-16, when a missing
+    ``--add-dir`` was read as a model inventing an answer.
+
+    Args:
+        result: The payload from `_agy_result`.
+
+    Returns:
+        A short explanation, or "" when the result says nothing useful.
+    """
+    parts = []
+    status = result.get("status", "")
+    if status and status != "SUCCESS":
+        parts.append(str(status))
+    error = result.get("error")
+    if error:
+        parts.append(str(error))
+    denied = result.get("denied_actions")
+    if denied:
+        parts.append(f"denied: {denied}")
+    response = str(result.get("response", "")).strip()
+    if response:
+        parts.append(response[:200])
+    return "; ".join(parts)[:300]
+
+
+class Spent(BaseModel):
+    """What one opencode call billed.
+
+    Attributes:
+        input_tokens: Prompt tokens, summed across the call's steps.
+        output_tokens: Completion tokens, summed the same way.
+        dollars: What the seller charged, which only this driver reports.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    dollars: float
+
+
+def _opencode_usage(log: Path) -> Spent:
+    """Sums the tokens and the cost across an opencode run.
+
+    Every ``step_finish`` event carries a `tokens` object and a `cost`, and a
+    round is many steps, so the call's total is their sum. Cached prompt tokens
+    are reported separately by the seller and are not added here: they are
+    charged at a different rate, and what this feeds is a token count the other
+    drivers report the same way.
+
+    Args:
+        log: Path to the ``opencode.ndjson`` transcript.
+
+    Returns:
+        The totals, zeroed when the stream carries none.
+    """
+    tokens_in = tokens_out = 0
+    dollars = 0.0
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "step_finish":
+            continue
+        part = event.get("part") or {}
+        tokens = part.get("tokens") or {}
+        tokens_in += int(tokens.get("input", 0))
+        tokens_out += int(tokens.get("output", 0))
+        dollars += float(part.get("cost", 0.0))
+    return Spent(input_tokens=tokens_in, output_tokens=tokens_out, dollars=dollars)
+
+
+def _opencode_last_text(log: Path) -> str:
+    """The last thing the round said, for a call that wrote nothing.
+
+    Args:
+        log: Path to the ``opencode.ndjson`` transcript.
+
+    Returns:
+        The first 200 characters of the last ``text`` event, or "".
+    """
+    last = ""
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "text":
+            last = str((event.get("part") or {}).get("text", "")) or last
+    return last[:200]
+
+
 class FakeMutator:
     """Edits ``child.py`` in place through ``edit``. For dry runs and tests."""
+
+    # Nothing reads them, but the loop still lays them out, so a dry run
+    # exercises the same copy a real round does. It writes no transcript, and
+    # the glob simply matches nothing.
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("fake*.jsonl",)
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the mutator.
@@ -542,3 +1354,299 @@ class FakeMutator:
             child: The file to rewrite.
         """
         child.write_text(self.edit(child.read_text(encoding="utf-8")), encoding="utf-8")
+
+
+def opencode_model() -> str:
+    """The ``provider/model`` an opencode round asks for, read at every call.
+
+    Returns:
+        The slug from the environment, or `config.OPENCODE_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    return os.environ.get("CAMPAIGN_OPENCODE_MODEL") or config.OPENCODE_MODEL
+
+
+def opencode_fallback() -> str:
+    """The seller retried once when the first fails without a verdict.
+
+    Returns:
+        The slug from the environment, or `config.OPENCODE_FALLBACK_MODEL`.
+    """
+    load_dotenv(ENV, override=True)
+    value = os.environ.get("CAMPAIGN_OPENCODE_FALLBACK_MODEL")
+    return config.OPENCODE_FALLBACK_MODEL if value is None else value
+
+
+def known_opencode_models() -> set[str]:
+    """Every ``provider/model`` this opencode install can reach.
+
+    ``opencode models`` prints one per line across every authenticated
+    provider.
+
+    Returns:
+        The slugs it lists.
+    """
+    output = subprocess.run(
+        OPENCODE_CATALOG_COMMAND, capture_output=True, check=True, text=True
+    ).stdout
+    return {line.strip() for line in output.splitlines() if "/" in line}
+
+
+def validate_opencode_model(model: str) -> None:
+    """Fails fast when ``model`` is not one this install can reach.
+
+    Args:
+        model: The ``provider/model`` to check.
+
+    Raises:
+        SystemExit: ``model`` is not in `known_opencode_models`.
+    """
+    if model not in known_opencode_models():
+        raise SystemExit(
+            f"{model!r} is not a model this opencode install can reach "
+            "(run `opencode models` to check the spelling, and "
+            "`opencode auth list` to see which sellers are signed in)"
+        )
+
+
+# Every program that can drive a round. The selection names one of these and
+# `build` returns it; nothing else in the loop knows there is more than one.
+DRIVERS: dict[str, type] = {
+    "codex": CodexMutator,
+    "agy": AgyMutator,
+    "opencode": OpenCodeMutator,
+}
+
+
+def selected() -> str:
+    """Which program drives a round, read fresh so it can change.
+
+    Returns:
+        "codex" or "agy".
+
+    Raises:
+        SystemExit: The name is neither.
+    """
+    load_dotenv(ENV, override=True)
+    kind = os.environ.get("CAMPAIGN_MUTATOR") or config.MUTATOR
+    if kind not in DRIVERS:
+        named = ", ".join(repr(name) for name in DRIVERS)
+        raise SystemExit(f"{kind!r} is not a mutator; use one of {named}")
+    return kind
+
+
+# What a program says when the entitlement is gone rather than the call being
+# wrong. agy says "Individual quota reached", codex "You've hit your usage
+# limit"; matched loosely because the wording is theirs to change and the cost
+# of a false match is one call handed to the next program, which is where a
+# true match sends it anyway.
+EXHAUSTED = ("quota", "usage limit", "rate limit", "insufficient_quota")
+
+
+def named(driver: "Mutator") -> str:
+    """What to call a program in the log.
+
+    Two of the rotation's entries are `AgyMutator`, differing only in which
+    entitlement their model bills, so the class name alone cannot say which
+    one refused or which one answered -- and that is exactly the question the
+    log is read to answer.
+
+    Args:
+        driver: The program to name.
+
+    Returns:
+        The class name, and the model where the program chooses one.
+    """
+    source = getattr(driver, "source", None)
+    return f"{type(driver).__name__}({source()})" if source else type(driver).__name__
+
+
+def out_of_quota(mutation: "Mutation") -> bool:
+    """Whether this call failed because the entitlement is spent.
+
+    Args:
+        mutation: What the call came back with.
+
+    Returns:
+        True when the failure is an exhausted entitlement rather than a round
+        that ran and wrote nothing.
+    """
+    if mutation.status != "exec_error":
+        return False
+    said = mutation.reason.lower()
+    return any(phrase in said for phrase in EXHAUSTED)
+
+
+class Rotating:
+    """Tries each program in turn until one still has quota to answer with.
+
+    Three programs can drive a round and each bills a different entitlement,
+    which is the only reason there are three. Pinned to one, a run stops when
+    that one stops: agy ran out at 00:44 on 2026-09-19 and both lineages were
+    idle until morning, and on 2026-09-20 all three were out at once.
+
+    Nothing can be checked in advance. They are separate CLIs against separate
+    accounts, and the only tool that reports quota sees just the providers
+    opencode is signed into. So this asks, which is cheap -- a refusal comes
+    back in seconds, where an answer takes ten minutes.
+
+    Order matters and the configured program leads it, so a run with quota does
+    exactly what it did before this existed.
+
+    Attributes:
+        SKILLS_DIRS: Every place any of them looks for skills, so the workspace
+            suits whichever ends up serving the call.
+        TRANSCRIPTS: Every pattern any of them writes, so a call that was
+            passed along leaves both transcripts behind and the log shows it.
+    """
+
+    def __init__(self, drivers: "Sequence[Mutator]") -> None:
+        """Initializes the rotation.
+
+        Args:
+            drivers: The programs to try, in the order to try them.
+        """
+        self.drivers = drivers
+        # When each program may be asked again, as a monotonic deadline. An
+        # entitlement that just refused will refuse for hours, and asking it
+        # anyway costs the round the couple of minutes the refusal takes to
+        # arrive -- paid per round, against rounds that compose every three.
+        self.spent = [0.0] * len(drivers)
+        self.SKILLS_DIRS: tuple[Path, ...] = tuple(
+            dict.fromkeys(one for driver in drivers for one in driver.SKILLS_DIRS)
+        )
+        self.TRANSCRIPTS: tuple[str, ...] = tuple(
+            dict.fromkeys(one for driver in drivers for one in driver.TRANSCRIPTS)
+        )
+
+    async def __call__(
+        self, workspace: Path, message: str, program_id: str
+    ) -> "Mutation":
+        """Asks each program in turn until one answers with something.
+
+        Args:
+            workspace: A directory holding ``child.py`` and nothing else.
+            message: The whole prompt.
+            program_id: The child program id.
+
+        Waits and asks again when every one of them is out, rather than
+        failing the round: a round that produced nothing counts toward
+        `STAGNATION_SESSIONS` and is shown to the next round as its own
+        history, so spinning against a wall would have the campaign mistake an
+        outage for a champion that had gone stale.
+
+        Returns:
+            The first outcome that is not an exhausted entitlement. Does not
+            return while every program is refusing; cancellation is what ends
+            the wait, which is what shutting the loop down delivers.
+        """
+        assert self.drivers, "a rotation with no drivers in it"
+        waited = 0
+        while True:
+            # None when every program was still on cooldown this pass, which
+            # is the one case there is no fresh refusal to report.
+            refused: Mutation | None = None
+            for index, driver in enumerate(self.drivers):
+                if self.spent[index] > time.monotonic():
+                    continue
+                outcome = await driver(workspace, message, program_id)
+                if not out_of_quota(outcome):
+                    if waited:
+                        LOGGER.info("%s: quota is back after %ds", program_id, waited)
+                    # On success too, not only on failure. Every line this
+                    # wrote used to be an error, so the program that was
+                    # working was the one thing the log never mentioned.
+                    LOGGER.info("%s: %s answered", program_id, named(driver))
+                    self.spent[index] = 0.0
+                    return outcome
+                self.spent[index] = time.monotonic() + config.QUOTA_COOLDOWN
+                refused = outcome
+                LOGGER.warning(
+                    "%s: %s has no quota (%s); leaving it alone for %ds",
+                    program_id,
+                    named(driver),
+                    outcome.reason[:80],
+                    config.QUOTA_COOLDOWN,
+                )
+            # Everything is out. Waiting rather than failing, because a round
+            # that produced nothing counts toward stagnation and is shown to the
+            # next round as its own history -- so spinning would have the
+            # campaign mistake an outage for a champion that had gone stale.
+            LOGGER.error(
+                "%s: every program is out of quota; waiting %ds (%s)",
+                program_id,
+                config.QUOTA_WAIT,
+                refused.reason[:120] if refused else "all of them on cooldown",
+            )
+            # To the soonest deadline when nothing was even asked, because
+            # waking on `QUOTA_WAIT` would find every program still cooling
+            # and sleep again -- and with one program in the rotation it would
+            # never ask anybody at all.
+            nap = (
+                config.QUOTA_WAIT
+                if refused is not None
+                else max(0.0, min(self.spent) - time.monotonic())
+            )
+            await asyncio.sleep(nap)
+            waited += nap
+
+
+def build() -> "Rotating":
+    """The program `selected` names, and the others behind it.
+
+    One entitlement running out used to stop a run: agy's did at 00:44 on
+    2026-09-19 and both lineages were idle until morning. The three bill
+    separate accounts, so the others are still worth asking.
+
+    Returns:
+        A rotation, the selected program first, each reading its own model per
+        call.
+    """
+    first = selected()
+    order = [first, *(name for name in DRIVERS if name != first)]
+    drivers: list[Mutator] = []
+    for name in order:
+        drivers.append(DRIVERS[name]())
+        if name == "agy":
+            # Twice, because agy meters two entitlements apart and the model
+            # name alone decides which a call bills. Naming one left the other
+            # unspent while agy stopped both lineages for want of quota.
+            drivers.append(AgyMutator(source=agy_second))
+    return Rotating(drivers)
+
+
+def asked_model() -> str:
+    """The model the selected mutator will ask for.
+
+    Returns:
+        The slug, for the run's own record of what it opened on.
+    """
+    return {
+        "codex": model,
+        "agy": agy_model,
+        "opencode": opencode_model,
+    }[selected()]()
+
+
+def validate_models() -> None:
+    """Checks the selected mutator's models against its own catalog.
+
+    Each program has its own vocabulary and neither knows the other's:
+    `gpt-5.6-luna` is not a slug agy has ever heard of, and validating it
+    against the wrong catalog would refuse a run that was going to work.
+
+    Raises:
+        SystemExit: Either model is not one the login knows.
+    """
+    check, asked, retry = {
+        "codex": (validate_model, model, fallback),
+        "agy": (validate_agy_model, agy_model, agy_fallback),
+        "opencode": (validate_opencode_model, opencode_model, opencode_fallback),
+    }[selected()]
+    check(asked())
+    if retry():
+        check(retry())
+    # The other entitlement's slug too, whichever program leads: the rotation
+    # holds it either way, and a typo there is a pool that silently never gets
+    # asked rather than a run that fails loudly.
+    validate_agy_model(agy_second())

@@ -11,6 +11,7 @@ from kaggriculture.campaign import (
     dataset,
     evaluator,
     harness,
+    plan,
     prompt,
     validate,
 )
@@ -195,16 +196,18 @@ def test_the_message_carries_the_rules_and_its_own_play() -> None:
     assert prompt.GAMES in text
     assert "Episode `champion_1m1s1`" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
-    assert "/data" not in text
+    assert str(config.ROOT) not in text
 
 
-def test_the_message_carries_no_path_at_all() -> None:
-    """The doctrine: nothing the loop composes carries an opponent's path.
+def test_the_message_carries_no_path_into_the_campaign_itself() -> None:
+    """The half of the doctrine that survived 2026-09-15.
 
-    Everything a model is given is this string, so this is the whole of the
-    campaign's exposure. Names no longer travel either -- see
-    `test_no_opponent_is_named_anywhere_in_the_message` -- so what is left to
-    check here is that nothing which could be opened reaches a round.
+    Opponents opened that day: they are published kernels under Apache-2.0,
+    the field derives from them in the open, and the message now says where
+    they are. What stays shut is this campaign's own tree -- the archive, the
+    champions, the pool file, the run. A round edits a copy in a directory of
+    its own on purpose, and a path into `config.ROOT` is a round that can edit
+    the record of what every other round did.
     """
     text = prompt.compose(
         "champion_1",
@@ -215,9 +218,11 @@ def test_the_message_carries_no_path_at_all() -> None:
         IMPROVE,
     )
 
-    assert "/data/kaggriculture" not in text
-    assert not re.search(r"/(?:home|data|Users|tmp)/\S*", text)
     assert str(config.ROOT) not in text
+    assert "/data/kaggriculture/campaign" not in text, "the pool and run are ours"
+    assert not re.search(r"/(?:home|Users|tmp)/\S*", text)
+    # And the one path it is now meant to carry.
+    assert "/data/kaggriculture/opponents" in text
 
 
 def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
@@ -278,6 +283,13 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
     assert isinstance(prompt.INSTRUCTION, str)
     assert prompt.INSTRUCTION.strip()
     assert not isinstance(prompt.INSTRUCTION_NAME, (list, tuple, set, dict))
+    # It has to name the file the round is being asked to change, and that is
+    # not an editorial choice. 215 rounds were filed under the instruction name
+    # "plan" while the instruction itself said only to fix "this program", and
+    # every one of them read that as the controller: the plan came out of all
+    # 142 programs that carry one byte-identical. Named by the constant, so this
+    # tracks the file rather than the phrasing around it.
+    assert plan.PLAN_FILE in prompt.INSTRUCTION
     # And it reaches the round whole, since a truncated instruction is an
     # instruction to do something else.
     text = prompt.compose(
@@ -556,3 +568,52 @@ def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
 
     assert "the competition has recorded" in text
     assert prompt.GAMES in text
+
+
+COMMITTED = """
+def agent(observation, configuration=None):
+    day = observation["day"]
+    if day == 3:
+        return {"farmer": ["PLANT"], "hands": [], "market": []}
+    if day == 3 and observation["hour"] > 4:
+        return {"farmer": ["WATER"], "hands": [], "market": []}
+    if day >= 29:
+        return {"farmer": ["SELL"], "hands": [], "market": []}
+    if observation["cash"] > 500:
+        return {"farmer": ["BUY"], "hands": [], "market": []}
+    return {"farmer": ["PASS"], "hands": [], "market": []}
+"""
+
+
+def test_the_days_a_program_has_decided_are_counted_and_the_rest_named() -> None:
+    """What a round is shown about its own commitment.
+
+    A decision taken at a fixed day is a plan whether it is written as a table
+    or as `if day == 3`, and champion_15 put 32 of its 57 such conditions on
+    day 29 -- an endgame, not a season. The count is what lets a round see that
+    about itself; the days it names none of are the same fact from the other
+    side, and they are what the message actually says out loud.
+
+    The cash condition is here to be ignored: a comparison that names no day
+    is not a commitment to one, however many numbers it holds.
+    """
+    counted = prompt.schedule(COMMITTED)
+
+    assert counted == {3: 2, 29: 1}, counted
+    shown = "\n".join(prompt._schedule_lines(COMMITTED))
+    assert "day 3: 2" in shown and "day 29: 1" in shown
+    assert "500" not in shown, "a cash threshold was counted as a day"
+    # Every day it never names, so the silence is legible rather than implied.
+    for day in (0, 1, 2, 4, 28):
+        assert f"{day}" in shown.split("It names no day at")[1]
+
+
+def test_a_program_that_will_not_parse_is_shown_no_schedule() -> None:
+    """The message is composed before the gate rejects a broken edit.
+
+    `compose` runs on whatever the last round left in `child.py`, and a round
+    that wrote something unparseable must still get a message rather than take
+    the session down with a `SyntaxError` from the part that describes it.
+    """
+    assert prompt.schedule("def agent(o, c=None):\n    return {") == {}
+    assert prompt._schedule_lines("this is not python(") == []

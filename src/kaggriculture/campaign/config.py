@@ -119,6 +119,18 @@ UNIT_OPS: list[str] = [
     "COLLECT_FERTILIZER",
     "CARE",
 ]
+# The five plantable ones: `tables.rs`'s `Crop` enum, which is the first five
+# items. `PLANT` and `BUY_SEED` take one of these and nothing else.
+CROPS: list[str] = list(PRODUCTS[:5])
+# `sim.hpp`: `constexpr int MAX_UNITS = 40; // farmer + hands`. So a farm can
+# work thirty-nine hands beside its farmer, whatever any one champion happens
+# to hire.
+MAX_UNITS = 40
+# `kaggriculture.json` sets `"episodeSteps": 720`, and the interpreter fires
+# DONE at `step >= cfg.episodeSteps - 2`, on the step whose actions it just
+# read. So step 718 is the last one a unit acts on and a season is 719 acting
+# steps -- which is exactly how long every route in a plan is.
+SEASON = 719
 MARKET_OPS: list[str] = [
     "NONE",
     "HIRE",
@@ -129,9 +141,22 @@ MARKET_OPS: list[str] = [
     "SELL",
 ]
 
-# One codex session per worker; eight fit the machine beside their
-# evaluations. Spec section 8.
-SESSIONS = 8
+# One session per worker. Eight fit the machine beside their evaluations, and
+# eight is what this was while codex billed per call and the only limit was the
+# machine.
+#
+# Two, because the limit now is a quota window rather than a core. `agy` refills
+# on a five-hour clock, and on 2026-09-17 eight sessions took the Gemini pool
+# from 94% to zero in twenty minutes -- then every one of the eight walked into
+# the wall mid-round, so the window bought eight abandoned rounds and not one
+# verdict. Concurrency cannot buy more rounds than the quota holds; all it
+# decides is how many are in flight, unfinished, when the wall arrives.
+#
+# It also decides how fast each one measures. `--workers` is
+# `CORE_BUDGET // SESSIONS`, so two sessions give a round twenty cores instead
+# of five, and a round that can play its seasons four times as fast is a round
+# that measures before it edits rather than guessing because measuring was slow.
+SESSIONS = 2
 # Consecutive codex calls against one opponent before the session moves to the
 # next, and a session works through every opponent in the pool. So its length is
 # the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
@@ -179,6 +204,25 @@ ROUNDS_PER_OPPONENT = 12
 # graph and one more opponent is a whole new comparison where one more seed is
 # a slightly tighter old one.
 GATE_SEEDS = 16
+# The champion pairing alone, which the gate gives a veto no other opponent
+# has. The sweep above plays every pairing at `GATE_SEEDS`, and against an
+# opponent already beaten 1.000 that is ample -- more games buy nothing once
+# the interval is pinned at the ceiling. The head-to-head is the one pairing
+# whose games decide something, and it was being asked with too few to answer.
+#
+# Measured 2026-09-21. At 32 games a Wilson lower bound above 0.5 needs a rate
+# near 0.675 -- 22 wins of 32 -- so condition 3 was demanding a candidate beat
+# its parent seven games in ten, which is a rout rather than an improvement.
+# `pfe2ed71a20b0` won 0.594 of 32 and was refused at a lower bound of 0.423:
+# a real edge turned away for want of games, not for want of strength.
+#
+# Sixty-four seeds is 128 games and brings the rate needed down to about 0.59,
+# which is the size of edge an incremental improvement actually has. The bar
+# itself does not move -- still a 95% lower bound above 0.5 -- so this buys
+# evidence rather than lowering the standard, and a one-sided bound holds its
+# 5% false-promotion rate at any depth. It costs the 48 seeds the sweep did
+# not already play: 96 games against the sweep's ~5,800, about 1.7%.
+DUEL_SEEDS = 64
 # The whole space. Nothing is reserved any more: a set held back exists to
 # give a number the search cannot steer, and drawing fresh seeds every
 # evaluation already does that -- no program is ever measured on maps it or
@@ -290,6 +334,12 @@ GATE_CONTENDERS = 4
 # A key that cannot be produced by harvesting or by the old lineage ends both
 # problems: nothing to collide with, and nothing to scan a prefix for.
 POOL_CHAMPION = "ours"
+# What a retired champion is called, numbered from the promotion that retired
+# it: `ours_16`, `ours_17`. Not `champion_N`, which is the prefix that caused
+# the collision above -- `ours_` cannot be produced by harvesting, whose names
+# are an author and a kernel slug, nor by the tape lineage, whose agents are
+# `champion_N`.
+POOL_ANCESTOR = "ours_{number}"
 # There is no promotion margin any more, and this note is here so nobody adds
 # one back.
 #
@@ -390,6 +440,35 @@ SCRATCH_AGENT = (
 # Sessions without a promotion before a session starts from a program
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
+# How long the rotation waits before asking again when every program is out of
+# quota.
+#
+# It used to return the refusal and let the round fail, which spun: sixteen
+# refusals inside three minutes on 2026-09-20, as fast as four sessions could
+# ask. Failing is worse than idling -- a round that produced nothing counts
+# toward `STAGNATION_SESSIONS`, so an outage would have the campaign decide its
+# champion had gone stale when nothing had run, and the failures are shown to
+# the next round as though they were its own.
+#
+# Five minutes because a refusal costs seconds, so the poll is free next to the
+# ten-to-twenty-five minutes an answer takes, and the shortest reset seen so far
+# is a five-hour window.
+QUOTA_WAIT = 5 * 60
+# How long a refused entitlement is left alone before it is asked again.
+#
+# The rotation used to rediscover the same exhaustion every round: opus
+# refused, sonnet refused, the gemini pool answered, and the next round opened
+# by asking opus again. Measured 2026-09-21 the pair took about two and a half
+# minutes to refuse, against rounds composing every three -- so most of a
+# round's setup was spent confirming a wall that agy already reports, with a
+# reset time attached, in the refusal itself.
+#
+# Thirty minutes rather than that reset time, which arrives as prose ("Resets
+# in 2h48m38s") and would have to be parsed to be trusted. The cost of being
+# wrong is bounded and small in both directions: at worst half an hour of not
+# using an entitlement that came back early, against a couple of minutes a
+# round saved while it is genuinely out.
+QUOTA_COOLDOWN = 30 * 60
 # Calls in a row that may run to no verdict before the campaign stops. A call
 # that never reached the model is nobody's failure and writes nothing, so
 # without this the loop spins at full rate on an expired login, a withdrawn
@@ -444,6 +523,77 @@ CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 # `ultra`, which adds automatic task delegation; that is a different execution
 # shape rather than more thinking, and a round already has a shape.
 CODEX_REASONING = "max"
+
+# Which program drives a round: "codex" or "agy" (the Antigravity CLI). Read
+# per round through `mutate.selected`, so it can change under a running
+# campaign the way the model can.
+#
+# It is "agy" because the codex quota this account had is exhausted until
+# 2026-09-22 08:09 and the deadline is 2026-09-30, which left six of the
+# fourteen remaining days with no rounds at all. `agy` bills a different
+# entitlement entirely -- and two of them: `agy -p /usage` reports a Gemini
+# pool and a separate "Claude and GPT models" pool, the second untouched at
+# 100% while the codex one is at zero. So the wall the campaign hit was one
+# vendor's, not the account's.
+MUTATOR = "agy"
+# The model an `agy` round asks for. Sonnet rather than a flash model because
+# a round reads the champion and its opponents and edits a program, and the
+# cheap end of the catalog has already failed that once: `gemini-3.6-flash-low`
+# produced garbage on a two-step shell-and-edit probe that `-medium` completed.
+# It also spends the pool that has quota rather than the one that is 2% down.
+AGY_MODEL = "claude-sonnet-4-6"
+# Retried once when the first call fails without a verdict, across pools on
+# purpose: a Claude-pool refusal (rate limit, capacity) is exactly the failure
+# a same-pool retry would hit again.
+AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
+# How long one `agy` round may run.
+#
+# Deliberately far above the 5m default, for the reason a round cap was
+# removed from codex: the only cap this ever had cut calls off before they had
+# written anything. It has to be said out loud here because an expired
+# `--print-timeout` does not look like a failure -- agy returns the partial
+# answer, reports `"status": "SUCCESS"` and exits 0 (measured on 1.2.4, with
+# `child.py` untouched). Nothing but the file says whether the round worked,
+# which is why `_written` is what decides the verdict.
+AGY_TIMEOUT = "3h"
+# The model agy is asked for on its other entitlement.
+#
+# `agy -p /usage` reports two pools -- "Gemini Models" and "Claude and GPT
+# models" -- and meters them apart. The model name alone decides which a call
+# bills, so naming only one leaves the other unspent: on 2026-09-20 the Gemini
+# pool was down to 34% while Claude and GPT sat at 67%, and agy had already
+# stopped both lineages twice for want of quota.
+#
+# A Gemini model here because `CAMPAIGN_AGY_MODEL` now names a Claude one. The
+# pair is what matters, not which is first.
+AGY_SECOND_MODEL = "gemini-3.1-pro-high"
+# How long one opencode call may take before the loop stops waiting for it.
+#
+# `opencode run` has no timeout flag of its own, and on 2026-09-20 four calls
+# hung for four and a half hours apiece -- three minutes of CPU between them,
+# zero-byte transcripts -- while the loop waited, because nothing told it not
+# to. Its config's `timeout`/`headerTimeout`/`chunkTimeout` were already at
+# their five-minute defaults and did not fire: nothing had streamed, so the
+# hang was upstream of the request, in opencode's own server startup.
+#
+# Forty minutes rather than something tight. A round that is working takes ten
+# to twenty-five, so a shorter cap would throw away good calls to catch a rare
+# bad one; this is a backstop against a hang, not a limit on a round.
+OPENCODE_TIMEOUT = 40 * 60
+
+# The model an `opencode` round asks for, as `provider/model`.
+#
+# `gpt-5.6-luna` because it is the model this lineage was already climbing with
+# through codex, and OpenRouter sells it by the token with no window at all:
+# $0.20 a million input, about five cents for a round of the size measured
+# here. The quota walls that stopped the campaign -- codex until 2026-09-22,
+# agy's five-hour buckets -- are not a shape this provider has.
+OPENCODE_MODEL = "openrouter/openai/gpt-5.6-luna"
+# Retried once on the same model from a different seller, which is the only
+# fallback that answers the failure a fallback is for: a provider refusing,
+# rate-limiting or dropping the turn is a fact about that seller and not about
+# the model.
+OPENCODE_FALLBACK_MODEL = "opencode-go/gpt-5.6-luna"
 SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The database id of the program a cold start seeds itself from. The copy the
 # cold start writes under a run's `programs` is the campaign's lineage: every
@@ -491,6 +641,20 @@ class Run:
     def programs(self) -> Path:
         """Where a program's source is stored, by id."""
         return self.root / "programs"
+
+    @property
+    def rounds(self) -> Path:
+        """Where a round's own transcript is kept, by program id.
+
+        The workspace a round works in is temporary and takes the transcript
+        with it, which leaves the child and its score as the only record. That
+        cannot tell a round which never opened `plan.json` from one which
+        edited it, measured the edit worse and backed it out -- and the second
+        is the round doing exactly what it was told. A transcript runs to
+        hundreds of kilobytes, so this grows; it is worth the disk while what a
+        round does with the plan is the open question.
+        """
+        return self.root / "rounds"
 
     @property
     def seed_program(self) -> Path:
@@ -563,6 +727,14 @@ POOL = OPPONENTS.parent / "campaign" / "pool.json"
 # publications, so a restart after an outage catches up in one pass.
 HARVEST_INTERVAL_SECONDS = 3600
 HARVEST_LIMIT = 40
+# How often the loop reloads the games this lineage really lost. An hour, like
+# the harvest, and for the same reason: both keep a measurement from drifting
+# away from the competition while the campaign optimises against it.
+#
+# It costs little after the first pass: `losses._held` asks the database which
+# episodes it already holds, so an hour later only the games played since are
+# fetched -- and a submission plays a few an hour, not a few hundred.
+LOSSES_INTERVAL_SECONDS = 3600
 # The campaign this checkout runs. Everything that writes takes a `Run`, so
 # this is the only place the live one is named -- a dry run and a test each
 # construct their own and nothing has to be swapped out from under anyone.

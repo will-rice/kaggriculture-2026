@@ -54,14 +54,6 @@ uv run extract-corpus
 echo "=== $(date -u +%FT%TZ) measuring claims ==="
 uv run strategies
 
-# The field the campaign is gated against, refreshed from the day that just
-# landed. Clustering wants the whole corpus and belongs here rather than in
-# the loop; the loop takes what this writes and joins it to the pool, where
-# it is the only writer. A family already on disk keeps its name, so this
-# rewrites the tape of one that has a stronger member now and adds the rest.
-echo "=== $(date -u +%FT%TZ) farming tape opponents ==="
-uv run tape-opponents
-
 echo "=== $(date -u +%FT%TZ) rebuilding the build order ==="
 uv run build-order
 

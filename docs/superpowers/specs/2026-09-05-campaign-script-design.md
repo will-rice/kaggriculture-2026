@@ -18,7 +18,7 @@ listed in section 9, and each difference has a reason.
 
 1. **Initialize wandb from `{model}-{hash}`.**
 2. **Start the event loop.**
-3. **Spin off `SESSIONS = 8` workers**, each running section 3 forever.
+3. **Spin off `SESSIONS = 2` workers**, each running section 3 forever.
 4. **Gate the improvements** (section 5), fired by what the workers produce.
 
 ## 2. Definitions
@@ -281,17 +281,17 @@ with uncommitted changes under `src/`.
 
 ## 8. Constants
 
-| constant                 | source                         |
-| ------------------------ | ------------------------------ |
-| `SESSIONS` 8             | fits the machine               |
-| `ROUNDS_PER_SESSION` 12  | attempts at the session's seed |
-| `FAST_SEEDS` 8           | 4 was too noisy to rank on     |
-| `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent        |
-| `DEEP_TOP_K` 3           | FAMOU                          |
-| `DEEP_CONCURRENCY` 2     |                                |
-| `POOL_SIZE` 8            | the pool is the top of it      |
-| `STAGNATION_SESSIONS` 40 |                                |
-| `CORE_BUDGET` cores - 8  |                                |
+| constant                 | source                                 |
+| ------------------------ | -------------------------------------- |
+| `SESSIONS` 2             | fits the quota window, not the machine |
+| `ROUNDS_PER_SESSION` 12  | attempts at the session's seed         |
+| `FAST_SEEDS` 8           | 4 was too noisy to rank on             |
+| `EXAM_SEEDS` 64, sealed  | FAMOU 20 games/opponent                |
+| `DEEP_TOP_K` 3           | FAMOU                                  |
+| `DEEP_CONCURRENCY` 2     |                                        |
+| `POOL_SIZE` 8            | the pool is the top of it              |
+| `STAGNATION_SESSIONS` 40 |                                        |
+| `CORE_BUDGET` cores - 8  |                                        |
 
 ## 9. Deliberately not built
 

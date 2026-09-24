@@ -40,9 +40,11 @@ import math
 import random
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
@@ -60,7 +62,9 @@ from kaggriculture.campaign import (
     games,
     gate,
     harvest,
+    losses,
     measure,
+    plan,
     prompt,
     rating,
     validate,
@@ -69,13 +73,13 @@ from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.gate import Champion
 from kaggriculture.campaign.harness import OpponentCrash
 from kaggriculture.campaign.mutate import (
-    CodexMutator,
     FakeMutator,
     Mutation,
     Mutator,
-    fallback,
-    model,
-    validate_model,
+    asked_model,
+    build,
+    selected,
+    validate_models,
 )
 from kaggriculture.campaign.pool import Pool
 
@@ -124,7 +128,7 @@ def main(argv: list[str] | None = None) -> None:
     # place: a path captured in a default argument never moved.
     root = args.run_root / "dry-run" if args.dry_run else args.run_root
     paths = config.Run(
-        root=root, pool=root / "pool.json" if args.dry_run else config.POOL
+        root=root, pool=root / "pool.json" if args.dry_run else args.pool
     )
     if args.dry_run:
         LOGGER.info("dry run: every write goes under %s", paths.root)
@@ -133,15 +137,15 @@ def main(argv: list[str] | None = None) -> None:
         # time; caught here, before the run opens or a call is ever made.
         # Through the accessors, because `.env` is where the slug is chosen
         # now: validating the constant would pass a run that never uses it.
-        validate_model(model())
-        if fallback():
-            validate_model(fallback())
+        # Against the catalog of whichever program is driving, because the two
+        # share no vocabulary at all.
+        validate_models()
     # 1. wandb, named for the revision of the code that produced the run.
-    log = _open_run(dry_run=args.dry_run)
+    log = _open_run(dry_run=args.dry_run, tag=args.tag)
     mutator: Mutator = (
         FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
         if args.dry_run
-        else CodexMutator()
+        else build()
     )
     try:
         # 2-4. the event loop, the workers, and the gate they fire.
@@ -176,15 +180,34 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     # module to move one -- which is what used to happen, and what silently
     # failed against a path captured in a default argument.
     parser.add_argument("--run-root", type=Path, default=config.RUN)
+    # The pool this campaign measures against. A flag because two lineages
+    # can now run at once and a pool is read-modify-written on every
+    # promotion: sharing one would have them racing, and both writing the
+    # single `POOL_CHAMPION` key and their own `ours_N` series into it.
+    parser.add_argument("--pool", type=Path, default=config.POOL)
+    # Distinguishes this run's wandb id from another on the same revision.
+    # The id is the commit sha, which is the right name for one lineage and
+    # the same name for two.
+    parser.add_argument("--tag", default="")
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="fake calls, no log, every write under run/campaign/dry-run",
     )
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    # Absolute from here on. An evaluation worker is given a directory of its
+    # own and `chdir`s into it, so a relative path stops resolving the moment a
+    # game starts -- which is minutes after the mistake was made, and reads as
+    # a crashed agent rather than a bad argument. `--run-root` is resolved for
+    # a slower version of the same fault: `gate.promote` writes the champion's
+    # path into the pool as text, so a relative root seeds relative paths into
+    # a file every later gate reads.
+    for flag in ("seed_agent", "run_root", "pool"):
+        setattr(parsed, flag, getattr(parsed, flag).resolve())
+    return parsed
 
 
-def _open_run(dry_run: bool) -> wandb.Run:
+def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
     """Open the run this campaign logs to, named for the revision that made it.
 
     Two axes, because a session is many rounds now: everything a round
@@ -209,8 +232,9 @@ def _open_run(dry_run: bool) -> wandb.Run:
     dirty = Git(config.ROOT).status("--porcelain", "--", "src")
     if dirty:
         raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
-    started_on = model()
-    name = Repo(config.ROOT).head.commit.hexsha[:7]
+    started_on = asked_model()
+    # The revision, and what distinguishes one lineage on it from another.
+    name = Repo(config.ROOT).head.commit.hexsha[:7] + (f"-{tag}" if tag else "")
     log = wandb.init(
         entity=config.WANDB_ENTITY,
         project=config.WANDB_PROJECT,
@@ -220,8 +244,11 @@ def _open_run(dry_run: bool) -> wandb.Run:
         mode="disabled" if dry_run else "online",
         config={
             **{key: getattr(config, key) for key in HYPERPARAMETERS},
-            "CODEX_MODEL": started_on,
-            "CODEX_FALLBACK_MODEL": fallback(),
+            # Not `CODEX_MODEL`: it has held a codex slug and now holds
+            # whatever `MUTATOR` names, and a key that lies about which
+            # program produced a run is how the switch hides.
+            "MUTATOR": selected(),
+            "MUTATOR_MODEL": started_on,
         },
     )
     log.define_metric("sessions")
@@ -231,6 +258,140 @@ def _open_run(dry_run: bool) -> wandb.Run:
     log.define_metric("calls/*", step_metric="calls")
     log.define_metric("database/*", step_metric="calls")
     return log
+
+
+# What a round is not allowed to change: the campaign's own code, and the
+# messages it is asked with. Not the engine binary or anything compiled, which
+# no round has reason to touch and which would make this expensive.
+GUARDED = ("*.py", "*.md")
+
+
+def _with_skills(box: Path, wanted: tuple[Path, ...]) -> None:
+    """Copy the skills into every place a driver might look for them.
+
+    Which program serves this call is not settled until it is made -- one out
+    of quota hands it to the next -- and the workspace is prepared first. A
+    round that finds no skills still runs; it just never finds the schema or
+    the queries worth running, which is a failure that does not announce
+    itself.
+
+    Args:
+        box: The round's directory.
+        wanted: Where each driver looks, relative to it.
+    """
+    for where in wanted:
+        shutil.copytree(config.SKILLS, box / where)
+
+
+def _kept(root: Path = config.ROOT) -> dict[Path, bytes]:
+    """The campaign's own source, as it stands before a round runs.
+
+    Fifty files and about seven hundred kilobytes, read once against a call that
+    takes minutes.
+
+    Args:
+        root: The checkout to read. A parameter so a test can name its own.
+
+    Returns:
+        The bytes of every guarded file, by path.
+    """
+    return {
+        one: one.read_bytes()
+        for pattern in GUARDED
+        for one in sorted((root / "src").rglob(pattern))
+        if "__pycache__" not in one.parts
+    }
+
+
+def _restored(kept: dict[Path, bytes], mutation: Mutation, program_id: str) -> Mutation:
+    """Put back anything the round changed in the campaign's own source.
+
+    A round gets a throwaway directory holding one agent. On 2026-09-20 one
+    edited the campaign instead -- `REFERENCE_SAMPLE` to 0.0, turning off the
+    reference-engine cross-check, and `roster.path`'s `raise KeyError` into a
+    constructed path, making any string resolve to a file. Neither was random:
+    both weaken a guard in the direction that makes the round's own job easier,
+    and the second was provoked by `measure.py --against` refusing a mistyped
+    name. Given an objective and a writable grader, editing the grader is the
+    cheaper way to satisfy it.
+
+    Prevention is not on offer. agy's `--sandbox` restricts the terminal and a
+    round has to run `measure.py`, and the driver runs with
+    `--dangerously-skip-permissions`, which the comment on that flag wrongly
+    calls the same posture as codex's `-s workspace-write`.
+
+    Restored from bytes rather than from git, because the version that asked git
+    reverted all 250 tracked files when a pre-commit hook's `GIT_DIR` outranked
+    the repository it was handed. This writes back only what it read, so the
+    worst it can do is undo a change to one of the files it named.
+
+    The round is failed rather than scored: a program measured against guards it
+    removed is not measured at all.
+
+    Args:
+        kept: What `_kept` read before the round.
+        mutation: What the call produced.
+        program_id: The child program id, for the log and the reason.
+
+    Returns:
+        The mutation, or a copy recording that the round wrote out of bounds.
+    """
+    moved = sorted(
+        one for one, was in kept.items() if not one.exists() or one.read_bytes() != was
+    )
+    if not moved:
+        return mutation
+    for one in moved:
+        one.write_bytes(kept[one])
+    named = ", ".join(one.name for one in moved)
+    LOGGER.warning("%s changed the campaign and was put back: %s", program_id, named)
+    return mutation.model_copy(
+        update={
+            "child": None,
+            "status": "no_output",
+            "reason": (
+                f"this round changed the campaign's own source -- {named} -- and "
+                "it has been put back. The directory you are given holds the "
+                "program to edit; the campaign that measures it is not yours to "
+                "change, and a program measured against guards it removed is not "
+                "measured at all."
+            ),
+        }
+    )
+
+
+def _packed(mutation: Mutation, box: Path, program_id: str) -> Mutation:
+    """Write the round's program back as one file, or record that it cannot be.
+
+    The gate, the archive, the pool, the validator and the submission all expect
+    one self-contained file, and none of them has to learn otherwise, so the
+    plan is packed back into the program here.
+
+    A round that wrote a `plan.json` the schema refuses produced nothing
+    runnable. That is an ordinary outcome of asking a model to edit a file, and
+    it was a crash until 2026-09-20: `gather` validated, nothing caught what it
+    raised, and the error went up through the worker and the task group and took
+    both lineages down. The reason travels onto the mutation, so the next round
+    on this lineage is told what broke.
+
+    Args:
+        mutation: What the call produced.
+        box: The round's directory.
+        program_id: The child program id, for the log.
+
+    Returns:
+        The mutation, or a copy recording that nothing usable was written.
+    """
+    if mutation.child is None:
+        return mutation
+    try:
+        mutation.child.write_text(plan.gather(box), encoding="utf-8")
+    except plan.BrokenPlanError as broken:
+        LOGGER.warning("%s wrote an unusable plan: %s", program_id, broken)
+        return mutation.model_copy(
+            update={"child": None, "status": "no_output", "reason": str(broken)}
+        )
+    return mutation
 
 
 def state_file(paths: config.Run) -> Path:
@@ -284,11 +445,17 @@ def run(
     rng: random.Random,
     log: wandb.Run,
     paths: config.Run,
+    opponents: Path = config.OPPONENTS,
 ) -> State:
     """Load what a restart resumes, seed an empty database, drive the workers.
 
     ``sessions`` is how many this run starts; what is in flight when the last
     is taken is drained. Returns the state as of the last completed session.
+
+    ``opponents`` is the directory pool membership is read from, an argument
+    rather than a global so that what a run measures against is something the
+    caller states. A test that builds a two-opponent pool and then silently
+    plays the machine's whole data directory is not testing what it says.
     """
     resume = state_file(paths)
     state = (
@@ -304,6 +471,14 @@ def run(
         state.champion = champion
         LOGGER.info("resuming on champion %s from champion.json", champion.name)
     pool = Pool.load(paths.pool) if paths.pool.exists() else Pool.initial()
+    # Whatever has been vendored since the last launch joins here rather than
+    # waiting for the script that wrote it to remember the pool. Two writers
+    # fill the opponents directory and only `harvest` ever wrote membership,
+    # so sixty-one playable agents -- thirty-six of them families rebuilt from
+    # recorded ladder episodes -- had never been played by anything.
+    adopted = pool.adopt(opponents) if opponents.exists() else []
+    if adopted:
+        LOGGER.info("adopted %d opponents from %s", len(adopted), opponents)
     # A champion's name resolves through the pool file, so the pool on disk
     # must be current before anything plays a game.
     pool.save(paths.pool)
@@ -423,6 +598,10 @@ class Campaign:
         # rather than in a session, because the eight run at once and a block
         # only makes candidates comparable if they share it.
         self.block: list[int] = []
+        # The extra seasons the champion pairing is played on, drawn with the
+        # block and disjoint from it. `seasons` explains why it is a slice of
+        # the same sample rather than a second draw.
+        self.duel: list[int] = []
         self.measured = 0
         # Calls in a row that ran to no verdict. A call that never reached the
         # model is nobody's failure, so it writes nothing and the worker
@@ -494,6 +673,7 @@ class Campaign:
         # when the sessions do: a group waits for every task it holds, and a
         # harvester that sleeps for an hour would hold a finished run open.
         harvesting = asyncio.ensure_future(self.harvesting())
+        losing = asyncio.ensure_future(self.losing())
         for number in (signal.SIGINT, signal.SIGTERM):
             running.add_signal_handler(number, work.cancel)
         try:
@@ -502,8 +682,37 @@ class Campaign:
             LOGGER.warning("stopped on a signal at %d sessions", self.state.sessions)
         finally:
             harvesting.cancel()
+            losing.cancel()
             for number in (signal.SIGINT, signal.SIGTERM):
                 running.remove_signal_handler(number)
+
+    async def losing(self) -> None:
+        """Keep the games this lineage really lost current, for as long as it runs.
+
+        The same reasoning as `harvesting`, one level out. A pool left alone
+        becomes this campaign playing itself; a set of losses left alone becomes
+        the *previous* champion's failures, and the search then studies games the
+        standing program never played. Champions 31 to 39 all arrived inside a
+        day, so by hand this is stale within the hour.
+
+        Everything goes to a thread: the listing, the downloads and the parse are
+        all slow and none of them touches the pool or the state the loop owns.
+        Only the games database is written, and it takes parallel writers.
+
+        A failed refresh is not a failed campaign, for the same reason a failed
+        harvest is not: the competition's API is somebody else's uptime, and a
+        run that has been evaluating for hours must not end because a listing
+        timed out.
+        """
+        while True:
+            await asyncio.sleep(config.LOSSES_INTERVAL_SECONDS)
+            try:
+                loaded = await asyncio.to_thread(losses.refresh)
+            except Exception:
+                LOGGER.exception("loss refresh failed; the campaign continues")
+                continue
+            if loaded:
+                LOGGER.info("losses: %d new game(s) the lineage lost", loaded)
 
     async def harvesting(self) -> None:
         """Take newly published kernels into the pool, for as long as the run lasts.
@@ -514,36 +723,25 @@ class Campaign:
         published agents, and those frozen on the day someone last ran the
         harvest by hand.
 
-        Two sources, because the field has two halves. Newly published kernels
-        are discovered, downloaded, built and played here. Tape opponents are
-        not: the nightly corpus job clusters the day's replays into behavioural
-        families and writes one tape each, and what this does is notice them.
-
         Discovery, the download, the build and the 720-step check all go to a
         thread, because each is slow and none of them is the pool's. The pool
         is changed here, on the loop, where `gate.promote` also changes it and
         nothing runs at the same time. A load-modify-save from that thread
-        would quietly drop any champion promoted while it was downloading --
-        which is also why the nightly job writes tapes to disk and leaves them
-        there, rather than joining them to the pool itself.
+        would quietly drop any champion promoted while it was downloading.
 
         A failed harvest is not a failed campaign: the competition's API is
         somebody else's uptime, and a run that has been evaluating for hours
-        must not end because a listing timed out. The families are taken first
-        and kept whatever the listing does, for the same reason -- they are a
-        glob of the local disk, and nothing about them can fail that way.
+        must not end because a listing timed out.
         """
         while True:
             await asyncio.sleep(config.HARVEST_INTERVAL_SECONDS)
-            found = harvest.families(set(self.pool.opponents))
             try:
-                found |= await asyncio.to_thread(
-                    harvest.vendored,
-                    config.HARVEST_LIMIT,
-                    set(self.pool.opponents) | set(found),
+                found = await asyncio.to_thread(
+                    harvest.vendored, config.HARVEST_LIMIT, set(self.pool.opponents)
                 )
             except Exception:
                 LOGGER.exception("harvest failed; the campaign continues")
+                continue
             if not found:
                 continue
             self.pool.opponents.update(found)
@@ -655,7 +853,14 @@ class Campaign:
                 ]
                 playing = against[attempt % len(against)]
             message = prompt.compose(
-                name, playing, result.fitness, failures, siblings, instruction
+                name,
+                playing,
+                result.fitness,
+                failures,
+                siblings,
+                instruction,
+                source.read_text(encoding="utf-8"),
+                self.paths.champions,
             )
             outcome = await self.round(source, name, result, message, siblings, drawn)
             rounds += 1
@@ -726,7 +931,13 @@ class Campaign:
         ) as scratch:
             box = Path(scratch)
             child = box / "child.py"
-            shutil.copy(source, child)
+            # Apart, so the round can read and edit the plan: `child.py` is the
+            # controller with one import where 94,490 characters of base85 used
+            # to be, and `plan.json` is the strategy as readable JSON. No round
+            # had ever changed the plan -- champions 17 to 24 carry a
+            # byte-identical blob -- because as text it is unreadable and
+            # nothing said it was data.
+            plan.lay_out(source.read_text(encoding="utf-8"), box)
             # The gate writes a champion read-only so nothing can edit the file
             # the pool plays, and `shutil.copy` carries that mode across. This
             # copy is the one file the call must be able to write.
@@ -740,7 +951,23 @@ class Campaign:
             # is still the loop's: it plays every scored game itself, against
             # opponents this never sees, and nothing a round reports is read.
             shutil.copy(source, box / "parent.py")
-            shutil.copy(Path(measure.__file__), box / "measure.py")
+            # Copied with a shebang naming the interpreter this loop is
+            # running, and marked executable, because a round's own guess is
+            # wrong and it pays to guess. `python` is not on the PATH a round's
+            # commands see, `python3` is the system 3.10 with no
+            # `kaggriculture` in it, and the package is installed editable into
+            # a virtual environment a round has no reason to know about. Every
+            # round was rediscovering that by trial: one died having spent its
+            # whole call on "I will wait for the search for `kaggriculture` to
+            # complete", and the file's own docstring had told it to run
+            # `python measure.py`, which is the one command that cannot work.
+            runner = box / "measure.py"
+            runner.write_text(
+                f"#!{sys.executable}\n"
+                + Path(measure.__file__).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
             # And the edits already made to this program, which the message
             # names and scores. A score says a direction lost ground; the file
             # is what says which direction it was, and `measure.py` will play
@@ -749,13 +976,68 @@ class Campaign:
                 siblings[: prompt.RECENT_ATTEMPTS], start=1
             ):
                 shutil.copy(program.source_path, box / f"tried_{number}.py")
-            # And how to ask it, as a skill rather than as more message. Codex
-            # discovers `.codex/skills` under its working directory, so a
-            # round that wants the schema and the queries worth running opens
-            # them, and a round with a different question pays nothing for
-            # them. The message is read every round; this is read on demand.
-            shutil.copytree(config.SKILLS, box / ".codex" / "skills")
-            mutation = await self.mutator(box, message, program_id)
+            # And how to ask it, as a skill rather than as more message, at
+            # whichever path the driving program looks for one: codex reads
+            # `.codex/skills` under its working directory, agy walks up from
+            # it for `.agents`. So a round that wants the schema and the
+            # queries worth running opens them, and a round with a different
+            # question pays nothing for them -- both programs disclose a skill
+            # by name and description and load it only if asked. The message
+            # is read every round; this is read on demand.
+            # Into every place any driver looks, because which one serves
+            # this call is not settled until it is made: a provider out of
+            # quota hands it to the next.
+            _with_skills(box, self.mutator.SKILLS_DIRS)
+            # What the campaign's own source says before this round runs,
+            # so that what it says afterwards can be put back. `_restored`
+            # carries why that is necessary.
+            before = _kept()
+            # A round that writes a `plan.json` the schema refuses is a round
+            # that produced nothing runnable, which is an ordinary outcome of
+            # asking a model to edit a file -- and until 2026-09-20 it was a
+            # crash. `gather` validates, nothing caught what it raised, and the
+            # error went up through the driver, the worker and the task group
+            # and took both lineages down with it.
+            #
+            # It surfaced on the retry path, which is how a provider outage
+            # became a campaign outage: the first call failed on an exhausted
+            # quota, the fallback re-entered the driver, and `gather` read the
+            # workspace the first model had already written a broken plan into.
+            #
+            # Caught here rather than in each driver because every round goes
+            # through this function, so a fourth driver cannot forget it.
+            try:
+                mutation = await self.mutator(box, message, program_id)
+            except plan.BrokenPlanError as broken:
+                LOGGER.warning("%s wrote an unusable plan: %s", program_id, broken)
+                mutation = Mutation(
+                    program_id=program_id,
+                    child=None,
+                    status="no_output",
+                    reason=str(broken),
+                    seconds=0.0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    model=asked_model(),
+                )
+            # What the round did, before the workspace takes it. A child whose
+            # plan is unchanged can mean the round never opened `plan.json`, or
+            # that it edited it, measured the edit worse and backed it out --
+            # which is the round doing what it was told. The score cannot tell
+            # those apart and the transcript can.
+            kept_at = self.paths.rounds / program_id
+            written = {
+                one for pattern in self.mutator.TRANSCRIPTS for one in box.glob(pattern)
+            }
+            for transcript in sorted(written):
+                kept_at.mkdir(parents=True, exist_ok=True)
+                shutil.copy(transcript, kept_at / transcript.name)
+            # And back together before anything downstream looks at it. The
+            # gate, the archive, the pool, the validator and the submission all
+            # expect one self-contained file, and none of them has to learn
+            # otherwise.
+            mutation = _restored(before, mutation, program_id)
+            mutation = _packed(mutation, box, program_id)
             kept = await self.keep(mutation, name, drawn, program_id)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.
@@ -866,6 +1148,45 @@ class Campaign:
             mutation.child.read_text(encoding="utf-8"), program_id
         )
         try:
+            # The cheap half first. A sweep is 184 opponents where 126 sit at
+            # 1.000 against the champion and cannot move any verdict, and
+            # condition 1 is already read over the 58 that can -- so a
+            # candidate that condition turns away was decided by a third of
+            # the games. Both gates run on 2026-09-22 were exactly that, an
+            # hour each to refuse on a number settled in the first twenty
+            # minutes.
+            #
+            # The same test on the same seasons, so it cannot refuse a
+            # candidate the full gate would promote; anything it passes plays
+            # the whole pool and carries the per-opponent regression check
+            # over every opponent, the swept ones included.
+            against = self.screening()
+            if against is not None:
+                names = gate.contested(
+                    against, sorted(set(against.result.rates) - {against.name})
+                )
+                screen = await self.measure(stored, program_id, only=names, keep=False)
+                held, why = gate.screened(screen, against)
+                if not held:
+                    # Recorded the way a refusal is, not the way a failure is:
+                    # the round ran, produced a program and was judged, and the
+                    # next round is shown what it scored.
+                    table = gate.standing(
+                        program_id, screen.rates, 2 * config.GATE_SEEDS, self.paths
+                    )
+                    self.database.add(
+                        _program(
+                            program_id,
+                            stored,
+                            started_from,
+                            drawn,
+                            mutation.model,
+                            screen,
+                            table,
+                        )
+                    )
+                    LOGGER.info("%s %s screened: %s", program_id, drawn, why)
+                    return Kept(stored, program_id, screen, table, False)
             result = await self.measure(stored, program_id)
         except OpponentCrash:
             raise
@@ -1049,6 +1370,26 @@ class Campaign:
             return None
         return standing.model_copy(update={"result": measured})
 
+    def screening(self) -> "Champion | None":
+        """The champion the screen compares against, or None to skip it.
+
+        `paired` asks the same question of a finished evaluation and answers it
+        from that evaluation's seeds. The screen runs before there is one, so
+        this takes the baseline directly and checks only that it belongs to the
+        champion now standing -- the block is the current one by construction,
+        because the screen and the sweep that follows it share `seasons`.
+
+        Returns:
+            The champion carrying the measurement to compare against, or None
+            when there is nothing comparable and the sweep should just run.
+        """
+        if self.state.champion is None or self.champion_baseline is None:
+            return None
+        path, _, measured = self.champion_baseline
+        if path != self.state.champion.path:
+            return None
+        return self.state.champion.model_copy(update={"result": measured})
+
     def floor(self) -> str | None:
         """The champion's name, or None before there is one.
 
@@ -1060,7 +1401,13 @@ class Campaign:
         """
         return self.state.champion.name if self.state.champion else None
 
-    async def measure(self, source: Path, program_id: str) -> Result:
+    async def measure(
+        self,
+        source: Path,
+        program_id: str,
+        only: Sequence[str] | None = None,
+        keep: bool = True,
+    ) -> Result:
         """Play ``source`` against the pool as it stands, off the loop thread.
 
         This is the campaign's only measurement of a round, and the only one
@@ -1080,20 +1427,36 @@ class Campaign:
         """
         table = rating.standings(rating.Field.load(self.paths.field).everything())
         pool = self.snapshot()
+        if only is not None:
+            # The screen's pool: the opponents that can still move, without
+            # the 126 at 1.000 whose games cannot change the answer it asks.
+            wanted = set(only)
+            pool = Pool(
+                opponents={
+                    name: path
+                    for name, path in pool.opponents.items()
+                    if name in wanted
+                }
+            )
         # Recorded before a game is played, so the gate can tell afterwards
         # whether the champion it is being compared against is the one it met.
         self.champion_played[program_id] = pool.opponents.get(config.POOL_CHAMPION, "")
+        # `seasons` first and on its own line, because it is what rotates the
+        # blocks: read inside the call's argument list it would depend on
+        # left-to-right evaluation order to leave `self.duel` current.
+        block = self.seasons()
         result = await asyncio.to_thread(
             evaluator.score,
             source,
             program_id,
             pool,
             random.Random(self.rng.random()),
-            self.seasons(),
+            block,
             self.workers,
             self.paths.pool,
             table,
             self.must_play(table),
+            self.duel,
         )
         # Every game of it, into the one database the nightly extraction also
         # writes to. Every candidate, not only the ones that survive: what
@@ -1102,9 +1465,10 @@ class Campaign:
         # games nobody kept. Measured at 9.6 MB and 1.3s an evaluation, which
         # is about 11 GB a day at eight sessions -- affordable against the
         # competition's remaining weeks, and off the loop thread either way.
-        await asyncio.to_thread(
-            games.record, program_id, games.played(result, program_id)
-        )
+        if keep:
+            await asyncio.to_thread(
+                games.record, program_id, games.played(result, program_id)
+            )
         return result
 
     def seasons(self) -> list[int]:
@@ -1127,10 +1491,19 @@ class Campaign:
         Called on the loop thread, where the counter is nobody else's.
         """
         if self.measured % config.SEED_ROTATION == 0:
-            self.block = self.rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS)
+            # One sample split in two, not two samples. `random.sample` cannot
+            # repeat within a draw, so the sweep's seasons and the champion
+            # pairing's extra seasons are disjoint by construction -- and a
+            # season played in both blocks would be the same game counted
+            # twice in that pairing's rate.
+            drawn = self.rng.sample(config.GATE_SEED_RANGE, config.DUEL_SEEDS)
+            self.block = drawn[: config.GATE_SEEDS]
+            self.duel = drawn[config.GATE_SEEDS :]
             LOGGER.info(
-                "seasons: a fresh block of %d after %d candidates",
+                "seasons: a fresh block of %d, and %d more against the "
+                "champion, after %d candidates",
                 config.GATE_SEEDS,
+                len(self.duel),
                 self.measured,
             )
         self.measured += 1

@@ -4,7 +4,9 @@ import csv
 import statistics
 from pathlib import Path
 
-from kaggriculture.campaign import harness
+import pytest
+
+from kaggriculture.campaign import harness, measure
 
 PASS = (
     "def agent(observation, configuration=None):\n"
@@ -104,3 +106,104 @@ def test_a_replay_names_the_day_the_gap_moved_most(tmp_path: Path) -> None:
     worst, when = min(moves)
     assert 0 < when < len(game.days)
     assert worst == gaps[when] - gaps[when - 1]
+
+
+def test_the_measurement_can_be_pointed_at_a_matchup() -> None:
+    """The flag that makes a round able to check its own work.
+
+    `games.ordered` hands a round the matchup taking the most games off us, and
+    until this existed the only instrument played the edit against its own
+    parent. An edit that helped the matchup measured neutral there and was
+    dropped, which is how twenty-nine promotions passed without closing a
+    three-percent gap.
+    """
+    parsed = measure.parser().parse_args(["--against", "p1a2b3c4m1s1"])
+
+    # An episode key, not an opponent's name: the name is what must not travel.
+    assert parsed.against == "p1a2b3c4m1s1"
+
+
+def test_without_the_flag_the_measurement_is_still_against_the_parent() -> None:
+    """The old question stays the default, so nothing silently changes."""
+    assert measure.parser().parse_args([]).against is None
+
+
+def test_an_episode_not_on_the_record_fails_before_playing_anything(
+    tmp_path: Path,
+) -> None:
+    """A mistyped key must not cost ten minutes of games before it is noticed.
+
+    The message has to say where the right key is, because the episode key is
+    the round's only handle on the matchup it was given -- the opponent's name
+    is deliberately not.
+    """
+    child = tmp_path / "child.py"
+    parent = tmp_path / "parent.py"
+    child.write_text("", encoding="utf-8")
+    parent.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as refused:
+        measure.against(child, parent, "no_such_episodem1s1", 2)
+
+    assert "no_such_episodem1s1" in str(refused.value)
+    assert "The game" in str(refused.value)
+
+
+def test_the_two_measurements_read_a_difference_the_same_way(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """One verdict, shared, so a round does not meet two wordings for one idea."""
+    measure._verdict(1000.0, 100.0, 2.0, [1.0] * 8, 8)
+    kept = capsys.readouterr().out
+
+    measure._verdict(-1000.0, 100.0, 2.0, [1.0] * 8, 8)
+    dropped = capsys.readouterr().out
+
+    measure._verdict(10.0, 100.0, 2.0, [1.0] * 8, 8)
+    unknown = capsys.readouterr().out
+
+    assert "KEEP IT" in kept
+    assert "REVERT IT" in dropped
+    assert "THIS SAYS NOTHING" in unknown
+
+
+def test_one_run_answers_both_questions(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round does not choose which measurement to take, because it cannot.
+
+    There were two commands and the round picked between them. When only the
+    head-to-head existed it was the one they used, and it cannot see the matchup
+    a round is sent to beat -- twenty-nine promotions passed without closing a
+    three-percent gap that way. So the run reports the matchup and the
+    head-to-head together, and there is nothing to get wrong.
+    """
+    seen = []
+
+    def both(*arguments: object) -> None:
+        seen.append(arguments[2] if len(arguments) > 2 else None)
+
+    monkeypatch.setattr(measure, "against", lambda *a: seen.append("matchup"))
+    monkeypatch.setattr(measure, "compare", lambda *a: seen.append("head-to-head"))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["measure.py", "--against", "p1a2b3c4m1s1", "--seeds", "4"],
+    )
+
+    measure.main()
+
+    assert seen == ["matchup", "head-to-head"]
+
+
+def test_without_a_matchup_only_the_head_to_head_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first round on a lineage has no game to name, so there is no matchup."""
+    seen = []
+    monkeypatch.setattr(measure, "against", lambda *a: seen.append("matchup"))
+    monkeypatch.setattr(measure, "compare", lambda *a: seen.append("head-to-head"))
+    monkeypatch.setattr("sys.argv", ["measure.py", "--seeds", "4"])
+
+    measure.main()
+
+    assert seen == ["head-to-head"]

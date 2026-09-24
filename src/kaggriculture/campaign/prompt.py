@@ -22,6 +22,7 @@ Nothing measured off other agents' games reaches a round; see the note on the
 build order below for what happened when it did.
 """
 
+import ast
 import logging
 import re
 from pathlib import Path
@@ -30,6 +31,7 @@ from kaggriculture.campaign import (
     archive,
     config,
     harness,
+    plan,
     validate,
 )
 
@@ -73,6 +75,9 @@ REASON_CHARS = 200
 # direction that came closest and the ones that lost ground, and with eight
 # sessions editing the same champion the list is long enough to need a cut.
 RECENT_ATTEMPTS = 3
+# How many past promotions to show. Enough to see the shape of what has
+# worked, without the message growing a history nobody reads.
+KEPT_EDITS = 6
 
 # How a round reaches the games. One database holds every game this campaign
 # has played and every game recorded off the competition, and a round asks it
@@ -85,8 +90,72 @@ GAMES = config.GAMES_URL
 # per session -- and two of them, "a completely different algorithm" and "a
 # novel approach inspired by this one", took 54% of every call the campaign
 # made and returned 476 programs of which one scored above nought.
-INSTRUCTION = "Write a program that beats the opponent. Watch the market."
-# The objective, and one place to look.
+INSTRUCTION = (
+    "Find where this program loses, and change `plan.json` to fix it -- the "
+    "plan is what the farm does, and the controller only steers it. "
+    "`measure.py` plays as many seasons as you ask it to: run the experiment "
+    "that would show your change is not an improvement, and keep it only if it "
+    "survives."
+)
+# The objective, and the method.
+#
+# Rewritten 2026-09-16 into the loop a top competitor published as his own --
+# "the better prompt is not: build the optimal agent, but: where does this
+# agent lose, and what experiment could disprove the proposed improvement?" --
+# by a team whose agent this campaign vendored at a public score of 2,863. The
+# round already holds the two things that needs: one game it is losing, and a
+# paired harness that resolves a 5,000-coin difference in about four games.
+#
+# What it replaces asked for a committed season plan, and that was measured
+# inert: champions 14, 15 and 16 carried an identical 57 day-keyed conditions
+# with 36 of them on the last two days, and the field rate climbed anyway. An
+# instruction does not change a 2,300-line program's shape by asking.
+#
+#
+# The second sentence was replaced on 2026-09-15. What it replaced is kept
+# below because the reasoning still holds and only stopped being the binding
+# constraint.
+#
+# Commitment is the thing this lineage has never had, and the measurement that
+# says so is old. In the tape lineage the plan was worth ~136,680 mean bank and
+# everything 69 promotions added on top of it was worth +440: the tape was
+# byte-identical from the seed to champion_69, and 521 sessions never touched
+# it. The search was not lazy, it was locked out -- a plan reaches a proposer as
+# 29,820 chars of base64, which does not fit in a prompt beside a 3,220-line
+# program.
+#
+# That was true when it was written and is not now. `base64`, `zlib`, `json`
+# and `pathlib` are all on the whitelist -- the champion imports them to unpack
+# its own plan -- and a round is handed the plan as `plan.json`, 4,095 lines
+# with one step to a line, which `gather` packs back in. So the table can be
+# edited and can be shipped, and the instruction names it.
+#
+# Which is the whole of what changed on 2026-09-18. The method is untouched:
+# find where it loses, and run the experiment that would show the fix is not
+# one. What is added is where to look, because 215 rounds filed under the name
+# "plan" left the plan byte-identical -- one hash across 142 programs -- and
+# for 212 of them it was a line of base85 they could not read.
+#
+# What makes it worth the round: the tape lineage's own first champion replays
+# a fixed plan, 720 of 720 commands identical on a different season against the
+# same opponent and 694 of 720 against a different one -- it does not look at
+# the board at all -- and it still holds champion_14, fourteen champions of
+# per-turn adaptation, to 0.5625. Adaptation is not where the coins are.
+#
+# The third sentence is the same change aimed at the other half of the
+# problem. A round has been able to play its own games since `measure.py`
+# arrived on 2026-09-10 -- paired, both seats, a difference of 5,000 coins
+# resolved in about four games where the gate needs 114 -- and no message has
+# ever mentioned the file. The only place it is named is the `query-games`
+# skill, under the heading "Then measure the change", which is the whole
+# difficulty: it reads as a way to check an edit that has already been
+# decided, and a round that believes that will tweak and verify rather than
+# search. No transcript is kept, so how often it is actually run is not
+# something this can cite -- only that nothing ever asked for it.
+#
+# The gate is unchanged, so this costs nothing if it is wrong: a candidate of
+# the new shape is promoted only by beating champion_14 over the same pool as
+# anything else.
 #
 # The second sentence was added on 2026-09-14 and is a deliberate exception to
 # the line below it. champion_12 had stood for five and a half hours of loop
@@ -121,7 +190,7 @@ INSTRUCTION = "Write a program that beats the opponent. Watch the market."
 # It also asked for the wrong thing. A round told to improve a margin improves
 # the program it was handed, and seventy-nine rounds did exactly that without
 # once leaving that program's shape.
-INSTRUCTION_NAME = "win"
+INSTRUCTION_NAME = "plan"
 
 
 class Message:
@@ -215,14 +284,26 @@ def _game_lines(name: str, played: tuple[int, int, harness.Game] | None) -> list
         f"Episode `{episode}`. It held seat {game.seat} and finished "
         f"{game.ours:,.0f} against {game.theirs:,.0f}, {finish:+,.0f}.",
         "",
-        "Every day of it, both sides, is in the games database, along with "
-        "every game the competition has recorded:",
+        f"That is the matchup this round is on, and beating it is the job. "
+        f"`./measure.py --against {episode}` plays your child and the program "
+        f"you started from against it on the same seasons and reports the "
+        f"difference. Plain `./measure.py` plays them against each other, which "
+        f"says nothing about this matchup.",
+        "",
+        "Every day of it, both sides, is in the games database -- and so is "
+        "every game the competition has recorded, twenty-six thousand of them, "
+        "under `source = 'ladder'`. This asks where your season and theirs "
+        "part company:",
         "",
         f"    curl -s {GAMES} --data-binary "
-        + f"\"select * from games.days where episode='{episode}'"
-        + ' order by day, seat format Pretty"',
+        + '"select day,'
+        + " round(avgIf(bank, source = 'ladder')) as ladder,"
+        + " round(avgIf(bank, source = 'campaign')) as ours"
+        + ' from games.days group by day order by day format TabSeparated"',
         "",
-        "The `query-games` skill has the schema.",
+        f"Your own game is `select * from games.days where episode='{episode}' "
+        f"order by day, seat`. The `query-games` skill has the schema and "
+        f"`compare-to-the-field` has the rest of this comparison.",
     ]
 
 
@@ -252,6 +333,53 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     for failure in failures[-RECENT_FAILURES:]:
         lines.append(f"- {' '.join(failure.reason.split())[:REASON_CHARS]}")
     return lines
+
+
+def _kept_lines(champions: Path) -> list[str]:
+    """What every promotion before this one changed in the plan.
+
+    A round is told what its siblings scored and never what they did, so the
+    shape of an edit that worked has to be rediscovered each time. These are the
+    changes that survived a gate, in the terms a round would make them in.
+
+    Args:
+        champions: The directory every promoted program is written to.
+
+    Returns:
+        The lines to render, or nothing when no promotion has moved the plan.
+    """
+    if not champions.is_dir():
+        return []
+    chain = sorted(
+        champions.glob("champion_*.py"),
+        # Guarded because the glob does not promise a number, even though
+        # every name it matches has one.
+        key=lambda path: (
+            int(found.group(1)) if (found := re.search(r"(\d+)", path.name)) else 0
+        ),
+    )
+    said: list[str] = []
+    before = None
+    for path in chain:
+        source = path.read_text(encoding="utf-8")
+        if not plan.carries(source):
+            continue
+        _, after = plan.split(source)
+        if before is not None:
+            moved = plan.described(before, after)
+            if moved != "the plan is unchanged":
+                said.append(f"- {path.stem}: {moved}")
+        before = after
+    if not said:
+        return []
+    return [
+        "## What has worked",
+        "",
+        "Every change to the plan that has survived a gate, oldest first. A",
+        "score says an edit was kept; this says what it was.",
+        "",
+        *said[-KEPT_EDITS:],
+    ]
 
 
 def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> list[str]:
@@ -317,6 +445,76 @@ def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> lis
     return lines
 
 
+def schedule(source: str) -> dict[int, int]:
+    """How many of a program's conditions name a particular day.
+
+    A proxy for commitment, and a deliberately crude one: a decision taken at a
+    fixed day is a plan whether it is written as a table or as `if day == 3`,
+    and counting the days a program's conditions name is the cheapest way to
+    see which parts of the season it has decided in advance.
+
+    It undercounts. A decision committed to a day whose quantity is computed
+    from inventory still reads as one condition, and a schedule expressed
+    through a variable rather than a literal is invisible here. What it is for
+    is the shape: measured on champion_15, 30 of 46 named day 29 and eight days
+    of the season carried the other 16.
+
+    Args:
+        source: The program, as text.
+
+    Returns:
+        Day to how many conditions name it, empty if the source will not parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    counted: dict[int, int] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        parts = [node.left, *node.comparators]
+        if not any(_names_the_day(part) for part in parts):
+            continue
+        for part in parts:
+            if isinstance(part, ast.Constant) and isinstance(part.value, int):
+                counted[part.value] = counted.get(part.value, 0) + 1
+    return dict(sorted(counted.items()))
+
+
+def _names_the_day(node: ast.expr) -> bool:
+    """Whether this operand is the season's day, however it was reached."""
+    if isinstance(node, ast.Name):
+        return node.id == "day"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "day"
+    if isinstance(node, ast.Subscript):
+        index = node.slice
+        return isinstance(index, ast.Constant) and index.value == "day"
+    return False
+
+
+def _schedule_lines(source: str) -> list[str]:
+    """Where the program has already decided, and where it decides as it goes."""
+    counted = schedule(source)
+    if not counted:
+        return []
+    named = ", ".join(f"day {day}: {count}" for day, count in counted.items())
+    silent = [day for day in range(30) if day not in counted]
+    lines = [
+        "## Where your program has already decided",
+        "",
+        f"Conditions in `child.py` that name a day, counted: {named}.",
+    ]
+    if silent:
+        lines.append(
+            "It names no day at "
+            + ", ".join(str(day) for day in silent)
+            + " -- on those days it decides as it goes."
+        )
+    return lines
+
+
 def compose(
     name: str,
     played: tuple[int, int, harness.Game] | None,
@@ -324,6 +522,8 @@ def compose(
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
+    source: str = "",
+    champions: Path | None = None,
 ) -> str:
     """Compose the message for one round.
 
@@ -347,6 +547,11 @@ def compose(
             first few, and `round` copies the same ones into the directory.
         instruction: ``INSTRUCTION``, with any stagnation note the caller
             prepended.
+        source: The program in ``child.py``, so the message can show which days
+            of the season it has already decided. Empty renders no section.
+        champions: Where every promoted program is written, so the message can
+            say what each promotion changed in the plan rather than only what
+            it scored. None renders no section.
 
     Returns:
         The whole message, for codex's standard input.
@@ -357,12 +562,16 @@ def compose(
     # one leaves no gap.
     section = _game_lines(name, played)
     tried = _tried_lines(name, rate, siblings) if siblings else []
+    committed = _schedule_lines(source) if source else []
+    kept = _kept_lines(champions) if champions else []
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         imports=IMPORTS,
         game="\n".join(section) + "\n" if section else "",
         tried="\n".join(tried) + "\n" if tried else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
+        schedule="\n".join(committed) + "\n" if committed else "",
+        kept="\n".join(kept) + "\n" if kept else "",
         instruction=instruction,
     )
     LOGGER.info(

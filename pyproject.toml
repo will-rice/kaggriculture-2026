@@ -87,9 +87,15 @@ rust = ["maturin>=1.8,<2"]
 
 [project.scripts]
 package = "kaggriculture.scripts.package:main"
+losses = "kaggriculture.scripts.losses:main"
+standing = "kaggriculture.scripts.standing:main"
 submit = "kaggriculture.scripts.submit:main"
 campaign = "kaggriculture.campaign.harness:main"
 replay-corpus = "kaggriculture.scripts.replay_corpus:main"
 strategies = "kaggriculture.scripts.strategies:main"
 extract-corpus = "kaggriculture.scripts.extract_corpus:main"
 tape-opponents = "kaggriculture.scripts.tape_opponents:main"
+champions = "kaggriculture.scripts.champions:main"
+consensus = "kaggriculture.scripts.consensus:main"
+plan-search = "kaggriculture.scripts.plan_search:main"
+where-we-lose = "kaggriculture.scripts.where_we_lose:main"

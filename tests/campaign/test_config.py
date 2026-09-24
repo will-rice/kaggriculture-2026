@@ -91,7 +91,14 @@ def test_core_budget_leaves_headroom() -> None:
 
 def test_constants_match_the_spec_table() -> None:
     """Spec section 8: the campaign's constants, and only these."""
-    assert config.SESSIONS == 8
+    # Two, not the spec's original eight. Eight was chosen when a round cost a
+    # codex call and the only limit was the machine; the limit is now a five-hour
+    # quota window, and eight sessions drained one in twenty minutes and then
+    # walked into the wall mid-round eight times over -- a window spent on eight
+    # abandoned rounds and no verdict. Concurrency cannot buy rounds the quota
+    # does not hold; it only decides how many are unfinished when the wall lands,
+    # and how few cores each has to measure with.
+    assert config.SESSIONS == 2
     # Twelve consecutive attempts against one opponent, and a session works
     # through every opponent in the pool -- so a session's length is the pool's
     # rather than a constant, and there is no ROUNDS_PER_SESSION.

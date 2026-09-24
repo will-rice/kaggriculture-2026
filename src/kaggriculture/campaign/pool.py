@@ -43,6 +43,7 @@ rather than meet the whole field. Paths are stored here and shown nowhere.
 import math
 import os
 import random
+import re
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -92,6 +93,44 @@ class Pool(BaseModel):
     def names(self) -> list[str]:
         """Every opponent currently in the pool."""
         return list(self.opponents)
+
+    def adopt(self, root: Path) -> list[str]:
+        """Take every vendored agent under ``root`` the pool does not hold.
+
+        Agents reach ``root`` from two writers and only one of them ever
+        wrote the pool. `harvest` adds what it vendors. `tape_opponents`
+        writes the families it rebuilds from recorded episodes and stops
+        there, on a comment saying "the loop adopts what it finds here by
+        the `family_` prefix its names carry" -- and nothing adopted them.
+        Measured 2026-09-19: sixty-one playable agents sat unplayed in the
+        opponents directory, thirty-six of them families rebuilt from the
+        ladder we are scored against.
+
+        So membership is read from the directory rather than from whichever
+        script remembered to call `save`. A vendored agent is in the pool
+        because it is on disk, which is a thing a new writer cannot get
+        wrong the way it could forget a call.
+
+        Matched on the resolved path, never on the directory name. The
+        roster holds a dozen of these under short aliases -- `v56` is
+        `kaito_v56` -- so adopting by name would enrol a second entry
+        against the same file, and a candidate would play that agent twice
+        with both copies counting toward its rate.
+
+        Args:
+            root: The opponents directory.
+
+        Returns:
+            The names adopted, sorted, for the caller to log.
+        """
+        held = {Path(one).resolve() for one in self.opponents.values()}
+        found = sorted(
+            one.name
+            for one in root.iterdir()
+            if (one / "main.py").exists() and (one / "main.py").resolve() not in held
+        )
+        self.opponents.update({one: str(root / one / "main.py") for one in found})
+        return found
 
     def sample(
         self,
@@ -172,21 +211,39 @@ class Pool(BaseModel):
         return drawn[: config.GATE_OPPONENTS]
 
     def add_champion(self, path: str) -> None:
-        """Put our champion in the pool, replacing whichever one was there.
+        """Put our champion in the pool, and keep the one it replaces.
 
-        One key, `config.POOL_CHAMPION`, overwritten every promotion, because
-        there is one champion. Nothing is trimmed and no rating decides anything.
+        `config.POOL_CHAMPION` is the current champion and is overwritten
+        every promotion, because there is one champion. The one it displaces is
+        not replaced but kept, under `config.POOL_ANCESTOR`, and nothing
+        removes it: every rung the campaign has climbed stays in the pool.
 
-        It used to add `champion_N` and trim "our" champions to
-        `POOL_CHAMPIONS = 8` by the `champion_` prefix. That prefix is
-        overloaded -- the pool also holds `champion_1` and `champion_65` from the
-        abandoned tape lineage, which are opponents, not rungs of ours -- so the
-        trim could retire an agent the pool was keeping on purpose, and on
-        2026-09-12 a promotion numbering itself from an empty champions directory
-        picked `champion_1` and overwrote the tape agent of that name outright.
+        Ancestry is kept because the gate's field comparison excludes the
+        champion itself, so a pool of agents the champion already beats gives a
+        candidate nothing to fail: champion_19 beat all 67 harvested agents on
+        2026-09-16 and the rate pinned at 1.000, where no program that could
+        ever exist scores higher. Fifty candidates were refused in six hours,
+        every one of them at 0.994 against a champion at 1.000.
+
+        The keys are `ours_N`, not `champion_N`. That prefix is overloaded --
+        the pool also holds `champion_1` and `champion_65` from the abandoned
+        tape lineage, which are opponents, not rungs of ours -- and trimming by
+        it retired an agent the pool was keeping on purpose, then on 2026-09-12
+        a promotion numbering itself from an empty champions directory picked
+        `champion_1` and overwrote the tape agent of that name outright.
+        Harvested names are an author and a kernel slug, so nothing else can
+        produce `ours_`.
 
         Args:
             path: The champion's own immutable copy, which the pool plays.
         """
+        standing = self.opponents.get(config.POOL_CHAMPION)
+        if standing is not None and standing != path:
+            # Named from the file it is, not from a counter passed in: the
+            # champion's copy is `champion_N.py` and N is what it was.
+            was = re.search(r"champion_(\d+)", Path(standing).name)
+            if was:
+                key = config.POOL_ANCESTOR.format(number=was.group(1))
+                self.opponents[key] = standing
         self.opponents[config.POOL_CHAMPION] = path
         self.history.append({"action": "add_champion", "path": path, "ts": time.time()})

@@ -29,7 +29,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import harness, roster
+from kaggriculture.campaign import config, harness, roster
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
 
@@ -226,6 +226,7 @@ def score(
     pool_file: Path | None = None,
     standings: dict[str, float] | None = None,
     always: Sequence[str] = (),
+    duel_seeds: Sequence[int] = (),
 ) -> Result:
     """Mean win rate over ``GATE_SEEDS`` seasons, both seats.
 
@@ -268,6 +269,11 @@ def score(
         always: Opponents to draw whatever the dice say -- the top-ranked
             agent, which topping the field means beating, and the floor,
             which a promotion is measured as a gap over.
+        duel_seeds: Seasons played against the champion on top of ``seeds``,
+            because that pairing alone decides a promotion and the sweep's
+            depth is set by what the other 180 need. Disjoint from ``seeds``,
+            so the pairing is measured over both blocks and no game is played
+            twice. Empty leaves the champion at the sweep's depth.
 
     Returns:
         The mean fitness, the per-opponent rates and margins, the seeds
@@ -301,6 +307,25 @@ def score(
     # twenty-seven, so the cap on the pool is load-bearing now.
     names = measured.names()
     games = harness.play(agent, names, list(seeds), workers, days=True, pool=pool_file)
+    # The champion again, on seasons the sweep did not play. Named here rather
+    # than passed in: the pairing that carries the promotion is
+    # `config.POOL_CHAMPION` by construction, and a caller made to supply the
+    # name is a caller that can supply the wrong one -- the gate would then
+    # read its veto off 32 games while some other opponent got 128.
+    #
+    # Appending to `games` is the whole of the change. Everything below counts
+    # per opponent over the games played against it, so the deeper pairing
+    # flows into its rate, its interval, its decisive count and its recorded
+    # seasons with nothing else to keep in step.
+    if duel_seeds and config.POOL_CHAMPION in names:
+        games += harness.play(
+            agent,
+            [config.POOL_CHAMPION],
+            list(duel_seeds),
+            workers,
+            days=True,
+            pool=pool_file,
+        )
     rates = _rates(games, names)
     contested = _contested(games, names)
     # Ties on the rate are broken by the margin, because before the first win

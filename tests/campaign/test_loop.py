@@ -25,14 +25,16 @@ the promotion rule is then the real one, deciding on the numbers it is given.
 
 import asyncio
 import inspect
+import json
 import os
 import random
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -43,7 +45,6 @@ from git import Actor, Repo
 from kaggriculture.campaign import (
     archive,
     config,
-    copycheck,
     dataset,
     evaluator,
     gate,
@@ -166,10 +167,17 @@ def tiny_run(
     # the pipeline rather than today's ladder.
     corpus = tmp_path / "no-opponents"
     corpus.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(copycheck, "CORPUS_ROOTS", (corpus,))
-    copycheck._corpus.cache_clear()
     root = tmp_path / "run"
     return config.Run(root=root, pool=root / "pool.json")
+
+
+UNVENDORED = Path("/nonexistent-opponents-directory")
+"""What these tests pass as the opponents directory.
+
+They build the pool they mean, agent by agent, so there is nothing on disk for
+them to adopt. Pointing this at a path that does not exist says that, and keeps
+the machine's data box out of a unit test.
+"""
 
 
 def pass_pool(tmp_path: Path, paths: config.Run) -> pool.Pool:
@@ -313,9 +321,13 @@ class Recorder:
 
     The loop removes a round's directory once its program is in the database,
     so what a call was given has to be read while it is running. This is the
-    same contract ``FakeMutator`` meets, and nothing but the codex process is
-    stood in for.
+    same contract ``FakeMutator`` meets, and nothing but the driving process is
+    stood in for -- including where that process reads its skills, which the
+    loop asks the mutator for rather than deciding itself.
     """
+
+    SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+    TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
 
     def __init__(self, edit: Callable[[str], str]) -> None:
         """Initializes the recorder.
@@ -350,6 +362,13 @@ class Recorder:
             )
         )
         child.write_text(self.edit(source), encoding="utf-8")
+        # Every driver leaves one of these, and the loop copies it out before
+        # the workspace goes. Written after the round has noted what it was
+        # handed, because a transcript is what the round leaves rather than
+        # something it was given.
+        (workspace / "agy.jsonl").write_text(
+            f'{{"round": "{program_id}"}}\n', encoding="utf-8"
+        )
         return mutate.Mutation(
             program_id=program_id,
             child=child,
@@ -418,6 +437,7 @@ def test_a_better_child_is_promoted(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 2
@@ -464,6 +484,7 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # `config.ROOT` is the real checkout until here, because packaging a
@@ -505,6 +526,7 @@ def test_the_seed_is_champion_zero(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # Measured at the cold start, then enthroned: in the pool, on the floor,
@@ -573,6 +595,7 @@ def test_eight_workers_run_at_once(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == config.SESSIONS
@@ -604,12 +627,12 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     assert [handed.child for handed in mutator.seen] == [PASS]
     assert (paths.champions / "champion_2.py").read_text() == SELLER
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     assert mutator.seen[1].child == SELLER
     assert f"`{config.POOL_CHAMPION}m" in mutator.seen[1].message
@@ -640,7 +663,9 @@ def test_a_program_is_gated_once(
     seed = _write(tmp_path / "seed.py", PASS)
     for session in range(4):
         mutator = mutate.FakeMutator(edit=lambda s, n=session: f"{s}\n# child {n}\n")
-        loop.run(1, mutator, WORKERS, seed, random.Random(session), log, paths)
+        loop.run(
+            1, mutator, WORKERS, seed, random.Random(session), log, paths, UNVENDORED
+        )
 
     written = [name for name in scored if name not in {champion.name, config.SEED_ID}]
     assert len(written) > 2
@@ -682,6 +707,7 @@ def test_the_pool_is_changed_on_the_loop_thread(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.champion is not None
@@ -714,6 +740,7 @@ def test_a_promotion_logs_the_tarball_a_cut_uploads(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # One artifact: champion zero is not packaged, so only the promotion that
@@ -759,6 +786,7 @@ def test_a_provider_failure_is_not_the_lineages_failure(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 1
@@ -804,6 +832,7 @@ def test_a_broken_pool_opponent_stops_the_run(
             rng=random.Random(0),
             log=log,
             paths=paths,
+            opponents=UNVENDORED,
         )
 
     assert '"event": "failure"' not in paths.archive.read_text()
@@ -843,6 +872,7 @@ def test_cancellation_kills_the_session_process_group(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 0
@@ -873,8 +903,8 @@ def test_stagnation_switches_the_starting_program(
     marked = f"{SELLER}\n# a child of the champion\n"
     mutator = Recorder(edit=lambda _: marked)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second = mutator.seen
     assert first.child == SELLER and "no promotion" not in first.message
@@ -919,7 +949,14 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
     ``main`` ever sees it.
     """
     env = tmp_path / ".env"
-    env.write_text("CAMPAIGN_CODEX_MODEL=gpt-5.6-astra\n", encoding="utf-8")
+    # And the driver, because the campaign runs `agy` by default and each
+    # program's models are checked against its own catalog: without this the
+    # typo is never looked at, which is exactly what happened when the default
+    # moved.
+    env.write_text(
+        "CAMPAIGN_MUTATOR=codex\nCAMPAIGN_CODEX_MODEL=gpt-5.6-astra\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(mutate, "ENV", env)
     monkeypatch.setattr(
         mutate,
@@ -994,6 +1031,7 @@ def test_a_restart_resumes_state_json_and_champion_json(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 7 and state.sessions_since_promotion == 3
@@ -1027,17 +1065,17 @@ def test_a_round_is_told_a_name_and_never_a_path(
     mutator = Recorder(edit=lambda _: SELLER)
     seed = _write(tmp_path / "seed.py", PASS)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     handed = mutator.seen[0]
     # The episode key is `<name>m<matchup>s<season>`, so the name is a prefix
     # inside the quotes rather than the whole of what they hold.
     assert f"`{champion.name}m" in handed.message
     assert str(tmp_path) not in handed.message
-    assert "/data/kaggriculture" not in handed.message
+    assert "/data/kaggriculture/campaign" not in handed.message
     # The doctrine lives in `round_prompt.md` now, so this asserts on what
     # was actually delivered rather than on a constant that could drift.
-    assert "Every other opponent is closed" in handed.message
+    assert "keep the notice" in handed.message, "the licence obligation travels"
 
 
 def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
@@ -1058,7 +1096,9 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     fitting -- and that half is asserted in `test_prompt`, against the
     composed message, where "seed" is not also a word in the game's rules.
     What is left here is the branch: this session drew from the database, and
-    nothing openable reached the call.
+    no path into the campaign's own tree reached the call. The opponents'
+    directory is a different matter since 2026-09-15 and is named on purpose;
+    the archive, the champions and the pool are not.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -1066,16 +1106,18 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     mutator = Recorder(edit=lambda source: source + "\n# edited\n")
     seed = _write(tmp_path / "seed.py", PASS)
 
-    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    state = loop.run(
+        1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED
+    )
 
     # Champion zero, so a session is handed a champion's name rather than an id.
     assert state.champion is not None
     handed = mutator.seen[0]
     assert str(tmp_path) not in handed.message
-    assert "/data/kaggriculture" not in handed.message
+    assert "/data/kaggriculture/campaign" not in handed.message
     # The doctrine lives in `round_prompt.md` now, so this asserts on what
     # was actually delivered rather than on a constant that could drift.
-    assert "Every other opponent is closed" in handed.message
+    assert "keep the notice" in handed.message, "the licence obligation travels"
 
 
 def _repository(root: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
@@ -1209,7 +1251,7 @@ def test_a_session_is_rounds_and_each_continues_from_the_last(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda source: source + "# a round\n")
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     handed = [given.child for given in mutator.seen]
     assert handed == [PASS, PASS + "# a round\n", PASS + "# a round\n" * 2]
@@ -1245,7 +1287,7 @@ def test_a_round_that_lost_ground_is_not_what_the_next_one_builds_on(
     written = iter([better, PASS, better + "# and further\n"])
     mutator = Recorder(edit=lambda _: next(written))
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second, third = mutator.seen
     assert first.child == PASS
@@ -1277,7 +1319,7 @@ def test_the_database_records_which_model_wrote_each_program(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda source: source + "# a round\n")
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     database = archive.Database(paths.archive, paths.programs)
     assert database.get(config.SEED_ID).model == ""
@@ -1304,7 +1346,9 @@ def test_a_round_that_clears_the_bar_ends_the_session(
     # opponent, which is what beating them all means.
     mutator = Recorder(edit=lambda _: SELLER)
 
-    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    state = loop.run(
+        1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED
+    )
 
     # Ended before the round cap, and ended because the floor moved.
     assert 0 < len(mutator.seen) < 3
@@ -1336,6 +1380,7 @@ def test_a_round_that_writes_nothing_feeds_the_next_one(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert [record["sessions/rounds"] for record in sessions_of(records)] == [3]
@@ -1362,7 +1407,7 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     written = iter(["def agent(observation, configuration=None)\n", SELLER])
     mutator = Recorder(edit=lambda _: next(written))
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second = mutator.seen
     assert "produced nothing" not in first.message
@@ -1392,10 +1437,12 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     handed = mutator.seen[0]
-    assert handed.held == [".codex", "child.py", "measure.py", "parent.py"]
+    assert handed.held == sorted(
+        [Recorder.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
+    )
     assert not handed.where.exists()
 
 
@@ -1423,7 +1470,7 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     message = mutator.seen[0].message
     # One game, named by the program that played it -- champion zero, which is
@@ -1469,6 +1516,7 @@ def test_calls_that_never_reach_a_verdict_stop_the_campaign(
             rng=random.Random(0),
             log=log,
             paths=paths,
+            opponents=UNVENDORED,
         )
 
     # The seed and nothing else: three sessions ran and the database is as
@@ -1518,6 +1566,7 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     assert state.sessions == 4
@@ -1568,6 +1617,7 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         pool_file: Path | None = None,
         standings: dict[str, float] | None = None,
         always: Sequence[str] = (),
+        duel_seeds: Sequence[int] = (),
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
         result = measure(agent, program_id, opponents, rng, seeds, workers, pool_file)
@@ -1584,6 +1634,7 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     # The verdict is what matters, not which way it went: an opponent this
@@ -1674,8 +1725,10 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda source: source + "\n# edited\n")
 
-    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
-    state = loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths)
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
+    state = loop.run(
+        1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED
+    )
 
     # There is always a champion now, so the note has something true to say from
     # the first session: the line it names is champion zero's. It used to be
@@ -1713,6 +1766,7 @@ def test_a_round_logs_the_win_rate_and_the_place_it_bought(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     call = calls_of(records)[-1]
@@ -1747,6 +1801,7 @@ def test_a_program_carries_the_rating_it_was_given(
         rng=random.Random(0),
         log=log,
         paths=paths,
+        opponents=UNVENDORED,
     )
 
     database = archive.Database(paths.archive, paths.programs)
@@ -2109,14 +2164,20 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
 
-    async def cancelled(
-        workspace: Path, message: str, program_id: str
-    ) -> mutate.Mutation:
+    class Cancelled:
         """A call killed mid-flight, which is what the pacer does to a slow one."""
-        assert workspace.exists(), "the round never made a workspace to leak"
-        raise asyncio.CancelledError
 
-    campaign.mutator = cancelled
+        SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+        TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
+
+        async def __call__(
+            self, workspace: Path, message: str, program_id: str
+        ) -> mutate.Mutation:
+            """Check the directory is there to be leaked, then die."""
+            assert workspace.exists(), "the round never made a workspace to leak"
+            raise asyncio.CancelledError
+
+    campaign.mutator = Cancelled()
     # Workspaces come from `tempfile.mkdtemp`, so pointing the module at
     # `tmp_path` keeps this test's leak out of the machine's own /tmp and
     # clear of any already sitting there.
@@ -2150,12 +2211,11 @@ def test_the_campaign_harvests_while_it_runs(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(loop.harvest, "families", lambda known: {})
     monkeypatch.setattr(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
 
-    asyncio.run(_one_harvest(campaign))
+    asyncio.run(_a_pass(campaign.harvesting()))
 
     assert campaign.pool.opponents["fresh"] == "/vendored/main.py"
     # And it is on disk, because the pool file is what resolves an opponent's
@@ -2179,40 +2239,59 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.harvest, "vendored", refuses)
-    monkeypatch.setattr(loop.harvest, "families", lambda known: {})
     before = dict(campaign.pool.opponents)
 
-    asyncio.run(_one_harvest(campaign))
+    assert asyncio.run(_a_pass(campaign.harvesting()))
 
     assert campaign.pool.opponents == before
 
 
-def test_a_failed_listing_still_takes_the_tapes_the_night_left(
+def test_the_campaign_reloads_the_games_it_lost(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """The two halves of the field do not share a failure.
+    """The losses a round studies belong to the champion that is standing.
 
-    Kernels are discovered over the competition's API and tape families are a
-    glob of a directory the nightly job wrote hours ago. Taking them in one
-    `try` would mean a rate-limited listing -- somebody else's uptime -- also
-    froze the half of the field that never left this machine.
+    A round diagnoses the game it is handed, and against the gate's pool this
+    lineage wins; the games it loses are on the ladder. Champions 31 to 39 all
+    arrived inside a day, so refreshed by hand these are the *previous*
+    champion's failures within the hour -- the same drift as a pool nobody
+    harvests, one level out.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    passes = []
 
-    def refuses(limit: int, known: set) -> dict:
+    def loads() -> int:
+        """A refresh that finds one game the lineage had not held yet."""
+        passes.append(1)
+        return 1
+
+    monkeypatch.setattr(loop.losses, "refresh", loads)
+
+    asyncio.run(_a_pass(campaign.losing()))
+
+    assert passes
+
+
+def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Somebody else's uptime again, and the same answer.
+
+    Listing episodes and pulling 32 MB replays is more of the competition's
+    API than the harvest touches, so this is the more likely of the two to
+    fail -- and a run that has been evaluating for hours must not end with it.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+
+    def refuses() -> int:
         """A listing that fails, the way a rate-limited one does."""
         raise RuntimeError("kaggle said no")
 
-    monkeypatch.setattr(loop.harvest, "vendored", refuses)
-    monkeypatch.setattr(
-        loop.harvest, "families", lambda known: {"family_x": "/tapes/family_x/main.py"}
-    )
+    monkeypatch.setattr(loop.losses, "refresh", refuses)
 
-    asyncio.run(_one_harvest(campaign))
-
-    assert campaign.pool.opponents["family_x"] == "/tapes/family_x/main.py"
-    assert "family_x" in pool.Pool.load(campaign.paths.pool).opponents
+    assert asyncio.run(_a_pass(campaign.losing()))
 
 
 def test_a_round_is_given_its_parent_and_a_way_to_play(
@@ -2231,18 +2310,27 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     seen: dict[str, object] = {}
 
-    async def inspect(
-        workspace: Path, message: str, program_id: str
-    ) -> mutate.Mutation:
+    class Inspect:
         """A call that only reports what it was handed."""
-        seen["files"] = sorted(path.name for path in workspace.iterdir())
-        seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
-        seen["skill"] = (
-            workspace / ".codex" / "skills" / "query-games" / "SKILL.md"
-        ).exists()
-        raise asyncio.CancelledError
 
-    campaign.mutator = inspect
+        SKILLS_DIRS: tuple[Path, ...] = (Path(".agents") / "skills",)
+        TRANSCRIPTS: tuple[str, ...] = ("agy*.jsonl",)
+
+        async def __call__(
+            self, workspace: Path, message: str, program_id: str
+        ) -> mutate.Mutation:
+            """Note the directory, then leave without writing anything."""
+            seen["files"] = sorted(path.name for path in workspace.iterdir())
+            seen["parent"] = (workspace / "parent.py").read_text(encoding="utf-8")
+            seen["skill"] = (
+                workspace / self.SKILLS_DIRS[0] / "query-games" / "SKILL.md"
+            ).exists()
+            runner = workspace / "measure.py"
+            seen["shebang"] = runner.read_text(encoding="utf-8").splitlines()[0]
+            seen["runnable"] = os.access(runner, os.X_OK)
+            raise asyncio.CancelledError
+
+    campaign.mutator = Inspect()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     source = _write(tmp_path / "parent-source.py", SELLER)
 
@@ -2258,8 +2346,11 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             )
         )
 
-    assert seen["files"] == [".codex", "child.py", "measure.py", "parent.py"]
-    # The skills go in where codex looks for them, under its working directory.
+    assert seen["files"] == sorted(
+        [Inspect.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
+    )
+    # The skills go where the driving program looks for them: `.codex/skills`
+    # under codex's working directory, `.agents` for agy to walk up to.
     assert seen["skill"], "the round was given no query-games skill"
     # Every game behind the verdict, at a width no message could carry. The
     # message holds the index; this is what the index points at.
@@ -2268,6 +2359,14 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
     # The parent is the program as it was, not the edited copy: a comparison
     # against the thing being edited measures nothing.
     assert seen["parent"] == SELLER
+    # And it can be run without knowing anything about where the campaign lives.
+    # A round's commands do not see an interpreter that can import the package:
+    # `python` is not on their PATH and `python3` is a system one without it, so
+    # every round was working that out by trial and one spent its whole call on
+    # it. The shebang is the answer and it has to name this interpreter, not a
+    # `/usr/bin/env` lookup that would find the wrong one.
+    assert seen["shebang"] == f"#!{sys.executable}"
+    assert seen["runnable"], "a round cannot run ./measure.py"
 
 
 def test_candidates_share_a_block_of_seasons_and_it_rotates(
@@ -2301,15 +2400,244 @@ def test_candidates_share_a_block_of_seasons_and_it_rotates(
     assert all(len(set(block)) == len(block) for block in blocks)
 
 
-async def _one_harvest(campaign: loop.Campaign) -> None:
-    """Run the harvester long enough for exactly one pass, then stop it."""
-    task = asyncio.ensure_future(campaign.harvesting())
+def test_the_duel_block_never_shares_a_season_with_the_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Both blocks come out of one sample, so neither can repeat the other.
+
+    A season in both blocks is the same game played twice against the
+    champion, and both copies land in that pairing's rate and its decisive
+    count -- inflating the evidence behind the one condition that decides a
+    promotion, which is the opposite of what deepening it is for. Two
+    independent draws would collide rarely rather than never; one draw split
+    in two cannot collide at all.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "SEED_ROTATION", 1)
+    # A narrow range, because over the real one -- a million seeds -- two
+    # independent draws of 16 and 48 collide about once in a thousand runs,
+    # and a test that only fails then is a test that never fails. From 79
+    # seeds two independent draws overlap on about ten every time, while one
+    # sample split in two still cannot repeat itself.
+    monkeypatch.setattr(config, "GATE_SEED_RANGE", range(1, 80))
+
+    for _ in range(5):
+        block = campaign.seasons()
+
+        assert len(block) == config.GATE_SEEDS
+        assert len(campaign.duel) == config.DUEL_SEEDS - config.GATE_SEEDS
+        assert not set(block) & set(campaign.duel)
+        # The pairing is played over both, so together they are the depth the
+        # gate's third condition is read at.
+        assert len(set(block) | set(campaign.duel)) == config.DUEL_SEEDS
+
+
+async def _a_pass(timer: Coroutine[None, None, None]) -> bool:
+    """Run one of the loop's timers long enough to take its passes, then stop it.
+
+    Both timers -- the harvest and the loss refresh -- loop forever on an
+    interval a test sets to zero, so this drives one and cancels it the way
+    `drive` does.
+
+    Returns:
+        Whether it was still going when it was stopped, which is what a test
+        of somebody else's outage is really asking: a timer that let the
+        exception out is finished, and the campaign ended with it.
+    """
+    task = asyncio.ensure_future(timer)
     for _ in range(50):
         await asyncio.sleep(0)
         if task.done():
             break
+    alive = not task.done()
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
+    return alive
+
+
+@pytest.mark.slow
+def test_a_rounds_transcript_outlives_the_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """What a round did is kept, because the score cannot say it.
+
+    A child whose plan is unchanged can mean the round never opened
+    `plan.json`, or that it edited it, measured the edit worse and backed it
+    out -- and the second is the round doing exactly what it was told. The
+    workspace is temporary and used to take the only record of which with it.
+
+    Kept under the run's own directory rather than a module constant, so a dry
+    run does not write its transcripts into the live campaign's -- which is the
+    mistake `config.Run` exists to prevent and which this first repeated.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path, paths)
+    seed = _write(tmp_path / "seed.py", PASS)
+    mutator = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
+
+    kept = sorted(paths.rounds.glob("*/agy.jsonl"))
+    assert kept, "the round's transcript went with the workspace"
+    # Keyed by the program the round wrote, so it joins the archive.
+    for transcript in kept:
+        assert json.loads(transcript.read_text())["round"] == transcript.parent.name
+    assert paths.rounds.is_relative_to(paths.root), "a run owns its own transcripts"
+
+
+def test_every_path_argument_comes_back_absolute() -> None:
+    """The island's first launch died on a relative `--seed-agent`.
+
+    An evaluation worker is given a directory of its own and `chdir`s into it,
+    so a relative path resolves at parse time and not at the moment a game
+    actually opens the file. Every seat raised `FileNotFoundError` minutes
+    later, which reads as a crashed agent rather than as a bad argument.
+
+    `--pool` is read by those same workers. `--run-root` fails more slowly:
+    `gate.promote` writes the champion's path into the pool as text, so a
+    relative root would seed relative paths into a file every later gate reads.
+    """
+    parsed = loop._arguments(
+        [
+            "--seed-agent",
+            "run/island/empty_plan_seed.py",
+            "--run-root",
+            "run/island",
+            "--pool",
+            "run/island/pool.json",
+        ]
+    )
+
+    assert parsed.seed_agent.is_absolute(), parsed.seed_agent
+    assert parsed.run_root.is_absolute(), parsed.run_root
+    assert parsed.pool.is_absolute(), parsed.pool
+    assert parsed.seed_agent.name == "empty_plan_seed.py"
+
+
+def test_the_defaults_are_left_where_they_already_pointed() -> None:
+    """Resolving must not move a default that was already absolute."""
+    parsed = loop._arguments([])
+
+    assert parsed.run_root == config.RUN
+    assert parsed.pool == config.POOL
+    assert parsed.seed_agent == config.SEED
+
+
+def guarded(tmp_path: Path) -> Path:
+    """A checkout-shaped tree with one source file and one prompt in it."""
+    root = tmp_path / "checkout"
+    (root / "src" / "kaggriculture" / "campaign").mkdir(parents=True)
+    here = root / "src" / "kaggriculture" / "campaign"
+    (here / "harness.py").write_text("REFERENCE_SAMPLE = 0.02\n", encoding="utf-8")
+    (here / "roster.py").write_text("    raise KeyError(name)\n", encoding="utf-8")
+    (here / "round_prompt.md").write_text("# how to ask\n", encoding="utf-8")
+    (here / "engine.so").write_bytes(b"\x00compiled")
+    return root
+
+
+def a_call(program_id: str = "pdeadbeef") -> mutate.Mutation:
+    """A successful call, for the guard to turn down."""
+    return mutate.Mutation(
+        program_id=program_id,
+        child=Path("/tmp/child.py"),
+        status="ok",
+        reason="",
+        seconds=1.0,
+        input_tokens=1,
+        output_tokens=1,
+        model="test",
+    )
+
+
+def test_the_two_edits_a_round_actually_made_are_put_back(tmp_path: Path) -> None:
+    """The 2026-09-20 tampering, reproduced exactly.
+
+    A round set `REFERENCE_SAMPLE` to 0.0, turning off the reference-engine
+    cross-check, and turned `roster.path`'s `raise KeyError` into a constructed
+    path so any string resolves to a file. Both weaken a guard in the direction
+    that makes the round's own job easier.
+    """
+    root = guarded(tmp_path)
+    here = root / "src" / "kaggriculture" / "campaign"
+    before = loop._kept(root)
+    (here / "harness.py").write_text("REFERENCE_SAMPLE = 0.0\n", encoding="utf-8")
+    (here / "roster.py").write_text(
+        "    return Path('/data/' + name)\n", encoding="utf-8"
+    )
+
+    verdict = loop._restored(before, a_call(), "pdeadbeef")
+
+    assert (here / "harness.py").read_text(
+        encoding="utf-8"
+    ) == "REFERENCE_SAMPLE = 0.02\n"
+    assert (here / "roster.py").read_text(
+        encoding="utf-8"
+    ) == "    raise KeyError(name)\n"
+    assert verdict.status == "no_output"
+    assert verdict.child is None
+    assert "harness.py" in verdict.reason and "roster.py" in verdict.reason
+
+
+def test_the_message_a_round_is_asked_with_is_guarded_too(tmp_path: Path) -> None:
+    """A round that rewrites its own instructions has rewritten the objective."""
+    root = guarded(tmp_path)
+    prompt_file = root / "src" / "kaggriculture" / "campaign" / "round_prompt.md"
+    before = loop._kept(root)
+    prompt_file.write_text("# anything goes\n", encoding="utf-8")
+
+    verdict = loop._restored(before, a_call(), "pdeadbeef")
+
+    assert prompt_file.read_text(encoding="utf-8") == "# how to ask\n"
+    assert verdict.status == "no_output"
+
+
+def test_a_round_that_changes_nothing_is_left_alone(tmp_path: Path) -> None:
+    """The guard must not fail every round, which is how it would be noticed."""
+    root = guarded(tmp_path)
+
+    verdict = loop._restored(loop._kept(root), a_call(), "pdeadbeef")
+
+    assert verdict.status == "ok"
+    assert verdict.child is not None
+
+
+def test_a_deleted_source_file_comes_back(tmp_path: Path) -> None:
+    """Removing a guard is as effective as editing it."""
+    root = guarded(tmp_path)
+    gone = root / "src" / "kaggriculture" / "campaign" / "harness.py"
+    before = loop._kept(root)
+    gone.unlink()
+
+    verdict = loop._restored(before, a_call(), "pdeadbeef")
+
+    assert gone.read_text(encoding="utf-8") == "REFERENCE_SAMPLE = 0.02\n"
+    assert verdict.status == "no_output"
+
+
+def test_the_guard_can_only_write_back_what_it_read(tmp_path: Path) -> None:
+    """The bound the git version did not have.
+
+    That one asked git what had changed and reverted the answer, which under a
+    pre-commit hook was all 250 tracked files. This holds bytes, so a file it
+    never snapshotted -- anything compiled, anything outside `src` -- is one it
+    cannot touch however it is called.
+    """
+    root = guarded(tmp_path)
+    before = loop._kept(root)
+    binary = root / "src" / "kaggriculture" / "campaign" / "engine.so"
+    outside = tmp_path / "not_in_the_snapshot.py"
+    outside.write_text("untouched\n", encoding="utf-8")
+    binary.write_bytes(b"\x00changed")
+
+    verdict = loop._restored(before, a_call(), "pdeadbeef")
+
+    assert binary.read_bytes() == b"\x00changed"
+    assert outside.read_text(encoding="utf-8") == "untouched\n"
+    assert verdict.status == "ok"
+    assert set(before) == {
+        root / "src" / "kaggriculture" / "campaign" / name
+        for name in ("harness.py", "roster.py", "round_prompt.md")
+    }

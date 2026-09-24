@@ -54,6 +54,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
+import scipy.stats
 from pydantic import BaseModel
 
 from kaggriculture.campaign import config, harness, rating, roster
@@ -211,15 +212,36 @@ def promotion(
     *,
     decisive_bar: int = config.DECISIVE_GAMES,
 ) -> tuple[bool, str]:
-    """Whether the candidate is better than the champion, on both counts.
+    """Whether the candidate is better than the champion, on every count.
 
-    Two conditions, and both are required:
+    Three conditions, and all of them are required:
 
-    1. **A higher win rate**, over the opponents both were measured against,
-       beyond twice the error of the difference.
-    2. **Beating the champion head-to-head**: the Wilson lower bound of its rate
+    1. **No worse against the field**, on two measures -- the win rate over the
+       opponents both were measured against, and the mean final bank margin over
+       the same ones. Behind on either by more than twice the error of the
+       difference is a refusal; anything from level upward passes.
+    2. **No matchup thrown away**: no single opponent the candidate has fallen
+       behind the champion against by more than the joint noise, corrected for
+       the number of opponents tested. `_slipped` carries why a mean cannot do
+       this job -- on a field the champion sweeps, one matchup discarded moves
+       the mean by a fraction of its own bar.
+    3. **Beating the champion head-to-head**: the Wilson lower bound of its rate
        against the champion above 0.5, over at least ``decisive_bar`` decided
-       games.
+       games. That pairing is played at `config.DUEL_SEEDS` rather than at the
+       sweep's `GATE_SEEDS`, because it is the only comparison here whose games
+       decide anything: read off the sweep's 32 this condition needed a rate
+       near 0.675 to clear, which is a rout rather than an improvement, and on
+       2026-09-21 it turned away a candidate winning 0.594 of them.
+
+    The margin joined the first condition on 2026-09-16, on a measurement
+    published in the competition's own discussions: a round-robin of fourteen
+    public implementations spanning a month, over 96 fresh seeds and both seats,
+    found no intransitive triple, the newer implementation winning 86 of 91
+    chronological pairs, and "the ordering tracks average final money remarkably
+    closely". A stronger economy is a stronger agent here, which makes the
+    margin evidence about strength rather than a consolation prize -- and it has
+    no ceiling, where the win rate reached 1.000 on this pool the same day and
+    stopped separating anything.
 
     Neither implies the other, and the campaign has now produced both failures.
     Condition 2 alone promoted `champion_3` at a field rate of 0.114 over a
@@ -227,6 +249,21 @@ def promotion(
     promotions handing back field ground while winning the pairing decisively.
     Condition 1 alone would promote an agent that beats the field on average and
     loses to the specific program it replaces, which is not a ratchet.
+
+    Condition 1 demanded a *higher* rate until 2026-09-16, and that stopped
+    being a question a program could answer. champion_19 beat every agent in
+    the pool: its rate was 1.000, nothing scores higher than 1.000, and the
+    fifty candidates evaluated in the six hours after it were refused without
+    the second condition ever being reached. Two of them, `p0d46cde4bbcd` and
+    `p3c94d98c9d60`, beat champion_19 head-to-head 31-1 and 30-2 while sitting
+    in the database as rejects, and seven programs stood at fitness 1.0000 with
+    up to 1.000-against-0.000 between them -- a gate that called them identical
+    was discarding the only signal that separated them.
+
+    So the field rate keeps the job it can still do, which is refusing a
+    regression, and the pairing does the discriminating. That is also the
+    competition's own objective: wins against the agent you are matched with,
+    not a coin total and not an average over a field you already beat.
 
     The rate is compared on common opponents because the two were measured in
     different seed blocks against a pool that harvest grows, so their own
@@ -258,18 +295,116 @@ def promotion(
     common = sorted((set(result.rates) & set(champion.result.rates)) - {name})
     if not common:
         return False, f"no opponent in common with {name}"
-    mine = sum(result.rates[one] for one in common) / len(common)
-    theirs = sum(champion.result.rates[one] for one in common) / len(common)
-    played = max(1, len(common) * max(1, result.games))
-    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
-    bar = 2 * error
-    if mine - theirs <= bar:
+    # The mean is taken over the opponents the champion does not already
+    # sweep. An opponent at 1.000 has no room above it, so it says nothing
+    # about whether a candidate improved, and on 2026-09-21 there were 145 of
+    # them against 31 that could move -- the difference between a mean of
+    # 0.9661 and one of 0.8075, which is the difference between a number
+    # nobody can read and one that tracks the only games left to win.
+    #
+    # It is not more sensitive, and that was measured rather than assumed: an
+    # opponent at 1.000 contributes `p(1-p) = 0` variance as well as no room,
+    # so dropping those terms shrinks the signal and the noise by the same
+    # factor and the bar lands near one opponent-unit either way. What this
+    # buys is legibility, not power. Power is what `_gained` below is for.
+    #
+    # Chosen by the *champion's* rates and never the candidate's, so a
+    # candidate cannot pick its own denominator. A champion that sweeps
+    # everything leaves it empty and the mean falls back to every shared
+    # opponent -- the champion_19 case, where no program that could exist
+    # scores higher and this condition has nothing left to say.
+    held, why = _field(result, champion, common)
+    if not held:
+        return False, why
+    keen = contested(champion, common)
+    mine = sum(result.rates[one] for one in keen) / len(keen)
+    theirs = sum(champion.result.rates[one] for one in keen) / len(keen)
+
+    lead, coins = _margin_gap(result, champion, common)
+    if -lead > coins:
         return False, (
-            f"{mine:.3f} against the field where {name} has {theirs:.3f} over "
-            f"{len(common)} shared opponents: {mine - theirs:+.3f} is inside "
-            f"twice its error of {bar:.3f}"
+            f"{mine:.3f} against the field, level with {name}, but "
+            f"{lead:+,.0f} coins a game over {len(common)} shared opponents is "
+            f"behind by more than twice its error of {coins:,.0f}"
         )
 
+    slipped = _slipped(result, champion, common)
+    if slipped:
+        one, mine_one, theirs_one = slipped[0]
+        return False, (
+            f"{mine:.3f} against the field, level with {name} on the mean, but "
+            f"{one} took it from {theirs_one:.3f} to {mine_one:.3f}"
+            + (
+                f" and {len(slipped) - 1} more opponent(s) with it"
+                if len(slipped) > 1
+                else ""
+            )
+            + ": a mean over the field cannot see one matchup thrown away"
+        )
+
+    ahead, said = _outside(result, champion, common)
+    if ahead:
+        # The pairing still has a veto, just a weaker question than condition
+        # 3 asks below. A mirror match draws 94% of its games, so "did it beat
+        # its parent" is unanswerable for most candidates -- but "is it losing
+        # to its parent" is answerable from the same games, and that is the
+        # one the ratchet needs. Drawing while beating the field is an
+        # improvement; losing while beating the field is the non-transitivity
+        # a finale field punishes.
+        decided = result.decisive.get(name, 0)
+        _, high = wilson_interval(result.rates[name] * decided, decided)
+        if high < 0.5:
+            return False, (
+                f"{said}, but {result.rates[name]:.3f} against {name} over "
+                f"{decided} decided has upper bound {high:.3f}: ahead of the "
+                f"field and behind the program it would replace"
+            )
+        return True, (
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f}, nothing "
+            f"given back, and {said}"
+        )
+
+    gained = _gained(result, champion, common)
+    if gained:
+        one, mine_one, theirs_one = gained[0]
+        return True, (
+            f"{mine:.3f} against the field over {name}'s {theirs:.3f} on "
+            f"{len(keen)} contested opponents, nothing given back, and {one} "
+            f"went from {theirs_one:.3f} to {mine_one:.3f}"
+            + (f" with {len(gained) - 1} more opponent(s)" if len(gained) > 1 else "")
+        )
+
+    return _pairing(result, champion, mine, theirs, decisive_bar)
+
+
+def _pairing(
+    result: Result,
+    champion: "Champion",
+    mine: float,
+    theirs: float,
+    decisive_bar: int,
+) -> tuple[bool, str]:
+    """The head-to-head, the last route a candidate has left.
+
+    Lifted out of `promotion` when the field route made it a fourth branch and
+    `promotion` a function nobody could hold in their head at once.
+
+    It is the strictest of the routes and the narrowest: it can only answer for
+    a candidate that plays its parent differently, and most do not -- a
+    candidate edited from the champion draws 94% of its games with it, which is
+    why the other routes exist.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it must beat.
+        mine: The candidate's contested field rate, for the message.
+        theirs: The champion's, for the same.
+        decisive_bar: Decided games required before the pairing is read.
+
+    Returns:
+        Whether it beat the champion, and why either way.
+    """
+    name = champion.name
     decided = result.decisive.get(name, 0)
     rate = result.rates[name]
     if decided < decisive_bar:
@@ -289,6 +424,311 @@ def promotion(
         f"{rate:.3f} against {name} over {decided} decided has lower bound "
         f"{low:.3f}: not shown to beat it"
     )
+
+
+def _gained(
+    result: Result, champion: "Champion", common: list[str]
+) -> list[tuple[str, float, float]]:
+    """Opponents the candidate pulled ahead on, beyond the joint noise.
+
+    The upward half of `_slipped`, and the reason the gate has an objective
+    rather than only a ratchet. Every other condition refuses a candidate for
+    getting worse; this one promotes it for getting better at a specific
+    opponent, which is where the rating that is left to win actually lives.
+
+    Measured 2026-09-21 on champion_30: of 176 opponents it sweeps 145 at
+    1.000, and of the twelve contested outsiders one --
+    `haideptry_the_2950_peak_farm` -- takes all 32 games. Fixing that is the
+    single most valuable change available and no condition here could see it.
+    The field mean could not: moving it to an even 0.500 shifts the mean by
+    less than half the bar, because a mean spreads one opponent's evidence
+    across every denominator. `_slipped` could not either, by construction --
+    its family needs the champion to have something to lose, and against this
+    opponent the champion has nothing.
+
+    Per opponent the same change is decisive. At 32 games and a family of 31
+    the bar is 2.95 standard errors, which a candidate clears by taking seven
+    games off an opponent the champion takes none from -- about a fifth of an
+    opponent-unit, where the mean needs nine tenths of one.
+
+    The family is the opponents with room above them, the champion's rate
+    below 1.000, which is a count the candidate does not influence. The
+    correction matters as much here as in `_slipped` and in the same
+    direction: at 1.96 apiece over thirty-one opponents a candidate clears by
+    chance better than one time in four, which is a gate that opens on noise.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it is being measured against.
+        common: Opponents both were measured against, the champion excluded.
+
+    Returns:
+        ``(name, candidate rate, champion rate)`` per gain, largest first.
+    """
+    family = [one for one in common if champion.result.rates[one] < 1.0]
+    if not family:
+        return []
+    # One-sided, like the guard: a candidate falling behind on some opponent
+    # is `_slipped`'s business, and it has already refused before this runs.
+    bar = float(scipy.stats.norm.ppf(1 - 0.05 / len(family)))
+    mine_games = max(1, result.games)
+    theirs_games = max(1, champion.result.games)
+    gained = []
+    for one in family:
+        mine = result.rates[one]
+        theirs = champion.result.rates[one]
+        if mine <= theirs:
+            continue
+        error = math.sqrt(
+            mine * (1 - mine) / mine_games + theirs * (1 - theirs) / theirs_games
+        )
+        # Zero error with a gain is a pairing that went 0.000 to 1.000 on
+        # every game of both measurements, which is evidence rather than the
+        # absence of it -- the same reading `_slipped` gives a certain loss.
+        if error == 0.0 or mine - theirs > bar * error:
+            gained.append((one, mine, theirs))
+    return sorted(gained, key=lambda row: row[1] - row[2], reverse=True)
+
+
+def ours(name: str) -> bool:
+    """Whether a pool name is one of our own rather than a harvested agent.
+
+    Our champions are `ours_N` under `config.POOL_ANCESTOR` and the standing
+    one is `config.POOL_CHAMPION`; `family_` and `champion_` are the two
+    earlier lineages, kept as opponents. Everything else was harvested from
+    the competition and is what a ladder position is actually decided by.
+    """
+    return name == config.POOL_CHAMPION or name.startswith(
+        ("ours_", "family_", "champion_")
+    )
+
+
+def _outside(
+    result: Result, champion: "Champion", common: Sequence[str]
+) -> tuple[bool, str]:
+    """Whether the candidate is better than the champion against the field.
+
+    The route the gate was missing. Measured 2026-09-23: of thirty-one
+    contested opponents, nineteen are our own lineage and twelve are agents
+    from the competition -- and the champion beats its own history at 0.901
+    while managing 0.659 against the twelve. Only the twelve move a ladder
+    position, and they carry 39% of condition 1.
+
+    So a candidate can be decisively better where it counts and be turned away
+    by all three of the existing conditions: the mean dilutes a diffuse gain,
+    `_gained` wants it concentrated on one opponent, and the head-to-head is a
+    mirror match that draws 94% of the time because a candidate edited from
+    the champion plays the champion the same way it always did.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it is measured against.
+        common: Opponents both played, the champion excluded.
+
+    Returns:
+        Whether it is ahead beyond twice the error, and by how much.
+    """
+    field = [one for one in common if not ours(one)]
+    if not field:
+        return False, "no harvested opponent in common"
+    mine = sum(result.rates[one] for one in field) / len(field)
+    theirs = sum(champion.result.rates[one] for one in field) / len(field)
+    played = max(1, len(field) * max(1, result.games))
+    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
+    if mine - theirs <= 2 * error:
+        return False, (
+            f"{mine:.3f} against {len(field)} harvested opponents where "
+            f"{champion.name} has {theirs:.3f}"
+        )
+    return True, (
+        f"{mine:.3f} against the {len(field)} harvested opponents where "
+        f"{champion.name} has {theirs:.3f}: {mine - theirs:+.3f} is past twice "
+        f"its error of {2 * error:.3f}"
+    )
+
+
+def contested(champion: "Champion", common: Sequence[str]) -> list[str]:
+    """The opponents the champion does not already sweep.
+
+    An opponent at 1.000 has no room above it, so it can neither show a
+    candidate improving nor decide the mean -- it contributes `p(1-p) = 0`
+    variance along with no room. Measured 2026-09-22 there were 126 of those
+    against 58 that could move.
+
+    Chosen by the champion's rates and never the candidate's, so a candidate
+    cannot pick its own denominator. Empty means the champion sweeps
+    everything -- the champion_19 state -- and the caller falls back to every
+    shared opponent, because there is nothing this can say there.
+
+    Args:
+        champion: The champion the candidate is measured against.
+        common: Opponents both were measured against.
+
+    Returns:
+        Those with room above them, or every one of ``common`` when none has.
+    """
+    return [one for one in common if champion.result.rates[one] < 1.0] or list(common)
+
+
+def _field(
+    result: Result, champion: "Champion", common: Sequence[str]
+) -> tuple[bool, str]:
+    """Whether the candidate holds the field mean over the contested opponents.
+
+    Condition 1, on its own, because `screened` asks exactly this and nothing
+    else. One copy rather than two: a screen that drifted from the condition it
+    stands in for would start refusing candidates the gate would have promoted,
+    which is the one thing a screen must never do.
+    """
+    keen = contested(champion, common)
+    mine = sum(result.rates[one] for one in keen) / len(keen)
+    theirs = sum(champion.result.rates[one] for one in keen) / len(keen)
+    played = max(1, len(keen) * max(1, result.games))
+    error = math.sqrt(mine * (1 - mine) / played + theirs * (1 - theirs) / played)
+    bar = 2 * error
+    if theirs - mine > bar:
+        return False, (
+            f"{mine:.3f} against the field where {champion.name} has "
+            f"{theirs:.3f} over {len(keen)} contested opponents: "
+            f"{mine - theirs:+.3f} is behind by more than twice its error "
+            f"of {bar:.3f}"
+        )
+    return True, f"{mine:.3f} against {champion.name}'s {theirs:.3f}"
+
+
+def screened(result: Result, champion: "Champion | None") -> tuple[bool, str]:
+    """Whether a candidate is worth the whole sweep.
+
+    The same test as the gate's first condition on the same seasons, played
+    against the contested opponents alone. That is deliberate and is the whole
+    safety argument: identical criterion on identical evidence, so a candidate
+    this refuses is one `promotion` would refuse for the same reason and in the
+    same words. Nothing promotable is thrown away.
+
+    What it saves is the rest. A sweep is 184 opponents where 126 sit at 1.000
+    and cannot move a verdict; both gates run on 2026-09-22 spent an hour each
+    to refuse on a number the first third of the games had already settled.
+
+    A candidate it passes plays the full pool, so every promotion still carries
+    the per-opponent regression check over every opponent, swept ones included
+    -- which is where a collapse has the most room to hide.
+
+    Args:
+        result: The candidate measured against the contested opponents.
+        champion: The champion it must not be behind, or None at champion zero.
+
+    Returns:
+        Whether to spend the full sweep, and why not when not.
+    """
+    if champion is None:
+        return True, "no champion to screen against"
+    common = sorted(set(result.rates) & set(champion.result.rates) - {champion.name})
+    if not common:
+        return True, "no opponent in common to screen on"
+    return _field(result, champion, common)
+
+
+def _slipped(
+    result: Result, champion: "Champion", common: list[str]
+) -> list[tuple[str, float, float]]:
+    """Opponents the candidate lost ground against, beyond the joint noise.
+
+    The field condition is a mean over every shared opponent, and a mean is
+    the wrong instrument for the question it is asked. Measured 2026-09-19 on
+    champion_29: 89 of its 108 opponents sit at 1.000 and only five take more
+    than a game off it. Throwing the worst of those away outright -- 0.156 to
+    0.000 -- moves the mean by 0.0014 against a bar of 0.0096, so the gate
+    cannot see a candidate discarding one of the few matchups it still has to
+    lose. Repairing that same opponent is 0.33 of the bar, so it cannot see
+    the repair either. Per opponent, that change is 3.1 standard errors: the
+    evidence is there and averaging over a field of ceilings is what destroys
+    it.
+
+    So the regression guard is asked per opponent, where the evidence is, and
+    the mean keeps only the job it can still do.
+
+    The bar carries a Bonferroni correction. At 1.96 apiece over a hundred and
+    seventy opponents a candidate would be refused four times over by chance,
+    so a per-opponent test at the mean's confidence is a gate that never
+    opens. The family is the opponents where a slip is possible at all -- the
+    champion has to have something to lose -- which is a count the candidate
+    does not influence, so the correction is not chosen after seeing it. It
+    cannot be narrowed to the contested few: an opponent sitting at 1.000 is
+    exactly where a collapse has the most room to happen, so excluding it
+    would blind the guard to the case it exists for.
+
+    What that buys, at a family of about 170 and 32 games an opponent: one
+    opponent falling from 1.000 by 0.30 or more is refused, and a fall of
+    0.25 is not. Smaller slips are left to the mean, which sees them once
+    there are enough of them to matter -- five opponents each losing 0.25
+    moves it 0.0074 against a bar of 0.0043. A single matchup quietly
+    discarded is the hole this closes; a broad sag was never the hole.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it must not fall behind.
+        common: Opponents both were measured against, the champion excluded.
+
+    Returns:
+        ``(name, candidate rate, champion rate)`` per slip, worst first.
+    """
+    family = [one for one in common if champion.result.rates[one] > 0]
+    if not family:
+        return []
+    # One-sided: a candidate pulling ahead of the champion on some opponent is
+    # not a regression, and spending half the alpha on that tail would only
+    # make the guard harder to trip.
+    bar = float(scipy.stats.norm.ppf(1 - 0.05 / len(family)))
+    mine_games = max(1, result.games)
+    theirs_games = max(1, champion.result.games)
+    slipped = []
+    for one in family:
+        mine = result.rates[one]
+        theirs = champion.result.rates[one]
+        if mine >= theirs:
+            continue
+        error = math.sqrt(
+            mine * (1 - mine) / mine_games + theirs * (1 - theirs) / theirs_games
+        )
+        # Both sides deterministic and different is a certain slip, not a
+        # sampling question: 1.000 against 0.000 has no error to clear.
+        if error == 0.0 or theirs - mine > bar * error:
+            slipped.append((one, mine, theirs))
+    return sorted(slipped, key=lambda row: row[1] - row[2])
+
+
+def _margin_gap(
+    result: Result, champion: "Champion", common: list[str]
+) -> tuple[float, float]:
+    """The candidate's lead in coins a game over the champion, and its noise.
+
+    Mean final bank margin over the opponents both were measured against, one
+    minus the other, against twice the standard error of the difference. Each
+    opponent's margin carries its own error from the games behind it, so the
+    error of the mean is the root of the summed squares over the count -- the
+    same test the rate gets, on the measure that still has room to move.
+
+    Args:
+        result: The candidate's evaluation.
+        champion: The champion it must not be worse than.
+        common: The opponents both played, already cut by the caller.
+
+    Returns:
+        The lead in coins a game, and twice its error.
+    """
+    mine = [result.margins[one] for one in common if one in result.margins]
+    theirs = [
+        champion.result.margins[one] for one in common if one in champion.result.margins
+    ]
+    if not mine or not theirs:
+        return 0.0, 0.0
+    lead = sum(m.mean for m in mine) / len(mine) - sum(m.mean for m in theirs) / len(
+        theirs
+    )
+    noise = math.sqrt(
+        sum(m.error**2 for m in mine) + sum(m.error**2 for m in theirs)
+    ) / max(1, len(common))
+    return lead, 2 * noise
 
 
 def promote(
