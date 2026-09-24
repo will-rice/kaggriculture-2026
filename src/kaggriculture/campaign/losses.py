@@ -28,16 +28,25 @@ if TYPE_CHECKING:
     from kaggle import KaggleApi
 
 LOGGER = logging.getLogger(__name__)
-# Where a replay lands on its way into the database, one at a time. The API
-# writes to a directory rather than returning bytes, so there has to be one.
+# Every replay this has ever loaded, kept. A replay is 31 MB and thirty of them
+# arrive per submission, so an hourly loop does accumulate -- about a gigabyte a
+# submission, against 514 GB free on this disk.
 #
-# It is not a cache. A replay is 31 MB, the loop refreshes hourly, and every
-# submission brings thirty more -- kept, that is a gigabyte per submission for
-# files nothing reads twice, because `_held` already asks the database what has
-# been loaded and never fetches those again. So each is parsed and removed. If
-# a pass dies between the two, the rows are not in the database either and the
-# next pass simply fetches it again.
-STAGING = config.EPISODES.parent / "replays"
+# Worth it, because the database is a lossy derivation of this and not a
+# replacement for it. `dataset._rows` keeps every order and every move, but it
+# samples *state* once a day -- `steps[day * HOURS + LAST_HOUR]`, thirty of 720
+# steps -- so the other twenty-three hours of each day exist here and nowhere
+# else. A column added to the schema later is re-derived from these files; asked
+# of the rows alone it has no answer.
+#
+# Nor is re-downloading a fallback. Kaggle serves a submission's episodes while
+# that submission is listed, and the lineage promotes past a submission in
+# hours, so these are cheap to keep and may be impossible to fetch again.
+#
+# `_held` means the loader itself never reads one twice: it asks the database
+# which episodes it holds and does not fetch those. That makes the directory a
+# record rather than a working file, which is exactly why it outlives the pass.
+CACHE = config.EPISODES.parent / "replays"
 # How many of the closest losses to hold. Closest first, because a game lost by
 # 300 coins is one a small change would turn and a game lost by twenty thousand
 # says only that the opponent was better.
@@ -67,7 +76,7 @@ def refresh(keep: int = KEEP, submission: int = 0) -> int:
     if not wanted:
         return 0
 
-    STAGING.mkdir(parents=True, exist_ok=True)
+    CACHE.mkdir(parents=True, exist_ok=True)
     batch = games.Batch("live")
     loaded = 0
     for episode_id, seat, margin, played in wanted:
@@ -124,20 +133,14 @@ def _losses(api: "KaggleApi", submission: int) -> list[tuple[int, int, int, str]
 
 
 def _replay(api: "KaggleApi", episode_id: int) -> dict | None:
-    """One replay, parsed and then taken back off the disk.
-
-    A file already in staging is one a previous pass downloaded and died before
-    reading, so it is read rather than fetched again.
-    """
-    path = STAGING / f"episode-{episode_id}-replay.json"
+    """One replay, from the cache when it is already here."""
+    path = CACHE / f"episode-{episode_id}-replay.json"
     if not path.exists():
-        api.competition_episode_replay(episode_id, path=str(STAGING))
+        api.competition_episode_replay(episode_id, path=str(CACHE))
     if not path.exists():
         LOGGER.warning("  %d: no replay returned", episode_id)
         return None
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    path.unlink()
-    return raw
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _hold(
