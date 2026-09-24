@@ -6,15 +6,44 @@ description: Use when you want to know what the strongest agents on the competit
 # You are not the only agent in the database
 
 `games.days` holds one row per side per day for every game. `source` says which
-kind: `campaign` is a game this lineage played, `ladder` is one recorded off the
-competition. The ladder rows are the agents that are actually rated above this
-program, playing each other, through 2026-09-22.
+kind: `campaign` is a game against the gate's pool, `ladder` is one recorded off
+the competition between other teams, and `live` is a game this lineage played on
+the competition and lost. The ladder rows are agents rated above this program
+playing each other; the live rows are the opponents that actually beat us.
 
 Your own games say whether an edit beat the opponents this lineage is scored
 against. The ladder rows say what a stronger agent was doing on day 14 while
 this program was doing something else. Those are different questions and only
 one of them can tell you about a part of the game this lineage has never
 played well.
+
+## The games you actually lost
+
+`source = 'live'` is the narrowest and most valuable slice: games this lineage
+played on the competition and lost, both seats, every day. They are loaded
+closest-first, so the ones here are games a small change would have turned --
+the closest of them went by 34 coins.
+
+The two seats are `ours` and `opponent`. No opponent is named, and almost none
+is met twice, so there is nothing to recognise and nothing to be gained by
+trying.
+
+    curl -s http://127.0.0.1:8123 --data-binary "
+        select day,
+               round(avgIf(bank, team = 'ours')) as ours,
+               round(avgIf(bank, team = 'opponent')) as theirs,
+               round(avgIf(bank, team = 'ours') - avgIf(bank, team = 'opponent')) as gap
+        from games.days where source = 'live'
+        group by day order by day format TabSeparated"
+
+Read the gap column down the season and find where it turns. That is the
+stretch the game was decided in, and it is the one worth asking the rest of
+your questions about -- every column below works the same way with
+`source = 'live'` and `team` in place of `source`.
+
+These are the only rows here that are both _real opponents_ and _our losses_.
+The pool games are neither: they are opponents chosen weeks ago that this
+program beats most of the time.
 
 ## Which agents are worth comparing against
 

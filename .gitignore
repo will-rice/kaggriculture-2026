@@ -252,3 +252,7 @@ data/kernel_research/
 # rebuildable from bridge.cpp, never source.
 src/kaggriculture/campaign/engine/*.so
 src/kaggriculture/campaign/engine/*.tmp
+
+# Episode replays are 32 MB each. `losses` writes them outside the repo, but a
+# bare `competition_episode_replay` call defaults to the working directory.
+episode-*-replay.json

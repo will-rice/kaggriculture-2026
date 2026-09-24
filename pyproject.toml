@@ -87,6 +87,7 @@ rust = ["maturin>=1.8,<2"]
 
 [project.scripts]
 package = "kaggriculture.scripts.package:main"
+losses = "kaggriculture.scripts.losses:main"
 standing = "kaggriculture.scripts.standing:main"
 submit = "kaggriculture.scripts.submit:main"
 campaign = "kaggriculture.campaign.harness:main"
