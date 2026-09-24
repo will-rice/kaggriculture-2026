@@ -727,6 +727,14 @@ POOL = OPPONENTS.parent / "campaign" / "pool.json"
 # publications, so a restart after an outage catches up in one pass.
 HARVEST_INTERVAL_SECONDS = 3600
 HARVEST_LIMIT = 40
+# How often the loop reloads the games this lineage really lost. An hour, like
+# the harvest, and for the same reason: both keep a measurement from drifting
+# away from the competition while the campaign optimises against it.
+#
+# It costs little after the first pass: `losses._held` asks the database which
+# episodes it already holds, so an hour later only the games played since are
+# fetched -- and a submission plays a few an hour, not a few hundred.
+LOSSES_INTERVAL_SECONDS = 3600
 # The campaign this checkout runs. Everything that writes takes a `Run`, so
 # this is the only place the live one is named -- a dry run and a test each
 # construct their own and nothing has to be swapped out from under anyone.

@@ -23,8 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       # The version the compose file pins, on the port `config.GAMES_URL`
-      # defaults to. Empty at startup and never seeded: what the live tests
-      # check is the storage's own behaviour, and each builds what it needs.
+      # defaults to. Never seeded with rows: what the live tests check is the
+      # storage's own behaviour, and each builds the database it needs.
       clickhouse:
         image: clickhouse/clickhouse-server:24.8
         env:
@@ -49,4 +49,12 @@ jobs:
       - run: uv run ruff format --check src tests
       - run: uv run ruff check src tests
       - run: uv run ty check --exclude src/kaggriculture/served src tests main.py
+      # The empty tables, because not every reader builds its own. A test that
+      # asks the record about an episode -- `measure.against` refusing a key it
+      # cannot find, before spending ten minutes of games on it -- gets
+      # "Database games does not exist" from a bare server, which is a failure
+      # about the runner rather than about the code. `create` is additive and
+      # idempotent, and it also checks the declared partition keys against the
+      # live ones, which is the drift that froze the corpus for four days.
+      - run: uv run python -c "from kaggriculture.campaign import games; games.create()"
       - run: uv run pytest -q

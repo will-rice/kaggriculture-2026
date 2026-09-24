@@ -62,6 +62,7 @@ from kaggriculture.campaign import (
     games,
     gate,
     harvest,
+    losses,
     measure,
     plan,
     prompt,
@@ -672,6 +673,7 @@ class Campaign:
         # when the sessions do: a group waits for every task it holds, and a
         # harvester that sleeps for an hour would hold a finished run open.
         harvesting = asyncio.ensure_future(self.harvesting())
+        losing = asyncio.ensure_future(self.losing())
         for number in (signal.SIGINT, signal.SIGTERM):
             running.add_signal_handler(number, work.cancel)
         try:
@@ -680,8 +682,37 @@ class Campaign:
             LOGGER.warning("stopped on a signal at %d sessions", self.state.sessions)
         finally:
             harvesting.cancel()
+            losing.cancel()
             for number in (signal.SIGINT, signal.SIGTERM):
                 running.remove_signal_handler(number)
+
+    async def losing(self) -> None:
+        """Keep the games this lineage really lost current, for as long as it runs.
+
+        The same reasoning as `harvesting`, one level out. A pool left alone
+        becomes this campaign playing itself; a set of losses left alone becomes
+        the *previous* champion's failures, and the search then studies games the
+        standing program never played. Champions 31 to 39 all arrived inside a
+        day, so by hand this is stale within the hour.
+
+        Everything goes to a thread: the listing, the downloads and the parse are
+        all slow and none of them touches the pool or the state the loop owns.
+        Only the games database is written, and it takes parallel writers.
+
+        A failed refresh is not a failed campaign, for the same reason a failed
+        harvest is not: the competition's API is somebody else's uptime, and a
+        run that has been evaluating for hours must not end because a listing
+        timed out.
+        """
+        while True:
+            await asyncio.sleep(config.LOSSES_INTERVAL_SECONDS)
+            try:
+                loaded = await asyncio.to_thread(losses.refresh)
+            except Exception:
+                LOGGER.exception("loss refresh failed; the campaign continues")
+                continue
+            if loaded:
+                LOGGER.info("losses: %d new game(s) the lineage lost", loaded)
 
     async def harvesting(self) -> None:
         """Take newly published kernels into the pool, for as long as the run lasts.

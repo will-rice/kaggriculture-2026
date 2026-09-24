@@ -34,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -2215,7 +2215,7 @@ def test_the_campaign_harvests_while_it_runs(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
 
-    asyncio.run(_one_harvest(campaign))
+    asyncio.run(_a_pass(campaign.harvesting()))
 
     assert campaign.pool.opponents["fresh"] == "/vendored/main.py"
     # And it is on disk, because the pool file is what resolves an opponent's
@@ -2241,9 +2241,57 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
     monkeypatch.setattr(loop.harvest, "vendored", refuses)
     before = dict(campaign.pool.opponents)
 
-    asyncio.run(_one_harvest(campaign))
+    assert asyncio.run(_a_pass(campaign.harvesting()))
 
     assert campaign.pool.opponents == before
+
+
+def test_the_campaign_reloads_the_games_it_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The losses a round studies belong to the champion that is standing.
+
+    A round diagnoses the game it is handed, and against the gate's pool this
+    lineage wins; the games it loses are on the ladder. Champions 31 to 39 all
+    arrived inside a day, so refreshed by hand these are the *previous*
+    champion's failures within the hour -- the same drift as a pool nobody
+    harvests, one level out.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    passes = []
+
+    def loads() -> int:
+        """A refresh that finds one game the lineage had not held yet."""
+        passes.append(1)
+        return 1
+
+    monkeypatch.setattr(loop.losses, "refresh", loads)
+
+    asyncio.run(_a_pass(campaign.losing()))
+
+    assert passes
+
+
+def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """Somebody else's uptime again, and the same answer.
+
+    Listing episodes and pulling 32 MB replays is more of the competition's
+    API than the harvest touches, so this is the more likely of the two to
+    fail -- and a run that has been evaluating for hours must not end with it.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+
+    def refuses() -> int:
+        """A listing that fails, the way a rate-limited one does."""
+        raise RuntimeError("kaggle said no")
+
+    monkeypatch.setattr(loop.losses, "refresh", refuses)
+
+    assert asyncio.run(_a_pass(campaign.losing()))
 
 
 def test_a_round_is_given_its_parent_and_a_way_to_play(
@@ -2384,18 +2432,30 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
         assert len(set(block) | set(campaign.duel)) == config.DUEL_SEEDS
 
 
-async def _one_harvest(campaign: loop.Campaign) -> None:
-    """Run the harvester long enough for exactly one pass, then stop it."""
-    task = asyncio.ensure_future(campaign.harvesting())
+async def _a_pass(timer: Coroutine[None, None, None]) -> bool:
+    """Run one of the loop's timers long enough to take its passes, then stop it.
+
+    Both timers -- the harvest and the loss refresh -- loop forever on an
+    interval a test sets to zero, so this drives one and cancels it the way
+    `drive` does.
+
+    Returns:
+        Whether it was still going when it was stopped, which is what a test
+        of somebody else's outage is really asking: a timer that let the
+        exception out is finished, and the campaign ended with it.
+    """
+    task = asyncio.ensure_future(timer)
     for _ in range(50):
         await asyncio.sleep(0)
         if task.done():
             break
+    alive = not task.done()
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
+    return alive
 
 
 @pytest.mark.slow

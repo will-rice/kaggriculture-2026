@@ -947,7 +947,7 @@ def test_a_plan_the_schema_refuses_is_a_broken_plan_not_a_pydantic_error(
     `actions` is a plan that genuinely cannot be packed: every route cites
     entries in it, so there is no program on the other side.
     """
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, carried = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
     (tmp_path / plan.PLAN_FILE).write_text(
@@ -968,7 +968,7 @@ def test_a_plan_that_is_not_even_json_is_the_same_kind_of_failure(
     tmp_path: Path,
 ) -> None:
     """A truncated write is a round that produced nothing, not a crash."""
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, _ = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
     (tmp_path / plan.PLAN_FILE).write_text('{"actions": [', encoding="utf-8")
@@ -983,14 +983,14 @@ def test_a_whole_plan_still_packs_back_into_a_program(tmp_path: Path) -> None:
     A mutation-proof for the two above: if `gather` raised on everything they
     would pass while the campaign could never run a round again.
     """
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, carried = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
     (tmp_path / plan.PLAN_FILE).write_text(json.dumps(carried), encoding="utf-8")
 
-    packed = plan.gather(tmp_path)
+    program = plan.gather(tmp_path)
 
-    assert plan.split(packed)[1] == carried
+    assert plan.split(program)[1] == carried
 
 
 def test_a_plan_written_without_settings_keeps_the_controller_s(
@@ -1006,15 +1006,15 @@ def test_a_plan_written_without_settings_keeps_the_controller_s(
     on "1 validation error for Plan / settings / Field required" while its
     transcript shows it had read the full plan first.
     """
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, carried = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
     without = {name: value for name, value in carried.items() if name != "settings"}
     (tmp_path / plan.PLAN_FILE).write_text(json.dumps(without), encoding="utf-8")
 
-    packed = plan.gather(tmp_path)
+    program = plan.gather(tmp_path)
 
-    _, back = plan.split(packed)
+    _, back = plan.split(program)
     assert back["settings"] == carried["settings"]
 
 
@@ -1027,7 +1027,7 @@ def test_settings_a_round_did_write_are_the_ones_that_are_kept(
     wrote has to survive. If the controller's copy won instead, the gate would
     be scoring an edit the round did not make.
     """
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, carried = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
     chosen = dict(carried["settings"])
@@ -1036,9 +1036,9 @@ def test_settings_a_round_did_write_are_the_ones_that_are_kept(
         json.dumps({**carried, "settings": chosen}), encoding="utf-8"
     )
 
-    packed = plan.gather(tmp_path)
+    program = plan.gather(tmp_path)
 
-    _, back = plan.split(packed)
+    _, back = plan.split(program)
     assert back["settings"]["front_run"] == chosen["front_run"]
     assert back["settings"] != carried["settings"]
 
@@ -1053,7 +1053,7 @@ def test_a_plan_that_is_not_an_object_is_still_a_broken_plan(
     round -- up through the worker and into the loop, which is the shape of
     crash that killed the main lineage for ten hours on 2026-09-21.
     """
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, _ = plan.split(champion)
     (tmp_path / "child.py").write_text(controller, encoding="utf-8")
     (tmp_path / plan.PLAN_FILE).write_text(json.dumps([1, 2, 3]), encoding="utf-8")
@@ -1074,7 +1074,7 @@ def test_a_controller_the_plan_cannot_be_packed_into_is_a_broken_plan(
     `plan.json` hits those. One did, at 01:33, and it went up through the worker
     and the task group while the island ran on unaware.
     """
-    champion = (config.LIVE.floor / "main.py").read_text(encoding="utf-8")
+    champion = packed(PLAN)
     controller, carried = plan.split(champion)
     # A controller that still loads a plan but has lost the line `join` writes
     # the settings back into.

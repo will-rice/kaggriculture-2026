@@ -24,6 +24,9 @@ played on the competition and lost, both seats, every day. They are loaded
 closest-first, so the ones here are games a small change would have turned --
 the closest of them went by 34 coins.
 
+The loop reloads them hourly from the submission that is standing, so they are
+the current program's losses rather than a predecessor's.
+
 The two seats are `ours` and `opponent`. No opponent is named, and almost none
 is met twice, so there is nothing to recognise and nothing to be gained by
 trying.
