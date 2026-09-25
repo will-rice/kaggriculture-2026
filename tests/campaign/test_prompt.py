@@ -19,20 +19,6 @@ from kaggriculture.campaign import (
 IMPROVE = prompt.INSTRUCTION
 
 
-def table(
-    name: str, rates: dict[str, float], place: str = "bottom"
-) -> dict[str, float]:
-    """Standings with ``name`` in them, above or below the opponents.
-
-    The real ones come from a Bradley-Terry fit over the tournament; these are
-    written out, because what the message says about a place should not depend
-    on a solver agreeing with the test about the numbers.
-    """
-    standings = {opponent: -float(index) for index, opponent in enumerate(rates)}
-    standings[name] = 1.0 if place == "top" else -float(len(rates))
-    return standings
-
-
 def measured(**held: float) -> dict[str, float]:
     """A full measures dict: what is named, and zero for everything else.
 
@@ -92,7 +78,6 @@ def result(
     return evaluator.Result(
         program_id="p1",
         fitness=sum(rates.values()) / len(rates),
-        field=0.5,
         rates=rates,
         margins={
             name: harness.Margin(mean=-100.0, worst=-300.0, best=50.0) for name in rates
@@ -396,7 +381,6 @@ def stored(
         instruction="tune",
         model="gpt-5.6-luna",
         fitness=fitness,
-        field=fitness,
         rates={"v54": fitness},
         margins={"v54": harness.Margin(mean=-100.0, worst=-300.0, best=50.0)},
         created=0.0,

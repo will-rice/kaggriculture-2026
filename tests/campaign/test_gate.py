@@ -13,7 +13,6 @@ from kaggriculture.campaign import (
     harness,
     loop,
     pool,
-    rating,
 )
 
 PASS = (
@@ -29,7 +28,6 @@ def result(
     return evaluator.Result(
         program_id=pid,
         fitness=score,
-        field=score,
         rates=rates,
         margins={n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in rates},
         intervals={
@@ -40,90 +38,6 @@ def result(
         hardest=min(rates, default=""),
         states={},
     )
-
-
-def test_a_field_measured_at_another_depth_is_kept_and_extended(
-    tmp_path: Path,
-) -> None:
-    """The count is kept per pairing, so changing the gate's depth costs nothing.
-
-    It used to be one number for the whole field, on the reasoning that every
-    pairing is played on the same seeds. That could not be extended: measuring
-    anything at a new depth relabelled every cached rate as having been played
-    over games it was not, and the only safe response was to discard the lot.
-
-    Discarding the lot now means discarding the campaign's history -- two
-    hundred and eighty pairings -- and the rating everything is steered by is
-    fitted over exactly that history.
-    """
-    paths = _paths(tmp_path)
-    agents = {}
-    for name in ("one", "two", "three"):
-        path = tmp_path / f"{name}.py"
-        path.write_text(PASS, encoding="utf-8")
-        agents[name] = str(path)
-    pool.Pool(opponents=agents).save(paths.pool)
-
-    older = rating.Field(games=64)
-    older.record("one", "two", 1.0, 64)
-    older.save(paths.field)
-
-    gate.refresh("three", ["one", "two"], seeds=[1], workers=1, paths=paths)
-
-    field = rating.Field.load(paths.field)
-    # The old pairing survives at its own depth; the new ones carry theirs.
-    assert field.rates["one"]["two"] == 1.0
-    assert field.depth("one", "two") == 64
-    assert field.depth("three", "one") == 2
-
-
-def test_a_new_champion_has_its_own_edges_played(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A champion joins with no pairings, and `standing` plays nothing.
-
-    `Field` returns only the pairings it holds, so an agent with none is
-    absent from the fit rather than an error. For an opponent that has been
-    around that never matters. For a champion it is the whole ratchet: until
-    its own pairings exist it sits in every fit on the single edge of whoever
-    is being judged against it, and beating it drops its rating far enough to
-    make topping the field easy. Each promotion would buy the next cheaply.
-    """
-    paths = _paths(tmp_path)
-    agents = {}
-    for name in ("one", "two", "champ"):
-        path = tmp_path / f"{name}.py"
-        path.write_text(PASS, encoding="utf-8")
-        agents[name] = str(path)
-    pool.Pool(opponents=agents).save(paths.pool)
-
-    measured = gate.refresh("champ", ["one", "two"], seeds=[1], workers=1, paths=paths)
-
-    assert measured == [("champ", "one"), ("champ", "two")]
-    # Its own edges and nobody else's: what the pool's other members owe each
-    # other is not a promotion's business, and with nothing ever leaving the
-    # pool "every missing pair" grows with its square.
-    field = rating.Field.load(paths.field)
-    assert set(field.rates["champ"]) == {"one", "two"}
-    assert "two" not in field.rates.get("one", {})
-
-
-def test_edges_already_on_the_record_are_not_played_again(
-    tmp_path: Path,
-) -> None:
-    """A pairing is a constant: fixed files on fixed seeds, measured once."""
-    paths = _paths(tmp_path)
-    agents = {}
-    for name in ("one", "champ"):
-        path = tmp_path / f"{name}.py"
-        path.write_text(PASS, encoding="utf-8")
-        agents[name] = str(path)
-    pool.Pool(opponents=agents).save(paths.pool)
-
-    gate.refresh("champ", ["one"], seeds=[1], workers=1, paths=paths)
-    again = gate.refresh("champ", ["one"], seeds=[1], workers=1, paths=paths)
-
-    assert again == []
 
 
 def beat(
@@ -151,7 +65,6 @@ def beat(
     result = evaluator.Result(
         program_id="mine",
         fitness=rate,
-        field=field,
         rates=rates,
         margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
         decisive={champion: decided, **{f"public_{i}": 32 for i in range(shared)}},
@@ -615,7 +528,6 @@ def _program(
         instruction="improve it",
         model="gpt-5.6-luna",
         fitness=0.5,
-        field=0.5,
         rates={"a": 0.5},
         created=0.0,
     )
@@ -873,7 +785,6 @@ def banked(
         return evaluator.Result(
             program_id=pid,
             fitness=rate,
-            field=0.60,
             rates={k: rates[k] for k in keys},
             margins={
                 k: harness.Margin(mean=coins, worst=coins, best=coins, error=error)
@@ -990,7 +901,6 @@ def saturated(
     result = evaluator.Result(
         program_id="mine",
         fitness=sum(rates.values()) / len(rates),
-        field=1.0,
         rates=rates,
         margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
         decisive={champion: 32, **dict.fromkeys(theirs, 32)},

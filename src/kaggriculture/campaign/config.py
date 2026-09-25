@@ -168,23 +168,6 @@ DUEL_SEEDS = 64
 # its ancestors were selected on. The reserved block was a held-out set for a
 # search that is always, structurally, held out.
 GATE_SEED_RANGE = range(1, 1_000_000)
-# How the twenty-four are chosen. Anchors are played every single gate: they span
-# the strength range and they are what keeps the graph connected, so a new
-# champion is never rated through a chain of thirty overlapping pool eras.
-# Measured 2026-09-07, that chain predicted champion_37 would beat champion_1
-# 0.994 of the time; it beats it 0.729.
-#
-# Contenders are the highest rated, because topping the field still means
-# beating the best of it. The remainder is drawn at random from everything
-# else, which is both coverage -- the graph would otherwise go stale
-# everywhere except the top -- and how a counter gets found rather than
-# quietly discarded.
-GATE_ANCHORS = (
-    "champion_1",
-    "champion_65",
-    "thomastschinkel_router",
-    "router_v1",
-)
 # How many of our own champions stay in the pool. Harvested agents are never
 # trimmed and these are, because the two are different kinds of evidence: a
 # published agent says something about the field we are scored against and
@@ -268,16 +251,11 @@ class Run:
     """Every file one campaign writes, derived from the directory it owns.
 
     These were module constants, and a test isolated itself by reaching into
-    this module and swapping them. That works only while every reader looks
-    the value up at call time, and one did not: `gate.refresh` took
-    `kept: Path = FIELD`, a default evaluated once at definition, so no patch
-    ever moved it and a dry run wrote its champions into the live campaign's
-    pairings. The live `field.json` ended up holding `champion_1` through
-    `champion_9` and an opponent called `pass`.
-
-    A run is constructed instead, and passed. There is no global left to
-    patch, so there is none to patch wrongly, and a test gets a whole campaign
-    of its own by naming a directory.
+    this module and swapping them -- which holds only while every reader looks
+    the value up at call time, and a default argument does not. A run is
+    constructed instead, and passed. There is no global left to patch, so
+    there is none to patch wrongly, and a test gets a whole campaign of its
+    own by naming a directory.
 
     `pool` is given rather than derived: the live one deliberately sits
     outside the run directory, so that it is not a sibling of anything a codex
@@ -319,17 +297,6 @@ class Run:
     def seed_program(self) -> Path:
         """The cold start's own copy of the seed: the campaign's lineage."""
         return self.programs / f"{SEED_ID}.py"
-
-    @property
-    def field(self) -> Path:
-        """The pool's own pairings, kept between gates.
-
-        They are constants: the opponents are fixed files and none of them
-        draws on randomness. Derived state, not a committed artifact -- a pool
-        that gains a champion has that champion's pairings measured and added,
-        and one that loses an opponent stops asking for its row.
-        """
-        return self.root / "field.json"
 
     @property
     def floor(self) -> Path:

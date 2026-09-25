@@ -180,7 +180,6 @@ def test_a_program_in_the_pool_is_never_played_against_itself(
     other = tmp_path / "other.py"
     other.write_text(PASS, encoding="utf-8")
     monkeypatch.setattr(loop, "GATE_SEEDS", 1)
-    monkeypatch.setattr(evaluator, "VENDORED", ["other"])
     # Names resolve to paths through the saved pool, so it has to be on disk
     # and the evaluation has to be told where it is -- there is no module-level
     # pool to fall back on, which is the point.
@@ -267,24 +266,6 @@ def test_score_lets_a_crash_propagate_and_still_restores_the_cwd(
         evaluator.score(agent, "prog", p, random.Random(1), [5, 6], WORKERS)
 
     assert Path.cwd() == workspace
-
-
-def test_a_pool_of_champions_has_no_field_and_that_is_not_fatal() -> None:
-    """A pool of nothing but champions has no vendored field to average.
-
-    That is where this campaign is going: champions join on every promotion
-    and the weakest opponent makes way, so the published agents leave one at a
-    time and the last leaves for good. It used to raise there -- and
-    `ValueError` is not the `RuntimeError` a round catches, so it would have
-    gone up through the task group and stopped the campaign at its most
-    successful moment. Measured live: the pool reached seven champions and one
-    published agent, tied last, in two hours.
-
-    What is lost is a number, not the gate.
-    """
-    assert evaluator.vendored_field({"champion_1": 0.5, "champion_2": 0.9}) is None
-    # And it is still the mean while any of them remain.
-    assert evaluator.vendored_field({"champion_1": 0.5, "v54": 0.8}) == 0.8
 
 
 def played(opponent: str, banks: list[tuple[float, float]]) -> list[harness.Game]:
@@ -391,7 +372,6 @@ def test_a_result_serialises_without_its_games() -> None:
     result = evaluator.Result(
         program_id="p",
         fitness=1.0,
-        field=None,
         rates={"v54": 1.0},
         margins={"v54": harness.Margin(mean=2.0, worst=2.0, best=2.0)},
         games=1,
@@ -412,7 +392,6 @@ def rated(program_id: str, rates: dict[str, float]) -> evaluator.Result:
     return evaluator.Result(
         program_id=program_id,
         fitness=sum(rates.values()) / len(rates),
-        field=None,
         rates=rates,
         margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
         games=2,

@@ -36,7 +36,6 @@ the ``campaign loop`` entry point and pytest all do.
 import argparse
 import asyncio
 import logging
-import math
 import random
 import shutil
 import signal
@@ -67,7 +66,6 @@ from kaggriculture.campaign import (
     measure,
     plan,
     prompt,
-    rating,
     validate,
 )
 from kaggriculture.campaign.evaluator import Result
@@ -82,7 +80,7 @@ from kaggriculture.campaign.mutate import (
     selected,
     validate_models,
 )
-from kaggriculture.campaign.pool import GATE_CONTENDERS, GATE_OPPONENTS, Pool
+from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
 
@@ -317,8 +315,6 @@ def hyperparameters() -> dict[str, int]:
         "SESSIONS": config.SESSIONS,
         "ROUNDS_PER_OPPONENT": ROUNDS_PER_OPPONENT,
         "GATE_SEEDS": GATE_SEEDS,
-        "GATE_OPPONENTS": GATE_OPPONENTS,
-        "GATE_CONTENDERS": GATE_CONTENDERS,
         "STAGNATION_SESSIONS": STAGNATION_SESSIONS,
     }
 
@@ -619,23 +615,18 @@ class Kept(NamedTuple):
     """What a round produced, once it has been scored and put to the gate.
 
     One object rather than a widening tuple, because every field of it is
-    something a caller was recomputing. `table` in particular is a whole
-    Bradley-Terry fit: `round` made one for its metrics, `keep` made one for
-    the program record, and `session` made a third to ask the gate a question
-    `keep` had already answered.
+    something a caller was recomputing.
 
     Attributes:
         source: The stored program, on disk.
         name: Its database id.
         result: What the loop's evaluation of it said.
-        table: The standings that evaluation was fitted into, itself included.
         cleared: Whether the gate promoted it.
     """
 
     source: Path
     name: str
     result: Result
-    table: dict[str, float]
     cleared: bool
 
 
@@ -762,21 +753,15 @@ def _program(
     instruction: str,
     model: str,
     result: Result,
-    standings: dict[str, float] | None = None,
     parent: Path | None = None,
 ) -> archive.Program:
     """One database entry, stamped now.
-
-    ``standings`` is the tournament this program's evaluation was part of. It
-    is optional because the cold start seeds the database before any pool is
-    loaded, and a program with no rating is honestly recorded as having none.
 
     ``parent`` is the source this was edited from, and it is here for one
     reason: this is the only moment both plans exist as files, so describing
     the edit costs a read of two programs already on the disk. Asked later it
     costs the whole archive -- 489 programs at 869KB each.
     """
-    ranked = sorted(standings or {}, key=lambda name: -(standings or {})[name])
     return archive.Program(
         changed=_changed(source, parent),
         id=program_id,
@@ -785,9 +770,6 @@ def _program(
         instruction=instruction,
         model=model,
         fitness=result.fitness,
-        field=result.field,
-        rating=None if standings is None else standings[program_id],
-        place=0 if standings is None else 1 + ranked.index(program_id),
         rates=result.rates,
         margins=result.margins,
         created=time.time(),
@@ -1136,11 +1118,7 @@ class Campaign:
                 break
             source, name, result, cleared = outcome
             # The gate already ran, inside the round, under the promotions
-            # lock, and said so. This used to re-ask it here: a second
-            # `gate.standing` -- a whole Bradley-Terry fit -- and a second
-            # `gate.promotion` against a `floor` read at a different moment,
-            # which is two sources of truth for one question and three fits a
-            # round between them.
+            # lock, and said so.
             if cleared:
                 LOGGER.info("%s promoted: the session is done", name)
                 break
@@ -1324,25 +1302,12 @@ class Campaign:
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
         }
-        rated = [p.rating for p in self.database.programs if p.rating is not None]
-        if rated:
-            record["database/top_rating"] = max(rated)
         if kept is not None:
             # Named apart from `result`, which is the program this round was
             # given and is what the comparison below is against. Rebinding it
             # here made that comparison the child against itself.
             scored = kept.result
             record["calls/fitness"] = scored.fitness
-            if scored.field is not None:
-                record["calls/field"] = scored.field
-            # The fit `keep` already made. Computing another here was the third
-            # Bradley-Terry fit of the same round.
-            table = kept.table
-            program_id = kept.name
-            record["calls/rating"] = table[program_id]
-            record["calls/place"] = 1 + sorted(
-                table, key=lambda name: -table[name]
-            ).index(program_id)
             record["calls/pool"] = len(scored.rates)
         self.log.log(record)
         if mutation.status == "exec_error":
@@ -1449,9 +1414,6 @@ class Campaign:
                     # Recorded the way a refusal is, not the way a failure is:
                     # the round ran, produced a program and was judged, and the
                     # next round is shown what it scored.
-                    table = gate.standing(
-                        program_id, screen.rates, 2 * GATE_SEEDS, self.paths
-                    )
                     self.database.add(
                         _program(
                             program_id,
@@ -1460,19 +1422,17 @@ class Campaign:
                             drawn,
                             mutation.model,
                             screen,
-                            table,
                             parent,
                         )
                     )
                     LOGGER.info("%s %s screened: %s", program_id, drawn, why)
-                    return Kept(stored, program_id, screen, table, False)
+                    return Kept(stored, program_id, screen, False)
             result = await self.measure(stored, program_id)
         except OpponentCrash:
             raise
         except RuntimeError as error:
             self.fail(started_from, drawn, f"gate: {error}")
             return None
-        table = gate.standing(program_id, result.rates, 2 * GATE_SEEDS, self.paths)
         self.database.add(
             _program(
                 program_id,
@@ -1481,17 +1441,14 @@ class Campaign:
                 drawn,
                 mutation.model,
                 result,
-                table,
                 parent,
             )
         )
         LOGGER.info("%s %s gate %.3f", program_id, drawn, result.fitness)
-        cleared = await self.consider(program_id, result, table)
-        return Kept(stored, program_id, result, table, cleared)
+        cleared = await self.consider(program_id, result)
+        return Kept(stored, program_id, result, cleared)
 
-    async def consider(
-        self, program_id: str, result: Result, table: dict[str, float]
-    ) -> bool:
+    async def consider(self, program_id: str, result: Result) -> bool:
         """Promote ``program_id`` if it topped the tournament it was just in.
 
         This is the whole gate. There was a second one -- the best three
@@ -1544,7 +1501,7 @@ class Campaign:
                 )
                 self.log.log(
                     {
-                        **self.promotion_record(result, False, baseline, table),
+                        **self.promotion_record(result, False, baseline),
                         "gate/stale": 1,
                     }
                 )
@@ -1562,7 +1519,7 @@ class Campaign:
                 # enough.
                 self.log.log(
                     {
-                        **self.promotion_record(result, False, baseline, table),
+                        **self.promotion_record(result, False, baseline),
                         "gate/stale": 1,
                     }
                 )
@@ -1576,7 +1533,7 @@ class Campaign:
                 )
                 self.log.log(
                     {
-                        **self.promotion_record(result, False, baseline, table),
+                        **self.promotion_record(result, False, baseline),
                         "gate/stale": 1,
                     }
                 )
@@ -1622,7 +1579,7 @@ class Campaign:
                 )
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
-            self.log.log(self.promotion_record(result, verdict, baseline, table))
+            self.log.log(self.promotion_record(result, verdict, baseline))
             self.champion_played.pop(program_id, None)
             return verdict
 
@@ -1699,18 +1656,7 @@ class Campaign:
         a model is ever shown: the model plays nothing, so the seeds, the
         seating and the reading of "won" are all ours.
 
-        The opponents are a draw from the whole pool rather than the whole
-        pool, so the ratings on the record are handed down for it -- the
-        contenders are the highest rated, and without them the draw would be
-        anchors and noise.
-
-        The leader and the floor are drawn every time rather than left to the
-        dice. Topping the field means beating the best of it, and a promotion
-        is a rating gap over the floor: a candidate that happened not to draw
-        either would be turned away for the sampler's luck rather than for
-        anything it did.
         """
-        table = rating.standings(rating.Field.load(self.paths.field).everything())
         pool = self.snapshot()
         if only is not None:
             # The screen's pool: the opponents that can still move, without
@@ -1739,8 +1685,6 @@ class Campaign:
             block,
             self.workers,
             self.paths.pool,
-            table,
-            self.must_play(table),
             self.duel,
         )
         # Every game of it, into the one database the nightly extraction also
@@ -1797,20 +1741,6 @@ class Campaign:
         self.measured += 1
         return self.block
 
-    def must_play(self, standings: dict[str, float]) -> list[str]:
-        """The opponents every candidate is drawn against: the leader and the floor.
-
-        Usually one agent. The champion has out-rated the field since the
-        ratchet started, so the top of the standings and the floor are the
-        same name -- but they are different questions, and when they come
-        apart both have to be played: the leader because topping the field
-        means beating it, the floor because the promotion bar is a gap over
-        that specific agent.
-        """
-        floor = self.floor()
-        ranked = sorted(standings, key=lambda name: -standings[name])
-        return list(dict.fromkeys(ranked[:1] + ([floor] if floor else [])))
-
     def snapshot(self) -> Pool:
         """The pool as it stands, copied on the loop for one evaluation to keep."""
         return self.pool.model_copy(deep=True)
@@ -1846,12 +1776,12 @@ class Campaign:
 
         The scratch lineage is parented from its own best rather than from the
         database's, and that is what makes it more than a lottery ticket. A
-        program that begins from nothing rates far below a champion, and
-        `Database.top` ranks on rating -- so without this it would be scored
-        once, never drawn again, and the lineage would die in a single session
-        however promising it was. Parented from itself it gets a ratchet of its
-        own, and joins the global draw when its rating earns a place there
-        rather than being asked to earn one immediately.
+        program that begins from nothing scores far below a champion, and
+        `Database.top` ranks on the win rate -- so without this it would be
+        scored once, never drawn again, and the lineage would die in a single
+        session however promising it was. Parented from itself it gets a
+        ratchet of its own, and joins the global draw when its record earns a
+        place there rather than being asked to earn one immediately.
 
         Returns:
             The program to start from and the name it goes by: the best
@@ -1861,10 +1791,7 @@ class Campaign:
         if grown:
             best = max(
                 grown,
-                key=lambda program: (
-                    program.rating if program.rating is not None else -math.inf,
-                    archive.mean_margin(program),
-                ),
+                key=lambda program: (program.fitness, archive.mean_margin(program)),
             )
             return Path(best.source_path), best.id
         blank = self.database.store(SCRATCH_AGENT, SCRATCH_ID)
@@ -1910,7 +1837,6 @@ class Campaign:
         result: Result,
         promoted: bool,
         baseline: Champion | None,
-        standings: dict[str, float],
     ) -> dict[str, float]:
         """Section 10: one program judged, and whether it moved the floor.
 
@@ -1922,19 +1848,11 @@ class Campaign:
             result: The measurement it was judged on.
             promoted: Whether it cleared the gate.
             baseline: The floor as it stood when this was judged.
-            standings: The tournament that decided it, so the rating and the
-                place go on the record beside the win rates behind them.
         """
         record: dict[str, float] = {
             "sessions": self.state.sessions,
             "gate/score": result.fitness,
-            **({} if result.field is None else {"gate/field": result.field}),
             "gate/promoted": int(promoted),
-            "gate/rating": standings[result.program_id],
-            "gate/place": 1
-            + sorted(standings, key=lambda name: -standings[name]).index(
-                result.program_id
-            ),
             "gate/pool": len(result.rates),
             # Nothing has been watching this. The seed is 619 lines and
             # `SEED` says why that matters -- a round is handed the
@@ -1960,19 +1878,6 @@ class Campaign:
             # promoted or not, so the champions are a few dozen points buried
             # among hundreds; this is only ever written when the floor moves.
             record["champion/win_rate"] = result.fitness
-            # The series to watch, and the only one that compares across the
-            # whole campaign. A rating on one scale, anchored on the agents
-            # that never change, so champion 3's number and champion 30's are
-            # the same measurement -- unlike a win rate, which is against a
-            # field that gains a champion every promotion.
-            #
-            # It cannot saturate, which a win rate does: measured against the
-            # twelve published kernels, champion_1 scored 0.922 and
-            # champion_37 scored 0.938, while beating champion_20 -- itself
-            # far above champion_1 -- 0.885 of the time. Log-odds have no
-            # ceiling and go on separating agents that both beat the floor
-            # every time.
-            record["champion/rating"] = _anchored(standings, result.program_id)
             if baseline is not None and baseline.name in result.rates:
                 # What it did to the champion it replaced, head to head. The
                 # win rate above is against a pool that strengthens with every
@@ -1982,23 +1887,6 @@ class Campaign:
                 # stopped finding anything.
                 record["champion/over_previous"] = result.rates[baseline.name]
         return record
-
-
-def _anchored(standings: dict[str, float], name: str) -> float:
-    """One agent's rating, measured from the anchors rather than the mean.
-
-    A Bradley-Terry fit is only defined up to an additive constant, and
-    `rating.standings` centres it on the mean of everyone in it. That mean
-    climbs as champions are added, so the same agent's number would fall
-    over a campaign that only ever improved -- the scale sliding underneath
-    the series it is meant to be.
-
-    The anchors are fixed files that never change, so pinning them at zero
-    fixes the origin. Every gate plays them, which is what makes them
-    available here at all.
-    """
-    fixed = [standings[a] for a in config.GATE_ANCHORS if a in standings]
-    return standings[name] - (sum(fixed) / len(fixed) if fixed else 0.0)
 
 
 def _first(failures: BaseExceptionGroup) -> BaseException:

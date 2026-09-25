@@ -180,7 +180,6 @@ def tiny_run(
     """
     monkeypatch.setattr(loop, "ROUNDS_PER_OPPONENT", rounds)
     monkeypatch.setattr(loop, "GATE_SEEDS", 1)
-    monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
     # The copy check reads every opponent the machine holds, and the campaign
     # now harvests new ones every hour -- so a test that leaves this alone is
     # measured against a corpus that changes underneath it. These fixtures are
@@ -287,21 +286,15 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         agent = bound.arguments["agent"]
         program_id = bound.arguments["program_id"]
         opponents = bound.arguments["pool"]
-        rng = bound.arguments["rng"]
-        standings = bound.arguments["standings"]
-        always = bound.arguments["always"]
         scored.append(program_id)
         if crashes:
             raise RuntimeError("the candidate raised in its own seat")
         measured = evaluator.opponents(opponents, program_id, agent)
         rate = score(agent)
-        # The draw the real evaluation would make, so a test sees the same
-        # opponents the gate would: a sample, not the whole pool.
-        names = measured.sample(standings or {}, rng, program_id, always)
+        names = measured.names()
         return evaluator.Result(
             program_id=program_id,
             fitness=rate,
-            field=0.5,
             rates=dict.fromkeys(names, rate),
             # A measured margin, because promotion now asks whether beating
             # the champion was shown rather than by how much: a mean inside
@@ -404,28 +397,6 @@ class Recorder:
             output_tokens=0,
             model="recorder",
         )
-
-
-@pytest.mark.slow
-# `test_the_pool_plays_itself_before_anything_is_judged_against_it` stood here
-# until 2026-09-13. It asserted that a launch fills `paths.field` with the
-# pool's own pairings, so that a Bradley-Terry fit over the field is a
-# tournament rather than one candidate's row.
-#
-# The rule it protected is gone. Ratings decided promotion then, and a champion
-# that joined the pool with no pairings was rated almost entirely from the row
-# of whoever was being judged against it -- beat it, and its rating fell far
-# enough that each promotion bought the next one cheaply. Promotion is now a
-# win rate over the field and a head-to-head against the champion, both
-# measured inside the candidate's own evaluation, and neither reads a fit. The
-# refresh that kept the field current was removed with it: it cost 8.5 minutes
-# of the promotions lock per promotion, measured 2026-09-13, with three
-# candidates queued behind the first one of that run.
-#
-# So nothing writes the field and nothing downstream of it decides anything.
-# What remains of that machinery -- `gate.refresh`, `evaluator.score`'s unused
-# `standings` argument, and the fit `measure` makes to feed it -- is dead and
-# wants deleting, which is a change to `src/` rather than to a test.
 
 
 @pytest.mark.slow
@@ -842,7 +813,6 @@ def test_a_broken_pool_opponent_stops_the_run(
             instruction="seed",
             model="",
             fitness=0.5,
-            field=0.5,
             created=time.time(),
         )
     )
@@ -1233,7 +1203,6 @@ def _gate_result(
     return evaluator.Result(
         program_id=program_id,
         fitness=point,
-        field=point,
         rates=rates,
         margins={n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in rates},
         intervals={
@@ -1667,7 +1636,7 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
     candidates and every promotion for seven hours -- silently, because the
     only line that records a gate sat below the return.
 
-    What still has to hold is the floor, which `must_play` draws every time and
+    What still has to hold is the floor, which every candidate plays and
     the gate checks by name.
     """
     paths = tiny_run(tmp_path, monkeypatch)
@@ -1679,7 +1648,6 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         }
     )
     opponents.save(paths.pool)
-    monkeypatch.setattr(evaluator, "VENDORED", ["pass", "joiner"])
     scored = stub_evaluator(monkeypatch)
     measure = evaluator.score
 
@@ -1691,8 +1659,6 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         seeds: Sequence[int],
         workers: int,
         pool_file: Path | None = None,
-        standings: dict[str, float] | None = None,
-        always: Sequence[str] = (),
         duel_seeds: Sequence[int] = (),
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
@@ -1849,44 +1815,6 @@ def test_a_round_logs_the_win_rate_and_the_place_it_bought(
     assert 0.0 <= call["calls/fitness"] <= 1.0
     # One public opponent, plus champion zero.
     assert call["calls/pool"] == 2
-    assert isinstance(call["calls/rating"], float)
-    assert call["calls/place"] >= 1
-    # The best rating so far, so the curve has a ratchet on it and not just
-    # whatever the last round happened to score.
-    assert "database/top_rating" in call
-
-
-def test_a_program_carries_the_rating_it_was_given(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """Stored, not recomputed: the pool moves, and a rating is of its moment.
-
-    Refitting an old program against today's pool would answer a different
-    question from the one its evaluation asked, and `database/top_rating` is
-    meant to be the best any round actually achieved.
-    """
-    paths = tiny_run(tmp_path, monkeypatch)
-    pass_pool(tmp_path, paths)
-    stub_evaluator(monkeypatch)
-
-    loop.run(
-        sessions=1,
-        mutator=mutate.FakeMutator(edit=lambda source: f"{source}\n# edited\n"),
-        workers=WORKERS,
-        seed_agent=_write(tmp_path / "seed.py", PASS),
-        rng=random.Random(0),
-        log=log,
-        paths=paths,
-        opponents=UNVENDORED,
-    )
-
-    database = archive.Database(paths.archive, paths.programs)
-    child = next(p for p in database.programs if p.id != "seed")
-    assert child.rating is not None
-    assert child.place >= 1
-    # The seed is scored before any pool is loaded, so it honestly has none.
-    assert database.get("seed").rating is None
-    assert database.get("seed").place == 0
 
 
 def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
@@ -1897,8 +1825,8 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     With no champion there is nothing else deciding where a session begins, so
     a shuffle meant nine sessions in ten started from something worse than the
     best program the campaign had -- while one child in ten improves on its
-    parent and one in five is worse. Over 259 rated programs the best rating
-    peaked at the fiftieth and every cohort after was worse than it.
+    parent and one in five is worse. Over 259 programs the best score peaked
+    at the fiftieth and every cohort after was worse than it.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
@@ -1913,10 +1841,8 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
                 started_from="parent",
                 instruction="tune",
                 model="m",
-                fitness=0.5,
-                field=0.5,
                 # Rank 0 is the best; the draw should reflect that ordering.
-                rating=-float(rank),
+                fitness=1.0 - rank / loop.PARENT_POOL,
                 created=float(rank),
             )
         )
@@ -1947,8 +1873,8 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
 ) -> None:
     """The niche is what makes a blank start more than a lottery ticket.
 
-    A program that begins from nothing rates far below a champion, and
-    `Database.top` ranks on rating -- so parented from the database's best, a
+    A program that begins from nothing scores far below a champion, and
+    `Database.top` ranks on the win rate -- so parented from the database's best, a
     scratch session would start from the champion's lineage every time after
     the first and the blank start would never compound. Parented from its own
     best it gets a ratchet of its own.
@@ -1958,11 +1884,11 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
     stub_evaluator(monkeypatch)
     monkeypatch.setattr(loop, "SCRATCH_CHANCE", 1.0)
     database = archive.Database(paths.archive, paths.programs)
-    # The champion's lineage, rated far above anything a blank start reaches.
-    for name, parent, standing in (
-        ("champ", "seed", 5.0),
-        ("sprout", loop.SCRATCH_ID, -4.0),
-        ("sapling", "sprout", -3.0),
+    # The champion's lineage, scoring far above anything a blank start reaches.
+    for name, parent, rate in (
+        ("champ", "seed", 0.9),
+        ("sprout", loop.SCRATCH_ID, 0.1),
+        ("sapling", "sprout", 0.2),
     ):
         source = database.store(f"{PASS}# {name}\n", name)
         database.add(
@@ -1972,9 +1898,7 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
                 started_from=parent,
                 instruction="tune",
                 model="m",
-                fitness=0.5,
-                field=0.5,
-                rating=standing,
+                fitness=rate,
                 created=1.0,
             )
         )
@@ -1992,7 +1916,7 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
     _, name = campaign.start(stagnant=False)
 
     # The best of the scratch lineage, two generations down -- never `champ`,
-    # which out-rates every one of them by nine log-odds.
+    # which wins far more than any of them.
     assert name == "sapling"
 
 
@@ -2128,27 +2052,6 @@ def test_the_gate_asks_for_the_floor_and_not_the_whole_pool(
     assert campaign.floor() not in stale
 
 
-def test_the_draw_always_holds_the_leader_and_the_floor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """Two questions that are usually one agent, and must not be left to dice.
-
-    The champion has out-rated the field since the ratchet started, so the top
-    of the standings and the floor are the same name -- but they are different
-    questions, and when they come apart both have to be played: the leader
-    because topping the field means beating it, the floor because the bar is a
-    gap over that specific agent.
-    """
-    campaign = _record_campaign(tmp_path, monkeypatch, log)
-    campaign.state.champion = _champion("champion_2", 0.5)
-
-    same = campaign.must_play({"champion_2": 2.0, "v54": 1.0})
-    apart = campaign.must_play({"v54": 2.0, "champion_2": 1.0})
-
-    assert same == ["champion_2"]
-    assert apart == ["v54", "champion_2"]
-
-
 def test_only_a_promotion_writes_the_champion_series(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -2160,11 +2063,10 @@ def test_only_a_promotion_writes_the_champion_series(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"champion_2": 0.7, "v54": 0.9})
-    standings = {"p1": 1.0, "champion_2": 0.0, "v54": -1.0}
     floor = _champion("champion_2", 0.5)
 
-    refused = campaign.promotion_record(result, False, floor, standings)
-    promoted = campaign.promotion_record(result, True, floor, standings)
+    refused = campaign.promotion_record(result, False, floor)
+    promoted = campaign.promotion_record(result, True, floor)
 
     assert "champion/win_rate" not in refused
     assert promoted["champion/win_rate"] == result.fitness
@@ -2183,11 +2085,8 @@ def test_the_champion_series_says_what_it_did_to_the_one_it_replaced(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"champion_2": 0.72, "v54": 0.9})
-    standings = {"p1": 1.0, "champion_2": 0.0, "v54": -1.0}
 
-    record = campaign.promotion_record(
-        result, True, _champion("champion_2", 0.5), standings
-    )
+    record = campaign.promotion_record(result, True, _champion("champion_2", 0.5))
 
     assert record["champion/over_previous"] == 0.72
 
@@ -2203,7 +2102,7 @@ def test_the_first_champion_has_nothing_to_be_compared_against(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"v54": 0.9})
 
-    record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
+    record = campaign.promotion_record(result, True, None)
 
     assert record["champion/win_rate"] == result.fitness
     assert "champion/over_previous" not in record
@@ -2214,17 +2113,17 @@ def test_no_metric_is_frozen_at_a_score_nothing_can_earn(
 ) -> None:
     """`database/top_field` was the maximum of a score nothing could earn.
 
-    `field` averages the published opponents *in the pool*, and champions
-    trim them out one at a time until none is left; after that every program
-    scores None and drops out of the maximum. The series sat at 0.901 for 243
-    programs -- a value held by the seed itself, so the chart read "nothing
-    has ever beaten the starting program" when it meant "nothing since the
-    hundredth has been measured at all".
+    It averaged the published opponents *in the pool*, and champions trimmed
+    them out one at a time until none was left; after that every program
+    scored None and dropped out of the maximum. The series sat at 0.901 for
+    243 programs -- a value held by the seed itself, so the chart read
+    "nothing has ever beaten the starting program" when it meant "nothing
+    since the hundredth has been measured at all".
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"v54": 0.9})
 
-    record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
+    record = campaign.promotion_record(result, True, None)
 
     assert not any("top_field" in key for key in record)
 
