@@ -105,6 +105,32 @@ BLOB_LOADER_SOURCE = """import pathlib
 
 DATA = (pathlib.Path(__file__).with_name({file!r})).read_text(encoding="utf-8")
 """
+# The third payload a program carries, and 12,939 of the 13,626 characters of
+# champion_41's header: the whole Apache-2.0 licence body, pasted into the file
+# as comments by the published kernel this lineage derives from. Two hundred
+# lines before the module docstring, re-read on every round, about 3,200
+# tokens of it, and not one line about this program -- so a round reading the
+# top of its own file learns nothing and pays for the privilege.
+#
+# The licence's terms are met without it. Section 4 asks that a recipient be
+# given a copy of the licence and that the copyright and attribution notices
+# be retained in the source: `harness.package` ships `LICENSE` -- the same two
+# hundred lines -- beside `main.py` in every archive, and the notices proper
+# are the twenty-three lines above the body, which stay where they are.
+#
+# Shelving it rather than asking a round to leave it alone settles both halves
+# at once: the round cannot spend tokens on it and cannot strip it. The
+# obligation stops depending on what a model decides to rewrite.
+NOTICE = re.compile(
+    r"^#[^\n]*Apache License[^\n]*\n(?:#[^\n]*\n)*?#[^\n]*"
+    r"limitations under the License\.[^\n]*\n",
+    re.MULTILINE,
+)
+NOTICE_FILE = "licence.txt"
+NOTICE_MARK = (
+    "# The Apache-2.0 licence body sits in `licence.txt` and is put back into"
+    " this\n# file when the campaign packs it. Leave this line where it is.\n"
+)
 # What the farm does on a step no season names: nothing. A written season may
 # stop short of the year, and this is what the rest of it is.
 IDLE: dict = {"farmer": ["PASS"], "hands": [], "market": []}
@@ -909,10 +935,10 @@ def lay_out(source: str, box: Path, name: str = "child.py") -> None:
         name: What to call the program there.
     """
     if not carries(source):
-        (box / name).write_text(source, encoding="utf-8")
+        (box / name).write_text(shelve_notice(source, box), encoding="utf-8")
         return
     controller, plan = split(source)
-    controller = shelve_blob(controller, box)
+    controller = shelve_notice(shelve_blob(controller, box), box)
     (box / name).write_text(controller, encoding="utf-8")
     (box / PLAN_FILE).write_text(readable(plan), encoding="utf-8")
     (box / f"{PLAN_MODULE}.py").write_text(
@@ -940,6 +966,53 @@ def shelve_blob(controller: str, box: Path) -> str:
     )
     line = LOADER.format(name=found.group("name"), module=BLOB_MODULE)
     return controller[: found.start()] + line + controller[found.end() :]
+
+
+def shelve_notice(controller: str, box: Path) -> str:
+    """Move the inlined licence body out of the program into a file beside it.
+
+    Args:
+        controller: The program's source, plan already taken out.
+        box: The round's directory.
+
+    Returns:
+        The controller with one line where the licence body was, or unchanged
+        when it carries none -- the scratch lineage starts from a program that
+        derives from nothing and has no notice to keep.
+    """
+    found = NOTICE.search(controller)
+    if found is None:
+        return controller
+    (box / NOTICE_FILE).write_text(found.group(0), encoding="utf-8")
+    return controller[: found.start()] + NOTICE_MARK + controller[found.end() :]
+
+
+def unshelve_notice(source: str, box: Path) -> str:
+    """Put the licence body back, from the file `shelve_notice` wrote.
+
+    Args:
+        source: The program, plan and blob already packed back in.
+        box: The round's directory.
+
+    Returns:
+        The program with the licence body inline, or unchanged when it never
+        had a mark.
+
+    Raises:
+        ValueError: The mark is there and the file behind it is not. The
+            program would ship a derivative work of Apache-2.0 kernels with
+            the licence body gone, which is the one thing this may not do
+            quietly.
+    """
+    if NOTICE_MARK not in source:
+        return source
+    shelf = box / NOTICE_FILE
+    if not shelf.exists():
+        raise ValueError(
+            f"the program's licence body was shelved to {NOTICE_FILE} and the "
+            "round removed it"
+        )
+    return source.replace(NOTICE_MARK, shelf.read_text(encoding="utf-8"), 1)
 
 
 def unshelve_blob(source: str, box: Path) -> str:
@@ -1023,8 +1096,9 @@ def gather(box: Path, name: str = "child.py") -> str:
     plan_file = box / PLAN_FILE
     if not plan_file.exists() or UNPACKED.search(source) is None:
         # No loader left: the round rewrote the program around its own data,
-        # and what it wrote is what it meant. The plan file is a leftover.
-        return source
+        # and what it wrote is what it meant. The plan file is a leftover --
+        # the licence body is not, and goes back whatever else was rewritten.
+        return unshelve_notice(source, box)
     # Checked here, where the round can still be told it wrote nothing usable.
     # Unchecked, a plan with a verb the engine has no op for, or a shop pair
     # pointing at a route that is not there, is a program that forfeits every
@@ -1047,7 +1121,7 @@ def gather(box: Path, name: str = "child.py") -> str:
         # killed the main lineage for ten hours the day before.
         if isinstance(written, dict) and "settings" not in written:
             written["settings"] = carried_settings(source)
-        return unshelve_blob(join(source, written), box)
+        return unshelve_notice(unshelve_blob(join(source, written), box), box)
     except ValueError as broken:
         # `ValueError` rather than the two the plan can fail with, because the
         # controller can fail too and does: `join` raises it from eight places

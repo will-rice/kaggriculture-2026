@@ -229,6 +229,23 @@ def test_the_round_is_told_the_whole_campaign_is_a_file_beside_it() -> None:
     assert "one JSON object per line" in text
 
 
+def test_the_round_is_told_what_the_shelved_files_are() -> None:
+    """A file in the box the round should not read, and one it should not copy.
+
+    `licence.txt` holds the licence body `plan.shelve_notice` takes out of the
+    program, so a round that goes looking is told in one line to leave it
+    alone rather than working out what it is. And `opponent.py` is there to be
+    read for mechanisms, never copied: copying it takes on an attribution the
+    round would have to write, and an edit fitted to one agent is worth
+    nothing against the ladder's, which is what the fingerprinting lineage
+    proved.
+    """
+    text = prompt.compose("champion_1", first_game(result({"v54": 0.5})))
+
+    assert "licence.txt" in text
+    assert "Do not copy code out of `opponent.py`" in text
+
+
 def test_only_this_rounds_opponent_is_named() -> None:
     """The round is writing a program to beat any opponent, not these ones.
 
