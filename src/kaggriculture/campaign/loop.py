@@ -1375,8 +1375,7 @@ class Campaign:
             if self.no_verdict >= NO_VERDICT_LIMIT:
                 raise SystemExit(
                     f"{self.no_verdict} calls in a row ran to no verdict, the "
-                    f"last on {config.CODEX_MODEL} and {config.CODEX_FALLBACK_MODEL}: "
-                    f"{mutation.reason[:200]}"
+                    f"last on {mutation.model}: {mutation.reason[:200]}"
                 )
             return None
         self.no_verdict = 0

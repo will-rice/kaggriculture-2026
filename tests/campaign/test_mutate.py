@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, mutate
+from kaggriculture.campaign import mutate
 
 # A codex that says nothing but a well-formed transcript, so the no-output
 # path can be read without spending a call.
@@ -265,22 +265,22 @@ def catalog(*slugs: str) -> list[str]:
     return ["printf", "%s", body]
 
 
-def test_known_models_is_exactly_the_catalogs_slugs(
+def test_the_catalog_is_exactly_the_commands_slugs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``known_models`` reads slugs from the catalog command, nothing else."""
+    """`catalog` reads slugs from the catalog command, nothing else."""
     monkeypatch.setattr(
-        mutate, "MODEL_CATALOG_COMMAND", catalog("gpt-6-astra", "gpt-5.6-luna")
+        mutate.CodexMutator, "CATALOG", catalog("gpt-6-astra", "gpt-5.6-luna")
     )
-    assert mutate.known_models() == {"gpt-6-astra", "gpt-5.6-luna"}
+    assert mutate.CodexMutator.catalog() == {"gpt-6-astra", "gpt-5.6-luna"}
 
 
 def test_validate_model_accepts_a_slug_the_catalog_lists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A model this login's catalog knows about passes without complaint."""
-    monkeypatch.setattr(mutate, "MODEL_CATALOG_COMMAND", catalog("gpt-5.6-luna"))
-    mutate.validate_model("gpt-5.6-luna")
+    monkeypatch.setattr(mutate.CodexMutator, "CATALOG", catalog("gpt-5.6-luna"))
+    mutate.CodexMutator.validate("gpt-5.6-luna")
 
 
 def test_validate_model_refuses_a_typo_and_names_it(
@@ -291,9 +291,9 @@ def test_validate_model_refuses_a_typo_and_names_it(
     This is not hypothetical: this login accepts ``gpt-6-astra`` but refuses
     ``gpt-5.6-astra``.
     """
-    monkeypatch.setattr(mutate, "MODEL_CATALOG_COMMAND", catalog("gpt-6-astra"))
+    monkeypatch.setattr(mutate.CodexMutator, "CATALOG", catalog("gpt-6-astra"))
     with pytest.raises(SystemExit, match="gpt-5.6-astra"):
-        mutate.validate_model("gpt-5.6-astra")
+        mutate.CodexMutator.validate("gpt-5.6-astra")
 
 
 @pytest.mark.skipif(
@@ -358,9 +358,9 @@ def test_the_reasoning_effort_is_passed_on_every_call(
     asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p12"))
 
     passed = argv.read_text(encoding="utf-8").splitlines()
-    assert f"model_reasoning_effort={mutate.CODEX_REASONING}" in passed
+    assert f"model_reasoning_effort={mutate.CodexMutator.REASONING}" in passed
     # Beside the model, so a call names both rather than inheriting either.
-    assert config.CODEX_MODEL in passed
+    assert mutate.CodexMutator.MODEL in passed
 
 
 def test_the_model_changes_under_a_running_campaign(
@@ -380,10 +380,10 @@ def test_the_model_changes_under_a_running_campaign(
     env = tmp_path / ".env"
 
     env.write_text("CAMPAIGN_CODEX_MODEL=first-model\n", encoding="utf-8")
-    before = mutate.model()
+    before = mutate.CodexMutator.asked()
     # The same process, no restart, nothing re-imported.
     env.write_text("CAMPAIGN_CODEX_MODEL=second-model\n", encoding="utf-8")
-    after = mutate.model()
+    after = mutate.CodexMutator.asked()
 
     assert before == "first-model"
     assert after == "second-model", "the change did not reach a running process"
@@ -402,8 +402,8 @@ def test_an_unset_model_is_the_campaigns_own(
     monkeypatch.delenv("CAMPAIGN_CODEX_FALLBACK_MODEL", raising=False)
     (tmp_path / ".env").write_text("", encoding="utf-8")
 
-    assert mutate.model() == config.CODEX_MODEL
-    assert mutate.fallback() == config.CODEX_FALLBACK_MODEL
+    assert mutate.CodexMutator.asked() == mutate.CodexMutator.MODEL
+    assert mutate.CodexMutator.retry() == mutate.CodexMutator.FALLBACK
 
 
 def test_a_round_asks_for_whatever_the_model_is_now(
@@ -718,11 +718,11 @@ def test_the_selection_decides_which_program_and_which_vocabulary(
 
     env.write_text("CAMPAIGN_MUTATOR=codex\n", encoding="utf-8")
     assert isinstance(mutate.build().drivers[0], mutate.CodexMutator)
-    assert mutate.asked_model() == mutate.model()
+    assert mutate.asked_model() == mutate.CodexMutator.asked()
 
     env.write_text("CAMPAIGN_MUTATOR=agy\n", encoding="utf-8")
     assert isinstance(mutate.build().drivers[0], mutate.AgyMutator)
-    assert mutate.asked_model() == mutate.agy_model()
+    assert mutate.asked_model() == mutate.AgyMutator.asked()
 
 
 def test_a_mutator_that_is_neither_is_refused_by_name(
@@ -746,8 +746,8 @@ def test_an_unset_agy_model_is_the_campaigns_own(
     monkeypatch.delenv("CAMPAIGN_AGY_FALLBACK_MODEL", raising=False)
     (tmp_path / ".env").write_text("", encoding="utf-8")
 
-    assert mutate.agy_model() == mutate.AGY_MODEL
-    assert mutate.agy_fallback() == mutate.AGY_FALLBACK_MODEL
+    assert mutate.AgyMutator.asked() == mutate.AgyMutator.MODEL
+    assert mutate.AgyMutator.retry() == mutate.AgyMutator.FALLBACK
 
 
 def test_validation_checks_the_selected_programs_own_catalog(
@@ -767,8 +767,8 @@ def test_validation_checks_the_selected_programs_own_catalog(
     )
     monkeypatch.setattr(mutate, "ENV", env)
     monkeypatch.setattr(
-        mutate,
-        "AGY_CATALOG_COMMAND",
+        mutate.AgyMutator,
+        "CATALOG",
         ["printf", "%s", "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"],
     )
 
@@ -787,8 +787,8 @@ def test_the_agy_catalog_is_read_as_the_text_agy_prints(
     become part of a slug.
     """
     monkeypatch.setattr(
-        mutate,
-        "AGY_CATALOG_COMMAND",
+        mutate.AgyMutator,
+        "CATALOG",
         [
             "printf",
             "%s",
@@ -797,7 +797,7 @@ def test_the_agy_catalog_is_read_as_the_text_agy_prints(
         ],
     )
 
-    assert mutate.known_agy_models() == {
+    assert mutate.AgyMutator.catalog() == {
         "gemini-3.8-flash-medium",
         "claude-opus-4-6-thinking",
     }
@@ -821,7 +821,10 @@ def test_a_round_is_invoked_with_everything_it_needs_to_measure() -> None:
     assert invocation[1:3] == ["--print", MESSAGE]
     assert invocation[invocation.index("--add-dir") + 1] == str(box)
     assert invocation[invocation.index("--model") + 1] == "claude-sonnet-4-6"
-    assert invocation[invocation.index("--print-timeout") + 1] == mutate.AGY_TIMEOUT
+    assert (
+        invocation[invocation.index("--print-timeout") + 1]
+        == mutate.AgyMutator.PRINT_TIMEOUT
+    )
     assert invocation[invocation.index("--output-format") + 1] == "stream-json"
     assert invocation[invocation.index("--mode") + 1] == "accept-edits"
     # The grant that lets a round run `measure.py`, which is the whole point of
@@ -935,7 +938,7 @@ def test_opencode_sums_the_tokens_and_the_price_across_the_steps(
 def test_the_price_of_a_call_is_read_even_though_no_field_carries_it(
     tmp_path: Path,
 ) -> None:
-    """`Spent` is what the transcript says the seller charged.
+    """`Report.dollars` is what the transcript says the seller charged.
 
     Cached prompt tokens are deliberately not added to the input count: the
     seller bills them at another rate, and what this feeds is a number the other
@@ -944,7 +947,7 @@ def test_the_price_of_a_call_is_read_even_though_no_field_carries_it(
     log = tmp_path / "opencode.ndjson"
     log.write_text(OPENCODE_WROTE_A_CHILD, encoding="utf-8")
 
-    spent = mutate._opencode_usage(log)
+    spent = mutate.OpenCodeMutator().report(log)
 
     assert spent.input_tokens == 1000 and spent.output_tokens == 100
     assert spent.dollars == pytest.approx(0.0413)
@@ -1030,7 +1033,7 @@ def test_every_driver_is_reachable_by_name(
         assert isinstance(mutate.build().drivers[0], driver)
 
     env.write_text("CAMPAIGN_MUTATOR=opencode\n", encoding="utf-8")
-    assert mutate.asked_model() == mutate.opencode_model()
+    assert mutate.asked_model() == mutate.OpenCodeMutator.asked()
 
 
 def test_an_unset_opencode_model_is_the_campaigns_own(
@@ -1042,13 +1045,13 @@ def test_an_unset_opencode_model_is_the_campaigns_own(
     monkeypatch.delenv("CAMPAIGN_OPENCODE_FALLBACK_MODEL", raising=False)
     (tmp_path / ".env").write_text("", encoding="utf-8")
 
-    assert mutate.opencode_model() == mutate.OPENCODE_MODEL
-    assert mutate.opencode_fallback() == mutate.OPENCODE_FALLBACK_MODEL
+    assert mutate.OpenCodeMutator.asked() == mutate.OpenCodeMutator.MODEL
+    assert mutate.OpenCodeMutator.retry() == mutate.OpenCodeMutator.FALLBACK
     # The same model from two shops, which is what makes the retry worth making.
-    assert mutate.OPENCODE_MODEL != mutate.OPENCODE_FALLBACK_MODEL
+    assert mutate.OpenCodeMutator.MODEL != mutate.OpenCodeMutator.FALLBACK
     assert (
-        mutate.OPENCODE_MODEL.rsplit("/", 1)[-1]
-        == (mutate.OPENCODE_FALLBACK_MODEL.rsplit("/", 1)[-1])
+        mutate.OpenCodeMutator.MODEL.rsplit("/", 1)[-1]
+        == (mutate.OpenCodeMutator.FALLBACK.rsplit("/", 1)[-1])
     )
 
 
@@ -1328,10 +1331,10 @@ def test_the_second_entitlement_follows_its_own_key_at_the_call(
     env = tmp_path / ".env"
 
     env.write_text("CAMPAIGN_AGY_SECOND_MODEL=gemini-3.8-flash-low\n", encoding="utf-8")
-    assert mutate.agy_second() == "gemini-3.8-flash-low"
+    assert mutate.AgyMutator.second() == "gemini-3.8-flash-low"
 
     env.write_text("CAMPAIGN_AGY_SECOND_MODEL=gpt-oss-120b-medium\n", encoding="utf-8")
-    assert mutate.agy_second() == "gpt-oss-120b-medium"
+    assert mutate.AgyMutator.second() == "gpt-oss-120b-medium"
 
 
 def test_the_two_agy_entries_are_not_the_same_object(

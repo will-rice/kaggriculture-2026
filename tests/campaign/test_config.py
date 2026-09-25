@@ -112,9 +112,9 @@ def test_constants_match_the_spec_table() -> None:
     # margin beyond twice its own error instead.
     assert not hasattr(config, "PROMOTION_MARGIN")
     assert loop.STAGNATION_SESSIONS == 40
-    assert config.CODEX_MODEL == "gpt-5.6-luna"
-    assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
-    assert mutate.CODEX_REASONING == "max"
+    assert mutate.CodexMutator.MODEL == "gpt-5.6-luna"
+    assert mutate.CodexMutator.FALLBACK == "gpt-5.6-sol"
+    assert mutate.CodexMutator.REASONING == "max"
 
 
 def test_the_deleted_constants_are_gone() -> None:

@@ -930,14 +930,14 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
 ) -> None:
     """A typo'd model is caught before wandb opens or a call is ever made.
 
-    Real ``--dry-run`` never reaches ``validate_model`` -- a fake mutator
+    Real ``--dry-run`` never reaches `Driver.validate` -- a fake mutator
     spends no codex call -- so this is the other of the two tests that call
     ``main``, and it never runs with ``--dry-run``: a dirty-``src`` check or
     a live wandb run would otherwise have to be arranged just to reach the
     check this test is about.
 
     The typo goes in an ``.env`` of this test's own, because that file is
-    where the slug is chosen: `mutate.model` reloads it with ``override=True``
+    where the slug is chosen: `mutate.setting` reloads it with ``override=True``
     on every read, so a slug set any other way -- a patched constant, an
     exported variable -- is overwritten by the host's real file before
     ``main`` ever sees it.
@@ -953,8 +953,8 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
     )
     monkeypatch.setattr(mutate, "ENV", env)
     monkeypatch.setattr(
-        mutate,
-        "MODEL_CATALOG_COMMAND",
+        mutate.CodexMutator,
+        "CATALOG",
         ["printf", "%s", '{"models":[{"slug":"gpt-6-astra"}]}'],
     )
 
@@ -983,7 +983,7 @@ def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
 
     assert first.name == expected and first.id == expected
     assert second.id == first.id
-    assert config.CODEX_MODEL not in first.id
+    assert mutate.CodexMutator.MODEL not in first.id
 
 
 def test_a_restart_finds_the_champions_games_on_the_record_not_in_the_state(
@@ -1349,7 +1349,7 @@ def test_the_database_records_which_model_wrote_each_program(
     """A program remembers which model wrote it.
 
     That is what lets a block of quota be judged after the fact, even once
-    ``config.CODEX_MODEL`` has moved on to another value. The seed carries no
+    the model in `.env` has moved on to another value. The seed carries no
     model: no session wrote it.
     """
     paths = tiny_run(tmp_path, monkeypatch)
