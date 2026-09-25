@@ -708,11 +708,24 @@ class Campaign:
             await asyncio.sleep(config.LOSSES_INTERVAL_SECONDS)
             try:
                 loaded = await asyncio.to_thread(losses.refresh)
+                # Every pass, not only the ones that loaded something. The
+                # figures describe the corpus rather than the delta, so a run
+                # that promotes a champion and loads nothing for an hour still
+                # has a series to read the promotion against.
+                where = await asyncio.to_thread(losses.deficit)
             except Exception:
                 LOGGER.exception("loss refresh failed; the campaign continues")
                 continue
             if loaded:
                 LOGGER.info("losses: %d new game(s) the lineage lost", loaded)
+            if where:
+                self.log.log(where)
+                LOGGER.info(
+                    "losses: %.0f games, gap %s at day 10, %s over days 20-29",
+                    where["losses/games"],
+                    f"{where['losses/gap_day10']:+,.0f}",
+                    f"{where['losses/gap_days20_29']:+,.0f}",
+                )
 
     async def harvesting(self) -> None:
         """Take newly published kernels into the pool, for as long as the run lasts.

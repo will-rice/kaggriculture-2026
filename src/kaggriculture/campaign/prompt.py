@@ -290,16 +290,26 @@ def _game_lines(name: str, played: tuple[int, int, harness.Game] | None) -> list
         f"difference. Plain `./measure.py` plays them against each other, which "
         f"says nothing about this matchup.",
         "",
-        "Every day of it, both sides, is in the games database -- and so is "
-        "every game the competition has recorded, twenty-six thousand of them, "
-        "under `source = 'ladder'`. This asks where your season and theirs "
-        "part company:",
+        "Every day of it, both sides, is in the games database. So are the "
+        "games this program has really lost -- played on the competition "
+        "against opponents it was scored against, not against this pool -- "
+        "under `source = 'live'`, both seats, every day. This reads the two "
+        "banks down one of those seasons:",
         "",
         f"    curl -s {GAMES} --data-binary "
         + '"select day,'
-        + " round(avgIf(bank, source = 'ladder')) as ladder,"
-        + " round(avgIf(bank, source = 'campaign')) as ours"
-        + ' from games.days group by day order by day format TabSeparated"',
+        + " round(avgIf(bank, team = 'ours')) as ours,"
+        + " round(avgIf(bank, team = 'opponent')) as theirs,"
+        + " round(avgIf(bank, team = 'ours')"
+        + " - avgIf(bank, team = 'opponent')) as gap"
+        + " from games.days where source = 'live'"
+        + ' group by day order by day format TabSeparated"',
+        "",
+        "Those are losses, so the gap ends negative; where it *turns* is a "
+        "different question from how it ends, and the answer is not in the "
+        "game above, which this pool decided by a margin no real opponent "
+        "gives up. Every game the competition has recorded between other "
+        "teams is under `source = 'ladder'` for the same treatment.",
         "",
         f"Your own game is `select * from games.days where episode='{episode}' "
         f"order by day, seat`. The `query-games` skill has the schema and "
