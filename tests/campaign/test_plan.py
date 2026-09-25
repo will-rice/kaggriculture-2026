@@ -1149,3 +1149,86 @@ def test_a_controller_the_plan_cannot_be_packed_into_is_a_broken_plan(
         plan.gather(tmp_path)
 
     assert "does not pack back into a program" in str(broken.value)
+
+
+LICENCE_HEADER = """# Modified 2026-09-25: expand planned carrot sale lots.
+# Runtime chassis: Apache-2.0; thomastschinkel, yhay81, tetsutani.
+#
+#                                  Apache License
+#                            Version 2.0, January 2004
+#
+#    TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+"""
+
+
+def test_the_licence_body_is_shelved_and_comes_back(tmp_path: Path) -> None:
+    """Two hundred lines a round reads and cannot act on, kept out of its way.
+
+    champion_41's header is 224 lines and 13,626 characters, of which about
+    200 lines are the Apache-2.0 licence body pasted in by the kernel this
+    lineage derives from -- re-read on every round, about 3,200 tokens, and
+    nothing in it about this program. `harness.package` ships the same text as
+    `LICENSE` beside `main.py`, so what the licence asks for travels either
+    way; what the round sees is one line.
+    """
+    box = tmp_path / "box"
+    box.mkdir()
+    source = LICENCE_HEADER + packed(PLAN)
+
+    plan.lay_out(source, box)
+
+    given = (box / "child.py").read_text(encoding="utf-8")
+    assert "TERMS AND CONDITIONS" not in given, "the round still reads the licence"
+    assert "Apache License" not in given
+    # The notices proper stay: they are what section 4 asks be retained.
+    assert "Runtime chassis: Apache-2.0; thomastschinkel" in given
+    assert plan.NOTICE_MARK in given
+    assert "TERMS AND CONDITIONS" in (box / plan.NOTICE_FILE).read_text(
+        encoding="utf-8"
+    )
+    # And the program that ships carries the body again, in its place, with
+    # the plan it went in with. Not compared byte for byte: `gather` re-packs
+    # the plan and zlib does not promise the same bytes twice.
+    shipped = plan.gather(box)
+    assert shipped.startswith(LICENCE_HEADER)
+    assert plan.NOTICE_MARK not in shipped
+    assert plan.split(shipped)[1] == plan.split(source)[1]
+
+
+def test_a_round_cannot_ship_a_program_whose_licence_it_deleted(
+    tmp_path: Path,
+) -> None:
+    """The obligation stops depending on what a model decides to rewrite.
+
+    A round that deletes `licence.txt` and keeps the mark would ship a
+    derivative work of Apache-2.0 kernels with the licence body gone. It is
+    refused the way a broken plan is: the round produced nothing runnable and
+    is told why.
+    """
+    box = tmp_path / "box"
+    box.mkdir()
+    plan.lay_out(LICENCE_HEADER + packed(PLAN), box)
+    (box / plan.NOTICE_FILE).unlink()
+
+    with pytest.raises(plan.BrokenPlanError, match="licence"):
+        plan.gather(box)
+
+
+def test_a_program_that_derives_from_nothing_has_no_licence_to_shelve(
+    tmp_path: Path,
+) -> None:
+    """The scratch lineage starts from a blank program, and it is left alone."""
+    box = tmp_path / "box"
+    box.mkdir()
+    source = packed(PLAN)
+
+    plan.lay_out(source, box)
+
+    assert not (box / plan.NOTICE_FILE).exists()
+    assert plan.NOTICE_MARK not in (box / "child.py").read_text(encoding="utf-8")
+    assert plan.split(plan.gather(box))[1] == plan.split(source)[1]

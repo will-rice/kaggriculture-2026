@@ -228,6 +228,13 @@ What the campaign plays is `child.py` with `plan.json` packed back into it, one
 self-contained file whose last callable is `agent(observation, configuration)`.
 A program that crashes forfeits every game.
 
+`licence.txt` is the licence body of the kernels this program derives from,
+taken out of its header so you never read it and put back when the campaign
+packs the program. Leave the line that marks where it goes and ignore the
+file. Do not copy code out of `opponent.py` either: read it to work out what
+it does and write your own, which is the only way an edit generalises past
+that one agent.
+
 `plan.json` holds four things:
 
 - `actions` is a pool of every distinct step any season plays: the farmer's
