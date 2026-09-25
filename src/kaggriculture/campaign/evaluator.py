@@ -111,18 +111,22 @@ class Result(BaseModel):
     states: dict[str, list[harness.Game]] = Field(default_factory=dict, exclude=True)
 
     def beats(self, other: "Result") -> bool:
-        """Whether this scored better than ``other`` over what both played.
+        """Whether this banked more than ``other`` over what both played.
 
-        The shared opponents rather than `fitness`, because the pool grows
-        while a session runs -- harvest enrolled one at 14:01 on 2026-09-13,
-        mid-session -- and a mean over a pool that gained an agent is not the
-        same number as a mean over the pool before it. The shift is about a
-        forty-seventh of a rate difference, which is the size of the
-        improvements this comparison exists to tell apart.
+        The mean bank margin over the shared opponents, then the win rate
+        over them, the order `Database.top` ranks in and for the same reason:
+        a program that wins the same games by more is an improvement, and
+        against a pool it already beats the rate cannot say so. A session
+        continues from whichever of its rounds banked the most.
 
-        Ties go to ``other``. Two programs that draw every game are the same
-        program however their sources differ, and there is no reason to move
-        onto one of them.
+        The shared opponents rather than the whole pool, because the pool
+        grows while a session runs -- harvest enrolled one at 14:01 on
+        2026-09-13, mid-session -- and a mean over a pool that gained an
+        agent is not the same number as a mean over the pool before it.
+
+        Ties go to ``other``. Two programs that bank the same against everyone
+        are the same program however their sources differ, and there is no
+        reason to move onto one of them.
 
         Args:
             other: The result to compare against, usually the program this one
@@ -135,8 +139,14 @@ class Result(BaseModel):
         common = sorted(set(self.rates) & set(other.rates))
         if not common:
             return False
-        mine = sum(self.rates[one] for one in common) / len(common)
-        theirs = sum(other.rates[one] for one in common) / len(common)
+        mine = (
+            sum(self.margins[one].mean for one in common) / len(common),
+            sum(self.rates[one] for one in common) / len(common),
+        )
+        theirs = (
+            sum(other.margins[one].mean for one in common) / len(common),
+            sum(other.rates[one] for one in common) / len(common),
+        )
         return mine > theirs
 
 

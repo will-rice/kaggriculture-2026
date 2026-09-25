@@ -312,7 +312,12 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             games=2,
             seeds=[1],
             hardest=names[0],
-            states=dict.fromkeys(names, []),
+            # One dayless game per opponent, so the loop records them and a
+            # session reads a game back to hand its rounds, as a real one does.
+            states={
+                name: [_played([]).model_copy(update={"opponent": name})]
+                for name in names
+            },
         )
 
     monkeypatch.setattr(evaluator, "score", measure)
@@ -1025,7 +1030,7 @@ def test_a_restart_finds_the_champions_games_on_the_record_not_in_the_state(
     loop.run(1, again, WORKERS, seed, random.Random(1), log, paths, UNVENDORED)
 
     message = again.seen[0].message
-    assert "## The game" in message
+    assert "## This round's game" in message
     assert f"Episode `{config.POOL_CHAMPION}m" in message
 
 
@@ -1114,9 +1119,6 @@ def test_a_round_is_told_a_name_and_never_a_path(
     assert f"`{champion.name}m" in handed.message
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture/campaign" not in handed.message
-    # The doctrine lives in `round_prompt.md` now, so this asserts on what
-    # was actually delivered rather than on a constant that could drift.
-    assert "keep the notice" in handed.message, "the licence obligation travels"
 
 
 def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
@@ -1156,9 +1158,6 @@ def test_a_round_drawn_from_the_database_is_told_an_id_and_never_a_path(
     handed = mutator.seen[0]
     assert str(tmp_path) not in handed.message
     assert "/data/kaggriculture/campaign" not in handed.message
-    # The doctrine lives in `round_prompt.md` now, so this asserts on what
-    # was actually delivered rather than on a constant that could drift.
-    assert "keep the notice" in handed.message, "the licence obligation travels"
 
 
 def _repository(root: Path, monkeypatch: pytest.MonkeyPatch) -> Repo:
@@ -1316,8 +1315,8 @@ def test_a_round_that_lost_ground_is_not_what_the_next_one_builds_on(
     two is a climb.
 
     The second round here shortens the source, which the stub scores lower, so
-    the third round is handed the first round's program again -- and is told
-    that the discarded one exists and what it cost.
+    the third round is handed the first round's program again. The discarded
+    one stays on the record, where `attempts.jsonl` carries it.
     """
     paths = tiny_run(tmp_path, monkeypatch, rounds=3)
     pass_pool(tmp_path, paths)
@@ -1334,12 +1333,8 @@ def test_a_round_that_lost_ground_is_not_what_the_next_one_builds_on(
     assert second.child == better
     # Not `PASS`, which is what the second round wrote and scored worse for.
     assert third.child == better
-    # The regression is still in the database -- it was played, and what it
-    # cost is worth telling the next round -- and it reaches that round as a
-    # file it can diff rather than as prose.
-    assert "## Edits already tried on" in third.message
-    assert "`tried_1.py` scored" in third.message
-    assert "tried_1.py" in third.held
+    # The regression is still in the database: it was played and it counts.
+    assert "tried_1.py" not in third.message
     database = archive.Database(paths.archive, paths.programs)
     assert len([p for p in database.programs if p.id != config.SEED_ID]) == 3
 
@@ -1432,13 +1427,13 @@ def test_a_round_that_writes_nothing_feeds_the_next_one(
 def test_a_rejected_round_is_the_next_rounds_feedback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
-    """A program that did not parse is exactly what a next attempt can fix.
+    """A round that did not parse costs one round, not the session.
 
     The first round writes something that will not compile. Validation is the
-    real one, so the reason in the second round's message is the one the
-    campaign recorded, and the file that round is handed is the unchanged
-    program the first round started from -- four remaining rounds are not
-    thrown away over a fixable mistake.
+    real one, so the campaign records the reason against the lineage, and the
+    file the next round is handed is the unchanged program the first round
+    started from -- the remaining rounds are not thrown away over a fixable
+    mistake.
     """
     paths = tiny_run(tmp_path, monkeypatch, rounds=2)
     pass_pool(tmp_path, paths)
@@ -1450,10 +1445,11 @@ def test_a_rejected_round_is_the_next_rounds_feedback(
     loop.run(1, mutator, WORKERS, seed, random.Random(0), log, paths, UNVENDORED)
 
     first, second = mutator.seen
-    assert "produced nothing" not in first.message
-    assert "- syntax: " in second.message
     assert second.child == first.child == PASS
     database = archive.Database(paths.archive, paths.programs)
+    assert [f.reason[:8] for f in database.failures(config.POOL_CHAMPION)] == [
+        "syntax: "
+    ]
     # The seed came from nothing; the round's program came from champion zero,
     # which is what a session starts from and is named by its pool key.
     assert [p.started_from for p in database.programs] == ["", config.POOL_CHAMPION]
@@ -1486,6 +1482,7 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
             "attempts.jsonl",
             "child.py",
             "measure.py",
+            "opponent.py",
             "parent.py",
         ]
     )
@@ -1521,7 +1518,7 @@ def test_the_first_round_is_sent_the_loops_own_verdict_and_states(
     message = mutator.seen[0].message
     # One game, named by the program that played it -- champion zero, which is
     # the seed enthroned at startup and goes by the pool key.
-    assert "## The game" in message
+    assert "## This round's game" in message
     assert f"Episode `{config.POOL_CHAMPION}m" in message
     # Its result, which is what a round can act on: PASS against PASS is a dead
     # heat, so the banks it finished on are equal and the difference is zero.
@@ -1713,6 +1710,9 @@ def test_a_dry_run_writes_only_under_the_root_it_was_given(
     paths = tiny_run(tmp_path, monkeypatch)
     _repository(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "ROOT", tmp_path)
+    # A promotion packages the champion with the repository's licence, and a
+    # dry run promotes like any other run.
+    (tmp_path / "LICENSE").write_text("dry run\n", encoding="utf-8")
     stub_evaluator(monkeypatch)
     root = tmp_path / "run"
     seed = _write(tmp_path / "seed.py", PASS)
@@ -1779,7 +1779,9 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     # never had one was a sentence about nothing.
     assert state.champion is not None
     assert state.sessions_since_promotion >= loop.STAGNATION_SESSIONS
-    assert len(mutator.seen) == 2
+    # A session runs a block of rounds per opponent its program has played,
+    # so two sessions are at least two rounds; the count is the pool's.
+    assert len(mutator.seen) >= 2
     assert any("no promotion" in seen.message for seen in mutator.seen)
 
 
@@ -1816,6 +1818,8 @@ def test_a_round_logs_the_win_rate_and_the_place_it_bought(
     assert 0.0 <= call["calls/fitness"] <= 1.0
     # One public opponent, plus champion zero.
     assert call["calls/pool"] == 2
+    # The number the search climbs, beside the rate it no longer ranks on.
+    assert isinstance(call["database/top_margin"], float)
 
 
 def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
@@ -2166,8 +2170,8 @@ def test_a_cancelled_round_does_not_leave_its_workspace_behind(
                 "champion_1",
                 _gate_result("p1", {"v54": 0.5}),
                 "improve it",
-                [],
                 "margin",
+                _write(tmp_path / "rival.py", PASS),
             )
         )
 
@@ -2369,8 +2373,8 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
                 "champion_1",
                 _gate_result("p1", {"v54": 0.5}, days=30),
                 "improve it",
-                [],
                 "margin",
+                _write(tmp_path / "rival.py", PASS),
             )
         )
 
@@ -2380,6 +2384,7 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
             "attempts.jsonl",
             "child.py",
             "measure.py",
+            "opponent.py",
             "parent.py",
         ]
     )

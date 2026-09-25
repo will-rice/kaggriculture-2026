@@ -617,6 +617,15 @@ class CodexMutator(Driver):
             str(workspace),
             "-c",
             f"model_reasoning_effort={self.REASONING}",
+            # `workspace-write` closes the network by default, and a round's
+            # one instrument opens a socket: `measure.py --against` asks the
+            # games database which opponent an episode was, and the day tables
+            # the message points at live there. Measured over 46 codex rounds
+            # on 2026-09-25: 36 `--against` runs died on `PermissionError`, 44
+            # queries were refused, and the rounds reported the required test
+            # as blocked -- which the loop then filed as their failure.
+            "-c",
+            "sandbox_workspace_write.network_access=true",
         ]
 
     def report(self, log: Path) -> Report:

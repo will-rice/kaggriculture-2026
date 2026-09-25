@@ -21,10 +21,10 @@ from kaggriculture.campaign.harness import Margin
 def mean_margin(program: "Program") -> float:
     """Mean bank margin across the opponents a program was measured on.
 
-    The tie-break behind `Database.top`. A program with no margins scores
-    zero, which is neither the best nor the worst: a margin is a bank
-    difference and runs either side of zero. Only a record written before
-    margins existed has none, and this campaign started after they did.
+    What `Database.top` ranks on. A program with no margins scores zero,
+    which is neither the best nor the worst: a margin is a bank difference
+    and runs either side of zero. Only a record written before margins
+    existed has none, and this campaign started after they did.
     """
     if not program.margins:
         return 0.0
@@ -156,11 +156,10 @@ class Database:
     def attempts(self, path: Path) -> int:
         """Write every attempt and what it did, one JSON object per line.
 
-        The whole campaign as something a round can grep. It has been told what
-        its own siblings scored and what the promotions changed, which is a few
-        dozen edits out of four hundred and eighty-nine; the rest -- every
-        change measured and refused -- was on the record and reachable by
-        nothing.
+        The whole campaign as something a round can grep. The message tells it
+        what the promotions changed, which is a few dozen edits out of hundreds;
+        the rest -- every change measured and refused -- is here, and nowhere
+        else a round can reach.
 
         A file rather than more of the message, and that is the point. Four
         hundred attempts would not fit in a round's budget, and a round pays for
@@ -243,34 +242,29 @@ class Database:
         return dict(self._promoted)
 
     def top(self, k: int) -> list[Program]:
-        """Return the `k` best programs, best first: most games won.
+        """Return the `k` best programs, best first: widest bank margin.
 
-        On the win rate, because every candidate plays the whole pool on the
-        same seeds in both seats, which makes the rate directly comparable.
-        Then on the mean bank margin across opponents. That tie-break is what
-        makes the opening hours a search rather than a random walk: before the
-        first win every rate is 0.0, sorting on it alone leaves the ties in
-        insertion order, and the margins say which of those came closest.
+        On the mean bank margin across opponents, then on the win rate. Both
+        are comparable directly, because every candidate plays the whole pool
+        on the same seeds in both seats; what separates them is where each
+        still has a gradient. The gate reads a win rate of 0.86 to 0.89 with
+        most of the pool at 1.000, so a program that got better at the
+        economy scores exactly what its parent scored on the rate, and the
+        search cannot see it. The margin still moves there, and against an
+        opponent already beaten it is close to a pure measure of the
+        program's own economy -- the thing that carries to the ladder's
+        opponents nobody in the pool resembles, where half our real losses
+        are within 1,000 coins on banks of 100,000 (`standing`, 2026-09-25).
+
+        The rate ranked first until 2026-09-25, on the reading that winning
+        is the objective and the margin only a tie-break. Winning is the
+        objective; it is not the signal, once the pool is beaten.
         """
         return sorted(
             self._programs.values(),
-            key=lambda p: (p.fitness, mean_margin(p)),
+            key=lambda p: (mean_margin(p), p.fitness),
             reverse=True,
         )[:k]
-
-    def children(self, program_id: str) -> list[Program]:
-        """Every program written from `program_id`, best first.
-
-        What the next round is told has already been tried from where it
-        stands. Ordered like `top`, on fitness and then on the mean bank
-        margin, because before the first win every fitness is 0.0 and
-        insertion order says nothing about which attempt came closest.
-        """
-        return sorted(
-            (p for p in self._programs.values() if p.started_from == program_id),
-            key=lambda p: (p.fitness, mean_margin(p)),
-            reverse=True,
-        )
 
     def descendants(self, root: str) -> list[Program]:
         """Every program grown from ``root``, however many generations down.

@@ -387,13 +387,25 @@ def test_a_result_serialises_without_its_games() -> None:
     assert back.rates == result.rates and back.margins == result.margins
 
 
-def rated(program_id: str, rates: dict[str, float]) -> evaluator.Result:
-    """A result carrying nothing but the rates a comparison reads."""
+def rated(
+    program_id: str, rates: dict[str, float], margins: dict[str, float] | None = None
+) -> evaluator.Result:
+    """A result carrying the rates and margins a comparison reads.
+
+    Margins default to zero against everyone, so a test about the rates is
+    read on the rates alone.
+    """
+    banked = margins or dict.fromkeys(rates, 0.0)
     return evaluator.Result(
         program_id=program_id,
         fitness=sum(rates.values()) / len(rates),
         rates=rates,
-        margins={name: harness.Margin(mean=0.0, worst=0.0, best=0.0) for name in rates},
+        margins={
+            name: harness.Margin(
+                mean=banked[name], worst=banked[name], best=banked[name]
+            )
+            for name in rates
+        },
         games=2,
         seeds=[1],
         hardest=next(iter(rates)),
@@ -415,6 +427,31 @@ def test_a_result_is_compared_over_the_opponents_both_programs_played() -> None:
     assert child.fitness > parent.fitness, "the whole-pool mean favours the child"
     assert not child.beats(parent), "over the shared two it is 0.30 against 0.40"
     assert parent.beats(child)
+
+
+def test_winning_the_same_games_by_more_is_an_improvement() -> None:
+    """The gradient on the opponents a program already beats.
+
+    Both sides win every game, so the rate has nothing to say; the child
+    banked 900 more a game against each, and that is what a session should
+    continue from. Measured on the ladder 2026-09-25, half our real losses
+    are within 1,000 coins, which is the size of edge this comparison exists
+    to keep.
+    """
+    parent = rated("parent", {"a": 1.0, "b": 1.0}, {"a": 2_000.0, "b": 3_000.0})
+    child = rated("child", {"a": 1.0, "b": 1.0}, {"a": 2_900.0, "b": 3_900.0})
+
+    assert child.beats(parent)
+    assert not parent.beats(child)
+
+
+def test_the_margin_outranks_the_rate() -> None:
+    """A program that banks more is ahead of one that merely wins more often."""
+    often = rated("often", {"a": 0.6, "b": 0.6}, {"a": 100.0, "b": 100.0})
+    much = rated("much", {"a": 0.5, "b": 0.5}, {"a": 1_500.0, "b": 1_500.0})
+
+    assert much.beats(often)
+    assert not often.beats(much)
 
 
 def test_a_tie_is_not_an_improvement() -> None:
