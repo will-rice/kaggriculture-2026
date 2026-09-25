@@ -2215,7 +2215,9 @@ def test_the_campaign_harvests_while_it_runs(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
 
-    asyncio.run(_a_pass(campaign.harvesting()))
+    asyncio.run(
+        _a_pass(campaign.harvesting(), lambda: "fresh" in campaign.pool.opponents)
+    )
 
     assert campaign.pool.opponents["fresh"] == "/vendored/main.py"
     # And it is on disk, because the pool file is what resolves an opponent's
@@ -2234,14 +2236,17 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
 
+    asked = []
+
     def refuses(limit: int, known: set) -> dict:
         """A listing that fails, the way a rate-limited one does."""
+        asked.append(1)
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.harvest, "vendored", refuses)
     before = dict(campaign.pool.opponents)
 
-    assert asyncio.run(_a_pass(campaign.harvesting()))
+    assert asyncio.run(_a_pass(campaign.harvesting(), lambda: len(asked) > 1))
 
     assert campaign.pool.opponents == before
 
@@ -2269,7 +2274,7 @@ def test_the_campaign_reloads_the_games_it_lost(
     monkeypatch.setattr(loop.losses, "refresh", loads)
     monkeypatch.setattr(loop.losses, "deficit", dict)
 
-    asyncio.run(_a_pass(campaign.losing()))
+    asyncio.run(_a_pass(campaign.losing(), lambda: passes))
 
     assert passes
 
@@ -2286,14 +2291,17 @@ def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
 
+    asked = []
+
     def refuses() -> int:
         """A listing that fails, the way a rate-limited one does."""
+        asked.append(1)
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.losses, "refresh", refuses)
     monkeypatch.setattr(loop.losses, "deficit", dict)
 
-    assert asyncio.run(_a_pass(campaign.losing()))
+    assert asyncio.run(_a_pass(campaign.losing(), lambda: len(asked) > 1))
 
 
 def test_where_the_losses_are_decided_reaches_the_run(
@@ -2322,7 +2330,12 @@ def test_where_the_losses_are_decided_reaches_the_run(
     }
     monkeypatch.setattr(loop.losses, "deficit", lambda: where)
 
-    asyncio.run(_a_pass(campaign.losing()))
+    asyncio.run(
+        _a_pass(
+            campaign.losing(),
+            lambda: any("losses/games" in record for _, record in records),
+        )
+    )
 
     logged = [record for _, record in records if "losses/games" in record]
     assert logged, "the gap has to reach wandb to be worth measuring"
@@ -2471,12 +2484,27 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
         assert len(set(block) | set(campaign.duel)) == config.DUEL_SEEDS
 
 
-async def _a_pass(timer: Coroutine[None, None, None]) -> bool:
-    """Run one of the loop's timers long enough to take its passes, then stop it.
+async def _a_pass(
+    timer: Coroutine[None, None, None], until: Callable[[], object]
+) -> bool:
+    """Run one of the loop's timers until ``until`` holds, then stop it.
 
     Both timers -- the harvest and the loss refresh -- loop forever on an
     interval a test sets to zero, so this drives one and cancels it the way
     `drive` does.
+
+    Waits for what the test is waiting *for*, rather than yielding the event
+    loop a fixed number of times. It used to do the latter, 50 turns of
+    `sleep(0)`, which is not a wait at all: both timers do their work in
+    `to_thread`, so whether the thread had finished by the fiftieth yield was a
+    question about how busy the machine was. It held here and failed on a CI
+    runner, which is the worst way to learn it -- a test that passes on the
+    author's box and fails on somebody else's teaches the wrong lesson twice.
+
+    Args:
+        timer: The coroutine to drive.
+        until: Checked between turns; the pass is over when it is truthy. The
+            deadline exists only so a broken timer fails instead of hanging.
 
     Returns:
         Whether it was still going when it was stopped, which is what a test
@@ -2484,9 +2512,10 @@ async def _a_pass(timer: Coroutine[None, None, None]) -> bool:
         exception out is finished, and the campaign ended with it.
     """
     task = asyncio.ensure_future(timer)
-    for _ in range(50):
-        await asyncio.sleep(0)
-        if task.done():
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        if task.done() or until():
             break
     alive = not task.done()
     task.cancel()
