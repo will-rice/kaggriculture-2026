@@ -132,8 +132,8 @@ def vendor(entry: Path, name: str) -> Path:
     target = config.OPPONENTS / name
     # Built beside the target and renamed onto it, never written in place.
     # `config.OPPONENTS` is read continuously while this runs: every game
-    # resolves an opponent's path under it, and `copycheck` walks the whole
-    # tree reading every file. A `rmtree` followed by a `copytree` leaves that
+    # resolves an opponent's path under it. A `rmtree` followed by a
+    # `copytree` leaves that
     # tree half-built for the length of the copy, and a reader landing inside
     # the gap gets `FileNotFoundError` -- which is what killed the run at
     # 02:37 on 2026-09-11, on the first harvest that ever ran while games

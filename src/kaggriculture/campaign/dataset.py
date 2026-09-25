@@ -4,7 +4,7 @@ Every question about the recorded games used to mean another walk of the
 archives: twenty-odd minutes to learn one number, and the same parse each
 time whatever was being asked. That is the wrong way round -- the parse is
 the cost and it does not depend on the question -- so the corpus is parsed
-once into SQLite and the questions become SQL.
+once into ClickHouse and the questions become SQL.
 
 It also fixes what the questions could be about. Eleven numbers per side per
 day, read from one hour in twenty-four, is a small corner of what a tape
@@ -223,13 +223,13 @@ def _ingest(archive: Path, database: str) -> int:
     batch = games.Batch("ladder")
     read = 0
     for episode in tapes.qualifying_episodes(archive):
-        _rows(batch, episode, archive.stem[-10:])
+        rows(batch, episode, archive.stem[-10:])
         read += 1
     batch.send(database)
     return read
 
 
-def _rows(batch: "games.Batch", episode: tapes.Episode, played: str) -> None:
+def rows(batch: "games.Batch", episode: tapes.Episode, played: str) -> None:
     """Hold every row one recorded game produces."""
     identity = episode.info
     # `is None` rather than `or`: an EpisodeId of 0 is an episode id, and

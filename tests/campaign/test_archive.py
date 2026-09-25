@@ -73,9 +73,10 @@ def test_attempts_is_the_whole_campaign_one_line_each(tmp_path: Path) -> None:
         created=time.time(),
     )
     db.add(second)
+    db.promoted_as("p2", "champion_1")
 
     out = tmp_path / "attempts.jsonl"
-    written = db.attempts(out, promoted={"p2"})
+    written = db.attempts(out)
 
     lines = [json.loads(line) for line in out.read_text().splitlines()]
     assert written == 2 and len(lines) == 2
@@ -93,6 +94,27 @@ def test_attempts_is_the_whole_campaign_one_line_each(tmp_path: Path) -> None:
     assert lines[1]["changed"] == "every SELL WHEAT tripled"
     assert lines[1]["promoted"] is True
     assert lines[1]["margin"] == 300
+
+
+def test_a_promotion_is_an_event_the_log_replays(tmp_path: Path) -> None:
+    """Which attempts survived a gate is on the record, and survives a restart.
+
+    `gate.promote` copies a program to `champion_N.py` and keeps no id, so the
+    one fact about an attempt worth more than its score was recoverable only by
+    diffing champion files against every stored source. An event, like the
+    rest: folded before it is written, replayed on start.
+    """
+    db = make(tmp_path)
+    program(db, "p1", 0.4)
+    program(db, "p2", 0.5)
+    db.promoted_as("p2", "champion_3")
+
+    assert db.promoted == {"p2": "champion_3"}
+    assert make(tmp_path).promoted == {"p2": "champion_3"}
+    with pytest.raises(ValueError, match="unknown program"):
+        db.promoted_as("nobody", "champion_4")
+    # And a refused event never reached the log, so a replay does not trip on it.
+    assert make(tmp_path).promoted == {"p2": "champion_3"}
 
 
 def test_a_program_recorded_before_changed_existed_still_loads(

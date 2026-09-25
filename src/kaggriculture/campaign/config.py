@@ -594,7 +594,6 @@ OPENCODE_MODEL = "openrouter/openai/gpt-5.6-luna"
 # rate-limiting or dropping the turn is a fact about that seller and not about
 # the model.
 OPENCODE_FALLBACK_MODEL = "opencode-go/gpt-5.6-luna"
-SERVED = ROOT / "src" / "kaggriculture" / "served" / "main.py"
 # The database id of the program a cold start seeds itself from. The copy the
 # cold start writes under a run's `programs` is the campaign's lineage: every
 # program descends from it, and it cannot change once written, which the file

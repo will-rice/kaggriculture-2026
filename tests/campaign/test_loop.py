@@ -47,6 +47,7 @@ from kaggriculture.campaign import (
     config,
     dataset,
     evaluator,
+    games,
     gate,
     harness,
     loop,
@@ -54,6 +55,30 @@ from kaggriculture.campaign import (
     pool,
     prompt,
 )
+
+
+@pytest.fixture(autouse=True)
+def games_scratch(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """Every test here writes its games to a database of its own.
+
+    The loop records every game it scores and reads a program's games back to
+    hand a round one, so a test campaign that wrote into the live `games`
+    database would read the real champion's seasons back as its own -- and
+    until this fixture existed, every loop test did write there: hundreds of
+    `PASS`-against-`PASS` games filed under the live champion's name.
+
+    Autouse because `tiny_run` is a plain function forty tests call, and the
+    isolation is not a thing a test should have to remember to ask for.
+    """
+    name = f"test_{abs(hash(request.node.name)):x}"[:40]
+    games.query(f"DROP DATABASE IF EXISTS {name}")
+    request.addfinalizer(lambda: games.query(f"DROP DATABASE IF EXISTS {name}"))
+    games.create(name)
+    monkeypatch.setattr(games, "DATABASE", name)
+    return name
+
 
 PASS = (
     "def agent(observation, configuration=None):\n"
@@ -465,14 +490,13 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     """A campaign that promotes must still be a campaign that can restart.
 
     Every write a promotion makes is under ``run/campaign``. One that landed
-    in ``src/`` -- ``served/main.py`` was such a write -- would dirty a
+    in ``src/`` -- the seed file was such a write, once -- would dirty a
     tracked file, and ``_open_run`` refuses to start a run whose ``src/`` has
     uncommitted changes: the first promotion would be the last thing that
     campaign ever did.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     repo = _repository(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "SERVED", tmp_path / "src" / "served" / "main.py")
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
 
@@ -992,6 +1016,48 @@ def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
     assert config.CODEX_MODEL not in first.id
 
 
+def test_a_restart_finds_the_champions_games_on_the_record_not_in_the_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The state is kilobytes, and a resumed session still has a game to show.
+
+    `state.json` was 688 MB rewritten after every session, and `champion.json`
+    646 MB: the champion's result carried every game it was scored on with its
+    day table, all of them already in the games database. A result serialises
+    without them now, so a champion loaded back has none -- and the game a
+    round is handed comes off the record instead, where it was written the
+    moment the champion was scored. Two launches, so the second one proves the
+    read-back rather than the memory.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path, paths)
+    seed = _write(tmp_path / "seed.py", PASS)
+
+    loop.run(
+        1,
+        Recorder(edit=lambda _: SELLER),
+        WORKERS,
+        seed,
+        random.Random(0),
+        log,
+        paths,
+        UNVENDORED,
+    )
+
+    assert paths.champion.stat().st_size < 200_000, (
+        "the floor's record is a record, not a corpus"
+    )
+    loaded = gate.load_champion(paths)
+    assert loaded is not None and loaded.result.states == {}
+    again = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, again, WORKERS, seed, random.Random(1), log, paths, UNVENDORED)
+
+    message = again.seen[0].message
+    assert "## The game" in message
+    assert f"Episode `{config.POOL_CHAMPION}m" in message
+
+
 def test_a_restart_resumes_state_json_and_champion_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -1035,8 +1101,12 @@ def test_a_restart_resumes_state_json_and_champion_json(
     )
 
     assert state.sessions == 7 and state.sessions_since_promotion == 3
-    assert state.champion == champion
-    assert state.champion != stale
+    # As the disk carries it: a result serialises without its games, so the
+    # champion that came back is the one that was written, less the games it
+    # was written without -- and it is not the stale one `state.json` held.
+    assert state.champion is not None
+    assert state.champion.model_dump() == champion.model_dump()
+    assert state.champion.name != stale.name
 
 
 @pytest.mark.slow
@@ -1441,7 +1511,13 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
 
     handed = mutator.seen[0]
     assert handed.held == sorted(
-        [Recorder.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
+        [
+            Recorder.SKILLS_DIRS[0].parts[0],
+            "attempts.jsonl",
+            "child.py",
+            "measure.py",
+            "parent.py",
+        ]
     )
     assert not handed.where.exists()
 
@@ -2445,7 +2521,13 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         )
 
     assert seen["files"] == sorted(
-        [Inspect.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
+        [
+            Inspect.SKILLS_DIRS[0].parts[0],
+            "attempts.jsonl",
+            "child.py",
+            "measure.py",
+            "parent.py",
+        ]
     )
     # The skills go where the driving program looks for them: `.codex/skills`
     # under codex's working directory, `.agents` for agy to walk up to.

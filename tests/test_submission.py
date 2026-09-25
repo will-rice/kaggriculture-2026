@@ -25,11 +25,11 @@ def test_the_entrypoint_is_the_campaign_floor() -> None:
 
     The two used to be the same path, and a promotion wrote through `src/`
     to reach it. Shipping the floor is what lets the seed stay a seed: the
-    cold start begins from `served/main.py` while the ladder gets whatever
+    cold start begins from `seed/main.py` while the ladder gets whatever
     the campaign has actually promoted.
     """
     assert ENTRYPOINT == config.LIVE.floor / "main.py"
-    assert ENTRYPOINT != config.SERVED
+    assert ENTRYPOINT != config.SEED
 
 
 @needs_the_floor

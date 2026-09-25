@@ -8,15 +8,87 @@ from _common import PASS, assert_exact_engine, emit, new_env
 
 
 EXPECTED_PARAMS = {
-    "WHEAT": {"base": 25, "I0": 10000, "T": 400, "below_func": "sqrt", "below_target": 0.80, "above_func": "log", "above_target": 0.20},
-    "CARROT": {"base": 35, "I0": 10000, "T": 450, "below_func": "hinge", "below_target": 1.00, "above_func": "sqrt", "above_target": 0.70},
-    "TOMATO": {"base": 60, "I0": 10000, "T": 200, "below_func": "hinge", "below_target": 0.40, "above_func": "sqrt", "above_target": 0.60},
-    "STRAWBERRY": {"base": 120, "I0": 10000, "T": 100, "below_func": "sqrt", "below_target": 0.70, "above_func": "linear", "above_target": 1.60},
-    "MELON": {"base": 250, "I0": 10000, "T": 300, "below_func": "log", "below_target": 0.20, "above_func": "sq", "above_target": 3.60},
-    "EGG": {"base": 50, "I0": 10000, "T": 332, "below_func": "hinge", "below_target": 0.40, "above_func": "log", "above_target": 0.20},
-    "MILK": {"base": 160, "I0": 10000, "T": 122, "below_func": "sqrt", "below_target": 0.60, "above_func": "linear", "above_target": 1.60},
-    "WOOL": {"base": 200, "I0": 10000, "T": 105, "below_func": "log", "below_target": 0.20, "above_func": "sq", "above_target": 3.20},
-    "FERTILIZER": {"base": 100, "I0": 10000, "T": 200, "below_func": "linear", "below_target": 0.40, "above_func": "linear", "above_target": 0.40},
+    "WHEAT": {
+        "base": 25,
+        "I0": 10000,
+        "T": 400,
+        "below_func": "sqrt",
+        "below_target": 0.80,
+        "above_func": "log",
+        "above_target": 0.20,
+    },
+    "CARROT": {
+        "base": 35,
+        "I0": 10000,
+        "T": 450,
+        "below_func": "hinge",
+        "below_target": 1.00,
+        "above_func": "sqrt",
+        "above_target": 0.70,
+    },
+    "TOMATO": {
+        "base": 60,
+        "I0": 10000,
+        "T": 200,
+        "below_func": "hinge",
+        "below_target": 0.40,
+        "above_func": "sqrt",
+        "above_target": 0.60,
+    },
+    "STRAWBERRY": {
+        "base": 120,
+        "I0": 10000,
+        "T": 100,
+        "below_func": "sqrt",
+        "below_target": 0.70,
+        "above_func": "linear",
+        "above_target": 1.60,
+    },
+    "MELON": {
+        "base": 250,
+        "I0": 10000,
+        "T": 300,
+        "below_func": "log",
+        "below_target": 0.20,
+        "above_func": "sq",
+        "above_target": 3.60,
+    },
+    "EGG": {
+        "base": 50,
+        "I0": 10000,
+        "T": 332,
+        "below_func": "hinge",
+        "below_target": 0.40,
+        "above_func": "log",
+        "above_target": 0.20,
+    },
+    "MILK": {
+        "base": 160,
+        "I0": 10000,
+        "T": 122,
+        "below_func": "sqrt",
+        "below_target": 0.60,
+        "above_func": "linear",
+        "above_target": 1.60,
+    },
+    "WOOL": {
+        "base": 200,
+        "I0": 10000,
+        "T": 105,
+        "below_func": "log",
+        "below_target": 0.20,
+        "above_func": "sq",
+        "above_target": 3.20,
+    },
+    "FERTILIZER": {
+        "base": 100,
+        "I0": 10000,
+        "T": 200,
+        "below_func": "linear",
+        "below_target": 0.40,
+        "above_func": "linear",
+        "above_target": 0.40,
+    },
 }
 
 
@@ -47,8 +119,12 @@ def market_parameters_and_curves() -> dict[str, object]:
     for item in ("CARROT", "TOMATO", "EGG"):
         params = EXPECTED_PARAMS[item]
         hinge[item] = {
-            "price_at_half_T_scarcity": engine.market_price(item, params["I0"] - params["T"] / 2),
-            "price_at_double_T_scarcity": engine.market_price(item, params["I0"] - 2 * params["T"]),
+            "price_at_half_T_scarcity": engine.market_price(
+                item, params["I0"] - params["T"] / 2
+            ),
+            "price_at_double_T_scarcity": engine.market_price(
+                item, params["I0"] - 2 * params["T"]
+            ),
         }
     assert hinge == {
         "CARROT": {"price_at_half_T_scarcity": 52, "price_at_double_T_scarcity": 385},
@@ -91,10 +167,12 @@ def simultaneous_and_sequential_sales() -> dict[str, object]:
     env.state[0].observation.private.shed.CARROT = 3
     quotes = [engine.market_price("CARROT", 9100 + i) for i in range(3)]
     assert quotes == [385, 384, 382]
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [["SELL", "CARROT", 3]]},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": [["SELL", "CARROT", 3]]},
+            PASS,
+        ]
+    )
     assert env.state[0].observation.farms[0].money == 3000 + sum(quotes)
     assert env.state[0].observation.market.inventory.CARROT == 9103
     return {
@@ -117,10 +195,12 @@ def sale_floor_and_purchase_rules() -> dict[str, object]:
     engine._refresh_prices(market)
     assert market["prices"]["MELON"] == 1
     env.state[0].observation.private.shed.MELON = 1
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [["SELL", "MELON", 1]]},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": [["SELL", "MELON", 1]]},
+            PASS,
+        ]
+    )
     assert env.state[0].observation.farms[0].money == 3001
     assert env.state[0].observation.market.inventory.MELON == 10300
 
@@ -130,28 +210,36 @@ def sale_floor_and_purchase_rules() -> dict[str, object]:
     market = env.state[0].observation.market
     market.inventory.WHEAT = 10000
     engine._refresh_prices(market)
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [
-            ["BUY_PRODUCT", "WHEAT", 1], ["SELL", "WHEAT", 1]
-        ]},
-        PASS,
-    ])
+    env.step(
+        [
+            {
+                "farmer": ["PASS"],
+                "hands": [],
+                "market": [["BUY_PRODUCT", "WHEAT", 1], ["SELL", "WHEAT", 1]],
+            },
+            PASS,
+        ]
+    )
     assert env.state[0].observation.farms[0].money == 3000
     assert env.state[0].observation.market.inventory.WHEAT == 10000
     assert env.state[0].observation.private.shed.WHEAT == 0
     before = env.state[0].observation.farms[0].money
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [["BUY_PRODUCT", "CARROT", 1]]},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": [["BUY_PRODUCT", "CARROT", 1]]},
+            PASS,
+        ]
+    )
     assert env.state[0].observation.farms[0].money == before
 
     env.state[0].observation.private.inventories[0]["WOOL"] = 2
     before = env.state[0].observation.farms[0].money
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WOOL", 2]]},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WOOL", 2]]},
+            PASS,
+        ]
+    )
     assert env.state[0].observation.farms[0].money == before
     assert env.state[0].observation.private.inventories[0].WOOL == 2
     return {
@@ -164,7 +252,9 @@ def sale_floor_and_purchase_rules() -> dict[str, object]:
         "SELL_source": "shed only",
         "carried_wool_not_sold": 2,
         "seed_prices": {crop: data["seed"] for crop, data in engine.CROPS.items()},
-        "animal_prices": {animal: data["cost"] for animal, data in engine.ANIMALS.items()},
+        "animal_prices": {
+            animal: data["cost"] for animal, data in engine.ANIMALS.items()
+        },
     }
 
 
@@ -172,10 +262,12 @@ def order_limit_and_catalogue() -> dict[str, object]:
     env = new_env(seed=1, weedSpawnChance=0)
     env.reset(2)
     eleven_hires = [["HIRE"] for _ in range(11)]
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": eleven_hires},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": eleven_hires},
+            PASS,
+        ]
+    )
     farm = env.state[0].observation.farms[0]
     assert len(farm.hands) == 10
     assert farm.money == 2857
@@ -183,7 +275,14 @@ def order_limit_and_catalogue() -> dict[str, object]:
         "max_orders_per_player_turn": 10,
         "submitted_orders": 11,
         "processed_orders": 10,
-        "market_verbs": ["BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL", "HIRE", "BUY_LAND"],
+        "market_verbs": [
+            "BUY_SEED",
+            "BUY_PRODUCT",
+            "BUY_ANIMAL",
+            "SELL",
+            "HIRE",
+            "BUY_LAND",
+        ],
         "quantified_verbs": ["BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL"],
         "atomic_verbs": ["HIRE", "BUY_LAND"],
     }
@@ -221,7 +320,11 @@ def shops_and_duplicates() -> dict[str, object]:
     env = new_env(seed=1, weedSpawnChance=0, townShopUnlockInterval=1000)
     env.reset(2)
     env.step([PASS, PASS])
-    env.state[0].observation.town.unlocked_shops = ["YARN_STORE", "BAKERY", "YARN_STORE"]
+    env.state[0].observation.town.unlocked_shops = [
+        "YARN_STORE",
+        "BAKERY",
+        "YARN_STORE",
+    ]
     for _ in range(3):
         env.step([PASS, PASS])
     before = dict(env.state[0].observation.market.inventory)
@@ -251,7 +354,9 @@ def unlock_sequence(seed: int) -> dict[str, object]:
         shops = list(env.state[0].observation.town.unlocked_shops)
         if len(shops) > seen:
             obs = env.state[0].observation
-            events.append({"day": obs.day, "recorded_step": obs.step, "shop": shops[-1]})
+            events.append(
+                {"day": obs.day, "recorded_step": obs.step, "shop": shops[-1]}
+            )
             seen = len(shops)
     return {
         "input_seed": seed,
@@ -270,7 +375,16 @@ def shop_unlocks_and_seed() -> dict[str, object]:
     assert seed1a["events"] != seed2["events"]
     expected_days = [3, 6, 9, 12, 15, 18, 21, 24]
     assert [event["day"] for event in seed1a["events"]] == expected_days
-    assert [event["recorded_step"] for event in seed1a["events"]] == [72, 144, 216, 288, 360, 432, 504, 576]
+    assert [event["recorded_step"] for event in seed1a["events"]] == [
+        72,
+        144,
+        216,
+        288,
+        360,
+        432,
+        504,
+        576,
+    ]
     assert seed1a["configuration_seed_after_reset"] is None
     return {
         "unlock_every_days": 3,
@@ -285,13 +399,15 @@ def shop_unlocks_and_seed() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    emit({
-        "engine": assert_exact_engine(),
-        "market": market_parameters_and_curves(),
-        "sales": simultaneous_and_sequential_sales(),
-        "purchase_and_floor_rules": sale_floor_and_purchase_rules(),
-        "orders": order_limit_and_catalogue(),
-        "town_center": town_center(),
-        "shops": shops_and_duplicates(),
-        "shop_unlocks": shop_unlocks_and_seed(),
-    })
+    emit(
+        {
+            "engine": assert_exact_engine(),
+            "market": market_parameters_and_curves(),
+            "sales": simultaneous_and_sequential_sales(),
+            "purchase_and_floor_rules": sale_floor_and_purchase_rules(),
+            "orders": order_limit_and_catalogue(),
+            "town_center": town_center(),
+            "shops": shops_and_duplicates(),
+            "shop_unlocks": shop_unlocks_and_seed(),
+        }
+    )

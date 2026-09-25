@@ -5,7 +5,9 @@ import json
 import re
 from pathlib import Path
 
-ROOT = Path("/home/will/projects/kaggriculture-2026/.claude/worktrees/campaign/src/kaggriculture")
+ROOT = Path(
+    "/home/will/projects/kaggriculture-2026/.claude/worktrees/campaign/src/kaggriculture"
+)
 
 
 def main() -> None:
@@ -47,10 +49,16 @@ def main() -> None:
         print(f"   {name:<32} {reader}")
 
     roster = ROOT / "campaign" / "roster.py"
-    training = re.findall(r'^\s+"([^"]+)":\s*config\.', roster.read_text(encoding="utf-8"), re.M)
-    pool = json.loads(Path("/data/kaggriculture/campaign/pool.json").read_text(encoding="utf-8"))
+    training = re.findall(
+        r'^\s+"([^"]+)":\s*config\.', roster.read_text(encoding="utf-8"), re.M
+    )
+    pool = json.loads(
+        Path("/data/kaggriculture/campaign/pool.json").read_text(encoding="utf-8")
+    )
     held = set(pool.get("opponents", pool) if isinstance(pool, dict) else [])
-    print(f"\nroster.TRAINING names {len(training)} opponents; the pool holds {len(held)}")
+    print(
+        f"\nroster.TRAINING names {len(training)} opponents; the pool holds {len(held)}"
+    )
     print(f"   TRAINING not in pool: {sorted(set(training) - held)}")
 
 

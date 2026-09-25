@@ -47,7 +47,10 @@ def main() -> None:
     rows.sort()
     half = len(rows) // 2
     LOGGER.info("%d rounds that produced something", len(rows))
-    for name, part in (("lighter readers", rows[:half]), ("heavier readers", rows[half:])):
+    for name, part in (
+        ("lighter readers", rows[:half]),
+        ("heavier readers", rows[half:]),
+    ):
         LOGGER.info(
             "  %-16s read %5.0f KB median, %4.1f measurements median, "
             "%4.1f file changes median",

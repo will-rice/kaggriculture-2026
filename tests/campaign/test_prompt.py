@@ -160,6 +160,7 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
         "champion_1",
         first_game(result({"v54": 0.0})),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -187,6 +188,7 @@ def test_the_message_carries_the_rules_and_its_own_play() -> None:
         "champion_1",
         first_game(result({"v54": 0.0}, days=30)),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -213,6 +215,7 @@ def test_the_message_carries_no_path_into_the_campaign_itself() -> None:
         "champion_1",
         first_game(result({"v54": 0.1, "router_v1": 0.0})),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -237,6 +240,7 @@ def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -254,6 +258,7 @@ def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -296,6 +301,7 @@ def test_the_instruction_states_the_bar_and_not_a_method() -> None:
         "champion_1",
         first_game(result({"v54": 0.0}, days=30)),
         0.316,
+        -100.0,
         [],
         [],
         prompt.INSTRUCTION,
@@ -333,6 +339,7 @@ def test_the_message_carries_the_lineages_recent_failures() -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         failures,
         [],
         IMPROVE,
@@ -353,6 +360,7 @@ def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -367,6 +375,7 @@ def test_the_instruction_reaches_the_message_whole() -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         [],
         prompt.INSTRUCTION,
@@ -409,6 +418,7 @@ def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> N
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         db.children("champion_1"),
         IMPROVE,
@@ -438,17 +448,71 @@ def test_the_edits_already_tried_are_named_and_scored(tmp_path: Path) -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         db.children("champion_1"),
         IMPROVE,
     )
 
     assert "## Edits already tried on `champion_1`" in text
-    assert "`child.py` wins 0.316 of its games" in text
+    assert "`child.py` wins 0.316 of its games against the pool, by -100 coins" in text
     # Best first, which is `children`'s own order, and each delta is against
-    # the program in `child.py` rather than against the one above it.
-    assert "- `tried_1.py` scored 0.340 (+0.024)" in text
-    assert "- `tried_2.py` scored 0.130 (-0.186)" in text
+    # the program in `child.py` rather than against the one above it. The
+    # margin beside the rate, because it is the number with resolution and the
+    # one the gate promotes on; here every sibling banked the same, so +0.
+    assert "- `tried_1.py` scored 0.340 (+0.024), margin -100 (+0)" in text
+    assert "- `tried_2.py` scored 0.130 (-0.186), margin -100 (+0)" in text
+    assert "The gate promotes on the margin and the head-to-head" in text
+
+
+def test_what_has_worked_comes_from_the_record_not_from_the_files() -> None:
+    """The promotions' changes are sentences the archive carries, not diffs to redo.
+
+    This used to read every champion file back, split each and diff it against
+    the one before -- 39 programs of 869 KB, on every round -- to recompute what
+    `Program.changed` now records the moment a program is stored. So the section
+    is rendered from ``(name, changed)`` pairs, and a promotion whose plan did
+    not move is left out rather than rendered as a change.
+    """
+    text = prompt.compose(
+        "champion_1",
+        first_game(result({"v54": 0.5})),
+        0.316,
+        -100.0,
+        [],
+        [],
+        IMPROVE,
+        kept=[
+            ("champion_1", "every SELL WHEAT tripled"),
+            ("champion_2", ""),
+            ("champion_3", "two orders added to step 40"),
+        ],
+    )
+
+    assert "## What has worked" in text
+    assert "- champion_1: every SELL WHEAT tripled" in text
+    assert "- champion_3: two orders added to step 40" in text
+    assert "champion_2" not in text, (
+        "a promotion that did not move the plan is not a change"
+    )
+
+
+def test_the_round_is_told_the_whole_campaign_is_a_file_beside_it() -> None:
+    """`attempts.jsonl` is named, so a round knows the record is there to grep.
+
+    Every program the campaign has written, one JSON object per line: what it
+    changed, what it scored, whether it survived a gate, and its rate against
+    each opponent. A file rather than more message, because four hundred
+    attempts would not fit in a round's budget and a round pays for what it
+    reads -- and because worked examples in the prompt become the subject where
+    a file answers the question the round brought to it.
+    """
+    text = prompt.compose(
+        "champion_1", first_game(result({"v54": 0.5})), 0.316, -100.0, [], [], IMPROVE
+    )
+
+    assert "attempts.jsonl" in text
+    assert "one JSON object per line" in text
 
 
 def test_only_the_first_few_edits_are_sent(tmp_path: Path) -> None:
@@ -467,6 +531,7 @@ def test_only_the_first_few_edits_are_sent(tmp_path: Path) -> None:
         "champion_1",
         first_game(result({"v54": 0.5})),
         0.316,
+        -100.0,
         [],
         db.children("champion_1"),
         IMPROVE,
@@ -505,6 +570,7 @@ def test_no_opponent_is_named_anywhere_in_the_message() -> None:
         "champion_1",
         first_game(result(rates, days=30)),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -523,6 +589,7 @@ def test_the_templates_own_note_never_reaches_the_model() -> None:
         "champion_1",
         first_game(result({"v54": 0.5}, days=30)),
         0.316,
+        -100.0,
         [],
         [],
         IMPROVE,
@@ -542,7 +609,7 @@ def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
     """
     rates = {"close": 0.5, "beaten": 0.1}
     text = prompt.compose(
-        "champion_1", first_game(result(rates, days=4)), 0.316, [], [], IMPROVE
+        "champion_1", first_game(result(rates, days=4)), 0.316, -100.0, [], [], IMPROVE
     )
 
     assert prompt.GAMES in text, "the round is not told where to ask"
@@ -563,7 +630,7 @@ def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
     """
     rates = {"close": 0.5}
     text = prompt.compose(
-        "champion_1", first_game(result(rates, days=4)), 0.316, [], [], IMPROVE
+        "champion_1", first_game(result(rates, days=4)), 0.316, -100.0, [], [], IMPROVE
     )
 
     assert "the competition has recorded" in text

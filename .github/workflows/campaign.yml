@@ -48,7 +48,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff format --check src tests
       - run: uv run ruff check src tests
-      - run: uv run ty check --exclude src/kaggriculture/served src tests main.py
+      - run: uv run ty check src tests
       # The empty tables, because not every reader builds its own. A test that
       # asks the record about an episode -- `measure.against` refusing a key it
       # cannot find, before spending ten minutes of games on it -- gets

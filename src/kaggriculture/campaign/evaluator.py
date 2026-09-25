@@ -27,7 +27,7 @@ import random
 from collections.abc import Sequence
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from kaggriculture.campaign import config, harness, roster
 from kaggriculture.campaign.pool import Pool
@@ -113,7 +113,13 @@ class Result(BaseModel):
     games: int = 0
     seeds: list[int]
     hardest: str
-    states: dict[str, list[harness.Game]]
+    # Every game with its day table, for `games.record` -- and for nothing
+    # else, which is why it is excluded from what a result serialises to. It
+    # was not, and a champion's result rode inside `State`, so `state.json`
+    # was 688 MB rewritten after every session and `champion.json` 646 MB,
+    # both holding twelve thousand games that were already in the database.
+    # Loaded back, a result has no games; `games.recorded` reads them.
+    states: dict[str, list[harness.Game]] = Field(default_factory=dict, exclude=True)
 
     def beats(self, other: "Result") -> bool:
         """Whether this scored better than ``other`` over what both played.

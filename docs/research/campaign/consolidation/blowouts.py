@@ -55,7 +55,9 @@ def main() -> None:
                 spent / 1000,
             )
 
-    LOGGER.info("\n%d of %d rounds had a read over %d KB", hit, len(rounds), BIG // 1000)
+    LOGGER.info(
+        "\n%d of %d rounds had a read over %d KB", hit, len(rounds), BIG // 1000
+    )
     LOGGER.info("the largest single reads:")
     for size, name, command in sorted(worst, reverse=True)[:8]:
         LOGGER.info("  %7.0f KB  %s  %s", size / 1000, name, command)

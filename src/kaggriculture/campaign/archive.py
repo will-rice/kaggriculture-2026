@@ -116,6 +116,7 @@ class Database:
         self.programs_dir = programs_dir
         self._programs: dict[str, Program] = {}
         self._failures: list[Failure] = []
+        self._promoted: dict[str, str] = {}
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 self._apply(json.loads(line), persist=False)
@@ -146,6 +147,10 @@ class Database:
             self._programs[program.id] = program
         elif kind == "failure":
             self._failures.append(Failure.model_validate(event["failure"]))
+        elif kind == "promotion":
+            if event["id"] not in self._programs:
+                raise ValueError(f"promotion of an unknown program: {event['id']!r}")
+            self._promoted[event["id"]] = event["name"]
         else:
             raise ValueError(f"unknown database event: {kind!r}")
         if persist:
@@ -158,7 +163,7 @@ class Database:
         """Every program, in the order it was added."""
         return list(self._programs.values())
 
-    def attempts(self, path: Path, promoted: set[str]) -> int:
+    def attempts(self, path: Path) -> int:
         """Write every attempt and what it did, one JSON object per line.
 
         The whole campaign as something a round can grep. It has been told what
@@ -181,8 +186,6 @@ class Database:
 
         Args:
             path: Where to write it.
-            promoted: The ids that became champions, so an attempt says whether
-                it survived rather than leaving a round to infer it.
 
         Returns:
             How many attempts were written.
@@ -199,7 +202,7 @@ class Database:
                             "changed": program.changed,
                             "wins": round(program.fitness, 4),
                             "margin": round(mean_margin(program)),
-                            "promoted": program.id in promoted,
+                            "promoted": program.id in self._promoted,
                             "rates": {
                                 name: round(rate, 3)
                                 for name, rate in program.rates.items()
@@ -229,6 +232,25 @@ class Database:
     def record_failure(self, failure: Failure) -> None:
         """Record an attempt that produced no program."""
         self._apply({"event": "failure", "failure": failure.model_dump()})
+
+    def promoted_as(self, program_id: str, name: str) -> None:
+        """Record that `program_id` became the champion the pool knows as `name`.
+
+        The archive is the record of every attempt, and which of them survived
+        a gate is the one fact about an attempt worth more than its score. It
+        was recoverable only by diffing the champion files against every stored
+        source, because `gate.promote` copies a program to `champion_N.py` and
+        keeps no id. An event, like the rest, so a replay knows it too.
+
+        Raises:
+            ValueError: The archive holds no such program.
+        """
+        self._apply({"event": "promotion", "id": program_id, "name": name})
+
+    @property
+    def promoted(self) -> dict[str, str]:
+        """Every program that became a champion, by id, to the name it took."""
+        return dict(self._promoted)
 
     def top(self, k: int) -> list[Program]:
         """Return the `k` best programs, best first: most games won.

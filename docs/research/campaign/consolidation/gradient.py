@@ -30,7 +30,9 @@ def main() -> None:
     LOGGER.info(
         "  fitness at the ceiling (>= 0.999): %d of %d", len(pinned), len(recent)
     )
-    LOGGER.info("  distinct fitness values: %d", len({round(one.fitness, 3) for one in recent}))
+    LOGGER.info(
+        "  distinct fitness values: %d", len({round(one.fitness, 3) for one in recent})
+    )
 
     fields = [one.field for one in recent if one.field is not None]
     if fields:

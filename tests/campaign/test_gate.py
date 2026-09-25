@@ -602,9 +602,6 @@ def _program(
     destination of the suite. They cannot be: a promotion writes into the run
     it is handed, and this hands it one made here.
     """
-    # Not a destination either, and redirected so that a promotion which
-    # wrongly wrote there would write here instead of into the checkout.
-    monkeypatch.setattr(config, "SERVED", tmp_path / "src" / "served" / "main.py")
     source = tmp_path / f"prog-{body}.py"
     source.write_text(
         f"def agent(o, c=None):\n"
@@ -807,7 +804,7 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
 ) -> None:
     """Nothing under `src/` is a promotion's business.
 
-    `served/main.py` is the committed seed a cold start begins from, not the
+    `seed/main.py` is the committed seed a cold start begins from, not the
     floor a campaign produces. A promotion that wrote there would dirty a
     tracked file, and `loop._open_run` refuses to start a run whose `src/`
     has uncommitted changes -- so the first promotion would have been the
@@ -816,6 +813,7 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
     paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
+    seed_before = config.SEED.read_bytes()
 
     gate.enroll(
         gate.record(
@@ -826,9 +824,8 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
         paths,
     )
 
-    assert not config.SERVED.exists()
     assert not (tmp_path / "src").exists()
-    assert "SERVED" not in gate.__dict__
+    assert config.SEED.read_bytes() == seed_before, "the seed is not written to"
 
 
 def test_a_second_promotion_on_the_saved_pool_yields_champion_2(

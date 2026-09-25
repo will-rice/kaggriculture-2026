@@ -10,7 +10,9 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path("/home/will/projects/kaggriculture-2026/.claude/worktrees/campaign/src/kaggriculture")
+ROOT = Path(
+    "/home/will/projects/kaggriculture-2026/.claude/worktrees/campaign/src/kaggriculture"
+)
 # Comments that record a decision reversed or a path retired. Each is a seam
 # where two designs met; the survivor is documented, the loser often is too.
 REVERSALS = re.compile(
@@ -43,24 +45,38 @@ def main() -> None:
         lines = path.read_text(encoding="utf-8").splitlines()
         flips = [i + 1 for i, line in enumerate(lines) if REVERSALS.search(line)]
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module and "kaggriculture" in node.module:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and "kaggriculture" in node.module
+            ):
                 for alias in node.names:
-                    imported_by[f"{node.module.split('kaggriculture.')[-1]}.{alias.name}"].add(name)
+                    imported_by[
+                        f"{node.module.split('kaggriculture.')[-1]}.{alias.name}"
+                    ].add(name)
                     imported_by[node.module.split("kaggriculture.")[-1]].add(name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     if "kaggriculture" in alias.name:
                         imported_by[alias.name.split("kaggriculture.")[-1]].add(name)
-        print(f"### {name}  ({len(lines)} lines, {len(public)} public, {len(flips)} reversal marks)")
+        print(
+            f"### {name}  ({len(lines)} lines, {len(public)} public, {len(flips)} reversal marks)"
+        )
         print(f"    {doc[:230]}")
-        print(f"    exports: {', '.join(public[:14])}{' ...' if len(public) > 14 else ''}")
+        print(
+            f"    exports: {', '.join(public[:14])}{' ...' if len(public) > 14 else ''}"
+        )
         if flips:
-            print(f"    reversals at lines: {flips[:12]}{' ...' if len(flips) > 12 else ''}")
+            print(
+                f"    reversals at lines: {flips[:12]}{' ...' if len(flips) > 12 else ''}"
+            )
 
     print("\n### who imports whom (campaign modules)")
     for name in sorted(exports):
         users = sorted(u for u in imported_by.get(name, ()) if u != name)
-        print(f"  {name:<28} <- {', '.join(users) if users else '(nothing in the package)'}")
+        print(
+            f"  {name:<28} <- {', '.join(users) if users else '(nothing in the package)'}"
+        )
 
     sys.stdout.flush()
 

@@ -42,7 +42,9 @@ def main() -> None:
                 or item.get("text")
                 or str(item.get("command") or "")
             )
-            LOGGER.info("    %-16s %s", item.get("type"), str(text)[:150].replace("\n", " "))
+            LOGGER.info(
+                "    %-16s %s", item.get("type"), str(text)[:150].replace("\n", " ")
+            )
 
 
 if __name__ == "__main__":

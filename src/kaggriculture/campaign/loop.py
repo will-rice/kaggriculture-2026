@@ -40,6 +40,7 @@ import math
 import random
 import shutil
 import signal
+import statistics
 import sys
 import tempfile
 import time
@@ -93,9 +94,8 @@ THREADS = config.SESSIONS + 1
 # The database id of the program a cold start seeds itself from. Until the
 # first promotion there is no champion, so this is the name the first
 # sessions are told they are editing and the bar their verdict quotes. It
-# lives in `config` because `copycheck` needs the file it names -- the stored
-# copy is what the campaign's lineage actually is -- and two modules agreeing
-# on a magic string is how they come to disagree on one.
+# lives in `config` so that the stored copy -- which is what the campaign's
+# lineage actually is -- is named in one place.
 SEED_ID = config.SEED_ID
 
 # What the wandb run records as its configuration: spec section 8's table.
@@ -521,9 +521,16 @@ def run(
                 workers,
                 paths.pool,
             )
+        # On the record like every other evaluation. A session hands its rounds
+        # a game read back from the database, so a champion whose games were
+        # never written would give the first sessions nothing to show -- which
+        # was the case until 2026-09-25, when the seed's games lived only in
+        # memory and were lost with the process.
+        games.record(first.id, games.played(scored, first.id), games.DATABASE)
         champion = gate.promote(first, scored, paths, package=False)
         gate.enroll(champion, pool, paths)
         state.champion = gate.record(champion, paths)
+        database.promoted_as(first.id, champion.name)
         LOGGER.info(
             "champion zero: %s from %s at %.3f", champion.name, first.id, scored.fitness
         )
@@ -869,17 +876,18 @@ class Campaign:
         # Every opponent, `ROUNDS_PER_OPPONENT` consecutive rounds each, so the
         # session's length is the pool's rather than a constant. A promotion ends
         # it long before the pool is exhausted in practice.
-        planned = config.ROUNDS_PER_OPPONENT * max(1, len(games.ordered(result)))
+        # The games this program played, off the record rather than out of the
+        # result: a result carries no games once it has been through the disk,
+        # and every game the campaign scores is written the moment it is
+        # scored, so the database is the one place they always are. Keyed the
+        # way `record` wrote them, name included; `compose` has the name.
+        scored = await asyncio.to_thread(games.recorded, name, games.DATABASE)
+        planned = config.ROUNDS_PER_OPPONENT * max(
+            1, len({matchup for matchup, _, _ in scored})
+        )
         for turn in range(planned):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
-            # One game played by the program this round is editing -- not the
-            # champion's, once they differ. `games.played` keys them the way the
-            # database does, name included; `compose` has the name already.
-            scored = [
-                (matchup, season, game)
-                for matchup, season, _, game in games.played(result, name)
-            ]
             # `config.ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
             # then the next, with the season advancing inside the block. Four
             # attempts against one agent on four maps: enough to learn it,
@@ -896,11 +904,15 @@ class Campaign:
                 name,
                 playing,
                 result.fitness,
+                statistics.fmean(one.mean for one in result.margins.values()),
                 failures,
                 siblings,
                 instruction,
                 source.read_text(encoding="utf-8"),
-                self.paths.champions,
+                [
+                    (champion_name, self.database.get(program_id).changed)
+                    for program_id, champion_name in self.database.promoted.items()
+                ],
             )
             outcome = await self.round(source, name, result, message, siblings, drawn)
             rounds += 1
@@ -1016,6 +1028,10 @@ class Campaign:
                 siblings[: prompt.RECENT_ATTEMPTS], start=1
             ):
                 shutil.copy(program.source_path, box / f"tried_{number}.py")
+            # And the whole campaign, one line per program, for whatever
+            # question the round brings to it. The message names it and reads
+            # none of it out.
+            self.database.attempts(box / "attempts.jsonl")
             # And how to ask it, as a skill rather than as more message, at
             # whichever path the driving program looks for one: codex reads
             # `.codex/skills` under its working directory, agy walks up from
@@ -1186,9 +1202,7 @@ class Campaign:
         if mutation.child is None:
             self.fail(started_from, drawn, f"{mutation.status}: {mutation.reason}")
             return None
-        verdict = await asyncio.to_thread(
-            validate.validate, mutation.child, 720, self.paths.seed_program
-        )
+        verdict = await asyncio.to_thread(validate.validate, mutation.child, 720)
         if verdict.status != "ok":
             self.fail(started_from, drawn, f"{verdict.status}: {verdict.reason}")
             return None
@@ -1377,6 +1391,7 @@ class Campaign:
                 gate.enroll(champion, self.pool, self.paths)
                 LOGGER.info("pool: %d opponents", len(self.pool.names()))
                 self.state.champion = gate.record(champion, self.paths)
+                self.database.promoted_as(program_id, champion.name)
                 self.state.sessions_since_promotion = 0
                 # No field refresh. It played the new champion's pairings so a
                 # Bradley-Terry fit would have edges for it, and nothing reads
@@ -1523,7 +1538,10 @@ class Campaign:
         # competition's remaining weeks, and off the loop thread either way.
         if keep:
             await asyncio.to_thread(
-                games.record, program_id, games.played(result, program_id)
+                games.record,
+                program_id,
+                games.played(result, program_id),
+                games.DATABASE,
             )
         return result
 

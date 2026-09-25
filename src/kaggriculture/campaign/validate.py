@@ -391,14 +391,12 @@ def _kill_the_family(process: "multiprocessing.process.BaseProcess") -> None:
     process.join()
 
 
-def validate(agent: Path, steps: int = 720, seed: Path | None = None) -> Verdict:
+def validate(agent: Path, steps: int = 720) -> Verdict:
     """Run every check, cheapest first, and return the first one that fails.
 
     Args:
         agent: The candidate's `main.py`.
         steps: How many turns `harness.check` plays before stopping.
-        seed: Kept for callers that still name it; nothing reads it since the
-            copy gate was removed on 2026-09-15.
 
     Returns:
         The first failing `Verdict`, or `status="ok"`.
