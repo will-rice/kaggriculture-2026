@@ -18,32 +18,35 @@ for the design and
 [docs/superpowers/plans/2026-09-05-campaign-script.md](docs/superpowers/plans/2026-09-05-campaign-script.md)
 for how it was built.
 
-| path                                                                  | responsibility                                                                                                                                                  |
-| --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/kaggriculture/campaign/__init__.py`                              | package marker                                                                                                                                                  |
-| `src/kaggriculture/campaign/config.py`                                | every path and constant: `EXAM_SEEDS`, `ROOT`, `RUN`, `OPPONENTS`, `EPISODES`, `ENGINE_LIBRARY`, `CORE_BUDGET`, `ITEMS`, `SHOP_NAMES`, `UNIT_OPS`, `MARKET_OPS` |
-| `src/kaggriculture/campaign/arena.py`                                 | reference-engine games between two agent files, both seats, over a process pool (from `search/arena.py`, stripped to file-path opponents)                       |
-| `src/kaggriculture/campaign/engine/sim.hpp`, `pyrandom.hpp`, `NOTICE` | the adopted port, verbatim, with license                                                                                                                        |
-| `src/kaggriculture/campaign/engine/bridge.cpp`                        | `extern "C"` surface: create, step, export packed state, free                                                                                                   |
-| `src/kaggriculture/campaign/engine/build.py`                          | compiles `kaggriculture_engine.so` beside itself                                                                                                                |
-| `src/kaggriculture/campaign/engine/wrapper.py`                        | `Engine` class: `reset`, `step`, `observation(player)`, `bank(player)`; `pack_action`, `render`                                                                 |
-| `src/kaggriculture/campaign/tapes.py`                                 | iterate archived episodes: seed, actions per step, observations per step                                                                                        |
-| `src/kaggriculture/campaign/roster.py`                                | opponent names → paths (never exposed), training pool and held-out set                                                                                          |
-| `src/kaggriculture/campaign/harness.py`                               | `play`, `check`, `package`; the `campaign` CLI                                                                                                                  |
-| `src/kaggriculture/campaign/copycheck.py`                             | token-shingle similarity against opponent sources                                                                                                               |
-| `src/kaggriculture/campaign/validate.py`                              | `validate(agent) -> Verdict`: syntax, contract, imports, copy check, a full game; no latency check                                                              |
-| `src/kaggriculture/campaign/archive.py`                               | the shared database: every program with its scores, its deep result and every failure, as an append-only log                                                    |
-| `src/kaggriculture/campaign/prompt.py`                                | composes the message a call is given: the rules, one game, the edits already tried on this program and what they scored, one instruction                        |
-| `src/kaggriculture/campaign/mutate.py`                                | one `codex exec` call: a directory holding `child.py`, the message on stdin, a fallback model on a provider refusal                                             |
-| `src/kaggriculture/campaign/evaluator.py`                             | `fast` on fresh seeds and `deep` on the sealed block; a program never plays itself                                                                              |
-| `src/kaggriculture/campaign/pool.py`                                  | the opponents, counting equally; champions join, the crushed retire at `POOL_CAP`                                                                               |
-| `src/kaggriculture/campaign/gate.py`                                  | `promotion`: beat every pool opponent. `promote`: the tarball, the champion file, the floor, `champion.json`                                                    |
-| `src/kaggriculture/campaign/loop.py`                                  | the script: wandb, the event loop, `SESSIONS` workers, the gate they fire                                                                                       |
-| `src/kaggriculture/campaign/field_gate.py`, `kernel_watch.py`         | the vendored-field rate, and the ladder scan that finds new held-out opponents                                                                                  |
-| `src/kaggriculture/scripts/package.py`, `submit.py`                   | shipping, without the routes store                                                                                                                              |
-| `src/kaggriculture/served/main.py`                                    | the cold-start seed the loop begins from; not what ships                                                                                                        |
-| `src/kaggriculture/campaign/task_prompt.md`                           | the game as a call is told it: objective, rules, verified economics, the interface, the doctrine                                                                |
-| `tests/campaign/*.py`                                                 | one test module per source module                                                                                                                               |
+| path                                                           | responsibility                                                                                                           |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `src/kaggriculture/campaign/loop.py`                           | the script: the event loop, `SESSIONS` workers, a session's rounds, and the gate they fire                               |
+| `src/kaggriculture/campaign/workspace.py`                      | the directory a round works in: laid out, guarded against edits to the campaign's own source, read back                  |
+| `src/kaggriculture/campaign/mutate.py`                         | one `Driver` under codex, agy and opencode; a rotation that hands a call to the next program when one is out of quota    |
+| `src/kaggriculture/campaign/prompt.py`                         | composes the message a round is given: the rules, its games, the edits already tried on this program, one instruction    |
+| `src/kaggriculture/campaign/plan.py`                           | the plan a program carries, laid out as `plan.json` for a round and packed back afterwards                               |
+| `src/kaggriculture/campaign/measure.py`                        | copied into every round as `measure.py`: plays `child.py` against its parent, one season at a time                       |
+| `src/kaggriculture/campaign/validate.py`                       | `validate(agent) -> Verdict`: syntax, contract, imports, a full game through Kaggle's own loader                         |
+| `src/kaggriculture/campaign/evaluator.py`                      | the one measurement: fresh seeds, both seats, against the whole pool; a program never plays itself                       |
+| `src/kaggriculture/campaign/gate.py`                           | `promotion`: no worse against the field on rate and margin, and a decisive head-to-head. `promote`: tarball, copy, floor |
+| `src/kaggriculture/campaign/pool.py`                           | the opponents, counting equally; harvested agents never leave, champions join                                            |
+| `src/kaggriculture/campaign/roster.py`                         | opponent names → paths (never exposed): the vendored kernels the pool starts from                                        |
+| `src/kaggriculture/campaign/archive.py`                        | the shared database: every program with its rates and margins, every failure, every promotion, as an append-only log     |
+| `src/kaggriculture/campaign/harness.py`                        | `play`, `check`, `package`; the `campaign` CLI                                                                           |
+| `src/kaggriculture/campaign/pools.py`                          | where somebody else's program runs and where it may write                                                                |
+| `src/kaggriculture/campaign/arena.py`                          | reference-engine games between two agent files, both seats, over a process pool                                          |
+| `src/kaggriculture/campaign/engine/`                           | the C++ engine port, its bridge, and the `Engine` wrapper                                                                |
+| `src/kaggriculture/campaign/games.py`                          | the ClickHouse games database: the recorded ladder and every game the campaign plays                                     |
+| `src/kaggriculture/campaign/dataset.py`, `tapes.py`            | archived episodes parsed into that database                                                                              |
+| `src/kaggriculture/campaign/losses.py`                         | the games this lineage lost, kept current for the round prompt's live query                                              |
+| `src/kaggriculture/campaign/harvest.py`, `kernel_watch.py`     | the ladder scan that vendors newly published kernels into the pool                                                       |
+| `src/kaggriculture/campaign/rating.py`                         | a Bradley-Terry fit, used only to rate the public corpus and the champion lineage                                        |
+| `src/kaggriculture/campaign/telemetry.py`                      | the wandb run, named for the git revision                                                                                |
+| `src/kaggriculture/campaign/config.py`                         | the paths, and the constants two modules share                                                                           |
+| `src/kaggriculture/campaign/task_prompt.md`, `round_prompt.md` | the game as a round is told it, and how a round is asked                                                                 |
+| `src/kaggriculture/seed/main.py`                               | the cold-start seed the loop begins from; not what ships                                                                 |
+| `src/kaggriculture/scripts/package.py`, `submit.py`            | shipping the floor                                                                                                       |
+| `tests/campaign/*.py`                                          | one test module per source module                                                                                        |
 
 ### Running the campaign
 
@@ -86,29 +89,21 @@ sessions to run; whatever is in flight when the last one is taken is drained.
 
 The pool is built from published kernels, and the agents at the top of the
 leaderboard publish none — so the strongest play in the competition appears
-nowhere in the pool and only in the public replay archive. Two commands mine
-it, and both write files the round prompt reads:
+nowhere in the pool and only in the public replay archive. Two commands put it
+where a round can query it:
 
 ```bash
-uv run extract-corpus     # /data/.../corpus.sqlite: every game as a table
-uv run strategies         # strategies.jsonl: what separates the strong from the rest
+uv run extract-corpus     # every recorded game into the ClickHouse games database
+uv run losses             # the games this lineage lost, from the ladder's own records
 ```
 
-`extract-corpus` parses every recorded game once into SQLite — one row per
-game, per game-day, per market order and per command — so a question about the
-corpus costs a query rather than a twenty-minute walk of the archives. It also
-fits a Bradley-Terry rating over all of them, and that rating is what the other
-two are grouped by.
-
-The grouping is the whole point. Read by _who won each game_, eleven quantities
-over thirteen thousand games all came back between 45% and 60%: about half of a
-ladder's winners are the weaker agent having a good day, and that noise swamps
-everything. Read by _who is actually strong_, the same games separate at
-90-100% — and reverse the sign of one of them.
-
-`strategies` puts every quantity crossed with every day to the corpus as a
-paired within-game comparison between the stronger and the weaker agent, and
-keeps whatever settles.
+`extract-corpus` parses every recorded game once — one row per game, per
+game-day, per market order and per command — so a question about the corpus
+costs a query rather than a twenty-minute walk of the archives, and fits a
+Bradley-Terry rating over the ladder so a query can ask about the strong
+rather than about the lucky. The loop records every game it scores into the
+same database, and the round prompt carries a live query over the games we
+lost.
 
 Nothing measured off other agents' games reaches a round. A `build-order`
 command used to write a table of what the top-rated agents hold on each day,
@@ -116,20 +111,14 @@ and the round prompt carried it whole; both were removed on 2026-09-10 after
 measurement, because supplying another strategy's schedule took the median
 candidate from 0.275 to 0.026 and stopped promotions for ten hours.
 
-`scripts/daily_corpus.sh` runs both nightly from its own
-worktree. Everything reads every
-game there is rather than a sample: measured over sixty games eight of the
-first eleven claims cleared the bar, over four hundred six did, and over all
-sixteen thousand one did. Selecting a claim for scoring highly on a sample is
-the same winner's curse the promotion gate was rebuilt to avoid, and the log
-keeps every measurement so a claim settled early and undone later keeps both.
+`scripts/daily_corpus.sh` runs the extraction nightly from its own worktree.
 
 `dry-run` swaps the codex call for one that copies the parent with a visible
 edit, so it exercises validation, evaluation, insertion and the promotion gate
 without spending quota. Both commands resume from `run/campaign/state.json`,
 `run/campaign/champion.json` and the archive log, so a killed loop restarts
-where it stopped, and it resumes the same wandb run, named
-`<codex model>-<git revision>`; a dry run logs nothing. Each promotion uploads
+where it stopped, and it resumes the same wandb run, named for
+the git revision; a dry run logs nothing. Each promotion uploads
 the champion's tarball as a wandb artifact named after it. `--workers` is what
 one evaluation may fan over, and every session in flight can be evaluating at
 once, so keep `--workers * SESSIONS` inside `CORE_BUDGET`.

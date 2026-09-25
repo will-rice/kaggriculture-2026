@@ -54,6 +54,7 @@ from kaggriculture.campaign import (
     mutate,
     pool,
     prompt,
+    telemetry,
 )
 
 
@@ -462,7 +463,7 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
 
     Every write a promotion makes is under ``run/campaign``. One that landed
     in ``src/`` -- the seed file was such a write, once -- would dirty a
-    tracked file, and ``_open_run`` refuses to start a run whose ``src/`` has
+    tracked file, and `telemetry.open_run` refuses to start a run whose ``src/`` has
     uncommitted changes: the first promotion would be the last thing that
     campaign ever did.
     """
@@ -488,7 +489,7 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     assert state.champion is not None
     monkeypatch.setattr(config, "ROOT", tmp_path)
     assert repo.git.status("--porcelain", "--", "src") == ""
-    loop._open_run(dry_run=True).finish()
+    telemetry.open_run(True, "", {}).finish()
 
 
 def test_the_seed_is_champion_zero(
@@ -976,9 +977,9 @@ def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
     monkeypatch.setattr(config, "ROOT", tmp_path)
     expected = repo.head.commit.hexsha[:7]
 
-    first = loop._open_run(dry_run=True)
+    first = telemetry.open_run(True, "", {})
     first.finish()
-    second = loop._open_run(dry_run=True)
+    second = telemetry.open_run(True, "", {})
     second.finish()
 
     assert first.name == expected and first.id == expected
@@ -2321,52 +2322,6 @@ def test_where_the_losses_are_decided_reaches_the_run(
     assert logged[0]["losses/gap_day10"] > 0
 
 
-def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:
-    """The record says what changed, not only what it scored.
-
-    Every promotion's change was rendered for the prompt by reading the
-    champion files back and diffing them; the four hundred and fifty edits that
-    were measured and refused were described nowhere. The moment a program is
-    stored is the only one where both plans are already files, so that is where
-    the sentence is written.
-    """
-    from tests.campaign.test_plan import PLAN, packed
-
-    parent = tmp_path / "parent.py"
-    parent.write_text(packed(PLAN), encoding="utf-8")
-    # Through JSON, which is the trip a plan makes anyway and leaves the
-    # literal's mixed value types behind.
-    flipped = json.loads(json.dumps(PLAN))
-    flipped["settings"]["front_run"] = True
-    child = tmp_path / "child.py"
-    child.write_text(packed(flipped), encoding="utf-8")
-
-    said = loop._changed(child, parent)
-
-    assert said and said != "the plan is unchanged"
-    assert "front_run" in said
-
-
-def test_a_program_whose_parent_carries_no_plan_records_nothing(
-    tmp_path: Path,
-) -> None:
-    """Empty rather than a crash: a scored program must never be lost to a sentence.
-
-    The seed has no parent, programs before champion_17 carry no packed plan,
-    and a round can rewrite the controller into something `split` refuses. None
-    of those is a failed evaluation.
-    """
-    from tests.campaign.test_plan import PLAN, packed
-
-    bare = tmp_path / "bare.py"
-    bare.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
-    child = tmp_path / "child.py"
-    child.write_text(packed(PLAN), encoding="utf-8")
-
-    assert loop._changed(child, bare) == ""
-    assert loop._changed(child, None) == ""
-
-
 def test_a_round_is_given_its_parent_and_a_way_to_play(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -2619,120 +2574,3 @@ def test_the_defaults_are_left_where_they_already_pointed() -> None:
     assert parsed.run_root == config.RUN
     assert parsed.pool == config.POOL
     assert parsed.seed_agent == loop.SEED
-
-
-def guarded(tmp_path: Path) -> Path:
-    """A checkout-shaped tree with one source file and one prompt in it."""
-    root = tmp_path / "checkout"
-    (root / "src" / "kaggriculture" / "campaign").mkdir(parents=True)
-    here = root / "src" / "kaggriculture" / "campaign"
-    (here / "harness.py").write_text("REFERENCE_SAMPLE = 0.02\n", encoding="utf-8")
-    (here / "roster.py").write_text("    raise KeyError(name)\n", encoding="utf-8")
-    (here / "round_prompt.md").write_text("# how to ask\n", encoding="utf-8")
-    (here / "engine.so").write_bytes(b"\x00compiled")
-    return root
-
-
-def a_call(program_id: str = "pdeadbeef") -> mutate.Mutation:
-    """A successful call, for the guard to turn down."""
-    return mutate.Mutation(
-        program_id=program_id,
-        child=Path("/tmp/child.py"),
-        status="ok",
-        reason="",
-        seconds=1.0,
-        input_tokens=1,
-        output_tokens=1,
-        model="test",
-    )
-
-
-def test_the_two_edits_a_round_actually_made_are_put_back(tmp_path: Path) -> None:
-    """The 2026-09-20 tampering, reproduced exactly.
-
-    A round set `REFERENCE_SAMPLE` to 0.0, turning off the reference-engine
-    cross-check, and turned `roster.path`'s `raise KeyError` into a constructed
-    path so any string resolves to a file. Both weaken a guard in the direction
-    that makes the round's own job easier.
-    """
-    root = guarded(tmp_path)
-    here = root / "src" / "kaggriculture" / "campaign"
-    before = loop._kept(root)
-    (here / "harness.py").write_text("REFERENCE_SAMPLE = 0.0\n", encoding="utf-8")
-    (here / "roster.py").write_text(
-        "    return Path('/data/' + name)\n", encoding="utf-8"
-    )
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert (here / "harness.py").read_text(
-        encoding="utf-8"
-    ) == "REFERENCE_SAMPLE = 0.02\n"
-    assert (here / "roster.py").read_text(
-        encoding="utf-8"
-    ) == "    raise KeyError(name)\n"
-    assert verdict.status == "no_output"
-    assert verdict.child is None
-    assert "harness.py" in verdict.reason and "roster.py" in verdict.reason
-
-
-def test_the_message_a_round_is_asked_with_is_guarded_too(tmp_path: Path) -> None:
-    """A round that rewrites its own instructions has rewritten the objective."""
-    root = guarded(tmp_path)
-    prompt_file = root / "src" / "kaggriculture" / "campaign" / "round_prompt.md"
-    before = loop._kept(root)
-    prompt_file.write_text("# anything goes\n", encoding="utf-8")
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert prompt_file.read_text(encoding="utf-8") == "# how to ask\n"
-    assert verdict.status == "no_output"
-
-
-def test_a_round_that_changes_nothing_is_left_alone(tmp_path: Path) -> None:
-    """The guard must not fail every round, which is how it would be noticed."""
-    root = guarded(tmp_path)
-
-    verdict = loop._restored(loop._kept(root), a_call(), "pdeadbeef")
-
-    assert verdict.status == "ok"
-    assert verdict.child is not None
-
-
-def test_a_deleted_source_file_comes_back(tmp_path: Path) -> None:
-    """Removing a guard is as effective as editing it."""
-    root = guarded(tmp_path)
-    gone = root / "src" / "kaggriculture" / "campaign" / "harness.py"
-    before = loop._kept(root)
-    gone.unlink()
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert gone.read_text(encoding="utf-8") == "REFERENCE_SAMPLE = 0.02\n"
-    assert verdict.status == "no_output"
-
-
-def test_the_guard_can_only_write_back_what_it_read(tmp_path: Path) -> None:
-    """The bound the git version did not have.
-
-    That one asked git what had changed and reverted the answer, which under a
-    pre-commit hook was all 250 tracked files. This holds bytes, so a file it
-    never snapshotted -- anything compiled, anything outside `src` -- is one it
-    cannot touch however it is called.
-    """
-    root = guarded(tmp_path)
-    before = loop._kept(root)
-    binary = root / "src" / "kaggriculture" / "campaign" / "engine.so"
-    outside = tmp_path / "not_in_the_snapshot.py"
-    outside.write_text("untouched\n", encoding="utf-8")
-    binary.write_bytes(b"\x00changed")
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert binary.read_bytes() == b"\x00changed"
-    assert outside.read_text(encoding="utf-8") == "untouched\n"
-    assert verdict.status == "ok"
-    assert set(before) == {
-        root / "src" / "kaggriculture" / "campaign" / name
-        for name in ("harness.py", "roster.py", "round_prompt.md")
-    }

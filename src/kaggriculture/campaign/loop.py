@@ -37,10 +37,8 @@ import argparse
 import asyncio
 import logging
 import random
-import shutil
 import signal
 import statistics
-import sys
 import tempfile
 import time
 import uuid
@@ -50,7 +48,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import wandb
-from git import Git, Repo
 from pydantic import BaseModel
 
 # `gate` is also the name of a `Campaign` method, so annotations in the class
@@ -63,10 +60,11 @@ from kaggriculture.campaign import (
     gate,
     harvest,
     losses,
-    measure,
     plan,
     prompt,
+    telemetry,
     validate,
+    workspace,
 )
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.gate import Champion
@@ -77,7 +75,6 @@ from kaggriculture.campaign.mutate import (
     Mutator,
     asked_model,
     build,
-    selected,
     validate_models,
 )
 from kaggriculture.campaign.pool import Pool
@@ -278,13 +275,6 @@ SEED_ROTATION = 64
 # drawn from the database's top ten instead of the champion.
 STAGNATION_SESSIONS = 40
 
-# Metrics go to one wandb run per campaign, resumed across restarts by its
-# fixed id. Starting a fresh campaign (a new `run/campaign`) means a new id
-# here, or its curves land on top of the old run's.
-WANDB_ENTITY = "will-rice"
-
-WANDB_PROJECT = "kaggriculture-2026"
-
 # Threads the loop needs at once: one per session for whichever blocking step
 # it is on -- scoring a program, validating one, reading a transcript, and
 # never two at once within a session -- plus the one a promotion packages on.
@@ -300,7 +290,7 @@ SEED_ID = config.SEED_ID
 # What the wandb run records as its configuration: spec section 8's table.
 # The two model slugs are not here: they are chosen in `.env` at the call, so
 # the constant beside them is a default rather than a fact about this run.
-# `_open_run` reads them through the accessors instead.
+# `telemetry.open_run` reads them through the accessors instead.
 
 
 def hyperparameters() -> dict[str, int]:
@@ -353,7 +343,7 @@ def main(argv: list[str] | None = None) -> None:
         # share no vocabulary at all.
         validate_models()
     # 1. wandb, named for the revision of the code that produced the run.
-    log = _open_run(dry_run=args.dry_run, tag=args.tag)
+    log = telemetry.open_run(args.dry_run, args.tag, hyperparameters())
     mutator: Mutator = (
         FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
         if args.dry_run
@@ -417,193 +407,6 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     for flag in ("seed_agent", "run_root", "pool"):
         setattr(parsed, flag, getattr(parsed, flag).resolve())
     return parsed
-
-
-def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
-    """Open the run this campaign logs to, named for the revision that made it.
-
-    Two axes, because a session is many rounds now: everything a round
-    produces is stepped by ``calls`` and everything a session or a gate
-    produces by ``sessions``. One axis for both would file five rounds under
-    one session number and keep the last.
-
-    The revision alone. The model used to be in the name too, from when it
-    was a constant compiled into the run; it is chosen in `.env` at the call
-    now and can change without a restart, so a name carrying it would be
-    wrong from the first round that moved it -- and a wandb id is fixed for
-    the life of the run, so there is no renaming it afterwards. The model
-    this run opened on is recorded in the run config, and `calls/model` is
-    logged per call and is the truth about any one of them.
-
-    Exits on uncommitted changes under ``src/``: a run named by a hash has to
-    be that hash.
-    """
-    # `Git` is bound to the directory and runs there. `Repo.git` is not: in a
-    # linked worktree `Repo` resolves to the shared git directory with no
-    # working tree of its own, and `git status` fails outright there.
-    dirty = Git(config.ROOT).status("--porcelain", "--", "src")
-    if dirty:
-        raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
-    started_on = asked_model()
-    # The revision, and what distinguishes one lineage on it from another.
-    name = Repo(config.ROOT).head.commit.hexsha[:7] + (f"-{tag}" if tag else "")
-    log = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        id=name,
-        name=name,
-        resume="allow",
-        mode="disabled" if dry_run else "online",
-        config={
-            **hyperparameters(),
-            # Not `CODEX_MODEL`: it has held a codex slug and now holds
-            # whatever `MUTATOR` names, and a key that lies about which
-            # program produced a run is how the switch hides.
-            "MUTATOR": selected(),
-            "MUTATOR_MODEL": started_on,
-        },
-    )
-    log.define_metric("sessions")
-    log.define_metric("calls")
-    log.define_metric("sessions/*", step_metric="sessions")
-    log.define_metric("gate/*", step_metric="sessions")
-    log.define_metric("calls/*", step_metric="calls")
-    log.define_metric("database/*", step_metric="calls")
-    return log
-
-
-# What a round is not allowed to change: the campaign's own code, and the
-# messages it is asked with. Not the engine binary or anything compiled, which
-# no round has reason to touch and which would make this expensive.
-GUARDED = ("*.py", "*.md")
-
-
-def _with_skills(box: Path, wanted: tuple[Path, ...]) -> None:
-    """Copy the skills into every place a driver might look for them.
-
-    Which program serves this call is not settled until it is made -- one out
-    of quota hands it to the next -- and the workspace is prepared first. A
-    round that finds no skills still runs; it just never finds the schema or
-    the queries worth running, which is a failure that does not announce
-    itself.
-
-    Args:
-        box: The round's directory.
-        wanted: Where each driver looks, relative to it.
-    """
-    for where in wanted:
-        shutil.copytree(config.SKILLS, box / where)
-
-
-def _kept(root: Path = config.ROOT) -> dict[Path, bytes]:
-    """The campaign's own source, as it stands before a round runs.
-
-    Fifty files and about seven hundred kilobytes, read once against a call that
-    takes minutes.
-
-    Args:
-        root: The checkout to read. A parameter so a test can name its own.
-
-    Returns:
-        The bytes of every guarded file, by path.
-    """
-    return {
-        one: one.read_bytes()
-        for pattern in GUARDED
-        for one in sorted((root / "src").rglob(pattern))
-        if "__pycache__" not in one.parts
-    }
-
-
-def _restored(kept: dict[Path, bytes], mutation: Mutation, program_id: str) -> Mutation:
-    """Put back anything the round changed in the campaign's own source.
-
-    A round gets a throwaway directory holding one agent. On 2026-09-20 one
-    edited the campaign instead -- `REFERENCE_SAMPLE` to 0.0, turning off the
-    reference-engine cross-check, and `roster.path`'s `raise KeyError` into a
-    constructed path, making any string resolve to a file. Neither was random:
-    both weaken a guard in the direction that makes the round's own job easier,
-    and the second was provoked by `measure.py --against` refusing a mistyped
-    name. Given an objective and a writable grader, editing the grader is the
-    cheaper way to satisfy it.
-
-    Prevention is not on offer. agy's `--sandbox` restricts the terminal and a
-    round has to run `measure.py`, and the driver runs with
-    `--dangerously-skip-permissions`, which the comment on that flag wrongly
-    calls the same posture as codex's `-s workspace-write`.
-
-    Restored from bytes rather than from git, because the version that asked git
-    reverted all 250 tracked files when a pre-commit hook's `GIT_DIR` outranked
-    the repository it was handed. This writes back only what it read, so the
-    worst it can do is undo a change to one of the files it named.
-
-    The round is failed rather than scored: a program measured against guards it
-    removed is not measured at all.
-
-    Args:
-        kept: What `_kept` read before the round.
-        mutation: What the call produced.
-        program_id: The child program id, for the log and the reason.
-
-    Returns:
-        The mutation, or a copy recording that the round wrote out of bounds.
-    """
-    moved = sorted(
-        one for one, was in kept.items() if not one.exists() or one.read_bytes() != was
-    )
-    if not moved:
-        return mutation
-    for one in moved:
-        one.write_bytes(kept[one])
-    named = ", ".join(one.name for one in moved)
-    LOGGER.warning("%s changed the campaign and was put back: %s", program_id, named)
-    return mutation.model_copy(
-        update={
-            "child": None,
-            "status": "no_output",
-            "reason": (
-                f"this round changed the campaign's own source -- {named} -- and "
-                "it has been put back. The directory you are given holds the "
-                "program to edit; the campaign that measures it is not yours to "
-                "change, and a program measured against guards it removed is not "
-                "measured at all."
-            ),
-        }
-    )
-
-
-def _packed(mutation: Mutation, box: Path, program_id: str) -> Mutation:
-    """Write the round's program back as one file, or record that it cannot be.
-
-    The gate, the archive, the pool, the validator and the submission all expect
-    one self-contained file, and none of them has to learn otherwise, so the
-    plan is packed back into the program here.
-
-    A round that wrote a `plan.json` the schema refuses produced nothing
-    runnable. That is an ordinary outcome of asking a model to edit a file, and
-    it was a crash until 2026-09-20: `gather` validated, nothing caught what it
-    raised, and the error went up through the worker and the task group and took
-    both lineages down. The reason travels onto the mutation, so the next round
-    on this lineage is told what broke.
-
-    Args:
-        mutation: What the call produced.
-        box: The round's directory.
-        program_id: The child program id, for the log.
-
-    Returns:
-        The mutation, or a copy recording that nothing usable was written.
-    """
-    if mutation.child is None:
-        return mutation
-    try:
-        mutation.child.write_text(plan.gather(box), encoding="utf-8")
-    except plan.BrokenPlanError as broken:
-        LOGGER.warning("%s wrote an unusable plan: %s", program_id, broken)
-        return mutation.model_copy(
-            update={"child": None, "status": "no_output", "reason": str(broken)}
-        )
-    return mutation
 
 
 def state_file(paths: config.Run) -> Path:
@@ -707,7 +510,7 @@ def run(
             paths.pool,
         )
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
-        database.add(_program(SEED_ID, stored, "", "seed", "", scored))
+        database.add(archive.measured(SEED_ID, stored, "", "seed", "", scored))
         LOGGER.info("seeded from %s at %.3f over the pool", seed_agent, scored.fitness)
     # Champion zero, so there is no pre-champion regime: every session starts
     # from a champion and every candidate plays one head-to-head, which makes the
@@ -744,56 +547,6 @@ def run(
     campaign = Campaign(state, database, pool, mutator, workers, rng, log, paths)
     asyncio.run(campaign.drive(sessions))
     return campaign.state
-
-
-def _program(
-    program_id: str,
-    source: Path,
-    started_from: str,
-    instruction: str,
-    model: str,
-    result: Result,
-    parent: Path | None = None,
-) -> archive.Program:
-    """One database entry, stamped now.
-
-    ``parent`` is the source this was edited from, and it is here for one
-    reason: this is the only moment both plans exist as files, so describing
-    the edit costs a read of two programs already on the disk. Asked later it
-    costs the whole archive -- 489 programs at 869KB each.
-    """
-    return archive.Program(
-        changed=_changed(source, parent),
-        id=program_id,
-        source_path=str(source),
-        started_from=started_from,
-        instruction=instruction,
-        model=model,
-        fitness=result.fitness,
-        rates=result.rates,
-        margins=result.margins,
-        created=time.time(),
-    )
-
-
-def _changed(source: Path, parent: Path | None) -> str:
-    """What this program did to its parent's plan, in a round's own terms.
-
-    Empty rather than raising, for every reason a pair of programs might not be
-    comparable: the seed has no parent, a program from before champion_17
-    carries no packed plan, and a round can rewrite the controller into
-    something `split` refuses. None of those is a failed evaluation, and a
-    campaign must not lose a scored program because the sentence describing it
-    could not be written.
-    """
-    if parent is None:
-        return ""
-    try:
-        _, before = plan.split(parent.read_text(encoding="utf-8"))
-        _, after = plan.split(source.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return ""
-    return plan.described(before, after)
 
 
 class Campaign:
@@ -1176,72 +929,13 @@ class Campaign:
             prefix="campaign-round-", ignore_cleanup_errors=True
         ) as scratch:
             box = Path(scratch)
-            child = box / "child.py"
-            # Apart, so the round can read and edit the plan: `child.py` is the
-            # controller with one import where 94,490 characters of base85 used
-            # to be, and `plan.json` is the strategy as readable JSON. No round
-            # had ever changed the plan -- champions 17 to 24 carry a
-            # byte-identical blob -- because as text it is unreadable and
-            # nothing said it was data.
-            plan.lay_out(source.read_text(encoding="utf-8"), box)
-            # The gate writes a champion read-only so nothing can edit the file
-            # the pool plays, and `shutil.copy` carries that mode across. This
-            # copy is the one file the call must be able to write.
-            child.chmod(0o644)
-            # The same program again, and the script that plays one against
-            # the other. The spec had the model run nothing -- "the loop
-            # plays; the model never does" -- which made every round an edit
-            # shipped blind and waited on. A round can now change one thing
-            # and measure it before spending a gate on it, which is what every
-            # improvement found by hand on 2026-09-10 came from. The verdict
-            # is still the loop's: it plays every scored game itself, against
-            # opponents this never sees, and nothing a round reports is read.
-            shutil.copy(source, box / "parent.py")
-            # Copied with a shebang naming the interpreter this loop is
-            # running, and marked executable, because a round's own guess is
-            # wrong and it pays to guess. `python` is not on the PATH a round's
-            # commands see, `python3` is the system 3.10 with no
-            # `kaggriculture` in it, and the package is installed editable into
-            # a virtual environment a round has no reason to know about. Every
-            # round was rediscovering that by trial: one died having spent its
-            # whole call on "I will wait for the search for `kaggriculture` to
-            # complete", and the file's own docstring had told it to run
-            # `python measure.py`, which is the one command that cannot work.
-            runner = box / "measure.py"
-            runner.write_text(
-                f"#!{sys.executable}\n"
-                + Path(measure.__file__).read_text(encoding="utf-8"),
-                encoding="utf-8",
+            workspace.prepare(
+                box, source, siblings, self.database, self.mutator.SKILLS_DIRS
             )
-            runner.chmod(0o755)
-            # And the edits already made to this program, which the message
-            # names and scores. A score says a direction lost ground; the file
-            # is what says which direction it was, and `measure.py` will play
-            # one of them against `child.py` if the round wants that too.
-            for number, program in enumerate(
-                siblings[: prompt.RECENT_ATTEMPTS], start=1
-            ):
-                shutil.copy(program.source_path, box / f"tried_{number}.py")
-            # And the whole campaign, one line per program, for whatever
-            # question the round brings to it. The message names it and reads
-            # none of it out.
-            self.database.attempts(box / "attempts.jsonl")
-            # And how to ask it, as a skill rather than as more message, at
-            # whichever path the driving program looks for one: codex reads
-            # `.codex/skills` under its working directory, agy walks up from
-            # it for `.agents`. So a round that wants the schema and the
-            # queries worth running opens them, and a round with a different
-            # question pays nothing for them -- both programs disclose a skill
-            # by name and description and load it only if asked. The message
-            # is read every round; this is read on demand.
-            # Into every place any driver looks, because which one serves
-            # this call is not settled until it is made: a provider out of
-            # quota hands it to the next.
-            _with_skills(box, self.mutator.SKILLS_DIRS)
-            # What the campaign's own source says before this round runs,
-            # so that what it says afterwards can be put back. `_restored`
+            # What the campaign's own source says before this round runs, so
+            # that what it says afterwards can be put back. `workspace.restored`
             # carries why that is necessary.
-            before = _kept()
+            before = workspace.kept()
             # A round that writes a `plan.json` the schema refuses is a round
             # that produced nothing runnable, which is an ordinary outcome of
             # asking a model to edit a file -- and until 2026-09-20 it was a
@@ -1270,24 +964,11 @@ class Campaign:
                     output_tokens=0,
                     model=asked_model(),
                 )
-            # What the round did, before the workspace takes it. A child whose
-            # plan is unchanged can mean the round never opened `plan.json`, or
-            # that it edited it, measured the edit worse and backed it out --
-            # which is the round doing what it was told. The score cannot tell
-            # those apart and the transcript can.
-            kept_at = self.paths.rounds / program_id
-            written = {
-                one for pattern in self.mutator.TRANSCRIPTS for one in box.glob(pattern)
-            }
-            for transcript in sorted(written):
-                kept_at.mkdir(parents=True, exist_ok=True)
-                shutil.copy(transcript, kept_at / transcript.name)
-            # And back together before anything downstream looks at it. The
-            # gate, the archive, the pool, the validator and the submission all
-            # expect one self-contained file, and none of them has to learn
-            # otherwise.
-            mutation = _restored(before, mutation, program_id)
-            mutation = _packed(mutation, box, program_id)
+            workspace.transcripts(
+                box, self.mutator.TRANSCRIPTS, self.paths.rounds / program_id
+            )
+            mutation = workspace.restored(before, mutation, program_id)
+            mutation = workspace.packed(mutation, box, program_id)
             kept = await self.keep(mutation, name, drawn, program_id, source)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.
@@ -1414,7 +1095,7 @@ class Campaign:
                     # the round ran, produced a program and was judged, and the
                     # next round is shown what it scored.
                     self.database.add(
-                        _program(
+                        archive.measured(
                             program_id,
                             stored,
                             started_from,
@@ -1433,7 +1114,7 @@ class Campaign:
             self.fail(started_from, drawn, f"gate: {error}")
             return None
         self.database.add(
-            _program(
+            archive.measured(
                 program_id,
                 stored,
                 started_from,

@@ -252,3 +252,49 @@ def test_the_margin_never_outranks_the_win_rate(tmp_path: Path) -> None:
     program(db, "narrow", 0.0, margin=-1.0)
     program(db, "winner", 0.5, margin=-800.0)
     assert [p.id for p in db.top(2)] == ["winner", "narrow"]
+
+
+def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:
+    """The record says what changed, not only what it scored.
+
+    Every promotion's change was rendered for the prompt by reading the
+    champion files back and diffing them; the four hundred and fifty edits that
+    were measured and refused were described nowhere. The moment a program is
+    stored is the only one where both plans are already files, so that is where
+    the sentence is written.
+    """
+    from tests.campaign.test_plan import PLAN, packed
+
+    parent = tmp_path / "parent.py"
+    parent.write_text(packed(PLAN), encoding="utf-8")
+    # Through JSON, which is the trip a plan makes anyway and leaves the
+    # literal's mixed value types behind.
+    flipped = json.loads(json.dumps(PLAN))
+    flipped["settings"]["front_run"] = True
+    child = tmp_path / "child.py"
+    child.write_text(packed(flipped), encoding="utf-8")
+
+    said = archive.changed(child, parent)
+
+    assert said and said != "the plan is unchanged"
+    assert "front_run" in said
+
+
+def test_a_program_whose_parent_carries_no_plan_records_nothing(
+    tmp_path: Path,
+) -> None:
+    """Empty rather than a crash: a scored program must never be lost to a sentence.
+
+    The seed has no parent, programs before champion_17 carry no packed plan,
+    and a round can rewrite the controller into something `split` refuses. None
+    of those is a failed evaluation.
+    """
+    from tests.campaign.test_plan import PLAN, packed
+
+    bare = tmp_path / "bare.py"
+    bare.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
+    child = tmp_path / "child.py"
+    child.write_text(packed(PLAN), encoding="utf-8")
+
+    assert archive.changed(child, bare) == ""
+    assert archive.changed(child, None) == ""

@@ -719,7 +719,7 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
 
     `seed/main.py` is the committed seed a cold start begins from, not the
     floor a campaign produces. A promotion that wrote there would dirty a
-    tracked file, and `loop._open_run` refuses to start a run whose `src/`
+    tracked file, and `telemetry.open_run` refuses to start a run whose `src/`
     has uncommitted changes -- so the first promotion would have been the
     last thing that campaign ever did.
     """
