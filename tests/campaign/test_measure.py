@@ -149,6 +149,51 @@ def test_an_episode_not_on_the_record_fails_before_playing_anything(
     assert "The game" in str(refused.value)
 
 
+def test_the_day_table_says_where_the_edit_changed_the_season(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """An edit that gains late reads as gaining late, not as gaining.
+
+    This is the column a round now needs: it is handed the champion's real
+    losses day by day, where the gap turns around day twenty, so being told
+    only the final margin leaves it unable to check its own answer. The child
+    here is level to day fifteen and ahead from twenty, which the last column
+    has to show as zero and then positive.
+    """
+    child = {0: [0.0], 5: [10.0], 10: [20.0], 15: [30.0], 20: [900.0], 29: [2000.0]}
+    parent = {0: [0.0], 5: [10.0], 10: [20.0], 15: [30.0], 20: [400.0], 29: [1000.0]}
+
+    measure._walked(child, parent)
+    table = capsys.readouterr().out
+
+    rows = {
+        int(line.split()[0]): line.split()[-1]
+        for line in table.splitlines()
+        if line.strip() and line.split()[0].isdigit()
+    }
+    # The five-day marks, and the close -- which is 29 and survives despite not
+    # being one of them, because the last day is the one the match is decided
+    # on and dropping it would be the whole point missed.
+    assert sorted(rows) == [0, 5, 10, 15, 20, 29]
+    assert rows[15] == "+0", "level to fifteen"
+    assert rows[20] == "+500", "the child's margin less the parent's, not the reverse"
+    assert rows[29] == "+1,000"
+
+
+def test_a_day_table_with_nothing_shared_prints_nothing(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A game played without day rows leaves the column out, not blank.
+
+    `days=True` is what fills these, and a caller that forgets it should get a
+    measurement with no day table rather than a header over an empty table --
+    which reads as "the edit changed nothing on any day".
+    """
+    measure._walked({}, {})
+
+    assert capsys.readouterr().out == ""
+
+
 def test_the_two_measurements_read_a_difference_the_same_way(
     capsys: pytest.CaptureFixture,
 ) -> None:
