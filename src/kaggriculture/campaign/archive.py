@@ -13,22 +13,45 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from kaggriculture.campaign import plan
+from kaggriculture.campaign import evaluator, plan
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.harness import Margin
 
 
 def mean_margin(program: "Program") -> float:
-    """Mean bank margin across the opponents a program was measured on.
+    """Mean bank margin across every opponent a program was measured on.
 
-    What `Database.top` ranks on. A program with no margins scores zero,
-    which is neither the best nor the worst: a margin is a bank difference
-    and runs either side of zero. Only a record written before margins
-    existed has none, and this campaign started after they did.
+    What the record shows of a program. A program with no margins scores
+    zero, which is neither the best nor the worst: a margin is a bank
+    difference and runs either side of zero. Only a record written before
+    margins existed has none, and this campaign started after they did.
     """
     if not program.margins:
         return 0.0
     return sum(m.mean for m in program.margins.values()) / len(program.margins)
+
+
+def swept_margin(program: "Program") -> float:
+    """Mean bank margin over the opponents this program beats every time.
+
+    The tie-break behind `Database.top`, and the one place a margin is asked
+    to rank anything. Against an opponent already swept the win rate has
+    nothing left to say, so the bank is the only improvement there is to see,
+    and it reads as the program's own economy rather than as a matchup.
+
+    Over every opponent when it sweeps none, because then the pool is all
+    contested and the bank is the whole of the signal -- which is where a
+    young lineage lives, and what the first run's climb from -119,258 to
+    -8,444 was made of while its rate sat at nothing.
+    """
+    swept = {
+        name: margin.mean
+        for name, margin in program.margins.items()
+        if program.rates.get(name, 0.0) >= evaluator.SWEPT
+    } or {name: margin.mean for name, margin in program.margins.items()}
+    if not swept:
+        return 0.0
+    return sum(swept.values()) / len(swept)
 
 
 class Program(BaseModel):
@@ -191,6 +214,7 @@ class Database:
                             "changed": program.changed,
                             "wins": round(program.fitness, 4),
                             "margin": round(mean_margin(program)),
+                            "swept_margin": round(swept_margin(program)),
                             "promoted": program.id in self._promoted,
                             "rates": {
                                 name: round(rate, 3)
@@ -242,27 +266,26 @@ class Database:
         return dict(self._promoted)
 
     def top(self, k: int) -> list[Program]:
-        """Return the `k` best programs, best first: widest bank margin.
+        """Return the `k` best programs, best first: most games won.
 
-        On the mean bank margin across opponents, then on the win rate. Both
-        are comparable directly, because every candidate plays the whole pool
-        on the same seeds in both seats; what separates them is where each
-        still has a gradient. The gate reads a win rate of 0.86 to 0.89 with
-        most of the pool at 1.000, so a program that got better at the
-        economy scores exactly what its parent scored on the rate, and the
-        search cannot see it. The margin still moves there, and against an
-        opponent already beaten it is close to a pure measure of the
-        program's own economy -- the thing that carries to the ladder's
-        opponents nobody in the pool resembles, where half our real losses
-        are within 1,000 coins on banks of 100,000 (`standing`, 2026-09-25).
+        Winning is the objective, so the win rate ranks them, and the bank
+        margin over the opponents a program sweeps breaks the tie -- where
+        the rate has nothing left to say, banking more is the improvement.
 
-        The rate ranked first until 2026-09-25, on the reading that winning
-        is the objective and the margin only a tie-break. Winning is the
-        objective; it is not the signal, once the pool is beaten.
+        The margin led this ranking for a few hours on 2026-09-25 and it was
+        wrong, for a reason that does not apply to `Result.beats`: that
+        compares a child with its parent, measured minutes apart on the same
+        seed block, and this compares hundreds of programs measured across
+        dozens of blocks. Seeds are redrawn every `SEED_ROTATION` candidates
+        and a margin scales with how rich the maps were, so of the spread
+        across 494 recorded programs, 19,240 coins sat between blocks against
+        8,253 within one -- and the gap it was being asked to resolve at the
+        top was 5,621. It was ranking blocks. A rate is bounded and saturating,
+        so it survives the comparison the margin cannot.
         """
         return sorted(
             self._programs.values(),
-            key=lambda p: (mean_margin(p), p.fitness),
+            key=lambda p: (p.fitness, swept_margin(p)),
             reverse=True,
         )[:k]
 

@@ -371,8 +371,8 @@ def test_the_stagnation_note_leads_the_instruction() -> None:
         "This session did not start from the champion.\n\n",
     )
 
-    assert "## Your instruction\n\nWiden" in plain
+    assert "## Your instruction\n\nWin more games" in plain
     assert (
-        "## Your instruction\n\nThis session did not start from the champion.\n\nWiden"
-        in noted
+        "## Your instruction\n\nThis session did not start from the champion."
+        "\n\nWin more games" in noted
     )

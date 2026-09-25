@@ -965,9 +965,10 @@ class Campaign:
             "calls/seconds": mutation.seconds,
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
-            # The number the search climbs. `database/top` is that program's
-            # win rate, which sits near 0.89 whatever happens to the economy.
-            "database/top_margin": archive.mean_margin(self.database.top(1)[0]),
+            # What the best program banks against the opponents it sweeps,
+            # which is the axis `database/top` cannot show: that rate sits
+            # near 0.99 whatever happens to the economy underneath it.
+            "database/top_margin": archive.swept_margin(self.database.top(1)[0]),
         }
         if kept is not None:
             # Named apart from `result`, which is the program this round was
@@ -1446,8 +1447,9 @@ class Campaign:
         `Database.top` ranks on the win rate -- so without this it would be
         scored once, never drawn again, and the lineage would die in a single
         session however promising it was. Parented from itself it gets a
-        ratchet of its own, and joins the global draw when its record earns a
-        place there rather than being asked to earn one immediately.
+        ratchet of its own, ordered the way `top` orders, and joins the global
+        draw when its record earns a place there rather than being asked to
+        earn one immediately.
 
         Returns:
             The program to start from and the name it goes by: the best
@@ -1457,7 +1459,7 @@ class Campaign:
         if grown:
             best = max(
                 grown,
-                key=lambda program: (archive.mean_margin(program), program.fitness),
+                key=lambda program: (program.fitness, archive.swept_margin(program)),
             )
             return Path(best.source_path), best.id
         blank = self.database.store(SCRATCH_AGENT, SCRATCH_ID)

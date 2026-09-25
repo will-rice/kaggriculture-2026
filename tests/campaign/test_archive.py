@@ -80,6 +80,7 @@ def test_attempts_is_the_whole_campaign_one_line_each(tmp_path: Path) -> None:
         "changed": "",
         "wins": 0.4,
         "margin": 120,
+        "swept_margin": 120,
         "promoted": False,
         "rates": {"v54": 0.4},
     }
@@ -150,14 +151,14 @@ def test_a_program_with_no_model_is_a_bug_not_a_legacy_case() -> None:
         )
 
 
-def test_top_ranks_by_the_bank_margin(tmp_path: Path) -> None:
-    """`top` is the programs that banked the most against the pool.
+def test_top_ranks_by_games_won(tmp_path: Path) -> None:
+    """`top` is the programs that won the most, which is the objective.
 
-    It decides what a session starts from. The win rate ranked first until
-    2026-09-25, and by then it had nothing to say: the gate read 0.86 to 0.89
-    with most of the pool at 1.000, so a program that got better at the
-    economy scored what its parent scored. The margin is where the gradient
-    is, and against a beaten opponent it is the program's own economy.
+    It decides what a session starts from. The margin led this ranking for a
+    few hours on 2026-09-25 and it was ranking seed blocks: margins are
+    measured on maps redrawn every `SEED_ROTATION` candidates, and across 494
+    recorded programs 19,240 coins of spread sat between blocks against 8,253
+    within one, while the gap it was resolving at the top was 5,621.
     """
     db = make(tmp_path)
     # Deliberately disagreeing: `b` won the most games, `c` banked the most.
@@ -165,7 +166,7 @@ def test_top_ranks_by_the_bank_margin(tmp_path: Path) -> None:
     program(db, "b", 0.7, margin=800.0)
     program(db, "c", 0.4, margin=2_000.0)
 
-    assert [p.id for p in db.top(2)] == ["c", "b"]
+    assert [p.id for p in db.top(2)] == ["b", "c"]
 
 
 def test_the_log_survives_a_restart(tmp_path: Path) -> None:
@@ -250,12 +251,47 @@ def test_top_breaks_a_tie_on_the_bank_margin(tmp_path: Path) -> None:
     assert [p.id for p in db.top(2)] == ["closest", "middling"]
 
 
-def test_the_win_rate_breaks_a_tie_on_the_margin(tmp_path: Path) -> None:
-    """Two programs banking the same are ordered by how often they won."""
+def test_the_tie_is_broken_on_the_swept_opponents_alone(tmp_path: Path) -> None:
+    """Where the rate is pinned, the bank there ranks -- and only there.
+
+    Both programs win the same share of games. One banks more against the
+    opponent it sweeps, the other against the one it only half beats, and a
+    mean over the pool calls the second the better: that is a margin grown by
+    giving up games, which is what `swept_margin` exists to refuse.
+    """
     db = make(tmp_path)
-    program(db, "drew_more", 0.3, margin=500.0)
-    program(db, "won_more", 0.5, margin=500.0)
-    assert [p.id for p in db.top(2)] == ["won_more", "drew_more"]
+    for name, swept, contested in (
+        ("economy", 4_000.0, 0.0),
+        ("trader", 1_000.0, 9_000.0),
+    ):
+        db.add(
+            archive.Program(
+                id=name,
+                source_path=str(db.store(AGENT, name)),
+                started_from="",
+                instruction="improve",
+                model="m",
+                fitness=0.75,
+                rates={"swept": 1.0, "contested": 0.5},
+                margins={
+                    "swept": Margin(mean=swept, worst=swept, best=swept),
+                    "contested": Margin(
+                        mean=contested, worst=contested, best=contested
+                    ),
+                },
+                created=time.time(),
+            )
+        )
+
+    assert [p.id for p in db.top(2)] == ["economy", "trader"]
+    # The whole-pool mean is what the record shows and it disagrees, which is
+    # the disagreement this ranking exists to have.
+    assert archive.mean_margin(db.get("trader")) > archive.mean_margin(
+        db.get("economy")
+    )
+    assert archive.swept_margin(db.get("economy")) > archive.swept_margin(
+        db.get("trader")
+    )
 
 
 def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:

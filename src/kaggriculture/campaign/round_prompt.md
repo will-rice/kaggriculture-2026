@@ -247,8 +247,9 @@ season's indices changes the order without touching a step.
 `parent.py` is the program you started from, unchanged. `attempts.jsonl` is
 every program this campaign has written, one JSON object per line: `id`, the
 `from` it was edited from, what it `changed` in the plan, its `wins` and
-`margin` against the pool, whether it was `promoted`, and its `rates` against
-each opponent by name.
+`margin` against the whole pool, its `swept_margin` against the opponents it
+beat every time, whether it was `promoted`, and its `rates` against each
+opponent by name.
 
 `./measure.py` plays `child.py` against `parent.py` on the same seasons in both
 seats and reports the difference in coins with its noise. `--against <episode>`
@@ -271,11 +272,14 @@ and every game the competition has recorded between other teams under
 
 ## Your instruction
 
-{note}Widen this program's bank margin. The campaign keeps the program that banks
-the most against the whole pool, and a session continues from the round that
-banked the most; it does not select on the win rate. So a game this program
-already wins is worth as much as one it loses, and banking more in it is the
-job.
+{note}Win more games than this program does, and where it already wins every
+game, win them by more. Those are the same job on two different parts of the
+pool. Against an opponent it sometimes loses to, take the games: the campaign
+keeps the program that wins most, and never one that gave up games to bank
+more. Against an opponent it already beats every time there are no games left
+to take, so the only improvement is the bank -- and that is where this
+program's own economy shows, because what it earns against an agent it always
+beats is what it will earn against one it has never met.
 
 The plan is what the farm does and the controller only steers it, so start
 with `plan.json`. Measure every change before you keep it:

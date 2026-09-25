@@ -406,7 +406,7 @@ def rated(
             )
             for name in rates
         },
-        games=2,
+        games=32,
         seeds=[1],
         hardest=next(iter(rates)),
         states={},
@@ -432,11 +432,10 @@ def test_a_result_is_compared_over_the_opponents_both_programs_played() -> None:
 def test_winning_the_same_games_by_more_is_an_improvement() -> None:
     """The gradient on the opponents a program already beats.
 
-    Both sides win every game, so the rate has nothing to say; the child
+    Both sides sweep every pairing, so the rate has nothing to say; the child
     banked 900 more a game against each, and that is what a session should
     continue from. Measured on the ladder 2026-09-25, half our real losses
-    are within 1,000 coins, which is the size of edge this comparison exists
-    to keep.
+    are within 1,000 coins, which is the size of edge this exists to keep.
     """
     parent = rated("parent", {"a": 1.0, "b": 1.0}, {"a": 2_000.0, "b": 3_000.0})
     child = rated("child", {"a": 1.0, "b": 1.0}, {"a": 2_900.0, "b": 3_900.0})
@@ -445,13 +444,51 @@ def test_winning_the_same_games_by_more_is_an_improvement() -> None:
     assert not parent.beats(child)
 
 
-def test_the_margin_outranks_the_rate() -> None:
-    """A program that banks more is ahead of one that merely wins more often."""
-    often = rated("often", {"a": 0.6, "b": 0.6}, {"a": 100.0, "b": 100.0})
-    much = rated("much", {"a": 0.5, "b": 0.5}, {"a": 1_500.0, "b": 1_500.0})
+def test_a_rate_loss_is_never_bought_with_bank() -> None:
+    """Winning is the objective, so no amount of bank pays for a lost game.
 
-    assert much.beats(often)
-    assert not often.beats(much)
+    Measured over the 277 parent/child pairs on record 2026-09-25: 25
+    children won fewer games than their parent while banking more, one of
+    them giving up 0.130 of rate for 5,246 coins. A margin-led comparison
+    continued from every one of them.
+    """
+    names = list("abcdefghij")
+    parent = rated("parent", dict.fromkeys(names, 1.0), dict.fromkeys(names, 1_000.0))
+    spendthrift = rated(
+        "spendthrift", dict.fromkeys(names, 0.5), dict.fromkeys(names, 50_000.0)
+    )
+
+    assert not spendthrift.beats(parent)
+    assert parent.beats(spendthrift)
+
+
+def test_the_bank_decides_when_the_same_games_were_won() -> None:
+    """The case the margin is here for, and the only one it rules on.
+
+    An edit that banks more against an opponent this program already sweeps
+    changes no rate at all -- every pairing it swept it still sweeps -- so the
+    two tie on games won and the bank decides. It is read over the opponents
+    both sweep and never the contested one, where a margin can be grown by
+    giving up games.
+    """
+    swept = list("abcdefghij")
+    rates = dict.fromkeys(swept, 1.0) | {"contested": 0.50}
+    banked = dict.fromkeys(swept, 1_000.0) | {"contested": 0.0}
+    parent = rated("parent", rates, banked)
+    # The same games won, 400 better on one it sweeps, 5,000 worse on the one
+    # it does not -- so a mean over the whole pool calls it the worse program
+    # and the swept set calls it the better. The swept set is the one that
+    # counts: against a contested opponent what matters is the games, and the
+    # games held.
+    child = rated("child", rates, banked | {"a": 1_400.0, "contested": -5_000.0})
+
+    assert child.beats(parent)
+    assert not parent.beats(child)
+    # And the reading the restriction exists to overrule, or this proves nothing.
+    common = sorted(set(parent.rates) & set(child.rates))
+    pooled = sum(child.margins[one].mean for one in common) / len(common)
+    theirs = sum(parent.margins[one].mean for one in common) / len(common)
+    assert pooled < theirs, "the whole-pool mean has to disagree here"
 
 
 def test_a_tie_is_not_an_improvement() -> None:
