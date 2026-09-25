@@ -18,35 +18,35 @@ for the design and
 [docs/superpowers/plans/2026-09-05-campaign-script.md](docs/superpowers/plans/2026-09-05-campaign-script.md)
 for how it was built.
 
-| path                                                           | responsibility                                                                                                           |
-| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `src/kaggriculture/campaign/loop.py`                           | the script: the event loop, `SESSIONS` workers, a session's rounds, and the gate they fire                               |
-| `src/kaggriculture/campaign/workspace.py`                      | the directory a round works in: laid out, guarded against edits to the campaign's own source, read back                  |
-| `src/kaggriculture/campaign/mutate.py`                         | one `Driver` under codex, agy and opencode; a rotation that hands a call to the next program when one is out of quota    |
-| `src/kaggriculture/campaign/prompt.py`                         | composes the message a round is given: the rules, its games, the edits already tried on this program, one instruction    |
-| `src/kaggriculture/campaign/plan.py`                           | the plan a program carries, laid out as `plan.json` for a round and packed back afterwards                               |
-| `src/kaggriculture/campaign/measure.py`                        | copied into every round as `measure.py`: plays `child.py` against its parent, one season at a time                       |
-| `src/kaggriculture/campaign/validate.py`                       | `validate(agent) -> Verdict`: syntax, contract, imports, a full game through Kaggle's own loader                         |
-| `src/kaggriculture/campaign/evaluator.py`                      | the one measurement: fresh seeds, both seats, against the whole pool; a program never plays itself                       |
-| `src/kaggriculture/campaign/gate.py`                           | `promotion`: no worse against the field on rate and margin, and a decisive head-to-head. `promote`: tarball, copy, floor |
-| `src/kaggriculture/campaign/pool.py`                           | the opponents, counting equally; harvested agents never leave, champions join                                            |
-| `src/kaggriculture/campaign/roster.py`                         | opponent names → paths (never exposed): the vendored kernels the pool starts from                                        |
-| `src/kaggriculture/campaign/archive.py`                        | the shared database: every program with its rates and margins, every failure, every promotion, as an append-only log     |
-| `src/kaggriculture/campaign/harness.py`                        | `play`, `check`, `package`; the `campaign` CLI                                                                           |
-| `src/kaggriculture/campaign/pools.py`                          | where somebody else's program runs and where it may write                                                                |
-| `src/kaggriculture/campaign/arena.py`                          | reference-engine games between two agent files, both seats, over a process pool                                          |
-| `src/kaggriculture/campaign/engine/`                           | the C++ engine port, its bridge, and the `Engine` wrapper                                                                |
-| `src/kaggriculture/campaign/games.py`                          | the ClickHouse games database: the recorded ladder and every game the campaign plays                                     |
-| `src/kaggriculture/campaign/dataset.py`, `tapes.py`            | archived episodes parsed into that database                                                                              |
-| `src/kaggriculture/campaign/losses.py`                         | the games this lineage lost, kept current for the round prompt's live query                                              |
-| `src/kaggriculture/campaign/harvest.py`, `kernel_watch.py`     | the ladder scan that vendors newly published kernels into the pool                                                       |
-| `src/kaggriculture/campaign/rating.py`                         | a Bradley-Terry fit, used only to rate the public corpus and the champion lineage                                        |
-| `src/kaggriculture/campaign/telemetry.py`                      | the wandb run, named for the git revision                                                                                |
-| `src/kaggriculture/campaign/config.py`                         | the paths, and the constants two modules share                                                                           |
-| `src/kaggriculture/campaign/task_prompt.md`, `round_prompt.md` | the game as a round is told it, and how a round is asked                                                                 |
-| `src/kaggriculture/seed/main.py`                               | the cold-start seed the loop begins from; not what ships                                                                 |
-| `src/kaggriculture/scripts/package.py`, `submit.py`            | shipping the floor                                                                                                       |
-| `tests/campaign/*.py`                                          | one test module per source module                                                                                        |
+| path                                                       | responsibility                                                                                                                        |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/kaggriculture/campaign/loop.py`                       | the script: the event loop, `SESSIONS` workers, a session's rounds, and the gate they fire                                            |
+| `src/kaggriculture/campaign/workspace.py`                  | the directory a round works in: laid out, guarded against edits to the campaign's own source, read back                               |
+| `src/kaggriculture/campaign/mutate.py`                     | one `Driver` under codex, agy and opencode; a rotation that hands a call to the next program when one is out of quota                 |
+| `src/kaggriculture/campaign/prompt.py`                     | composes the message a round is given: the rules, its files, this round's opponent and game, what promotions changed, one instruction |
+| `src/kaggriculture/campaign/plan.py`                       | the plan a program carries, laid out as `plan.json` for a round and packed back afterwards                                            |
+| `src/kaggriculture/campaign/measure.py`                    | copied into every round as `measure.py`: plays `child.py` against its parent, one season at a time                                    |
+| `src/kaggriculture/campaign/validate.py`                   | `validate(agent) -> Verdict`: syntax, contract, imports, a full game through Kaggle's own loader                                      |
+| `src/kaggriculture/campaign/evaluator.py`                  | the one measurement: fresh seeds, both seats, against the whole pool; a program never plays itself                                    |
+| `src/kaggriculture/campaign/gate.py`                       | `promotion`: no worse against the field on rate and margin, and a decisive head-to-head. `promote`: tarball, copy, floor              |
+| `src/kaggriculture/campaign/pool.py`                       | the opponents, counting equally; harvested agents never leave, champions join                                                         |
+| `src/kaggriculture/campaign/roster.py`                     | opponent names → paths (never exposed): the vendored kernels the pool starts from                                                     |
+| `src/kaggriculture/campaign/archive.py`                    | the shared database: every program with its rates and margins, every failure, every promotion, as an append-only log                  |
+| `src/kaggriculture/campaign/harness.py`                    | `play`, `check`, `package`; the `campaign` CLI                                                                                        |
+| `src/kaggriculture/campaign/pools.py`                      | where somebody else's program runs and where it may write                                                                             |
+| `src/kaggriculture/campaign/arena.py`                      | reference-engine games between two agent files, both seats, over a process pool                                                       |
+| `src/kaggriculture/campaign/engine/`                       | the C++ engine port, its bridge, and the `Engine` wrapper                                                                             |
+| `src/kaggriculture/campaign/games.py`                      | the ClickHouse games database: the recorded ladder and every game the campaign plays                                                  |
+| `src/kaggriculture/campaign/dataset.py`, `tapes.py`        | archived episodes parsed into that database                                                                                           |
+| `src/kaggriculture/campaign/losses.py`                     | the games this lineage lost, kept current for the round prompt's live query                                                           |
+| `src/kaggriculture/campaign/harvest.py`, `kernel_watch.py` | the ladder scan that vendors newly published kernels into the pool                                                                    |
+| `src/kaggriculture/campaign/rating.py`                     | a Bradley-Terry fit, used only to rate the public corpus and the champion lineage                                                     |
+| `src/kaggriculture/campaign/telemetry.py`                  | the wandb run, named for the git revision                                                                                             |
+| `src/kaggriculture/campaign/config.py`                     | the paths, and the constants two modules share                                                                                        |
+| `src/kaggriculture/campaign/round_prompt.md`               | the whole message a round is given, rules included                                                                                    |
+| `src/kaggriculture/seed/main.py`                           | the cold-start seed the loop begins from; not what ships                                                                              |
+| `src/kaggriculture/scripts/package.py`, `submit.py`        | shipping the floor                                                                                                                    |
+| `tests/campaign/*.py`                                      | one test module per source module                                                                                                     |
 
 ### Running the campaign
 

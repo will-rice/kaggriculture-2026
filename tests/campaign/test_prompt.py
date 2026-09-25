@@ -6,17 +6,13 @@ from pathlib import Path
 import pytest
 
 from kaggriculture.campaign import (
-    archive,
     config,
     dataset,
     evaluator,
     harness,
     plan,
     prompt,
-    validate,
 )
-
-IMPROVE = prompt.INSTRUCTION
 
 
 def measured(**held: float) -> dict[str, float]:
@@ -144,11 +140,6 @@ def test_the_round_template_is_loaded_and_checked_at_import() -> None:
     prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.0})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
     )
 
 
@@ -172,14 +163,9 @@ def test_the_message_carries_the_rules_and_its_own_play() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.0}, days=30)),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
     )
 
-    assert prompt.TASK_PROMPT.read_text(encoding="utf-8").strip()[:80] in text
+    assert "## Rules" in text and "### Market" in text
     assert prompt.GAMES in text
     assert "Episode `champion_1m1s1`" in text
     # Aggregate only, still: no opponent is named and no path of theirs appears.
@@ -190,51 +176,24 @@ def test_the_message_carries_no_path_into_the_campaign_itself() -> None:
     """The half of the doctrine that survived 2026-09-15.
 
     Opponents opened that day: they are published kernels under Apache-2.0,
-    the field derives from them in the open, and the message now says where
-    they are. What stays shut is this campaign's own tree -- the archive, the
-    champions, the pool file, the run. A round edits a copy in a directory of
+    the field derives from them in the open, and this round's opponent is
+    copied into the box as `opponent.py`. What stays shut is this campaign's
+    own tree -- the archive, the champions, the pool file, the run. A round
+    edits a copy in a directory of
     its own on purpose, and a path into `config.ROOT` is a round that can edit
     the record of what every other round did.
     """
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.1, "router_v1": 0.0})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
     )
 
     assert str(config.ROOT) not in text
     assert "/data/kaggriculture/campaign" not in text, "the pool and run are ours"
     assert not re.search(r"/(?:home|Users|tmp)/\S*", text)
     # And the one path it is now meant to carry.
-    assert "/data/kaggriculture/opponents" in text
-
-
-def test_the_message_states_the_imports_the_gate_actually_allows() -> None:
-    """A model told it may import our package would write a program that dies.
-
-    One file ships, so the whitelist is the program's whole dependency
-    surface. The section is rendered from `validate.ALLOWED_IMPORTS` rather
-    than restated, because a model told a different set from the one that
-    rejects it is worse than one told nothing.
-    """
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
-    )
-
-    for name in validate.ALLOWED_IMPORTS:
-        assert f"`{name}`" in text, name
-    assert "`ctypes`" not in text
-    assert "`kaggriculture`" not in text
+    # The opponent travels as a file in the box, so no path of its own either.
+    assert "/data/kaggriculture/opponents" not in text
 
 
 def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
@@ -242,243 +201,13 @@ def test_the_message_carries_the_rules_and_nothing_to_run() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
     )
 
     assert "Kaggriculture policy task" in text
-    assert "never read opponent source" in text
     assert "campaign play AGENT" not in text and "campaign check" not in text
     assert "uv run" not in text and "--vs" not in text
     assert "engine/kaggriculture.py" not in text
     assert "700000" not in text
-
-
-def test_the_instruction_states_the_bar_and_not_a_method() -> None:
-    """One instruction, and it says what the gate asks rather than how.
-
-    There were five drawn per session. Two of them told a round to
-    replace the program with something else, which cost 54% of every
-    call the campaign made and returned 259 programs of which one
-    scored above nought -- because the program is a rated agent now,
-    and a farm bot written from scratch loses every game to this pool.
-    The three that survived were within 0.06 of each other.
-    """
-    # One instruction, not a set to draw from. That is the whole invariant,
-    # and it is structural: wording is an editorial choice and a test that
-    # pins it breaks on every rewrite while catching nothing.
-    assert isinstance(prompt.INSTRUCTION, str)
-    assert prompt.INSTRUCTION.strip()
-    assert not isinstance(prompt.INSTRUCTION_NAME, (list, tuple, set, dict))
-    # It has to name the file the round is being asked to change, and that is
-    # not an editorial choice. 215 rounds were filed under the instruction name
-    # "plan" while the instruction itself said only to fix "this program", and
-    # every one of them read that as the controller: the plan came out of all
-    # 142 programs that carry one byte-identical. Named by the constant, so this
-    # tracks the file rather than the phrasing around it.
-    assert plan.PLAN_FILE in prompt.INSTRUCTION
-    # And it reaches the round whole, since a truncated instruction is an
-    # instruction to do something else.
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.0}, days=30)),
-        0.316,
-        -100.0,
-        [],
-        [],
-        prompt.INSTRUCTION,
-    )
-    assert prompt.INSTRUCTION in text
-
-
-def failure(reason: str) -> archive.Failure:
-    """One rejected round, as the ledger holds it."""
-    return archive.Failure(
-        started_from="champion_1",
-        instruction="improve",
-        reason=reason,
-        created=0.0,
-    )
-
-
-def test_the_message_carries_the_lineages_recent_failures() -> None:
-    """A rejected round's reason is what the next round can act on.
-
-    "Your program did not parse" is feedback a model can use, so the last few
-    failures on the lineage travel with the verdict. Only the last few: an
-    older one is about a program this lineage has already moved past. Each
-    arrives on one line, because a reason is free-form -- a codex call's own
-    last message is one -- and a bullet list is no place for a traceback.
-    """
-    failures = [
-        failure("syntax: invalid syntax (<unknown>, line 12)"),
-        failure("contract: agent is shadowed by 'policy', the last callable"),
-        failure("crashed: KeyError: 'EGG'"),
-        failure("no_output: I rewrote the planner\nand left it in child.py"),
-    ]
-
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        failures,
-        [],
-        IMPROVE,
-    )
-
-    assert "## Recent attempts on `champion_1` that produced nothing" in text
-    assert "- contract: agent is shadowed by 'policy', the last callable" in text
-    assert "- crashed: KeyError: 'EGG'" in text
-    assert "- no_output: I rewrote the planner and left it in child.py" in text
-    assert "invalid syntax" not in text
-    # The instruction stays the last thing said, failures or not.
-    assert text.rstrip().endswith(IMPROVE)
-
-
-def test_a_lineage_with_nothing_against_it_gets_no_failure_section() -> None:
-    """A heading over an empty list is noise in a message read every round."""
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
-    )
-
-    assert "produced nothing" not in text
-
-
-def test_the_instruction_reaches_the_message_whole() -> None:
-    """It is the last thing said, and it arrives uncut."""
-    message = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        prompt.INSTRUCTION,
-    )
-
-    assert message.rstrip().endswith(prompt.INSTRUCTION)
-
-
-def stored(
-    db: archive.Database, name: str, parent: str, fitness: float, docstring: str
-) -> archive.Program:
-    """Store a program whose source opens with ``docstring``, and add it."""
-    source = f'"""{docstring}"""\n\n\ndef agent(o, c=None):\n    return {{}}\n'
-    program = archive.Program(
-        id=name,
-        source_path=str(db.store(source, name)),
-        started_from=parent,
-        instruction="tune",
-        model="gpt-5.6-luna",
-        fitness=fitness,
-        rates={"v54": fitness},
-        margins={"v54": harness.Margin(mean=-100.0, worst=-300.0, best=50.0)},
-        created=0.0,
-    )
-    db.add(program)
-    return program
-
-
-def test_a_program_nothing_has_been_made_of_gets_no_section(tmp_path: Path) -> None:
-    """A heading over an empty table is noise in a message read every round.
-
-    The string this asserted on until 2026-09-13 was "already been made",
-    which no version of the section has ever rendered, so it held whatever the
-    code did. It asserts on the heading `_tried_lines` actually writes now.
-    """
-    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
-
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        db.children("champion_1"),
-        IMPROVE,
-    )
-
-    assert "Edits already tried" not in text
-    assert "tried_1.py" not in text
-
-
-def test_the_edits_already_tried_are_named_and_scored(tmp_path: Path) -> None:
-    """A round is told which way its predecessors moved, and by how much.
-
-    A codex call remembers nothing of the ones before it, so a session's twelve
-    consecutive attempts on one opponent were twelve independent guesses. On
-    2026-09-13 that cost four of a run's thirteen rounds: one session wrote a
-    program scoring 0.000 and spent three more rounds editing that, because
-    nothing ever told a round what its last change did.
-
-    The score is in the message and the program itself is a file, so the round
-    can diff whichever one its own question is about.
-    """
-    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
-    stored(db, "p_better", "champion_1", 0.340, "nudged the opening")
-    stored(db, "p_worse", "champion_1", 0.130, "rewrote the planner")
-
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        db.children("champion_1"),
-        IMPROVE,
-    )
-
-    assert "## Edits already tried on `champion_1`" in text
-    assert "`child.py` wins 0.316 of its games against the pool, by -100 coins" in text
-    # Best first, which is `children`'s own order, and each delta is against
-    # the program in `child.py` rather than against the one above it. The
-    # margin beside the rate, because it is the number with resolution and the
-    # one the gate promotes on; here every sibling banked the same, so +0.
-    assert "- `tried_1.py` scored 0.340 (+0.024), margin -100 (+0)" in text
-    assert "- `tried_2.py` scored 0.130 (-0.186), margin -100 (+0)" in text
-    assert "The gate promotes on the margin and the head-to-head" in text
-
-
-def test_what_has_worked_comes_from_the_record_not_from_the_files() -> None:
-    """The promotions' changes are sentences the archive carries, not diffs to redo.
-
-    This used to read every champion file back, split each and diff it against
-    the one before -- 39 programs of 869 KB, on every round -- to recompute what
-    `Program.changed` now records the moment a program is stored. So the section
-    is rendered from ``(name, changed)`` pairs, and a promotion whose plan did
-    not move is left out rather than rendered as a change.
-    """
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
-        kept=[
-            ("champion_1", "every SELL WHEAT tripled"),
-            ("champion_2", ""),
-            ("champion_3", "two orders added to step 40"),
-        ],
-    )
-
-    assert "## What has worked" in text
-    assert "- champion_1: every SELL WHEAT tripled" in text
-    assert "- champion_3: two orders added to step 40" in text
-    assert "champion_2" not in text, (
-        "a promotion that did not move the plan is not a change"
-    )
 
 
 def test_the_round_is_told_the_whole_campaign_is_a_file_beside_it() -> None:
@@ -492,40 +221,15 @@ def test_the_round_is_told_the_whole_campaign_is_a_file_beside_it() -> None:
     a file answers the question the round brought to it.
     """
     text = prompt.compose(
-        "champion_1", first_game(result({"v54": 0.5})), 0.316, -100.0, [], [], IMPROVE
+        "champion_1",
+        first_game(result({"v54": 0.5})),
     )
 
     assert "attempts.jsonl" in text
     assert "one JSON object per line" in text
 
 
-def test_only_the_first_few_edits_are_sent(tmp_path: Path) -> None:
-    """Eight sessions edit one champion, so the list needs a cut.
-
-    Every program written from the champion by any session is a sibling, and
-    `RECENT_ATTEMPTS` of them reach the message -- the best, since that is the
-    order `children` returns and the direction that came closest is what a
-    round can act on.
-    """
-    db = archive.Database(tmp_path / "db.jsonl", tmp_path / "programs")
-    for number in range(prompt.RECENT_ATTEMPTS + 2):
-        stored(db, f"p{number}", "champion_1", 0.30 - number / 100, f"try {number}")
-
-    text = prompt.compose(
-        "champion_1",
-        first_game(result({"v54": 0.5})),
-        0.316,
-        -100.0,
-        [],
-        db.children("champion_1"),
-        IMPROVE,
-    )
-
-    assert f"`tried_{prompt.RECENT_ATTEMPTS}.py`" in text
-    assert f"`tried_{prompt.RECENT_ATTEMPTS + 1}.py`" not in text
-
-
-def test_no_opponent_is_named_anywhere_in_the_message() -> None:
+def test_only_this_rounds_opponent_is_named() -> None:
     """The round is writing a program to beat any opponent, not these ones.
 
     "Beat this pool" is a fitting objective and "beat any opponent" is a
@@ -536,10 +240,11 @@ def test_no_opponent_is_named_anywhere_in_the_message() -> None:
     and worth nothing on a ladder where the agent across the table is one it
     has never seen.
 
-    A name is all it takes to start fitting, so no opponent's travels. The pool
-    is a sample of the field, and the sections that used to rank it, place this
-    program in it, and label each day table with who was across the table are
-    gone.
+    A name is all it takes to start fitting, so the pool does not travel: the
+    sections that used to rank it, place this program in it, and label each
+    day table with who was across the table are gone. What does travel is the
+    one opponent this round is on, because its program is in the directory and
+    the round has to be able to ask the record about it.
 
     The program's own id does travel now, inside the episode key of the game
     the round is working on -- `<id>m<matchup>s<season>` is how the games
@@ -553,14 +258,11 @@ def test_no_opponent_is_named_anywhere_in_the_message() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result(rates, days=30)),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
     )
 
-    for opponent in rates:
+    # The game's own opponent, and only that one.
+    assert "The opponent is `v54`" in text
+    for opponent in ("shopforge", "router_v1"):
         assert opponent not in text, f"{opponent} reached the round by name"
     # Its own id appears only inside the episode key, and nowhere else.
     assert "champion_1m1s1" in text
@@ -572,11 +274,6 @@ def test_the_templates_own_note_never_reaches_the_model() -> None:
     text = prompt.compose(
         "champion_1",
         first_game(result({"v54": 0.5}, days=30)),
-        0.316,
-        -100.0,
-        [],
-        [],
-        IMPROVE,
     )
 
     assert prompt.ROUND_PROMPT.read_text(encoding="utf-8").startswith("<!--")
@@ -593,7 +290,8 @@ def test_the_message_points_at_the_database_rather_than_carrying_it() -> None:
     """
     rates = {"close": 0.5, "beaten": 0.1}
     text = prompt.compose(
-        "champion_1", first_game(result(rates, days=4)), 0.316, -100.0, [], [], IMPROVE
+        "champion_1",
+        first_game(result(rates, days=4)),
     )
 
     assert prompt.GAMES in text, "the round is not told where to ask"
@@ -614,7 +312,8 @@ def test_the_round_is_told_the_rest_of_the_database_is_there() -> None:
     """
     rates = {"close": 0.5}
     text = prompt.compose(
-        "champion_1", first_game(result(rates, days=4)), 0.316, -100.0, [], [], IMPROVE
+        "champion_1",
+        first_game(result(rates, days=4)),
     )
 
     assert "the competition has recorded" in text
@@ -636,35 +335,44 @@ def agent(observation, configuration=None):
 """
 
 
-def test_the_days_a_program_has_decided_are_counted_and_the_rest_named() -> None:
-    """What a round is shown about its own commitment.
+def test_there_is_one_instruction_and_it_names_the_plan() -> None:
+    """One instruction, in the template, and it names the file to change.
 
-    A decision taken at a fixed day is a plan whether it is written as a table
-    or as `if day == 3`, and champion_15 put 32 of its 57 such conditions on
-    day 29 -- an endgame, not a season. The count is what lets a round see that
-    about itself; the days it names none of are the same fact from the other
-    side, and they are what the message actually says out loud.
-
-    The cash condition is here to be ignored: a comparison that names no day
-    is not a commitment to one, however many numbers it holds.
+    There were five drawn per session. Two of them told a round to replace
+    the program with something else, which cost 54% of every call the
+    campaign made and returned 476 programs of which one scored above nought.
+    And it has to name the file: 215 rounds were filed under "plan" while the
+    instruction said only to fix "this program", and every one of them read
+    that as the controller.
     """
-    counted = prompt.schedule(COMMITTED)
+    sections = prompt.ROUND.text.split("## Your instruction")
+    assert len(sections) == 2, "one instruction, not a set to draw from"
+    instruction = (
+        sections[1].replace("{note}", "").replace("{episode}", "champion_1m1s1")
+    )
+    assert plan.PLAN_FILE in instruction
+    # And it reaches the round whole, at the end, since a truncated
+    # instruction is an instruction to do something else.
+    text = prompt.compose("champion_1", first_game(result({"v54": 0.0}, days=30)))
+    assert text.rstrip().endswith(instruction.rstrip())
 
-    assert counted == {3: 2, 29: 1}, counted
-    shown = "\n".join(prompt._schedule_lines(COMMITTED))
-    assert "day 3: 2" in shown and "day 29: 1" in shown
-    assert "500" not in shown, "a cash threshold was counted as a day"
-    # Every day it never names, so the silence is legible rather than implied.
-    for day in (0, 1, 2, 4, 28):
-        assert f"{day}" in shown.split("It names no day at")[1]
 
+def test_the_stagnation_note_leads_the_instruction() -> None:
+    """The one thing the instruction says differently between rounds.
 
-def test_a_program_that_will_not_parse_is_shown_no_schedule() -> None:
-    """The message is composed before the gate rejects a broken edit.
-
-    `compose` runs on whatever the last round left in `child.py`, and a round
-    that wrote something unparseable must still get a message rather than take
-    the session down with a `SyntaxError` from the part that describes it.
+    A session that did not start from the champion is told so first, and a
+    session that did is told nothing extra: no blank line, no heading over an
+    empty note.
     """
-    assert prompt.schedule("def agent(o, c=None):\n    return {") == {}
-    assert prompt._schedule_lines("this is not python(") == []
+    plain = prompt.compose("champion_1", first_game(result({"v54": 0.0})))
+    noted = prompt.compose(
+        "champion_1",
+        first_game(result({"v54": 0.0})),
+        "This session did not start from the champion.\n\n",
+    )
+
+    assert "## Your instruction\n\nWiden" in plain
+    assert (
+        "## Your instruction\n\nThis session did not start from the champion.\n\nWiden"
+        in noted
+    )

@@ -359,6 +359,10 @@ def test_the_reasoning_effort_is_passed_on_every_call(
 
     passed = argv.read_text(encoding="utf-8").splitlines()
     assert f"model_reasoning_effort={mutate.CodexMutator.REASONING}" in passed
+    # And the network, which `workspace-write` closes by default: without it
+    # `measure.py --against` and every query the message points at die on a
+    # socket, which is what 36 of the first codex rounds did.
+    assert "sandbox_workspace_write.network_access=true" in passed
     # Beside the model, so a call names both rather than inheriting either.
     assert mutate.CodexMutator.MODEL in passed
 

@@ -1,180 +1,290 @@
 <!--
 The whole message a round is given. `prompt.compose` fills the placeholders
-and nothing else composes a message, so what a codex call sees is this file
-plus numbers.
+and nothing else composes a message, so what a call sees is this file plus
+what the campaign measured.
 
-Placeholders, all filled on every round:
-
-  {task}         the game's rules, from `task_prompt.md`
-  {imports}      the allowed-import list, rendered from the gate's own
-                 whitelist so a round is never told a different set from the
-                 one that rejects it
-  {game}         the one game this round is feedback on
-  {tried}        the edits already made to this program and what they scored,
-                 or empty before any has been
-  {failures}     the lineage's recent rejected attempts, or empty
-  {schedule}     which days of the season the program has already decided
-  {kept}         every plan change that has survived a gate, or empty
-  {instruction}  what to do
+  {opponent}     this round's opponent, by pool name
+  {episode}      the key of this round's game in the games database
+  {seat}         the seat this program held in it
+  {ours}         its final bank there, and {theirs} the opponent's
+  {finish}       the difference, signed
+  {games}        where the games database answers
+  {note}         why a session started off the champion, or empty
 -->
 
-{task}
+# Kaggriculture policy task
 
-## Your program
+Two players farm for thirty days on one shared market, and the one with more
+bank at the final state wins. These are the rules of
+`kaggle-environments==1.32.7`, the engine the campaign plays on.
 
-`child.py` in your working directory is the program, and `plan.json` beside it
-is the strategy it plays. Edit either, in place. Both are read: what the
-campaign plays is `child.py` with `plan.json` packed back into it, as one
-self-contained file whose last top-level callable is
-`agent(observation, configuration)` -- that is what Kaggle loads, and a program
-that crashes forfeits every game.
+## Key insights
 
-`plan.json` holds four things, and they decide what the agent does on the
-board:
+- The final observation is recorded step `719` at day `29`, hour `23`;
+  policies act on steps `0..718`.
+  The last completed daily refresh appears at recorded step `696`, so the final
+  day never closes.
+- Labour is deliberately cheap and temporary. With multiplier `1`, daily hires
+  cost `1,1,2,3,5,8,13,…` and disappear at day-end; the first `7` cost only
+  `$33`.
+- The shed is a hard shared inventory bottleneck at `100` non-seed items.
+  End-of-day auto-drop and `DROP` silently erase overflow; seeds are outside the
+  cap.
+- The product market and town demand are shared. Your sales lower later prices;
+  opponent sales do too. Same-position transactions are lockstepped, so both
+  players receive the same pre-commit quote for that unit.
+- Seed purchases resolve after unit actions and cannot fund same-step planting.
+  Harvest enters carried inventory, while `SELL` reads only the shed; route
+  units through a shed corner before selling.
+- Locked land blocks tile operations but not movement or shed operations from
+  the four inner corners `(4,4)`, `(5,4)`, `(4,5)`, `(5,5)`.
+- Water a seed on planting day: its initial dry count is already `1`, so it
+  weeds on the first night if ignored. After a watered night, two consecutive
+  dry nights kill it.
+- “Ongoing” crops are finite producers. Tomato yields on ages `8,9,10,11` and
+  strawberry on `10,12,14,16`, then stop after `4` scheduled productions.
+- Melon has the largest base quote at `$250`, but its quadratic glut curve hits
+  the `$1` floor by `I0+T`; wheat's logarithmic glut curve is much gentler and
+  wheat also feeds every animal.
+- Read the opponent's public farm and bank. You cannot see its shed, seeds, or
+  carried inventory.
+
+## Rules
+
+### Clock and resolution
+
+A season is `30` days, numbered `0` to `29`. A decision made on day `3` is
+still being paid for on day `22`. A season has `720` recorded states but only
+`719` policy calls per seat.
+
+The board defaults to `10×10`; both players start with `$3000`. Days and hours
+are zero-based, with `24` hour labels per day. An ordinary day-end follows the
+action at hour `23` and is visible at the next hour `0`.
+
+Each action step resolves unit actions, market orders, town demand, crop decay,
+then—when applicable—the daily refresh. Daily refresh updates plants and
+animals, attempts weeds at probability `0.005` per empty owned tile, auto-drops
+inventory, resets labour and positions, and may unlock a shop.
+
+### Crops
+
+`interval=0` means one-time. Ongoing means harvest leaves the plant, not that it
+produces forever.
+
+| Crop       |   Seed | First yield age | Max-yield day | Interval | Cap | Ongoing |
+| ---------- | -----: | --------------: | ------------: | -------: | --: | :-----: |
+| Wheat      |  `$10` |             `2` |           `4` |      `0` | `6` |   no    |
+| Carrot     |  `$20` |             `2` |           `3` |      `0` | `4` |   no    |
+| Tomato     |  `$50` |             `8` |           `8` |      `1` | `4` |   yes   |
+| Strawberry | `$100` |            `10` |          `10` |      `2` | `4` |   yes   |
+| Melon      |  `$80` |            `10` |          `12` |      `0` | `6` |   no    |
+
+One-time plants begin with `1` latent unit. Plain productive water ages are
+wheat `2,3,4`, carrot `2,3`, and melon `6,7,8,9,10`; resulting plain yields are
+`4`, `3`, and `6`. Fertilized water adds `2` rather than `1` and lasts `3` days
+inclusive. Melon is already capped at age `10`, despite max-yield day `12`.
+
+Unharvested plants eventually lose `1` unit every `2` action steps and turn to
+weeds at zero. Harvest clears one-time plants; it resets held yield but not the
+finite production count of ongoing plants.
+
+### Animals and structures
+
+| Animal |   Cost | Structure | Product | First yield age | Interval | Max held |
+| ------ | -----: | --------- | ------- | --------------: | -------: | -------: |
+| Goose  | `$300` | Coop      | Egg     |             `4` |      `1` |      `4` |
+| Cow    | `$400` | Pasture   | Milk    |             `8` |      `2` |      `6` |
+| Sheep  | `$500` | Pasture   | Wool    |             `6` |      `3` |      `6` |
+
+Coops and pastures cost `$0`. Buy an animal into the shed, pick it up, and place
+it on a matching empty structure. An uncared production adds `1` product.
+Feeding costs `1` carried wheat per day; after `2` consecutive unfed nights the
+animal escapes and leaves the structure. Each surviving night makes at most `1`
+fertilizer available.
+
+Feed plus care banks a `+1` bonus after that night's production check. Bonuses
+can accumulate and are consumed by a later fed production, subject to max held;
+care never boosts the same night's production.
+
+### Land, hands, and shed
+
+The northwest `5×5` quadrant begins unlocked. `BUY_LAND` then unlocks northeast,
+southwest, southeast for `$1000`, `$2000`, `$4000`.
+
+The daily hire price is `farmHandCostMult × fib(hires_today)`, with the default
+multiplier `1` and sequence `1,1,2,3,5,8,13,21,34,55,…`. Each hand gets one
+unit action per policy call, then disappears at day-end.
+
+The shed holds `100` total crops, products, fertilizer, and unplaced animals.
+`BUY_PRODUCT`/`BUY_ANIMAL` fail when full. Shed-form `PLACE` preserves unplaced
+excess, but `DROP` and automatic day-end deposit discard overflow. Carrying has
+no cap.
+
+### Market
+
+All products begin at inventory `I0=10000`. Prices are integer-rounded and
+floored at `$1`. At distance `x`, amplitude is `target×base/f(T)`; price adds
+`amp×f(x)` below `I0` and subtracts it at or above `I0`.
+
+Shapes are linear, square, square root, natural log of `1+x`, base-ten log of
+`1+x`, and hinge. For hinge, `u=x/T` and
+`f(x)=u+8×max(0,u−1)²`, so scarcity accelerates beyond `T`.
+
+| Product    |   Base |     T | Scarcity shape/target | Glut shape/target | Price at I0−T / I0 / I0+T |
+| ---------- | -----: | ----: | --------------------- | ----------------- | ------------------------: |
+| Wheat      |  `$25` | `400` | sqrt / `0.80`         | log / `0.20`      |         `$45 / $25 / $20` |
+| Carrot     |  `$35` | `450` | hinge / `1.00`        | sqrt / `0.70`     |         `$70 / $35 / $10` |
+| Tomato     |  `$60` | `200` | hinge / `0.40`        | sqrt / `0.60`     |         `$84 / $60 / $24` |
+| Strawberry | `$120` | `100` | sqrt / `0.70`         | linear / `1.60`   |        `$204 / $120 / $1` |
+| Melon      | `$250` | `300` | log / `0.20`          | square / `3.60`   |        `$300 / $250 / $1` |
+| Egg        |  `$50` | `332` | hinge / `0.40`        | log / `0.20`      |         `$70 / $50 / $40` |
+| Milk       | `$160` | `122` | sqrt / `0.60`         | linear / `1.60`   |        `$256 / $160 / $1` |
+| Wool       | `$200` | `105` | log / `0.20`          | square / `3.20`   |        `$240 / $200 / $1` |
+| Fertilizer | `$100` | `200` | linear / `0.40`       | linear / `0.40`   |       `$140 / $100 / $60` |
+
+Market order semantics:
+
+- `BUY_SEED crop n`: fixed seed price; separate seed store; no market impact.
+- `BUY_ANIMAL animal n`: fixed animal price; shed capacity required; no product-market impact.
+- `BUY_PRODUCT item n`: only wheat or fertilizer; quote post-buy inventory, then
+  subtract `1` inventory per unit.
+- `SELL item n`: only from shed; quote current inventory, then add `1` supply per
+  unit unless the quote is exactly `$1`, in which case supply does not change.
+- `HIRE` and `BUY_LAND`: atomic, unquantified orders.
+
+These unit effects and the zero-cost unchanged-market buy/sell round trip were
+verified directly.
+
+At most `10` market-order entries per player are processed per action step;
+extras vanish. Quantities within an entry execute per unit, and the public price
+refreshes after each order entry and again after town consumption.
+
+### Town and seed
+
+The town centre takes `1` of every non-fertilizer product every `24` action
+steps, starting at step `0`; it fires `30` times. Shops consume every `4` action
+steps. A multi-product shop takes `1` of each ingredient; yarn store and pet
+cafe are single-product shops and take `2` wool or carrot. Duplicate shop
+instances consume independently.
+
+Shop recipes are:
+
+- bakery: egg, wheat;
+- pizza shop: milk, tomato, wheat;
+- brunch spot: egg, wheat, strawberry;
+- yarn store: wool;
+- ice cream shop: strawberry, milk, wheat;
+- pet cafe: carrot;
+- smoothie shop: strawberry, milk;
+- farmers market: wheat, carrot, tomato, strawberry.
+
+One shop instance unlocks on days `3,6,9,12,15,18,21,24`, capped at `8` and
+drawn with replacement. The resolved episode seed initializes daily weed/shop
+randomness, but the resolved value is hidden from agents; farm occupancy affects
+how far the RNG advances before the shop draw.
+
+### Visibility and win condition
+
+Both seats see shared `farms`, `market`, `town`, `day`, and `hour`. Each public
+farm contains money, tiles, main-farmer/hand positions, unlocked quadrants, and
+today's hire count. Each seat sees only its own `private` shed, seeds, and unit
+inventories. Compare your bank with `farms[1-player].money`; a strict lead at the
+final state wins and equality ties.
+
+## Interface
+
+The program is one Python file. Kaggle executes it and calls the **last
+callable left in its global namespace** as `agent(observation, configuration)`,
+so nothing is defined or imported after `agent`. Each call returns:
+
+```text
+{{
+  "farmer": [UNIT_OP, ...args],
+  "hands": [[UNIT_OP, ...args], ...],
+  "market": [[MARKET_OP, ...args], ...]
+}}
+```
+
+Accepted unit operations are `NORTH`, `SOUTH`, `EAST`, `WEST`, `PASS`, `DROP`,
+`PICKUP item [n]`, `PLACE item [n]`, `PLANT crop`, `WATER`, `HARVEST`,
+`FERTILIZE`, `DIG`, `BUILD_COOP`, `BUILD_PASTURE`, `FEED`,
+`COLLECT_FERTILIZER`, and `CARE`. `DROP` is real even though older published
+action schemas omitted it.
+
+Accepted market operations are `BUY_SEED crop n`, `BUY_PRODUCT item n`,
+`BUY_ANIMAL animal n`, `SELL item n`, `HIRE`, and `BUY_LAND`.
+
+The engine silently no-ops invalid actions. Return one hand action per hand you
+intend to operate. Keep each call below the `1` second `actTimeout`.
+
+Do not depend on `observation.step`: the framework supplies it to seat `0` but
+not seat `1`. Use
+`observation.day * configuration.turnsPerDay + observation.hour` instead.
+
+## Your files
+
+`child.py` is the program and `plan.json` beside it is the strategy it plays.
+What the campaign plays is `child.py` with `plan.json` packed back into it, one
+self-contained file whose last callable is `agent(observation, configuration)`.
+A program that crashes forfeits every game.
+
+`plan.json` holds four things:
 
 - `actions` is a pool of every distinct step any season plays: the farmer's
   move, each hand's move, and the market orders. Where a step sits in the pool
-  means nothing. One step per line, so `actions[N]` is line `N + 3` of the file
-  and you can go straight to it.
+  means nothing. One step per line, so `actions[N]` is line `N + 3` of the file.
 - `routes` is one whole season per route number: 719 indices into `actions`,
-  one per step, so entry N says which pooled step the farm plays on step N.
-  These are not board tiles. A step the farm plays forty times is one pooled
-  entry cited forty times. One season per line.
+  one per step. A step the farm plays forty times is one pooled entry cited
+  forty times. One season per line.
 - `shops` maps the two shops a map happens to have to a route number, so it
-  chooses which season gets played. 64 lines, and the smallest change that
-  makes the agent play a different game.
-- `settings` switches the chassis's nine reactive layers on and off. The
-  controller's own table names them and says what each one hooks into.
+  chooses which season gets played.
+- `settings` switches the controller's reactive layers on and off; the
+  controller's own table names them and says what each hooks into.
 
-`attempts.jsonl` beside them is every program this campaign has ever written,
-one JSON object per line: `id`, the `from` it was edited from, what it
-`changed` in the plan, its `wins` and `margin` against the pool, whether it was
-`promoted`, and its `rates` against each opponent by name. It is not read to
-you and it is not a suggestion; it is the record, for the question you bring to
-it -- whether an edit like the one you have in mind has been measured before,
-and against which agent it helped. `grep` it.
+Changing a pooled step changes it everywhere every season cites it; changing a
+season's indices changes the order without touching a step.
 
-So there are two kinds of edit. Changing a pooled step changes that step
-everywhere every season cites it. Changing a season's indices changes the order
-without touching a step. Both are real edits; neither is the other.
+`parent.py` is the program you started from, unchanged. `attempts.jsonl` is
+every program this campaign has written, one JSON object per line: `id`, the
+`from` it was edited from, what it `changed` in the plan, its `wins` and
+`margin` against the pool, whether it was `promoted`, and its `rates` against
+each opponent by name.
 
-## How big an edit has to be to be worth making
+`./measure.py` plays `child.py` against `parent.py` on the same seasons in both
+seats and reports the difference in coins with its noise. `--against <episode>`
+also plays both against that episode's opponent, which is how an edit aimed at
+this round's opponent is told from noise. `--seeds N` sets how many seasons:
+8 takes about fifteen seconds and the default 64 about two minutes.
 
-The margins that decide these games are small next to the banks. The champion
-banks around 100,000 and beats the field by between 279 and 3,242. So an edit
-worth keeping has to be worth hundreds, and most edits are worth nothing:
+## This round's game
 
-- One quantity changed on one pooled step was measured at **+6**. Twenty-two of
-  twenty-four such edits changed the score by nothing at all, because a game
-  plays one route and any one route cites only 18% of the pool.
-- The same change applied to _every_ pooled step matching a rule -- every
-  `SELL MELON`, capped -- moved **1,269** on a single seed. A grep for
-  `SELL MELON` reaches 61 pooled steps deciding 543 step-slots; `HIRE` reaches
-  400 steps and 2,169 slots.
+The opponent is `{opponent}`, and its program is `opponent.py` beside yours.
+Episode `{episode}`: this program held seat {seat} and finished {ours} against
+{theirs}, {finish}.
 
-So the useful unit is a rule and not a step: work out what this program is
-getting wrong, and change every step that does it. `plan.json` is ordinary JSON; read it, transform it with a few
-lines of Python, write it back.
-
-Nothing limits you to one rule. Eight of them have measured positive
-independently, and whether they add up is not known, because they have only ever
-been tried one at a time. The market is shared and finite, so they may well
-fight: selling more of two goods at once moves both prices against you. Stack
-them and find out -- but measure after each one you add rather than at the end,
-because a bundle that nets positive can carry a losing rule inside it, and the
-gate promotes whole programs. An edit that rides in on a better one is inherited
-by every program after it.
-
-`./measure.py --against <episode>` answers both questions your edit has to
-answer, in one run. `The game` section gives the episode key.
-
-First, against the matchup: your child and the program you started from each
-play that opponent, on the same seasons and both seats, and the difference
-between them is reported. That matchup is the one taking the most games off us,
-and beating it is the job.
-
-Then, against the program you started from directly. That is the bar the job has
-to clear on the way -- a program is promoted for beating what it replaces, so an
-edit that helps the matchup and loses to its own parent does not get in.
-
-You do not choose between these. For a long time only the second existed, which
-is how this lineage spent twenty-nine promotions without closing a three-percent
-gap: rounds were aimed at a matchup and graded against a sibling, so every edit
-that helped the matchup measured neutral and was thrown away.
-
-Each comes back in coins, with what your change is worth and how much noise is
-in the figure. Read the second number. If it is larger than the first, that run
-has told you nothing at all, and the two ways out are more seasons or a bigger
-change.
-
-Measurements are not instant and you have to wait for them. `--against` plays
-both programs, so the default sixty-four seasons is 256 games and takes about
-two minutes; `--seeds 8` is 32 games and takes about fifteen. Open with
-`--seeds 8` on one edit, and spend the full block only on something that already
-looks worth settling. Do not start several at once -- they share the same cores,
-so three at a time is three times slower, not three times more evidence.
-
-A turn that ends while a measurement is still running produces nothing: the
-round is thrown away, the edit with it, and the next round starts from where
-this one did. Run the command, wait for its output, and read it. If you find
-yourself writing that you will review the results shortly, you are about to
-waste the round -- wait instead.
-
-Small samples do not merely say less, they mislead. The same edit measured +454
-over four seasons, +314 over sixteen, and +255 over sixty-four: the small sample
-was wrong about the size and confident about being wrong, because a handful of
-seasons that happen to agree is indistinguishable from certainty.
-
-It came from a solver, and no round before this one could read it -- it shipped
-as a single line of base85 and was left untouched through eight promotions
-while the controller around it was rewritten again and again. That is why
-children keep drawing with the champion: the two share this file, so they play
-the same game, and the gate cannot tell them apart. An edit here is an edit to
-what the agent does; an edit to `child.py` alone is an edit to how it is
-steered.
-
-Both are worth doing. Measure either the same way.
-
-The directory is yours and is thrown away after this call.
-
-Nobody is reading this session. There is no human to answer a question,
-approve a design or confirm anything, and nothing in your reply is read. Plan
-as much as you like, then edit, and never stop to ask.
-
-The rules above cite probes by filename. Those files are not here: take their
-numbers as verified and do not go looking.
-
-## What your program may import
-
-It ships alone, so it may import only these. Anything else is rejected before
-the program is scored.
-
-{imports}
-
-## Opponents
-
-Building on published work is what this competition allows, and the field is
-doing it in the open: the agents that beat this program carry Apache-2.0
-notices and attribute a shared lineage of published kernels by name.
-
-They are on disk at `/data/kaggriculture/opponents/<name>/main.py`, one
-directory per pool opponent, and `{game}` below names the one you are losing
-to. Read them. The ones that win are not doing something unguessable -- they
-issue about as many sell orders as this program does and move fourteen times
-the units through them -- but how they decide that is in the source and not in
-any number we can hand you.
-
-If you take Apache-2.0 code, the licence's terms come with it: keep the notice
-and the attribution in `child.py`. That is what those kernels themselves do,
-and it is the whole of the obligation.
-
-{game}
-{tried}
-{failures}
-{schedule}
-
-{kept}
+Every day of that game, both sides, is in the games database at {games}:
+`select * from games.days where episode='{episode}' order by day, seat`. Every
+game this program has played against the pool is there under
+`source = 'campaign'`, its games on the competition under `source = 'live'`,
+and every game the competition has recorded between other teams under
+`source = 'ladder'`. The `query-games` skill has the schema.
 
 ## Your instruction
 
-{instruction}
+{note}Widen this program's bank margin. The campaign keeps the program that banks
+the most against the whole pool, and a session continues from the round that
+banked the most; it does not select on the win rate. So a game this program
+already wins is worth as much as one it loses, and banking more in it is the
+job.
+
+The plan is what the farm does and the controller only steers it, so start
+with `plan.json`. Measure every change before you keep it:
+`./measure.py --against {episode} --seeds 8` first, the full block
+only on a change worth settling, and one measurement at a time -- they share
+the cores. Wait for the output and read the noise beside the effect; a turn
+that ends with a measurement still running produces nothing. Keep an edit only
+if it survives.
+
+The directory is yours and is thrown away after this call. Nobody is reading
+this session and nothing in your reply is read: edit, measure, and never stop
+to ask.

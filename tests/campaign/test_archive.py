@@ -150,18 +150,22 @@ def test_a_program_with_no_model_is_a_bug_not_a_legacy_case() -> None:
         )
 
 
-def test_top_ranks_by_games_won(tmp_path: Path) -> None:
-    """`top` is the programs that won the most, which is the objective.
+def test_top_ranks_by_the_bank_margin(tmp_path: Path) -> None:
+    """`top` is the programs that banked the most against the pool.
 
-    It decides what a session starts from, and every candidate plays the
-    whole pool on the same seeds in both seats, so the rate compares directly.
+    It decides what a session starts from. The win rate ranked first until
+    2026-09-25, and by then it had nothing to say: the gate read 0.86 to 0.89
+    with most of the pool at 1.000, so a program that got better at the
+    economy scored what its parent scored. The margin is where the gradient
+    is, and against a beaten opponent it is the program's own economy.
     """
     db = make(tmp_path)
-    program(db, "a", 0.1)
-    program(db, "b", 0.7)
-    program(db, "c", 0.4)
+    # Deliberately disagreeing: `b` won the most games, `c` banked the most.
+    program(db, "a", 0.1, margin=-500.0)
+    program(db, "b", 0.7, margin=800.0)
+    program(db, "c", 0.4, margin=2_000.0)
 
-    assert [p.id for p in db.top(2)] == ["b", "c"]
+    assert [p.id for p in db.top(2)] == ["c", "b"]
 
 
 def test_the_log_survives_a_restart(tmp_path: Path) -> None:
@@ -246,12 +250,12 @@ def test_top_breaks_a_tie_on_the_bank_margin(tmp_path: Path) -> None:
     assert [p.id for p in db.top(2)] == ["closest", "middling"]
 
 
-def test_the_margin_never_outranks_the_win_rate(tmp_path: Path) -> None:
-    """A program that won more is above one that only lost narrowly."""
+def test_the_win_rate_breaks_a_tie_on_the_margin(tmp_path: Path) -> None:
+    """Two programs banking the same are ordered by how often they won."""
     db = make(tmp_path)
-    program(db, "narrow", 0.0, margin=-1.0)
-    program(db, "winner", 0.5, margin=-800.0)
-    assert [p.id for p in db.top(2)] == ["winner", "narrow"]
+    program(db, "drew_more", 0.3, margin=500.0)
+    program(db, "won_more", 0.5, margin=500.0)
+    assert [p.id for p in db.top(2)] == ["won_more", "drew_more"]
 
 
 def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:

@@ -11,10 +11,9 @@ downstream expects.
 import logging
 import shutil
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 
-from kaggriculture.campaign import archive, config, measure, plan, prompt
+from kaggriculture.campaign import archive, config, measure, plan
 from kaggriculture.campaign.mutate import Mutation
 
 LOGGER = logging.getLogger(__name__)
@@ -160,9 +159,9 @@ def packed(mutation: Mutation, box: Path, program_id: str) -> Mutation:
 def prepare(
     box: Path,
     source: Path,
-    siblings: Sequence[archive.Program],
     database: archive.Database,
     skills: tuple[Path, ...],
+    opponent: Path,
 ) -> None:
     """Lay out one round's directory: the program to edit and what it needs.
 
@@ -186,10 +185,10 @@ def prepare(
     spent its whole call on "I will wait for the search for `kaggriculture`
     to complete".
 
-    ``tried_N.py``: the edits already made to this program, which the message
-    names and scores. A score says a direction lost ground; the file is what
-    says which direction it was. ``attempts.jsonl``: the whole campaign, one
-    line per program, for whatever question the round brings to it.
+    ``attempts.jsonl``: the whole campaign, one line per program -- what each
+    edit changed and what it banked -- for whatever question the round brings
+    to it. ``opponent.py``: this round's opponent, copied here so that no path
+    to it travels in the message.
 
     And the skills, at whichever path the driving program looks for one, so a
     round that wants the schema and the queries worth running opens them and
@@ -198,9 +197,9 @@ def prepare(
     Args:
         box: The round's directory, empty.
         source: The program this round starts from.
-        siblings: Programs already written from ``source``, best first.
         database: The campaign's record, for ``attempts.jsonl``.
         skills: Where each driver looks for skills, relative to the box.
+        opponent: This round's opponent.
     """
     plan.lay_out(source.read_text(encoding="utf-8"), box)
     # The gate writes a champion read-only so nothing can edit the file the
@@ -214,9 +213,8 @@ def prepare(
         encoding="utf-8",
     )
     runner.chmod(0o755)
-    for number, program in enumerate(siblings[: prompt.RECENT_ATTEMPTS], start=1):
-        shutil.copy(program.source_path, box / f"tried_{number}.py")
     database.attempts(box / "attempts.jsonl")
+    shutil.copy(opponent, box / "opponent.py")
     with_skills(box, skills)
 
 

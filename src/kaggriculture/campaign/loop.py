@@ -38,7 +38,6 @@ import asyncio
 import logging
 import random
 import signal
-import statistics
 import tempfile
 import time
 import uuid
@@ -807,15 +806,14 @@ class Campaign:
         standing = self.state.champion
         if standing is not None and str(source) == standing.path:
             self.champion_baseline = (standing.path, tuple(result.seeds), result)
-        # One instruction, the same every round: the bar the gate applies.
-        # There were five drawn per session, and two of them -- "a completely
-        # different algorithm" and "a novel approach inspired by this one" --
-        # took 54% of every call the campaign made and returned 476 programs
-        # of which one scored above nought. See `prompt.INSTRUCTION`.
-        drawn, instruction = prompt.INSTRUCTION_NAME, prompt.INSTRUCTION
-        if stagnant:
-            note = STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
-            instruction = note + instruction
+        # One instruction, the same every round, in the template; what a
+        # session can add is the note that it did not start from the champion.
+        drawn = prompt.INSTRUCTION_NAME
+        note = (
+            STAGNATION_NOTE.format(sessions=self.state.sessions_since_promotion)
+            if stagnant
+            else ""
+        )
         rounds = 0
         # A different game every round, so a session's rounds see as many maps as
         # it has rounds and no change gets twelve consecutive attempts at
@@ -833,39 +831,25 @@ class Campaign:
         # scored, so the database is the one place they always are. Keyed the
         # way `record` wrote them, name included; `compose` has the name.
         scored = await asyncio.to_thread(games.recorded, name, games.DATABASE)
-        planned = ROUNDS_PER_OPPONENT * max(
-            1, len({matchup for matchup, _, _ in scored})
-        )
+        if not scored:
+            raise RuntimeError(f"{name} has no games on the record to hand a round")
+        matchups = sorted({one[0] for one in scored})
+        planned = ROUNDS_PER_OPPONENT * len(matchups)
         for turn in range(planned):
-            failures = self.database.failures(name)
-            siblings = self.database.children(name)
             # `ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
             # then the next, with the season advancing inside the block. Four
             # attempts against one agent on four maps: enough to learn it,
             # without four attempts at the same game.
-            matchups = sorted({one[0] for one in scored})
-            playing = None
-            if matchups:
-                block, attempt = divmod(turn, ROUNDS_PER_OPPONENT)
-                against = [
-                    one for one in scored if one[0] == matchups[block % len(matchups)]
-                ]
-                playing = against[attempt % len(against)]
-            message = prompt.compose(
-                name,
-                playing,
-                result.fitness,
-                statistics.fmean(one.mean for one in result.margins.values()),
-                failures,
-                siblings,
-                instruction,
-                source.read_text(encoding="utf-8"),
-                [
-                    (champion_name, self.database.get(program_id).changed)
-                    for program_id, champion_name in self.database.promoted.items()
-                ],
-            )
-            outcome = await self.round(source, name, result, message, siblings, drawn)
+            block, attempt = divmod(turn, ROUNDS_PER_OPPONENT)
+            against = [
+                one for one in scored if one[0] == matchups[block % len(matchups)]
+            ]
+            playing = against[attempt % len(against)]
+            message = prompt.compose(name, playing, note)
+            # The opponent's program goes into the round's directory as a
+            # file, so the message names it and carries no path to it.
+            opponent = Path(self.pool.opponents[playing[2].opponent])
+            outcome = await self.round(source, name, result, message, drawn, opponent)
             rounds += 1
             if outcome is None:
                 break
@@ -883,8 +867,8 @@ class Campaign:
         name: str,
         result: Result,
         message: str,
-        siblings: list[archive.Program],
         drawn: str,
+        opponent: Path,
     ) -> tuple[Path, str, Result, bool] | None:
         """One round: one codex call on one file, and the loop's verdict on it.
 
@@ -899,9 +883,8 @@ class Campaign:
             result: The loop's verdict on that program, carried through so a
                 rejected round hands the same program to the next one.
             message: The composed prompt for this round.
-            siblings: Programs already written from ``source``, best first. The
-                message names the first few as ``tried_1.py`` and so on; this
-                is what puts those files in the directory.
+            opponent: This round's opponent, copied into the directory as
+                ``opponent.py``.
             drawn: The name of the drawn instruction, recorded on the program.
 
         Returns:
@@ -930,7 +913,7 @@ class Campaign:
         ) as scratch:
             box = Path(scratch)
             workspace.prepare(
-                box, source, siblings, self.database, self.mutator.SKILLS_DIRS
+                box, source, self.database, self.mutator.SKILLS_DIRS, opponent
             )
             # What the campaign's own source says before this round runs, so
             # that what it says afterwards can be put back. `workspace.restored`
@@ -982,6 +965,9 @@ class Campaign:
             "calls/seconds": mutation.seconds,
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
+            # The number the search climbs. `database/top` is that program's
+            # win rate, which sits near 0.89 whatever happens to the economy.
+            "database/top_margin": archive.mean_margin(self.database.top(1)[0]),
         }
         if kept is not None:
             # Named apart from `result`, which is the program this round was
@@ -1471,7 +1457,7 @@ class Campaign:
         if grown:
             best = max(
                 grown,
-                key=lambda program: (program.fitness, archive.mean_margin(program)),
+                key=lambda program: (archive.mean_margin(program), program.fitness),
             )
             return Path(best.source_path), best.id
         blank = self.database.store(SCRATCH_AGENT, SCRATCH_ID)
