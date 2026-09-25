@@ -5,8 +5,8 @@ where its source lives -- but that is a convention this module keeps, not a
 wall it builds: ``codex exec -s workspace-write`` restricts writes only, and
 a session that walked up to the repository could read this file. What stops
 a candidate from copying an opponent is the doctrine in the prompt and the
-copy-check gate that rejects a candidate resembling one. ``path`` is called
-only by the harness and the gate.
+validator's import and packing rules, which refuse the way a recording
+travels. ``path`` is called only by the harness and the gate.
 
 Measured overlap, so the held-out and field numbers are read with the right
 discount (spec section 5.6): ``indarkarhana`` against ``lynnsakurai_v5``

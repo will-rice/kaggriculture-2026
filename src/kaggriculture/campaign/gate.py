@@ -41,7 +41,7 @@ other seven workers are reading while this one promotes.
 
 Nothing here touches version control, and every write is under
 `run/campaign`. In particular nothing writes into `src/`: the committed
-`served/main.py` is the seed a cold start begins from, not the floor a
+`seed/main.py` is the seed a cold start begins from, not the floor a
 campaign produces, and a promotion that dirtied a tracked file would leave
 a tree the next launch refuses to start on.
 """
@@ -80,8 +80,8 @@ class Champion(BaseModel):
         tarball: The archive a cut uploads, written by this promotion. Empty
             for champion zero, which is the seed enthroned at startup so that
             there is no pre-champion regime: nothing would ever submit it, and
-            packaging needs the licence and the served skeleton, which a bare
-            run directory does not have.
+            packaging needs the repository's licence, which a bare run
+            directory does not have.
         result: The measurement it was promoted on, which is also what a
             session is shown of the program it starts from.
     """

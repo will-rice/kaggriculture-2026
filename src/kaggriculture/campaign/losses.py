@@ -8,7 +8,7 @@ over half of them inside a thousand.
 
 Kaggle keeps every one. `competition_list_episodes` says which were lost and by
 how much, `competition_episode_replay` returns all 720 steps of both seats, and
-that is the shape `dataset._rows` already parses. The rows land under
+that is the shape `dataset.rows` already parses. The rows land under
 `source = 'live'`; the tables are partitioned on `source`, so a corpus rebuild
 replaces `ladder` and cannot touch them.
 
@@ -33,7 +33,7 @@ LOGGER = logging.getLogger(__name__)
 # submission, against 514 GB free on this disk.
 #
 # Worth it, because the database is a lossy derivation of this and not a
-# replacement for it. `dataset._rows` keeps every order and every move, but it
+# replacement for it. `dataset.rows` keeps every order and every move, but it
 # samples *state* once a day -- `steps[day * HOURS + LAST_HOUR]`, thirty of 720
 # steps -- so the other twenty-three hours of each day exist here and nowhere
 # else. A column added to the schema later is re-derived from these files; asked
@@ -207,4 +207,4 @@ def _hold(
         },
         steps=raw["steps"],
     )
-    dataset._rows(batch, episode, played)
+    dataset.rows(batch, episode, played)

@@ -280,8 +280,8 @@ def against(
     """
     opponent = _matchup(episode)
     block = list(SEEDS[:seeds])
-    mine = _versus(child, opponent, block)
-    theirs = _versus(parent, opponent, block)
+    mine, mine_days = _versus(child, opponent, block)
+    theirs, their_days = _versus(parent, opponent, block)
 
     # Keyed by season and seat, so the subtraction is between the same game
     # played by two programs rather than between two draws.
@@ -319,15 +319,72 @@ def against(
             f"{parent_season:>+10,.0f} {paired:>+10,.0f}"
         )
 
+    _walked(mine_days, their_days)
     _verdict(mean, error, bar, seasons, seeds)
+
+
+def _walked(mine: dict[int, list[float]], theirs: dict[int, list[float]]) -> None:
+    """Where in the season the two programs part company.
+
+    The table above says whether the edit helped. This says where, which is a
+    different question and the one a round is now asked: it is handed the
+    champion's real losses day by day, where the gap turns around day twenty,
+    and could previously only answer on the last day of the season.
+
+    Read the last column. It is the child's margin less the parent's on that
+    day, so a positive number is ground the edit gained by then, and the shape
+    matters more than any single row: an edit that is level to day fifteen and
+    ahead from twenty changed the end of the season, and one that is ahead at
+    day five and level after gained nothing that lasted.
+
+    The final margin is still the verdict. This column is a day-indexed
+    correlate of it, and day-10 bank once trended across a whole selected chain
+    of champions without being the mechanism -- so it is here to locate what an
+    edit did, never to be the thing an edit is aimed at.
+
+    Args:
+        mine: The child's per-day margins, pooled over its games.
+        theirs: The parent's, over the same games.
+    """
+    shared = sorted(set(mine) & set(theirs))
+    if not shared:
+        return
+    print("\n  day       child     parent     paired")
+    for day in shared:
+        if day % 5 and day != shared[-1]:
+            continue
+        child = statistics.fmean(mine[day])
+        parent = statistics.fmean(theirs[day])
+        print(
+            f"  {day:<8} {child:>+10,.0f} {parent:>+10,.0f} {child - parent:>+10,.0f}"
+        )
+    print()
 
 
 def _versus(
     agent: pathlib.Path, opponent: str, seeds: list
-) -> dict[tuple[int, int], float]:
-    """One program's bank margin against one opponent, by season and seat."""
-    games = harness.play(agent, [opponent], seeds, _spare_cores(), pool=config.POOL)
-    return {(game.seed, game.seat): game.ours - game.theirs for game in games}
+) -> tuple[dict[tuple[int, int], float], dict[int, list[float]]]:
+    """One program against one opponent: the season margins, and each day's.
+
+    `days=True` because the final margin says whether an edit helped and never
+    where in the season it did, and a round is now handed the champion's real
+    losses day by day -- a program cannot be asked which day it is losing and
+    then measured only on the last one. It costs about 5% of the games' wall
+    clock, measured on this opponent over four seasons in both seats.
+
+    Returns:
+        The bank margin by season and seat, and the margin on each day pooled
+        over every game played.
+    """
+    games = harness.play(
+        agent, [opponent], seeds, _spare_cores(), days=True, pool=config.POOL
+    )
+    margins = {(game.seed, game.seat): game.ours - game.theirs for game in games}
+    walked: dict[int, list[float]] = {}
+    for game in games:
+        for row in game.days:
+            walked.setdefault(row.day, []).append(row.ours_bank - row.theirs_bank)
+    return margins, walked
 
 
 def _matchup(episode: str) -> str:

@@ -35,7 +35,10 @@ def unit_actions() -> dict[str, object]:
         apply(farm, private, [op])
         positions[op] = list(farm["farmer"])
     assert positions == {
-        "NORTH": [4, 3], "SOUTH": [4, 5], "EAST": [5, 4], "WEST": [3, 4]
+        "NORTH": [4, 3],
+        "SOUTH": [4, 5],
+        "EAST": [5, 4],
+        "WEST": [3, 4],
     }
     assert farm["money"] == MONEY
     effects["movement"] = {"origin": origin, "destinations": positions, "money_cost": 0}
@@ -52,7 +55,9 @@ def unit_actions() -> dict[str, object]:
     assert private["shed"]["WHEAT"] == 100
     assert private["inventories"][0] == {}
     effects["DROP"] = {
-        "carried_before": 101, "shed_after": 100, "carried_after": 0,
+        "carried_before": 101,
+        "shed_after": 100,
+        "carried_after": 0,
         "overflow_destroyed": 1,
     }
 
@@ -66,7 +71,10 @@ def unit_actions() -> dict[str, object]:
     apply(farm2, private2, ["PICKUP", "WHEAT"])
     assert private2["inventories"][0]["WHEAT"] == 1
     effects["PICKUP"] = {
-        "requested": 3, "picked_up": 3, "shed_remaining": 2, "default_quantity": 1
+        "requested": 3,
+        "picked_up": 3,
+        "shed_remaining": 2,
+        "default_quantity": 1,
     }
 
     farm, private = fresh()
@@ -80,8 +88,11 @@ def unit_actions() -> dict[str, object]:
     apply(farm2, private2, ["PLACE", "WHEAT"])
     assert private2["shed"]["WHEAT"] == 1 and private2["inventories"][0]["WHEAT"] == 1
     effects["PLACE_shed"] = {
-        "requested": 3, "placed_with_one_slot": 1, "still_carried": 4,
-        "overflow_destroyed": 0, "default_quantity": 1,
+        "requested": 3,
+        "placed_with_one_slot": 1,
+        "still_carried": 4,
+        "overflow_destroyed": 0,
+        "default_quantity": 1,
     }
 
     farm, private = fresh()
@@ -92,7 +103,9 @@ def unit_actions() -> dict[str, object]:
     assert farm["tiles"][4][4]["animal"] == "GOOSE"
     assert "GOOSE" not in private["inventories"][0]
     effects["BUILD_COOP_and_PLACE_animal"] = {
-        "money_cost": 0, "animals_consumed": 1, "animal": "GOOSE"
+        "money_cost": 0,
+        "animals_consumed": 1,
+        "animal": "GOOSE",
     }
 
     farm, private = fresh()
@@ -107,7 +120,8 @@ def unit_actions() -> dict[str, object]:
     assert tile["crop"] == "WHEAT" and private["seeds"]["WHEAT"] == 0
     assert tile["yield_units"] == 1 and tile["consecutive_unwatered"] == 1
     effects["PLANT"] = {
-        "seeds_consumed": 1, "initial_yield_units": 1,
+        "seeds_consumed": 1,
+        "initial_yield_units": 1,
         "initial_consecutive_unwatered": 1,
     }
 
@@ -126,7 +140,8 @@ def unit_actions() -> dict[str, object]:
     apply(farm, private, ["WATER"], day=2)
     assert tile["yield_units"] == 3
     effects["FERTILIZE"] = {
-        "fertilizer_consumed": 1, "active_days": [2, 3, 4],
+        "fertilizer_consumed": 1,
+        "active_days": [2, 3, 4],
         "water_yield_added_while_active": 2,
     }
 
@@ -192,19 +207,50 @@ def unit_actions() -> dict[str, object]:
     apply(farm, private, ["PLANT", "WHEAT"])
     assert farm["tiles"][4][5] == "LOCKED" and private["seeds"]["WHEAT"] == 1
     effects["locked_tiles"] = {
-        "movement_allowed": True, "shed_access_allowed_from_inner_corner": True,
+        "movement_allowed": True,
+        "shed_access_allowed_from_inner_corner": True,
         "tile_mutation_allowed": False,
     }
 
     expected_verbs = {
-        "NORTH", "SOUTH", "EAST", "WEST", "PASS", "DROP", "PICKUP", "PLACE",
-        "PLANT", "WATER", "HARVEST", "FERTILIZE", "DIG", "BUILD_COOP",
-        "BUILD_PASTURE", "FEED", "COLLECT_FERTILIZER", "CARE",
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "PASS",
+        "DROP",
+        "PICKUP",
+        "PLACE",
+        "PLANT",
+        "WATER",
+        "HARVEST",
+        "FERTILIZE",
+        "DIG",
+        "BUILD_COOP",
+        "BUILD_PASTURE",
+        "FEED",
+        "COLLECT_FERTILIZER",
+        "CARE",
     }
     tested_verbs = {
-        "NORTH", "SOUTH", "EAST", "WEST", "PASS", "DROP", "PICKUP", "PLACE",
-        "PLANT", "WATER", "HARVEST", "FERTILIZE", "DIG", "BUILD_COOP",
-        "BUILD_PASTURE", "FEED", "COLLECT_FERTILIZER", "CARE",
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "PASS",
+        "DROP",
+        "PICKUP",
+        "PLACE",
+        "PLANT",
+        "WATER",
+        "HARVEST",
+        "FERTILIZE",
+        "DIG",
+        "BUILD_COOP",
+        "BUILD_PASTURE",
+        "FEED",
+        "COLLECT_FERTILIZER",
+        "CARE",
     }
     assert tested_verbs == expected_verbs and len(tested_verbs) == 18
     effects["tested_verbs"] = sorted(tested_verbs)
@@ -214,19 +260,25 @@ def unit_actions() -> dict[str, object]:
 def plant_atomicity_and_ordering() -> dict[str, object]:
     env = new_env(seed=1, weedSpawnChance=0)
     env.reset(2)
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [
-            ["HIRE"], ["BUY_LAND"], ["BUY_SEED", "WHEAT", 1]
-        ]},
-        PASS,
-    ])
+    env.step(
+        [
+            {
+                "farmer": ["PASS"],
+                "hands": [],
+                "market": [["HIRE"], ["BUY_LAND"], ["BUY_SEED", "WHEAT", 1]],
+            },
+            PASS,
+        ]
+    )
     obs = env.state[0].observation
     assert obs.private.seeds.WHEAT == 1
     assert obs.farms[0].money == 1989
-    env.step([
-        {"farmer": ["PLANT", "WHEAT"], "hands": [["PLANT", "WHEAT"]], "market": []},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PLANT", "WHEAT"], "hands": [["PLANT", "WHEAT"]], "market": []},
+            PASS,
+        ]
+    )
     obs = env.state[0].observation
     assert obs.private.seeds.WHEAT == 1
     assert obs.farms[0].tiles[4][4] is None
@@ -268,8 +320,7 @@ def land_and_hiring() -> dict[str, object]:
     for _ in range(3):
         engine._do_buy_land(farm, BOARD)
         land_banks.append(farm["money"])
-        unlocked.append(list(farm["unlocked_quadrants"])
-        )
+        unlocked.append(list(farm["unlocked_quadrants"]))
     assert land_banks == [3000.0, 2000.0, 0.0, 0.0]
     # The third parcel costs 4000, so it cannot be bought from this bank.
     farm["money"] = 4000
@@ -301,10 +352,12 @@ def land_and_hiring() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    emit({
-        "engine": assert_exact_engine(),
-        "unit_actions": unit_actions(),
-        "plant_atomicity": plant_atomicity_and_ordering(),
-        "shed": shed_end_of_day(),
-        "land_and_hiring": land_and_hiring(),
-    })
+    emit(
+        {
+            "engine": assert_exact_engine(),
+            "unit_actions": unit_actions(),
+            "plant_atomicity": plant_atomicity_and_ordering(),
+            "shed": shed_end_of_day(),
+            "land_and_hiring": land_and_hiring(),
+        }
+    )

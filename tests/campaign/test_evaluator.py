@@ -368,6 +368,45 @@ def test_every_game_it_scores_is_a_game_the_round_can_improve(tmp_path: Path) ->
     assert gaps == sorted(gaps), "narrowest first, so season 1 is the reachable one"
 
 
+def test_a_result_serialises_without_its_games() -> None:
+    """The games are for the record, not for the file the state is kept in.
+
+    A champion's result rode inside `State`, and `state.json` was 688 MB
+    rewritten after every session -- twelve thousand games with their day
+    tables, every one of them already in the games database. What a result
+    carries through the disk is what the gate reads: the rates, the margins
+    and the rest. What it loads back with is no games, and a caller that wants
+    them asks `games.recorded`.
+    """
+    seasons = [
+        harness.Game(
+            opponent="v54",
+            seed=11,
+            seat=0,
+            ours=5.0,
+            theirs=3.0,
+            worst_step_seconds=0.1,
+        )
+    ]
+    result = evaluator.Result(
+        program_id="p",
+        fitness=1.0,
+        field=None,
+        rates={"v54": 1.0},
+        margins={"v54": harness.Margin(mean=2.0, worst=2.0, best=2.0)},
+        games=1,
+        seeds=[11],
+        hardest="v54",
+        states={"v54": seasons},
+    )
+
+    assert result.states == {"v54": seasons}, "in memory, the games are there"
+    assert "states" not in result.model_dump()
+    back = evaluator.Result.model_validate_json(result.model_dump_json())
+    assert back.states == {}
+    assert back.rates == result.rates and back.margins == result.margins
+
+
 def rated(program_id: str, rates: dict[str, float]) -> evaluator.Result:
     """A result carrying nothing but the rates a comparison reads."""
     return evaluator.Result(

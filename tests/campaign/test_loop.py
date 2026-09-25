@@ -47,6 +47,7 @@ from kaggriculture.campaign import (
     config,
     dataset,
     evaluator,
+    games,
     gate,
     harness,
     loop,
@@ -54,6 +55,30 @@ from kaggriculture.campaign import (
     pool,
     prompt,
 )
+
+
+@pytest.fixture(autouse=True)
+def games_scratch(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """Every test here writes its games to a database of its own.
+
+    The loop records every game it scores and reads a program's games back to
+    hand a round one, so a test campaign that wrote into the live `games`
+    database would read the real champion's seasons back as its own -- and
+    until this fixture existed, every loop test did write there: hundreds of
+    `PASS`-against-`PASS` games filed under the live champion's name.
+
+    Autouse because `tiny_run` is a plain function forty tests call, and the
+    isolation is not a thing a test should have to remember to ask for.
+    """
+    name = f"test_{abs(hash(request.node.name)):x}"[:40]
+    games.query(f"DROP DATABASE IF EXISTS {name}")
+    request.addfinalizer(lambda: games.query(f"DROP DATABASE IF EXISTS {name}"))
+    games.create(name)
+    monkeypatch.setattr(games, "DATABASE", name)
+    return name
+
 
 PASS = (
     "def agent(observation, configuration=None):\n"
@@ -465,14 +490,13 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     """A campaign that promotes must still be a campaign that can restart.
 
     Every write a promotion makes is under ``run/campaign``. One that landed
-    in ``src/`` -- ``served/main.py`` was such a write -- would dirty a
+    in ``src/`` -- the seed file was such a write, once -- would dirty a
     tracked file, and ``_open_run`` refuses to start a run whose ``src/`` has
     uncommitted changes: the first promotion would be the last thing that
     campaign ever did.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     repo = _repository(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "SERVED", tmp_path / "src" / "served" / "main.py")
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
 
@@ -992,6 +1016,48 @@ def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
     assert config.CODEX_MODEL not in first.id
 
 
+def test_a_restart_finds_the_champions_games_on_the_record_not_in_the_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The state is kilobytes, and a resumed session still has a game to show.
+
+    `state.json` was 688 MB rewritten after every session, and `champion.json`
+    646 MB: the champion's result carried every game it was scored on with its
+    day table, all of them already in the games database. A result serialises
+    without them now, so a champion loaded back has none -- and the game a
+    round is handed comes off the record instead, where it was written the
+    moment the champion was scored. Two launches, so the second one proves the
+    read-back rather than the memory.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    pass_pool(tmp_path, paths)
+    seed = _write(tmp_path / "seed.py", PASS)
+
+    loop.run(
+        1,
+        Recorder(edit=lambda _: SELLER),
+        WORKERS,
+        seed,
+        random.Random(0),
+        log,
+        paths,
+        UNVENDORED,
+    )
+
+    assert paths.champion.stat().st_size < 200_000, (
+        "the floor's record is a record, not a corpus"
+    )
+    loaded = gate.load_champion(paths)
+    assert loaded is not None and loaded.result.states == {}
+    again = Recorder(edit=lambda _: SELLER)
+
+    loop.run(1, again, WORKERS, seed, random.Random(1), log, paths, UNVENDORED)
+
+    message = again.seen[0].message
+    assert "## The game" in message
+    assert f"Episode `{config.POOL_CHAMPION}m" in message
+
+
 def test_a_restart_resumes_state_json_and_champion_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -1035,8 +1101,12 @@ def test_a_restart_resumes_state_json_and_champion_json(
     )
 
     assert state.sessions == 7 and state.sessions_since_promotion == 3
-    assert state.champion == champion
-    assert state.champion != stale
+    # As the disk carries it: a result serialises without its games, so the
+    # champion that came back is the one that was written, less the games it
+    # was written without -- and it is not the stale one `state.json` held.
+    assert state.champion is not None
+    assert state.champion.model_dump() == champion.model_dump()
+    assert state.champion.name != stale.name
 
 
 @pytest.mark.slow
@@ -1441,7 +1511,13 @@ def test_a_round_is_given_one_file_and_the_directory_is_removed(
 
     handed = mutator.seen[0]
     assert handed.held == sorted(
-        [Recorder.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
+        [
+            Recorder.SKILLS_DIRS[0].parts[0],
+            "attempts.jsonl",
+            "child.py",
+            "measure.py",
+            "parent.py",
+        ]
     )
     assert not handed.where.exists()
 
@@ -2215,7 +2291,9 @@ def test_the_campaign_harvests_while_it_runs(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
 
-    asyncio.run(_a_pass(campaign.harvesting()))
+    asyncio.run(
+        _a_pass(campaign.harvesting(), lambda: "fresh" in campaign.pool.opponents)
+    )
 
     assert campaign.pool.opponents["fresh"] == "/vendored/main.py"
     # And it is on disk, because the pool file is what resolves an opponent's
@@ -2234,14 +2312,17 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
 
+    asked = []
+
     def refuses(limit: int, known: set) -> dict:
         """A listing that fails, the way a rate-limited one does."""
+        asked.append(1)
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.harvest, "vendored", refuses)
     before = dict(campaign.pool.opponents)
 
-    assert asyncio.run(_a_pass(campaign.harvesting()))
+    assert asyncio.run(_a_pass(campaign.harvesting(), lambda: len(asked) > 1))
 
     assert campaign.pool.opponents == before
 
@@ -2269,7 +2350,7 @@ def test_the_campaign_reloads_the_games_it_lost(
     monkeypatch.setattr(loop.losses, "refresh", loads)
     monkeypatch.setattr(loop.losses, "deficit", dict)
 
-    asyncio.run(_a_pass(campaign.losing()))
+    asyncio.run(_a_pass(campaign.losing(), lambda: passes))
 
     assert passes
 
@@ -2286,14 +2367,17 @@ def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
 
+    asked = []
+
     def refuses() -> int:
         """A listing that fails, the way a rate-limited one does."""
+        asked.append(1)
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.losses, "refresh", refuses)
     monkeypatch.setattr(loop.losses, "deficit", dict)
 
-    assert asyncio.run(_a_pass(campaign.losing()))
+    assert asyncio.run(_a_pass(campaign.losing(), lambda: len(asked) > 1))
 
 
 def test_where_the_losses_are_decided_reaches_the_run(
@@ -2322,7 +2406,12 @@ def test_where_the_losses_are_decided_reaches_the_run(
     }
     monkeypatch.setattr(loop.losses, "deficit", lambda: where)
 
-    asyncio.run(_a_pass(campaign.losing()))
+    asyncio.run(
+        _a_pass(
+            campaign.losing(),
+            lambda: any("losses/games" in record for _, record in records),
+        )
+    )
 
     logged = [record for _, record in records if "losses/games" in record]
     assert logged, "the gap has to reach wandb to be worth measuring"
@@ -2331,6 +2420,52 @@ def test_where_the_losses_are_decided_reaches_the_run(
     # corpus and not the delta: an hour with no new losses is still an hour a
     # promotion has to be read against.
     assert logged[0]["losses/gap_day10"] > 0
+
+
+def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:
+    """The record says what changed, not only what it scored.
+
+    Every promotion's change was rendered for the prompt by reading the
+    champion files back and diffing them; the four hundred and fifty edits that
+    were measured and refused were described nowhere. The moment a program is
+    stored is the only one where both plans are already files, so that is where
+    the sentence is written.
+    """
+    from tests.campaign.test_plan import PLAN, packed
+
+    parent = tmp_path / "parent.py"
+    parent.write_text(packed(PLAN), encoding="utf-8")
+    # Through JSON, which is the trip a plan makes anyway and leaves the
+    # literal's mixed value types behind.
+    flipped = json.loads(json.dumps(PLAN))
+    flipped["settings"]["front_run"] = True
+    child = tmp_path / "child.py"
+    child.write_text(packed(flipped), encoding="utf-8")
+
+    said = loop._changed(child, parent)
+
+    assert said and said != "the plan is unchanged"
+    assert "front_run" in said
+
+
+def test_a_program_whose_parent_carries_no_plan_records_nothing(
+    tmp_path: Path,
+) -> None:
+    """Empty rather than a crash: a scored program must never be lost to a sentence.
+
+    The seed has no parent, programs before champion_17 carry no packed plan,
+    and a round can rewrite the controller into something `split` refuses. None
+    of those is a failed evaluation.
+    """
+    from tests.campaign.test_plan import PLAN, packed
+
+    bare = tmp_path / "bare.py"
+    bare.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
+    child = tmp_path / "child.py"
+    child.write_text(packed(PLAN), encoding="utf-8")
+
+    assert loop._changed(child, bare) == ""
+    assert loop._changed(child, None) == ""
 
 
 def test_a_round_is_given_its_parent_and_a_way_to_play(
@@ -2386,7 +2521,13 @@ def test_a_round_is_given_its_parent_and_a_way_to_play(
         )
 
     assert seen["files"] == sorted(
-        [Inspect.SKILLS_DIRS[0].parts[0], "child.py", "measure.py", "parent.py"]
+        [
+            Inspect.SKILLS_DIRS[0].parts[0],
+            "attempts.jsonl",
+            "child.py",
+            "measure.py",
+            "parent.py",
+        ]
     )
     # The skills go where the driving program looks for them: `.codex/skills`
     # under codex's working directory, `.agents` for agy to walk up to.
@@ -2471,12 +2612,27 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
         assert len(set(block) | set(campaign.duel)) == config.DUEL_SEEDS
 
 
-async def _a_pass(timer: Coroutine[None, None, None]) -> bool:
-    """Run one of the loop's timers long enough to take its passes, then stop it.
+async def _a_pass(
+    timer: Coroutine[None, None, None], until: Callable[[], object]
+) -> bool:
+    """Run one of the loop's timers until ``until`` holds, then stop it.
 
     Both timers -- the harvest and the loss refresh -- loop forever on an
     interval a test sets to zero, so this drives one and cancels it the way
     `drive` does.
+
+    Waits for what the test is waiting *for*, rather than yielding the event
+    loop a fixed number of times. It used to do the latter, 50 turns of
+    `sleep(0)`, which is not a wait at all: both timers do their work in
+    `to_thread`, so whether the thread had finished by the fiftieth yield was a
+    question about how busy the machine was. It held here and failed on a CI
+    runner, which is the worst way to learn it -- a test that passes on the
+    author's box and fails on somebody else's teaches the wrong lesson twice.
+
+    Args:
+        timer: The coroutine to drive.
+        until: Checked between turns; the pass is over when it is truthy. The
+            deadline exists only so a broken timer fails instead of hanging.
 
     Returns:
         Whether it was still going when it was stopped, which is what a test
@@ -2484,9 +2640,10 @@ async def _a_pass(timer: Coroutine[None, None, None]) -> bool:
         exception out is finished, and the campaign ended with it.
     """
     task = asyncio.ensure_future(timer)
-    for _ in range(50):
-        await asyncio.sleep(0)
-        if task.done():
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        if task.done() or until():
             break
     alive = not task.done()
     task.cancel()

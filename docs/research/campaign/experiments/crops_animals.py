@@ -12,11 +12,46 @@ TPD = 24
 
 def crop_constants() -> dict[str, dict[str, object]]:
     expected = {
-        "WHEAT": {"seed": 10, "first_yield_day": 2, "max_yield_day": 4, "interval": 0, "max_yield": 6, "ongoing": False},
-        "CARROT": {"seed": 20, "first_yield_day": 2, "max_yield_day": 3, "interval": 0, "max_yield": 4, "ongoing": False},
-        "TOMATO": {"seed": 50, "first_yield_day": 8, "max_yield_day": 8, "interval": 1, "max_yield": 4, "ongoing": True},
-        "STRAWBERRY": {"seed": 100, "first_yield_day": 10, "max_yield_day": 10, "interval": 2, "max_yield": 4, "ongoing": True},
-        "MELON": {"seed": 80, "first_yield_day": 10, "max_yield_day": 12, "interval": 0, "max_yield": 6, "ongoing": False},
+        "WHEAT": {
+            "seed": 10,
+            "first_yield_day": 2,
+            "max_yield_day": 4,
+            "interval": 0,
+            "max_yield": 6,
+            "ongoing": False,
+        },
+        "CARROT": {
+            "seed": 20,
+            "first_yield_day": 2,
+            "max_yield_day": 3,
+            "interval": 0,
+            "max_yield": 4,
+            "ongoing": False,
+        },
+        "TOMATO": {
+            "seed": 50,
+            "first_yield_day": 8,
+            "max_yield_day": 8,
+            "interval": 1,
+            "max_yield": 4,
+            "ongoing": True,
+        },
+        "STRAWBERRY": {
+            "seed": 100,
+            "first_yield_day": 10,
+            "max_yield_day": 10,
+            "interval": 2,
+            "max_yield": 4,
+            "ongoing": True,
+        },
+        "MELON": {
+            "seed": 80,
+            "first_yield_day": 10,
+            "max_yield_day": 12,
+            "interval": 0,
+            "max_yield": 6,
+            "ongoing": False,
+        },
     }
     assert engine.CROPS == expected
     return expected
@@ -24,9 +59,21 @@ def crop_constants() -> dict[str, dict[str, object]]:
 
 def one_time_water_windows() -> dict[str, object]:
     expected = {
-        "WHEAT": {"productive_water_ages": [2, 3, 4], "plain_yield_by_age": [1, 1, 2, 3, 4], "fertilized_cap_age": 4},
-        "CARROT": {"productive_water_ages": [2, 3], "plain_yield_by_age": [1, 1, 2, 3], "fertilized_cap_age": 3},
-        "MELON": {"productive_water_ages": [6, 7, 8, 9, 10], "plain_yield_by_age": [1, 1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 6, 6], "fertilized_cap_age": 8},
+        "WHEAT": {
+            "productive_water_ages": [2, 3, 4],
+            "plain_yield_by_age": [1, 1, 2, 3, 4],
+            "fertilized_cap_age": 4,
+        },
+        "CARROT": {
+            "productive_water_ages": [2, 3],
+            "plain_yield_by_age": [1, 1, 2, 3],
+            "fertilized_cap_age": 3,
+        },
+        "MELON": {
+            "productive_water_ages": [6, 7, 8, 9, 10],
+            "plain_yield_by_age": [1, 1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 6, 6],
+            "fertilized_cap_age": 8,
+        },
     }
     result: dict[str, object] = {}
     for crop in ("WHEAT", "CARROT", "MELON"):
@@ -54,7 +101,9 @@ def one_time_water_windows() -> dict[str, object]:
         tile = farm["tiles"][4][4]
         window_start = (data["max_yield_day"] + 1) // 2
         private["inventories"][0]["FERTILIZER"] = 1
-        engine._apply_unit_action(farm, private, 0, ["FERTILIZE"], 10, window_start, TPD, 100)
+        engine._apply_unit_action(
+            farm, private, 0, ["FERTILIZE"], 10, window_start, TPD, 100
+        )
         cap_age = None
         for age in range(window_start, data["max_yield_day"] + 1):
             tile["watered_today"] = False
@@ -135,9 +184,30 @@ def watering_and_decay() -> dict[str, object]:
 
 def animal_constants() -> dict[str, dict[str, object]]:
     expected = {
-        "GOOSE": {"cost": 300, "structure": "COOP", "first_yield_day": 4, "interval": 1, "max_held": 4, "product": "EGG"},
-        "COW": {"cost": 400, "structure": "PASTURE", "first_yield_day": 8, "interval": 2, "max_held": 6, "product": "MILK"},
-        "SHEEP": {"cost": 500, "structure": "PASTURE", "first_yield_day": 6, "interval": 3, "max_held": 6, "product": "WOOL"},
+        "GOOSE": {
+            "cost": 300,
+            "structure": "COOP",
+            "first_yield_day": 4,
+            "interval": 1,
+            "max_held": 4,
+            "product": "EGG",
+        },
+        "COW": {
+            "cost": 400,
+            "structure": "PASTURE",
+            "first_yield_day": 8,
+            "interval": 2,
+            "max_held": 6,
+            "product": "MILK",
+        },
+        "SHEEP": {
+            "cost": 500,
+            "structure": "PASTURE",
+            "first_yield_day": 6,
+            "interval": 3,
+            "max_held": 6,
+            "product": "WOOL",
+        },
     }
     assert engine.ANIMALS == expected
     return expected
@@ -227,13 +297,15 @@ def animal_care_feed_and_fertilizer() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    emit({
-        "engine": assert_exact_engine(),
-        "crops": crop_constants(),
-        "one_time_crops": one_time_water_windows(),
-        "ongoing_crops": ongoing_schedules(),
-        "plant_health": watering_and_decay(),
-        "animals": animal_constants(),
-        "animal_schedules": animal_schedules(),
-        "animal_care_feed_fertilizer": animal_care_feed_and_fertilizer(),
-    })
+    emit(
+        {
+            "engine": assert_exact_engine(),
+            "crops": crop_constants(),
+            "one_time_crops": one_time_water_windows(),
+            "ongoing_crops": ongoing_schedules(),
+            "plant_health": watering_and_decay(),
+            "animals": animal_constants(),
+            "animal_schedules": animal_schedules(),
+            "animal_care_feed_fertilizer": animal_care_feed_and_fertilizer(),
+        }
+    )

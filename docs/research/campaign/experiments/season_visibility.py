@@ -42,9 +42,13 @@ def config_defaults() -> dict[str, object]:
 def timing_boundaries() -> dict[str, object]:
     env = new_env(seed=1, weedSpawnChance=0)
     env.reset(2)
-    samples = [{"recorded_step": env.state[0].observation.step,
-                "day": env.state[0].observation.day,
-                "hour": env.state[0].observation.hour}]
+    samples = [
+        {
+            "recorded_step": env.state[0].observation.step,
+            "day": env.state[0].observation.day,
+            "hour": env.state[0].observation.hour,
+        }
+    ]
     for _ in range(25):
         env.step([PASS, PASS])
         step = env.state[0].observation.step
@@ -64,10 +68,12 @@ def timing_boundaries() -> dict[str, object]:
 def end_of_day_reset() -> dict[str, object]:
     env = new_env(seed=1, weedSpawnChance=0)
     env.reset(2)
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [["HIRE"]]},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": [["HIRE"]]},
+            PASS,
+        ]
+    )
     farm = env.state[0].observation.farms[0]
     private = env.state[0].observation.private
     private.inventories[0]["WHEAT"] = 2
@@ -106,14 +112,21 @@ def visibility() -> dict[str, object]:
     assert o0.private is not o1.private
     assert "private" not in o0.farms[1]
     assert set(o0.farms[1].keys()) == {
-        "money", "tiles", "farmer", "hands", "unlocked_quadrants", "hires_today"
+        "money",
+        "tiles",
+        "farmer",
+        "hands",
+        "unlocked_quadrants",
+        "hires_today",
     }
     assert set(o0.private.keys()) == {"shed", "seeds", "inventories"}
     assert "step" in o0 and "step" not in o1
-    env.step([
-        {"farmer": ["PASS"], "hands": [], "market": [["BUY_SEED", "WHEAT", 1]]},
-        PASS,
-    ])
+    env.step(
+        [
+            {"farmer": ["PASS"], "hands": [], "market": [["BUY_SEED", "WHEAT", 1]]},
+            PASS,
+        ]
+    )
     assert env.state[0].observation.farms == env.state[1].observation.farms
     assert env.state[0].observation.private != env.state[1].observation.private
     return {
@@ -139,7 +152,9 @@ def full_episode() -> dict[str, object]:
     def agent1(observation, configuration):
         calls[1] += 1
         # Seat 1 has no framework-added `step`; shared day/hour are reliable.
-        seen_steps[1].append(observation.day * configuration.turnsPerDay + observation.hour)
+        seen_steps[1].append(
+            observation.day * configuration.turnsPerDay + observation.hour
+        )
         return PASS
 
     env = new_env(seed=1, weedSpawnChance=0)
@@ -170,11 +185,13 @@ def full_episode() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    emit({
-        "engine": assert_exact_engine(),
-        "configuration": config_defaults(),
-        "timing": timing_boundaries(),
-        "end_of_day": end_of_day_reset(),
-        "visibility": visibility(),
-        "episode": full_episode(),
-    })
+    emit(
+        {
+            "engine": assert_exact_engine(),
+            "configuration": config_defaults(),
+            "timing": timing_boundaries(),
+            "end_of_day": end_of_day_reset(),
+            "visibility": visibility(),
+            "episode": full_episode(),
+        }
+    )

@@ -196,6 +196,44 @@ def test_the_opponent_is_recorded_by_roster_name(scratch: str) -> None:
     assert teams == "0\tv54\n1\tprobe"
 
 
+@live
+def test_a_programs_games_come_back_off_the_record_as_they_were_written(
+    scratch: str,
+) -> None:
+    """`recorded` is the inverse of `record`, seat and numbering included.
+
+    A result serialises without its games, so a champion loaded on restart
+    has none and the game a round is shown has to come from here. Seat 1 and
+    two matchups, so the assertions pin which bank is whose and that the
+    matchup and season numbers `record` assigned are the ones that come back
+    -- a round's episode key is built from them.
+    """
+    games.record(
+        "probe",
+        [
+            (7, 1, "probe", game([day(0, 5.0, 3.0)], seat=1)),
+            (7, 2, "probe", game([day(0, 2.0, 9.0)], seat=0)),
+            (3, 1, "probe", game([day(0, 4.0, 4.0)], seat=1)),
+        ],
+        scratch,
+    )
+
+    back = games.recorded("probe", scratch)
+
+    assert [(matchup, season) for matchup, season, _ in back] == [
+        (3, 1),
+        (7, 1),
+        (7, 2),
+    ]
+    first = back[1][2]
+    assert first.seat == 1 and first.opponent == "v54" and first.seed == 101
+    assert (first.ours, first.theirs) == (5.0, 3.0), "seat 1's bank is ours"
+    second = back[2][2]
+    assert second.seat == 0 and (second.ours, second.theirs) == (2.0, 9.0)
+    assert all(one.days == [] for _, _, one in back), "days are rows, not cargo"
+    assert games.recorded("nobody", scratch) == []
+
+
 def test_a_name_carrying_a_tab_cannot_shift_the_columns() -> None:
     """TabSeparated's delimiters are the escape's whole reason.
 

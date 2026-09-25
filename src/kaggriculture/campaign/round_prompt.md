@@ -46,6 +46,14 @@ board:
 - `settings` switches the chassis's nine reactive layers on and off. The
   controller's own table names them and says what each one hooks into.
 
+`attempts.jsonl` beside them is every program this campaign has ever written,
+one JSON object per line: `id`, the `from` it was edited from, what it
+`changed` in the plan, its `wins` and `margin` against the pool, whether it was
+`promoted`, and its `rates` against each opponent by name. It is not read to
+you and it is not a suggestion; it is the record, for the question you bring to
+it -- whether an edit like the one you have in mind has been measured before,
+and against which agent it helped. `grep` it.
+
 So there are two kinds of edit. Changing a pooled step changes that step
 everywhere every season cites it. Changing a season's indices changes the order
 without touching a step. Both are real edits; neither is the other.

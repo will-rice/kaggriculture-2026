@@ -323,11 +323,7 @@ def test_the_seed_passes_the_gate_it_will_be_measured_by(
     importable; and it has to load and play inside Kaggle's own per-call second
     like anything else. Either failing is a campaign that seeds and then
     rejects every child it has.
-
-    The seed is handed in because that is what a cold start does -- it
-    copies the seed into the run and validates against that copy --
-    rather than leaning on whatever the box is running today.
     """
-    verdict = validate.validate(config.SEED, seed=config.SEED)
+    verdict = validate.validate(config.SEED)
 
     assert verdict.status == "ok", verdict.reason

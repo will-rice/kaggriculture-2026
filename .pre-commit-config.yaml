@@ -28,7 +28,7 @@ repos:
       - id: ty
         name: ty
         language: system
-        entry: uv run ty check src tests main.py
+        entry: uv run ty check src tests
         files: ^(src|tests)/.*\.py$|^[^/]*\.py$
         pass_filenames: false
       # The Rust engine is linted like the Python: formatting, then clippy

@@ -52,6 +52,17 @@ class Program(BaseModel):
             program from before there was one.
         margins: Fast-evaluation bank margin per pool opponent. Defaulted,
             so a program written before margins existed still loads.
+        changed: What this edit did to the plan, as `plan.described` renders
+            it, or "" when nothing computed it -- the seed, a program from
+            before this field, or a child whose parent carries no packed plan.
+
+            The score was the only thing kept about an attempt, and a score
+            says an edit was worth keeping without saying what it was. Every
+            promotion's change was rendered for the prompt by reading the
+            champion files back and diffing them, so the thirty-nine that
+            worked were described and the four hundred and fifty that did not
+            were described nowhere. Recorded here because the moment a program
+            is stored is the only one where both plans are already in hand.
         created: Unix timestamp.
     """
 
@@ -66,6 +77,7 @@ class Program(BaseModel):
     place: int = 0
     rates: dict[str, float] = {}
     margins: dict[str, Margin] = {}
+    changed: str = ""
     created: float
 
 
@@ -104,6 +116,7 @@ class Database:
         self.programs_dir = programs_dir
         self._programs: dict[str, Program] = {}
         self._failures: list[Failure] = []
+        self._promoted: dict[str, str] = {}
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 self._apply(json.loads(line), persist=False)
@@ -134,6 +147,10 @@ class Database:
             self._programs[program.id] = program
         elif kind == "failure":
             self._failures.append(Failure.model_validate(event["failure"]))
+        elif kind == "promotion":
+            if event["id"] not in self._programs:
+                raise ValueError(f"promotion of an unknown program: {event['id']!r}")
+            self._promoted[event["id"]] = event["name"]
         else:
             raise ValueError(f"unknown database event: {kind!r}")
         if persist:
@@ -145,6 +162,57 @@ class Database:
     def programs(self) -> list[Program]:
         """Every program, in the order it was added."""
         return list(self._programs.values())
+
+    def attempts(self, path: Path) -> int:
+        """Write every attempt and what it did, one JSON object per line.
+
+        The whole campaign as something a round can grep. It has been told what
+        its own siblings scored and what the promotions changed, which is a few
+        dozen edits out of four hundred and eighty-nine; the rest -- every
+        change measured and refused -- was on the record and reachable by
+        nothing.
+
+        A file rather than more of the message, and that is the point. Four
+        hundred attempts would not fit in a round's budget, and a round pays for
+        what it reads: this costs nothing until a question calls for it. It is
+        also not an example. Worked examples in the prompt become the subject --
+        forty-six of forty-six queries went where the one worked query pointed
+        -- where a file answers the question the round brought to it.
+
+        The opponent names come too. They are already in `games.days` and
+        `games.episodes` by roster name, which a round queries, so withholding
+        them here would buy nothing and cost the one question worth asking of
+        this file: whether an edit helped against the agent that beats us.
+
+        Args:
+            path: Where to write it.
+
+        Returns:
+            How many attempts were written.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as out:
+            for program in self._programs.values():
+                out.write(
+                    json.dumps(
+                        {
+                            "id": program.id,
+                            "from": program.started_from,
+                            "instruction": program.instruction,
+                            "changed": program.changed,
+                            "wins": round(program.fitness, 4),
+                            "margin": round(mean_margin(program)),
+                            "promoted": program.id in self._promoted,
+                            "rates": {
+                                name: round(rate, 3)
+                                for name, rate in program.rates.items()
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+        return len(self._programs)
 
     def store(self, source: str, program_id: str) -> Path:
         """Write `source` to `programs_dir/<program_id>.py` and return its path."""
@@ -164,6 +232,25 @@ class Database:
     def record_failure(self, failure: Failure) -> None:
         """Record an attempt that produced no program."""
         self._apply({"event": "failure", "failure": failure.model_dump()})
+
+    def promoted_as(self, program_id: str, name: str) -> None:
+        """Record that `program_id` became the champion the pool knows as `name`.
+
+        The archive is the record of every attempt, and which of them survived
+        a gate is the one fact about an attempt worth more than its score. It
+        was recoverable only by diffing the champion files against every stored
+        source, because `gate.promote` copies a program to `champion_N.py` and
+        keeps no id. An event, like the rest, so a replay knows it too.
+
+        Raises:
+            ValueError: The archive holds no such program.
+        """
+        self._apply({"event": "promotion", "id": program_id, "name": name})
+
+    @property
+    def promoted(self) -> dict[str, str]:
+        """Every program that became a champion, by id, to the name it took."""
+        return dict(self._promoted)
 
     def top(self, k: int) -> list[Program]:
         """Return the `k` best programs, best first: most games won.

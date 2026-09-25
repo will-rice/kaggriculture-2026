@@ -73,7 +73,7 @@ def _refuse_a_shadowed_entrypoint(entrypoint: Path) -> None:
         RuntimeError: If the entrypoint fails any check, the shadowed-agent
             check included.
     """
-    verdict = validate.validate(entrypoint, seed=config.LIVE.seed_program)
+    verdict = validate.validate(entrypoint)
     if verdict.status != "ok":
         raise RuntimeError(
             f"{entrypoint} must not ship: {verdict.status}: {verdict.reason}"

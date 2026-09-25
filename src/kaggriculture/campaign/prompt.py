@@ -25,13 +25,13 @@ build order below for what happened when it did.
 import ast
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 from kaggriculture.campaign import (
     archive,
     config,
     harness,
-    plan,
     validate,
 )
 
@@ -345,41 +345,26 @@ def _failure_lines(name: str, failures: list[archive.Failure]) -> list[str]:
     return lines
 
 
-def _kept_lines(champions: Path) -> list[str]:
+def _kept_lines(kept: list[tuple[str, str]]) -> list[str]:
     """What every promotion before this one changed in the plan.
 
     A round is told what its siblings scored and never what they did, so the
     shape of an edit that worked has to be rediscovered each time. These are the
     changes that survived a gate, in the terms a round would make them in.
 
+    From the record. This used to read every champion file back, split each and
+    diff it against the one before -- 39 programs of 869 KB, every round, to
+    recompute sentences the archive now carries as `Program.changed` from the
+    moment each program was stored.
+
     Args:
-        champions: The directory every promoted program is written to.
+        kept: ``(name, changed)`` per promotion, oldest first, as the archive
+            records them.
 
     Returns:
         The lines to render, or nothing when no promotion has moved the plan.
     """
-    if not champions.is_dir():
-        return []
-    chain = sorted(
-        champions.glob("champion_*.py"),
-        # Guarded because the glob does not promise a number, even though
-        # every name it matches has one.
-        key=lambda path: (
-            int(found.group(1)) if (found := re.search(r"(\d+)", path.name)) else 0
-        ),
-    )
-    said: list[str] = []
-    before = None
-    for path in chain:
-        source = path.read_text(encoding="utf-8")
-        if not plan.carries(source):
-            continue
-        _, after = plan.split(source)
-        if before is not None:
-            moved = plan.described(before, after)
-            if moved != "the plan is unchanged":
-                said.append(f"- {path.stem}: {moved}")
-        before = after
+    said = [f"- {name}: {changed}" for name, changed in kept if changed]
     if not said:
         return []
     return [
@@ -392,7 +377,9 @@ def _kept_lines(champions: Path) -> list[str]:
     ]
 
 
-def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> list[str]:
+def _tried_lines(
+    name: str, rate: float, margin: float, siblings: list[archive.Program]
+) -> list[str]:
     """Render the edits already made to this program and what they scored.
 
     A round is a fresh call that remembers nothing of the ones before it, so
@@ -427,6 +414,11 @@ def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> lis
         name: The program in ``child.py``, by name.
         rate: Its mean win rate over the opponents it was measured on, so the
             deltas below have something to be deltas from.
+        margin: Its mean final bank margin over the same opponents. The win
+            rate says how often; the margin says by how much, and it is the
+            measure with resolution -- over the last sixty programs the win
+            rate took 37 distinct values and the margin 55 -- and one of the
+            two the gate promotes on.
         siblings: Programs written from it, best first, already copied into the
             round's directory as ``tried_1.py`` and so on.
 
@@ -436,21 +428,26 @@ def _tried_lines(name: str, rate: float, siblings: list[archive.Program]) -> lis
     lines = [
         f"## Edits already tried on `{name}`",
         "",
-        f"`child.py` wins {rate:.3f} of its games against the pool. These "
-        "programs were written from it and played, best first, and each one is "
-        "in your directory:",
+        f"`child.py` wins {rate:.3f} of its games against the pool, by "
+        f"{margin:+,.0f} coins a game. These programs were written from it and "
+        "played, best first, and each one is in your directory:",
         "",
     ]
     for number, program in enumerate(siblings[:RECENT_ATTEMPTS], start=1):
+        banked = archive.mean_margin(program)
         lines.append(
             f"- `tried_{number}.py` scored {program.fitness:.3f} "
-            f"({program.fitness - rate:+.3f})"
+            f"({program.fitness - rate:+.3f}), margin {banked:+,.0f} "
+            f"({banked - margin:+,.0f})"
         )
     lines += [
         "",
         "Diff them against `child.py` to see what each one changed. A better "
         "score is a direction to go further in; a worse one is a direction "
-        "already measured and lost.",
+        "already measured and lost. The gate promotes on the margin and the "
+        "head-to-head, so of the two numbers the margin is the one that "
+        "decides; the win rate stops moving once a program beats most of the "
+        "pool, and the margin does not.",
     ]
     return lines
 
@@ -529,11 +526,12 @@ def compose(
     name: str,
     played: tuple[int, int, harness.Game] | None,
     rate: float,
+    margin: float,
     failures: list[archive.Failure],
     siblings: list[archive.Program],
     instruction: str,
     source: str = "",
-    champions: Path | None = None,
+    kept: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Compose the message for one round.
 
@@ -549,6 +547,8 @@ def compose(
             season and the game itself. None before there is an evaluation.
         rate: The program's mean win rate over the opponents it was measured
             on, which is the number the edits below are deltas from.
+        margin: Its mean final bank margin over the same opponents, the other
+            number they are deltas from and the one the gate promotes on.
         failures: Every failure the ledger holds against that program, oldest
             first. The caller hands over what it has and this cuts it to the
             last few, so a caller cannot forget to.
@@ -559,9 +559,10 @@ def compose(
             prepended.
         source: The program in ``child.py``, so the message can show which days
             of the season it has already decided. Empty renders no section.
-        champions: Where every promoted program is written, so the message can
-            say what each promotion changed in the plan rather than only what
-            it scored. None renders no section.
+        kept: ``(name, changed)`` for every promotion, oldest first, as the
+            archive records them, so the message can say what each promotion
+            changed in the plan rather than only what it scored. Empty renders
+            no section.
 
     Returns:
         The whole message, for codex's standard input.
@@ -571,9 +572,9 @@ def compose(
     # reads every round. The template puts each on its own line, so an empty
     # one leaves no gap.
     section = _game_lines(name, played)
-    tried = _tried_lines(name, rate, siblings) if siblings else []
+    tried = _tried_lines(name, rate, margin, siblings) if siblings else []
     committed = _schedule_lines(source) if source else []
-    kept = _kept_lines(champions) if champions else []
+    worked = _kept_lines(list(kept)) if kept else []
     message = ROUND.render(
         task=TASK_PROMPT.read_text(encoding="utf-8").rstrip("\n"),
         imports=IMPORTS,
@@ -581,7 +582,7 @@ def compose(
         tried="\n".join(tried) + "\n" if tried else "",
         failures="\n".join(_failure_lines(name, failures)) + "\n" if failures else "",
         schedule="\n".join(committed) + "\n" if committed else "",
-        kept="\n".join(kept) + "\n" if kept else "",
+        kept="\n".join(worked) + "\n" if worked else "",
         instruction=instruction,
     )
     LOGGER.info(

@@ -1,9 +1,11 @@
-"""Parse every recorded game once into SQLite, so a question costs a query.
+"""Parse every recorded game once into the games database, so a question costs a query.
 
 Everything the tapes hold, at the resolution it is held: one row per game,
 one per (game, seat, day), one per non-zero holding, one per market order and
-one per farmer or hand command. Rebuilt rather than appended to, because a
-half-built dataset that looks complete is worse than none.
+one per farmer or hand command. The ladder partition is replaced rather than
+appended to, because a half-built dataset that looks complete is worse than
+none; the campaign's own games and the live losses sit in other partitions
+and are not touched.
 
 Aggregate only: this reads public replays and writes counts. No opponent's
 source is read and no path of theirs appears in what it writes.
@@ -12,13 +14,12 @@ Run from the repository root::
 
     uv run extract-corpus
 
-Then ask it things::
+Then ask it things, the way a round does::
 
-    sqlite3 /data/kaggriculture/corpus.sqlite
-    sqlite> SELECT verb, item, sum(quantity) FROM orders GROUP BY 1, 2;
+    curl -s http://127.0.0.1:8123 --data-binary "select verb, item,
+      sum(quantity) from games.orders group by 1, 2"
 
-Re-run it when new archives land. It takes about as long as one pass of
-`strategies` and replaces every later pass of anything.
+Re-run it when new archives land.
 """
 
 import argparse

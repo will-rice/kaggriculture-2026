@@ -510,6 +510,58 @@ def played(
     ]
 
 
+def recorded(
+    name: str, database: str = DATABASE
+) -> list[tuple[int, int, harness.Game]]:
+    """One program's games back off the record, keyed the way they were written.
+
+    The inverse of `played` for a result that has been through the disk. A
+    result serialises without its games -- twelve thousand of them, with day
+    tables, is what made `state.json` 688 MB -- so a champion loaded on
+    restart has none, and the game a round is shown has to come from here.
+    The games are already here: `record` wrote them, matchup and season
+    numbered, the moment the program was scored.
+
+    Args:
+        name: The program whose games these are.
+        database: Which database to read.
+
+    Returns:
+        ``(matchup, season, game)`` per game, in matchup then season order,
+        with the game's day table empty: the days are rows a round queries,
+        not a thing the message carries.
+    """
+    quoted = name.replace("'", "")
+    rows = query(
+        "select c.matchup, c.season, c.seat, e.seed, e.team_0, e.team_1, "
+        f"e.bank_0, e.bank_1 from {database}.candidate as c "
+        f"join {database}.episodes as e on c.episode = e.episode "
+        f"where c.team = '{quoted}' and c.source = 'campaign' "
+        "order by c.matchup, c.season format TabSeparated"
+    )
+    out = []
+    for line in rows.splitlines():
+        matchup, season, seat, seed, team_0, team_1, bank_0, bank_1 = line.split("\t")
+        mine = int(seat)
+        banks = (float(bank_0), float(bank_1))
+        teams = (team_0, team_1)
+        out.append(
+            (
+                int(matchup),
+                int(season),
+                harness.Game(
+                    opponent=teams[1 - mine],
+                    seed=int(seed),
+                    seat=mine,
+                    ours=banks[mine],
+                    theirs=banks[1 - mine],
+                    worst_step_seconds=0.0,
+                ),
+            )
+        )
+    return out
+
+
 def record(
     name: str,
     played: Sequence[tuple[int, int, str, harness.Game]],
