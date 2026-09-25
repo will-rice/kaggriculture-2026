@@ -297,12 +297,19 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             program_id=program_id,
             fitness=rate,
             rates=dict.fromkeys(names, rate),
-            # A measured margin, because promotion now asks whether beating
-            # the champion was shown rather than by how much: a mean inside
-            # its own error refuses, and a zero error reads as unmeasured.
+            # A measured margin, because promotion asks whether beating the
+            # champion was shown rather than by how much: a mean inside its
+            # own error refuses, and a zero error reads as unmeasured. It
+            # tracks the score, as a real evaluation's does -- a program that
+            # wins more banks more.
             margins=dict.fromkeys(
                 names,
-                harness.Margin(mean=5000.0, worst=0.0, best=9000.0, error=500.0),
+                harness.Margin(
+                    mean=5_000.0 + 10_000.0 * rate,
+                    worst=0.0,
+                    best=9_000.0,
+                    error=500.0,
+                ),
             ),
             intervals=dict.fromkeys(names, (0.0, 1.0)),
             # Every game decided. A stub that left this empty would be a

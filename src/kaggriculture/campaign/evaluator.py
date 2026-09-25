@@ -32,6 +32,12 @@ from kaggriculture.campaign import config, harness
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
 
+# A rate at or above this is a sweep: every game of that pairing was won, or
+# the one that was not was a draw. Not 1.0 exactly, because a rate is a mean
+# over both seats and a float, and a pairing decided 32-0 can arrive as
+# 0.9999999999999999.
+SWEPT = 0.999
+
 
 class Result(BaseModel):
     """The measurement, and the only one there is.
@@ -111,20 +117,36 @@ class Result(BaseModel):
     states: dict[str, list[harness.Game]] = Field(default_factory=dict, exclude=True)
 
     def beats(self, other: "Result") -> bool:
-        """Whether this banked more than ``other`` over what both played.
+        """Whether this is the better program over what both played.
 
-        The mean bank margin over the shared opponents, then the win rate
-        over them, the order `Database.top` ranks in and for the same reason:
-        a program that wins the same games by more is an improvement, and
-        against a pool it already beats the rate cannot say so. A session
-        continues from whichever of its rounds banked the most.
+        Winning is the objective, so the win rate decides: a higher rate over
+        the shared opponents is the better program and a lower one never is,
+        whatever it banked. Measured over the 277 parent/child pairs on record
+        2026-09-25, 25 children were behind on the rate while banking more,
+        one of them giving up 0.130 of rate for 5,246 coins, and a margin-led
+        comparison continued from every one of them.
 
-        The shared opponents rather than the whole pool, because the pool
-        grows while a session runs -- harvest enrolled one at 14:01 on
-        2026-09-13, mid-session -- and a mean over a pool that gained an
-        agent is not the same number as a mean over the pool before it.
+        No tolerance around that, and the reason is the case the margin is
+        here for. An edit that banks more against an opponent this program
+        already sweeps does not change a single rate -- every pairing it swept
+        it still sweeps -- so the rates tie exactly and the bank decides
+        without anything having to judge what counts as a real difference. A
+        threshold would only ever rule on rate changes that did happen, and
+        `gate.promotion` already carries the note on why a fixed one cannot
+        answer a quantity that varies with the draw.
 
-        Ties go to ``other``. Two programs that bank the same against everyone
+        When the rates tie, the bank margin over the opponents they **both
+        sweep** decides. That set is exactly where winning more often is not
+        on offer -- the champion sweeps 171 of 194 -- so banking more there is
+        the only improvement a rate can never see, and it reads as the
+        program's own economy rather than as a matchup.
+
+        The shared opponents rather than the whole pool, because the pool grows
+        while a session runs -- harvest enrolled one at 14:01 on 2026-09-13,
+        mid-session -- and a mean over a pool that gained an agent is not the
+        same number as a mean over the pool before it.
+
+        Ties go to ``other``. Two programs that win as often and bank the same
         are the same program however their sources differ, and there is no
         reason to move onto one of them.
 
@@ -139,15 +161,23 @@ class Result(BaseModel):
         common = sorted(set(self.rates) & set(other.rates))
         if not common:
             return False
-        mine = (
-            sum(self.margins[one].mean for one in common) / len(common),
-            sum(self.rates[one] for one in common) / len(common),
-        )
-        theirs = (
-            sum(other.margins[one].mean for one in common) / len(common),
-            sum(other.rates[one] for one in common) / len(common),
-        )
-        return mine > theirs
+        mine = _mean({one: self.rates[one] for one in common})
+        theirs = _mean({one: other.rates[one] for one in common})
+        if mine != theirs:
+            return mine > theirs
+        # The same games won. The opponents both sweep, or -- before anything
+        # is swept, which is where a young lineage lives -- everything they
+        # played, because then the bank is the whole of the signal: the first
+        # run's record went from -119,258 to -8,444 with the rate flat at
+        # nothing.
+        swept = [
+            one
+            for one in common
+            if self.rates[one] >= SWEPT and other.rates[one] >= SWEPT
+        ] or common
+        banked = _mean({one: self.margins[one].mean for one in swept})
+        against = _mean({one: other.margins[one].mean for one in swept})
+        return banked > against
 
 
 def _mean(rates: dict[str, float]) -> float:
