@@ -2267,6 +2267,7 @@ def test_the_campaign_reloads_the_games_it_lost(
         return 1
 
     monkeypatch.setattr(loop.losses, "refresh", loads)
+    monkeypatch.setattr(loop.losses, "deficit", dict)
 
     asyncio.run(_a_pass(campaign.losing()))
 
@@ -2290,8 +2291,46 @@ def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
         raise RuntimeError("kaggle said no")
 
     monkeypatch.setattr(loop.losses, "refresh", refuses)
+    monkeypatch.setattr(loop.losses, "deficit", dict)
 
     assert asyncio.run(_a_pass(campaign.losing()))
+
+
+def test_where_the_losses_are_decided_reaches_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """The figures are logged, which is the only place they are read.
+
+    They are deliberately not gated on: the day-29 gap *is* the final margin the
+    gate already scores, and a day-indexed figure before it is a correlate --
+    day-10 bank trended across a selected chain of champions and was not the
+    mechanism. So the value of measuring them is entirely that a person can read
+    them against promotions, and a record that never reaches the run is the same
+    as not measuring them at all.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop.losses, "refresh", lambda: 0)
+    where = {
+        "losses/games": 49.0,
+        "losses/gap_day10": 87.0,
+        "losses/gap_days20_29": -533.0,
+        "losses/gap_final": -804.0,
+    }
+    monkeypatch.setattr(loop.losses, "deficit", lambda: where)
+
+    asyncio.run(_a_pass(campaign.losing()))
+
+    logged = [record for _, record in records if "losses/games" in record]
+    assert logged, "the gap has to reach wandb to be worth measuring"
+    assert logged[0] == where
+    # Logged on a pass that loaded nothing, because the figures describe the
+    # corpus and not the delta: an hour with no new losses is still an hour a
+    # promotion has to be read against.
+    assert logged[0]["losses/gap_day10"] > 0
 
 
 def test_a_round_is_given_its_parent_and_a_way_to_play(

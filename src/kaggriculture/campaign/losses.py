@@ -91,6 +91,46 @@ def refresh(keep: int = KEEP, submission: int = 0) -> int:
     return loaded
 
 
+def deficit() -> dict[str, float]:
+    """Where the standing program's real losses are decided, as numbers to log.
+
+    Recorded rather than gated on. The day-29 gap *is* the final margin, which
+    the gate already scores, and a day-indexed figure earlier than that is a
+    correlate: day-10 bank once trended beautifully across a selected chain of
+    champions and was not the mechanism. So these go to wandb, where a person
+    reads them against promotions, and nowhere near `gate.promotion`.
+
+    Returns:
+        The count of games held, and the mean gap between the two banks at day
+        10, over days 20 to 29, and at the close. Empty when nothing is held,
+        because a refresh that has never run has nothing to say.
+
+        Empty is decided by the count, not by whether the server answered. An
+        average over no rows is `nan` and arrives as a row like any other, so
+        reading "did it reply" would log four `nan`s an hour against a database
+        whose live partition is simply still empty.
+    """
+    rows = games.query(
+        "select count(distinct episode),"
+        " round(avgIf(bank, team = 'ours' and day = 10)"
+        " - avgIf(bank, team = 'opponent' and day = 10)),"
+        " round(avgIf(bank, team = 'ours' and day >= 20)"
+        " - avgIf(bank, team = 'opponent' and day >= 20)),"
+        " round(avgIf(bank, team = 'ours' and day = 29)"
+        " - avgIf(bank, team = 'opponent' and day = 29))"
+        f" from {games.DATABASE}.days where source = 'live' FORMAT TabSeparated"
+    ).strip()
+    held, ten, late, close = rows.split("\t")
+    if not float(held):
+        return {}
+    return {
+        "losses/games": float(held),
+        "losses/gap_day10": float(ten),
+        "losses/gap_days20_29": float(late),
+        "losses/gap_final": float(close),
+    }
+
+
 def _held() -> set[str]:
     """Episode keys already in the live partition."""
     rows = games.query(
