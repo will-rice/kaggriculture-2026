@@ -540,15 +540,22 @@ def _program(
     model: str,
     result: Result,
     standings: dict[str, float] | None = None,
+    parent: Path | None = None,
 ) -> archive.Program:
     """One database entry, stamped now.
 
     ``standings`` is the tournament this program's evaluation was part of. It
     is optional because the cold start seeds the database before any pool is
     loaded, and a program with no rating is honestly recorded as having none.
+
+    ``parent`` is the source this was edited from, and it is here for one
+    reason: this is the only moment both plans exist as files, so describing
+    the edit costs a read of two programs already on the disk. Asked later it
+    costs the whole archive -- 489 programs at 869KB each.
     """
     ranked = sorted(standings or {}, key=lambda name: -(standings or {})[name])
     return archive.Program(
+        changed=_changed(source, parent),
         id=program_id,
         source_path=str(source),
         started_from=started_from,
@@ -562,6 +569,26 @@ def _program(
         margins=result.margins,
         created=time.time(),
     )
+
+
+def _changed(source: Path, parent: Path | None) -> str:
+    """What this program did to its parent's plan, in a round's own terms.
+
+    Empty rather than raising, for every reason a pair of programs might not be
+    comparable: the seed has no parent, a program from before champion_17
+    carries no packed plan, and a round can rewrite the controller into
+    something `split` refuses. None of those is a failed evaluation, and a
+    campaign must not lose a scored program because the sentence describing it
+    could not be written.
+    """
+    if parent is None:
+        return ""
+    try:
+        _, before = plan.split(parent.read_text(encoding="utf-8"))
+        _, after = plan.split(source.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return ""
+    return plan.described(before, after)
 
 
 class Campaign:
@@ -1051,7 +1078,7 @@ class Campaign:
             # otherwise.
             mutation = _restored(before, mutation, program_id)
             mutation = _packed(mutation, box, program_id)
-            kept = await self.keep(mutation, name, drawn, program_id)
+            kept = await self.keep(mutation, name, drawn, program_id, source)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.
         record: dict[str, float | str] = {
@@ -1119,7 +1146,12 @@ class Campaign:
         return kept.source, kept.name, kept.result, kept.cleared
 
     async def keep(
-        self, mutation: Mutation, started_from: str, drawn: str, program_id: str
+        self,
+        mutation: Mutation,
+        started_from: str,
+        drawn: str,
+        program_id: str,
+        parent: Path,
     ) -> Kept | None:
         """Validate what a call wrote, score it, insert it, and gate the top K.
 
@@ -1133,6 +1165,9 @@ class Campaign:
             started_from: The id or name the call was editing.
             drawn: The name of the drawn instruction.
             program_id: The child program id.
+            parent: The program this was edited from, so the record can carry
+                what the edit did and not only what it scored. Both plans are
+                files here and nowhere later.
 
         Returns:
             What the round produced and what the gate said about it, or None.
@@ -1196,6 +1231,7 @@ class Campaign:
                             mutation.model,
                             screen,
                             table,
+                            parent,
                         )
                     )
                     LOGGER.info("%s %s screened: %s", program_id, drawn, why)
@@ -1211,7 +1247,14 @@ class Campaign:
         )
         self.database.add(
             _program(
-                program_id, stored, started_from, drawn, mutation.model, result, table
+                program_id,
+                stored,
+                started_from,
+                drawn,
+                mutation.model,
+                result,
+                table,
+                parent,
             )
         )
         LOGGER.info("%s %s gate %.3f", program_id, drawn, result.fitness)
