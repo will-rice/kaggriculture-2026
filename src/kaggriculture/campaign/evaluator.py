@@ -2,10 +2,9 @@
 
 ``score`` plays fresh seeds through the harness, both seats, against every
 pool opponent, and reports the per-opponent rates with Wilson intervals.
-Every opponent counts the same -- the gate asks whether a candidate beats
-each of them, not what it averages -- so the fitness is the plain mean of
-the per-opponent rates, and the promotion turns on the tournament fitted
-over them rather than on that mean.
+Every opponent counts the same, so the fitness is the plain mean of the
+per-opponent rates; the promotion reads the rates and margins themselves,
+against the champion's, rather than that mean.
 
 There were two evaluations here: a cheap ranking on eight seeds and a sealed
 sixty-four-seed block that decided promotions. The cheap one did not rank.
@@ -19,7 +18,7 @@ can -- so there is one measurement, deep enough to select on.
 It never plays a program against itself. A champion is a member of the pool
 it is re-scored on, and its own bytes in the other seat are a structural 0.5
 that no metric should carry: ``opponents`` drops that entry before any game
-is played, so the fitness, the rates, ``field`` and the intervals are all
+is played, so the fitness, the rates and the intervals are all
 over real opponents and nothing downstream has to know the mirror existed.
 """
 
@@ -29,11 +28,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from kaggriculture.campaign import config, harness, roster
+from kaggriculture.campaign import config, harness
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
-
-VENDORED = list(roster.TRAINING)
 
 
 class Result(BaseModel):
@@ -55,10 +52,6 @@ class Result(BaseModel):
         program_id: The program this measures.
         fitness: Mean win rate over the pool, which grows as champions join
             it, so it ranks the database but does not compare across time.
-        field: Mean win rate over the vendored incumbents alone. They never
-            change, so this is the one number that means the same thing on
-            the first session and the thousandth -- and None once the pool
-            has trimmed the last of them away.
         rates: Win rate per pool opponent, ties as half.
         margins: Bank margin per pool opponent.
         intervals: Wilson interval per pool opponent, over the decisive games
@@ -70,10 +63,7 @@ class Result(BaseModel):
         games: Games played against each opponent: ``2 * GATE_SEEDS``.
         seeds: The seeds drawn for this call. Fresh every time, which is what
             makes every measurement a held-out one.
-        hardest: The opponent with the lowest win rate. The log line names it;
-            what a round is *shown* is chosen from the standings instead,
-            because the gate is a tournament and the agent to study is the one
-            directly above, not the one furthest away.
+        hardest: The opponent with the lowest win rate, for the log line.
         states: Every game played, grouped by the opponent it was played
             against and narrowest first within each group.
 
@@ -105,7 +95,6 @@ class Result(BaseModel):
 
     program_id: str
     fitness: float
-    field: float | None
     rates: dict[str, float]
     margins: dict[str, harness.Margin]
     intervals: dict[str, tuple[float, float]] = {}
@@ -230,8 +219,6 @@ def score(
     seeds: Sequence[int],
     workers: int,
     pool_file: Path | None = None,
-    standings: dict[str, float] | None = None,
-    always: Sequence[str] = (),
     duel_seeds: Sequence[int] = (),
 ) -> Result:
     """Mean win rate over ``GATE_SEEDS`` seasons, both seats.
@@ -253,12 +240,9 @@ def score(
     0.070. The maps are seven times the draw, which was the opposite of what
     this looked like before it was measured.
 
-    Every game is played with its day table recorded, because one of them is
-    what the loop shows a model of how its program played. Which one is not
-    decided here: the gate is a tournament, so the game worth studying is the
-    one against the agent directly above in the standings, and those are not
-    fitted until these rates exist. So the narrowest game against every
-    opponent is kept and the caller picks.
+    Every game is played with its day table recorded: the games are what a
+    round is shown of how its program played, and every one of them is kept,
+    grouped by opponent, for the caller to write out.
 
     Args:
         agent: The candidate's ``main.py``.
@@ -269,12 +253,6 @@ def score(
         workers: Processes to fan the games over.
         pool_file: Where a champion's name resolves from, since the
             roster only knows the vendored opponents.
-        standings: Ratings the contenders are chosen by. Without them the
-            draw is anchors plus a random remainder, which is what a cold
-            start has and is enough to fit the first ratings from.
-        always: Opponents to draw whatever the dice say -- the top-ranked
-            agent, which topping the field means beating, and the floor,
-            which a promotion is measured as a gap over.
         duel_seeds: Seasons played against the champion on top of ``seeds``,
             because that pairing alone decides a promotion and the sweep's
             depth is set by what the other 180 need. Disjoint from ``seeds``,
@@ -283,7 +261,7 @@ def score(
 
     Returns:
         The mean fitness, the per-opponent rates and margins, the seeds
-        drawn, and one game against the hardest opponent day by day.
+        drawn, and every game day by day.
 
     Raises:
         RuntimeError: A side raised during a game. A crashed candidate is a
@@ -293,7 +271,7 @@ def score(
     # The whole pool, not a sample of it, and that is what lets a win rate be
     # the answer on its own.
     #
-    # It was a draw of `GATE_OPPONENTS` from the pool, and the draw is the only
+    # It was a draw of twenty-four from the pool, and the draw is the only
     # reason this ever needed a Bradley-Terry fit: two candidates measured
     # against different samples have win rates that are not comparable, so a
     # rating was fitted across every pairing on the record to place them
@@ -357,7 +335,6 @@ def score(
     return Result(
         program_id=program_id,
         fitness=_mean(rates),
-        field=vendored_field(rates),
         rates=rates,
         margins=margins,
         intervals={
@@ -376,35 +353,3 @@ def score(
         hardest=hardest,
         states=states,
     )
-
-
-def vendored_field(rates: dict[str, float]) -> float | None:
-    """Mean win rate over the vendored incumbents in ``rates``.
-
-    The pool grows as champions join it, so a mean over the pool moves for
-    reasons that have nothing to do with a program improving. The vendored
-    kernels are fixed, so this number is comparable across the whole
-    campaign.
-
-    Args:
-        rates: Win rate per opponent name.
-
-    Returns:
-        The mean over the vendored names present, or None when the pool
-        holds none of them.
-
-    None rather than an error, because a pool of nothing but champions
-    is where this campaign is going: they join on every promotion and
-    the weakest opponent makes way, so the published agents leave one
-    at a time and the last of them leaves for good. Raising there would
-    kill the run at its most successful moment -- and did nearly:
-    `ValueError` is not the `RuntimeError` a round catches, so it would
-    have gone up through the task group and stopped the campaign.
-
-    What is lost is a number, not the gate. `field` is the one metric
-    comparable across the whole campaign because the vendored agents
-    never change; without them there is nothing fixed to compare to,
-    and the promotion chain is what says the search is moving.
-    """
-    vendored = {name: rate for name, rate in rates.items() if name in VENDORED}
-    return _mean(vendored) if vendored else None

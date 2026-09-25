@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, harness, roster, validate
+from kaggriculture.campaign import harness, loop, roster, validate
 
 GOOD = """
 import math
@@ -316,7 +316,7 @@ def test_a_candidate_that_never_finishes_loading_is_rejected_not_waited_on(
 def test_the_seed_passes_the_gate_it_will_be_measured_by(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cold start seeds from `config.SEED`, so the gate has to accept it.
+    """A cold start seeds from `loop.SEED`, so the gate has to accept it.
 
     Every check at once, which is the point: it is a published agent, so the
     it carries a compressed table, so `base64` and `zlib` have to be
@@ -324,6 +324,6 @@ def test_the_seed_passes_the_gate_it_will_be_measured_by(
     like anything else. Either failing is a campaign that seeds and then
     rejects every child it has.
     """
-    verdict = validate.validate(config.SEED)
+    verdict = validate.validate(loop.SEED)
 
     assert verdict.status == "ok", verdict.reason

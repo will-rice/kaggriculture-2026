@@ -36,12 +36,9 @@ the ``campaign loop`` entry point and pytest all do.
 import argparse
 import asyncio
 import logging
-import math
 import random
-import shutil
 import signal
 import statistics
-import sys
 import tempfile
 import time
 import uuid
@@ -51,7 +48,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import wandb
-from git import Git, Repo
 from pydantic import BaseModel
 
 # `gate` is also the name of a `Campaign` method, so annotations in the class
@@ -64,11 +60,11 @@ from kaggriculture.campaign import (
     gate,
     harvest,
     losses,
-    measure,
     plan,
     prompt,
-    rating,
+    telemetry,
     validate,
+    workspace,
 )
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.gate import Champion
@@ -79,12 +75,205 @@ from kaggriculture.campaign.mutate import (
     Mutator,
     asked_model,
     build,
-    selected,
     validate_models,
 )
 from kaggriculture.campaign.pool import Pool
 
 LOGGER = logging.getLogger(__name__)
+
+# Seeds a program is scored on: drawn fresh every evaluation and played in
+# both seats against every pool opponent. This is the whole measurement -- one
+# gate, one number, and promotion decided on it.
+#
+# There used to be two, a cheap ranking on eight seeds and a sealed block of
+# sixty-four that promoted. The cheap one did not work. Over 471 programs it
+# called 78 of them the best in the tournament and the block promoted none of
+# them: its rating climbed 1.43 -> 2.16 while the block's score sat flat
+# between 0.798 and 0.859, and the best block score belonged to the very first
+# program measured.
+#
+# That gap was never overfitting -- the seeds are redrawn every call, so there
+# is nothing to fit. It is the winner's curse. A rate over sixteen games has a
+# standard error of 0.125, and taking the maximum over hundreds of such
+# estimates returns the luckiest program rather than the best one. Selection
+# on a noisy estimator is biased upward by construction, and no second
+# measurement fixes that; only games do.
+#
+# Thirty-two seeds is 64 games a pairing and a standard error of 0.062, a
+# quarter of the variance the eight-seed ranking selected on. It costs
+# throughput -- about 31 programs an hour against 60 -- and that is the trade
+# being made deliberately: 471 programs at the old depth bought no measurable
+# improvement at all.
+# Sixteen now rather than thirty-two, because the same budget buys twice as
+# many opponents and a rating is fitted over all of a candidate's edges. Eight
+# opponents at 64 games each and sixteen at 32 each are the same 512 games; the
+# second tells you more, because a rating's precision comes from the whole
+# graph and one more opponent is a whole new comparison where one more seed is
+# a slightly tighter old one.
+GATE_SEEDS = 16
+
+# How often the campaign takes newly published kernels into its pool, and how
+# many refs it considers each time.
+#
+# `harvest` was written as the other half of the ratchet -- champions join on
+# every promotion and nothing else does, so left alone the pool becomes the
+# campaign playing itself. It ran on 2026-09-01 and 2026-09-06 and then
+# nothing ran it, which is the whole of why the pool reached 69 champions
+# against 12 published agents, all of them frozen at the older of those dates.
+# A field that turns over in days was being gated against a five-day-old
+# snapshot of itself.
+#
+# So the loop harvests rather than a person remembering to. Hourly because
+# that is the rate the competition publishes at and a kernel costs one
+# 720-step game to check; forty refs because that is roughly five days of
+# publications, so a restart after an outage catches up in one pass.
+HARVEST_INTERVAL_SECONDS = 3600
+
+HARVEST_LIMIT = 40
+
+# How often the loop reloads the games this lineage really lost. An hour, like
+# the harvest, and for the same reason: both keep a measurement from drifting
+# away from the competition while the campaign optimises against it.
+#
+# It costs little after the first pass: `losses._held` asks the database which
+# episodes it already holds, so an hour later only the games played since are
+# fetched -- and a submission plays a few an hour, not a few hundred.
+LOSSES_INTERVAL_SECONDS = 3600
+
+# Calls in a row that may run to no verdict before the campaign stops. A call
+# that never reached the model is nobody's failure and writes nothing, so
+# without this the loop spins at full rate on an expired login, a withdrawn
+# model or a provider outage, looking busy and producing nothing. Eight is
+# one per worker: a single bad call is noise, eight is the machine.
+NO_VERDICT_LIMIT = 8
+
+PARENT_DECAY = 0.5
+
+# How many of the database's best a session may start from, and how sharply
+# the draw favours the better ones: weight `PARENT_DECAY ** rank`, so the best
+# is taken about half the time, the second a quarter, and the tenth almost
+# never.
+#
+# It was a uniform draw over ten, which is barely selection at all. With no
+# champion there is nothing else deciding where a session begins, so nine
+# sessions in ten started from something worse than the best program the
+# campaign had -- while only one child in ten improves on its parent and one
+# in five is worse. The population drifted down faster than selection pulled
+# it up: over 259 rated programs the best rating peaked at the fiftieth and
+# every cohort after was worse.
+#
+# Not fully greedy, because a parent is only half the move: the five
+# instructions and the model's own sampling are the other half, and a search
+# that always started from one program would explore with one hand.
+PARENT_POOL = 10
+
+# Consecutive codex calls against one opponent before the session moves to the
+# next, and a session works through every opponent in the pool. So its length is
+# the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
+# a promotion, a call that ran to no verdict, or the run stopping.
+#
+# There is no fixed cap any more. `ROUNDS_PER_SESSION = 12` was one, and it made
+# the session length arbitrary -- twelve rounds covered one opponent or twelve
+# depending on how the games happened to be walked. Both ways of walking them
+# shipped on 2026-09-12 and both were wrong: the flat list gave twelve seasons
+# against whichever agent `games.ordered` puts first, since it is matchup-major
+# and that is the one the program loses to hardest; striding matchups gave one
+# game against each of twelve, which is twelve first impressions.
+#
+# Twelve attempts is what learning an opponent takes, and the season advances
+# inside the block, so they are twelve maps against the same agent rather than
+# twelve tries at one game.
+ROUNDS_PER_OPPONENT = 12
+
+# The blank slate itself: a policy that passes every turn. Not an empty file,
+# which nothing downstream can score, and not `SEED`, which is the ancestry
+# being escaped. It loses every game it plays, which is the point -- what it
+# has that a champion does not is no commitments.
+SCRATCH_AGENT = (
+    "def agent(observation, configuration=None):\n"
+    "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+)
+
+# How often a session begins from nothing instead of from the champion.
+#
+# Every champion this campaign has produced is an edit of an edit of `SEED`,
+# which is a harvested public agent -- one program's descendants, sixty-five
+# generations deep. That is the monoculture at its root, and no instruction
+# escapes it, because a round is handed the champion and asked to improve it.
+#
+# The case is structural, not empirical, and it is worth being exact about
+# which. It is tempting to point at champion_1 scoring 2086.8 and champion_48
+# scoring 1963.3 and say sixty-five generations bought nothing -- but those are
+# different days, and the same bytes have scored 2386.8 and 1555.8 five days
+# apart, so that comparison measures the field moving rather than the lineage
+# standing still. Even the same-day pair, champion_47 at 2005.9 and
+# champion_48 at 1963.3, sits inside a noise floor where identical agents have
+# landed 455 and 512 apart.
+#
+# What is established is narrower and does not need the leaderboard: every
+# champion is an edit of an edit of one harvested public agent, and neither
+# signal we have can currently tell us whether that is working. The ladder
+# score moves with the field; the gate's own rating over-claims by about five
+# points of win rate against exactly the opponents that predict the ladder,
+# because most of its evidence is the lineage measuring itself. Diversity here
+# is a hedge against being stuck without being able to see it, which is a
+# weaker claim than "the lineage is stuck" and the one the evidence supports.
+#
+# One session in eight. It is a real cost -- an eighth of the quota, on
+# programs that begin unable to play -- so it is written here as a number to
+# turn down rather than buried in the loop.
+SCRATCH_CHANCE = 0.125
+
+# The name the blank slate goes by, and the root every scratch lineage is
+# traced back to.
+SCRATCH_ID = "scratch"
+
+# `pb75e380571fc`, the best program the campaign's own rule-based lineage ever
+# wrote: 491 lines that decide the season turn by turn from the observation --
+# analytic market prices, crop and livestock forecasts on actual production
+# dates, workers assigned by value. No recorded actions anywhere in it.
+#
+# It replaces `thomastschinkel_router`, which was adopted on 2026-09-07 on the
+# reading that the rule-based search had no gradient: 95% of every rate it
+# measured was a shutout. That reading was of the wrong number. Win rate was
+# flat because a young lineage beats nobody, while the mean bank margin
+# underneath it ran from -179,647 to -8,444 -- 171,000 coins of clean,
+# well-ordered signal, already recorded on every program, already the
+# tie-break `Database.top` sorts on. The record over that run went -119,258,
+# then -10,446, then -8,444, the last of them 585 seconds before the run was
+# stopped. It was accelerating when we read it as dead.
+#
+# What we adopted instead turned out to be a 720-step recording with a repair
+# layer around it: 86.5% of champion_69's actions came out of the table
+# verbatim, the table was byte-identical from the seed through 69 promotions,
+# and emptying it dropped the agent to 3,000 -- what passing every turn banks.
+# The search never touched the policy because it never could; 29,820
+# characters of base64 do not fit in a prompt.
+#
+# So the lineage starts from a program that plays, and `ALLOWED_IMPORTS` no
+# longer admits `base64` or `zlib`, which is what a recording needs to travel.
+SEED = config.ROOT / "src" / "kaggriculture" / "seed" / "main.py"
+
+# Candidates that share one block of seasons before a fresh block is drawn.
+#
+# Sharing is what makes two candidates comparable at all. The seeds used to be
+# drawn per call, so no two programs were ever ranked on the same seasons --
+# and a season is most of what the rating measures. One unchanged agent
+# through the gate five times, opponents held fixed and only the seeds moving,
+# gave fitted ratings from -3.466 to -2.226: a standard deviation of 0.491,
+# against a promotion bar that used to be 0.15. Holding the seeds and varying
+# the opponents instead moved it 0.070, so the maps are seven times the draw.
+#
+# Rotating is what keeps the note above this constant true -- a block that
+# never moved would be one the search gets selected against, which is exactly
+# what the reserved held-out set existed to prevent. Sixty-four is a few
+# generations of eight concurrent sessions: long enough that the candidates
+# being compared share a block, short enough that no lineage lives in one.
+SEED_ROTATION = 64
+
+# Sessions without a promotion before a session starts from a program
+# drawn from the database's top ten instead of the champion.
+STAGNATION_SESSIONS = 40
 
 # Threads the loop needs at once: one per session for whichever blocking step
 # it is on -- scoring a program, validating one, reading a transcript, and
@@ -101,11 +290,24 @@ SEED_ID = config.SEED_ID
 # What the wandb run records as its configuration: spec section 8's table.
 # The two model slugs are not here: they are chosen in `.env` at the call, so
 # the constant beside them is a default rather than a fact about this run.
-# `_open_run` reads them through the accessors instead.
-HYPERPARAMETERS = (
-    "SESSIONS ROUNDS_PER_OPPONENT GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
-    "STAGNATION_SESSIONS"
-).split()
+# `telemetry.open_run` reads them through the accessors instead.
+
+
+def hyperparameters() -> dict[str, int]:
+    """What the wandb run records as its configuration: spec section 8's table.
+
+    Read at the call rather than held in a tuple of names, because each
+    constant lives in the module that reads it and a test that moves one moves
+    it there -- a name looked up on `config` would report the value the run
+    did not use.
+    """
+    return {
+        "SESSIONS": config.SESSIONS,
+        "ROUNDS_PER_OPPONENT": ROUNDS_PER_OPPONENT,
+        "GATE_SEEDS": GATE_SEEDS,
+        "STAGNATION_SESSIONS": STAGNATION_SESSIONS,
+    }
+
 
 # Prepended to the instruction under stagnation, so the message says that this
 # session did not start from the champion, and why.
@@ -141,7 +343,7 @@ def main(argv: list[str] | None = None) -> None:
         # share no vocabulary at all.
         validate_models()
     # 1. wandb, named for the revision of the code that produced the run.
-    log = _open_run(dry_run=args.dry_run, tag=args.tag)
+    log = telemetry.open_run(args.dry_run, args.tag, hyperparameters())
     mutator: Mutator = (
         FakeMutator(edit=lambda source: source + "\n# dry-run mutation\n")
         if args.dry_run
@@ -174,7 +376,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     # what `copycheck` exempts, so a run started from a snapshot exempts the
     # snapshot and a run started from the default exempts the default. There
     # is nothing here for the gate to disagree with.
-    parser.add_argument("--seed-agent", type=Path, default=config.SEED)
+    parser.add_argument("--seed-agent", type=Path, default=SEED)
     # The directory this campaign owns. A flag rather than a constant so a
     # dry run and a test each name their own, instead of reaching into this
     # module to move one -- which is what used to happen, and what silently
@@ -207,193 +409,6 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     return parsed
 
 
-def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
-    """Open the run this campaign logs to, named for the revision that made it.
-
-    Two axes, because a session is many rounds now: everything a round
-    produces is stepped by ``calls`` and everything a session or a gate
-    produces by ``sessions``. One axis for both would file five rounds under
-    one session number and keep the last.
-
-    The revision alone. The model used to be in the name too, from when it
-    was a constant compiled into the run; it is chosen in `.env` at the call
-    now and can change without a restart, so a name carrying it would be
-    wrong from the first round that moved it -- and a wandb id is fixed for
-    the life of the run, so there is no renaming it afterwards. The model
-    this run opened on is recorded in the run config, and `calls/model` is
-    logged per call and is the truth about any one of them.
-
-    Exits on uncommitted changes under ``src/``: a run named by a hash has to
-    be that hash.
-    """
-    # `Git` is bound to the directory and runs there. `Repo.git` is not: in a
-    # linked worktree `Repo` resolves to the shared git directory with no
-    # working tree of its own, and `git status` fails outright there.
-    dirty = Git(config.ROOT).status("--porcelain", "--", "src")
-    if dirty:
-        raise SystemExit(f"uncommitted changes under src/:\n{dirty}")
-    started_on = asked_model()
-    # The revision, and what distinguishes one lineage on it from another.
-    name = Repo(config.ROOT).head.commit.hexsha[:7] + (f"-{tag}" if tag else "")
-    log = wandb.init(
-        entity=config.WANDB_ENTITY,
-        project=config.WANDB_PROJECT,
-        id=name,
-        name=name,
-        resume="allow",
-        mode="disabled" if dry_run else "online",
-        config={
-            **{key: getattr(config, key) for key in HYPERPARAMETERS},
-            # Not `CODEX_MODEL`: it has held a codex slug and now holds
-            # whatever `MUTATOR` names, and a key that lies about which
-            # program produced a run is how the switch hides.
-            "MUTATOR": selected(),
-            "MUTATOR_MODEL": started_on,
-        },
-    )
-    log.define_metric("sessions")
-    log.define_metric("calls")
-    log.define_metric("sessions/*", step_metric="sessions")
-    log.define_metric("gate/*", step_metric="sessions")
-    log.define_metric("calls/*", step_metric="calls")
-    log.define_metric("database/*", step_metric="calls")
-    return log
-
-
-# What a round is not allowed to change: the campaign's own code, and the
-# messages it is asked with. Not the engine binary or anything compiled, which
-# no round has reason to touch and which would make this expensive.
-GUARDED = ("*.py", "*.md")
-
-
-def _with_skills(box: Path, wanted: tuple[Path, ...]) -> None:
-    """Copy the skills into every place a driver might look for them.
-
-    Which program serves this call is not settled until it is made -- one out
-    of quota hands it to the next -- and the workspace is prepared first. A
-    round that finds no skills still runs; it just never finds the schema or
-    the queries worth running, which is a failure that does not announce
-    itself.
-
-    Args:
-        box: The round's directory.
-        wanted: Where each driver looks, relative to it.
-    """
-    for where in wanted:
-        shutil.copytree(config.SKILLS, box / where)
-
-
-def _kept(root: Path = config.ROOT) -> dict[Path, bytes]:
-    """The campaign's own source, as it stands before a round runs.
-
-    Fifty files and about seven hundred kilobytes, read once against a call that
-    takes minutes.
-
-    Args:
-        root: The checkout to read. A parameter so a test can name its own.
-
-    Returns:
-        The bytes of every guarded file, by path.
-    """
-    return {
-        one: one.read_bytes()
-        for pattern in GUARDED
-        for one in sorted((root / "src").rglob(pattern))
-        if "__pycache__" not in one.parts
-    }
-
-
-def _restored(kept: dict[Path, bytes], mutation: Mutation, program_id: str) -> Mutation:
-    """Put back anything the round changed in the campaign's own source.
-
-    A round gets a throwaway directory holding one agent. On 2026-09-20 one
-    edited the campaign instead -- `REFERENCE_SAMPLE` to 0.0, turning off the
-    reference-engine cross-check, and `roster.path`'s `raise KeyError` into a
-    constructed path, making any string resolve to a file. Neither was random:
-    both weaken a guard in the direction that makes the round's own job easier,
-    and the second was provoked by `measure.py --against` refusing a mistyped
-    name. Given an objective and a writable grader, editing the grader is the
-    cheaper way to satisfy it.
-
-    Prevention is not on offer. agy's `--sandbox` restricts the terminal and a
-    round has to run `measure.py`, and the driver runs with
-    `--dangerously-skip-permissions`, which the comment on that flag wrongly
-    calls the same posture as codex's `-s workspace-write`.
-
-    Restored from bytes rather than from git, because the version that asked git
-    reverted all 250 tracked files when a pre-commit hook's `GIT_DIR` outranked
-    the repository it was handed. This writes back only what it read, so the
-    worst it can do is undo a change to one of the files it named.
-
-    The round is failed rather than scored: a program measured against guards it
-    removed is not measured at all.
-
-    Args:
-        kept: What `_kept` read before the round.
-        mutation: What the call produced.
-        program_id: The child program id, for the log and the reason.
-
-    Returns:
-        The mutation, or a copy recording that the round wrote out of bounds.
-    """
-    moved = sorted(
-        one for one, was in kept.items() if not one.exists() or one.read_bytes() != was
-    )
-    if not moved:
-        return mutation
-    for one in moved:
-        one.write_bytes(kept[one])
-    named = ", ".join(one.name for one in moved)
-    LOGGER.warning("%s changed the campaign and was put back: %s", program_id, named)
-    return mutation.model_copy(
-        update={
-            "child": None,
-            "status": "no_output",
-            "reason": (
-                f"this round changed the campaign's own source -- {named} -- and "
-                "it has been put back. The directory you are given holds the "
-                "program to edit; the campaign that measures it is not yours to "
-                "change, and a program measured against guards it removed is not "
-                "measured at all."
-            ),
-        }
-    )
-
-
-def _packed(mutation: Mutation, box: Path, program_id: str) -> Mutation:
-    """Write the round's program back as one file, or record that it cannot be.
-
-    The gate, the archive, the pool, the validator and the submission all expect
-    one self-contained file, and none of them has to learn otherwise, so the
-    plan is packed back into the program here.
-
-    A round that wrote a `plan.json` the schema refuses produced nothing
-    runnable. That is an ordinary outcome of asking a model to edit a file, and
-    it was a crash until 2026-09-20: `gather` validated, nothing caught what it
-    raised, and the error went up through the worker and the task group and took
-    both lineages down. The reason travels onto the mutation, so the next round
-    on this lineage is told what broke.
-
-    Args:
-        mutation: What the call produced.
-        box: The round's directory.
-        program_id: The child program id, for the log.
-
-    Returns:
-        The mutation, or a copy recording that nothing usable was written.
-    """
-    if mutation.child is None:
-        return mutation
-    try:
-        mutation.child.write_text(plan.gather(box), encoding="utf-8")
-    except plan.BrokenPlanError as broken:
-        LOGGER.warning("%s wrote an unusable plan: %s", program_id, broken)
-        return mutation.model_copy(
-            update={"child": None, "status": "no_output", "reason": str(broken)}
-        )
-    return mutation
-
-
 def state_file(paths: config.Run) -> Path:
     """Where the state a restart resumes from lives, beside the database."""
     return paths.state
@@ -403,23 +418,18 @@ class Kept(NamedTuple):
     """What a round produced, once it has been scored and put to the gate.
 
     One object rather than a widening tuple, because every field of it is
-    something a caller was recomputing. `table` in particular is a whole
-    Bradley-Terry fit: `round` made one for its metrics, `keep` made one for
-    the program record, and `session` made a third to ask the gate a question
-    `keep` had already answered.
+    something a caller was recomputing.
 
     Attributes:
         source: The stored program, on disk.
         name: Its database id.
         result: What the loop's evaluation of it said.
-        table: The standings that evaluation was fitted into, itself included.
         cleared: Whether the gate promoted it.
     """
 
     source: Path
     name: str
     result: Result
-    table: dict[str, float]
     cleared: bool
 
 
@@ -495,12 +505,12 @@ def run(
             SEED_ID,
             pool,
             rng,
-            rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+            rng.sample(config.GATE_SEED_RANGE, GATE_SEEDS),
             workers,
             paths.pool,
         )
         stored = database.store(seed_agent.read_text(encoding="utf-8"), SEED_ID)
-        database.add(_program(SEED_ID, stored, "", "seed", "", scored))
+        database.add(archive.measured(SEED_ID, stored, "", "seed", "", scored))
         LOGGER.info("seeded from %s at %.3f over the pool", seed_agent, scored.fitness)
     # Champion zero, so there is no pre-champion regime: every session starts
     # from a champion and every candidate plays one head-to-head, which makes the
@@ -517,7 +527,7 @@ def run(
                 first.id,
                 pool,
                 rng,
-                rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+                rng.sample(config.GATE_SEED_RANGE, GATE_SEEDS),
                 workers,
                 paths.pool,
             )
@@ -537,65 +547,6 @@ def run(
     campaign = Campaign(state, database, pool, mutator, workers, rng, log, paths)
     asyncio.run(campaign.drive(sessions))
     return campaign.state
-
-
-def _program(
-    program_id: str,
-    source: Path,
-    started_from: str,
-    instruction: str,
-    model: str,
-    result: Result,
-    standings: dict[str, float] | None = None,
-    parent: Path | None = None,
-) -> archive.Program:
-    """One database entry, stamped now.
-
-    ``standings`` is the tournament this program's evaluation was part of. It
-    is optional because the cold start seeds the database before any pool is
-    loaded, and a program with no rating is honestly recorded as having none.
-
-    ``parent`` is the source this was edited from, and it is here for one
-    reason: this is the only moment both plans exist as files, so describing
-    the edit costs a read of two programs already on the disk. Asked later it
-    costs the whole archive -- 489 programs at 869KB each.
-    """
-    ranked = sorted(standings or {}, key=lambda name: -(standings or {})[name])
-    return archive.Program(
-        changed=_changed(source, parent),
-        id=program_id,
-        source_path=str(source),
-        started_from=started_from,
-        instruction=instruction,
-        model=model,
-        fitness=result.fitness,
-        field=result.field,
-        rating=None if standings is None else standings[program_id],
-        place=0 if standings is None else 1 + ranked.index(program_id),
-        rates=result.rates,
-        margins=result.margins,
-        created=time.time(),
-    )
-
-
-def _changed(source: Path, parent: Path | None) -> str:
-    """What this program did to its parent's plan, in a round's own terms.
-
-    Empty rather than raising, for every reason a pair of programs might not be
-    comparable: the seed has no parent, a program from before champion_17
-    carries no packed plan, and a round can rewrite the controller into
-    something `split` refuses. None of those is a failed evaluation, and a
-    campaign must not lose a scored program because the sentence describing it
-    could not be written.
-    """
-    if parent is None:
-        return ""
-    try:
-        _, before = plan.split(parent.read_text(encoding="utf-8"))
-        _, after = plan.split(source.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return ""
-    return plan.described(before, after)
 
 
 class Campaign:
@@ -739,7 +690,7 @@ class Campaign:
         timed out.
         """
         while True:
-            await asyncio.sleep(config.LOSSES_INTERVAL_SECONDS)
+            await asyncio.sleep(LOSSES_INTERVAL_SECONDS)
             try:
                 loaded = await asyncio.to_thread(losses.refresh)
                 # Every pass, not only the ones that loaded something. The
@@ -781,10 +732,10 @@ class Campaign:
         must not end because a listing timed out.
         """
         while True:
-            await asyncio.sleep(config.HARVEST_INTERVAL_SECONDS)
+            await asyncio.sleep(HARVEST_INTERVAL_SECONDS)
             try:
                 found = await asyncio.to_thread(
-                    harvest.vendored, config.HARVEST_LIMIT, set(self.pool.opponents)
+                    harvest.vendored, HARVEST_LIMIT, set(self.pool.opponents)
                 )
             except Exception:
                 LOGGER.exception("harvest failed; the campaign continues")
@@ -842,7 +793,7 @@ class Campaign:
         # a model that a line it never left is stuck.
         stagnant = (
             self.state.champion is not None
-            and self.state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+            and self.state.sessions_since_promotion >= STAGNATION_SESSIONS
         )
         source, name = self.start(stagnant)
         # Not caught: a starting program that raises is a broken floor, and
@@ -882,20 +833,20 @@ class Campaign:
         # scored, so the database is the one place they always are. Keyed the
         # way `record` wrote them, name included; `compose` has the name.
         scored = await asyncio.to_thread(games.recorded, name, games.DATABASE)
-        planned = config.ROUNDS_PER_OPPONENT * max(
+        planned = ROUNDS_PER_OPPONENT * max(
             1, len({matchup for matchup, _, _ in scored})
         )
         for turn in range(planned):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
-            # `config.ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
+            # `ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
             # then the next, with the season advancing inside the block. Four
             # attempts against one agent on four maps: enough to learn it,
             # without four attempts at the same game.
             matchups = sorted({one[0] for one in scored})
             playing = None
             if matchups:
-                block, attempt = divmod(turn, config.ROUNDS_PER_OPPONENT)
+                block, attempt = divmod(turn, ROUNDS_PER_OPPONENT)
                 against = [
                     one for one in scored if one[0] == matchups[block % len(matchups)]
                 ]
@@ -920,11 +871,7 @@ class Campaign:
                 break
             source, name, result, cleared = outcome
             # The gate already ran, inside the round, under the promotions
-            # lock, and said so. This used to re-ask it here: a second
-            # `gate.standing` -- a whole Bradley-Terry fit -- and a second
-            # `gate.promotion` against a `floor` read at a different moment,
-            # which is two sources of truth for one question and three fits a
-            # round between them.
+            # lock, and said so.
             if cleared:
                 LOGGER.info("%s promoted: the session is done", name)
                 break
@@ -982,72 +929,13 @@ class Campaign:
             prefix="campaign-round-", ignore_cleanup_errors=True
         ) as scratch:
             box = Path(scratch)
-            child = box / "child.py"
-            # Apart, so the round can read and edit the plan: `child.py` is the
-            # controller with one import where 94,490 characters of base85 used
-            # to be, and `plan.json` is the strategy as readable JSON. No round
-            # had ever changed the plan -- champions 17 to 24 carry a
-            # byte-identical blob -- because as text it is unreadable and
-            # nothing said it was data.
-            plan.lay_out(source.read_text(encoding="utf-8"), box)
-            # The gate writes a champion read-only so nothing can edit the file
-            # the pool plays, and `shutil.copy` carries that mode across. This
-            # copy is the one file the call must be able to write.
-            child.chmod(0o644)
-            # The same program again, and the script that plays one against
-            # the other. The spec had the model run nothing -- "the loop
-            # plays; the model never does" -- which made every round an edit
-            # shipped blind and waited on. A round can now change one thing
-            # and measure it before spending a gate on it, which is what every
-            # improvement found by hand on 2026-09-10 came from. The verdict
-            # is still the loop's: it plays every scored game itself, against
-            # opponents this never sees, and nothing a round reports is read.
-            shutil.copy(source, box / "parent.py")
-            # Copied with a shebang naming the interpreter this loop is
-            # running, and marked executable, because a round's own guess is
-            # wrong and it pays to guess. `python` is not on the PATH a round's
-            # commands see, `python3` is the system 3.10 with no
-            # `kaggriculture` in it, and the package is installed editable into
-            # a virtual environment a round has no reason to know about. Every
-            # round was rediscovering that by trial: one died having spent its
-            # whole call on "I will wait for the search for `kaggriculture` to
-            # complete", and the file's own docstring had told it to run
-            # `python measure.py`, which is the one command that cannot work.
-            runner = box / "measure.py"
-            runner.write_text(
-                f"#!{sys.executable}\n"
-                + Path(measure.__file__).read_text(encoding="utf-8"),
-                encoding="utf-8",
+            workspace.prepare(
+                box, source, siblings, self.database, self.mutator.SKILLS_DIRS
             )
-            runner.chmod(0o755)
-            # And the edits already made to this program, which the message
-            # names and scores. A score says a direction lost ground; the file
-            # is what says which direction it was, and `measure.py` will play
-            # one of them against `child.py` if the round wants that too.
-            for number, program in enumerate(
-                siblings[: prompt.RECENT_ATTEMPTS], start=1
-            ):
-                shutil.copy(program.source_path, box / f"tried_{number}.py")
-            # And the whole campaign, one line per program, for whatever
-            # question the round brings to it. The message names it and reads
-            # none of it out.
-            self.database.attempts(box / "attempts.jsonl")
-            # And how to ask it, as a skill rather than as more message, at
-            # whichever path the driving program looks for one: codex reads
-            # `.codex/skills` under its working directory, agy walks up from
-            # it for `.agents`. So a round that wants the schema and the
-            # queries worth running opens them, and a round with a different
-            # question pays nothing for them -- both programs disclose a skill
-            # by name and description and load it only if asked. The message
-            # is read every round; this is read on demand.
-            # Into every place any driver looks, because which one serves
-            # this call is not settled until it is made: a provider out of
-            # quota hands it to the next.
-            _with_skills(box, self.mutator.SKILLS_DIRS)
-            # What the campaign's own source says before this round runs,
-            # so that what it says afterwards can be put back. `_restored`
+            # What the campaign's own source says before this round runs, so
+            # that what it says afterwards can be put back. `workspace.restored`
             # carries why that is necessary.
-            before = _kept()
+            before = workspace.kept()
             # A round that writes a `plan.json` the schema refuses is a round
             # that produced nothing runnable, which is an ordinary outcome of
             # asking a model to edit a file -- and until 2026-09-20 it was a
@@ -1076,24 +964,11 @@ class Campaign:
                     output_tokens=0,
                     model=asked_model(),
                 )
-            # What the round did, before the workspace takes it. A child whose
-            # plan is unchanged can mean the round never opened `plan.json`, or
-            # that it edited it, measured the edit worse and backed it out --
-            # which is the round doing what it was told. The score cannot tell
-            # those apart and the transcript can.
-            kept_at = self.paths.rounds / program_id
-            written = {
-                one for pattern in self.mutator.TRANSCRIPTS for one in box.glob(pattern)
-            }
-            for transcript in sorted(written):
-                kept_at.mkdir(parents=True, exist_ok=True)
-                shutil.copy(transcript, kept_at / transcript.name)
-            # And back together before anything downstream looks at it. The
-            # gate, the archive, the pool, the validator and the submission all
-            # expect one self-contained file, and none of them has to learn
-            # otherwise.
-            mutation = _restored(before, mutation, program_id)
-            mutation = _packed(mutation, box, program_id)
+            workspace.transcripts(
+                box, self.mutator.TRANSCRIPTS, self.paths.rounds / program_id
+            )
+            mutation = workspace.restored(before, mutation, program_id)
+            mutation = workspace.packed(mutation, box, program_id)
             kept = await self.keep(mutation, name, drawn, program_id, source)
         self.state.calls += 1
         # Section 10, on the `calls` axis: one line per codex call.
@@ -1108,25 +983,12 @@ class Campaign:
             "database/programs": len(self.database.programs),
             "database/top": self.database.top(1)[0].fitness,
         }
-        rated = [p.rating for p in self.database.programs if p.rating is not None]
-        if rated:
-            record["database/top_rating"] = max(rated)
         if kept is not None:
             # Named apart from `result`, which is the program this round was
             # given and is what the comparison below is against. Rebinding it
             # here made that comparison the child against itself.
             scored = kept.result
             record["calls/fitness"] = scored.fitness
-            if scored.field is not None:
-                record["calls/field"] = scored.field
-            # The fit `keep` already made. Computing another here was the third
-            # Bradley-Terry fit of the same round.
-            table = kept.table
-            program_id = kept.name
-            record["calls/rating"] = table[program_id]
-            record["calls/place"] = 1 + sorted(
-                table, key=lambda name: -table[name]
-            ).index(program_id)
             record["calls/pool"] = len(scored.rates)
         self.log.log(record)
         if mutation.status == "exec_error":
@@ -1191,11 +1053,10 @@ class Campaign:
         if mutation.status == "exec_error":
             LOGGER.warning("%s: no verdict (%s)", program_id, mutation.reason[:200])
             self.no_verdict += 1
-            if self.no_verdict >= config.NO_VERDICT_LIMIT:
+            if self.no_verdict >= NO_VERDICT_LIMIT:
                 raise SystemExit(
                     f"{self.no_verdict} calls in a row ran to no verdict, the "
-                    f"last on {config.CODEX_MODEL} and {config.CODEX_FALLBACK_MODEL}: "
-                    f"{mutation.reason[:200]}"
+                    f"last on {mutation.model}: {mutation.reason[:200]}"
                 )
             return None
         self.no_verdict = 0
@@ -1233,51 +1094,41 @@ class Campaign:
                     # Recorded the way a refusal is, not the way a failure is:
                     # the round ran, produced a program and was judged, and the
                     # next round is shown what it scored.
-                    table = gate.standing(
-                        program_id, screen.rates, 2 * config.GATE_SEEDS, self.paths
-                    )
                     self.database.add(
-                        _program(
+                        archive.measured(
                             program_id,
                             stored,
                             started_from,
                             drawn,
                             mutation.model,
                             screen,
-                            table,
                             parent,
                         )
                     )
                     LOGGER.info("%s %s screened: %s", program_id, drawn, why)
-                    return Kept(stored, program_id, screen, table, False)
+                    return Kept(stored, program_id, screen, False)
             result = await self.measure(stored, program_id)
         except OpponentCrash:
             raise
         except RuntimeError as error:
             self.fail(started_from, drawn, f"gate: {error}")
             return None
-        table = gate.standing(
-            program_id, result.rates, 2 * config.GATE_SEEDS, self.paths
-        )
         self.database.add(
-            _program(
+            archive.measured(
                 program_id,
                 stored,
                 started_from,
                 drawn,
                 mutation.model,
                 result,
-                table,
                 parent,
             )
         )
         LOGGER.info("%s %s gate %.3f", program_id, drawn, result.fitness)
-        cleared = await self.consider(program_id, result, table)
-        return Kept(stored, program_id, result, table, cleared)
+        cleared = await self.consider(program_id, result)
+        return Kept(stored, program_id, result, cleared)
 
-    async def consider(
-        self, program_id: str, result: Result, table: dict[str, float]
-    ) -> bool:
+    async def consider(self, program_id: str, result: Result) -> bool:
         """Promote ``program_id`` if it topped the tournament it was just in.
 
         This is the whole gate. There was a second one -- the best three
@@ -1330,7 +1181,7 @@ class Campaign:
                 )
                 self.log.log(
                     {
-                        **self.promotion_record(result, False, baseline, table),
+                        **self.promotion_record(result, False, baseline),
                         "gate/stale": 1,
                     }
                 )
@@ -1348,7 +1199,7 @@ class Campaign:
                 # enough.
                 self.log.log(
                     {
-                        **self.promotion_record(result, False, baseline, table),
+                        **self.promotion_record(result, False, baseline),
                         "gate/stale": 1,
                     }
                 )
@@ -1362,7 +1213,7 @@ class Campaign:
                 )
                 self.log.log(
                     {
-                        **self.promotion_record(result, False, baseline, table),
+                        **self.promotion_record(result, False, baseline),
                         "gate/stale": 1,
                     }
                 )
@@ -1408,7 +1259,7 @@ class Campaign:
                 )
                 artifact.add_file(champion.tarball)
                 self.log.log_artifact(artifact)
-            self.log.log(self.promotion_record(result, verdict, baseline, table))
+            self.log.log(self.promotion_record(result, verdict, baseline))
             self.champion_played.pop(program_id, None)
             return verdict
 
@@ -1485,18 +1336,7 @@ class Campaign:
         a model is ever shown: the model plays nothing, so the seeds, the
         seating and the reading of "won" are all ours.
 
-        The opponents are a draw from the whole pool rather than the whole
-        pool, so the ratings on the record are handed down for it -- the
-        contenders are the highest rated, and without them the draw would be
-        anchors and noise.
-
-        The leader and the floor are drawn every time rather than left to the
-        dice. Topping the field means beating the best of it, and a promotion
-        is a rating gap over the floor: a candidate that happened not to draw
-        either would be turned away for the sampler's luck rather than for
-        anything it did.
         """
-        table = rating.standings(rating.Field.load(self.paths.field).everything())
         pool = self.snapshot()
         if only is not None:
             # The screen's pool: the opponents that can still move, without
@@ -1525,8 +1365,6 @@ class Campaign:
             block,
             self.workers,
             self.paths.pool,
-            table,
-            self.must_play(table),
             self.duel,
         )
         # Every game of it, into the one database the nightly extraction also
@@ -1556,7 +1394,7 @@ class Campaign:
         moved it 0.070. The maps are seven times the draw.
 
         Rotated, because a set that never moves is one the search can be
-        selected against. `config.SEED_ROTATION` candidates share a block and
+        selected against. `SEED_ROTATION` candidates share a block and
         then it is redrawn from the whole range, so no program is measured for
         long on maps its ancestors were selected on -- which is what the
         reserved held-out block used to be for, and why there is no longer
@@ -1564,38 +1402,24 @@ class Campaign:
 
         Called on the loop thread, where the counter is nobody else's.
         """
-        if self.measured % config.SEED_ROTATION == 0:
+        if self.measured % SEED_ROTATION == 0:
             # One sample split in two, not two samples. `random.sample` cannot
             # repeat within a draw, so the sweep's seasons and the champion
             # pairing's extra seasons are disjoint by construction -- and a
             # season played in both blocks would be the same game counted
             # twice in that pairing's rate.
             drawn = self.rng.sample(config.GATE_SEED_RANGE, config.DUEL_SEEDS)
-            self.block = drawn[: config.GATE_SEEDS]
-            self.duel = drawn[config.GATE_SEEDS :]
+            self.block = drawn[:GATE_SEEDS]
+            self.duel = drawn[GATE_SEEDS:]
             LOGGER.info(
                 "seasons: a fresh block of %d, and %d more against the "
                 "champion, after %d candidates",
-                config.GATE_SEEDS,
+                GATE_SEEDS,
                 len(self.duel),
                 self.measured,
             )
         self.measured += 1
         return self.block
-
-    def must_play(self, standings: dict[str, float]) -> list[str]:
-        """The opponents every candidate is drawn against: the leader and the floor.
-
-        Usually one agent. The champion has out-rated the field since the
-        ratchet started, so the top of the standings and the floor are the
-        same name -- but they are different questions, and when they come
-        apart both have to be played: the leader because topping the field
-        means beating it, the floor because the promotion bar is a gap over
-        that specific agent.
-        """
-        floor = self.floor()
-        ranked = sorted(standings, key=lambda name: -standings[name])
-        return list(dict.fromkeys(ranked[:1] + ([floor] if floor else [])))
 
     def snapshot(self) -> Pool:
         """The pool as it stands, copied on the loop for one evaluation to keep."""
@@ -1611,50 +1435,47 @@ class Campaign:
         draw below -- which is why that draw has to be a selection and not a
         shuffle.
         """
-        if self.rng.random() < config.SCRATCH_CHANCE:
+        if self.rng.random() < SCRATCH_CHANCE:
             return self.scratch()
         champion = self.state.champion
         if champion is not None and not stagnant:
             return Path(champion.path), champion.name
-        candidates = self.database.top(config.PARENT_POOL)
-        # Weighted by rank, not uniform: `config.PARENT_POOL` says why.
-        weights = [config.PARENT_DECAY**rank for rank in range(len(candidates))]
+        candidates = self.database.top(PARENT_POOL)
+        # Weighted by rank, not uniform: `PARENT_POOL` says why.
+        weights = [PARENT_DECAY**rank for rank in range(len(candidates))]
         program = self.rng.choices(candidates, weights=weights)[0]
         return Path(program.source_path), program.id
 
     def scratch(self) -> tuple[Path, str]:
         """A session that begins outside the champion's ancestry.
 
-        Every champion descends from `config.SEED`, a harvested public agent,
+        Every champion descends from `SEED`, a harvested public agent,
         so every round edits one program's sixty-fifth-generation descendant
         and no instruction reaches outside that basin. This is the only
         starting point the campaign has that does not.
 
         The scratch lineage is parented from its own best rather than from the
         database's, and that is what makes it more than a lottery ticket. A
-        program that begins from nothing rates far below a champion, and
-        `Database.top` ranks on rating -- so without this it would be scored
-        once, never drawn again, and the lineage would die in a single session
-        however promising it was. Parented from itself it gets a ratchet of its
-        own, and joins the global draw when its rating earns a place there
-        rather than being asked to earn one immediately.
+        program that begins from nothing scores far below a champion, and
+        `Database.top` ranks on the win rate -- so without this it would be
+        scored once, never drawn again, and the lineage would die in a single
+        session however promising it was. Parented from itself it gets a
+        ratchet of its own, and joins the global draw when its record earns a
+        place there rather than being asked to earn one immediately.
 
         Returns:
             The program to start from and the name it goes by: the best
             scratch-descended program, or the blank slate when there is none.
         """
-        grown = self.database.descendants(config.SCRATCH_ID)
+        grown = self.database.descendants(SCRATCH_ID)
         if grown:
             best = max(
                 grown,
-                key=lambda program: (
-                    program.rating if program.rating is not None else -math.inf,
-                    archive.mean_margin(program),
-                ),
+                key=lambda program: (program.fitness, archive.mean_margin(program)),
             )
             return Path(best.source_path), best.id
-        blank = self.database.store(config.SCRATCH_AGENT, config.SCRATCH_ID)
-        return blank, config.SCRATCH_ID
+        blank = self.database.store(SCRATCH_AGENT, SCRATCH_ID)
+        return blank, SCRATCH_ID
 
     def fail(self, started_from: str, instruction: str, reason: str) -> None:
         """Record an attempt that produced no program, and say why."""
@@ -1696,7 +1517,6 @@ class Campaign:
         result: Result,
         promoted: bool,
         baseline: Champion | None,
-        standings: dict[str, float],
     ) -> dict[str, float]:
         """Section 10: one program judged, and whether it moved the floor.
 
@@ -1708,22 +1528,14 @@ class Campaign:
             result: The measurement it was judged on.
             promoted: Whether it cleared the gate.
             baseline: The floor as it stood when this was judged.
-            standings: The tournament that decided it, so the rating and the
-                place go on the record beside the win rates behind them.
         """
         record: dict[str, float] = {
             "sessions": self.state.sessions,
             "gate/score": result.fitness,
-            **({} if result.field is None else {"gate/field": result.field}),
             "gate/promoted": int(promoted),
-            "gate/rating": standings[result.program_id],
-            "gate/place": 1
-            + sorted(standings, key=lambda name: -standings[name]).index(
-                result.program_id
-            ),
             "gate/pool": len(result.rates),
             # Nothing has been watching this. The seed is 619 lines and
-            # `config.SEED` says why that matters -- a round is handed the
+            # `SEED` says why that matters -- a round is handed the
             # whole program, and a big one spends the call being read rather
             # than improved. champion_69 is 3,220 lines, five times its own
             # ancestor, and the growth arrived a few hundred lines at a time
@@ -1746,19 +1558,6 @@ class Campaign:
             # promoted or not, so the champions are a few dozen points buried
             # among hundreds; this is only ever written when the floor moves.
             record["champion/win_rate"] = result.fitness
-            # The series to watch, and the only one that compares across the
-            # whole campaign. A rating on one scale, anchored on the agents
-            # that never change, so champion 3's number and champion 30's are
-            # the same measurement -- unlike a win rate, which is against a
-            # field that gains a champion every promotion.
-            #
-            # It cannot saturate, which a win rate does: measured against the
-            # twelve published kernels, champion_1 scored 0.922 and
-            # champion_37 scored 0.938, while beating champion_20 -- itself
-            # far above champion_1 -- 0.885 of the time. Log-odds have no
-            # ceiling and go on separating agents that both beat the floor
-            # every time.
-            record["champion/rating"] = _anchored(standings, result.program_id)
             if baseline is not None and baseline.name in result.rates:
                 # What it did to the champion it replaced, head to head. The
                 # win rate above is against a pool that strengthens with every
@@ -1768,23 +1567,6 @@ class Campaign:
                 # stopped finding anything.
                 record["champion/over_previous"] = result.rates[baseline.name]
         return record
-
-
-def _anchored(standings: dict[str, float], name: str) -> float:
-    """One agent's rating, measured from the anchors rather than the mean.
-
-    A Bradley-Terry fit is only defined up to an additive constant, and
-    `rating.standings` centres it on the mean of everyone in it. That mean
-    climbs as champions are added, so the same agent's number would fall
-    over a campaign that only ever improved -- the scale sliding underneath
-    the series it is meant to be.
-
-    The anchors are fixed files that never change, so pinning them at zero
-    fixes the origin. Every gate plays them, which is what makes them
-    available here at all.
-    """
-    fixed = [standings[a] for a in config.GATE_ANCHORS if a in standings]
-    return standings[name] - (sum(fixed) / len(fixed) if fixed else 0.0)
 
 
 def _first(failures: BaseExceptionGroup) -> BaseException:

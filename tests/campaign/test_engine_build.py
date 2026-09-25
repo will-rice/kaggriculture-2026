@@ -7,14 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config
 from kaggriculture.campaign.engine import build
 
 
 def test_build_produces_a_loadable_library_with_abi_version_1() -> None:
     """The compiled bridge loads and reports ABI version 1 and the pinned engine."""
     path = build.build()
-    assert path == config.ENGINE_LIBRARY and path.exists()
+    assert path == build.ENGINE_LIBRARY and path.exists()
     library = ctypes.CDLL(str(path))
     library.kag_abi_version.restype = ctypes.c_uint32
     assert library.kag_abi_version() == 1
@@ -34,7 +33,7 @@ def test_a_compile_is_never_visible_at_the_target_until_it_is_whole(
     writes -- which only holds if the real compile goes somewhere else first.
     """
     target = tmp_path / "engine.so"
-    monkeypatch.setattr(config, "ENGINE_LIBRARY", target)
+    monkeypatch.setattr(build, "ENGINE_LIBRARY", target)
     midway: list[bytes] = []
 
     def fake_compile(command: list[str], check: bool) -> subprocess.CompletedProcess:
@@ -59,7 +58,7 @@ def test_a_failed_compile_leaves_no_scratch_library_behind(
 ) -> None:
     """The private output path is cleaned up when the compiler fails."""
     target = tmp_path / "engine.so"
-    monkeypatch.setattr(config, "ENGINE_LIBRARY", target)
+    monkeypatch.setattr(build, "ENGINE_LIBRARY", target)
 
     def failing_compile(command: list[str], check: bool) -> subprocess.CompletedProcess:
         """Write a partial output, then fail as g++ would."""
@@ -75,7 +74,7 @@ def test_a_failed_compile_leaves_no_scratch_library_behind(
 
 def _build_into(target: Path) -> None:
     """Point this process's config at ``target`` and build. Runs after a fork."""
-    config.ENGINE_LIBRARY = target
+    build.ENGINE_LIBRARY = target
     build.build()
 
 

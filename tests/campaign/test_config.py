@@ -7,7 +7,7 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import (
     SHOPS,
 )
 
-from kaggriculture.campaign import config, roster
+from kaggriculture.campaign import config, loop, mutate
 
 
 def test_item_order_matches_the_engine_port_enum() -> None:
@@ -102,38 +102,19 @@ def test_constants_match_the_spec_table() -> None:
     # Twelve consecutive attempts against one opponent, and a session works
     # through every opponent in the pool -- so a session's length is the pool's
     # rather than a constant, and there is no ROUNDS_PER_SESSION.
-    assert config.ROUNDS_PER_OPPONENT == 12
+    assert loop.ROUNDS_PER_OPPONENT == 12
     assert not hasattr(config, "ROUNDS_PER_SESSION")
-    # Sixteen seeds over twenty-four opponents: 768 games a candidate, up from
-    # the 512 that sixteen opponents cost. The budget goes into opponents
-    # because a rating's precision comes from the whole graph -- one more
-    # opponent is a whole new comparison, one more seed a slightly tighter old
-    # one -- and the eight added slots are what let every vendored agent be
-    # played every gate rather than drawn by luck.
-    assert config.GATE_SEEDS == 16
-    assert config.GATE_OPPONENTS == 24
-    assert 2 * config.GATE_SEEDS * config.GATE_OPPONENTS == 768
-    # The draw has to hold every vendored opponent, the anchors that are not
-    # themselves vendored, the leader and floor, and the contenders -- with
-    # room left over for the random remainder that finds a counter. This is
-    # the arithmetic that decides `GATE_OPPONENTS`, so it is asserted rather
-    # than left to be rediscovered when the roster next grows.
-    vendored = len(roster.TRAINING)
-    fixed = vendored + len({*config.GATE_ANCHORS} - {*roster.TRAINING}) + 2
-    assert fixed + config.GATE_CONTENDERS < config.GATE_OPPONENTS, (
-        f"{vendored} vendored + anchors + leader/floor + "
-        f"{config.GATE_CONTENDERS} contenders does not fit in "
-        f"{config.GATE_OPPONENTS}: the draw would truncate the vendored set, "
-        "which is the only cross-population evidence the gate gets"
-    )
+    # Sixteen seeds against every opponent in the pool, both seats: thirty-two
+    # games a pairing, and the pool's size sets the rest.
+    assert loop.GATE_SEEDS == 16
     # There is deliberately no promotion margin: a fixed bar could not
     # answer a noise level that varies, and `gate.promotion` asks for a
     # margin beyond twice its own error instead.
     assert not hasattr(config, "PROMOTION_MARGIN")
-    assert config.STAGNATION_SESSIONS == 40
-    assert config.CODEX_MODEL == "gpt-5.6-luna"
-    assert config.CODEX_FALLBACK_MODEL == "gpt-5.6-sol"
-    assert config.CODEX_REASONING == "max"
+    assert loop.STAGNATION_SESSIONS == 40
+    assert mutate.CodexMutator.MODEL == "gpt-5.6-luna"
+    assert mutate.CodexMutator.FALLBACK == "gpt-5.6-sol"
+    assert mutate.CodexMutator.REASONING == "max"
 
 
 def test_the_deleted_constants_are_gone() -> None:
@@ -182,7 +163,6 @@ def test_runtime_paths_live_under_run_campaign() -> None:
         config.LIVE.floor,
         config.LIVE.champions,
         config.LIVE.champion,
-        config.LIVE.field,
         config.LIVE.state,
     ):
         assert config.LIVE.root in path.parents

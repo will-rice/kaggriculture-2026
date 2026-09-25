@@ -26,9 +26,14 @@ from pathlib import Path
 
 from kaggriculture.campaign import config
 
+# Where an opponent whose source predates the vendored drop still lives; the
+# roster names one. Both roots are stated here so no other module spells out
+# a path under /data.
+AGENTS = Path("/data/kaggriculture/agents")
+
 TRAINING: dict[str, Path] = {
     # Harvested 2026-09-01 and before.
-    "router_v1": config.AGENTS / "yhay81_router_v1" / "main.py",
+    "router_v1": AGENTS / "yhay81_router_v1" / "main.py",
     "router2929": config.OPPONENTS / "yhay81_router2929" / "main.py",
     "v54": config.OPPONENTS / "kaito_v54" / "main.py",
     "v56": config.OPPONENTS / "kaito_v56" / "main.py",

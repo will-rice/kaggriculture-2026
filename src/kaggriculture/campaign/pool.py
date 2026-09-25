@@ -1,10 +1,8 @@
 """The opponent pool: who a candidate is measured against.
 
-Every opponent counts the same, and the gate is a place rather than a
-standard: a candidate is promoted when it comes out top of a Bradley-Terry
-tournament over this pool, which is how the competition itself ranks a field.
-There is no weight for a candidate to buy a promotion with and no single
-opponent it must beat -- only a field it has to finish above.
+Every opponent counts the same and every candidate plays all of them: a
+promotion is measured against the champion over the opponents both played,
+and there is no weight for a candidate to buy a promotion with.
 
 The pool holds two kinds of thing on two different terms.
 
@@ -32,20 +30,12 @@ fresh seeds in both seats found no intransitive triple, the newer beating the
 older in 86 of 91 chronological pairs. On a ladder, an agent that rates low is
 the one worth dropping.
 
-`sample` draws one gate's opponents from what remains: anchors that span the
-range and are played every time, every harvested agent, the highest-rated
-contenders, and a random remainder. A rating is fitted over every pairing
-anyone has ever played -- retired champions included, since their games stay
-on the record -- so a candidate only has to add its own edges to that graph
-rather than meet the whole field. Paths are stored here and shown nowhere.
+Paths are stored here and shown nowhere.
 """
 
-import math
 import os
-import random
 import re
 import time
-from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -131,84 +121,6 @@ class Pool(BaseModel):
         )
         self.opponents.update({one: str(root / one / "main.py") for one in found})
         return found
-
-    def sample(
-        self,
-        standings: dict[str, float],
-        rng: random.Random,
-        exclude: str = "",
-        always: Sequence[str] = (),
-    ) -> list[str]:
-        """The opponents for one gate, drawn three ways from the whole pool.
-
-        A candidate cannot play a pool of hundreds -- that is thousands of
-        games for one verdict -- and with a rating it does not have to. The
-        fit is over every pairing the campaign has ever played, so a
-        candidate contributes its own edges and is placed against agents it
-        never met through the ones it did.
-
-        What it plays has to be chosen rather than drawn flat, because the
-        three things a gate needs are different things:
-
-        - **Every vendored opponent**, always. They are the only agents in
-          the pool this campaign did not write, so they are the only evidence
-          about the field we are actually scored against -- and drawing them
-          by chance starved them. Measured 2026-09-09: the two that happen to
-          be anchors held 33 and 31 pairings, while four harvested on 09-06
-          held one between them and `tetsutani_shape0905` had never been
-          played at all. There are about a dozen and the set does not grow
-          with promotions, so playing all of them is affordable in a way that
-          playing the whole pool is not.
-        - **Anchors**, every time. `config.GATE_ANCHORS` spans the strength
-          range and never changes, so every candidate has direct edges to
-          fixed points at every level. Without them a champion is rated
-          through a chain of overlapping pool eras, and that chain is
-          measurably wrong: it put champion_37 at 0.994 against champion_1,
-          which beats it 0.729 in the games themselves.
-        - **Contenders**, the highest rated, and ``always`` on top of them.
-          Topping the field means beating the best of it, so the top-ranked
-          agent is drawn every time rather than left to the dice -- a
-          candidate rejected because it happened not to draw the leader would
-          be rejected for the sampler's luck. The floor is drawn for the same
-          reason: a promotion is a rating gap over it, and a gap against an
-          agent you never played is not measurable.
-        - **The rest, at random.** Coverage, so the graph does not go stale
-          everywhere but the top -- and the only way a counter is found
-          rather than quietly never played again.
-
-        Args:
-            standings: A rating per opponent; anything unrated sorts last.
-            rng: The generator the random remainder is drawn from.
-            exclude: A name never to draw, so a champion in the pool is not
-                measured against itself.
-            always: Names to include whatever the draw says -- the top-ranked
-                agent and the floor. Ignored where the pool does not hold
-                them, which is the cold start.
-
-        Returns:
-            Opponent names, at most `config.GATE_OPPONENTS` of them.
-        """
-        available = [name for name in self.opponents if name != exclude]
-        # `always` leads, and the order is load-bearing rather than tidy: the
-        # list is truncated to `config.GATE_OPPONENTS` at the end, and the
-        # floor is the one opponent a promotion cannot be measured without.
-        # Anything dropped by that truncation has to be a contender or a
-        # vendored opponent, never the floor or the leader.
-        wanted = [*always, *config.GATE_ANCHORS, *roster.TRAINING]
-        drawn: list[str] = []
-        for name in wanted:
-            if name in available and name not in drawn:
-                drawn.append(name)
-        rated = sorted(
-            (name for name in available if name not in drawn),
-            key=lambda name: -standings.get(name, -math.inf),
-        )
-        drawn += rated[: config.GATE_CONTENDERS]
-        remainder = list(rated[config.GATE_CONTENDERS :])
-        room = config.GATE_OPPONENTS - len(drawn)
-        if room > 0:
-            drawn += rng.sample(remainder, min(room, len(remainder)))
-        return drawn[: config.GATE_OPPONENTS]
 
     def add_champion(self, path: str) -> None:
         """Put our champion in the pool, and keep the one it replaces.

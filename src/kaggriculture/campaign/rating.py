@@ -1,55 +1,31 @@
-"""The tournament the gate is: Bradley-Terry over a candidate and the pool.
+"""A Bradley-Terry fit over a set of pairings: one strength per agent.
 
-The finale is a single Bradley-Terry tournament over the episodes that keep
-running after the deadline, and a leaderboard position is a skill rating. The
-gate runs that same tournament: every agent plays every other, one fit ranks
-them all, and beating the pool means coming out on top of it.
-
-The candidate's own games are played every time. The pool's games against each
-other are played once and kept, because they are constants: a game is decided
-by the two agents' files and the seed, the opponents are fixed files, and none
-of them draws on randomness -- verified by replaying pairings to identical
-rates and by there being no `random` call anywhere in the roster. Replaying
-them each gate would re-derive numbers already known.
-
-That keeps the pool dynamic without paying for it twice. A champion joining
-brings pairings nobody has played, so those are measured and kept too; an
-opponent leaving takes its row out and costs nothing. Only a new member's
-pairings ever run.
-
-The one thing that would break it is a harvested opponent that draws on
-unseeded randomness, which would make a kept rate a stale sample rather than a
-fact. `Field.record` is where a rate enters, and `tests/campaign/test_rating`
-is where the roster is checked for it.
+The gate does not read this. It did until 2026-09-12, when every candidate
+began playing the whole pool on the same seeds in both seats, which makes the
+win rate directly comparable and leaves a rating estimating something already
+measured. What remains is the diagnostic: `dataset.leaderboard` rates the
+public corpus with it, where agents play different opponents on different
+seeds and a mean win rate says nothing, and `scripts/champions.py` rates the
+champion lineage on fixed files.
 
 One latent strength per agent, fitted from every pairing at once, such that
 ``P(i beats j) = p_i / (p_i + p_j)``. Beating a strong opponent counts for
 more than beating a weak one, and one bad matchup is absorbed rather than
-fatal -- which is where it differs from asking whether a program beat *every*
-opponent. Measured on 2026-09-06, the second-strongest agent in the published
-field loses one matchup at 0.062, and an absolute gate turns that agent away.
+fatal.
 
 Ratings are identified only up to a constant, so a number means nothing on its
-own: only differences within one fit do. The gate only ever takes differences
-within one fit, so that is enough.
+own: only differences within one fit do.
 
 The prior matters. Without it an agent that has won nothing has strength zero
-and a rating of negative infinity, and almost every program this campaign has
-produced has won nothing -- 264 of the first 266. Two phantom games at even
-odds keep every rating finite, and the winless then tie at the bottom rather
-than being incomparable.
+and a rating of negative infinity. Two phantom games at even odds keep every
+rating finite, and the winless then tie at the bottom rather than being
+incomparable.
 
 It is blind to margin, because the competition is: the win condition is
-relative bank and the margin never counts. Two programs that lose every game
-rate the same however close one came, which is why `Database.top` breaks its
-ties on the bank margin instead.
+relative bank and the margin never counts.
 """
 
 import math
-import os
-from pathlib import Path
-
-from pydantic import BaseModel
 
 # Phantom games at even odds against an average opponent, so a winless agent
 # still has a finite rating. Two is weak enough to move a well-measured agent
@@ -93,9 +69,7 @@ def ratings(
             if two not in rates or one not in rates[two]:
                 raise ValueError(f"pairing {one} vs {two} has no mirror")
     if not names:
-        # No games on the record, which is a cold start rather than an error:
-        # the first candidate of a run is measured before anything has been
-        # played, and a rating over nobody is nobody rated.
+        # Nobody to rate.
         return {}
     strength = dict.fromkeys(names, 1.0)
     for _ in range(ITERATIONS):
@@ -137,115 +111,3 @@ def standings(results: list[tuple[str, str, float, int]]) -> dict[str, float]:
         counts.setdefault(one, {})[two] = float(games)
         counts.setdefault(two, {})[one] = float(games)
     return ratings(rates, counts)
-
-
-class Field(BaseModel):
-    """The pool's pairings against each other, kept between gates.
-
-    Every rate here is a constant: the agents are fixed files and the games
-    are seeded, so a pairing measured once is measured for good. What is
-    *not* here is any candidate's row -- a candidate is a new program every
-    time and its games are always played fresh.
-
-    Attributes:
-        rates: ``rates[a][b]``, a's win rate against b, ties as half.
-        played: ``played[a][b]``, games behind that rate.
-        games: The depth pairings were measured at before the count was kept
-            per pairing. Read when `played` has no entry, so a field written
-            by the older code keeps its weights instead of being discarded.
-
-    The count used to be one number for the whole field, on the reasoning
-    that every pairing is played on the same seeds. It is per pairing now,
-    because a single number cannot be extended: changing the gate's depth
-    made every cached rate mislabelled, and the only safe thing was to throw
-    away the lot and play them again. That is two hundred and eighty pairings
-    of history, and the rating this campaign is now steered by is fitted over
-    exactly that history.
-    """
-
-    rates: dict[str, dict[str, float]] = {}
-    played: dict[str, dict[str, int]] = {}
-    games: int = 0
-
-    @classmethod
-    def load(cls, path: Path) -> "Field":
-        """Read the kept pairings, or an empty field if there are none yet."""
-        if not path.exists():
-            return cls()
-        return cls.model_validate_json(path.read_text(encoding="utf-8"))
-
-    def save(self, path: Path) -> None:
-        """Write the pairings, atomically.
-
-        A temporary file and a rename: gates run concurrently, and a reader
-        landing inside a truncate would get half a document and a parse error
-        nothing catches.
-        """
-        path.parent.mkdir(parents=True, exist_ok=True)
-        scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        scratch.write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        scratch.replace(path)
-
-    def missing(self, names: list[str]) -> list[tuple[str, str]]:
-        """Pairings among ``names`` not measured yet, in a stable order.
-
-        A pool that gained a champion has that champion's pairings missing
-        and nothing else, which is the whole point: only a new member's
-        pairings ever run.
-        """
-        return [
-            (one, two)
-            for index, one in enumerate(names)
-            for two in names[index + 1 :]
-            if two not in self.rates.get(one, {})
-        ]
-
-    def record(self, one: str, two: str, rate: float, games: int) -> None:
-        """Keep a measured pairing, both ways round.
-
-        Args:
-            one: An agent.
-            two: The agent it played.
-            rate: One's win rate against two, ties as half.
-            games: How many games that rate is over, kept per pairing so a
-                field measured at one depth can be extended at another.
-        """
-        self.rates.setdefault(one, {})[two] = rate
-        self.rates.setdefault(two, {})[one] = 1.0 - rate
-        self.played.setdefault(one, {})[two] = games
-        self.played.setdefault(two, {})[one] = games
-
-    def depth(self, one: str, two: str) -> int:
-        """Games behind one pairing, falling back to the field-wide count.
-
-        The fallback is what lets a field written before the count was kept
-        per pairing go on being used rather than being thrown away.
-        """
-        return self.played.get(one, {}).get(two, self.games)
-
-    def results(self, names: list[str]) -> list[tuple[str, str, float, int]]:
-        """The kept pairings among ``names``, as `standings` takes them."""
-        return [
-            (one, two, self.rates[one][two], self.depth(one, two))
-            for index, one in enumerate(names)
-            for two in names[index + 1 :]
-            if two in self.rates.get(one, {})
-        ]
-
-    def everything(self) -> list[tuple[str, str, float, int]]:
-        """Every pairing on the record, whoever is in the pool today.
-
-        What a rating is fitted over. Restricting it to the current pool was
-        right when the pool was the tournament and a candidate played all of
-        it; it is wrong now that a candidate plays a sample, because then the
-        agents it did not draw are exactly what place it against the ones it
-        did. The record has never been trimmed -- forty-four agents and two
-        hundred and eighty pairings at the time this was written -- so this is
-        the whole history and it costs a dictionary walk.
-        """
-        return [
-            (one, two, rate, self.depth(one, two))
-            for one, against in self.rates.items()
-            for two, rate in against.items()
-            if one < two
-        ]

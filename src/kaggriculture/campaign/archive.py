@@ -8,10 +8,13 @@ database, so the ledger is the only place it is written down.
 """
 
 import json
+import time
 from pathlib import Path
 
 from pydantic import BaseModel
 
+from kaggriculture.campaign import plan
+from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.harness import Margin
 
 
@@ -38,20 +41,10 @@ class Program(BaseModel):
         instruction: The mutation instruction the round was given.
         model: The model that wrote it, so a block of quota can be judged
             after the fact. Empty for the seed, which no model wrote.
-        fitness: Mean pool win rate from the fast evaluation.
-        rates: Fast-evaluation win rate per pool opponent.
-        field: Mean win rate over the vendored incumbents alone, which never
-            change, so it is comparable across the whole campaign where
-            ``fitness`` is not. None once the pool holds none of them.
-        rating: Its Bradley-Terry rating in the tournament that scored it --
-            the measure the gate promotes on and the competition ranks by.
-            Defaulted, so a program written before the tournament still loads;
-            such a program has no rating rather than a rating of zero, and
-            `place` says the same about where it came.
-        place: Where it finished in that tournament, 1 being top. Zero for a
-            program from before there was one.
-        margins: Fast-evaluation bank margin per pool opponent. Defaulted,
-            so a program written before margins existed still loads.
+        fitness: Mean win rate over the pool it was measured against.
+        rates: Win rate per pool opponent.
+        margins: Bank margin per pool opponent. Defaulted, so a program
+            written before margins existed still loads.
         changed: What this edit did to the plan, as `plan.described` renders
             it, or "" when nothing computed it -- the seed, a program from
             before this field, or a child whose parent carries no packed plan.
@@ -72,9 +65,6 @@ class Program(BaseModel):
     instruction: str
     model: str
     fitness: float
-    field: float | None = None
-    rating: float | None = None
-    place: int = 0
     rates: dict[str, float] = {}
     margins: dict[str, Margin] = {}
     changed: str = ""
@@ -255,23 +245,8 @@ class Database:
     def top(self, k: int) -> list[Program]:
         """Return the `k` best programs, best first: most games won.
 
-        On the win rate, because every candidate now plays the whole pool on
-        the same seeds in both seats and that makes the rate directly
-        comparable. It ranked on the Bradley-Terry rating until 2026-09-12, for
-        a reason that was sound at the time -- the gate promoted on the rating,
-        so selection and the bar wanted the same answer -- and for one that
-        never was: that a rate "counts beating the pool's weakest agent for as
-        much as beating its strongest", which is a complaint about the
-        objective rather than the estimator, and the objective is to win games.
-
-        The rating had to go because it stopped separating anything at the top.
-        Measured 2026-09-12: the best program the campaign has produced sat at
-        rating rank 1 behind a program winning 12.5 points fewer games, on an
-        identical fitted rating of -1.983, so `PARENT_DECAY ** rank` drew the
-        worse one half the time and the better one a quarter. The second and
-        third best by games won were at rating ranks 14 and 10, outside the
-        parent pool entirely.
-
+        On the win rate, because every candidate plays the whole pool on the
+        same seeds in both seats, which makes the rate directly comparable.
         Then on the mean bank margin across opponents. That tie-break is what
         makes the opening hours a search rather than a random walk: before the
         first win every rate is 0.0, sorting on it alone leaves the ties in
@@ -329,3 +304,53 @@ class Database:
     def failures(self, started_from: str) -> list[Failure]:
         """Return the failures recorded against `started_from`, oldest first."""
         return [f for f in self._failures if f.started_from == started_from]
+
+
+def measured(
+    program_id: str,
+    source: Path,
+    started_from: str,
+    instruction: str,
+    model: str,
+    result: Result,
+    parent: Path | None = None,
+) -> Program:
+    """One database entry for a measured program, stamped now.
+
+    ``parent`` is the source this was edited from, and it is here for one
+    reason: this is the only moment both plans exist as files, so describing
+    the edit costs a read of two programs already on the disk. Asked later it
+    costs the whole archive -- 489 programs at 869KB each.
+    """
+    return Program(
+        changed=changed(source, parent),
+        id=program_id,
+        source_path=str(source),
+        started_from=started_from,
+        instruction=instruction,
+        model=model,
+        fitness=result.fitness,
+        rates=result.rates,
+        margins=result.margins,
+        created=time.time(),
+    )
+
+
+def changed(source: Path, parent: Path | None) -> str:
+    """What this program did to its parent's plan, in a round's own terms.
+
+    Empty rather than raising, for every reason a pair of programs might not be
+    comparable: the seed has no parent, a program from before champion_17
+    carries no packed plan, and a round can rewrite the controller into
+    something `split` refuses. None of those is a failed evaluation, and a
+    campaign must not lose a scored program because the sentence describing it
+    could not be written.
+    """
+    if parent is None:
+        return ""
+    try:
+        _, before = plan.split(parent.read_text(encoding="utf-8"))
+        _, after = plan.split(source.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return ""
+    return plan.described(before, after)

@@ -1,11 +1,12 @@
 """The one place a candidate becomes the floor.
 
-The gate is a tournament. Every agent plays every other -- the candidate
-against the pool and the pool against itself -- one Bradley-Terry fit ranks
-them all, and a candidate is promoted when it comes out top. That is the
-competition's own reading of better: the finale is a single Bradley-Terry
-tournament over the episodes that keep running past the deadline, and a
-leaderboard position is a skill rating.
+A candidate is measured against the whole pool on seeds drawn fresh for that
+evaluation, and `promotion` reads three things off the measurement: its win
+rate over the opponents it shares with the champion, its mean bank margin over
+the same ones, and the head-to-head against the champion itself. It is
+promoted when it is no worse on the first two and demonstrably better on the
+third. That is the competition's own reading of better -- the win condition is
+relative bank, game by game -- asked of the one agent a promotion replaces.
 
 It used to ask something else -- beat *every* opponent -- which is a minimum
 where the ladder takes a strength-weighted view. Measured on the pool as it
@@ -13,16 +14,12 @@ stood on 2026-09-06, exactly one published agent cleared that bar, and the
 second-strongest agent in the whole field was turned away for a single
 matchup at 0.062 while winning 78.6% of everything else.
 
-The pool is dynamic -- a champion joins and the weakest opponent makes way --
-and the tournament is over the pool as it stands. What is not replayed is the
-pool's games against itself: those are constants, so they are measured once
-and kept, and only a new member's pairings ever run. The candidate's own row
-is always played fresh, because a candidate has no history.
+The pool is dynamic -- a champion joins on every promotion and the harvest
+adds what the ladder publishes -- and every candidate plays all of it.
 
 Champions accumulating in the pool are what makes the chain a ratchet: each
-promotion came top of a field that already held every champion before it,
-on seeds drawn fresh for that tournament and never seen by the lineage
-being judged.
+promotion beat the floor before it, on seeds drawn fresh for that measurement
+and never seen by the lineage being judged.
 
 A promotion also produces the artefact a cut uploads: the program is
 packaged into `champions/<name>.tar.gz`, so a cut is one command -- upload
@@ -57,13 +54,51 @@ from pathlib import Path
 import scipy.stats
 from pydantic import BaseModel
 
-from kaggriculture.campaign import config, harness, rating, roster
+from kaggriculture.campaign import config, harness
 from kaggriculture.campaign.archive import Program
 from kaggriculture.campaign.evaluator import Result
 from kaggriculture.campaign.pool import Pool
 from kaggriculture.report import wilson_interval
 
 LOGGER = logging.getLogger(__name__)
+
+# There is no promotion margin any more, and this note is here so nobody adds
+# one back.
+#
+# It was `PROMOTION_MARGIN = 0.15` of rating, about 26 Elo, and its job was to
+# stop the winner's curse: selecting the maximum of a noisy estimator is
+# biased upward by construction, and 78 of 471 programs once topped a noisy
+# gate with none surviving a deeper look. The reasoning was right and the
+# instrument was never checked against it. Measured 2026-09-11: one unchanged
+# agent's fitted rating moves with a standard deviation of 0.745 across draws
+# -- 129 Elo -- so the bar sat a fifth of a standard deviation out and
+# filtered almost none of the noise it was aimed at. What it did filter
+# reliably was a real improvement too small to clear it.
+#
+# A fixed size cannot be the answer to a quantity that varies with the draw,
+# the candidate's strength and how many games were decided. `gate.promotion`
+# asks for significance instead: the gate already plays the candidate against
+# the champion over every gate seed in both seats, which is one set of seasons
+# played twice and therefore paired, and a margin larger than twice its own
+# error is a demonstration. That bar tightens when the measurement is good and
+# refuses when it is not, which is the whole of what the constant was for.
+# The fewest games a candidate must actually decide against the floor before
+# the margin above means anything.
+#
+# Measured 2026-09-08. champion_55 was promoted over champion_54 on a rating
+# gap that the bar above reads as "about a 54% head-to-head". Their thirty-two
+# games were two wins by five units and thirty exact draws: the two programs
+# play the same game. A draw scores as half a win, so thirty draws and two
+# wins come to 0.53125 -- the same number as seventeen wins and fifteen
+# losses, which is two agents genuinely trading games rather than one agent
+# and a copy of itself. Bradley-Terry cannot tell those apart, and the Wilson
+# guard beside it was claiming thirty-two games of confidence for a pairing
+# that decided two.
+#
+# Eight of thirty-two is a quarter. Below that the two programs are the same
+# program and there is nothing to promote; above it the margin above is being
+# read on games that happened.
+DECISIVE_GAMES = 8
 
 
 class Champion(BaseModel):
@@ -92,125 +127,11 @@ class Champion(BaseModel):
     result: Result
 
 
-def refresh(
-    name: str,
-    against: list[str],
-    seeds: Sequence[int],
-    workers: int,
-    paths: config.Run,
-) -> list[tuple[str, str]]:
-    """Play one agent's missing edges against ``against``, and keep them.
-
-    `standing` fits a rating over pairings that already exist and plays
-    nothing. That is what makes a verdict cheap enough to give every round --
-    and it means a pairing nobody has played is simply absent from the fit.
-
-    Absent is fine for an opponent that has been around; it is wrong for a
-    champion. A champion joins the pool the moment it is promoted with no
-    pairings at all, so until they are played it sits in every fit on a
-    single edge: the row of whichever candidate is being judged against it.
-    Its rating is then inferred almost entirely from that one result -- beat
-    it, and its rating falls far enough to make topping the field easy. Each
-    promotion would buy the next one cheaply, which is the ratchet running
-    backwards.
-
-    It plays *one agent's* edges rather than every missing pair in the pool.
-    Nothing leaves the pool now, so "every missing pair" grows with its
-    square: sixty opponents is one thousand seven hundred and seventy
-    pairings, and a promotion cannot cost forty thousand games. A new
-    champion needs edges to the agents it will be compared against, and
-    `Pool.sample` already says which those are.
-
-    Args:
-        name: The agent whose edges are wanted, normally a new champion.
-        against: The opponents to connect it to.
-        seeds: Episode seeds; each pairing is played on all of them, both
-            seats, so a pairing is ``2 * len(seeds)`` games.
-        workers: Processes to fan the games over.
-        paths: The run whose field the pairings are kept in.
-
-    Returns:
-        The pairings measured, empty when the field already held them all.
-
-    Raises:
-        OpponentCrash: An opponent raised in its own seat.
-    """
-    games = 2 * len(seeds)
-    field = rating.Field.load(paths.field)
-    absent = [
-        other
-        for other in against
-        if other != name and other not in field.rates.get(name, {})
-    ]
-    if not absent:
-        return []
-    LOGGER.info("field: %d pairing(s) for %s, measuring them", len(absent), name)
-    for other in absent:
-        field.record(
-            name,
-            other,
-            _rate(roster.path(name, paths.pool), other, seeds, workers, paths.pool),
-            games,
-        )
-    field.save(paths.field)
-    return [(name, other) for other in absent]
-
-
-def _rate(
-    agent: Path,
-    opponent: str,
-    seeds: Sequence[int],
-    workers: int,
-    pool: Path | None = None,
-) -> float:
-    """``agent``'s win rate against ``opponent`` over ``seeds``, both seats."""
-    played = harness.play(agent, [opponent], list(seeds), workers, pool=pool)
-    return sum(
-        1.0 if game.ours > game.theirs else 0.5 if game.ours == game.theirs else 0.0
-        for game in played
-    ) / len(played)
-
-
-def standing(
-    name: str,
-    rates: dict[str, float],
-    games: int,
-    paths: config.Run,
-) -> dict[str, float]:
-    """The same tournament, over games already played: no new ones.
-
-    A round has just measured its program against the opponents it drew, and
-    every pairing anyone has ever played is kept, so the standings that
-    verdict needs are a fit and nothing more. That is what lets the loop tell
-    a model where it ranks after every round rather than only at the gate.
-
-    Fitted over the whole record rather than over the pool as it stands. That
-    distinction is what makes a sampled gate work at all: a candidate draws
-    sixteen opponents out of dozens, and it is the pairings among the agents
-    it did *not* draw that place it against them. Restricted to the drawn few,
-    every candidate would be rated in a private tournament and the numbers
-    would not compare.
-
-    Args:
-        name: The program's name in the standings.
-        rates: Its win rate against each opponent it played.
-        games: Games behind each rate.
-        paths: The run whose field the pairings are kept in.
-
-    Returns:
-        A rating per agent, the program included.
-    """
-    field = rating.Field.load(paths.field)
-    results = field.everything()
-    results += [(name, two, rate, games) for two, rate in rates.items()]
-    return rating.standings(results)
-
-
 def promotion(
     result: Result,
     champion: "Champion | None",
     *,
-    decisive_bar: int = config.DECISIVE_GAMES,
+    decisive_bar: int = DECISIVE_GAMES,
 ) -> tuple[bool, str]:
     """Whether the candidate is better than the champion, on every count.
 

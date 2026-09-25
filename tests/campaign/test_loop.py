@@ -54,6 +54,7 @@ from kaggriculture.campaign import (
     mutate,
     pool,
     prompt,
+    telemetry,
 )
 
 
@@ -178,9 +179,8 @@ def tiny_run(
     ask for more. It is the only constant here that decides behaviour rather
     than cost, which is why it is a parameter and not a line in the body.
     """
-    monkeypatch.setattr(config, "ROUNDS_PER_OPPONENT", rounds)
-    monkeypatch.setattr(config, "GATE_SEEDS", 1)
-    monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
+    monkeypatch.setattr(loop, "ROUNDS_PER_OPPONENT", rounds)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 1)
     # The copy check reads every opponent the machine holds, and the campaign
     # now harvests new ones every hour -- so a test that leaves this alone is
     # measured against a corpus that changes underneath it. These fixtures are
@@ -287,21 +287,15 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
         agent = bound.arguments["agent"]
         program_id = bound.arguments["program_id"]
         opponents = bound.arguments["pool"]
-        rng = bound.arguments["rng"]
-        standings = bound.arguments["standings"]
-        always = bound.arguments["always"]
         scored.append(program_id)
         if crashes:
             raise RuntimeError("the candidate raised in its own seat")
         measured = evaluator.opponents(opponents, program_id, agent)
         rate = score(agent)
-        # The draw the real evaluation would make, so a test sees the same
-        # opponents the gate would: a sample, not the whole pool.
-        names = measured.sample(standings or {}, rng, program_id, always)
+        names = measured.names()
         return evaluator.Result(
             program_id=program_id,
             fitness=rate,
-            field=0.5,
             rates=dict.fromkeys(names, rate),
             # A measured margin, because promotion now asks whether beating
             # the champion was shown rather than by how much: a mean inside
@@ -314,7 +308,7 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             # Every game decided. A stub that left this empty would be a
             # candidate indistinguishable from the floor, which the gate
             # refuses -- correctly, and not what any of these tests is about.
-            decisive=dict.fromkeys(names, config.DECISIVE_GAMES),
+            decisive=dict.fromkeys(names, gate.DECISIVE_GAMES),
             games=2,
             seeds=[1],
             hardest=names[0],
@@ -407,28 +401,6 @@ class Recorder:
 
 
 @pytest.mark.slow
-# `test_the_pool_plays_itself_before_anything_is_judged_against_it` stood here
-# until 2026-09-13. It asserted that a launch fills `paths.field` with the
-# pool's own pairings, so that a Bradley-Terry fit over the field is a
-# tournament rather than one candidate's row.
-#
-# The rule it protected is gone. Ratings decided promotion then, and a champion
-# that joined the pool with no pairings was rated almost entirely from the row
-# of whoever was being judged against it -- beat it, and its rating fell far
-# enough that each promotion bought the next one cheaply. Promotion is now a
-# win rate over the field and a head-to-head against the champion, both
-# measured inside the candidate's own evaluation, and neither reads a fit. The
-# refresh that kept the field current was removed with it: it cost 8.5 minutes
-# of the promotions lock per promotion, measured 2026-09-13, with three
-# candidates queued behind the first one of that run.
-#
-# So nothing writes the field and nothing downstream of it decides anything.
-# What remains of that machinery -- `gate.refresh`, `evaluator.score`'s unused
-# `standings` argument, and the fit `measure` makes to feed it -- is dead and
-# wants deleting, which is a change to `src/` rather than to a test.
-
-
-@pytest.mark.slow
 def test_a_better_child_is_promoted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -451,7 +423,7 @@ def test_a_better_child_is_promoted(
     draw or two without dropping under the decisive floor.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "GATE_SEEDS", 6)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 6)
     pass_pool(tmp_path, paths)
 
     state = loop.run(
@@ -491,7 +463,7 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
 
     Every write a promotion makes is under ``run/campaign``. One that landed
     in ``src/`` -- the seed file was such a write, once -- would dirty a
-    tracked file, and ``_open_run`` refuses to start a run whose ``src/`` has
+    tracked file, and `telemetry.open_run` refuses to start a run whose ``src/`` has
     uncommitted changes: the first promotion would be the last thing that
     campaign ever did.
     """
@@ -517,7 +489,7 @@ def test_a_promotion_leaves_a_tree_the_next_launch_can_start_from(
     assert state.champion is not None
     monkeypatch.setattr(config, "ROOT", tmp_path)
     assert repo.git.status("--porcelain", "--", "src") == ""
-    loop._open_run(dry_run=True).finish()
+    telemetry.open_run(True, "", {}).finish()
 
 
 def test_the_seed_is_champion_zero(
@@ -646,7 +618,7 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     two-condition gate cannot be satisfied at `tiny_run`'s one.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "GATE_SEEDS", 6)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 6)
     pass_pool(tmp_path, paths)
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
@@ -842,7 +814,6 @@ def test_a_broken_pool_opponent_stops_the_run(
             instruction="seed",
             model="",
             fitness=0.5,
-            field=0.5,
             created=time.time(),
         )
     )
@@ -920,7 +891,7 @@ def test_stagnation_switches_the_starting_program(
 ) -> None:
     """With no promotion in sight, a session starts from the top ten and is told so."""
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "STAGNATION_SESSIONS", 1)
+    monkeypatch.setattr(loop, "STAGNATION_SESSIONS", 1)
     strong_champion(tmp_path, paths)
     stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
@@ -960,14 +931,14 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
 ) -> None:
     """A typo'd model is caught before wandb opens or a call is ever made.
 
-    Real ``--dry-run`` never reaches ``validate_model`` -- a fake mutator
+    Real ``--dry-run`` never reaches `Driver.validate` -- a fake mutator
     spends no codex call -- so this is the other of the two tests that call
     ``main``, and it never runs with ``--dry-run``: a dirty-``src`` check or
     a live wandb run would otherwise have to be arranged just to reach the
     check this test is about.
 
     The typo goes in an ``.env`` of this test's own, because that file is
-    where the slug is chosen: `mutate.model` reloads it with ``override=True``
+    where the slug is chosen: `mutate.setting` reloads it with ``override=True``
     on every read, so a slug set any other way -- a patched constant, an
     exported variable -- is overwritten by the host's real file before
     ``main`` ever sees it.
@@ -983,8 +954,8 @@ def test_a_bad_model_name_refuses_to_start_before_opening_a_run(
     )
     monkeypatch.setattr(mutate, "ENV", env)
     monkeypatch.setattr(
-        mutate,
-        "MODEL_CATALOG_COMMAND",
+        mutate.CodexMutator,
+        "CATALOG",
         ["printf", "%s", '{"models":[{"slug":"gpt-6-astra"}]}'],
     )
 
@@ -1006,14 +977,14 @@ def test_a_clean_tree_names_the_run_and_a_second_launch_resumes_it(
     monkeypatch.setattr(config, "ROOT", tmp_path)
     expected = repo.head.commit.hexsha[:7]
 
-    first = loop._open_run(dry_run=True)
+    first = telemetry.open_run(True, "", {})
     first.finish()
-    second = loop._open_run(dry_run=True)
+    second = telemetry.open_run(True, "", {})
     second.finish()
 
     assert first.name == expected and first.id == expected
     assert second.id == first.id
-    assert config.CODEX_MODEL not in first.id
+    assert mutate.CodexMutator.MODEL not in first.id
 
 
 def test_a_restart_finds_the_champions_games_on_the_record_not_in_the_state(
@@ -1233,13 +1204,12 @@ def _gate_result(
     return evaluator.Result(
         program_id=program_id,
         fitness=point,
-        field=point,
         rates=rates,
         margins={n: harness.Margin(mean=0.0, worst=0.0, best=0.0) for n in rates},
         intervals={
             n: (max(0.0, r - 0.05), min(1.0, r + 0.05)) for n, r in rates.items()
         },
-        decisive=dict.fromkeys(rates, config.DECISIVE_GAMES),
+        decisive=dict.fromkeys(rates, gate.DECISIVE_GAMES),
         games=4,
         seeds=[1],
         hardest=min(rates, default=""),
@@ -1380,7 +1350,7 @@ def test_the_database_records_which_model_wrote_each_program(
     """A program remembers which model wrote it.
 
     That is what lets a block of quota be judged after the fact, even once
-    ``config.CODEX_MODEL`` has moved on to another value. The seed carries no
+    the model in `.env` has moved on to another value. The seed carries no
     model: no session wrote it.
     """
     paths = tiny_run(tmp_path, monkeypatch)
@@ -1576,7 +1546,7 @@ def test_calls_that_never_reach_a_verdict_stop_the_campaign(
     """
     paths = tiny_run(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SESSIONS", 1)
-    monkeypatch.setattr(config, "NO_VERDICT_LIMIT", 3)
+    monkeypatch.setattr(loop, "NO_VERDICT_LIMIT", 3)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     monkeypatch.setattr(
@@ -1616,7 +1586,7 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
     """
     paths = tiny_run(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SESSIONS", 1)
-    monkeypatch.setattr(config, "NO_VERDICT_LIMIT", 2)
+    monkeypatch.setattr(loop, "NO_VERDICT_LIMIT", 2)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     # One byte per call, and the odd-numbered ones fail: a marker file, not a
@@ -1667,7 +1637,7 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
     candidates and every promotion for seven hours -- silently, because the
     only line that records a gate sat below the return.
 
-    What still has to hold is the floor, which `must_play` draws every time and
+    What still has to hold is the floor, which every candidate plays and
     the gate checks by name.
     """
     paths = tiny_run(tmp_path, monkeypatch)
@@ -1679,7 +1649,6 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         }
     )
     opponents.save(paths.pool)
-    monkeypatch.setattr(evaluator, "VENDORED", ["pass", "joiner"])
     scored = stub_evaluator(monkeypatch)
     measure = evaluator.score
 
@@ -1691,8 +1660,6 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
         seeds: Sequence[int],
         workers: int,
         pool_file: Path | None = None,
-        standings: dict[str, float] | None = None,
-        always: Sequence[str] = (),
         duel_seeds: Sequence[int] = (),
     ) -> evaluator.Result:
         """Every measurement lands as if ``joiner`` had joined during it."""
@@ -1795,7 +1762,7 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     falsehood in the one message it reads.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "STAGNATION_SESSIONS", 1)
+    monkeypatch.setattr(loop, "STAGNATION_SESSIONS", 1)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
@@ -1811,7 +1778,7 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     # withheld here, because telling a model its lineage was stuck when it had
     # never had one was a sentence about nothing.
     assert state.champion is not None
-    assert state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+    assert state.sessions_since_promotion >= loop.STAGNATION_SESSIONS
     assert len(mutator.seen) == 2
     assert any("no promotion" in seen.message for seen in mutator.seen)
 
@@ -1849,44 +1816,6 @@ def test_a_round_logs_the_win_rate_and_the_place_it_bought(
     assert 0.0 <= call["calls/fitness"] <= 1.0
     # One public opponent, plus champion zero.
     assert call["calls/pool"] == 2
-    assert isinstance(call["calls/rating"], float)
-    assert call["calls/place"] >= 1
-    # The best rating so far, so the curve has a ratchet on it and not just
-    # whatever the last round happened to score.
-    assert "database/top_rating" in call
-
-
-def test_a_program_carries_the_rating_it_was_given(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """Stored, not recomputed: the pool moves, and a rating is of its moment.
-
-    Refitting an old program against today's pool would answer a different
-    question from the one its evaluation asked, and `database/top_rating` is
-    meant to be the best any round actually achieved.
-    """
-    paths = tiny_run(tmp_path, monkeypatch)
-    pass_pool(tmp_path, paths)
-    stub_evaluator(monkeypatch)
-
-    loop.run(
-        sessions=1,
-        mutator=mutate.FakeMutator(edit=lambda source: f"{source}\n# edited\n"),
-        workers=WORKERS,
-        seed_agent=_write(tmp_path / "seed.py", PASS),
-        rng=random.Random(0),
-        log=log,
-        paths=paths,
-        opponents=UNVENDORED,
-    )
-
-    database = archive.Database(paths.archive, paths.programs)
-    child = next(p for p in database.programs if p.id != "seed")
-    assert child.rating is not None
-    assert child.place >= 1
-    # The seed is scored before any pool is loaded, so it honestly has none.
-    assert database.get("seed").rating is None
-    assert database.get("seed").place == 0
 
 
 def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
@@ -1897,14 +1826,14 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     With no champion there is nothing else deciding where a session begins, so
     a shuffle meant nine sessions in ten started from something worse than the
     best program the campaign had -- while one child in ten improves on its
-    parent and one in five is worse. Over 259 rated programs the best rating
-    peaked at the fiftieth and every cohort after was worse than it.
+    parent and one in five is worse. Over 259 programs the best score peaked
+    at the fiftieth and every cohort after was worse than it.
     """
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     database = archive.Database(paths.archive, paths.programs)
-    for rank in range(config.PARENT_POOL):
+    for rank in range(loop.PARENT_POOL):
         source = database.store(f"{PASS}# rank {rank}\n", f"p{rank}")
         database.add(
             archive.Program(
@@ -1913,10 +1842,8 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
                 started_from="parent",
                 instruction="tune",
                 model="m",
-                fitness=0.5,
-                field=0.5,
                 # Rank 0 is the best; the draw should reflect that ordering.
-                rating=-float(rank),
+                fitness=1.0 - rank / loop.PARENT_POOL,
                 created=float(rank),
             )
         )
@@ -1934,7 +1861,7 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     drawn = [campaign.start(stagnant=False)[1] for _ in range(400)]
 
     best = drawn.count("p0")
-    worst = drawn.count(f"p{config.PARENT_POOL - 1}")
+    worst = drawn.count(f"p{loop.PARENT_POOL - 1}")
     assert best > len(drawn) * 0.35, f"the best was drawn only {best} times"
     assert best > 10 * max(1, worst), "the best must dominate the tail"
     # Still a search, not a hill climb: something other than the best is
@@ -1947,8 +1874,8 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
 ) -> None:
     """The niche is what makes a blank start more than a lottery ticket.
 
-    A program that begins from nothing rates far below a champion, and
-    `Database.top` ranks on rating -- so parented from the database's best, a
+    A program that begins from nothing scores far below a champion, and
+    `Database.top` ranks on the win rate -- so parented from the database's best, a
     scratch session would start from the champion's lineage every time after
     the first and the blank start would never compound. Parented from its own
     best it gets a ratchet of its own.
@@ -1956,13 +1883,13 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
-    monkeypatch.setattr(config, "SCRATCH_CHANCE", 1.0)
+    monkeypatch.setattr(loop, "SCRATCH_CHANCE", 1.0)
     database = archive.Database(paths.archive, paths.programs)
-    # The champion's lineage, rated far above anything a blank start reaches.
-    for name, parent, standing in (
-        ("champ", "seed", 5.0),
-        ("sprout", config.SCRATCH_ID, -4.0),
-        ("sapling", "sprout", -3.0),
+    # The champion's lineage, scoring far above anything a blank start reaches.
+    for name, parent, rate in (
+        ("champ", "seed", 0.9),
+        ("sprout", loop.SCRATCH_ID, 0.1),
+        ("sapling", "sprout", 0.2),
     ):
         source = database.store(f"{PASS}# {name}\n", name)
         database.add(
@@ -1972,9 +1899,7 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
                 started_from=parent,
                 instruction="tune",
                 model="m",
-                fitness=0.5,
-                field=0.5,
-                rating=standing,
+                fitness=rate,
                 created=1.0,
             )
         )
@@ -1992,7 +1917,7 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
     _, name = campaign.start(stagnant=False)
 
     # The best of the scratch lineage, two generations down -- never `champ`,
-    # which out-rates every one of them by nine log-odds.
+    # which wins far more than any of them.
     assert name == "sapling"
 
 
@@ -2008,7 +1933,7 @@ def test_the_first_scratch_session_begins_from_the_blank_slate(
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
-    monkeypatch.setattr(config, "SCRATCH_CHANCE", 1.0)
+    monkeypatch.setattr(loop, "SCRATCH_CHANCE", 1.0)
     campaign = loop.Campaign(
         loop.State(),
         archive.Database(paths.archive, paths.programs),
@@ -2022,9 +1947,9 @@ def test_the_first_scratch_session_begins_from_the_blank_slate(
 
     source, name = campaign.start(stagnant=False)
 
-    assert name == config.SCRATCH_ID
-    assert source.read_text(encoding="utf-8") == config.SCRATCH_AGENT
-    assert "PASS" in config.SCRATCH_AGENT
+    assert name == loop.SCRATCH_ID
+    assert source.read_text(encoding="utf-8") == loop.SCRATCH_AGENT
+    assert "PASS" in loop.SCRATCH_AGENT
 
 
 def _record_campaign(
@@ -2128,27 +2053,6 @@ def test_the_gate_asks_for_the_floor_and_not_the_whole_pool(
     assert campaign.floor() not in stale
 
 
-def test_the_draw_always_holds_the_leader_and_the_floor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
-) -> None:
-    """Two questions that are usually one agent, and must not be left to dice.
-
-    The champion has out-rated the field since the ratchet started, so the top
-    of the standings and the floor are the same name -- but they are different
-    questions, and when they come apart both have to be played: the leader
-    because topping the field means beating it, the floor because the bar is a
-    gap over that specific agent.
-    """
-    campaign = _record_campaign(tmp_path, monkeypatch, log)
-    campaign.state.champion = _champion("champion_2", 0.5)
-
-    same = campaign.must_play({"champion_2": 2.0, "v54": 1.0})
-    apart = campaign.must_play({"v54": 2.0, "champion_2": 1.0})
-
-    assert same == ["champion_2"]
-    assert apart == ["v54", "champion_2"]
-
-
 def test_only_a_promotion_writes_the_champion_series(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> None:
@@ -2160,11 +2064,10 @@ def test_only_a_promotion_writes_the_champion_series(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"champion_2": 0.7, "v54": 0.9})
-    standings = {"p1": 1.0, "champion_2": 0.0, "v54": -1.0}
     floor = _champion("champion_2", 0.5)
 
-    refused = campaign.promotion_record(result, False, floor, standings)
-    promoted = campaign.promotion_record(result, True, floor, standings)
+    refused = campaign.promotion_record(result, False, floor)
+    promoted = campaign.promotion_record(result, True, floor)
 
     assert "champion/win_rate" not in refused
     assert promoted["champion/win_rate"] == result.fitness
@@ -2183,11 +2086,8 @@ def test_the_champion_series_says_what_it_did_to_the_one_it_replaced(
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"champion_2": 0.72, "v54": 0.9})
-    standings = {"p1": 1.0, "champion_2": 0.0, "v54": -1.0}
 
-    record = campaign.promotion_record(
-        result, True, _champion("champion_2", 0.5), standings
-    )
+    record = campaign.promotion_record(result, True, _champion("champion_2", 0.5))
 
     assert record["champion/over_previous"] == 0.72
 
@@ -2203,7 +2103,7 @@ def test_the_first_champion_has_nothing_to_be_compared_against(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"v54": 0.9})
 
-    record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
+    record = campaign.promotion_record(result, True, None)
 
     assert record["champion/win_rate"] == result.fitness
     assert "champion/over_previous" not in record
@@ -2214,17 +2114,17 @@ def test_no_metric_is_frozen_at_a_score_nothing_can_earn(
 ) -> None:
     """`database/top_field` was the maximum of a score nothing could earn.
 
-    `field` averages the published opponents *in the pool*, and champions
-    trim them out one at a time until none is left; after that every program
-    scores None and drops out of the maximum. The series sat at 0.901 for 243
-    programs -- a value held by the seed itself, so the chart read "nothing
-    has ever beaten the starting program" when it meant "nothing since the
-    hundredth has been measured at all".
+    It averaged the published opponents *in the pool*, and champions trimmed
+    them out one at a time until none was left; after that every program
+    scored None and dropped out of the maximum. The series sat at 0.901 for
+    243 programs -- a value held by the seed itself, so the chart read
+    "nothing has ever beaten the starting program" when it meant "nothing
+    since the hundredth has been measured at all".
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     result = _gate_result("p1", {"v54": 0.9})
 
-    record = campaign.promotion_record(result, True, None, {"p1": 1.0, "v54": -1.0})
+    record = campaign.promotion_record(result, True, None)
 
     assert not any("top_field" in key for key in record)
 
@@ -2286,7 +2186,7 @@ def test_the_campaign_harvests_while_it_runs(
     back.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "HARVEST_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
@@ -2310,7 +2210,7 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
     timed out, so the harvester logs and waits for the next turn.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "HARVEST_INTERVAL_SECONDS", 0)
 
     asked = []
 
@@ -2339,7 +2239,7 @@ def test_the_campaign_reloads_the_games_it_lost(
     harvests, one level out.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "LOSSES_INTERVAL_SECONDS", 0)
     passes = []
 
     def loads() -> int:
@@ -2365,7 +2265,7 @@ def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
     fail -- and a run that has been evaluating for hours must not end with it.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "LOSSES_INTERVAL_SECONDS", 0)
 
     asked = []
 
@@ -2396,7 +2296,7 @@ def test_where_the_losses_are_decided_reaches_the_run(
     as not measuring them at all.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "LOSSES_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(loop.losses, "refresh", lambda: 0)
     where = {
         "losses/games": 49.0,
@@ -2420,52 +2320,6 @@ def test_where_the_losses_are_decided_reaches_the_run(
     # corpus and not the delta: an hour with no new losses is still an hour a
     # promotion has to be read against.
     assert logged[0]["losses/gap_day10"] > 0
-
-
-def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:
-    """The record says what changed, not only what it scored.
-
-    Every promotion's change was rendered for the prompt by reading the
-    champion files back and diffing them; the four hundred and fifty edits that
-    were measured and refused were described nowhere. The moment a program is
-    stored is the only one where both plans are already files, so that is where
-    the sentence is written.
-    """
-    from tests.campaign.test_plan import PLAN, packed
-
-    parent = tmp_path / "parent.py"
-    parent.write_text(packed(PLAN), encoding="utf-8")
-    # Through JSON, which is the trip a plan makes anyway and leaves the
-    # literal's mixed value types behind.
-    flipped = json.loads(json.dumps(PLAN))
-    flipped["settings"]["front_run"] = True
-    child = tmp_path / "child.py"
-    child.write_text(packed(flipped), encoding="utf-8")
-
-    said = loop._changed(child, parent)
-
-    assert said and said != "the plan is unchanged"
-    assert "front_run" in said
-
-
-def test_a_program_whose_parent_carries_no_plan_records_nothing(
-    tmp_path: Path,
-) -> None:
-    """Empty rather than a crash: a scored program must never be lost to a sentence.
-
-    The seed has no parent, programs before champion_17 carry no packed plan,
-    and a round can rewrite the controller into something `split` refuses. None
-    of those is a failed evaluation.
-    """
-    from tests.campaign.test_plan import PLAN, packed
-
-    bare = tmp_path / "bare.py"
-    bare.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
-    child = tmp_path / "child.py"
-    child.write_text(packed(PLAN), encoding="utf-8")
-
-    assert loop._changed(child, bare) == ""
-    assert loop._changed(child, None) == ""
 
 
 def test_a_round_is_given_its_parent_and_a_way_to_play(
@@ -2566,7 +2420,7 @@ def test_candidates_share_a_block_of_seasons_and_it_rotates(
     against, which is what the reserved held-out seeds existed to prevent.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "SEED_ROTATION", 3)
+    monkeypatch.setattr(loop, "SEED_ROTATION", 3)
 
     blocks = [campaign.seasons() for _ in range(7)]
 
@@ -2576,7 +2430,7 @@ def test_candidates_share_a_block_of_seasons_and_it_rotates(
     assert blocks[0] != blocks[3]
     assert blocks[6] != blocks[3]
     # And a block is a full gate's worth of seasons, every time.
-    assert all(len(block) == config.GATE_SEEDS for block in blocks)
+    assert all(len(block) == loop.GATE_SEEDS for block in blocks)
     assert all(len(set(block)) == len(block) for block in blocks)
 
 
@@ -2593,7 +2447,7 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
     in two cannot collide at all.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "SEED_ROTATION", 1)
+    monkeypatch.setattr(loop, "SEED_ROTATION", 1)
     # A narrow range, because over the real one -- a million seeds -- two
     # independent draws of 16 and 48 collide about once in a thousand runs,
     # and a test that only fails then is a test that never fails. From 79
@@ -2604,8 +2458,8 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
     for _ in range(5):
         block = campaign.seasons()
 
-        assert len(block) == config.GATE_SEEDS
-        assert len(campaign.duel) == config.DUEL_SEEDS - config.GATE_SEEDS
+        assert len(block) == loop.GATE_SEEDS
+        assert len(campaign.duel) == config.DUEL_SEEDS - loop.GATE_SEEDS
         assert not set(block) & set(campaign.duel)
         # The pairing is played over both, so together they are the depth the
         # gate's third condition is read at.
@@ -2719,121 +2573,4 @@ def test_the_defaults_are_left_where_they_already_pointed() -> None:
 
     assert parsed.run_root == config.RUN
     assert parsed.pool == config.POOL
-    assert parsed.seed_agent == config.SEED
-
-
-def guarded(tmp_path: Path) -> Path:
-    """A checkout-shaped tree with one source file and one prompt in it."""
-    root = tmp_path / "checkout"
-    (root / "src" / "kaggriculture" / "campaign").mkdir(parents=True)
-    here = root / "src" / "kaggriculture" / "campaign"
-    (here / "harness.py").write_text("REFERENCE_SAMPLE = 0.02\n", encoding="utf-8")
-    (here / "roster.py").write_text("    raise KeyError(name)\n", encoding="utf-8")
-    (here / "round_prompt.md").write_text("# how to ask\n", encoding="utf-8")
-    (here / "engine.so").write_bytes(b"\x00compiled")
-    return root
-
-
-def a_call(program_id: str = "pdeadbeef") -> mutate.Mutation:
-    """A successful call, for the guard to turn down."""
-    return mutate.Mutation(
-        program_id=program_id,
-        child=Path("/tmp/child.py"),
-        status="ok",
-        reason="",
-        seconds=1.0,
-        input_tokens=1,
-        output_tokens=1,
-        model="test",
-    )
-
-
-def test_the_two_edits_a_round_actually_made_are_put_back(tmp_path: Path) -> None:
-    """The 2026-09-20 tampering, reproduced exactly.
-
-    A round set `REFERENCE_SAMPLE` to 0.0, turning off the reference-engine
-    cross-check, and turned `roster.path`'s `raise KeyError` into a constructed
-    path so any string resolves to a file. Both weaken a guard in the direction
-    that makes the round's own job easier.
-    """
-    root = guarded(tmp_path)
-    here = root / "src" / "kaggriculture" / "campaign"
-    before = loop._kept(root)
-    (here / "harness.py").write_text("REFERENCE_SAMPLE = 0.0\n", encoding="utf-8")
-    (here / "roster.py").write_text(
-        "    return Path('/data/' + name)\n", encoding="utf-8"
-    )
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert (here / "harness.py").read_text(
-        encoding="utf-8"
-    ) == "REFERENCE_SAMPLE = 0.02\n"
-    assert (here / "roster.py").read_text(
-        encoding="utf-8"
-    ) == "    raise KeyError(name)\n"
-    assert verdict.status == "no_output"
-    assert verdict.child is None
-    assert "harness.py" in verdict.reason and "roster.py" in verdict.reason
-
-
-def test_the_message_a_round_is_asked_with_is_guarded_too(tmp_path: Path) -> None:
-    """A round that rewrites its own instructions has rewritten the objective."""
-    root = guarded(tmp_path)
-    prompt_file = root / "src" / "kaggriculture" / "campaign" / "round_prompt.md"
-    before = loop._kept(root)
-    prompt_file.write_text("# anything goes\n", encoding="utf-8")
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert prompt_file.read_text(encoding="utf-8") == "# how to ask\n"
-    assert verdict.status == "no_output"
-
-
-def test_a_round_that_changes_nothing_is_left_alone(tmp_path: Path) -> None:
-    """The guard must not fail every round, which is how it would be noticed."""
-    root = guarded(tmp_path)
-
-    verdict = loop._restored(loop._kept(root), a_call(), "pdeadbeef")
-
-    assert verdict.status == "ok"
-    assert verdict.child is not None
-
-
-def test_a_deleted_source_file_comes_back(tmp_path: Path) -> None:
-    """Removing a guard is as effective as editing it."""
-    root = guarded(tmp_path)
-    gone = root / "src" / "kaggriculture" / "campaign" / "harness.py"
-    before = loop._kept(root)
-    gone.unlink()
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert gone.read_text(encoding="utf-8") == "REFERENCE_SAMPLE = 0.02\n"
-    assert verdict.status == "no_output"
-
-
-def test_the_guard_can_only_write_back_what_it_read(tmp_path: Path) -> None:
-    """The bound the git version did not have.
-
-    That one asked git what had changed and reverted the answer, which under a
-    pre-commit hook was all 250 tracked files. This holds bytes, so a file it
-    never snapshotted -- anything compiled, anything outside `src` -- is one it
-    cannot touch however it is called.
-    """
-    root = guarded(tmp_path)
-    before = loop._kept(root)
-    binary = root / "src" / "kaggriculture" / "campaign" / "engine.so"
-    outside = tmp_path / "not_in_the_snapshot.py"
-    outside.write_text("untouched\n", encoding="utf-8")
-    binary.write_bytes(b"\x00changed")
-
-    verdict = loop._restored(before, a_call(), "pdeadbeef")
-
-    assert binary.read_bytes() == b"\x00changed"
-    assert outside.read_text(encoding="utf-8") == "untouched\n"
-    assert verdict.status == "ok"
-    assert set(before) == {
-        root / "src" / "kaggriculture" / "campaign" / name
-        for name in ("harness.py", "roster.py", "round_prompt.md")
-    }
+    assert parsed.seed_agent == loop.SEED

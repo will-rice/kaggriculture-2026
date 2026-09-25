@@ -23,13 +23,8 @@ def program(
     name: str,
     fitness: float,
     margin: float = 0.0,
-    rating: float | None = None,
 ) -> archive.Program:
-    """Store a source and add a program with its scores and one bank margin.
-
-    ``rating`` defaults to ``fitness`` because most tests want the two to
-    agree and care about neither; the ones about ranking set it apart.
-    """
+    """Store a source and add a program with its score and one bank margin."""
     p = archive.Program(
         id=name,
         source_path=str(db.store(AGENT, name)),
@@ -37,8 +32,6 @@ def program(
         instruction="improve",
         model="gpt-5.6-luna",
         fitness=fitness,
-        field=0.5,
-        rating=fitness if rating is None else rating,
         rates={"v54": fitness},
         margins={"v54": Margin(mean=margin, worst=margin, best=margin)},
         created=time.time(),
@@ -160,51 +153,15 @@ def test_a_program_with_no_model_is_a_bug_not_a_legacy_case() -> None:
 def test_top_ranks_by_games_won(tmp_path: Path) -> None:
     """`top` is the programs that won the most, which is the objective.
 
-    It decides what a session starts from. It ranked on the Bradley-Terry
-    rating until 2026-09-12, when every candidate began playing the whole pool
-    on the same seeds in both seats -- which makes the rate comparable directly
-    and leaves the rating estimating something already measured.
-
-    The rating also stopped separating the top. Measured that day: the best
-    program the campaign had produced tied on rating with one winning 12.5
-    points fewer games, so the rank-weighted draw took the worse one half the
-    time; the second and third best by games won sat at rating ranks 14 and 10,
-    outside the parent pool.
+    It decides what a session starts from, and every candidate plays the
+    whole pool on the same seeds in both seats, so the rate compares directly.
     """
     db = make(tmp_path)
-    # Deliberately disagreeing: `c` has the rating, `b` won the games.
-    program(db, "a", 0.1, rating=-2.0)
-    program(db, "b", 0.7, rating=0.1)
-    program(db, "c", 0.4, rating=1.5)
+    program(db, "a", 0.1)
+    program(db, "b", 0.7)
+    program(db, "c", 0.4)
 
     assert [p.id for p in db.top(2)] == ["b", "c"]
-
-
-def test_an_unrated_program_is_ranked_on_what_it_won(
-    tmp_path: Path,
-) -> None:
-    """A missing rating is no longer a reason to sort last.
-
-    The seed has no rating -- it is scored before any pool is loaded -- and
-    while `top` ranked on the rating that put it below every rated program
-    however many games it won. It ranks on games won now, so the seed competes
-    on the same terms as everything else and an absent rating decides nothing.
-    """
-    db = make(tmp_path)
-    program(db, "rated_badly", 0.0, rating=-9.0)
-    unrated = archive.Program(
-        id="seed",
-        source_path=str(db.store(AGENT, "seed")),
-        started_from="",
-        instruction="seed",
-        model="",
-        fitness=0.9,
-        field=0.9,
-        created=time.time(),
-    )
-    db.add(unrated)
-
-    assert [p.id for p in db.top(2)] == ["seed", "rated_badly"]
 
 
 def test_the_log_survives_a_restart(tmp_path: Path) -> None:
@@ -283,15 +240,61 @@ def test_top_breaks_a_tie_on_the_bank_margin(tmp_path: Path) -> None:
     competition is.
     """
     db = make(tmp_path)
-    program(db, "first", 0.0, margin=-900.0, rating=-6.0)
-    program(db, "closest", 0.0, margin=-5.0, rating=-6.0)
-    program(db, "middling", 0.0, margin=-300.0, rating=-6.0)
+    program(db, "first", 0.0, margin=-900.0)
+    program(db, "closest", 0.0, margin=-5.0)
+    program(db, "middling", 0.0, margin=-300.0)
     assert [p.id for p in db.top(2)] == ["closest", "middling"]
 
 
-def test_the_margin_never_outranks_the_rating(tmp_path: Path) -> None:
-    """A program that rates higher is above one that only lost narrowly."""
+def test_the_margin_never_outranks_the_win_rate(tmp_path: Path) -> None:
+    """A program that won more is above one that only lost narrowly."""
     db = make(tmp_path)
-    program(db, "narrow", 0.0, margin=-1.0, rating=-3.0)
-    program(db, "winner", 0.5, margin=-800.0, rating=-1.0)
+    program(db, "narrow", 0.0, margin=-1.0)
+    program(db, "winner", 0.5, margin=-800.0)
     assert [p.id for p in db.top(2)] == ["winner", "narrow"]
+
+
+def test_a_stored_program_records_what_its_edit_did(tmp_path: Path) -> None:
+    """The record says what changed, not only what it scored.
+
+    Every promotion's change was rendered for the prompt by reading the
+    champion files back and diffing them; the four hundred and fifty edits that
+    were measured and refused were described nowhere. The moment a program is
+    stored is the only one where both plans are already files, so that is where
+    the sentence is written.
+    """
+    from tests.campaign.test_plan import PLAN, packed
+
+    parent = tmp_path / "parent.py"
+    parent.write_text(packed(PLAN), encoding="utf-8")
+    # Through JSON, which is the trip a plan makes anyway and leaves the
+    # literal's mixed value types behind.
+    flipped = json.loads(json.dumps(PLAN))
+    flipped["settings"]["front_run"] = True
+    child = tmp_path / "child.py"
+    child.write_text(packed(flipped), encoding="utf-8")
+
+    said = archive.changed(child, parent)
+
+    assert said and said != "the plan is unchanged"
+    assert "front_run" in said
+
+
+def test_a_program_whose_parent_carries_no_plan_records_nothing(
+    tmp_path: Path,
+) -> None:
+    """Empty rather than a crash: a scored program must never be lost to a sentence.
+
+    The seed has no parent, programs before champion_17 carry no packed plan,
+    and a round can rewrite the controller into something `split` refuses. None
+    of those is a failed evaluation.
+    """
+    from tests.campaign.test_plan import PLAN, packed
+
+    bare = tmp_path / "bare.py"
+    bare.write_text("def agent(o, c=None):\n    return {}\n", encoding="utf-8")
+    child = tmp_path / "child.py"
+    child.write_text(packed(PLAN), encoding="utf-8")
+
+    assert archive.changed(child, bare) == ""
+    assert archive.changed(child, None) == ""

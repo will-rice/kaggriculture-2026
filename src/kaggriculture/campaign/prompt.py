@@ -535,11 +535,6 @@ def compose(
 ) -> str:
     """Compose the message for one round.
 
-    A rating used to be passed in and is not any more. It was never rendered --
-    a place is not something a round can act on, it cannot choose its opponents
-    or its rank -- and it cost a Bradley-Terry fit per round to compute an
-    argument nothing read.
-
     Args:
         name: What the program in ``child.py`` is called -- a pool name or a
             database id. It is interpolated raw, so it must never be a path.
