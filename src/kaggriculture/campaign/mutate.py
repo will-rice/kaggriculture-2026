@@ -5,7 +5,7 @@ whole message -- on standard input for codex, as an argument for agy. It edits
 that file and stops; the loop reads it back, scores it, and composes the next
 round's message from the result.
 
-Two programs can drive a round. `config.MUTATOR` chooses, and `build` returns
+Two programs can drive a round. `MUTATOR` chooses, and `build` returns
 it. They exist side by side because an entitlement ran out rather than because
 either is better: codex has no quota on this account until 2026-09-22, and agy
 bills a different one.
@@ -53,6 +53,129 @@ from pydantic import BaseModel
 from kaggriculture.campaign import config, plan
 
 LOGGER = logging.getLogger(__name__)
+
+# Retried once when the first call fails without a verdict, across pools on
+# purpose: a Claude-pool refusal (rate limit, capacity) is exactly the failure
+# a same-pool retry would hit again.
+AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
+
+# The model an `agy` round asks for. Sonnet rather than a flash model because
+# a round reads the champion and its opponents and edits a program, and the
+# cheap end of the catalog has already failed that once: `gemini-3.6-flash-low`
+# produced garbage on a two-step shell-and-edit probe that `-medium` completed.
+# It also spends the pool that has quota rather than the one that is 2% down.
+AGY_MODEL = "claude-sonnet-4-6"
+
+# The model agy is asked for on its other entitlement.
+#
+# `agy -p /usage` reports two pools -- "Gemini Models" and "Claude and GPT
+# models" -- and meters them apart. The model name alone decides which a call
+# bills, so naming only one leaves the other unspent: on 2026-09-20 the Gemini
+# pool was down to 34% while Claude and GPT sat at 67%, and agy had already
+# stopped both lineages twice for want of quota.
+#
+# A Gemini model here because `CAMPAIGN_AGY_MODEL` now names a Claude one. The
+# pair is what matters, not which is first.
+AGY_SECOND_MODEL = "gemini-3.1-pro-high"
+
+# How long one `agy` round may run.
+#
+# Deliberately far above the 5m default, for the reason a round cap was
+# removed from codex: the only cap this ever had cut calls off before they had
+# written anything. It has to be said out loud here because an expired
+# `--print-timeout` does not look like a failure -- agy returns the partial
+# answer, reports `"status": "SUCCESS"` and exits 0 (measured on 1.2.4, with
+# `child.py` untouched). Nothing but the file says whether the round worked,
+# which is why `_written` is what decides the verdict.
+AGY_TIMEOUT = "3h"
+
+# How hard the model is asked to think, passed on every call.
+#
+# Astra offers low, medium, high, xhigh, max and ultra, and defaults to medium.
+# The campaign was not running at medium, though, and not at anything it chose:
+# `~/.codex/config.toml` sets `model_reasoning_effort = "high"` for the host's
+# own interactive use, and every campaign call inherited it. That is the same
+# shape of coupling as a round inheriting the host's skills -- the loop's
+# behaviour changing because a file it does not own changed -- and it is worth
+# closing whatever the value is.
+#
+# `max` is "maximum reasoning depth for the hardest problems". Above it sits
+# `ultra`, which adds automatic task delegation; that is a different execution
+# shape rather than more thinking, and a round already has a shape.
+CODEX_REASONING = "max"
+
+# Which program drives a round: "codex" or "agy" (the Antigravity CLI). Read
+# per round through `mutate.selected`, so it can change under a running
+# campaign the way the model can.
+#
+# It is "agy" because the codex quota this account had is exhausted until
+# 2026-09-22 08:09 and the deadline is 2026-09-30, which left six of the
+# fourteen remaining days with no rounds at all. `agy` bills a different
+# entitlement entirely -- and two of them: `agy -p /usage` reports a Gemini
+# pool and a separate "Claude and GPT models" pool, the second untouched at
+# 100% while the codex one is at zero. So the wall the campaign hit was one
+# vendor's, not the account's.
+MUTATOR = "agy"
+
+# Retried once on the same model from a different seller, which is the only
+# fallback that answers the failure a fallback is for: a provider refusing,
+# rate-limiting or dropping the turn is a fact about that seller and not about
+# the model.
+OPENCODE_FALLBACK_MODEL = "opencode-go/gpt-5.6-luna"
+
+# The model an `opencode` round asks for, as `provider/model`.
+#
+# `gpt-5.6-luna` because it is the model this lineage was already climbing with
+# through codex, and OpenRouter sells it by the token with no window at all:
+# $0.20 a million input, about five cents for a round of the size measured
+# here. The quota walls that stopped the campaign -- codex until 2026-09-22,
+# agy's five-hour buckets -- are not a shape this provider has.
+OPENCODE_MODEL = "openrouter/openai/gpt-5.6-luna"
+
+# How long one opencode call may take before the loop stops waiting for it.
+#
+# `opencode run` has no timeout flag of its own, and on 2026-09-20 four calls
+# hung for four and a half hours apiece -- three minutes of CPU between them,
+# zero-byte transcripts -- while the loop waited, because nothing told it not
+# to. Its config's `timeout`/`headerTimeout`/`chunkTimeout` were already at
+# their five-minute defaults and did not fire: nothing had streamed, so the
+# hang was upstream of the request, in opencode's own server startup.
+#
+# Forty minutes rather than something tight. A round that is working takes ten
+# to twenty-five, so a shorter cap would throw away good calls to catch a rare
+# bad one; this is a backstop against a hang, not a limit on a round.
+OPENCODE_TIMEOUT = 40 * 60
+
+# How long a refused entitlement is left alone before it is asked again.
+#
+# The rotation used to rediscover the same exhaustion every round: opus
+# refused, sonnet refused, the gemini pool answered, and the next round opened
+# by asking opus again. Measured 2026-09-21 the pair took about two and a half
+# minutes to refuse, against rounds composing every three -- so most of a
+# round's setup was spent confirming a wall that agy already reports, with a
+# reset time attached, in the refusal itself.
+#
+# Thirty minutes rather than that reset time, which arrives as prose ("Resets
+# in 2h48m38s") and would have to be parsed to be trusted. The cost of being
+# wrong is bounded and small in both directions: at worst half an hour of not
+# using an entitlement that came back early, against a couple of minutes a
+# round saved while it is genuinely out.
+QUOTA_COOLDOWN = 30 * 60
+
+# How long the rotation waits before asking again when every program is out of
+# quota.
+#
+# It used to return the refusal and let the round fail, which spun: sixteen
+# refusals inside three minutes on 2026-09-20, as fast as four sessions could
+# ask. Failing is worse than idling -- a round that produced nothing counts
+# toward `STAGNATION_SESSIONS`, so an outage would have the campaign decide its
+# champion had gone stale when nothing had run, and the failures are shown to
+# the next round as though they were its own.
+#
+# Five minutes because a refusal costs seconds, so the poll is free next to the
+# ten-to-twenty-five minutes an answer takes, and the shortest reset seen so far
+# is a five-hour window.
+QUOTA_WAIT = 5 * 60
 
 # Reads the model catalog this login's codex is entitled to -- a local
 # lookup, not a model turn, so no quota is spent running it. A test replaces
@@ -149,21 +272,21 @@ def agy_model() -> str:
     part of its environment it can re-read.
 
     Returns:
-        The slug from the environment, or `config.AGY_MODEL`.
+        The slug from the environment, or `AGY_MODEL`.
     """
     load_dotenv(ENV, override=True)
-    return os.environ.get("CAMPAIGN_AGY_MODEL") or config.AGY_MODEL
+    return os.environ.get("CAMPAIGN_AGY_MODEL") or AGY_MODEL
 
 
 def agy_fallback() -> str:
     """The agy model retried once when the first fails without a verdict.
 
     Returns:
-        The slug from the environment, or `config.AGY_FALLBACK_MODEL`.
+        The slug from the environment, or `AGY_FALLBACK_MODEL`.
     """
     load_dotenv(ENV, override=True)
     value = os.environ.get("CAMPAIGN_AGY_FALLBACK_MODEL")
-    return config.AGY_FALLBACK_MODEL if value is None else value
+    return AGY_FALLBACK_MODEL if value is None else value
 
 
 def agy_second() -> str:
@@ -175,10 +298,10 @@ def agy_second() -> str:
     than half its entitlement was untouched.
 
     Returns:
-        The slug from the environment, or `config.AGY_SECOND_MODEL`.
+        The slug from the environment, or `AGY_SECOND_MODEL`.
     """
     load_dotenv(ENV, override=True)
-    return os.environ.get("CAMPAIGN_AGY_SECOND_MODEL") or config.AGY_SECOND_MODEL
+    return os.environ.get("CAMPAIGN_AGY_SECOND_MODEL") or AGY_SECOND_MODEL
 
 
 def known_agy_models() -> set[str]:
@@ -410,7 +533,7 @@ class CodexMutator:
             # Passed per call rather than left to `~/.codex/config.toml`, so
             # the campaign's effort is the campaign's decision and does not
             # move when the host edits its own codex settings.
-            command += ["-c", f"model_reasoning_effort={config.CODEX_REASONING}"]
+            command += ["-c", f"model_reasoning_effort={CODEX_REASONING}"]
         log = workspace / "codex.jsonl"
         with log.open("w", encoding="utf-8") as handle:
             process = await asyncio.create_subprocess_exec(
@@ -647,7 +770,7 @@ class AgyMutator:
             "--model",
             model,
             "--print-timeout",
-            config.AGY_TIMEOUT,
+            AGY_TIMEOUT,
         ]
 
     async def call(
@@ -836,7 +959,7 @@ class OpenCodeMutator:
     # defaults are 300000 for each and they did not save us -- a hung call
     # produced nothing for four and a half hours, which means it never got as
     # far as a request -- so these are the inner of two layers, and
-    # `config.OPENCODE_TIMEOUT` is the outer one that actually caught it.
+    # `OPENCODE_TIMEOUT` is the outer one that actually caught it.
     #
     # `timeout` caps the request, `headerTimeout` the wait for response
     # headers, `chunkTimeout` the gap between streamed chunks. Named per
@@ -964,7 +1087,7 @@ class OpenCodeMutator:
             )
             try:
                 _, stderr = await asyncio.wait_for(
-                    process.communicate(), config.OPENCODE_TIMEOUT
+                    process.communicate(), OPENCODE_TIMEOUT
                 )
             except TimeoutError:
                 # The arm that was missing. Same kill as cancellation, because
@@ -972,7 +1095,7 @@ class OpenCodeMutator:
                 LOGGER.warning(
                     "opencode call for %s gave up after %ds, killed pgid %s",
                     program_id,
-                    config.OPENCODE_TIMEOUT,
+                    OPENCODE_TIMEOUT,
                     kill_group(process),
                 )
                 return Mutation(
@@ -980,8 +1103,7 @@ class OpenCodeMutator:
                     child=None,
                     status="exec_error",
                     reason=(
-                        f"opencode wrote nothing in {config.OPENCODE_TIMEOUT}s "
-                        "and was killed"
+                        f"opencode wrote nothing in {OPENCODE_TIMEOUT}s and was killed"
                     ),
                     seconds=time.perf_counter() - started,
                     input_tokens=0,
@@ -1360,21 +1482,21 @@ def opencode_model() -> str:
     """The ``provider/model`` an opencode round asks for, read at every call.
 
     Returns:
-        The slug from the environment, or `config.OPENCODE_MODEL`.
+        The slug from the environment, or `OPENCODE_MODEL`.
     """
     load_dotenv(ENV, override=True)
-    return os.environ.get("CAMPAIGN_OPENCODE_MODEL") or config.OPENCODE_MODEL
+    return os.environ.get("CAMPAIGN_OPENCODE_MODEL") or OPENCODE_MODEL
 
 
 def opencode_fallback() -> str:
     """The seller retried once when the first fails without a verdict.
 
     Returns:
-        The slug from the environment, or `config.OPENCODE_FALLBACK_MODEL`.
+        The slug from the environment, or `OPENCODE_FALLBACK_MODEL`.
     """
     load_dotenv(ENV, override=True)
     value = os.environ.get("CAMPAIGN_OPENCODE_FALLBACK_MODEL")
-    return config.OPENCODE_FALLBACK_MODEL if value is None else value
+    return OPENCODE_FALLBACK_MODEL if value is None else value
 
 
 def known_opencode_models() -> set[str]:
@@ -1428,7 +1550,7 @@ def selected() -> str:
         SystemExit: The name is neither.
     """
     load_dotenv(ENV, override=True)
-    kind = os.environ.get("CAMPAIGN_MUTATOR") or config.MUTATOR
+    kind = os.environ.get("CAMPAIGN_MUTATOR") or MUTATOR
     if kind not in DRIVERS:
         named = ", ".join(repr(name) for name in DRIVERS)
         raise SystemExit(f"{kind!r} is not a mutator; use one of {named}")
@@ -1559,14 +1681,14 @@ class Rotating:
                     LOGGER.info("%s: %s answered", program_id, named(driver))
                     self.spent[index] = 0.0
                     return outcome
-                self.spent[index] = time.monotonic() + config.QUOTA_COOLDOWN
+                self.spent[index] = time.monotonic() + QUOTA_COOLDOWN
                 refused = outcome
                 LOGGER.warning(
                     "%s: %s has no quota (%s); leaving it alone for %ds",
                     program_id,
                     named(driver),
                     outcome.reason[:80],
-                    config.QUOTA_COOLDOWN,
+                    QUOTA_COOLDOWN,
                 )
             # Everything is out. Waiting rather than failing, because a round
             # that produced nothing counts toward stagnation and is shown to the
@@ -1575,7 +1697,7 @@ class Rotating:
             LOGGER.error(
                 "%s: every program is out of quota; waiting %ds (%s)",
                 program_id,
-                config.QUOTA_WAIT,
+                QUOTA_WAIT,
                 refused.reason[:120] if refused else "all of them on cooldown",
             )
             # To the soonest deadline when nothing was even asked, because
@@ -1583,7 +1705,7 @@ class Rotating:
             # and sleep again -- and with one program in the rotation it would
             # never ask anybody at all.
             nap = (
-                config.QUOTA_WAIT
+                QUOTA_WAIT
                 if refused is not None
                 else max(0.0, min(self.spent) - time.monotonic())
             )

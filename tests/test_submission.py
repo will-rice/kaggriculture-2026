@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config
+from kaggriculture.campaign import config, loop
 from kaggriculture.scripts.package import (
     ENTRYPOINT,
     _refuse_a_shadowed_entrypoint,
@@ -29,7 +29,7 @@ def test_the_entrypoint_is_the_campaign_floor() -> None:
     the campaign has actually promoted.
     """
     assert ENTRYPOINT == config.LIVE.floor / "main.py"
-    assert ENTRYPOINT != config.SEED
+    assert ENTRYPOINT != loop.SEED
 
 
 @needs_the_floor

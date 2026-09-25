@@ -65,6 +65,44 @@ from kaggriculture.report import wilson_interval
 
 LOGGER = logging.getLogger(__name__)
 
+# There is no promotion margin any more, and this note is here so nobody adds
+# one back.
+#
+# It was `PROMOTION_MARGIN = 0.15` of rating, about 26 Elo, and its job was to
+# stop the winner's curse: selecting the maximum of a noisy estimator is
+# biased upward by construction, and 78 of 471 programs once topped a noisy
+# gate with none surviving a deeper look. The reasoning was right and the
+# instrument was never checked against it. Measured 2026-09-11: one unchanged
+# agent's fitted rating moves with a standard deviation of 0.745 across draws
+# -- 129 Elo -- so the bar sat a fifth of a standard deviation out and
+# filtered almost none of the noise it was aimed at. What it did filter
+# reliably was a real improvement too small to clear it.
+#
+# A fixed size cannot be the answer to a quantity that varies with the draw,
+# the candidate's strength and how many games were decided. `gate.promotion`
+# asks for significance instead: the gate already plays the candidate against
+# the champion over every gate seed in both seats, which is one set of seasons
+# played twice and therefore paired, and a margin larger than twice its own
+# error is a demonstration. That bar tightens when the measurement is good and
+# refuses when it is not, which is the whole of what the constant was for.
+# The fewest games a candidate must actually decide against the floor before
+# the margin above means anything.
+#
+# Measured 2026-09-08. champion_55 was promoted over champion_54 on a rating
+# gap that the bar above reads as "about a 54% head-to-head". Their thirty-two
+# games were two wins by five units and thirty exact draws: the two programs
+# play the same game. A draw scores as half a win, so thirty draws and two
+# wins come to 0.53125 -- the same number as seventeen wins and fifteen
+# losses, which is two agents genuinely trading games rather than one agent
+# and a copy of itself. Bradley-Terry cannot tell those apart, and the Wilson
+# guard beside it was claiming thirty-two games of confidence for a pairing
+# that decided two.
+#
+# Eight of thirty-two is a quarter. Below that the two programs are the same
+# program and there is nothing to promote; above it the margin above is being
+# read on games that happened.
+DECISIVE_GAMES = 8
+
 
 class Champion(BaseModel):
     """The promoted floor, as the runs ``champion.json`` records it.
@@ -210,7 +248,7 @@ def promotion(
     result: Result,
     champion: "Champion | None",
     *,
-    decisive_bar: int = config.DECISIVE_GAMES,
+    decisive_bar: int = DECISIVE_GAMES,
 ) -> tuple[bool, str]:
     """Whether the candidate is better than the champion, on every count.
 

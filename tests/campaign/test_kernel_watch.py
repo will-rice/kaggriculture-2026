@@ -38,7 +38,10 @@ def test_resolving_a_stranger_cannot_write_into_our_working_directory(
     agent_file = tmp_path / "candidate.py"
     agent_file.write_text(WRITES_A_FILE, encoding="utf-8")
 
-    assert kernel_watch.resolved_entrypoint(agent_file) == "agent"
+    assert (
+        kernel_watch.resolve_in_sandbox(agent_file.read_text(encoding="utf-8"))
+        == "agent"
+    )
     assert kernel_watch.loadable(WRITES_A_FILE)
     assert not (tmp_path / "escaped.csv").exists()
 
@@ -131,65 +134,6 @@ def test_an_entrypoint_bound_at_module_level_is_recognised() -> None:
     assert re.search(kernel_watch.ENTRYPOINT, "agent = make_agent()", re.M)
     assert re.search(kernel_watch.ENTRYPOINT, "def agent(obs):\n    pass", re.M)
     assert not re.search(kernel_watch.ENTRYPOINT, "agents = []", re.M)
-
-
-WRITES_ON_LOAD = """
-from pathlib import Path
-
-Path("main.py").write_text("# a scanned kernel overwrote this")
-
-
-def agent(observation, configuration=None):
-    return {"farmer": ["PASS"], "hands": [], "market": []}
-"""
-
-
-def test_gating_a_stranger_cannot_overwrite_our_entrypoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Playing an agent executes it, and a gated candidate is usually a stranger.
-
-    This is not hypothetical: a sweep gated from the repository root overwrote
-    `main.py`, our own competition entrypoint, and left four agent files and a
-    tarball behind.
-
-    What is checked here is the wiring: that `gate` hands the play to
-    `pools.isolated` and hands it an absolute path. The isolation itself --
-    that a task cannot write where its caller stands -- belongs to `pools` and
-    is asserted in `test_pools.py`, against a task that really does write.
-
-    The split is not tidiness. `isolated` forks, and a forked child re-imports
-    rather than inheriting, so nothing this test patched would reach the play
-    anyway: the old version of this test patched `harness.play` and asserted
-    the patch had run, which after the fork stopped being true of the code
-    under test and started being true of nothing.
-    """
-    from kaggriculture.campaign import pools, roster
-
-    monkeypatch.chdir(tmp_path)
-    ours = tmp_path / "main.py"
-    ours.write_text("# our real entrypoint", encoding="utf-8")
-    candidate = tmp_path / "candidate.py"
-    candidate.write_text(WRITES_ON_LOAD, encoding="utf-8")
-    opponent = tmp_path / "opponent.py"
-    opponent.write_text(WRITES_ON_LOAD, encoding="utf-8")
-    monkeypatch.setattr(roster, "TRAINING", {"only": opponent})
-    sent: list[tuple[object, ...]] = []
-
-    def record(call: object, *args: object) -> tuple[dict[str, float], None]:
-        """Stand in for the fork, recording what would have crossed into it."""
-        sent.append((call, *args))
-        return {"only": 1.0}, None
-
-    monkeypatch.setattr(pools, "isolated", record)
-
-    kernel_watch.gate(candidate, gate_seeds=1, workers=1)
-
-    assert sent, "the play did not go through `pools.isolated`"
-    played = sent[0][1]
-    assert isinstance(played, Path) and played.is_absolute()
-    assert played == candidate.resolve()
-    assert ours.read_text(encoding="utf-8") == "# our real entrypoint"
 
 
 EMBEDS_AN_AGENT = '''

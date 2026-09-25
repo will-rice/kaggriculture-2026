@@ -59,6 +59,17 @@ from pydantic import (
 
 from kaggriculture.campaign import config
 
+# `sim.hpp`: `constexpr int MAX_UNITS = 40; // farmer + hands`. So a farm can
+# work thirty-nine hands beside its farmer, whatever any one champion happens
+# to hire.
+MAX_UNITS = 40
+
+# `kaggriculture.json` sets `"episodeSteps": 720`, and the interpreter fires
+# DONE at `step >= cfg.episodeSteps - 2`, on the step whose actions it just
+# read. So step 718 is the last one a unit acts on and a season is 719 acting
+# steps -- which is exactly how long every route in a plan is.
+SEASON = 719
+
 # The plan as a program carries it: a generated name, then the three calls.
 # The name is captured so it can be put back; it differs between programs.
 PACKED = re.compile(
@@ -75,6 +86,25 @@ UNPACKED = re.compile(
 )
 
 PLAN_FILE = "plan.json"
+# The second payload a program carries, and the second reason a round cannot
+# read its own program: `_V92_P_BLOB` is the price-prototype library, 440,834
+# bytes of base85 on one line of a controller whose median line is 43 bytes.
+# Any `diff` or `rg` that crosses it returns the lot -- 20 of 41 rounds had one
+# command return over 100 KB, the largest 1,021 KB, against a budget of about
+# 800 KB -- and it is data no round has any reason to read. It goes beside the
+# program the way the plan does, and comes back the way the plan does.
+BLOB = re.compile(
+    r"^(?P<name>_V92_P_BLOB)\s*=\s*'(?P<payload>[^']+)'\s*$", re.MULTILINE
+)
+BLOB_FILE = "prototypes.b85"
+BLOB_MODULE = "_prototypes"
+BLOB_UNPACKED = re.compile(
+    r"^(?P<name>_V92_P_BLOB)=__import__\('_prototypes'\)\.DATA\s*$", re.MULTILINE
+)
+BLOB_LOADER_SOURCE = """import pathlib
+
+DATA = (pathlib.Path(__file__).with_name({file!r})).read_text(encoding="utf-8")
+"""
 # What the farm does on a step no season names: nothing. A written season may
 # stop short of the year, and this is what the rest of it is.
 IDLE: dict = {"farmer": ["PASS"], "hands": [], "market": []}
@@ -161,14 +191,14 @@ class Action(BaseModel):
         ),
     )
     hands: list[UnitCommand] = Field(
-        max_length=config.MAX_UNITS - 1,
+        max_length=MAX_UNITS - 1,
         description=(
             "One command for each hand hired so far, in the order they were "
             "hired: the first entry is the first hand. Empty at the start of a "
             "season, before anything has hired, and never longer than the number "
             "of hands the farm actually has -- a command addressed to a hand that "
             "does not exist is ignored. A farm can work at most "
-            f"{config.MAX_UNITS - 1}, which is every unit slot the engine keeps "
+            f"{MAX_UNITS - 1}, which is every unit slot the engine keeps "
             "beside the farmer."
         ),
     )
@@ -195,10 +225,10 @@ RouteId = Annotated[
 Season = Annotated[
     list[Annotated[int, Field(ge=0)]],
     Field(
-        min_length=config.SEASON,
-        max_length=config.SEASON,
+        min_length=SEASON,
+        max_length=SEASON,
         description=(
-            f"One index into `actions` for each of the {config.SEASON} steps a "
+            f"One index into `actions` for each of the {SEASON} steps a "
             "season has. Shorter and the farm stands idle for the rest of the "
             "year; longer and the tail is never reached."
         ),
@@ -297,7 +327,7 @@ class Settings(BaseModel):
 
     block_turns: int = Field(
         ge=1,
-        le=config.SEASON,
+        le=SEASON,
         description=(
             "How many steps ahead the budget guard funds. The season runs in "
             "blocks of this many, and each block's purchases are paid for "
@@ -334,7 +364,7 @@ class Plan(BaseModel):
             "entries by index, and two routes that do the same thing on some "
             "step cite the same entry. So this is a pool, and it is smaller "
             "than the seasons it spells out -- the champion's 41 routes are "
-            f"{config.SEASON} steps each, {41 * config.SEASON:,} step slots in "
+            f"{SEASON} steps each, {41 * SEASON:,} step slots in "
             "all, drawn from 3,982 entries here."
         ),
     )
@@ -343,7 +373,7 @@ class Plan(BaseModel):
         description=(
             "One whole season per route, keyed by the number the shop lookup "
             "chooses it by. A season is not a path across the board: it is "
-            f"{config.SEASON} indices into `actions`, one per step, so entry N "
+            f"{SEASON} indices into `actions`, one per step, so entry N "
             "is which pooled step the farm plays on step N. Repeats are normal "
             "and are what makes the pool small -- a step the farm plays forty "
             "times is one entry in `actions` cited forty times here. The "
@@ -421,7 +451,7 @@ class Stretch(BaseModel):
     )
     steps: int = Field(
         ge=1,
-        le=config.SEASON,
+        le=SEASON,
         description=(
             "How many steps in a row to play it. One means this step alone. "
             "Use a longer stretch for a rhythm the farm holds -- watering the "
@@ -436,15 +466,15 @@ Stretches = Annotated[
     list[Stretch],
     Field(
         min_length=1,
-        max_length=config.SEASON,
+        max_length=SEASON,
         description=(
             f"A season, as stretches in the order they are played. The season "
-            f"is {config.SEASON} steps long; the counts may add up to less "
+            f"is {SEASON} steps long; the counts may add up to less "
             f"than that, and the farm then does nothing for the rest of the "
             f"year, but they may not add up to more, because a step past the "
             f"end is never played. There is no minimum number of stretches -- "
             f"one step held for the whole season is legal, and so is "
-            f"{config.SEASON} stretches of one."
+            f"{SEASON} stretches of one."
         ),
     ),
 ]
@@ -503,11 +533,11 @@ class Written(BaseModel):
         over = {
             f"route {route} covers {total}"
             for route, stretches in self.routes.items()
-            if (total := sum(stretch.steps for stretch in stretches)) > config.SEASON
+            if (total := sum(stretch.steps for stretch in stretches)) > SEASON
         }
         if over:
             raise ValueError(
-                f"a season is {config.SEASON} steps and these run past the end "
+                f"a season is {SEASON} steps and these run past the end "
                 f"of it: {', '.join(sorted(over))}"
             )
         return self
@@ -546,12 +576,12 @@ def fold(written: Written, over: Plan) -> Plan:
         # A season that stopped short is idle for the rest of the year. The
         # program indexes a season by step number and every step has to be
         # there, so the idleness is written out rather than left implied.
-        if len(season) < config.SEASON:
+        if len(season) < SEASON:
             key = json.dumps(IDLE, sort_keys=True, separators=(",", ":"))
             if key not in at_index:
                 at_index[key] = len(pool)
                 pool.append(IDLE)
-            season.extend([at_index[key]] * (config.SEASON - len(season)))
+            season.extend([at_index[key]] * (SEASON - len(season)))
         seasons[route] = season
 
     spare = seasons[min(seasons, key=int)]
@@ -882,11 +912,62 @@ def lay_out(source: str, box: Path, name: str = "child.py") -> None:
         (box / name).write_text(source, encoding="utf-8")
         return
     controller, plan = split(source)
+    controller = shelve_blob(controller, box)
     (box / name).write_text(controller, encoding="utf-8")
     (box / PLAN_FILE).write_text(readable(plan), encoding="utf-8")
     (box / f"{PLAN_MODULE}.py").write_text(
         PLAN_LOADER_SOURCE.format(file=PLAN_FILE), encoding="utf-8"
     )
+
+
+def shelve_blob(controller: str, box: Path) -> str:
+    """Move the prototype blob out of the controller into a file beside it.
+
+    Args:
+        controller: The program's source, plan already taken out.
+        box: The round's directory.
+
+    Returns:
+        The controller with a loader line where the blob was, or unchanged
+        when it carries no blob.
+    """
+    found = BLOB.search(controller)
+    if found is None:
+        return controller
+    (box / BLOB_FILE).write_text(found.group("payload"), encoding="utf-8")
+    (box / f"{BLOB_MODULE}.py").write_text(
+        BLOB_LOADER_SOURCE.format(file=BLOB_FILE), encoding="utf-8"
+    )
+    line = LOADER.format(name=found.group("name"), module=BLOB_MODULE)
+    return controller[: found.start()] + line + controller[found.end() :]
+
+
+def unshelve_blob(source: str, box: Path) -> str:
+    """Put the prototype blob back on its line, from the file `shelve_blob` wrote.
+
+    Args:
+        source: The program, plan already packed back in.
+        box: The round's directory.
+
+    Returns:
+        The program with the blob literal inline, or unchanged when it never
+        had a loader line.
+
+    Raises:
+        ValueError: The loader line is there and the file behind it is not, so
+            the program would load nothing where it expects a library.
+    """
+    found = BLOB_UNPACKED.search(source)
+    if found is None:
+        return source
+    shelf = box / BLOB_FILE
+    if not shelf.exists():
+        raise ValueError(f"the controller loads {BLOB_FILE} and the round removed it")
+    payload = shelf.read_text(encoding="utf-8").strip()
+    if "'" in payload:
+        raise ValueError(f"{BLOB_FILE} holds a quote and cannot go back on its line")
+    line = f"{found.group('name')} = '{payload}'"
+    return source[: found.start()] + line + source[found.end() :]
 
 
 class BrokenPlanError(ValueError):
@@ -966,7 +1047,7 @@ def gather(box: Path, name: str = "child.py") -> str:
         # killed the main lineage for ten hours the day before.
         if isinstance(written, dict) and "settings" not in written:
             written["settings"] = carried_settings(source)
-        return join(source, written)
+        return unshelve_blob(join(source, written), box)
     except ValueError as broken:
         # `ValueError` rather than the two the plan can fail with, because the
         # controller can fail too and does: `join` raises it from eight places

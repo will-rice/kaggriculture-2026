@@ -56,8 +56,8 @@ def test_the_draw_always_contains_every_anchor(
     champion_1, which beats it 0.729 in the games themselves.
     """
     monkeypatch.setattr(config, "GATE_ANCHORS", ("a", "e"))
-    monkeypatch.setattr(config, "GATE_OPPONENTS", 3)
-    monkeypatch.setattr(config, "GATE_CONTENDERS", 1)
+    monkeypatch.setattr(pool, "GATE_OPPONENTS", 3)
+    monkeypatch.setattr(pool, "GATE_CONTENDERS", 1)
     p = five()
 
     for seed in range(20):
@@ -75,8 +75,8 @@ def test_the_draw_contains_the_highest_rated(
     them, however well it did against the rest.
     """
     monkeypatch.setattr(config, "GATE_ANCHORS", ())
-    monkeypatch.setattr(config, "GATE_OPPONENTS", 2)
-    monkeypatch.setattr(config, "GATE_CONTENDERS", 2)
+    monkeypatch.setattr(pool, "GATE_OPPONENTS", 2)
+    monkeypatch.setattr(pool, "GATE_CONTENDERS", 2)
     p = five()
 
     drawn = p.sample(
@@ -97,8 +97,8 @@ def test_the_leader_is_drawn_however_the_dice_fall(
     rating gap over that one named agent.
     """
     monkeypatch.setattr(config, "GATE_ANCHORS", ())
-    monkeypatch.setattr(config, "GATE_OPPONENTS", 2)
-    monkeypatch.setattr(config, "GATE_CONTENDERS", 0)
+    monkeypatch.setattr(pool, "GATE_OPPONENTS", 2)
+    monkeypatch.setattr(pool, "GATE_CONTENDERS", 0)
     p = five()
 
     for seed in range(30):
@@ -192,8 +192,8 @@ def test_every_vendored_opponent_is_drawn_into_every_gate(
     """
     monkeypatch.setattr(roster, "TRAINING", {"a": "/x/a.py", "b": "/x/b.py"})
     monkeypatch.setattr(config, "GATE_ANCHORS", ())
-    monkeypatch.setattr(config, "GATE_CONTENDERS", 1)
-    monkeypatch.setattr(config, "GATE_OPPONENTS", 4)
+    monkeypatch.setattr(pool, "GATE_CONTENDERS", 1)
+    monkeypatch.setattr(pool, "GATE_OPPONENTS", 4)
     p = five()
 
     for seed in range(20):
@@ -212,9 +212,9 @@ def test_the_floor_survives_a_draw_too_small_to_hold_everyone(
     """
     monkeypatch.setattr(roster, "TRAINING", {n: f"/x/{n}.py" for n in "abcde"})
     monkeypatch.setattr(config, "GATE_ANCHORS", ("a", "b"))
-    monkeypatch.setattr(config, "GATE_CONTENDERS", 2)
+    monkeypatch.setattr(pool, "GATE_CONTENDERS", 2)
     # Smaller than the vendored set alone, so something must be dropped.
-    monkeypatch.setattr(config, "GATE_OPPONENTS", 2)
+    monkeypatch.setattr(pool, "GATE_OPPONENTS", 2)
     p = five()
 
     drawn = p.sample({"c": 1.0}, random.Random(0), always=("d",))

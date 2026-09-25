@@ -70,12 +70,7 @@ GAMES_DB = "games"
 # the tests cannot reach is a skill that goes stale the first time a column is
 # renamed, and goes stale silently.
 SKILLS = ROOT / ".agents" / "skills"
-# Where an opponent whose source predates the vendored drop still lives; the
-# roster names one. Both roots are stated here so no other module spells out
-# a path under /data.
-AGENTS = Path("/data/kaggriculture/agents")
 EPISODES = Path("/data/kaggriculture/episodes")
-ENGINE_LIBRARY = Path(__file__).parent / "engine" / "kaggriculture_engine.so"
 
 # Cores the arena and the engine may use between them.
 #
@@ -122,15 +117,6 @@ UNIT_OPS: list[str] = [
 # The five plantable ones: `tables.rs`'s `Crop` enum, which is the first five
 # items. `PLANT` and `BUY_SEED` take one of these and nothing else.
 CROPS: list[str] = list(PRODUCTS[:5])
-# `sim.hpp`: `constexpr int MAX_UNITS = 40; // farmer + hands`. So a farm can
-# work thirty-nine hands beside its farmer, whatever any one champion happens
-# to hire.
-MAX_UNITS = 40
-# `kaggriculture.json` sets `"episodeSteps": 720`, and the interpreter fires
-# DONE at `step >= cfg.episodeSteps - 2`, on the step whose actions it just
-# read. So step 718 is the last one a unit acts on and a season is 719 acting
-# steps -- which is exactly how long every route in a plan is.
-SEASON = 719
 MARKET_OPS: list[str] = [
     "NONE",
     "HIRE",
@@ -157,53 +143,6 @@ MARKET_OPS: list[str] = [
 # of five, and a round that can play its seasons four times as fast is a round
 # that measures before it edits rather than guessing because measuring was slow.
 SESSIONS = 2
-# Consecutive codex calls against one opponent before the session moves to the
-# next, and a session works through every opponent in the pool. So its length is
-# the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
-# a promotion, a call that ran to no verdict, or the run stopping.
-#
-# There is no fixed cap any more. `ROUNDS_PER_SESSION = 12` was one, and it made
-# the session length arbitrary -- twelve rounds covered one opponent or twelve
-# depending on how the games happened to be walked. Both ways of walking them
-# shipped on 2026-09-12 and both were wrong: the flat list gave twelve seasons
-# against whichever agent `games.ordered` puts first, since it is matchup-major
-# and that is the one the program loses to hardest; striding matchups gave one
-# game against each of twelve, which is twelve first impressions.
-#
-# Twelve attempts is what learning an opponent takes, and the season advances
-# inside the block, so they are twelve maps against the same agent rather than
-# twelve tries at one game.
-ROUNDS_PER_OPPONENT = 12
-# Seeds a program is scored on: drawn fresh every evaluation and played in
-# both seats against every pool opponent. This is the whole measurement -- one
-# gate, one number, and promotion decided on it.
-#
-# There used to be two, a cheap ranking on eight seeds and a sealed block of
-# sixty-four that promoted. The cheap one did not work. Over 471 programs it
-# called 78 of them the best in the tournament and the block promoted none of
-# them: its rating climbed 1.43 -> 2.16 while the block's score sat flat
-# between 0.798 and 0.859, and the best block score belonged to the very first
-# program measured.
-#
-# That gap was never overfitting -- the seeds are redrawn every call, so there
-# is nothing to fit. It is the winner's curse. A rate over sixteen games has a
-# standard error of 0.125, and taking the maximum over hundreds of such
-# estimates returns the luckiest program rather than the best one. Selection
-# on a noisy estimator is biased upward by construction, and no second
-# measurement fixes that; only games do.
-#
-# Thirty-two seeds is 64 games a pairing and a standard error of 0.062, a
-# quarter of the variance the eight-seed ranking selected on. It costs
-# throughput -- about 31 programs an hour against 60 -- and that is the trade
-# being made deliberately: 471 programs at the old depth bought no measurable
-# improvement at all.
-# Sixteen now rather than thirty-two, because the same budget buys twice as
-# many opponents and a rating is fitted over all of a candidate's edges. Eight
-# opponents at 64 games each and sixteen at 32 each are the same 512 games; the
-# second tells you more, because a rating's precision comes from the whole
-# graph and one more opponent is a whole new comparison where one more seed is
-# a slightly tighter old one.
-GATE_SEEDS = 16
 # The champion pairing alone, which the gate gives a veto no other opponent
 # has. The sweep above plays every pairing at `GATE_SEEDS`, and against an
 # opponent already beaten 1.000 that is ample -- more games buy nothing once
@@ -229,46 +168,6 @@ DUEL_SEEDS = 64
 # its ancestors were selected on. The reserved block was a held-out set for a
 # search that is always, structurally, held out.
 GATE_SEED_RANGE = range(1, 1_000_000)
-# Candidates that share one block of seasons before a fresh block is drawn.
-#
-# Sharing is what makes two candidates comparable at all. The seeds used to be
-# drawn per call, so no two programs were ever ranked on the same seasons --
-# and a season is most of what the rating measures. One unchanged agent
-# through the gate five times, opponents held fixed and only the seeds moving,
-# gave fitted ratings from -3.466 to -2.226: a standard deviation of 0.491,
-# against a promotion bar that used to be 0.15. Holding the seeds and varying
-# the opponents instead moved it 0.070, so the maps are seven times the draw.
-#
-# Rotating is what keeps the note above this constant true -- a block that
-# never moved would be one the search gets selected against, which is exactly
-# what the reserved held-out set existed to prevent. Sixty-four is a few
-# generations of eight concurrent sessions: long enough that the candidates
-# being compared share a block, short enough that no lineage lives in one.
-SEED_ROTATION = 64
-# Opponents drawn for one gate. The pool itself is now everything the campaign
-# has ever produced or harvested and nothing leaves it, so this is a sample
-# and not the pool: a rating is fitted over every pairing anyone has ever
-# played, and each candidate only has to add its own edges to that graph.
-#
-# The pool used to keep the top eight by rating and drop the rest, on the
-# reasoning that an opponent every candidate beats separates two candidates no
-# better than a coin. That is true of a *win rate* and false of a rating, and
-# it cost us: champion_1 was trimmed out long ago, and champion_37 -- thirty
-# promotions later, rated five log-odds above it -- beats it only 0.729 of the
-# time. A field this non-transitive keeps its counters or walks past them.
-#
-# Twenty-four rather than sixteen, because the draw now includes every vendored
-# opponent: about a dozen of those, plus the leader and floor, plus the four
-# anchors that are not themselves vendored, plus `GATE_CONTENDERS`. Sixteen
-# would have truncated exactly the agents the change exists to include.
-#
-# The cost is real and was weighed against playing the pool entire. That is
-# roughly 75 opponents today, 2,400 games a candidate against 512, and it grows
-# with every promotion -- while buying no extra *share* of cross-population
-# evidence, since the pool is itself 84% champions. Drawing all the vendored
-# agents and sampling the rest lifts that share from about a sixth to about a
-# half for half the added cost, and does not grow.
-GATE_OPPONENTS = 24
 # How the twenty-four are chosen. Anchors are played every single gate: they span
 # the strength range and they are what keeps the graph connected, so a new
 # champion is never rated through a chain of thirty overlapping pool eras.
@@ -286,29 +185,6 @@ GATE_ANCHORS = (
     "thomastschinkel_router",
     "router_v1",
 )
-# Four, and every one of them a different agent. It was six, and four of those
-# were champion_1, _10, _20 and _30 -- which read as four points spanning the
-# strength range and were four ages of one recording. The 720-step table
-# underneath that lineage is byte-identical from its seed through champion_69,
-# sha ef59f6f4a545d342, and 86.5% of every action any of them emits comes
-# straight out of it; what differs between them is the repair layer over the
-# other 13%.
-#
-# An anchor's whole job is to be a fixed point a rating is calibrated against,
-# so anchoring the scale to one agent at four ages is the failure that
-# calibration exists to prevent. champion_65 replaces the three: it is the
-# strongest of that lineage and the bar a submission has to clear, so it earns
-# a slot on its own account rather than as a reference point.
-#
-# The rest of that lineage left the pool with them. Sixty-nine champions held
-# ten of a gate's twenty-four slots, which bought ten readings of one
-# recording; its run is kept whole under `run/campaign-tape-lineage/` and its
-# pairings stay in `field.json`, so the fit still places it.
-# Highest-rated agents drawn beyond the anchors and the vendored set. Four
-# rather than six because the leader is already drawn through `always` and the
-# vendored opponents now take a dozen slots: the contenders were competing for
-# room with the only cross-population evidence the gate gets.
-GATE_CONTENDERS = 4
 # How many of our own champions stay in the pool. Harvested agents are never
 # trimmed and these are, because the two are different kinds of evidence: a
 # published agent says something about the field we are scored against and
@@ -340,141 +216,8 @@ POOL_CHAMPION = "ours"
 # are an author and a kernel slug, nor by the tape lineage, whose agents are
 # `champion_N`.
 POOL_ANCESTOR = "ours_{number}"
-# There is no promotion margin any more, and this note is here so nobody adds
-# one back.
-#
-# It was `PROMOTION_MARGIN = 0.15` of rating, about 26 Elo, and its job was to
-# stop the winner's curse: selecting the maximum of a noisy estimator is
-# biased upward by construction, and 78 of 471 programs once topped a noisy
-# gate with none surviving a deeper look. The reasoning was right and the
-# instrument was never checked against it. Measured 2026-09-11: one unchanged
-# agent's fitted rating moves with a standard deviation of 0.745 across draws
-# -- 129 Elo -- so the bar sat a fifth of a standard deviation out and
-# filtered almost none of the noise it was aimed at. What it did filter
-# reliably was a real improvement too small to clear it.
-#
-# A fixed size cannot be the answer to a quantity that varies with the draw,
-# the candidate's strength and how many games were decided. `gate.promotion`
-# asks for significance instead: the gate already plays the candidate against
-# the champion over every gate seed in both seats, which is one set of seasons
-# played twice and therefore paired, and a margin larger than twice its own
-# error is a demonstration. That bar tightens when the measurement is good and
-# refuses when it is not, which is the whole of what the constant was for.
-# The fewest games a candidate must actually decide against the floor before
-# the margin above means anything.
-#
-# Measured 2026-09-08. champion_55 was promoted over champion_54 on a rating
-# gap that the bar above reads as "about a 54% head-to-head". Their thirty-two
-# games were two wins by five units and thirty exact draws: the two programs
-# play the same game. A draw scores as half a win, so thirty draws and two
-# wins come to 0.53125 -- the same number as seventeen wins and fifteen
-# losses, which is two agents genuinely trading games rather than one agent
-# and a copy of itself. Bradley-Terry cannot tell those apart, and the Wilson
-# guard beside it was claiming thirty-two games of confidence for a pairing
-# that decided two.
-#
-# Eight of thirty-two is a quarter. Below that the two programs are the same
-# program and there is nothing to promote; above it the margin above is being
-# read on games that happened.
-DECISIVE_GAMES = 8
-# How many of the database's best a session may start from, and how sharply
-# the draw favours the better ones: weight `PARENT_DECAY ** rank`, so the best
-# is taken about half the time, the second a quarter, and the tenth almost
-# never.
-#
-# It was a uniform draw over ten, which is barely selection at all. With no
-# champion there is nothing else deciding where a session begins, so nine
-# sessions in ten started from something worse than the best program the
-# campaign had -- while only one child in ten improves on its parent and one
-# in five is worse. The population drifted down faster than selection pulled
-# it up: over 259 rated programs the best rating peaked at the fiftieth and
-# every cohort after was worse.
-#
-# Not fully greedy, because a parent is only half the move: the five
-# instructions and the model's own sampling are the other half, and a search
-# that always started from one program would explore with one hand.
-PARENT_POOL = 10
-PARENT_DECAY = 0.5
 
-# How often a session begins from nothing instead of from the champion.
-#
-# Every champion this campaign has produced is an edit of an edit of `SEED`,
-# which is a harvested public agent -- one program's descendants, sixty-five
-# generations deep. That is the monoculture at its root, and no instruction
-# escapes it, because a round is handed the champion and asked to improve it.
-#
-# The case is structural, not empirical, and it is worth being exact about
-# which. It is tempting to point at champion_1 scoring 2086.8 and champion_48
-# scoring 1963.3 and say sixty-five generations bought nothing -- but those are
-# different days, and the same bytes have scored 2386.8 and 1555.8 five days
-# apart, so that comparison measures the field moving rather than the lineage
-# standing still. Even the same-day pair, champion_47 at 2005.9 and
-# champion_48 at 1963.3, sits inside a noise floor where identical agents have
-# landed 455 and 512 apart.
-#
-# What is established is narrower and does not need the leaderboard: every
-# champion is an edit of an edit of one harvested public agent, and neither
-# signal we have can currently tell us whether that is working. The ladder
-# score moves with the field; the gate's own rating over-claims by about five
-# points of win rate against exactly the opponents that predict the ladder,
-# because most of its evidence is the lineage measuring itself. Diversity here
-# is a hedge against being stuck without being able to see it, which is a
-# weaker claim than "the lineage is stuck" and the one the evidence supports.
-#
-# One session in eight. It is a real cost -- an eighth of the quota, on
-# programs that begin unable to play -- so it is written here as a number to
-# turn down rather than buried in the loop.
-SCRATCH_CHANCE = 0.125
-# The name the blank slate goes by, and the root every scratch lineage is
-# traced back to.
-SCRATCH_ID = "scratch"
-# The blank slate itself: a policy that passes every turn. Not an empty file,
-# which nothing downstream can score, and not `SEED`, which is the ancestry
-# being escaped. It loses every game it plays, which is the point -- what it
-# has that a champion does not is no commitments.
-SCRATCH_AGENT = (
-    "def agent(observation, configuration=None):\n"
-    "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
-)
 
-# Sessions without a promotion before a session starts from a program
-# drawn from the database's top ten instead of the champion.
-STAGNATION_SESSIONS = 40
-# How long the rotation waits before asking again when every program is out of
-# quota.
-#
-# It used to return the refusal and let the round fail, which spun: sixteen
-# refusals inside three minutes on 2026-09-20, as fast as four sessions could
-# ask. Failing is worse than idling -- a round that produced nothing counts
-# toward `STAGNATION_SESSIONS`, so an outage would have the campaign decide its
-# champion had gone stale when nothing had run, and the failures are shown to
-# the next round as though they were its own.
-#
-# Five minutes because a refusal costs seconds, so the poll is free next to the
-# ten-to-twenty-five minutes an answer takes, and the shortest reset seen so far
-# is a five-hour window.
-QUOTA_WAIT = 5 * 60
-# How long a refused entitlement is left alone before it is asked again.
-#
-# The rotation used to rediscover the same exhaustion every round: opus
-# refused, sonnet refused, the gemini pool answered, and the next round opened
-# by asking opus again. Measured 2026-09-21 the pair took about two and a half
-# minutes to refuse, against rounds composing every three -- so most of a
-# round's setup was spent confirming a wall that agy already reports, with a
-# reset time attached, in the refusal itself.
-#
-# Thirty minutes rather than that reset time, which arrives as prose ("Resets
-# in 2h48m38s") and would have to be parsed to be trusted. The cost of being
-# wrong is bounded and small in both directions: at worst half an hour of not
-# using an entitlement that came back early, against a couple of minutes a
-# round saved while it is genuinely out.
-QUOTA_COOLDOWN = 30 * 60
-# Calls in a row that may run to no verdict before the campaign stops. A call
-# that never reached the model is nobody's failure and writes nothing, so
-# without this the loop spins at full rate on an expired login, a withdrawn
-# model or a provider outage, looking busy and producing nothing. Eight is
-# one per worker: a single bad call is noise, eight is the machine.
-NO_VERDICT_LIMIT = 8
 # The cheap model, and the campaign is back on it.
 #
 # `gpt-6-astra` ran here for three hours on 2026-09-09 and the trial is recorded
@@ -509,91 +252,8 @@ CODEX_MODEL = "gpt-5.6-luna"
 # all -- and which matters more now that astra is the primary rather than the
 # thing being fallen back from.
 CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-# How hard the model is asked to think, passed on every call.
-#
-# Astra offers low, medium, high, xhigh, max and ultra, and defaults to medium.
-# The campaign was not running at medium, though, and not at anything it chose:
-# `~/.codex/config.toml` sets `model_reasoning_effort = "high"` for the host's
-# own interactive use, and every campaign call inherited it. That is the same
-# shape of coupling as a round inheriting the host's skills -- the loop's
-# behaviour changing because a file it does not own changed -- and it is worth
-# closing whatever the value is.
-#
-# `max` is "maximum reasoning depth for the hardest problems". Above it sits
-# `ultra`, which adds automatic task delegation; that is a different execution
-# shape rather than more thinking, and a round already has a shape.
-CODEX_REASONING = "max"
 
-# Which program drives a round: "codex" or "agy" (the Antigravity CLI). Read
-# per round through `mutate.selected`, so it can change under a running
-# campaign the way the model can.
-#
-# It is "agy" because the codex quota this account had is exhausted until
-# 2026-09-22 08:09 and the deadline is 2026-09-30, which left six of the
-# fourteen remaining days with no rounds at all. `agy` bills a different
-# entitlement entirely -- and two of them: `agy -p /usage` reports a Gemini
-# pool and a separate "Claude and GPT models" pool, the second untouched at
-# 100% while the codex one is at zero. So the wall the campaign hit was one
-# vendor's, not the account's.
-MUTATOR = "agy"
-# The model an `agy` round asks for. Sonnet rather than a flash model because
-# a round reads the champion and its opponents and edits a program, and the
-# cheap end of the catalog has already failed that once: `gemini-3.6-flash-low`
-# produced garbage on a two-step shell-and-edit probe that `-medium` completed.
-# It also spends the pool that has quota rather than the one that is 2% down.
-AGY_MODEL = "claude-sonnet-4-6"
-# Retried once when the first call fails without a verdict, across pools on
-# purpose: a Claude-pool refusal (rate limit, capacity) is exactly the failure
-# a same-pool retry would hit again.
-AGY_FALLBACK_MODEL = "gemini-3.8-flash-medium"
-# How long one `agy` round may run.
-#
-# Deliberately far above the 5m default, for the reason a round cap was
-# removed from codex: the only cap this ever had cut calls off before they had
-# written anything. It has to be said out loud here because an expired
-# `--print-timeout` does not look like a failure -- agy returns the partial
-# answer, reports `"status": "SUCCESS"` and exits 0 (measured on 1.2.4, with
-# `child.py` untouched). Nothing but the file says whether the round worked,
-# which is why `_written` is what decides the verdict.
-AGY_TIMEOUT = "3h"
-# The model agy is asked for on its other entitlement.
-#
-# `agy -p /usage` reports two pools -- "Gemini Models" and "Claude and GPT
-# models" -- and meters them apart. The model name alone decides which a call
-# bills, so naming only one leaves the other unspent: on 2026-09-20 the Gemini
-# pool was down to 34% while Claude and GPT sat at 67%, and agy had already
-# stopped both lineages twice for want of quota.
-#
-# A Gemini model here because `CAMPAIGN_AGY_MODEL` now names a Claude one. The
-# pair is what matters, not which is first.
-AGY_SECOND_MODEL = "gemini-3.1-pro-high"
-# How long one opencode call may take before the loop stops waiting for it.
-#
-# `opencode run` has no timeout flag of its own, and on 2026-09-20 four calls
-# hung for four and a half hours apiece -- three minutes of CPU between them,
-# zero-byte transcripts -- while the loop waited, because nothing told it not
-# to. Its config's `timeout`/`headerTimeout`/`chunkTimeout` were already at
-# their five-minute defaults and did not fire: nothing had streamed, so the
-# hang was upstream of the request, in opencode's own server startup.
-#
-# Forty minutes rather than something tight. A round that is working takes ten
-# to twenty-five, so a shorter cap would throw away good calls to catch a rare
-# bad one; this is a backstop against a hang, not a limit on a round.
-OPENCODE_TIMEOUT = 40 * 60
 
-# The model an `opencode` round asks for, as `provider/model`.
-#
-# `gpt-5.6-luna` because it is the model this lineage was already climbing with
-# through codex, and OpenRouter sells it by the token with no window at all:
-# $0.20 a million input, about five cents for a round of the size measured
-# here. The quota walls that stopped the campaign -- codex until 2026-09-22,
-# agy's five-hour buckets -- are not a shape this provider has.
-OPENCODE_MODEL = "openrouter/openai/gpt-5.6-luna"
-# Retried once on the same model from a different seller, which is the only
-# fallback that answers the failure a fallback is for: a provider refusing,
-# rate-limiting or dropping the turn is a fact about that seller and not about
-# the model.
-OPENCODE_FALLBACK_MODEL = "opencode-go/gpt-5.6-luna"
 # The database id of the program a cold start seeds itself from. The copy the
 # cold start writes under a run's `programs` is the campaign's lineage: every
 # program descends from it, and it cannot change once written, which the file
@@ -701,65 +361,10 @@ class Run:
         return self.root / "state.json"
 
 
-# Metrics go to one wandb run per campaign, resumed across restarts by its
-# fixed id. Starting a fresh campaign (a new `run/campaign`) means a new id
-# here, or its curves land on top of the old run's.
-WANDB_ENTITY = "will-rice"
-WANDB_PROJECT = "kaggriculture-2026"
 # The only file that lists opponent paths, kept out of `run/campaign/` so it
 # is not a sibling of anything a codex call is given.
 POOL = OPPONENTS.parent / "campaign" / "pool.json"
-# How often the campaign takes newly published kernels into its pool, and how
-# many refs it considers each time.
-#
-# `harvest` was written as the other half of the ratchet -- champions join on
-# every promotion and nothing else does, so left alone the pool becomes the
-# campaign playing itself. It ran on 2026-09-01 and 2026-09-06 and then
-# nothing ran it, which is the whole of why the pool reached 69 champions
-# against 12 published agents, all of them frozen at the older of those dates.
-# A field that turns over in days was being gated against a five-day-old
-# snapshot of itself.
-#
-# So the loop harvests rather than a person remembering to. Hourly because
-# that is the rate the competition publishes at and a kernel costs one
-# 720-step game to check; forty refs because that is roughly five days of
-# publications, so a restart after an outage catches up in one pass.
-HARVEST_INTERVAL_SECONDS = 3600
-HARVEST_LIMIT = 40
-# How often the loop reloads the games this lineage really lost. An hour, like
-# the harvest, and for the same reason: both keep a measurement from drifting
-# away from the competition while the campaign optimises against it.
-#
-# It costs little after the first pass: `losses._held` asks the database which
-# episodes it already holds, so an hour later only the games played since are
-# fetched -- and a submission plays a few an hour, not a few hundred.
-LOSSES_INTERVAL_SECONDS = 3600
 # The campaign this checkout runs. Everything that writes takes a `Run`, so
 # this is the only place the live one is named -- a dry run and a test each
 # construct their own and nothing has to be swapped out from under anyone.
 LIVE = Run(root=RUN, pool=POOL)
-# `pb75e380571fc`, the best program the campaign's own rule-based lineage ever
-# wrote: 491 lines that decide the season turn by turn from the observation --
-# analytic market prices, crop and livestock forecasts on actual production
-# dates, workers assigned by value. No recorded actions anywhere in it.
-#
-# It replaces `thomastschinkel_router`, which was adopted on 2026-09-07 on the
-# reading that the rule-based search had no gradient: 95% of every rate it
-# measured was a shutout. That reading was of the wrong number. Win rate was
-# flat because a young lineage beats nobody, while the mean bank margin
-# underneath it ran from -179,647 to -8,444 -- 171,000 coins of clean,
-# well-ordered signal, already recorded on every program, already the
-# tie-break `Database.top` sorts on. The record over that run went -119,258,
-# then -10,446, then -8,444, the last of them 585 seconds before the run was
-# stopped. It was accelerating when we read it as dead.
-#
-# What we adopted instead turned out to be a 720-step recording with a repair
-# layer around it: 86.5% of champion_69's actions came out of the table
-# verbatim, the table was byte-identical from the seed through 69 promotions,
-# and emptying it dropped the agent to 3,000 -- what passing every turn banks.
-# The search never touched the policy because it never could; 29,820
-# characters of base64 do not fit in a prompt.
-#
-# So the lineage starts from a program that plays, and `ALLOWED_IMPORTS` no
-# longer admits `base64` or `zlib`, which is what a recording needs to travel.
-SEED = ROOT / "src" / "kaggriculture" / "seed" / "main.py"

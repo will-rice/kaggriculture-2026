@@ -82,9 +82,210 @@ from kaggriculture.campaign.mutate import (
     selected,
     validate_models,
 )
-from kaggriculture.campaign.pool import Pool
+from kaggriculture.campaign.pool import GATE_CONTENDERS, GATE_OPPONENTS, Pool
 
 LOGGER = logging.getLogger(__name__)
+
+# Seeds a program is scored on: drawn fresh every evaluation and played in
+# both seats against every pool opponent. This is the whole measurement -- one
+# gate, one number, and promotion decided on it.
+#
+# There used to be two, a cheap ranking on eight seeds and a sealed block of
+# sixty-four that promoted. The cheap one did not work. Over 471 programs it
+# called 78 of them the best in the tournament and the block promoted none of
+# them: its rating climbed 1.43 -> 2.16 while the block's score sat flat
+# between 0.798 and 0.859, and the best block score belonged to the very first
+# program measured.
+#
+# That gap was never overfitting -- the seeds are redrawn every call, so there
+# is nothing to fit. It is the winner's curse. A rate over sixteen games has a
+# standard error of 0.125, and taking the maximum over hundreds of such
+# estimates returns the luckiest program rather than the best one. Selection
+# on a noisy estimator is biased upward by construction, and no second
+# measurement fixes that; only games do.
+#
+# Thirty-two seeds is 64 games a pairing and a standard error of 0.062, a
+# quarter of the variance the eight-seed ranking selected on. It costs
+# throughput -- about 31 programs an hour against 60 -- and that is the trade
+# being made deliberately: 471 programs at the old depth bought no measurable
+# improvement at all.
+# Sixteen now rather than thirty-two, because the same budget buys twice as
+# many opponents and a rating is fitted over all of a candidate's edges. Eight
+# opponents at 64 games each and sixteen at 32 each are the same 512 games; the
+# second tells you more, because a rating's precision comes from the whole
+# graph and one more opponent is a whole new comparison where one more seed is
+# a slightly tighter old one.
+GATE_SEEDS = 16
+
+# How often the campaign takes newly published kernels into its pool, and how
+# many refs it considers each time.
+#
+# `harvest` was written as the other half of the ratchet -- champions join on
+# every promotion and nothing else does, so left alone the pool becomes the
+# campaign playing itself. It ran on 2026-09-01 and 2026-09-06 and then
+# nothing ran it, which is the whole of why the pool reached 69 champions
+# against 12 published agents, all of them frozen at the older of those dates.
+# A field that turns over in days was being gated against a five-day-old
+# snapshot of itself.
+#
+# So the loop harvests rather than a person remembering to. Hourly because
+# that is the rate the competition publishes at and a kernel costs one
+# 720-step game to check; forty refs because that is roughly five days of
+# publications, so a restart after an outage catches up in one pass.
+HARVEST_INTERVAL_SECONDS = 3600
+
+HARVEST_LIMIT = 40
+
+# How often the loop reloads the games this lineage really lost. An hour, like
+# the harvest, and for the same reason: both keep a measurement from drifting
+# away from the competition while the campaign optimises against it.
+#
+# It costs little after the first pass: `losses._held` asks the database which
+# episodes it already holds, so an hour later only the games played since are
+# fetched -- and a submission plays a few an hour, not a few hundred.
+LOSSES_INTERVAL_SECONDS = 3600
+
+# Calls in a row that may run to no verdict before the campaign stops. A call
+# that never reached the model is nobody's failure and writes nothing, so
+# without this the loop spins at full rate on an expired login, a withdrawn
+# model or a provider outage, looking busy and producing nothing. Eight is
+# one per worker: a single bad call is noise, eight is the machine.
+NO_VERDICT_LIMIT = 8
+
+PARENT_DECAY = 0.5
+
+# How many of the database's best a session may start from, and how sharply
+# the draw favours the better ones: weight `PARENT_DECAY ** rank`, so the best
+# is taken about half the time, the second a quarter, and the tenth almost
+# never.
+#
+# It was a uniform draw over ten, which is barely selection at all. With no
+# champion there is nothing else deciding where a session begins, so nine
+# sessions in ten started from something worse than the best program the
+# campaign had -- while only one child in ten improves on its parent and one
+# in five is worse. The population drifted down faster than selection pulled
+# it up: over 259 rated programs the best rating peaked at the fiftieth and
+# every cohort after was worse.
+#
+# Not fully greedy, because a parent is only half the move: the five
+# instructions and the model's own sampling are the other half, and a search
+# that always started from one program would explore with one hand.
+PARENT_POOL = 10
+
+# Consecutive codex calls against one opponent before the session moves to the
+# next, and a session works through every opponent in the pool. So its length is
+# the pool's: 41 opponents is 492 rounds, and what ends a session in practice is
+# a promotion, a call that ran to no verdict, or the run stopping.
+#
+# There is no fixed cap any more. `ROUNDS_PER_SESSION = 12` was one, and it made
+# the session length arbitrary -- twelve rounds covered one opponent or twelve
+# depending on how the games happened to be walked. Both ways of walking them
+# shipped on 2026-09-12 and both were wrong: the flat list gave twelve seasons
+# against whichever agent `games.ordered` puts first, since it is matchup-major
+# and that is the one the program loses to hardest; striding matchups gave one
+# game against each of twelve, which is twelve first impressions.
+#
+# Twelve attempts is what learning an opponent takes, and the season advances
+# inside the block, so they are twelve maps against the same agent rather than
+# twelve tries at one game.
+ROUNDS_PER_OPPONENT = 12
+
+# The blank slate itself: a policy that passes every turn. Not an empty file,
+# which nothing downstream can score, and not `SEED`, which is the ancestry
+# being escaped. It loses every game it plays, which is the point -- what it
+# has that a champion does not is no commitments.
+SCRATCH_AGENT = (
+    "def agent(observation, configuration=None):\n"
+    "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
+)
+
+# How often a session begins from nothing instead of from the champion.
+#
+# Every champion this campaign has produced is an edit of an edit of `SEED`,
+# which is a harvested public agent -- one program's descendants, sixty-five
+# generations deep. That is the monoculture at its root, and no instruction
+# escapes it, because a round is handed the champion and asked to improve it.
+#
+# The case is structural, not empirical, and it is worth being exact about
+# which. It is tempting to point at champion_1 scoring 2086.8 and champion_48
+# scoring 1963.3 and say sixty-five generations bought nothing -- but those are
+# different days, and the same bytes have scored 2386.8 and 1555.8 five days
+# apart, so that comparison measures the field moving rather than the lineage
+# standing still. Even the same-day pair, champion_47 at 2005.9 and
+# champion_48 at 1963.3, sits inside a noise floor where identical agents have
+# landed 455 and 512 apart.
+#
+# What is established is narrower and does not need the leaderboard: every
+# champion is an edit of an edit of one harvested public agent, and neither
+# signal we have can currently tell us whether that is working. The ladder
+# score moves with the field; the gate's own rating over-claims by about five
+# points of win rate against exactly the opponents that predict the ladder,
+# because most of its evidence is the lineage measuring itself. Diversity here
+# is a hedge against being stuck without being able to see it, which is a
+# weaker claim than "the lineage is stuck" and the one the evidence supports.
+#
+# One session in eight. It is a real cost -- an eighth of the quota, on
+# programs that begin unable to play -- so it is written here as a number to
+# turn down rather than buried in the loop.
+SCRATCH_CHANCE = 0.125
+
+# The name the blank slate goes by, and the root every scratch lineage is
+# traced back to.
+SCRATCH_ID = "scratch"
+
+# `pb75e380571fc`, the best program the campaign's own rule-based lineage ever
+# wrote: 491 lines that decide the season turn by turn from the observation --
+# analytic market prices, crop and livestock forecasts on actual production
+# dates, workers assigned by value. No recorded actions anywhere in it.
+#
+# It replaces `thomastschinkel_router`, which was adopted on 2026-09-07 on the
+# reading that the rule-based search had no gradient: 95% of every rate it
+# measured was a shutout. That reading was of the wrong number. Win rate was
+# flat because a young lineage beats nobody, while the mean bank margin
+# underneath it ran from -179,647 to -8,444 -- 171,000 coins of clean,
+# well-ordered signal, already recorded on every program, already the
+# tie-break `Database.top` sorts on. The record over that run went -119,258,
+# then -10,446, then -8,444, the last of them 585 seconds before the run was
+# stopped. It was accelerating when we read it as dead.
+#
+# What we adopted instead turned out to be a 720-step recording with a repair
+# layer around it: 86.5% of champion_69's actions came out of the table
+# verbatim, the table was byte-identical from the seed through 69 promotions,
+# and emptying it dropped the agent to 3,000 -- what passing every turn banks.
+# The search never touched the policy because it never could; 29,820
+# characters of base64 do not fit in a prompt.
+#
+# So the lineage starts from a program that plays, and `ALLOWED_IMPORTS` no
+# longer admits `base64` or `zlib`, which is what a recording needs to travel.
+SEED = config.ROOT / "src" / "kaggriculture" / "seed" / "main.py"
+
+# Candidates that share one block of seasons before a fresh block is drawn.
+#
+# Sharing is what makes two candidates comparable at all. The seeds used to be
+# drawn per call, so no two programs were ever ranked on the same seasons --
+# and a season is most of what the rating measures. One unchanged agent
+# through the gate five times, opponents held fixed and only the seeds moving,
+# gave fitted ratings from -3.466 to -2.226: a standard deviation of 0.491,
+# against a promotion bar that used to be 0.15. Holding the seeds and varying
+# the opponents instead moved it 0.070, so the maps are seven times the draw.
+#
+# Rotating is what keeps the note above this constant true -- a block that
+# never moved would be one the search gets selected against, which is exactly
+# what the reserved held-out set existed to prevent. Sixty-four is a few
+# generations of eight concurrent sessions: long enough that the candidates
+# being compared share a block, short enough that no lineage lives in one.
+SEED_ROTATION = 64
+
+# Sessions without a promotion before a session starts from a program
+# drawn from the database's top ten instead of the champion.
+STAGNATION_SESSIONS = 40
+
+# Metrics go to one wandb run per campaign, resumed across restarts by its
+# fixed id. Starting a fresh campaign (a new `run/campaign`) means a new id
+# here, or its curves land on top of the old run's.
+WANDB_ENTITY = "will-rice"
+
+WANDB_PROJECT = "kaggriculture-2026"
 
 # Threads the loop needs at once: one per session for whichever blocking step
 # it is on -- scoring a program, validating one, reading a transcript, and
@@ -102,10 +303,25 @@ SEED_ID = config.SEED_ID
 # The two model slugs are not here: they are chosen in `.env` at the call, so
 # the constant beside them is a default rather than a fact about this run.
 # `_open_run` reads them through the accessors instead.
-HYPERPARAMETERS = (
-    "SESSIONS ROUNDS_PER_OPPONENT GATE_SEEDS GATE_OPPONENTS GATE_CONTENDERS "
-    "STAGNATION_SESSIONS"
-).split()
+
+
+def hyperparameters() -> dict[str, int]:
+    """What the wandb run records as its configuration: spec section 8's table.
+
+    Read at the call rather than held in a tuple of names, because each
+    constant lives in the module that reads it and a test that moves one moves
+    it there -- a name looked up on `config` would report the value the run
+    did not use.
+    """
+    return {
+        "SESSIONS": config.SESSIONS,
+        "ROUNDS_PER_OPPONENT": ROUNDS_PER_OPPONENT,
+        "GATE_SEEDS": GATE_SEEDS,
+        "GATE_OPPONENTS": GATE_OPPONENTS,
+        "GATE_CONTENDERS": GATE_CONTENDERS,
+        "STAGNATION_SESSIONS": STAGNATION_SESSIONS,
+    }
+
 
 # Prepended to the instruction under stagnation, so the message says that this
 # session did not start from the champion, and why.
@@ -174,7 +390,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     # what `copycheck` exempts, so a run started from a snapshot exempts the
     # snapshot and a run started from the default exempts the default. There
     # is nothing here for the gate to disagree with.
-    parser.add_argument("--seed-agent", type=Path, default=config.SEED)
+    parser.add_argument("--seed-agent", type=Path, default=SEED)
     # The directory this campaign owns. A flag rather than a constant so a
     # dry run and a test each name their own, instead of reaching into this
     # module to move one -- which is what used to happen, and what silently
@@ -236,14 +452,14 @@ def _open_run(dry_run: bool, tag: str = "") -> wandb.Run:
     # The revision, and what distinguishes one lineage on it from another.
     name = Repo(config.ROOT).head.commit.hexsha[:7] + (f"-{tag}" if tag else "")
     log = wandb.init(
-        entity=config.WANDB_ENTITY,
-        project=config.WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
         id=name,
         name=name,
         resume="allow",
         mode="disabled" if dry_run else "online",
         config={
-            **{key: getattr(config, key) for key in HYPERPARAMETERS},
+            **hyperparameters(),
             # Not `CODEX_MODEL`: it has held a codex slug and now holds
             # whatever `MUTATOR` names, and a key that lies about which
             # program produced a run is how the switch hides.
@@ -495,7 +711,7 @@ def run(
             SEED_ID,
             pool,
             rng,
-            rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+            rng.sample(config.GATE_SEED_RANGE, GATE_SEEDS),
             workers,
             paths.pool,
         )
@@ -517,7 +733,7 @@ def run(
                 first.id,
                 pool,
                 rng,
-                rng.sample(config.GATE_SEED_RANGE, config.GATE_SEEDS),
+                rng.sample(config.GATE_SEED_RANGE, GATE_SEEDS),
                 workers,
                 paths.pool,
             )
@@ -739,7 +955,7 @@ class Campaign:
         timed out.
         """
         while True:
-            await asyncio.sleep(config.LOSSES_INTERVAL_SECONDS)
+            await asyncio.sleep(LOSSES_INTERVAL_SECONDS)
             try:
                 loaded = await asyncio.to_thread(losses.refresh)
                 # Every pass, not only the ones that loaded something. The
@@ -781,10 +997,10 @@ class Campaign:
         must not end because a listing timed out.
         """
         while True:
-            await asyncio.sleep(config.HARVEST_INTERVAL_SECONDS)
+            await asyncio.sleep(HARVEST_INTERVAL_SECONDS)
             try:
                 found = await asyncio.to_thread(
-                    harvest.vendored, config.HARVEST_LIMIT, set(self.pool.opponents)
+                    harvest.vendored, HARVEST_LIMIT, set(self.pool.opponents)
                 )
             except Exception:
                 LOGGER.exception("harvest failed; the campaign continues")
@@ -842,7 +1058,7 @@ class Campaign:
         # a model that a line it never left is stuck.
         stagnant = (
             self.state.champion is not None
-            and self.state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+            and self.state.sessions_since_promotion >= STAGNATION_SESSIONS
         )
         source, name = self.start(stagnant)
         # Not caught: a starting program that raises is a broken floor, and
@@ -882,20 +1098,20 @@ class Campaign:
         # scored, so the database is the one place they always are. Keyed the
         # way `record` wrote them, name included; `compose` has the name.
         scored = await asyncio.to_thread(games.recorded, name, games.DATABASE)
-        planned = config.ROUNDS_PER_OPPONENT * max(
+        planned = ROUNDS_PER_OPPONENT * max(
             1, len({matchup for matchup, _, _ in scored})
         )
         for turn in range(planned):
             failures = self.database.failures(name)
             siblings = self.database.children(name)
-            # `config.ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
+            # `ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
             # then the next, with the season advancing inside the block. Four
             # attempts against one agent on four maps: enough to learn it,
             # without four attempts at the same game.
             matchups = sorted({one[0] for one in scored})
             playing = None
             if matchups:
-                block, attempt = divmod(turn, config.ROUNDS_PER_OPPONENT)
+                block, attempt = divmod(turn, ROUNDS_PER_OPPONENT)
                 against = [
                     one for one in scored if one[0] == matchups[block % len(matchups)]
                 ]
@@ -1191,7 +1407,7 @@ class Campaign:
         if mutation.status == "exec_error":
             LOGGER.warning("%s: no verdict (%s)", program_id, mutation.reason[:200])
             self.no_verdict += 1
-            if self.no_verdict >= config.NO_VERDICT_LIMIT:
+            if self.no_verdict >= NO_VERDICT_LIMIT:
                 raise SystemExit(
                     f"{self.no_verdict} calls in a row ran to no verdict, the "
                     f"last on {config.CODEX_MODEL} and {config.CODEX_FALLBACK_MODEL}: "
@@ -1234,7 +1450,7 @@ class Campaign:
                     # the round ran, produced a program and was judged, and the
                     # next round is shown what it scored.
                     table = gate.standing(
-                        program_id, screen.rates, 2 * config.GATE_SEEDS, self.paths
+                        program_id, screen.rates, 2 * GATE_SEEDS, self.paths
                     )
                     self.database.add(
                         _program(
@@ -1256,9 +1472,7 @@ class Campaign:
         except RuntimeError as error:
             self.fail(started_from, drawn, f"gate: {error}")
             return None
-        table = gate.standing(
-            program_id, result.rates, 2 * config.GATE_SEEDS, self.paths
-        )
+        table = gate.standing(program_id, result.rates, 2 * GATE_SEEDS, self.paths)
         self.database.add(
             _program(
                 program_id,
@@ -1556,7 +1770,7 @@ class Campaign:
         moved it 0.070. The maps are seven times the draw.
 
         Rotated, because a set that never moves is one the search can be
-        selected against. `config.SEED_ROTATION` candidates share a block and
+        selected against. `SEED_ROTATION` candidates share a block and
         then it is redrawn from the whole range, so no program is measured for
         long on maps its ancestors were selected on -- which is what the
         reserved held-out block used to be for, and why there is no longer
@@ -1564,19 +1778,19 @@ class Campaign:
 
         Called on the loop thread, where the counter is nobody else's.
         """
-        if self.measured % config.SEED_ROTATION == 0:
+        if self.measured % SEED_ROTATION == 0:
             # One sample split in two, not two samples. `random.sample` cannot
             # repeat within a draw, so the sweep's seasons and the champion
             # pairing's extra seasons are disjoint by construction -- and a
             # season played in both blocks would be the same game counted
             # twice in that pairing's rate.
             drawn = self.rng.sample(config.GATE_SEED_RANGE, config.DUEL_SEEDS)
-            self.block = drawn[: config.GATE_SEEDS]
-            self.duel = drawn[config.GATE_SEEDS :]
+            self.block = drawn[:GATE_SEEDS]
+            self.duel = drawn[GATE_SEEDS:]
             LOGGER.info(
                 "seasons: a fresh block of %d, and %d more against the "
                 "champion, after %d candidates",
-                config.GATE_SEEDS,
+                GATE_SEEDS,
                 len(self.duel),
                 self.measured,
             )
@@ -1611,21 +1825,21 @@ class Campaign:
         draw below -- which is why that draw has to be a selection and not a
         shuffle.
         """
-        if self.rng.random() < config.SCRATCH_CHANCE:
+        if self.rng.random() < SCRATCH_CHANCE:
             return self.scratch()
         champion = self.state.champion
         if champion is not None and not stagnant:
             return Path(champion.path), champion.name
-        candidates = self.database.top(config.PARENT_POOL)
-        # Weighted by rank, not uniform: `config.PARENT_POOL` says why.
-        weights = [config.PARENT_DECAY**rank for rank in range(len(candidates))]
+        candidates = self.database.top(PARENT_POOL)
+        # Weighted by rank, not uniform: `PARENT_POOL` says why.
+        weights = [PARENT_DECAY**rank for rank in range(len(candidates))]
         program = self.rng.choices(candidates, weights=weights)[0]
         return Path(program.source_path), program.id
 
     def scratch(self) -> tuple[Path, str]:
         """A session that begins outside the champion's ancestry.
 
-        Every champion descends from `config.SEED`, a harvested public agent,
+        Every champion descends from `SEED`, a harvested public agent,
         so every round edits one program's sixty-fifth-generation descendant
         and no instruction reaches outside that basin. This is the only
         starting point the campaign has that does not.
@@ -1643,7 +1857,7 @@ class Campaign:
             The program to start from and the name it goes by: the best
             scratch-descended program, or the blank slate when there is none.
         """
-        grown = self.database.descendants(config.SCRATCH_ID)
+        grown = self.database.descendants(SCRATCH_ID)
         if grown:
             best = max(
                 grown,
@@ -1653,8 +1867,8 @@ class Campaign:
                 ),
             )
             return Path(best.source_path), best.id
-        blank = self.database.store(config.SCRATCH_AGENT, config.SCRATCH_ID)
-        return blank, config.SCRATCH_ID
+        blank = self.database.store(SCRATCH_AGENT, SCRATCH_ID)
+        return blank, SCRATCH_ID
 
     def fail(self, started_from: str, instruction: str, reason: str) -> None:
         """Record an attempt that produced no program, and say why."""
@@ -1723,7 +1937,7 @@ class Campaign:
             ),
             "gate/pool": len(result.rates),
             # Nothing has been watching this. The seed is 619 lines and
-            # `config.SEED` says why that matters -- a round is handed the
+            # `SEED` says why that matters -- a round is handed the
             # whole program, and a big one spends the call being read rather
             # than improved. champion_69 is 3,220 lines, five times its own
             # ancestor, and the growth arrived a few hundred lines at a time

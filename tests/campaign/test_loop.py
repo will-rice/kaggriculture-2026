@@ -178,8 +178,8 @@ def tiny_run(
     ask for more. It is the only constant here that decides behaviour rather
     than cost, which is why it is a parameter and not a line in the body.
     """
-    monkeypatch.setattr(config, "ROUNDS_PER_OPPONENT", rounds)
-    monkeypatch.setattr(config, "GATE_SEEDS", 1)
+    monkeypatch.setattr(loop, "ROUNDS_PER_OPPONENT", rounds)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 1)
     monkeypatch.setattr(evaluator, "VENDORED", ["pass"])
     # The copy check reads every opponent the machine holds, and the campaign
     # now harvests new ones every hour -- so a test that leaves this alone is
@@ -314,7 +314,7 @@ def stub_evaluator(monkeypatch: pytest.MonkeyPatch, crashes: bool = False) -> li
             # Every game decided. A stub that left this empty would be a
             # candidate indistinguishable from the floor, which the gate
             # refuses -- correctly, and not what any of these tests is about.
-            decisive=dict.fromkeys(names, config.DECISIVE_GAMES),
+            decisive=dict.fromkeys(names, gate.DECISIVE_GAMES),
             games=2,
             seeds=[1],
             hardest=names[0],
@@ -451,7 +451,7 @@ def test_a_better_child_is_promoted(
     draw or two without dropping under the decisive floor.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "GATE_SEEDS", 6)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 6)
     pass_pool(tmp_path, paths)
 
     state = loop.run(
@@ -646,7 +646,7 @@ def test_a_promotion_changes_what_the_next_session_starts_from(
     two-condition gate cannot be satisfied at `tiny_run`'s one.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "GATE_SEEDS", 6)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 6)
     pass_pool(tmp_path, paths)
     seed = _write(tmp_path / "seed.py", PASS)
     mutator = Recorder(edit=lambda _: SELLER)
@@ -920,7 +920,7 @@ def test_stagnation_switches_the_starting_program(
 ) -> None:
     """With no promotion in sight, a session starts from the top ten and is told so."""
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "STAGNATION_SESSIONS", 1)
+    monkeypatch.setattr(loop, "STAGNATION_SESSIONS", 1)
     strong_champion(tmp_path, paths)
     stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
@@ -1239,7 +1239,7 @@ def _gate_result(
         intervals={
             n: (max(0.0, r - 0.05), min(1.0, r + 0.05)) for n, r in rates.items()
         },
-        decisive=dict.fromkeys(rates, config.DECISIVE_GAMES),
+        decisive=dict.fromkeys(rates, gate.DECISIVE_GAMES),
         games=4,
         seeds=[1],
         hardest=min(rates, default=""),
@@ -1576,7 +1576,7 @@ def test_calls_that_never_reach_a_verdict_stop_the_campaign(
     """
     paths = tiny_run(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SESSIONS", 1)
-    monkeypatch.setattr(config, "NO_VERDICT_LIMIT", 3)
+    monkeypatch.setattr(loop, "NO_VERDICT_LIMIT", 3)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     monkeypatch.setattr(
@@ -1616,7 +1616,7 @@ def test_the_no_verdict_count_is_consecutive_calls_not_a_total(
     """
     paths = tiny_run(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SESSIONS", 1)
-    monkeypatch.setattr(config, "NO_VERDICT_LIMIT", 2)
+    monkeypatch.setattr(loop, "NO_VERDICT_LIMIT", 2)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     # One byte per call, and the odd-numbered ones fail: a marker file, not a
@@ -1795,7 +1795,7 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     falsehood in the one message it reads.
     """
     paths = tiny_run(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "STAGNATION_SESSIONS", 1)
+    monkeypatch.setattr(loop, "STAGNATION_SESSIONS", 1)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     seed = _write(tmp_path / "seed.py", PASS)
@@ -1811,7 +1811,7 @@ def test_stagnation_says_so_once_a_champion_has_stood_too_long(
     # withheld here, because telling a model its lineage was stuck when it had
     # never had one was a sentence about nothing.
     assert state.champion is not None
-    assert state.sessions_since_promotion >= config.STAGNATION_SESSIONS
+    assert state.sessions_since_promotion >= loop.STAGNATION_SESSIONS
     assert len(mutator.seen) == 2
     assert any("no promotion" in seen.message for seen in mutator.seen)
 
@@ -1904,7 +1904,7 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
     database = archive.Database(paths.archive, paths.programs)
-    for rank in range(config.PARENT_POOL):
+    for rank in range(loop.PARENT_POOL):
         source = database.store(f"{PASS}# rank {rank}\n", f"p{rank}")
         database.add(
             archive.Program(
@@ -1934,7 +1934,7 @@ def test_a_session_starts_from_the_best_far_more_often_than_the_tenth(
     drawn = [campaign.start(stagnant=False)[1] for _ in range(400)]
 
     best = drawn.count("p0")
-    worst = drawn.count(f"p{config.PARENT_POOL - 1}")
+    worst = drawn.count(f"p{loop.PARENT_POOL - 1}")
     assert best > len(drawn) * 0.35, f"the best was drawn only {best} times"
     assert best > 10 * max(1, worst), "the best must dominate the tail"
     # Still a search, not a hill climb: something other than the best is
@@ -1956,12 +1956,12 @@ def test_a_scratch_session_is_parented_from_the_scratch_lineage(
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
-    monkeypatch.setattr(config, "SCRATCH_CHANCE", 1.0)
+    monkeypatch.setattr(loop, "SCRATCH_CHANCE", 1.0)
     database = archive.Database(paths.archive, paths.programs)
     # The champion's lineage, rated far above anything a blank start reaches.
     for name, parent, standing in (
         ("champ", "seed", 5.0),
-        ("sprout", config.SCRATCH_ID, -4.0),
+        ("sprout", loop.SCRATCH_ID, -4.0),
         ("sapling", "sprout", -3.0),
     ):
         source = database.store(f"{PASS}# {name}\n", name)
@@ -2008,7 +2008,7 @@ def test_the_first_scratch_session_begins_from_the_blank_slate(
     paths = tiny_run(tmp_path, monkeypatch)
     pass_pool(tmp_path, paths)
     stub_evaluator(monkeypatch)
-    monkeypatch.setattr(config, "SCRATCH_CHANCE", 1.0)
+    monkeypatch.setattr(loop, "SCRATCH_CHANCE", 1.0)
     campaign = loop.Campaign(
         loop.State(),
         archive.Database(paths.archive, paths.programs),
@@ -2022,9 +2022,9 @@ def test_the_first_scratch_session_begins_from_the_blank_slate(
 
     source, name = campaign.start(stagnant=False)
 
-    assert name == config.SCRATCH_ID
-    assert source.read_text(encoding="utf-8") == config.SCRATCH_AGENT
-    assert "PASS" in config.SCRATCH_AGENT
+    assert name == loop.SCRATCH_ID
+    assert source.read_text(encoding="utf-8") == loop.SCRATCH_AGENT
+    assert "PASS" in loop.SCRATCH_AGENT
 
 
 def _record_campaign(
@@ -2286,7 +2286,7 @@ def test_the_campaign_harvests_while_it_runs(
     back.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "HARVEST_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(
         loop.harvest, "vendored", lambda limit, known: {"fresh": "/vendored/main.py"}
     )
@@ -2310,7 +2310,7 @@ def test_a_harvest_that_fails_does_not_end_the_campaign(
     timed out, so the harvester logs and waits for the next turn.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "HARVEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "HARVEST_INTERVAL_SECONDS", 0)
 
     asked = []
 
@@ -2339,7 +2339,7 @@ def test_the_campaign_reloads_the_games_it_lost(
     harvests, one level out.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "LOSSES_INTERVAL_SECONDS", 0)
     passes = []
 
     def loads() -> int:
@@ -2365,7 +2365,7 @@ def test_a_loss_refresh_that_fails_does_not_end_the_campaign(
     fail -- and a run that has been evaluating for hours must not end with it.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "LOSSES_INTERVAL_SECONDS", 0)
 
     asked = []
 
@@ -2396,7 +2396,7 @@ def test_where_the_losses_are_decided_reaches_the_run(
     as not measuring them at all.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "LOSSES_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(loop, "LOSSES_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(loop.losses, "refresh", lambda: 0)
     where = {
         "losses/games": 49.0,
@@ -2566,7 +2566,7 @@ def test_candidates_share_a_block_of_seasons_and_it_rotates(
     against, which is what the reserved held-out seeds existed to prevent.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "SEED_ROTATION", 3)
+    monkeypatch.setattr(loop, "SEED_ROTATION", 3)
 
     blocks = [campaign.seasons() for _ in range(7)]
 
@@ -2576,7 +2576,7 @@ def test_candidates_share_a_block_of_seasons_and_it_rotates(
     assert blocks[0] != blocks[3]
     assert blocks[6] != blocks[3]
     # And a block is a full gate's worth of seasons, every time.
-    assert all(len(block) == config.GATE_SEEDS for block in blocks)
+    assert all(len(block) == loop.GATE_SEEDS for block in blocks)
     assert all(len(set(block)) == len(block) for block in blocks)
 
 
@@ -2593,7 +2593,7 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
     in two cannot collide at all.
     """
     campaign = _record_campaign(tmp_path, monkeypatch, log)
-    monkeypatch.setattr(config, "SEED_ROTATION", 1)
+    monkeypatch.setattr(loop, "SEED_ROTATION", 1)
     # A narrow range, because over the real one -- a million seeds -- two
     # independent draws of 16 and 48 collide about once in a thousand runs,
     # and a test that only fails then is a test that never fails. From 79
@@ -2604,8 +2604,8 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
     for _ in range(5):
         block = campaign.seasons()
 
-        assert len(block) == config.GATE_SEEDS
-        assert len(campaign.duel) == config.DUEL_SEEDS - config.GATE_SEEDS
+        assert len(block) == loop.GATE_SEEDS
+        assert len(campaign.duel) == config.DUEL_SEEDS - loop.GATE_SEEDS
         assert not set(block) & set(campaign.duel)
         # The pairing is played over both, so together they are the depth the
         # gate's third condition is read at.
@@ -2719,7 +2719,7 @@ def test_the_defaults_are_left_where_they_already_pointed() -> None:
 
     assert parsed.run_root == config.RUN
     assert parsed.pool == config.POOL
-    assert parsed.seed_agent == config.SEED
+    assert parsed.seed_agent == loop.SEED
 
 
 def guarded(tmp_path: Path) -> Path:

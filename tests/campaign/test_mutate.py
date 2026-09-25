@@ -358,7 +358,7 @@ def test_the_reasoning_effort_is_passed_on_every_call(
     asyncio.run(mutate.CodexMutator()(box, MESSAGE, "p12"))
 
     passed = argv.read_text(encoding="utf-8").splitlines()
-    assert f"model_reasoning_effort={config.CODEX_REASONING}" in passed
+    assert f"model_reasoning_effort={mutate.CODEX_REASONING}" in passed
     # Beside the model, so a call names both rather than inheriting either.
     assert config.CODEX_MODEL in passed
 
@@ -746,8 +746,8 @@ def test_an_unset_agy_model_is_the_campaigns_own(
     monkeypatch.delenv("CAMPAIGN_AGY_FALLBACK_MODEL", raising=False)
     (tmp_path / ".env").write_text("", encoding="utf-8")
 
-    assert mutate.agy_model() == config.AGY_MODEL
-    assert mutate.agy_fallback() == config.AGY_FALLBACK_MODEL
+    assert mutate.agy_model() == mutate.AGY_MODEL
+    assert mutate.agy_fallback() == mutate.AGY_FALLBACK_MODEL
 
 
 def test_validation_checks_the_selected_programs_own_catalog(
@@ -821,7 +821,7 @@ def test_a_round_is_invoked_with_everything_it_needs_to_measure() -> None:
     assert invocation[1:3] == ["--print", MESSAGE]
     assert invocation[invocation.index("--add-dir") + 1] == str(box)
     assert invocation[invocation.index("--model") + 1] == "claude-sonnet-4-6"
-    assert invocation[invocation.index("--print-timeout") + 1] == config.AGY_TIMEOUT
+    assert invocation[invocation.index("--print-timeout") + 1] == mutate.AGY_TIMEOUT
     assert invocation[invocation.index("--output-format") + 1] == "stream-json"
     assert invocation[invocation.index("--mode") + 1] == "accept-edits"
     # The grant that lets a round run `measure.py`, which is the whole point of
@@ -1042,13 +1042,13 @@ def test_an_unset_opencode_model_is_the_campaigns_own(
     monkeypatch.delenv("CAMPAIGN_OPENCODE_FALLBACK_MODEL", raising=False)
     (tmp_path / ".env").write_text("", encoding="utf-8")
 
-    assert mutate.opencode_model() == config.OPENCODE_MODEL
-    assert mutate.opencode_fallback() == config.OPENCODE_FALLBACK_MODEL
+    assert mutate.opencode_model() == mutate.OPENCODE_MODEL
+    assert mutate.opencode_fallback() == mutate.OPENCODE_FALLBACK_MODEL
     # The same model from two shops, which is what makes the retry worth making.
-    assert config.OPENCODE_MODEL != config.OPENCODE_FALLBACK_MODEL
+    assert mutate.OPENCODE_MODEL != mutate.OPENCODE_FALLBACK_MODEL
     assert (
-        config.OPENCODE_MODEL.rsplit("/", 1)[-1]
-        == (config.OPENCODE_FALLBACK_MODEL.rsplit("/", 1)[-1])
+        mutate.OPENCODE_MODEL.rsplit("/", 1)[-1]
+        == (mutate.OPENCODE_FALLBACK_MODEL.rsplit("/", 1)[-1])
     )
 
 
@@ -1132,7 +1132,7 @@ def test_a_refused_program_is_not_asked_again_while_it_cools(
     refusal is not news after the first one: an entitlement that just ran out
     stays out for hours, and agy says so in the refusal itself.
     """
-    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 10_000)
+    monkeypatch.setattr(mutate, "QUOTA_COOLDOWN", 10_000)
     asked: list[str] = []
     rotation = mutate.Rotating(
         [
@@ -1161,7 +1161,7 @@ def test_a_cooled_program_is_asked_again_once_the_cooldown_expires(
     prefers -- it leads the order for a reason. A cooldown that never expired
     would quietly demote the best program for the rest of the run.
     """
-    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    monkeypatch.setattr(mutate, "QUOTA_COOLDOWN", 0)
     asked: list[str] = []
     rotation = mutate.Rotating(
         [
@@ -1182,7 +1182,7 @@ def test_a_program_that_answers_stops_cooling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A deadline left behind an answer would skip a program that works."""
-    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    monkeypatch.setattr(mutate, "QUOTA_COOLDOWN", 0)
     asked: list[str] = []
     rotation = mutate.Rotating(
         [Reviving(refusals=1, asked=[]), Stub("gemini", answered(), asked)]
@@ -1379,8 +1379,8 @@ def test_an_exhausted_rotation_waits_instead_of_failing_the_round(
     an outage would have the campaign decide its champion had gone stale when
     nothing had run.
     """
-    monkeypatch.setattr(config, "QUOTA_WAIT", 0)
-    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    monkeypatch.setattr(mutate, "QUOTA_WAIT", 0)
+    monkeypatch.setattr(mutate, "QUOTA_COOLDOWN", 0)
     asked: list[int] = []
     rotation = mutate.Rotating([Reviving(refusals=2, asked=asked)])
 
@@ -1394,8 +1394,8 @@ def test_the_wait_is_what_it_is_configured_to_be(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Polling is free next to an answer, but it is not free of a clock."""
-    monkeypatch.setattr(config, "QUOTA_WAIT", 7)
-    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    monkeypatch.setattr(mutate, "QUOTA_WAIT", 7)
+    monkeypatch.setattr(mutate, "QUOTA_COOLDOWN", 0)
     slept: list[float] = []
 
     async def note(seconds: float) -> None:
@@ -1419,7 +1419,7 @@ def test_waiting_ends_when_the_loop_is_shut_down(
     thing that must be able to end it is the cancellation a stopping loop
     delivers to every round in flight.
     """
-    monkeypatch.setattr(config, "QUOTA_COOLDOWN", 0)
+    monkeypatch.setattr(mutate, "QUOTA_COOLDOWN", 0)
     asked: list[int] = []
     # Never revives, so only cancellation can end this.
     rotation = mutate.Rotating([Reviving(refusals=10**6, asked=asked)])

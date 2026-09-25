@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.campaign import config, evaluator, harness, pool
+from kaggriculture.campaign import config, evaluator, harness, loop, pool
 
 # Fits the smallest box the suite runs on: CORE_BUDGET clamps to 1 on a
 # 4-core CI runner.
@@ -34,7 +34,7 @@ def test_score_plays_the_block_and_averages_the_pool(
 ) -> None:
     """It plays the seasons it is given, and every opponent counts the same.
 
-    The seeds assertion was `len(result.seeds) == config.GATE_SEEDS` until
+    The seeds assertion was `len(result.seeds) == loop.GATE_SEEDS` until
     2026-09-13, which contradicted both this docstring and the call right above
     it: `score` stopped drawing its own block and started taking one from the
     caller, so a test handing it `[5, 6]` was asserting that two seeds were
@@ -179,7 +179,7 @@ def test_a_program_in_the_pool_is_never_played_against_itself(
     champion.write_text(PASS, encoding="utf-8")
     other = tmp_path / "other.py"
     other.write_text(PASS, encoding="utf-8")
-    monkeypatch.setattr(config, "GATE_SEEDS", 1)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 1)
     monkeypatch.setattr(evaluator, "VENDORED", ["other"])
     # Names resolve to paths through the saved pool, so it has to be on disk
     # and the evaluation has to be told where it is -- there is no module-level
@@ -219,7 +219,7 @@ def test_score_diverts_what_a_candidate_writes_away_from_the_caller(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(config, "GATE_SEEDS", 1)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 1)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
     evaluator.score(agent, "prog", p, random_module.Random(3), [5, 6], workers=WORKERS)
@@ -240,7 +240,7 @@ def test_score_reports_an_interval_beside_every_rate(
     """
     agent = tmp_path / "main.py"
     agent.write_text(PASS, encoding="utf-8")
-    monkeypatch.setattr(config, "GATE_SEEDS", 2)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 2)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
     result = evaluator.score(agent, "prog", p, random.Random(1), [5, 6], WORKERS)
@@ -260,7 +260,7 @@ def test_score_lets_a_crash_propagate_and_still_restores_the_cwd(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(config, "GATE_SEEDS", 1)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 1)
     p = pool.Pool(opponents={"v54": str(config.OPPONENTS / "kaito_v54" / "main.py")})
 
     with pytest.raises(RuntimeError):

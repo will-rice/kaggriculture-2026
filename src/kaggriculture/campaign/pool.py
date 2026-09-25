@@ -52,6 +52,55 @@ from pydantic import BaseModel
 
 from kaggriculture.campaign import config, roster
 
+# Four, and every one of them a different agent. It was six, and four of those
+# were champion_1, _10, _20 and _30 -- which read as four points spanning the
+# strength range and were four ages of one recording. The 720-step table
+# underneath that lineage is byte-identical from its seed through champion_69,
+# sha ef59f6f4a545d342, and 86.5% of every action any of them emits comes
+# straight out of it; what differs between them is the repair layer over the
+# other 13%.
+#
+# An anchor's whole job is to be a fixed point a rating is calibrated against,
+# so anchoring the scale to one agent at four ages is the failure that
+# calibration exists to prevent. champion_65 replaces the three: it is the
+# strongest of that lineage and the bar a submission has to clear, so it earns
+# a slot on its own account rather than as a reference point.
+#
+# The rest of that lineage left the pool with them. Sixty-nine champions held
+# ten of a gate's twenty-four slots, which bought ten readings of one
+# recording; its run is kept whole under `run/campaign-tape-lineage/` and its
+# pairings stay in `field.json`, so the fit still places it.
+# Highest-rated agents drawn beyond the anchors and the vendored set. Four
+# rather than six because the leader is already drawn through `always` and the
+# vendored opponents now take a dozen slots: the contenders were competing for
+# room with the only cross-population evidence the gate gets.
+GATE_CONTENDERS = 4
+
+# Opponents drawn for one gate. The pool itself is now everything the campaign
+# has ever produced or harvested and nothing leaves it, so this is a sample
+# and not the pool: a rating is fitted over every pairing anyone has ever
+# played, and each candidate only has to add its own edges to that graph.
+#
+# The pool used to keep the top eight by rating and drop the rest, on the
+# reasoning that an opponent every candidate beats separates two candidates no
+# better than a coin. That is true of a *win rate* and false of a rating, and
+# it cost us: champion_1 was trimmed out long ago, and champion_37 -- thirty
+# promotions later, rated five log-odds above it -- beats it only 0.729 of the
+# time. A field this non-transitive keeps its counters or walks past them.
+#
+# Twenty-four rather than sixteen, because the draw now includes every vendored
+# opponent: about a dozen of those, plus the leader and floor, plus the four
+# anchors that are not themselves vendored, plus `GATE_CONTENDERS`. Sixteen
+# would have truncated exactly the agents the change exists to include.
+#
+# The cost is real and was weighed against playing the pool entire. That is
+# roughly 75 opponents today, 2,400 games a candidate against 512, and it grows
+# with every promotion -- while buying no extra *share* of cross-population
+# evidence, since the pool is itself 84% champions. Drawing all the vendored
+# agents and sampling the rest lifts that share from about a sixth to about a
+# half for half the added cost, and does not grow.
+GATE_OPPONENTS = 24
+
 # What `gate.promote` names a champion, and so how one is told apart from a
 # harvested agent. The two are kept on different terms -- ours are trimmed to
 # the best few, a published agent never is -- and this is the only thing that
@@ -186,11 +235,11 @@ class Pool(BaseModel):
                 them, which is the cold start.
 
         Returns:
-            Opponent names, at most `config.GATE_OPPONENTS` of them.
+            Opponent names, at most `GATE_OPPONENTS` of them.
         """
         available = [name for name in self.opponents if name != exclude]
         # `always` leads, and the order is load-bearing rather than tidy: the
-        # list is truncated to `config.GATE_OPPONENTS` at the end, and the
+        # list is truncated to `GATE_OPPONENTS` at the end, and the
         # floor is the one opponent a promotion cannot be measured without.
         # Anything dropped by that truncation has to be a contender or a
         # vendored opponent, never the floor or the leader.
@@ -203,12 +252,12 @@ class Pool(BaseModel):
             (name for name in available if name not in drawn),
             key=lambda name: -standings.get(name, -math.inf),
         )
-        drawn += rated[: config.GATE_CONTENDERS]
-        remainder = list(rated[config.GATE_CONTENDERS :])
-        room = config.GATE_OPPONENTS - len(drawn)
+        drawn += rated[:GATE_CONTENDERS]
+        remainder = list(rated[GATE_CONTENDERS:])
+        room = GATE_OPPONENTS - len(drawn)
         if room > 0:
             drawn += rng.sample(remainder, min(room, len(remainder)))
-        return drawn[: config.GATE_OPPONENTS]
+        return drawn[:GATE_OPPONENTS]
 
     def add_champion(self, path: str) -> None:
         """Put our champion in the pool, and keep the one it replaces.

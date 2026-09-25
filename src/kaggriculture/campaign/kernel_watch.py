@@ -1,34 +1,29 @@
-"""Find a newly published kernel, tune it, and gate it -- the whole upgrade path.
+"""Read a newly published kernel's agent out of its notebook.
 
 Three ladder upgrades in a week came from one competitor publishing v54, v56
-and v58, and each was worth more than any learning we attempted. The manual
-version of this took two hours per kernel and one mistake nearly cost a
-submission slot, so it is written down here.
+and v58, and each was worth more than any learning we attempted. `harvest`
+decides which published kernels join the pool and when; this is how one is
+turned into a file the harness can play.
 
-What it does, in order:
+What it does:
 
-1. Lists public kernels for the competition and reports any whose ref we have
-   not already recorded in ``run/kernel-watch/seen.json``.
-2. Extracts each new one statically -- ``ast.literal_eval`` of the payload
-   assignment, then base85 and zlib -- and verifies the digest the notebook
-   itself asserts. It never executes a notebook cell.
-3. Resolves the entrypoint the way the engine's loader does. These artifacts
-   shadow ``agent``, sometimes twice, and the surviving definition is not the
-   one that plays; getting this wrong measures a different agent than the one
-   a submission would run.
-4. Applies the two thresholds this author leaves conservative across the whole
-   lineage -- ``preempt_horizon`` 2 -> 7 and ``preempt_minimum_price_ratio``
-   0.45 -> 0.225 -- to any kernel that carries a ``ResidualConfig`` literal.
-   Measured on v56 that is worth 0.9922 of 128 mirror games, and it applies
-   unchanged to v58.
-5. Gates the tuned artifact against the FIELD lineages over every exam seed,
-   both seat orderings.
+1. Lists public kernels for the competition and reports any whose ref is not
+   already in ``run/kernel-watch/seen.json``.
+2. Extracts each statically -- ``ast.literal_eval`` of the payload assignment,
+   then base85 and zlib -- and verifies the digest the notebook itself asserts.
+   It never executes a notebook cell.
+3. Resolves the entrypoint the way the engine's loader does, in a sandbox.
+   These artifacts shadow ``agent``, sometimes twice, and the surviving
+   definition is not the one that plays; getting this wrong measures a
+   different agent than the one a submission would run.
+4. Builds a compiled kernel from the compiler line its own notebook runs, when
+   that line is a literal.
 
-It stops there. Submitting is a slot-spending, externally visible action and
-stays a human decision; the report ends with the command to run.
+It used to tune and gate as well -- a second gate beside `gate.py`, scoring
+against a hand-kept roster through its own field function -- and stop short of
+submitting. The pool is `harvest`'s to decide and the gate is `gate.py`'s.
 """
 
-import argparse
 import ast
 import base64
 import hashlib
@@ -59,34 +54,6 @@ WORK = config.ROOT / "run" / "kernel-watch" / "kernels"
 # module-level binding of one, which is how a factory-built policy is
 # published.
 ENTRYPOINT = r"^(?:def (?:agent|kaggle_agent)\(|(?:agent|main|policy)\s*=)"
-
-# The two fields, and the values 128-game gates picked out of a 44-parameter
-# sweep. The horizon curve is unimodal (2 -> 0.500, 5 -> 0.914, 7 -> 0.930,
-# 9 -> 0.844, 12 -> 0.656) and the pair sits on a plateau, not a spike.
-TUNED_HORIZON = 7
-TUNED_PRICE_RATIO = 0.225
-
-
-def main() -> None:
-    """Scan, extract, tune and gate; print what a human should do next."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--author", default=None, help="only this kernel author")
-    parser.add_argument("--limit", type=int, default=5, help="new kernels to process")
-    parser.add_argument("--gate-seeds", type=int, default=64, help="seeds to play")
-    parser.add_argument("--workers", type=int, default=20)
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-
-    fresh = discover(args.author, args.limit)
-    if not fresh:
-        LOGGER.info("no new kernels")
-        return
-    for ref in fresh:
-        try:
-            report(ref, args.gate_seeds, args.workers)
-        except Exception:
-            LOGGER.exception("%s failed; continuing", ref)
-    remember(fresh)
 
 
 def discover(author: str | None, limit: int) -> list[str]:
@@ -129,81 +96,6 @@ def remember(refs: list[str]) -> None:
     seen.update(refs)
     SEEN.parent.mkdir(parents=True, exist_ok=True)
     SEEN.write_text(json.dumps(sorted(seen), indent=1))
-
-
-def report(ref: str, gate_seeds: int, workers: int) -> None:
-    """Extract, tune and gate one kernel, logging every step's evidence.
-
-    Args:
-        ref: The kernel ref to process.
-        gate_seeds: How many seeds to play, both seat orderings.
-        workers: Arena processes.
-    """
-    # A compiled kernel is tried first, because its main.py extracts perfectly
-    # well as source and is useless on its own: it loads an agent.so that only
-    # exists once the notebook's own build cell has run. Left to the source
-    # path it resolves, then fails on the first turn.
-    built = build_compiled(ref)
-    if built is not None:
-        rate, low, high, games = gate(built, gate_seeds, workers)
-        LOGGER.info(
-            "%s [compiled]: FIELD %.4f Wilson [%.4f, %.4f] over %d games",
-            ref,
-            rate,
-            low,
-            high,
-            games,
-        )
-        if low > 0.80:
-            LOGGER.info("   CANDIDATE. Archive at %s", built.parent)
-        return
-    source = extract(ref)
-    if source is None:
-        LOGGER.info("%s: no verifiable agent payload; skipped", ref)
-        return
-    tuned = retune(source)
-    directory = WORK / ref.replace("/", "__")
-    directory.mkdir(parents=True, exist_ok=True)
-    plain = directory / "main.py"
-    plain.write_text(source, encoding="utf-8")
-    entry = resolved_entrypoint(plain)
-    LOGGER.info("%s: entrypoint %s", ref, entry)
-    candidates = {"as_published": plain}
-    if tuned is not None:
-        patched = directory / "main_tuned.py"
-        patched.write_text(tuned, encoding="utf-8")
-        candidates["tuned"] = patched
-    for label, path in candidates.items():
-        rate, low, high, games = gate(path, gate_seeds, workers)
-        LOGGER.info(
-            "%s [%s]: FIELD %.4f Wilson [%.4f, %.4f] over %d games",
-            ref,
-            label,
-            rate,
-            low,
-            high,
-            games,
-        )
-        # The bar is what it takes to be worth standing over the agent we would
-        # otherwise stand: our tuned_v58 gates at 0.700 here and shopforge at
-        # 0.906. Those two are not a like-for-like comparison -- every
-        # candidate is dropped from its own field, so shopforge is scored on
-        # four lineages and ours on five including shopforge. The per-lineage
-        # rates above are the ones to read when ranking two candidates; this
-        # number only has to answer "worth a closer look".
-        #
-        # A kernel that republishes a lineage we already hold ties itself at
-        # 0.5 in that row and reads lower than it plays -- scanning shopforge
-        # itself gives 0.85, not 0.906. That row is the tell, and it is worth
-        # more than the mean: an opponent it cannot beat is one it already is.
-        if low > 0.80:
-            LOGGER.info(
-                "   CANDIDATE. To submit: uv run --with kaggle kaggle competitions "
-                "submit %s -f <archive> -m '%s %s'",
-                COMPETITION,
-                ref,
-                label,
-            )
 
 
 def build_compiled(ref: str) -> Path | None:
@@ -578,82 +470,3 @@ def payload_literal(text: str) -> str | None:
             return None
         return value if isinstance(value, str) else None
     return None
-
-
-def retune(source: str) -> str | None:
-    """Return the source with this author's two conservative thresholds moved.
-
-    Args:
-        source: A kernel's agent source.
-
-    Returns:
-        The patched source, or None if it carries no configuration literal to
-        patch -- in which case the kernel is gated as published only.
-    """
-    if "'preempt_horizon': 2" not in source:
-        return None
-    patched = source.replace(
-        "'preempt_horizon': 2", f"'preempt_horizon': {TUNED_HORIZON}"
-    )
-    ratio = f"'preempt_minimum_price_ratio': {TUNED_PRICE_RATIO}"
-    return patched.replace(
-        "'preempt_maximum_batch': 8", f"'preempt_maximum_batch': 8, {ratio}"
-    )
-
-
-def resolved_entrypoint(path: Path) -> str:
-    """Return the callable the engine's own loader selects from a file.
-
-    Args:
-        path: The agent file.
-
-    Returns:
-        The selected callable's name. These artifacts shadow ``agent``, so the
-        surviving definition is often not the one that plays.
-    """
-    return resolve_in_sandbox(path.read_text(encoding="utf-8"))
-
-
-def gate(path: Path, gate_seeds: int, workers: int) -> tuple[float, float, float, int]:
-    """Play one candidate against the field lineages over a fixed block.
-
-    This deliberately does not gate against our own served agent. Doing so asks
-    "does this beat us", and the agent worth adopting is the one that beats the
-    FIELD -- which is not the same question, because the field is
-    non-transitive. Measured: shopforge scores 0.6875 against v56 and would
-    have missed the old 0.75 bar, while scoring 0.979 against the field against
-    our own 0.779. The best agent we have found would have been scanned,
-    logged and discarded by its own daily scan.
-
-    Args:
-        path: The candidate agent file.
-        gate_seeds: How many seeds, both seat orderings.
-        workers: Arena processes.
-
-    Returns:
-        The equal-weighted field rate, its Wilson bounds, and the games played.
-    """
-    from kaggriculture.campaign import roster
-    from kaggriculture.campaign.field_gate import score_field
-    from kaggriculture.report import wilson_interval
-
-    # A gated candidate is usually a stranger's kernel, and playing it executes
-    # it: one wrote its own `main.py` over ours and left four agent files and a
-    # tarball behind. `score_field` plays on the caller's own working
-    # directory, so this is the one place a stranger's writes must be diverted.
-    # The path is resolved to absolute before the sandbox is entered, because
-    # every relative path a caller might pass -- the daily scan's own kernel
-    # directories included -- stops resolving the moment the sandbox does.
-    absolute = path.resolve()
-    seeds = tuple(range(700_000, 700_000 + gate_seeds))
-    rates, _ = pools.isolated(
-        score_field, absolute, seeds, workers, list(roster.TRAINING)
-    )
-    games = len(rates) * len(seeds) * 2
-    equal = sum(rates.values()) / len(rates)
-    low, high = wilson_interval(equal * games, games)
-    return equal, low, high, games
-
-
-if __name__ == "__main__":
-    main()

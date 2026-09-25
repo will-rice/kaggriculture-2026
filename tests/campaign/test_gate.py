@@ -11,6 +11,7 @@ from kaggriculture.campaign import (
     evaluator,
     gate,
     harness,
+    loop,
     pool,
     rating,
 )
@@ -813,7 +814,7 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
     paths = _paths(tmp_path)
     program = _program(tmp_path, monkeypatch)
     p = pool.Pool(opponents={"a": "/x/a.py", "b": "/x/b.py"})
-    seed_before = config.SEED.read_bytes()
+    seed_before = loop.SEED.read_bytes()
 
     gate.enroll(
         gate.record(
@@ -825,7 +826,7 @@ def test_a_promotion_writes_nothing_outside_the_run_directory(
     )
 
     assert not (tmp_path / "src").exists()
-    assert config.SEED.read_bytes() == seed_before, "the seed is not written to"
+    assert loop.SEED.read_bytes() == seed_before, "the seed is not written to"
 
 
 def test_a_second_promotion_on_the_saved_pool_yields_champion_2(

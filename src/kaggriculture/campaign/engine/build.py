@@ -9,9 +9,9 @@ import os
 import subprocess
 from pathlib import Path
 
-from kaggriculture.campaign import config
-
 LOGGER = logging.getLogger(__name__)
+
+ENGINE_LIBRARY = Path(__file__).parent / "engine" / "kaggriculture_engine.so"
 HERE = Path(__file__).resolve().parent
 
 
@@ -31,7 +31,7 @@ def build() -> Path:
         The compiled library's path.
     """
     sources = [HERE / "bridge.cpp", HERE / "sim.hpp", HERE / "pyrandom.hpp"]
-    target = config.ENGINE_LIBRARY
+    target = ENGINE_LIBRARY
     if target.exists() and target.stat().st_mtime >= max(
         s.stat().st_mtime for s in sources
     ):

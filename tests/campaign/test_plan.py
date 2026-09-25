@@ -34,8 +34,8 @@ PLAN = {
     # which are the two things the schema checks and the two things this fixture
     # got wrong -- it cited steps 1, 2 and 3 of a one-step pool.
     "routes": {
-        "101": [step % 2 for step in range(config.SEASON)],
-        "112": [0] * config.SEASON,
+        "101": [step % 2 for step in range(plan.SEASON)],
+        "112": [0] * plan.SEASON,
     },
     "shops": [{"route": 101, "shops": ["BAKERY", "BAKERY"]}],
     # The chassis layers, which a program keeps on a line of its own and the
@@ -265,25 +265,25 @@ def test_the_schema_names_what_is_wrong_with_a_plan() -> None:
         # generator reaches for first, because an index is just a number and
         # nothing local to it is wrong.
         (
-            {"routes": {"101": [len(PLAN["actions"])] * config.SEASON}},
+            {"routes": {"101": [len(PLAN["actions"])] * plan.SEASON}},
             "cites",
         ),
         # A season that is not a season. Short and the farm idles out the year
         # on `PASS`, long and the tail is never read -- either way the plan is
         # not the thing it claims to be.
         (
-            {"routes": {"101": [0] * (config.SEASON - 1)}},
-            f"at least {config.SEASON}",
+            {"routes": {"101": [0] * (plan.SEASON - 1)}},
+            f"at least {plan.SEASON}",
         ),
         (
-            {"routes": {"101": [0] * (config.SEASON + 1)}},
-            f"at most {config.SEASON}",
+            {"routes": {"101": [0] * (plan.SEASON + 1)}},
+            f"at most {plan.SEASON}",
         ),
         # A route key the program cannot turn into a number. `int(k)` on it is
         # a crash at load, before a move is made, and a generator asked for a
         # plan reached for exactly this: a route called "season".
         (
-            {"routes": {"season": [0] * config.SEASON}},
+            {"routes": {"season": [0] * plan.SEASON}},
             "string_pattern_mismatch",
         ),
         # And the rest, which the types carry, so the message names the path.
@@ -382,6 +382,68 @@ def test_the_schema_takes_the_plan_the_champion_actually_carries() -> None:
     assert max(len(action.hands) for action in checked.actions) >= 8
 
 
+def test_the_prototype_blob_is_shelved_beside_the_program_and_packed_back(
+    tmp_path: Path,
+) -> None:
+    """One line of the controller was 440,834 bytes, and a round could not read past it.
+
+    `_V92_P_BLOB` is the price-prototype library, base85 on one line of a file
+    whose median line is 43 bytes. `diff` and `rg` return it whole -- 20 of 41
+    rounds had one command come back over 100 KB. It travels the way the plan
+    does now: a file beside `child.py` and a loader line in its place, put back
+    by `gather` before anything downstream reads the program.
+    """
+    payload = "c-ri}U9T+Nb{;gpYF1Tub" * 2000
+    source = packed(PLAN).replace(
+        "def agent(", f"_V92_P_BLOB = '{payload}'\n\n\ndef agent(", 1
+    )
+
+    plan.lay_out(source, tmp_path)
+
+    laid = (tmp_path / "child.py").read_text(encoding="utf-8")
+    assert payload not in laid
+    assert "_V92_P_BLOB=__import__('_prototypes').DATA" in laid
+    assert max(len(line) for line in laid.splitlines()) < 2_000, "no landmine left"
+    assert (tmp_path / "prototypes.b85").read_text(encoding="utf-8") == payload
+    # And it loads from there the way the plan does: through the module, so a
+    # program exec'd without a `__file__` still finds it.
+    assert (tmp_path / "_prototypes.py").exists()
+
+    back = plan.gather(tmp_path)
+
+    assert f"_V92_P_BLOB = '{payload}'" in back
+    assert "__import__('_prototypes')" not in back
+    _, data = plan.split(back)
+    assert data == plan.split(source)[1], "the plan came back with it"
+
+
+def test_a_round_that_removed_the_shelved_blob_wrote_nothing_runnable(
+    tmp_path: Path,
+) -> None:
+    """A loader line pointing at a file that is gone is a program that loads nothing."""
+    source = packed(PLAN).replace(
+        "def agent(", "_V92_P_BLOB = 'abc'\n\n\ndef agent(", 1
+    )
+    plan.lay_out(source, tmp_path)
+    (tmp_path / "prototypes.b85").unlink()
+
+    with pytest.raises(plan.BrokenPlanError, match="prototypes.b85"):
+        plan.gather(tmp_path)
+
+
+def test_a_program_without_a_blob_is_laid_out_and_gathered_as_before(
+    tmp_path: Path,
+) -> None:
+    """The older lineage carries no blob; nothing here may touch it."""
+    source = packed(PLAN)
+
+    plan.lay_out(source, tmp_path)
+
+    assert not (tmp_path / "prototypes.b85").exists()
+    assert not (tmp_path / "_prototypes.py").exists()
+    assert plan.split(plan.gather(tmp_path))[1] == plan.split(source)[1]
+
+
 def test_the_real_champion_survives_the_round_trip() -> None:
     """The property, on the program the campaign is actually standing on."""
     champion = Path("run/campaign/floor/agent/main.py")
@@ -415,7 +477,7 @@ def test_the_schema_accepts_everything_the_engine_acts_on() -> None:
     legal = [
         # A farm can work thirty-nine hands: `sim.hpp` keeps MAX_UNITS slots for
         # the farmer and its hands, and the first schema capped this at twelve.
-        step(hands=[["PASS"]] * (config.MAX_UNITS - 1)),
+        step(hands=[["PASS"]] * (plan.MAX_UNITS - 1)),
         # `PICKUP` and `PLACE` take an item, and the count is optional.
         step(farmer=["PICKUP", "COW"]),
         step(farmer=["PICKUP", "COW", 2]),
@@ -466,7 +528,7 @@ def test_the_schema_refuses_what_it_can_and_describes_the_rest() -> None:
         # A map unlocks two shops.
         step(),
         # And a farm cannot work more hands than the engine keeps slots for.
-        step(hands=[["PASS"]] * config.MAX_UNITS),
+        step(hands=[["PASS"]] * plan.MAX_UNITS),
     ):
         with pytest.raises(ValueError):
             if wrong == step():
@@ -610,7 +672,7 @@ def test_a_written_season_need_not_be_seven_hundred_entries_long() -> None:
     (season,) = schema["properties"]["routes"]["patternProperties"].values()
 
     assert season["minItems"] == 1, "a short season has to be writable"
-    assert season["maxItems"] == config.SEASON, "and no longer than a season"
+    assert season["maxItems"] == plan.SEASON, "and no longer than a season"
 
     # Three stretches covering the year, which the old schema refused.
     hold = {"farmer": ["WATER"], "hands": [], "market": []}
@@ -630,7 +692,7 @@ def test_a_written_season_need_not_be_seven_hundred_entries_long() -> None:
                         },
                         "steps": 1,
                     },
-                    {"step": hold, "steps": config.SEASON - 2},
+                    {"step": hold, "steps": plan.SEASON - 2},
                 ]
             },
             "shops": [],
@@ -641,14 +703,14 @@ def test_a_written_season_need_not_be_seven_hundred_entries_long() -> None:
     # cited as many times as its stretch is long.
     champion = plan.Plan.model_validate(PLAN)
     folded = plan.fold(short, champion)
-    assert len(folded.routes["100"]) == config.SEASON
+    assert len(folded.routes["100"]) == plan.SEASON
     assert len(folded.actions) == 3
 
 
 def test_a_written_plan_names_what_is_wrong_with_it() -> None:
     """Refused here, where it is still a sentence rather than a lost game."""
     pause = {"farmer": ["PASS"], "hands": [], "market": []}
-    whole = [{"step": pause, "steps": config.SEASON}]
+    whole = [{"step": pause, "steps": plan.SEASON}]
     for wrong, says in (
         # A season that runs past the end of the year. Stopping short is legal
         # and means the farm is idle for the rest, which is what both models
@@ -668,7 +730,7 @@ def test_a_written_plan_names_what_is_wrong_with_it() -> None:
             "run past the end",
         ),
         (
-            {"routes": {"100": [{"step": pause, "steps": config.SEASON + 1}]}},
+            {"routes": {"100": [{"step": pause, "steps": plan.SEASON + 1}]}},
             "less than or equal",
         ),
         ({"routes": {"season": whole}}, "string_pattern_mismatch"),
@@ -677,7 +739,7 @@ def test_a_written_plan_names_what_is_wrong_with_it() -> None:
             {
                 "routes": {
                     "100": [
-                        {"step": pause, "steps": config.SEASON - 1},
+                        {"step": pause, "steps": plan.SEASON - 1},
                         {
                             "step": {
                                 "farmer": ["PLANT", "EGG"],
@@ -790,7 +852,7 @@ def test_a_season_that_stops_short_leaves_the_farm_idle() -> None:
     working = {"farmer": ["WATER"], "hands": [], "market": []}
     short = plan.Written.model_validate(
         {
-            "routes": {"100": [{"step": working, "steps": config.SEASON - 20}]},
+            "routes": {"100": [{"step": working, "steps": plan.SEASON - 20}]},
             "shops": [],
         }
     )
@@ -798,8 +860,8 @@ def test_a_season_that_stops_short_leaves_the_farm_idle() -> None:
     folded = plan.fold(short, champion)
     season = [folded.actions[at] for at in folded.routes["100"]]
 
-    assert len(season) == config.SEASON, "the program needs every step"
-    assert all(step.farmer[0] == "WATER" for step in season[: config.SEASON - 20])
+    assert len(season) == plan.SEASON, "the program needs every step"
+    assert all(step.farmer[0] == "WATER" for step in season[: plan.SEASON - 20])
     assert all(step.model_dump(mode="json") == plan.IDLE for step in season[-20:])
     # Two pooled entries: the step it named, and doing nothing.
     assert len(folded.actions) == 2
@@ -915,7 +977,7 @@ def test_a_plan_that_did_not_move_says_so() -> None:
 def test_the_other_parts_are_described_too() -> None:
     """A season repointed, a shop pair moved and a switch flipped each show."""
     after = json.loads(json.dumps(PLAN))
-    after["routes"]["112"] = [1] * config.SEASON
+    after["routes"]["112"] = [1] * plan.SEASON
     after["shops"][0]["route"] = 112
     after["settings"]["front_run"] = True
 
