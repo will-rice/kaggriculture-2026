@@ -1692,8 +1692,10 @@ def test_a_result_that_did_not_play_every_opponent_still_reaches_the_gate(
     gates = gates_of(records)
     assert gates, "the gate returned before it judged anything"
     # And judged it, rather than turning it away for a draw it never made.
-    # `gate/stale` marks the second, which is what ran 232 times live.
+    # `gate/stale` marks the second, which is what ran 232 times live;
+    # `gate/unpaired` marks a baseline the campaign failed to keep.
     assert "gate/stale" not in gates[0]
+    assert "gate/unpaired" not in gates[0]
     assert "gate/score" in gates[0] and "gate/promoted" in gates[0]
     assert len(scored) > 1
 
@@ -1963,6 +1965,65 @@ def test_the_first_scratch_session_begins_from_the_blank_slate(
     assert "PASS" in loop.SCRATCH_AGENT
 
 
+def test_a_promotion_leaves_the_new_champions_own_measurement_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """The gate cannot judge a candidate without the champion on its block.
+
+    `paired` refuses one whose block or champion the baseline does not match,
+    and the baseline was written in one place: a session that happens to start
+    from the champion. A session is thousands of rounds long and ends on a
+    promotion, so between a promotion and the next session that starts from
+    the new champion, every candidate another session produced was refused
+    unjudged. Measured live on 2026-09-26: the last session to start from the
+    champion did so at 03:33, champion_43 took the slot at 05:55, and five
+    candidates over the following five and a half hours were all turned away,
+    two of them at 0.978.
+
+    A promotion can always leave it, for nothing: the candidate was measured
+    minutes earlier on the current block, and `gate.promote` copies those same
+    bytes, so its result *is* the new champion's on that block.
+
+    A seam test cannot catch this -- with two short sessions the next session
+    always starts from the champion and sets the baseline the old way, so the
+    gap never opens. The race needs a second session mid-lineage, which is
+    what this asserts directly.
+    """
+    campaign = _record_campaign(tmp_path, monkeypatch, log)
+    # The floor as it stands, and the program that is about to replace it.
+    standing = _champion(config.POOL_CHAMPION, 0.5)
+    campaign.state.champion = standing
+    source = campaign.database.store(SELLER, "p1")
+    campaign.database.add(
+        archive.Program(
+            id="p1",
+            source_path=str(source),
+            started_from=config.POOL_CHAMPION,
+            instruction="plan",
+            model="m",
+            fitness=0.9,
+            rates={config.POOL_CHAMPION: 0.9, "v54": 0.9},
+            created=time.time(),
+        )
+    )
+    result = _gate_result("p1", {config.POOL_CHAMPION: 0.9, "v54": 0.9})
+    # The champion measured on this candidate's own block, which is what makes
+    # the comparison possible at all.
+    campaign.champion_baseline = (standing.path, tuple(result.seeds), standing.result)
+
+    promoted = asyncio.run(campaign.consider("p1", result))
+
+    assert promoted, "the set-up has to promote or this asserts nothing"
+    assert campaign.state.champion is not None
+    assert campaign.champion_baseline is not None
+    path, seeds, kept = campaign.champion_baseline
+    # The new champion, not the one it replaced, on the block it was judged on.
+    assert path == campaign.state.champion.path
+    assert path != standing.path
+    assert seeds == tuple(result.seeds)
+    assert kept is result
+
+
 def _record_campaign(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> loop.Campaign:
@@ -2062,6 +2123,57 @@ def test_the_gate_asks_for_the_floor_and_not_the_whole_pool(
     # And a result from before this floor existed has no gap to measure.
     stale = {"champion_1": 0.8, "v54": 0.9}
     assert campaign.floor() not in stale
+
+
+def test_a_promotion_leaves_a_baseline_the_next_candidate_can_be_judged_against(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: wandb.Run,
+    records: list[tuple[float, dict]],
+) -> None:
+    """A promotion has to hand the gate the new champion's own measurement.
+
+    `paired` refuses a candidate whose champion or block the baseline does not
+    match, and the baseline used to be written in one place: a session that
+    happens to start from the champion. A session is thousands of rounds long
+    and ends on a promotion, so between one promotion and the next session
+    that starts from the new champion, every candidate was refused unjudged.
+    Measured live on 2026-09-26: five in a row over five and a half hours,
+    two of them at 0.978.
+
+    The promoted candidate was measured on the current block against the pool
+    as it then stood, and `gate.promote` copies those same bytes, so its
+    result is the champion's and costs nothing to keep.
+    """
+    # Real games and the real gate, six seeds for the reason
+    # `test_a_better_child_is_promoted` gives: at one seed neither promotion bar
+    # can be met however much better the child is.
+    paths = tiny_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(loop, "GATE_SEEDS", 6)
+    pass_pool(tmp_path, paths)
+
+    state = loop.run(
+        sessions=2,
+        mutator=mutate.FakeMutator(edit=lambda _: SELLER),
+        workers=WORKERS,
+        seed_agent=_write(tmp_path / "seed.py", PASS),
+        rng=random.Random(0),
+        log=log,
+        paths=paths,
+        opponents=UNVENDORED,
+    )
+
+    assert state.champion is not None
+    gates = gates_of(records)
+    assert any(record["gate/promoted"] for record in gates), "nothing promoted"
+    # Whatever the verdicts were, none of them was the refusal this is about:
+    # a candidate turned away because the gate held no comparable measurement
+    # of the champion standing at the time. `gate/stale` is the other fault --
+    # a candidate that played a champion since replaced -- which a promotion
+    # legitimately causes and this cannot prevent.
+    assert not any(record.get("gate/unpaired") for record in gates), (
+        "a candidate was refused for want of a baseline the promotion could have left"
+    )
 
 
 def test_only_a_promotion_writes_the_champion_series(

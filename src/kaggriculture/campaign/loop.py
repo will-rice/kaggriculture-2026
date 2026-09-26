@@ -620,6 +620,11 @@ class Campaign:
         # A session measures the program it starts from, so the champion is
         # re-measured on the current block eight times a generation for free.
         # This keeps the latest of those.
+        # The champion's own measurement on one block, which is what a
+        # candidate on that block can fairly be compared against. Written when
+        # a session starts from the champion and when a promotion makes one,
+        # since a promoted candidate was measured on the current block and its
+        # result is the new champion's.
         self.champion_baseline: tuple[str, tuple[int, ...], Result] | None = None
         # A promotion writes the floor and swaps the champion's pool slot; eight
         # sessions promoting at once would race on both.
@@ -1198,10 +1203,22 @@ class Campaign:
                     "not promoted",
                     program_id,
                 )
+                # A different series from `gate/stale`, because it is a
+                # different fault with a different owner. `gate/stale` is about
+                # the candidate: it played a champion that has since been
+                # replaced, or never played the floor, and nothing can be done
+                # for it. This is about us: the candidate is fine and we are
+                # holding no measurement of the champion on its block, so the
+                # comparison cannot be made for want of bookkeeping.
+                #
+                # They were one marker until 2026-09-26, and that is why five
+                # candidates in five and a half hours were refused unjudged --
+                # two at 0.978 -- while the record read exactly like a run of
+                # candidates that were not good enough.
                 self.log.log(
                     {
                         **self.promotion_record(result, False, baseline),
-                        "gate/stale": 1,
+                        "gate/unpaired": 1,
                     }
                 )
                 return False
@@ -1231,6 +1248,33 @@ class Campaign:
                 self.state.champion = gate.record(champion, self.paths)
                 self.database.promoted_as(program_id, champion.name)
                 self.state.sessions_since_promotion = 0
+                # The new champion's measurement on this block, which is the
+                # result it was just promoted on: the file `gate.promote`
+                # copied is these bytes, and they were measured minutes ago on
+                # `self.block` against the pool as it then stood.
+                #
+                # Without this the gate stops judging. A baseline was set in
+                # one place -- a session that happens to start from the
+                # champion -- and `paired` refuses any candidate whose block or
+                # champion it does not match, so between a promotion and the
+                # next session that starts from the new champion, every
+                # candidate is turned away unjudged however good it is.
+                # Measured live on 2026-09-26: the last session to start from
+                # the champion did so at 03:33, champion_43 took the slot at
+                # 05:55, and the five candidates gated over the following five
+                # and a half hours were all refused, two of them at 0.978. A
+                # session is thousands of rounds long and ends on a promotion,
+                # so "the next session to start from the champion" can be
+                # hours away or never.
+                #
+                # Free and exact, which is why it goes here rather than in a
+                # re-measurement: the candidate's own evaluation is the
+                # champion's evaluation, the same bytes on the same seeds.
+                self.champion_baseline = (
+                    self.state.champion.path,
+                    tuple(result.seeds),
+                    result,
+                )
                 # No field refresh. It played the new champion's pairings so a
                 # Bradley-Terry fit would have edges for it, and nothing reads
                 # that fit any more: the bar is a win rate and a head-to-head,
