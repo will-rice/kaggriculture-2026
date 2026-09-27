@@ -69,23 +69,41 @@ def test_unit_ops_match_the_port_enum_order() -> None:
     ]
 
 
-def test_core_budget_leaves_headroom() -> None:
-    """Enough cores stay free for codex, the loop, and the box's other tenants.
+def test_the_campaign_cannot_ask_for_more_than_its_budget() -> None:
+    """Everything a session runs at once comes out of one division of the budget.
 
-    Sized against a measurement rather than a guess. On 2026-09-09 the loop drew
-    60 cores against a budget of 56 while other tenants took 13.3, and `vmstat`
-    reported 89 to 151 runnable on 64 cores with zero blocked and zero iowait --
-    oversubscribed by half again, at sixty thousand context switches a second.
-    The reservation has to cover the tenants and the codex sessions, and eight
-    did not.
+    This is the invariant that matters, and bounding `CORE_BUDGET` alone did not
+    state it. A session runs two things that play games -- the gate evaluating
+    its candidate and the round measuring before it edits -- and each used to
+    take `CORE_BUDGET // SESSIONS` for itself, the loop through its `--workers`
+    default and `measure` through a hand-copied `(cpu_count() - 24) //
+    SESSIONS`. Peak demand was therefore twice the budget: 80 cores against 64,
+    which is the oversubscription the budget exists to prevent, reached from
+    inside it. What had been holding the total down was launching the loop with
+    half the workers it asked for.
+
+    The 2026-09-09 measurement behind the reservation stands: at 60 cores drawn
+    against a budget of 56, `vmstat` reported 89 to 151 runnable on 64 with zero
+    blocked and zero iowait, sixty thousand context switches a second --
+    oversubscribed by half again, and slower for it.
     """
     import os
 
     cores = os.cpu_count() or 1
     assert 1 <= config.CORE_BUDGET
-    assert config.CORE_BUDGET <= max(1, cores - 24), (
-        "the arena's budget has to leave room for the box's other tenants and "
-        "the codex sessions, or the shortfall is paid as contention instead"
+    assert (
+        config.SESSIONS * (config.GATE_CORES + config.ROUND_CORES) <= config.CORE_BUDGET
+    ), (
+        "a session's gate and its round play games at the same time, so both "
+        "shares together are what the campaign actually asks the box for"
+    )
+    # Six: two codex sessions and the shell commands they spawn, ClickHouse, and
+    # the machine. It was 24 while another project's dataloaders held 13.3 cores
+    # of this box -- 21.2 by 2026-09-27, across two trainings, both since
+    # stopped. Nothing else here takes as much as a core.
+    assert config.CORE_BUDGET <= max(1, cores - 6), (
+        "the budget has to leave room for the codex sessions and the machine, "
+        "or the shortfall is paid as contention instead"
     )
 
 

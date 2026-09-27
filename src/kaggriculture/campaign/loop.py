@@ -368,9 +368,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sessions", type=int, default=10**9)
     # Section 7: every session in flight can be evaluating at once.
-    parser.add_argument(
-        "--workers", type=int, default=max(1, config.CORE_BUDGET // config.SESSIONS)
-    )
+    parser.add_argument("--workers", type=int, default=config.GATE_CORES)
     # Whatever this names is copied to the run's `seed_program`, and that copy is
     # what `copycheck` exempts, so a run started from a snapshot exempts the
     # snapshot and a run started from the default exempts the default. There

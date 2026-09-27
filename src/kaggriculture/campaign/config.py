@@ -82,12 +82,13 @@ EPISODES = Path("/data/kaggriculture/episodes")
 # by half again, so a large share of the machine was spent scheduling rather
 # than playing games.
 #
-# The old reservation was not wrong when it was written, it was sized for a box
-# we had to ourselves. Eight cores cannot cover thirteen of other people's work
-# plus eight codex sessions, and the shortfall comes out of the arena either
-# way -- as contention rather than as a smaller pool, which is the same cost
-# paid less efficiently.
-CORE_BUDGET = max(1, (os.cpu_count() or 1) - 24)
+# The twenty-four reserved here were thirteen cores of another project's
+# dataloaders plus eight codex sessions. Measured 2026-09-27: those dataloaders
+# had grown to 21.2 cores across two `rsna-2026` trainings, 52 processes
+# feeding two GPUs, and both were stopped. Nothing else on the box takes as
+# much as a core, so the reservation is now six: two codex sessions and the
+# shell commands they spawn, ClickHouse, and the machine itself.
+CORE_BUDGET = max(1, (os.cpu_count() or 1) - 6)
 
 # Item order is sim.hpp's `Item` enum: the nine products, then the animals.
 ITEMS: list[str] = list(PRODUCTS) + list(ANIMALS)
@@ -143,6 +144,27 @@ MARKET_OPS: list[str] = [
 # of five, and a round that can play its seasons four times as fast is a round
 # that measures before it edits rather than guessing because measuring was slow.
 SESSIONS = 2
+
+# What one session may have playing games at once.
+#
+# A session runs two of them: the gate evaluating its candidate, and the round
+# measuring for itself before it edits. Each used to take `CORE_BUDGET //
+# SESSIONS` independently -- the loop through its `--workers` default and
+# `measure` through a hand-copied `(cpu_count() - 24) // SESSIONS` -- so the
+# campaign's peak demand was twice its budget: 80 cores against 64, which is
+# the oversubscription `CORE_BUDGET` was meant to prevent, arriving
+# from inside. Launching the loop with half the workers it asked for was what
+# had been holding the total down.
+#
+# So the budget is divided once, here, and both halves read it.
+SESSION_CORES = max(1, CORE_BUDGET // SESSIONS)
+# The round's share. A round measures one pairing over a block of seeds; the
+# gate plays the whole pool, which is three hundred and seventy-seven
+# opponents as of 2026-09-27, so
+# the gate is much the larger job and gets the larger share.
+ROUND_CORES = max(1, SESSION_CORES // 3)
+# The gate's share: whatever measuring a round does not need.
+GATE_CORES = max(1, SESSION_CORES - ROUND_CORES)
 # The champion pairing alone, which the gate gives a veto no other opponent
 # has. The sweep above plays every pairing at `GATE_SEEDS`, and against an
 # opponent already beaten 1.000 that is ample -- more games buy nothing once

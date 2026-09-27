@@ -171,6 +171,57 @@ def test_a_cell_with_no_embedded_agent_yields_nothing() -> None:
     assert kernel_watch.embedded_source(cells) is None
 
 
+def test_the_scan_pages_the_listing_to_the_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan that reads one page sees the front of the field and nothing else.
+
+    It read page one of three orderings and unioned them: about 126 refs of the
+    606 this competition holds, so 339 kernels had never been examined on
+    2026-09-27 -- among them a whole fortnight of an active field. A competitor
+    publishing a burst could also push a kernel past the front fifty between
+    two hourly scans, and nothing would ever look at it.
+    """
+    import importlib
+    import types
+
+    pages = {1: 100, 2: 100, 3: 6}
+
+    class Listing:
+        """Stands in for the competition's kernel listing, 206 refs over 3 pages."""
+
+        def authenticate(self) -> None:
+            """The scan authenticates before it lists."""
+
+        def kernels_list(
+            self,
+            competition: str,
+            sort_by: str,
+            user: str | None,
+            page_size: int,
+            page: int,
+        ) -> list[types.SimpleNamespace]:
+            """Return one page, the last one short."""
+            count = pages.get(page, 0)
+            first = sum(pages.get(one, 0) for one in range(1, page))
+            return [
+                types.SimpleNamespace(ref=f"author/kernel-{first + i}", title="t")
+                for i in range(count)
+            ]
+
+    # Imported through `importlib` rather than by attribute: the `kaggle`
+    # package binds `api` to an instantiated client, which shadows the submodule
+    # of the same name, so a dotted monkeypatch target resolves to the object.
+    extended = importlib.import_module("kaggle.api.kaggle_api_extended")
+    monkeypatch.setattr(extended, "KaggleApi", Listing)
+    monkeypatch.setattr(kernel_watch, "SEEN", tmp_path / "seen.json")
+
+    found = kernel_watch.discover(None, 1_000)
+
+    assert len(found) == 206, "the whole listing, not the first page"
+    assert found[0] == "author/kernel-0", "newest first, so a limit takes the freshest"
+
+
 def test_a_payload_joined_from_pieces_under_its_own_name_is_read() -> None:
     """A payload is what it decodes to, not what the notebook calls it.
 

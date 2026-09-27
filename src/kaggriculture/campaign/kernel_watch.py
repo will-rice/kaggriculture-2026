@@ -39,6 +39,11 @@ from kaggriculture.campaign import config, pools
 LOGGER = logging.getLogger(__name__)
 
 COMPETITION = "kaggriculture"
+# Kaggle's page ceiling, and how many pages a scan walks before it stops
+# asking. Forty pages is four thousand kernels against a competition holding
+# six hundred: a bound on somebody else's paging, not a limit on the field.
+PAGE = 100
+PAGES = 40
 # Absolute, anchored to the repository rather than to wherever the process
 # happens to stand. These were `Path("run/kernel-watch/...")`, which is right
 # for as long as nothing ever moves the working directory -- and things do:
@@ -63,27 +68,46 @@ DIGEST = re.compile(r"\b[0-9a-f]{64}\b")
 
 
 def discover(author: str | None, limit: int) -> list[str]:
-    """Return refs published since the last scan, newest first.
+    """Return refs this scan has not examined yet, newest first.
+
+    Every public kernel, paged to the end. This used to read the first page of
+    three orderings -- dateCreated, voteCount, hotness -- and union them, which
+    is about 126 refs of the 606 the competition holds. The rest were invisible
+    by construction: measured 2026-09-27, 339 of 606 had never been looked at,
+    and a kernel pushed past the front fifty between two hourly scans would
+    never be looked at either.
+
+    One ordering is enough once it is paged, and dateCreated is the one worth
+    keeping. It enumerates the whole competition and puts the newest first, so
+    `limit` takes the freshest unexamined refs rather than an arbitrary slice
+    of three interleaved listings.
 
     Args:
         author: Restrict to one author, or None for the whole competition.
-        limit: How many new refs to return.
+        limit: How many unexamined refs to return.
 
     Returns:
-        The refs not already in the seen file.
+        The refs not already in the seen file, newest first.
     """
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     api = KaggleApi()
     api.authenticate()
     listed: dict[str, str] = {}
-    for order in ("dateCreated", "voteCount", "hotness"):
+    for page in range(1, PAGES + 1):
         found = api.kernels_list(
-            competition=COMPETITION, sort_by=order, user=author, page_size=50
+            competition=COMPETITION,
+            sort_by="dateCreated",
+            user=author,
+            page_size=PAGE,
+            page=page,
         )
         for kernel in found or ():
             if kernel is not None:
                 listed[kernel.ref] = kernel.title
+        # A page short of the ceiling is the last page.
+        if not found or len(found) < PAGE:
+            break
     seen = set(json.loads(SEEN.read_text())) if SEEN.exists() else set()
     fresh = [ref for ref in listed if ref not in seen][:limit]
     LOGGER.info("%d listed, %d new", len(listed), len(fresh))

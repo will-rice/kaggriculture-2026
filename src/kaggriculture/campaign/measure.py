@@ -52,7 +52,6 @@ for deciding whether an edit helped before spending a gate on it.
 """
 
 import argparse
-import os
 import pathlib
 import statistics
 
@@ -471,14 +470,18 @@ def _games(child: pathlib.Path, parent: pathlib.Path, seeds: tuple, days: bool) 
 
 
 def _spare_cores() -> int:
-    """Cores to play on: what the campaign leaves for a round, and at least one.
+    """Cores to play on: the share of the budget a round measures with.
 
-    Eight sessions share the machine and each is usually waiting on its own
-    codex call rather than computing, so there is nearly always room. Bounded
-    anyway, because eight rounds measuring at once must not take the machine
-    away from the gates that decide anything.
+    Read from `config` rather than derived here. This used to recompute
+    `(cpu_count() - 24) // SESSIONS`, the same expression the loop's
+    `--workers` default used, and the two are not alternatives -- a session
+    runs both at once -- so the campaign asked for twice its budget: 80 cores
+    against 64. `config.ROUND_CORES` is this half of a single division.
+
+    Bounded because rounds measuring at once must not take the machine away
+    from the gates that decide anything.
     """
-    return max(1, ((os.cpu_count() or 2) - 24) // config.SESSIONS)
+    return config.ROUND_CORES
 
 
 if __name__ == "__main__":
