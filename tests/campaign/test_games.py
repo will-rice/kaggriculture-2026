@@ -200,13 +200,13 @@ def test_the_opponent_is_recorded_by_roster_name(scratch: str) -> None:
 def test_a_programs_games_come_back_off_the_record_as_they_were_written(
     scratch: str,
 ) -> None:
-    """`recorded` is the inverse of `record`, seat and numbering included.
+    """`recorded` is the inverse of `record`, seat and episode included.
 
     A result serialises without its games, so a champion loaded on restart
     has none and the game a round is shown has to come from here. Seat 1 and
     two matchups, so the assertions pin which bank is whose and that the
-    matchup and season numbers `record` assigned are the ones that come back
-    -- a round's episode key is built from them.
+    episode key `record` wrote is the one that comes back -- the message
+    hands that key to the round, which reads the day table by it.
     """
     games.record(
         "probe",
@@ -220,18 +220,55 @@ def test_a_programs_games_come_back_off_the_record_as_they_were_written(
 
     back = games.recorded("probe", scratch)
 
-    assert [(matchup, season) for matchup, season, _ in back] == [
-        (3, 1),
-        (7, 1),
-        (7, 2),
+    assert [episode for episode, _ in back] == [
+        "probem3s1",
+        "probem7s1",
+        "probem7s2",
     ]
-    first = back[1][2]
+    first = back[1][1]
     assert first.seat == 1 and first.opponent == "v54" and first.seed == 101
     assert (first.ours, first.theirs) == (5.0, 3.0), "seat 1's bank is ours"
-    second = back[2][2]
+    second = back[2][1]
     assert second.seat == 0 and (second.ours, second.theirs) == (2.0, 9.0)
-    assert all(one.days == [] for _, _, one in back), "days are rows, not cargo"
+    assert all(one.days == [] for _, one in back), "days are rows, not cargo"
     assert games.recorded("nobody", scratch) == []
+
+
+def test_two_measurements_of_one_program_do_not_invent_a_game(
+    scratch: str,
+) -> None:
+    """An episode key does not identify a game, and it used to be joined as if it did.
+
+    A program is measured more than once -- at the start of every session that
+    begins from it, and again as a candidate -- and each measurement numbers
+    the matchups afresh, so `probem1s1` is a different opponent on a different
+    seed each time. `recorded` joined `candidate` to `episodes` on that key and
+    cross-multiplied them: measured on the live database 2026-09-27, one key
+    carried three opponents, three seeds and three pairs of banks, so a round
+    could be told one opponent's name beside another's result. Where two rows'
+    seats disagreed the program came back as its own opponent, which is the
+    `KeyError` that stopped the campaign for eight hours.
+
+    Read from `episodes` alone, each row is one game and says who played it.
+    """
+    games.record("probe", [(1, 1, "probe", game([day(0, 5.0, 3.0)], seat=0))], scratch)
+    # The same program measured again: the same key, another opponent, another
+    # seed, another pair of banks.
+    games.record(
+        "probe",
+        [(1, 1, "probe", game([day(0, 1.0, 8.0)], seat=1, opponent="shopforge"))],
+        scratch,
+    )
+
+    back = games.recorded("probe", scratch)
+
+    assert len(back) == 2, "one game per episode row, never their product"
+    assert {one.opponent for _, one in back} == {"v54", "shopforge"}
+    # Each game's banks belong to the opponent it was played against.
+    against = {one.opponent: (one.ours, one.theirs) for _, one in back}
+    assert against["v54"] == (5.0, 3.0)
+    assert against["shopforge"] == (1.0, 8.0), "the seat-1 game comes back whole"
+    assert all(one.opponent != "probe" for _, one in back)
 
 
 def test_a_name_carrying_a_tab_cannot_shift_the_columns() -> None:

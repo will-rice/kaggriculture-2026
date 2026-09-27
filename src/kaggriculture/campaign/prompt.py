@@ -106,7 +106,7 @@ ROUND = Message(ROUND_PROMPT)
 
 def compose(
     name: str,
-    played: tuple[int, int, harness.Game],
+    played: tuple[str, harness.Game],
     note: str = "",
 ) -> str:
     """Compose the message for one round.
@@ -114,9 +114,9 @@ def compose(
     Args:
         name: What the program in ``child.py`` is called -- a pool name or a
             database id. It is interpolated raw, so it must never be a path.
-        played: The game this round is about, as its matchup, its season and
-            the game itself. Every round has one: the loop records every game
-            it scores before a session reads them back.
+        played: The game this round is about, as its episode key and the game
+            itself. Every round has one: the loop records every game it scores
+            before a session reads them back.
         note: What leads the instruction when a session did not start from
             the champion, or "" -- the one thing the instruction section says
             differently from one round to the next.
@@ -124,8 +124,7 @@ def compose(
     Returns:
         The whole message.
     """
-    matchup, season, game = played
-    episode = f"{name}m{matchup}s{season}"
+    episode, game = played
     message = ROUND.render(
         opponent=game.opponent,
         episode=episode,
