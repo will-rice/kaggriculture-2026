@@ -2613,11 +2613,12 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(loop, "SEED_ROTATION", 1)
     # A narrow range, because over the real one -- a million seeds -- two
-    # independent draws of 16 and 48 collide about once in a thousand runs,
-    # and a test that only fails then is a test that never fails. From 79
-    # seeds two independent draws overlap on about ten every time, while one
-    # sample split in two still cannot repeat itself.
-    monkeypatch.setattr(config, "GATE_SEED_RANGE", range(1, 80))
+    # independent draws of 16 and 176 collide about once in a thousand runs,
+    # and a test that only fails then is a test that never fails. It has to
+    # hold `DUEL_SEEDS` at all, so it is sized just above: from 200 seeds two
+    # independent draws of 16 and 176 overlap on about fourteen every time,
+    # while one sample split in two still cannot repeat itself.
+    monkeypatch.setattr(config, "GATE_SEED_RANGE", range(1, 201))
 
     for _ in range(5):
         block = campaign.seasons()
