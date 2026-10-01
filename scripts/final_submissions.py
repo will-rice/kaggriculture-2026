@@ -180,7 +180,14 @@ def describes(champion: Path) -> str:
                 f"sweeps."
             )
             if program.changed:
-                said.append(f"The edit that earned it: {program.changed}")
+                # `changed` is a round's own sentence and does not always end
+                # in one. The parts here are joined with a space, so on
+                # 2026-09-30 the dry run read "the plan is unchanged Selection
+                # is the win rate first" -- two sentences run together on the
+                # submission page.
+                edit = program.changed.strip()
+                stop = "" if edit.endswith((".", "!", "?")) else "."
+                said.append(f"The edit that earned it: {edit}{stop}")
             break
     except (OSError, ValueError, KeyError) as unreadable:
         LOGGER.warning("no record for %s: %s", champion.stem, unreadable)
