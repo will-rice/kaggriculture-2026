@@ -368,9 +368,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sessions", type=int, default=10**9)
     # Section 7: every session in flight can be evaluating at once.
-    parser.add_argument(
-        "--workers", type=int, default=max(1, config.CORE_BUDGET // config.SESSIONS)
-    )
+    parser.add_argument("--workers", type=int, default=config.GATE_CORES)
     # Whatever this names is copied to the run's `seed_program`, and that copy is
     # what `copycheck` exempts, so a run started from a snapshot exempts the
     # snapshot and a run started from the default exempts the default. There
@@ -836,9 +834,18 @@ class Campaign:
         # scored, so the database is the one place they always are. Keyed the
         # way `record` wrote them, name included; `compose` has the name.
         scored = await asyncio.to_thread(games.recorded, name, games.DATABASE)
+        # Only the games whose opponent this campaign can still put in the box.
+        # The record outlives the pool: it holds every game ever played, and an
+        # opponent can leave under a key nothing resolves any more, while a
+        # round is handed its opponent as a file.
+        scored = [one for one in scored if one[1].opponent in self.pool.opponents]
         if not scored:
             raise RuntimeError(f"{name} has no games on the record to hand a round")
-        matchups = sorted({one[0] for one in scored})
+        # Blocked by opponent rather than by the matchup number `record`
+        # assigned, because those numbers are assigned afresh every time a
+        # program is measured and mean nothing across two measurements. The
+        # opponent is the thing a block of rounds is about.
+        matchups = sorted({one[1].opponent for one in scored})
         planned = ROUNDS_PER_OPPONENT * len(matchups)
         for turn in range(planned):
             # `ROUNDS_PER_OPPONENT` consecutive rounds on one opponent,
@@ -847,13 +854,15 @@ class Campaign:
             # without four attempts at the same game.
             block, attempt = divmod(turn, ROUNDS_PER_OPPONENT)
             against = [
-                one for one in scored if one[0] == matchups[block % len(matchups)]
+                one
+                for one in scored
+                if one[1].opponent == matchups[block % len(matchups)]
             ]
             playing = against[attempt % len(against)]
             message = prompt.compose(name, playing, note)
             # The opponent's program goes into the round's directory as a
             # file, so the message names it and carries no path to it.
-            opponent = Path(self.pool.opponents[playing[2].opponent])
+            opponent = Path(self.pool.opponents[playing[1].opponent])
             outcome = await self.round(source, name, result, message, drawn, opponent)
             rounds += 1
             if outcome is None:

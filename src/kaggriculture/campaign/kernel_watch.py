@@ -39,6 +39,11 @@ from kaggriculture.campaign import config, pools
 LOGGER = logging.getLogger(__name__)
 
 COMPETITION = "kaggriculture"
+# Kaggle's page ceiling, and how many pages a scan walks before it stops
+# asking. Forty pages is four thousand kernels against a competition holding
+# six hundred: a bound on somebody else's paging, not a limit on the field.
+PAGE = 100
+PAGES = 40
 # Absolute, anchored to the repository rather than to wherever the process
 # happens to stand. These were `Path("run/kernel-watch/...")`, which is right
 # for as long as nothing ever moves the working directory -- and things do:
@@ -54,30 +59,55 @@ WORK = config.ROOT / "run" / "kernel-watch" / "kernels"
 # module-level binding of one, which is how a factory-built policy is
 # published.
 ENTRYPOINT = r"^(?:def (?:agent|kaggle_agent)\(|(?:agent|main|policy)\s*=)"
+# Every digest a cell states, whether written into the comparison or held in a
+# constant beside it. The check used to be `digest == '<hex>'`, which is one
+# author's house style: the notebooks that ship the field's strongest agents
+# write `assert hashlib.sha256(SOURCE_BYTES).hexdigest() == EXPECTED_MAIN_SHA256`
+# and that regex sees nothing to check.
+DIGEST = re.compile(r"\b[0-9a-f]{64}\b")
 
 
 def discover(author: str | None, limit: int) -> list[str]:
-    """Return refs published since the last scan, newest first.
+    """Return refs this scan has not examined yet, newest first.
+
+    Every public kernel, paged to the end. This used to read the first page of
+    three orderings -- dateCreated, voteCount, hotness -- and union them, which
+    is about 126 refs of the 606 the competition holds. The rest were invisible
+    by construction: measured 2026-09-27, 339 of 606 had never been looked at,
+    and a kernel pushed past the front fifty between two hourly scans would
+    never be looked at either.
+
+    One ordering is enough once it is paged, and dateCreated is the one worth
+    keeping. It enumerates the whole competition and puts the newest first, so
+    `limit` takes the freshest unexamined refs rather than an arbitrary slice
+    of three interleaved listings.
 
     Args:
         author: Restrict to one author, or None for the whole competition.
-        limit: How many new refs to return.
+        limit: How many unexamined refs to return.
 
     Returns:
-        The refs not already in the seen file.
+        The refs not already in the seen file, newest first.
     """
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     api = KaggleApi()
     api.authenticate()
     listed: dict[str, str] = {}
-    for order in ("dateCreated", "voteCount", "hotness"):
+    for page in range(1, PAGES + 1):
         found = api.kernels_list(
-            competition=COMPETITION, sort_by=order, user=author, page_size=50
+            competition=COMPETITION,
+            sort_by="dateCreated",
+            user=author,
+            page_size=PAGE,
+            page=page,
         )
         for kernel in found or ():
             if kernel is not None:
                 listed[kernel.ref] = kernel.title
+        # A page short of the ceiling is the last page.
+        if not found or len(found) < PAGE:
+            break
     seen = set(json.loads(SEEN.read_text())) if SEEN.exists() else set()
     fresh = [ref for ref in listed if ref not in seen][:limit]
     LOGGER.info("%d listed, %d new", len(listed), len(fresh))
@@ -181,14 +211,14 @@ def compiler_command(text: str) -> list[str] | None:
 
 
 def extract(ref: str) -> str | None:
-    """Return one kernel's agent source, digest-checked, without executing it.
+    """Return one kernel's agent source, without executing the notebook.
 
     Args:
         ref: The kernel ref to pull.
 
     Returns:
-        The decoded agent source, or None if the notebook ships no payload
-        whose digest it asserts.
+        The decoded agent source, or None if the notebook ships no agent this
+        can read.
     """
     from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -204,20 +234,20 @@ def extract(ref: str) -> str | None:
         if cell["cell_type"] != "code":
             continue
         text = "".join(cell["source"])
-        payload = payload_literal(text)
-        if payload is None:
+        source = payload_source(text)
+        if source is None:
             continue
-        try:
-            raw = zlib.decompress(base64.b85decode(payload))
-        except (ValueError, zlib.error):
-            # The assignment is named like a payload but is not b85+zlib.
-            LOGGER.info("%s: payload is not b85+zlib; trying other cells", ref)
-            continue
-        asserted = re.search(r"digest == '([0-9a-f]{64})'", text)
-        digest = hashlib.sha256(raw).hexdigest()
-        if asserted and digest != asserted.group(1):
-            raise ValueError(f"{ref}: payload digest {digest} != asserted")
-        return raw.decode("utf-8")
+        # Verified when the cell states this payload's digest, and it does not
+        # always: of the thirty-six payloads on disk on 2026-09-27, twenty-seven
+        # stated a digest and every one of those matched, while nine stated
+        # none. An unstated digest is not a reason to refuse an opponent -- a
+        # source-published agent carries no digest either and the pool is full
+        # of them -- and a mismatch is no longer raised, because a raise here
+        # is a stranger's notebook taking down the whole hourly harvest.
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        if digest not in DIGEST.findall(text):
+            LOGGER.info("%s: payload digest unstated, UNVERIFIED -- opponent only", ref)
+        return source
     embedded = embedded_source(cells)
     if embedded is not None and loadable(embedded):
         LOGGER.info("%s: agent embedded as a string, UNVERIFIED -- opponent only", ref)
@@ -439,14 +469,83 @@ def embedded_source(cells: list[dict[str, Any]]) -> str | None:
     return best
 
 
-def payload_literal(text: str) -> str | None:
-    """Return the payload string a code cell assigns, without running it.
+def concatenated(node: ast.expr) -> str | None:
+    """Return a string a cell builds out of constants, without running it.
+
+    `ast.literal_eval` reads a lone constant and implicit concatenation and
+    stops there. A megabyte of base85 is not published on one line: the
+    notebooks shipping the field's strongest agents write
+    ``''.join(('...', '...', ...))``, which `literal_eval` sees as a call and
+    refuses -- so the payload was reported as computed and the kernel as
+    having no agent.
+
+    A join of constants is decided by constants. Reading it executes nothing,
+    which is the property that matters: the separator and every element are
+    literals and the result follows from them.
+
+    Args:
+        node: The expression a cell assigns.
+
+    Returns:
+        The string, or None when constants do not decide the expression.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = concatenated(node.left), concatenated(node.right)
+        return None if left is None or right is None else left + right
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.Tuple, ast.List))
+    ):
+        separator = concatenated(node.func.value)
+        if separator is None:
+            return None
+        parts = []
+        for element in node.args[0].elts:
+            part = concatenated(element)
+            if part is None:
+                return None
+            parts.append(part)
+        return separator.join(parts)
+    return None
+
+
+def payload_source(text: str) -> str | None:
+    """Return the agent source a code cell carries as an encoded blob.
+
+    A payload is identified by what it decodes to, not by what it is called.
+    It used to be identified by name -- ``payload``, ``PAYLOAD``, ``blob`` --
+    and by being a single literal, which is what the competition published in
+    early September and has not published since.
+
+    Measured 2026-09-27 over the 327 kernels the scan had pulled: twelve
+    matched that shape, and another twenty-four carried a payload under nine
+    other names -- ``SOURCE_BLOB``, ``_BLOB``, ``_PAYLOAD``, ``SOURCE_B85``,
+    ``PACKED_AGENT``, ``agent_b85``, ``AGENT_B85``, ``SUBMISSION_B85``,
+    ``_PACKED_SOURCE`` -- nearly all of them joined from pieces, one in base64
+    rather than base85. Those twenty-four are where the field is: v52 through
+    v57 of an author publishing a version every day, the top public agent's
+    submission v13, three of another author's stack. Every one of them was
+    logged "no agent this can build or extract" and skipped, and the pool held
+    six of the fifty most recently published kernels.
+
+    So the test is the plaintext: a string built out of constants, base85 or
+    base64, zlib-compressed, that parses as Python and leaves an entrypoint
+    behind. That is also what tells the agent from the other blobs a cell
+    carries -- a licence, a table of routes -- which decode perfectly well and
+    are not agents.
+
+    Nothing is executed. The blob is read as a literal and decoded.
 
     Args:
         text: One notebook code cell's source.
 
     Returns:
-        The assigned string, or None if the cell assigns no payload.
+        The agent source, or None when the cell carries no payload.
     """
     try:
         tree = ast.parse(text)
@@ -455,18 +554,22 @@ def payload_literal(text: str) -> str | None:
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        target = getattr(node.targets[0], "id", "")
-        if target not in {"payload", "PAYLOAD", "blob"}:
+        blob = concatenated(node.value)
+        if blob is None:
             continue
-        try:
-            value = ast.literal_eval(node.value)
-        except (ValueError, SyntaxError):
-            # Some notebooks build the payload with a call rather than
-            # assigning a literal. There is no safe way to evaluate that
-            # statically, and executing the cell to find out is the one thing
-            # this scanner will not do, so the kernel is reported as
-            # unverifiable and skipped.
-            LOGGER.info("payload for %r is computed, not literal; skipping", target)
-            return None
-        return value if isinstance(value, str) else None
+        # base85 first: `b64decode` ignores characters outside its alphabet, so
+        # handed base85 it returns bytes rather than refusing, and those bytes
+        # are not what the notebook published.
+        for decode in (base64.b85decode, base64.b64decode):
+            try:
+                plain = zlib.decompress(decode(blob)).decode("utf-8")
+            except (ValueError, zlib.error, UnicodeDecodeError):
+                continue
+            if not re.search(ENTRYPOINT, plain, re.M):
+                continue
+            try:
+                ast.parse(plain)
+            except SyntaxError:
+                continue
+            return plain
     return None

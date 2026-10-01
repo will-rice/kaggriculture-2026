@@ -90,15 +90,17 @@ def result(
     )
 
 
-def first_game(scored: evaluator.Result) -> tuple[int, int, harness.Game]:
+def first_game(
+    scored: evaluator.Result, name: str = "champion_1"
+) -> tuple[str, harness.Game]:
     """The first scored game of an evaluation, as `compose` now takes it.
 
     A round is feedback on one game, so `compose` is given that game rather
-    than the whole evaluation it came out of. Matchup and season are what the
-    loop numbers them, and the database keys its episodes by.
+    than the whole evaluation it came out of, keyed by the episode
+    the database holds it under.
     """
     opponent = next(iter(scored.states))
-    return 1, 1, scored.states[opponent][0]
+    return f"{name}m1s1", scored.states[opponent][0]
 
 
 def test_a_template_names_its_own_fields(tmp_path: Path) -> None:

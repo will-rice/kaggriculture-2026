@@ -35,11 +35,11 @@ def day(number: int, ours: float, theirs: float, **held: float) -> harness.Day:
     )
 
 
-def game(days: list[harness.Day], seat: int = 0) -> harness.Game:
+def game(days: list[harness.Day], seat: int = 0, opponent: str = "v54") -> harness.Game:
     """One played game carrying those days."""
     final = days[-1]
     return harness.Game(
-        opponent="v54",
+        opponent=opponent,
         seed=101,
         seat=seat,
         ours=final.ours_bank,

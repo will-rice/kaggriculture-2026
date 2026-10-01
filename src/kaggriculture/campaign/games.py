@@ -510,45 +510,56 @@ def played(
     ]
 
 
-def recorded(
-    name: str, database: str = DATABASE
-) -> list[tuple[int, int, harness.Game]]:
-    """One program's games back off the record, keyed the way they were written.
+def recorded(name: str, database: str = DATABASE) -> list[tuple[str, harness.Game]]:
+    """One program's games back off the record, by episode.
 
     The inverse of `played` for a result that has been through the disk. A
     result serialises without its games -- twelve thousand of them, with day
     tables, is what made `state.json` 688 MB -- so a champion loaded on
     restart has none, and the game a round is shown has to come from here.
-    The games are already here: `record` wrote them, matchup and season
-    numbered, the moment the program was scored.
+
+    Read out of `episodes` alone. It used to join `candidate` to `episodes` on
+    the episode key to recover the matchup and season numbers, and that key
+    does not identify a game: a program is measured more than once -- at the
+    start of every session that begins from it, and again as a candidate --
+    and each measurement numbers the matchups afresh, so `p...m1s1` names a
+    different opponent on a different seed in each. The join cross-multiplied
+    them. Measured 2026-09-27 on the live database, one such key carried three
+    opponents, three seeds and three pairs of banks, so a round could be shown
+    one opponent's name against another's result; and where the seats of two
+    rows disagreed the program came back as its own opponent, which is the
+    `KeyError: 'p376836b01d7e'` that stopped the campaign for eight hours.
+
+    The episode row is the game: it holds both teams, the seed and both banks,
+    and which side is ours is which team carries ``name``. So the key travels
+    whole rather than being rebuilt from numbers, and nothing has to agree
+    about what matchup 1 meant.
 
     Args:
         name: The program whose games these are.
         database: Which database to read.
 
     Returns:
-        ``(matchup, season, game)`` per game, in matchup then season order,
-        with the game's day table empty: the days are rows a round queries,
-        not a thing the message carries.
+        ``(episode, game)`` per game, ordered by episode, with the game's day
+        table empty: the days are rows a round queries, not a thing the
+        message carries.
     """
     quoted = name.replace("'", "")
     rows = query(
-        "select c.matchup, c.season, c.seat, e.seed, e.team_0, e.team_1, "
-        f"e.bank_0, e.bank_1 from {database}.candidate as c "
-        f"join {database}.episodes as e on c.episode = e.episode "
-        f"where c.team = '{quoted}' and c.source = 'campaign' "
-        "order by c.matchup, c.season format TabSeparated"
+        "select episode, seed, team_0, team_1, bank_0, bank_1 "
+        f"from {database}.episodes "
+        f"where source = 'campaign' and (team_0 = '{quoted}' or team_1 = '{quoted}') "
+        "order by episode format TabSeparated"
     )
     out = []
     for line in rows.splitlines():
-        matchup, season, seat, seed, team_0, team_1, bank_0, bank_1 = line.split("\t")
-        mine = int(seat)
-        banks = (float(bank_0), float(bank_1))
+        episode, seed, team_0, team_1, bank_0, bank_1 = line.split("\t")
         teams = (team_0, team_1)
+        banks = (float(bank_0), float(bank_1))
+        mine = 0 if team_0 == name else 1
         out.append(
             (
-                int(matchup),
-                int(season),
+                episode,
                 harness.Game(
                     opponent=teams[1 - mine],
                     seed=int(seed),

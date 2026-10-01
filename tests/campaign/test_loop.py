@@ -2024,6 +2024,46 @@ def test_a_promotion_leaves_the_new_champions_own_measurement_behind(
     assert kept is result
 
 
+def test_a_matchup_the_pool_no_longer_holds_is_not_offered_to_a_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
+) -> None:
+    """A round is handed its opponent as a file, so it has to be one we hold.
+
+    The record outlives the pool: it keeps every game the campaign has played,
+    and an opponent can stop resolving under the key it was played against.
+    Reading a matchup out of the record and looking that key up in the pool
+    without checking took the run down on 2026-09-27 -- `KeyError:
+    'p376836b01d7e'` out of the task group -- and nothing restarted it for
+    eight hours.
+    """
+    paths = tiny_run(tmp_path, monkeypatch)
+    opponents = pass_pool(tmp_path, paths)
+    stub_evaluator(monkeypatch)
+    real = games.recorded
+
+    def haunted(name: str, database: str) -> list[tuple[str, harness.Game]]:
+        """Every recorded game, and one against an agent the pool never had."""
+        ghost = _played([]).model_copy(update={"opponent": "pgonelongago"})
+        return [*real(name, database), (f"{name}m99s1", ghost)]
+
+    monkeypatch.setattr(games, "recorded", haunted)
+    assert "pgonelongago" not in opponents.opponents
+
+    loop.run(
+        1,
+        mutate.FakeMutator(edit=lambda source: source + "\n# edited\n"),
+        WORKERS,
+        _write(tmp_path / "seed.py", PASS),
+        random.Random(0),
+        log,
+        paths,
+        UNVENDORED,
+    )
+
+    database = archive.Database(paths.archive, paths.programs)
+    assert [p for p in database.programs if p.id != config.SEED_ID], "no round ran"
+
+
 def _record_campaign(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: wandb.Run
 ) -> loop.Campaign:
@@ -2573,11 +2613,12 @@ def test_the_duel_block_never_shares_a_season_with_the_sweep(
     campaign = _record_campaign(tmp_path, monkeypatch, log)
     monkeypatch.setattr(loop, "SEED_ROTATION", 1)
     # A narrow range, because over the real one -- a million seeds -- two
-    # independent draws of 16 and 48 collide about once in a thousand runs,
-    # and a test that only fails then is a test that never fails. From 79
-    # seeds two independent draws overlap on about ten every time, while one
-    # sample split in two still cannot repeat itself.
-    monkeypatch.setattr(config, "GATE_SEED_RANGE", range(1, 80))
+    # independent draws of 16 and 176 collide about once in a thousand runs,
+    # and a test that only fails then is a test that never fails. It has to
+    # hold `DUEL_SEEDS` at all, so it is sized just above: from 200 seeds two
+    # independent draws of 16 and 176 overlap on about fourteen every time,
+    # while one sample split in two still cannot repeat itself.
+    monkeypatch.setattr(config, "GATE_SEED_RANGE", range(1, 201))
 
     for _ in range(5):
         block = campaign.seasons()

@@ -82,12 +82,13 @@ EPISODES = Path("/data/kaggriculture/episodes")
 # by half again, so a large share of the machine was spent scheduling rather
 # than playing games.
 #
-# The old reservation was not wrong when it was written, it was sized for a box
-# we had to ourselves. Eight cores cannot cover thirteen of other people's work
-# plus eight codex sessions, and the shortfall comes out of the arena either
-# way -- as contention rather than as a smaller pool, which is the same cost
-# paid less efficiently.
-CORE_BUDGET = max(1, (os.cpu_count() or 1) - 24)
+# The twenty-four reserved here were thirteen cores of another project's
+# dataloaders plus eight codex sessions. Measured 2026-09-27: those dataloaders
+# had grown to 21.2 cores across two `rsna-2026` trainings, 52 processes
+# feeding two GPUs, and both were stopped. Nothing else on the box takes as
+# much as a core, so the reservation is now six: two codex sessions and the
+# shell commands they spawn, ClickHouse, and the machine itself.
+CORE_BUDGET = max(1, (os.cpu_count() or 1) - 6)
 
 # Item order is sim.hpp's `Item` enum: the nine products, then the animals.
 ITEMS: list[str] = list(PRODUCTS) + list(ANIMALS)
@@ -143,6 +144,27 @@ MARKET_OPS: list[str] = [
 # of five, and a round that can play its seasons four times as fast is a round
 # that measures before it edits rather than guessing because measuring was slow.
 SESSIONS = 2
+
+# What one session may have playing games at once.
+#
+# A session runs two of them: the gate evaluating its candidate, and the round
+# measuring for itself before it edits. Each used to take `CORE_BUDGET //
+# SESSIONS` independently -- the loop through its `--workers` default and
+# `measure` through a hand-copied `(cpu_count() - 24) // SESSIONS` -- so the
+# campaign's peak demand was twice its budget: 80 cores against 64, which is
+# the oversubscription `CORE_BUDGET` was meant to prevent, arriving
+# from inside. Launching the loop with half the workers it asked for was what
+# had been holding the total down.
+#
+# So the budget is divided once, here, and both halves read it.
+SESSION_CORES = max(1, CORE_BUDGET // SESSIONS)
+# The round's share. A round measures one pairing over a block of seeds; the
+# gate plays the whole pool, which is three hundred and seventy-seven
+# opponents as of 2026-09-27, so
+# the gate is much the larger job and gets the larger share.
+ROUND_CORES = max(1, SESSION_CORES // 3)
+# The gate's share: whatever measuring a round does not need.
+GATE_CORES = max(1, SESSION_CORES - ROUND_CORES)
 # The champion pairing alone, which the gate gives a veto no other opponent
 # has. The sweep above plays every pairing at `GATE_SEEDS`, and against an
 # opponent already beaten 1.000 that is ample -- more games buy nothing once
@@ -155,13 +177,30 @@ SESSIONS = 2
 # `pfe2ed71a20b0` won 0.594 of 32 and was refused at a lower bound of 0.423:
 # a real edge turned away for want of games, not for want of strength.
 #
-# Sixty-four seeds is 128 games and brings the rate needed down to about 0.59,
-# which is the size of edge an incremental improvement actually has. The bar
-# itself does not move -- still a 95% lower bound above 0.5 -- so this buys
-# evidence rather than lowering the standard, and a one-sided bound holds its
-# 5% false-promotion rate at any depth. It costs the 48 seeds the sweep did
-# not already play: 96 games against the sweep's ~5,800, about 1.7%.
-DUEL_SEEDS = 64
+# Sixty-four seeds was 128 games, needing 76 wins -- a rate of 0.594 -- and the
+# same shape of failure arrived one notch finer. On 2026-09-28 eight consecutive
+# candidates beat champion_50 on the field, 0.876 climbing to 0.897 against its
+# 0.870, and every one was refused on the pairing; the last two won 75 of 128,
+# a rate of 0.586 whose lower bound is 0.4993 against a bar of 0.5. One game.
+#
+# The bar is what it always was and is not moving. What was wrong is the depth
+# it was read at. Power, computed 2026-09-29 against the bound this actually
+# applies: a candidate whose true edge is 0.586 clears 128 games 47% of the
+# time, 256 games 80%, and 384 games 92%. At 64 seeds a real improvement was
+# being turned away about half the time it was offered, which is the
+# `pfe2ed71a20b0` failure in a form no single verdict shows.
+#
+# The duel is cheap against the sweep, which is where the games are: 381
+# opponents at `GATE_SEEDS` is about 12,200 games, so 192 seeds adds 256 over
+# the 64-seed duel -- near 2% -- to roughly double the chance that a true edge
+# is demonstrated rather than missed.
+#
+# On the bound itself: `wilson_interval`'s default `z` is 1.96, the two-sided
+# 95% quantile, and read as a one-sided lower bound that is a 97.5% test with a
+# 2.5% false-promotion rate. This comment used to claim 95% and 5%. The rate is
+# the stricter one, deliberately kept on 2026-09-29 -- the answer to a real
+# edge short of proof is more games, not a wider interval.
+DUEL_SEEDS = 192
 # The whole space. Nothing is reserved any more: a set held back exists to
 # give a number the search cannot steer, and drawing fresh seeds every
 # evaluation already does that -- no program is ever measured on maps it or

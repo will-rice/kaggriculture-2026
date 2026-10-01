@@ -171,6 +171,111 @@ def test_a_cell_with_no_embedded_agent_yields_nothing() -> None:
     assert kernel_watch.embedded_source(cells) is None
 
 
+def test_the_scan_pages_the_listing_to_the_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan that reads one page sees the front of the field and nothing else.
+
+    It read page one of three orderings and unioned them: about 126 refs of the
+    606 this competition holds, so 339 kernels had never been examined on
+    2026-09-27 -- among them a whole fortnight of an active field. A competitor
+    publishing a burst could also push a kernel past the front fifty between
+    two hourly scans, and nothing would ever look at it.
+    """
+    import importlib
+    import types
+
+    pages = {1: 100, 2: 100, 3: 6}
+
+    class Listing:
+        """Stands in for the competition's kernel listing, 206 refs over 3 pages."""
+
+        def authenticate(self) -> None:
+            """The scan authenticates before it lists."""
+
+        def kernels_list(
+            self,
+            competition: str,
+            sort_by: str,
+            user: str | None,
+            page_size: int,
+            page: int,
+        ) -> list[types.SimpleNamespace]:
+            """Return one page, the last one short."""
+            count = pages.get(page, 0)
+            first = sum(pages.get(one, 0) for one in range(1, page))
+            return [
+                types.SimpleNamespace(ref=f"author/kernel-{first + i}", title="t")
+                for i in range(count)
+            ]
+
+    # Imported through `importlib` rather than by attribute: the `kaggle`
+    # package binds `api` to an instantiated client, which shadows the submodule
+    # of the same name, so a dotted monkeypatch target resolves to the object.
+    extended = importlib.import_module("kaggle.api.kaggle_api_extended")
+    monkeypatch.setattr(extended, "KaggleApi", Listing)
+    monkeypatch.setattr(kernel_watch, "SEEN", tmp_path / "seen.json")
+
+    found = kernel_watch.discover(None, 1_000)
+
+    assert len(found) == 206, "the whole listing, not the first page"
+    assert found[0] == "author/kernel-0", "newest first, so a limit takes the freshest"
+
+
+def test_a_payload_joined_from_pieces_under_its_own_name_is_read() -> None:
+    """A payload is what it decodes to, not what the notebook calls it.
+
+    The reader took three names and a single literal. Measured 2026-09-27 over
+    the 327 kernels the scan had pulled: twenty-four carried an agent it could
+    not see, among them v52 through v57 of an author publishing daily and the
+    top public agent's submission v13, each logged "no agent this can build or
+    extract". The pool held six of the fifty most recently published kernels.
+
+    This is the shape they publish: a name of the author's choosing, the blob
+    joined from pieces because a megabyte does not go on one line, and the
+    digest asserted through a constant rather than written into the comparison.
+    """
+    import base64
+    import hashlib
+    import zlib
+
+    source = "def agent(observation, configuration):\n    return []\n"
+    blob = base64.b85encode(zlib.compress(source.encode("utf-8"))).decode("ascii")
+    half = len(blob) // 2
+    cell = (
+        "import base64, hashlib, zlib\n"
+        f"EXPECTED_MAIN_SHA256 = '{hashlib.sha256(source.encode()).hexdigest()}'\n"
+        f"SOURCE_BLOB = ''.join((\n    '{blob[:half]}',\n    '{blob[half:]}',\n))\n"
+        "SOURCE_BYTES = zlib.decompress(base64.b85decode(SOURCE_BLOB))\n"
+        "assert hashlib.sha256(SOURCE_BYTES).hexdigest() == EXPECTED_MAIN_SHA256\n"
+    )
+
+    assert kernel_watch.payload_source(cell) == source
+
+
+def test_a_blob_that_is_not_an_agent_is_not_taken_for_one() -> None:
+    """A cell carries more than the agent, and the others decode just as well.
+
+    `lynnsakurai/farmer-john-and-the-wheat-seller` ships ``SOURCE_B85`` beside
+    ``LICENSE_B85``, and `yhay81`'s router ships a table of routes. Reading the
+    first blob that decompresses would enrol a licence as an opponent.
+    """
+    import base64
+    import zlib
+
+    licence = "Licensed under the Apache License, Version 2.0\n" * 20
+    packed = base64.b85encode(zlib.compress(licence.encode("utf-8"))).decode("ascii")
+
+    assert kernel_watch.payload_source(f"LICENSE_B85 = '{packed}'\n") is None
+
+
+def test_a_payload_a_cell_computes_is_still_declined() -> None:
+    """Constants decide a payload or it is not read; nothing is executed."""
+    computed = "PAYLOAD = open('agent.b85').read()\n"
+
+    assert kernel_watch.payload_source(computed) is None
+
+
 def test_a_notebooks_own_compiler_line_is_read_as_a_literal() -> None:
     """The top agent in this competition is C++ and must be built to be gated.
 
